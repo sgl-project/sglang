@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -24,7 +25,6 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,

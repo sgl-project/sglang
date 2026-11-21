@@ -1228,8 +1228,8 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # Kimi-K3 on ROCm: keep a 128-aligned MXFP4 MoE intermediate, and skip the
-    # router-logits contiguous copy.
+    # Kimi-K3 on ROCm: keep a 128-aligned MXFP4 MoE intermediate,
+    # and skip the router-logits contiguous copy.
     SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_AITER_K3_OPT"
     )
