@@ -671,6 +671,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with patch.object(decode_mod.time, "monotonic", return_value=42.0):
             q.resolve_deferred_releases()
+        self.assertTrue(mgr._shutdown_quiescence_lost)
         q.scheduler.request_retirer.release.assert_called_once_with(
             dreq.req, checkpoint=False
         )

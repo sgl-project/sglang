@@ -3484,6 +3484,32 @@ pub struct SeparateReasoningResponse {
     #[prost(message, optional, tag = "4")]
     pub text_blocks: ::core::option::Option<StringList>,
 }
+/// SglangService.Shutdown, tracked in #38075. Disabled unless
+/// SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC=1 and --admin-api-key is configured.
+/// Scope: a single-node, single-DP owning runtime (unified, Prefill, or Decode)
+/// whose launcher has installed the native SIGTERM drain and parent-supervisor
+/// notification. P/D requires TP=DP=PP=1, Mooncake and deferred KV release.
+/// Role switching is excluded. This is per-role support, not cluster shutdown.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShutdownRequest {
+    /// Required, nonempty, and equal to GetServerInfoResponse.instance_id.
+    /// Reject an empty identity with INVALID_ARGUMENT and a different identity
+    /// with FAILED_PRECONDITION, without starting shutdown. A reconnect to the
+    /// same endpoint must not inadvertently shut down a replacement runtime.
+    #[prost(string, tag = "1")]
+    pub expected_instance_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShutdownResponse {
+    /// The owning runtime that accepted the operation; NOT a cluster-wide epoch.
+    #[prost(string, tag = "1")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// True when this runtime accepted shutdown, including an idempotent retry.
+    #[prost(bool, tag = "2")]
+    pub accepted: bool,
+    #[prost(bool, tag = "3")]
+    pub already_requested: bool,
+}
 /// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetWeightsByNameRequest {

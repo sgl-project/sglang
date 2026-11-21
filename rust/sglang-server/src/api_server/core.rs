@@ -15,8 +15,9 @@ pub(crate) mod prefetch;
 mod request_log;
 mod validator;
 
+pub(crate) use crate::utils::inflight::InFlight;
 pub use abort_hook::AbortHook;
-pub(crate) use drain::{DrainEnd, DrainState, InFlight};
+pub(crate) use drain::{DrainEnd, DrainState};
 pub(crate) use error::{CoreError, CoreErrorKind, STREAM_INVALID_REQUEST_ERROR};
 #[cfg(test)]
 pub(crate) use frame::frame_metadata_case;

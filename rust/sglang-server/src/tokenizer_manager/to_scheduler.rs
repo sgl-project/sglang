@@ -72,6 +72,7 @@ fn abort_req(rid: &Rid) -> Option<SchedulerRequest> {
         Ok(header) => Some(SchedulerRequest {
             header,
             buffers: Vec::new(),
+            pipeline_guard: None,
         }),
         Err(e) => {
             tracing::error!(rid = %rid, error = %e, "abort encode failed");
@@ -498,6 +499,7 @@ impl Intake {
         if !self.to_scheduler_tx.try_push(SchedulerRequest {
             header,
             buffers: Vec::new(),
+            pipeline_guard: req.pipeline_guard.take(),
         }) {
             self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
@@ -511,6 +513,7 @@ impl Intake {
         if self.to_scheduler_tx.push_priority(SchedulerRequest {
             header,
             buffers: Vec::new(),
+            pipeline_guard: None,
         }) {
             Ok(())
         } else {
@@ -593,15 +596,17 @@ impl Intake {
         // Stamped before the push: once the scheduler has the request, its
         // response can reach the hook that reads the stamp.
         dispatch_finish_time.set_now();
-        if !self
-            .to_scheduler_tx
-            .try_push(SchedulerRequest { header, buffers })
-        {
+        if !self.to_scheduler_tx.try_push(SchedulerRequest {
+            header,
+            buffers,
+            pipeline_guard: req.pipeline_guard.take(),
+        }) {
             dispatch_finish_time.clear();
             self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
         // On success the scheduler owns the request (response arrives by rid); we
-        // drop our `Request` here — the detok shard holds the sink.
+        // drop our `Request` here — the detok shard holds the sink. The P/D
+        // pipeline guard moved onto the SchedulerRequest above.
     }
 }
 

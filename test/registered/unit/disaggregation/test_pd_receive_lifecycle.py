@@ -62,6 +62,7 @@ class _FailedReceiver:
         self.kv_mgr = SimpleNamespace(
             enable_deferred_decode_kv_release=True,
             is_abort_release_safe=lambda room, acks: False,
+            mark_shutdown_unquiescent=MagicMock(),
         )
 
     def poll(self):
@@ -110,6 +111,8 @@ class TestReceiveTimeoutStaysDone(CustomTestCase):
                     # Done stays done until the release.
                     self.assertEqual(flags, [True, True], now[0])
         self.assertEqual(agreed_at, 11.0)
+        for _, receiver, _ in ranks:
+            receiver.kv_mgr.mark_shutdown_unquiescent.assert_called()
 
 
 class TestReceivePreallocationConsumer(CustomTestCase):
