@@ -78,7 +78,10 @@ def draft_kv_ring_unsupported_reason(
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
-    if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
+    if disaggregation_mode != "null" and disaggregation_transfer_backend not in (
+        "mooncake",
+        "mori",
+    ):
         return (
             f"the {disaggregation_transfer_backend} PD transfer backend does not "
             "send the ring"
@@ -88,6 +91,9 @@ def draft_kv_ring_unsupported_reason(
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
     if draft_backend in DFLASH_MHA_RING_DRAFT_BACKENDS:
+        if disaggregation_mode != "null" and disaggregation_transfer_backend == "mori":
+            # MoRI sends ring rows whole, with no same-attention-TP check.
+            return "the mori PD transfer backend sends only an MLA ring"
         return _mha_ring_unsupported_reason(
             load_draft_hf_config,
             draft_backend=draft_backend,

@@ -263,5 +263,30 @@ class TestMoriPpDsaStatePairing(CustomTestCase):
                 manager._submit_batch_transfer_plan.assert_not_called()
 
 
+class TestMoriDraftRingState(unittest.TestCase):
+    def test_ring_rows_pair_only_where_both_dcp_ranks_own_the_position(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 1
+        manager.state_mem_descs = [["src"]]
+        manager.kv_args = SimpleNamespace(
+            state_types=["draft_ring"],
+            state_item_lens=[[64]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        peer = SimpleNamespace(
+            dst_state_mem_descs=[["dst"]],
+            dst_state_item_lens=[[64]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+        )
+
+        manager.send_state(peer, [np.array([5, 0, 7, 9])], [np.array([3, 4, 0, 8])])
+
+        plan = mori_conn.BatchTransferPlan([5 * 64, 9 * 64], [3 * 64, 8 * 64], [64, 64])
+        manager._submit_batch_transfer_plan.assert_called_once_with("src", "dst", plan)
+
+
 if __name__ == "__main__":
     unittest.main()
