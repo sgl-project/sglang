@@ -3,11 +3,15 @@
 import argparse
 import json
 import pathlib
+import re
 import shutil
 from typing import Any, Dict, List
 
 from safetensors.torch import load_file, save_file
 
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
+    pack_fp4_weight,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -37,12 +41,17 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     # for the FLF2V model
     "img_emb.emb_pos": "condition_embedder.image_embedder.pos_embed",
     # Add attention component mappings
+    "self_attn.q_rot": "attn1.q_rot",
+    "self_attn.k_rot": "attn1.k_rot",
     "self_attn.q": "attn1.to_q",
     "self_attn.k": "attn1.to_k",
     "self_attn.v": "attn1.to_v",
     "self_attn.o": "attn1.to_out.0",
     "self_attn.norm_q": "attn1.norm_q",
     "self_attn.norm_k": "attn1.norm_k",
+    "cross_attn.k_img": "attn2.add_k_proj",
+    "cross_attn.v_img": "attn2.add_v_proj",
+    "cross_attn.norm_k_img": "attn2.norm_added_k",
     "cross_attn.q": "attn2.to_q",
     "cross_attn.k": "attn2.to_k",
     "cross_attn.v": "attn2.to_v",
@@ -52,6 +61,7 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "attn2.to_k_img": "attn2.add_k_proj",
     "attn2.to_v_img": "attn2.add_v_proj",
     "attn2.norm_k_img": "attn2.norm_added_k",
+    "self_attn": "attn1",
     # MXFP4 msmodelslim wraps Linear layers with a `.linear.` subpath;
     # strip it so keys match the SGLang model parameters.
     ".linear.": ".",
@@ -96,10 +106,6 @@ def get_quant_subpath(
     return quant_path
 
 
-def update_dict_(d: Dict[str, Any], old_key: str, new_key: str) -> None:
-    d[new_key] = d.pop(old_key)
-
-
 def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     candidates = sorted(directory.glob(pattern))
     if not candidates:
@@ -109,6 +115,32 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
     for f in candidates:
         state_dict.update(load_file(f))
     return state_dict
+
+
+def load_quant_description(model_path: pathlib.Path) -> Dict[str, Any]:
+    """Load the inference description, excluding SVD calibration variants."""
+    candidates = sorted(model_path.glob("quant_model_description*.json"))
+    ignored = [c for c in candidates if c.stem.endswith("_svd")]
+    for path in ignored:
+        logger.info(
+            "Ignoring quantization-time description %s (inference uses the "
+            "plain variant)",
+            path.name,
+        )
+    candidates = [c for c in candidates if c not in ignored]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No quant_model_description*.json found in {model_path}"
+        )
+    if len(candidates) > 1:
+        names = ", ".join(c.name for c in candidates)
+        raise ValueError(
+            f"Multiple candidate descriptions in {model_path}: {names}; "
+            "remove the unused variants"
+        )
+    logger.info("Using quantization description %s", candidates[0].name)
+    with open(candidates[0]) as f:
+        return json.load(f)
 
 
 def convert_transformer(
@@ -122,23 +154,36 @@ def convert_transformer(
 
     state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
 
-    json_candidates = sorted(model_path.glob("quant_model_description*.json"))
-    if not json_candidates:
-        raise FileNotFoundError(
-            f"No quant_model_description*.json found in {model_path}"
-        )
-    with open(json_candidates[0]) as f:
-        quant_config = json.load(f)
+    quant_config = load_quant_description(model_path)
 
-    for key in list(state_dict.keys()):
-        new_key = key[:]
-        for replace_key, rename_key in RENAME_DICT.items():
-            new_key = new_key.replace(replace_key, rename_key)
-        if new_key != key:
-            update_dict_(state_dict, key, new_key)
-            # The quant JSON only covers quantized layers, not all model keys
-            if key in quant_config:
-                update_dict_(quant_config, key, new_key)
+    # Attention descriptors need not have a corresponding checkpoint tensor.
+    for mapping in (state_dict, quant_config):
+        renamed = {}
+        for key, value in mapping.items():
+            new_key = key
+            for replace_key, rename_key in RENAME_DICT.items():
+                if replace_key.startswith("."):
+                    new_key = new_key.replace(replace_key, rename_key)
+                else:
+                    # Projection names must not match quant_type or q_rot.
+                    new_key = re.sub(
+                        r"(?<!\w)" + re.escape(replace_key) + r"(?!\w)",
+                        rename_key,
+                        new_key,
+                    )
+            if new_key in renamed:
+                raise ValueError(f"Checkpoint keys collide after renaming: {new_key}")
+            renamed[new_key] = value
+        mapping.clear()
+        mapping.update(renamed)
+
+    for key, weight in state_dict.items():
+        if key.endswith(".weight") and quant_config.get(key) in (
+            "W4A4_MXFP4",
+            "W4A4_MXFP4_DYNAMIC",
+            "W4A4_MXFP4_DUALSCALE",
+        ):
+            state_dict[key] = pack_fp4_weight(weight)
 
     save_file(state_dict, out_path / "diffusion_pytorch_model.safetensors")
 
