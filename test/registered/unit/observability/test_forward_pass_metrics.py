@@ -466,6 +466,53 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
 
 
+class TestDecodeGraphRowsReporter(CustomTestCase):
+    def test_install_only_for_ordinary_decode_logging_rank(self):
+        report = Mock()
+        for pp_rank, stats_rank, attn_dp_enabled, spec, enabled, device, installed in (
+            (1, True, False, SpeculativeAlgorithm.NONE, True, "cuda", True),
+            (0, True, False, SpeculativeAlgorithm.NONE, True, "cuda", False),
+            (1, False, False, SpeculativeAlgorithm.NONE, True, "cuda", False),
+            (1, True, True, SpeculativeAlgorithm.NONE, True, "cuda", False),
+            (1, True, False, SpeculativeAlgorithm.EAGLE, True, "cuda", False),
+            (1, True, False, SpeculativeAlgorithm.NONE, False, "cuda", False),
+            (1, True, False, SpeculativeAlgorithm.NONE, True, "cpu", False),
+        ):
+            with self.subTest(
+                pp_rank=pp_rank,
+                stats_rank=stats_rank,
+                dp=attn_dp_enabled,
+                spec=spec,
+                enabled=enabled,
+                device=device,
+            ):
+                runner = SimpleNamespace(
+                    decode_graph_rows_reporter=None, spec_algorithm=spec
+                )
+                reporter = SimpleNamespace(
+                    enable_metrics=enabled,
+                    is_stats_logging_rank=stats_rank,
+                    scheduler=SimpleNamespace(
+                        device=device, tp_worker=SimpleNamespace(model_runner=runner)
+                    ),
+                    metrics_collector=SimpleNamespace(
+                        increment_decode_cuda_graph_rows=report
+                    ),
+                )
+                with patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter.get_parallel",
+                    return_value=SimpleNamespace(
+                        pp_rank=pp_rank, pp_size=2, attn_dp_enabled=attn_dp_enabled
+                    ),
+                ):
+                    SchedulerMetricsReporter._install_decode_graph_rows_reporter(
+                        reporter
+                    )
+                self.assertIs(
+                    runner.decode_graph_rows_reporter, report if installed else None
+                )
+
+
 class TestForwardPassMetrics(unittest.TestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace()

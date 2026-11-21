@@ -2151,6 +2151,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ) and fb_view.out_cache_loc is not None:
             fb_view.out_cache_loc = self.buffers.out_cache_loc[:num_tokens]
 
+    def _report_decode_graph_rows(self, forward_batch: ForwardBatch) -> None:
+        reporter = self.model_runner.decode_graph_rows_reporter
+        if (
+            reporter is not None
+            and forward_batch.forward_mode.is_decode()
+            and self.captured_req_width == 1
+            and not self.ragged_verify_mode
+            and not self.require_mlp_tp_gather
+            and self.raw_bs > 0
+        ):
+            reporter(self.raw_bs, self.bs)
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -2195,6 +2207,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self._process_output_after_replay(output, forward_batch)
+
+        if getattr(self.model_runner, "decode_graph_rows_reporter", None) is not None:
+            self._report_decode_graph_rows(forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

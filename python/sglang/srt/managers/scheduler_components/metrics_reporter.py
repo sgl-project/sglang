@@ -255,6 +255,7 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics()
         self._install_device_timer_on_runners()
+        self._install_decode_graph_rows_reporter()
         # Keep log history after the existing async result copy so reporting does
         # not synchronize the model stream once per generated token.
         self._eplb_balancedness_history = [
@@ -371,6 +372,24 @@ class SchedulerMetricsReporter:
                     dw.draft_runner.device_timer = timer
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
+
+    def _install_decode_graph_rows_reporter(self):
+        # Count a logical decode batch once, not on every TP/CP/PP rank.
+        # Attention DP can also pad to the largest rank's batch: that is not
+        # purely graph-bucket padding, so exclude it until it has its own metric.
+        parallel = get_parallel()
+        if (
+            self.enable_metrics
+            and self.is_stats_logging_rank
+            and parallel.pp_rank == parallel.pp_size - 1
+            and not parallel.attn_dp_enabled
+            and self.scheduler.device == "cuda"
+        ):
+            runner = self.scheduler.tp_worker.model_runner
+            if runner.spec_algorithm.is_none():
+                runner.decode_graph_rows_reporter = (
+                    self.metrics_collector.increment_decode_cuda_graph_rows
+                )
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
