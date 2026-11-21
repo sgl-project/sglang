@@ -1,5 +1,7 @@
 """Weight-free TileLang MQA operators for the simple QSA indexer;
-the torch implementations are the fallback and the reference."""
+the torch implementations are the fallback and the reference. On ROCm, decode
+scoring runs the Triton kernel in
+``sglang.kernels.ops.attention.qsa_mqa_decode_triton``."""
 
 import functools
 import math
@@ -700,13 +702,49 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_request: int = 1,
+    num_heads: Optional[int] = None,
 ) -> torch.Tensor:
+    """Paged decode MQA logits.
+
+    ``rows_per_request`` > 1 promises that each run of that many consecutive rows
+    belongs to one request, as a target-verify step's draft rows do, and shares
+    its page-table row; ``num_heads`` counts the leading heads of ``q`` that hold
+    the query, the rest being zero padding. On ROCm the Triton kernel uses both to
+    read each request's keys once; the other kernels score every row and head."""
     if _is_npu:
         if score_scale is not None:
             raise ValueError("Custom MQA scale is outside the model contract")
         from sgl_kernel_npu.operators.indexer import qsa_mqa_paged
 
         return qsa_mqa_paged(q, k_cache, page_table, context_lens, max_model_len)
+    if q.is_cuda and is_hip():
+        from sglang.kernels.ops.attention.qsa_mqa_decode_triton import (
+            can_use_qsa_mqa_decode_triton,
+            qsa_mqa_decode_triton,
+        )
+
+        if can_use_qsa_mqa_decode_triton(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            rows_per_request,
+            num_heads,
+        ):
+            _validate_decode_inputs(q, k_cache, page_table, context_lens)
+            return qsa_mqa_decode_triton(
+                q,
+                k_cache,
+                page_table,
+                context_lens,
+                max_model_len,
+                score_scale,
+                min_scored_len=min_scored_len,
+                rows_per_group=rows_per_request,
+                num_heads=num_heads,
+            )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,
