@@ -11,10 +11,11 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host import base, rocm_budget
+from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +40,19 @@ def _windowed(pool, full_layers=None, swa_layers=None):
         ],
     )
     return pool
+
+
+def _cpu_params():
+    return SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(device="cpu")
+        )
+    )
+
+
+def _plain_left():
+    # Plain RAM left in the active snapshot scope.
+    return base._host_memory_budget.get()[0]
 
 
 class TestHiCacheAutoSize(CustomTestCase):
@@ -223,6 +237,192 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertIsNone(
             resolution_result(explicit, "hicache_host_memory_fraction", 0.8)
         )
+
+    def test_explicit_size_books_a_snapshot_taken_before_peers_allocate(self):
+        """An explicit --hicache-size is checked against host memory sampled
+        before any rank allocates, not after its peers pinned their pools."""
+        pool = MHATokenToKVPool(
+            size=128,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=2,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        # 1e-5 GB is 79 pages of 2 tokens at 64 bytes per token on every rank.
+        pool_bytes = 79 * 2 * 64
+        rank_budget = 12_000
+        host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4 * rank_budget}
+        free_now = Mock(side_effect=lambda **_: host_free["bytes"])
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(sizing, "ranks_per_host", return_value=4),
+            patch.object(torch.distributed, "barrier"),
+            get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
+            patch.object(base, "available_host_memory_bytes", free_now),
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
+        ):
+            # Three peers on this host pin their pools before this rank builds its own.
+            host_free["bytes"] -= 3 * pool_bytes
+            host = MHATokenToKVPoolHost(
+                buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=2.0,
+                host_size=1e-5,
+                page_size=2,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                write_back_staging=pool.hicache_write_back_staging,
+            )
+            self.assertEqual(host.size * host.size_per_token, pool_bytes)
+            self.assertEqual(_plain_left(), rank_budget - pool_bytes)
+        self.assertIsNone(base._host_memory_budget.get())
+        # One snapshot per rank: building the pool books it, never re-samples.
+        free_now.assert_called_once()
+
+    def test_explicit_size_samples_host_memory_before_the_rank_barrier(self):
+        """Ranks sharing a host sample before any of them allocates."""
+        calls = Mock()
+        calls.free.return_value = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 2000
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=2),
+            patch.object(sizing, "ranks_per_host", return_value=2),
+            patch.object(base, "available_host_memory_bytes", calls.free),
+            patch.object(torch.distributed, "barrier", calls.barrier),
+            get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
+        ):
+            self.assertEqual(_plain_left(), 1000)
+        self.assertEqual([name for name, _, _ in calls.mock_calls], ["free", "barrier"])
+        calls.barrier.assert_called_once_with(group="cpu")
+
+    def test_explicit_size_on_a_lone_rank_still_sees_other_replicas_pools(self):
+        """A lone rank samples per pool and takes no collective, so another replica's pins stay visible."""
+        host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000}
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(sizing, "ranks_per_host", return_value=1),
+            patch.object(base, "is_gfx95_supported", return_value=False),
+            patch.object(rocm_budget, "rocm_pinnable_share_bytes", return_value=None),
+            patch.object(
+                base, "available_host_memory_bytes", lambda **_: host_free["bytes"]
+            ),
+            patch.object(torch.distributed, "barrier") as barrier,
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
+        ):
+            self.assertIsNone(base._host_memory_budget.get())
+            self.assertEqual(base.host_memory_preflight([200]).available_bytes, 1000)
+            # Another replica pins 600 bytes after this rank's first pool was checked.
+            host_free["bytes"] -= 600
+            self.assertEqual(base.host_memory_preflight([600]), (600, 400))
+        barrier.assert_not_called()
+
+    def _explicit_size_scope(
+        self, *, mode, available, hugetlb, gfx950, mappings, ranks
+    ):
+        # Returns the scope budget (None without a snapshot) and the preflight for the mappings.
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(device="cuda")
+            )
+        )
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=ranks),
+            patch.object(sizing, "ranks_per_host", return_value=ranks),
+            patch.object(torch.distributed, "barrier") as barrier,
+            get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
+            patch.object(base, "available_host_memory_bytes", return_value=available),
+            patch.object(base, "hugepage_size_requested", return_value=2 << 20),
+            patch.object(base, "hugepage_mode", return_value=mode),
+            patch.object(base, "device_uses_allocator", return_value=True),
+            patch.object(base, "is_gfx95_supported", return_value=gfx950),
+            patch.object(rocm_budget, "is_gfx95_supported", return_value=gfx950),
+            patch.object(
+                rocm_budget,
+                "rocm_pinnable_share_bytes",
+                return_value=(20 << 30) if gfx950 else None,
+            ),
+            patch.object(
+                HostTensorAllocator,
+                "free_hugetlb_bytes",
+                classmethod(lambda cls: hugetlb),
+            ),
+            patch.object(sizing, "get_allocator_type", return_value="default"),
+            sizing.auto_size_hicache(params=params, draft_plan=None, enabled=True),
+        ):
+            scope = base._host_memory_budget.get()
+            result = base.host_memory_preflight(mappings, HostTensorAllocator, "cuda")
+        # Only ranks sharing a host meet at the barrier; a lone rank has no process group to wait on.
+        if ranks > 1:
+            barrier.assert_called_once_with(group="cpu")
+        else:
+            barrier.assert_not_called()
+        return scope, result
+
+    def test_explicit_size_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(
+        self,
+    ):
+        scope, (allocation, available) = self._explicit_size_scope(
+            mode=base.HUGEPAGE_MODE_REQUIRED,
+            available=9 << 30,
+            hugetlb=16 << 30,
+            gfx950=False,
+            mappings=[4 << 30],
+            ranks=2,
+        )
+        self.assertLessEqual(allocation, available)
+        self.assertEqual(scope, (0, 8 << 30))
+
+    def test_a_lone_rank_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(
+        self,
+    ):
+        scope, (allocation, available) = self._explicit_size_scope(
+            mode=base.HUGEPAGE_MODE_PREFER,
+            available=9 << 30,
+            hugetlb=8 << 30,
+            gfx950=False,
+            mappings=[4 << 30],
+            ranks=1,
+        )
+        self.assertIsNone(scope)
+        self.assertLessEqual(allocation, available)
+
+    def test_explicit_size_on_gfx950_books_hugepage_pools_against_the_pinnable_share(
+        self,
+    ):
+        scope, (allocation, available) = self._explicit_size_scope(
+            mode=base.HUGEPAGE_MODE_PREFER,
+            available=200 << 30,
+            hugetlb=64 << 30,
+            gfx950=True,
+            mappings=[40 << 30],
+            ranks=1,
+        )
+        self.assertEqual(scope, (20 << 30, 0))
+        self.assertGreater(allocation, available)
 
 
 if __name__ == "__main__":

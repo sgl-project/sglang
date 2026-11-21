@@ -110,28 +110,62 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _host_allocator_and_device(params: CacheInitParams):
+    return (
+        get_allocator_class_from_storage(get_allocator_type()),
+        params.token_to_kv_pool_allocator.get_kvcache().device,
+    )
+
+
+@contextmanager
+def _explicit_size_budget(params: CacheInitParams):
+    # Sampling per pool charges a late rank for its peers' pools,
+    # so ranks sharing a host take one snapshot each (clamped to the TTM pinnable share on gfx950).
+    from sglang.srt.mem_cache.pool_host.rocm_budget import rocm_pinnable_share_bytes
+
+    gfx950_ttm = rocm_pinnable_share_bytes() is not None
+    if ranks_per_host() == 1 and not gfx950_ttm:
+        # A lone rank has no peer to race;
+        # sampling per pool still sees other engines' pools on this host, which a snapshot would not.
+        # It sees only pools already pinned: replicas that start together or span several ranks per host stay unaware.
+        yield
+        return
+    allocator, kvcache_device = _host_allocator_and_device(params)
+    if gfx950_ttm:
+        # gfx950 pins every host pool out of its TTM share: no hugetlb credit
+        allocator = kvcache_device = None
+    plain, hugetlb = host_memory_budget_plain_hugetlb(
+        allocator=allocator, device=kvcache_device
+    )
+    if ranks_per_host() > 1:
+        # Peers on this host must all sample before any pins a pool;
+        # ranks_per_host() is uniform, so every rank enters or skips the barrier.
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+    # A reserve above free RAM must not reject mappings that charge only the hugetlb pool.
+    with host_memory_budget_scope((max(plain, 0), hugetlb)):
+        yield
+
+
 @contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
 ):
     """Reduce the default HiCache ratio until this machine's host pools fit.
 
-    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
+    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size;
+    those pools keep their size; ranks sharing a host (or gfx950) book one host memory snapshot.
     """
+    if not enabled:
+        yield
+        return
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
-        from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
-
-        # gfx950 pins only its TTM share: book explicit sizes against it; else no-op
-        with explicit_size_scope(enabled):
+    if fraction is None:
+        with _explicit_size_budget(params):
             yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    kvcache_device = getattr(
-        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
-    )
-    allocator = get_allocator_class_from_storage(get_allocator_type())
+    allocator, kvcache_device = _host_allocator_and_device(params)
     plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
         allocator, kvcache_device, auto_size=True
     )
