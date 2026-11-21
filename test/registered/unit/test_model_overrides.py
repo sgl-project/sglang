@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
-from sglang.srt.server_args import _declared_default
+from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
 
@@ -255,6 +255,11 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "watermark_key_b",
                     "watermark_max_probability",
                     "watermark_mixing_probability",
+                    "watermark_keys",
+                    "watermark_ngram_len",
+                    "watermark_num_candidates",
+                    "watermark_context_history_size",
+                    "watermark_skip_first_ngram_calls",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
@@ -4384,6 +4389,49 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {},
         )
 
+    def test_dsa_family_detection_and_backend_guards(self):
+        mistral = SimpleNamespace(
+            architectures=["MistralLarge4ForCausalLM"],
+            index_topk=2048,
+            nope_layer_flags=[True],
+        )
+        configs = (
+            (mistral, "NoPE, SSMax or KV-sharing", {"attention_backend": "fa3"}),
+            (
+                SimpleNamespace(
+                    architectures=["PixtralForConditionalGeneration"],
+                    text_config=mistral,
+                ),
+                "NoPE, SSMax or KV-sharing",
+                {"attention_backend": "fa3"},
+            ),
+            (
+                SimpleNamespace(
+                    architectures=["HYV4FlashForConditionalGeneration"], index_topk=2048
+                ),
+                "Hy4-Flash does not support speculative decoding",
+                {"speculative_algorithm": "DSPARK"},
+            ),
+        )
+        with override_platform(is_npu=False, is_xpu=False, is_hip=False):
+            for config, error, invalid in configs:
+                arch = config.architectures[0]
+                with self.subTest(arch=arch):
+                    declarations = collect_model_override_declarations(
+                        arch, ServerArgs(model_path="dummy"), config
+                    )
+                    self.assertIn(
+                        (
+                            "_deepseek_family_overrides",
+                            {"attention_backend": "dsa", "page_size": 64},
+                        ),
+                        declarations,
+                    )
+                    with self.assertRaisesRegex(ValueError, error):
+                        collect_model_override_declarations(
+                            arch, ServerArgs(model_path="dummy", **invalid), config
+                        )
+
     def test_deepseek_family_order_safe_declarations(self):
         from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
             _deepseek_family_overrides,
@@ -4552,6 +4600,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
+
+    def test_qwen3_moe_family_covers_text_only_qwen3_5(self):
+        """Text-only Qwen3.5 checkpoints (Qwen3.8-2.4T-A95B ships as
+        Qwen3_5MoeForCausalLM) take the family's SM100 MoE runner rule, as their
+        multimodal siblings do. Under auto, ModelOpt NVFP4 MoE weights were
+        otherwise prepared for another runner than the kernel takes (#48108)."""
+        args = SimpleNamespace(
+            quantization="modelopt_mixed",
+            _quantization_explicitly_unset=False,
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+        )
+        for arch in ("Qwen3_5MoeForCausalLM", "Qwen3_5ForCausalLM"):
+            hf_config = SimpleNamespace(
+                architectures=[arch],
+                quantization_config={
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}
+                    },
+                },
+            )
+            with self.subTest(arch=arch), override_platform(is_sm100=True):
+                self.assertEqual(
+                    collect_model_override_declarations(arch, args, hf_config),
+                    [
+                        (
+                            "_qwen3_moe_family_overrides",
+                            {"moe_runner_backend": "flashinfer_trtllm"},
+                        )
+                    ],
+                )
 
     def test_qwen3_moe_family_mixed_precision_moe_runner(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (

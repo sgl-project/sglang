@@ -130,10 +130,6 @@ def _resolve_speculative_algorithm_alias(
 
 def _validate_draft_window_options(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    # Consumed by DFLASH (compact draft KV cache), Llama EAGLE-3 (drafter attention
-    # SWA), and the built-in MTP/NEXTN + EAGLE draft-decode path on the Triton and
-    # FlashInfer draft attention backends (StreamingLLM sink + recent window). The
-    # The resolved backend and draft's native window are checked after algorithm-specific resolution.
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:

@@ -645,7 +645,7 @@ class FlowMatchEulerDiscreteScheduler(
         return sample
 
     def __len__(self) -> int:
-        return 0
+        return self.config.num_train_timesteps
 
 
 EntryClass = FlowMatchEulerDiscreteScheduler

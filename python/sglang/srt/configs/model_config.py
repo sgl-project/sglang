@@ -215,8 +215,7 @@ def get_dsa_config(config):
     return config
 
 
-# Text-model implementations of DeepSeek sparse attention. Multimodal wrappers
-# are not listed: they qualify through the text model that carries the DSA fields.
+# Pixtral qualifies through its text model, which carries the DSA fields.
 _DSA_ARCHITECTURES = frozenset(
     {
         "DeepseekV3ForCausalLM",
@@ -234,6 +233,7 @@ _DSA_ARCHITECTURES = frozenset(
         "Dots3NoteForCausalLMNextN",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
         "Xing4_0ForCausalLM",
         "Ernie5_5_MoeForCausalLM",
         "Ernie5_5_MoeForCausalLMNextN",
@@ -1664,6 +1664,7 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4FlashForConditionalGeneration" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
@@ -2743,6 +2744,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
