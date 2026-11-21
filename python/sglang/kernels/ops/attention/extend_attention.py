@@ -1405,10 +1405,13 @@ def _fwd_kernel_unified(
 
         # Apply custom mask if provided
         if USE_CUSTOM_MASK:
+            # Mask rows are full length; the window rail starts at cur_window_start.
             custom_mask = tl.load(
                 mask_ptr
                 + cur_seq_mask_start_idx
-                + (cur_block_m * BLOCK_M + offs_m[:, None]) * cur_seq_kv_len
+                + (cur_block_m * BLOCK_M + offs_m[:, None])
+                * (cur_seq_kv_len + cur_window_start)
+                + cur_window_start
                 + start_n
                 + offs_n[None, :],
                 mask=(mask_m[:, None] & mask_n[None, :]),
