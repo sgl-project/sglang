@@ -503,7 +503,7 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m._socket_lock = threading.Lock()
         m._socket_cache = {}
         m._monitor_cache = {}
-        m.engine = MagicMock()
+        m.transport = MagicMock()
         m.request_status = MagicMock(spec=PPConsensusStore)
         # Built from KVArgs' own annotations: teardown walks several ptr/len
         # pairs, and hardcoding them here goes stale every time one is added.
