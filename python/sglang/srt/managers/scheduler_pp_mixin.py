@@ -308,7 +308,15 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_release_work = []
         early_send = self._pp_pd_early_send_enabled()
+        if envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get():
+            # All stages or none: results hold their checkpoint frees alike.
+            votes = [None] * get_parallel().pp_size
+            torch.distributed.all_gather_object(
+                votes, early_send, group=self.pp_group.cpu_group
+            )
+            early_send = all(votes)
         if early_send:
+            self.disagg_prefill_early_send_on = True
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
             self.disagg_prefill_early_send_stats = {"early": 0, "deferred": 0}

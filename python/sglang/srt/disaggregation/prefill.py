@@ -187,6 +187,19 @@ def _sender_takes_host_indices(sender) -> bool:
     )
 
 
+def _may_send_last_chunk_early(req: Req) -> bool:
+    """The part of early-send eligibility every PP stage and rank sees alike: what
+    the request asks for and how its sender takes indices."""
+    return (
+        not req.return_logprob
+        and not req.return_sampling_mask
+        and req.grammar is None
+        and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+        # Without host indices the send would read them on this thread.
+        and _sender_takes_host_indices(req.disagg_kv_sender)
+    )
+
+
 # Layouts a token-exact PD check covered with SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND
 # on: no MLA, and no transferred state but these. Others keep the result path.
 _PP_PD_EARLY_SEND_STATE_TYPES: frozenset = frozenset()
@@ -701,8 +714,10 @@ class SchedulerDisaggregationPrefillMixin:
     # Rids whose last KV chunk this stage sent when its forward ended
     # (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND); the PP prefill loop sets a real set.
     disagg_prefill_early_sent_rids: frozenset = frozenset()
-    # Their results' checkpoint device frees, held until the transfer ends.
-    disagg_prefill_deferred_frees: Mapping[str, list] = MappingProxyType({})
+    # Whether every PP stage runs early send; the PP prefill loop sets it.
+    disagg_prefill_early_send_on: bool = False
+    # Results' checkpoint device frees held until their transfer ends, by request.
+    disagg_prefill_deferred_frees: Mapping[Req, list] = MappingProxyType({})
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -1311,8 +1326,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.batch_result_processor._maybe_collect_customized_info(
                     i, req, logits_output
                 )
-                if req.rid in self.disagg_prefill_early_sent_rids:
-                    self._checkpoint_early_sent(req)
+                if self.disagg_prefill_early_send_on and _may_send_last_chunk_early(
+                    req
+                ):
+                    self._checkpoint_holding_frees(req)
                 else:
                     self.checkpoint_disagg_prefill(req)
                 move(
@@ -1818,12 +1835,7 @@ class SchedulerDisaggregationPrefillMixin:
             and req.metadata_buffer_index >= 0
             and req.discard_output_reason is None
             and not is_aborted(req)
-            and not req.return_logprob
-            and not req.return_sampling_mask
-            and req.grammar is None
-            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
-            # Without host indices the send would read them on this thread.
-            and _sender_takes_host_indices(req.disagg_kv_sender)
+            and _may_send_last_chunk_early(req)
         )
 
     def _pp_pd_early_send_last_chunks(
@@ -1910,11 +1922,12 @@ class SchedulerDisaggregationPrefillMixin:
             stats["deferred"],
         )
 
-    def _checkpoint_early_sent(self: Scheduler, req: Req) -> None:
-        """Checkpoint a result whose last chunk left at forward end. The transfer
-        may still read pages the checkpoint's dedup frees, so those frees wait for
-        the inflight release. Decided by early-send membership, never by this
-        stage's transfer status, so every PP rank's tree and pools change alike."""
+    def _checkpoint_holding_frees(self: Scheduler, req: Req) -> None:
+        """Checkpoint a result whose last chunk some PP stage may have sent at forward
+        end. That transfer may still read pages the checkpoint's dedup frees, so the
+        frees wait for the inflight release. Every stage and rank decides this from
+        the same inputs, never from whether it sent early itself, so their trees and
+        pools change alike."""
         self.disagg_prefill_early_send_stats["deferred"] += 1
         if not isinstance(self.tree_cache, UnifiedRadixCache):
             return  # The release after the transfer publishes the KV.
@@ -1922,12 +1935,12 @@ class SchedulerDisaggregationPrefillMixin:
         with self.tree_cache.defer_device_frees(frees):
             self.checkpoint_disagg_prefill(req)
         if frees:
-            self.disagg_prefill_deferred_frees[req.rid] = frees
+            self.disagg_prefill_deferred_frees[req] = frees
 
     def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
-        frees = self.disagg_prefill_deferred_frees.get(req.rid)
+        frees = self.disagg_prefill_deferred_frees.get(req)
         if frees is not None:
-            del self.disagg_prefill_deferred_frees[req.rid]
+            del self.disagg_prefill_deferred_frees[req]
             self.tree_cache.apply_deferred_frees(frees)
 
     def _forget_early_sent_last_chunk(self: Scheduler, req: Req) -> bool:
