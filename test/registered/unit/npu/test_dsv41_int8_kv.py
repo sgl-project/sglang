@@ -5,7 +5,11 @@ import unittest
 
 import torch
 
-from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import decode_int8, encode_int8
+from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import (
+    decode_int8,
+    encode_int8,
+    physical_page_map,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_kv import (
     materialize_kv_pages,
     pack_kv,
@@ -64,6 +68,20 @@ class TestDSV41Int8KV(unittest.TestCase):
         )
         empty = torch.empty((0, 1, 512), dtype=torch.bfloat16)
         self.assertEqual(unpack_kv(pack_kv(empty)).shape, empty.shape)
+
+    def test_captured_page_workspace_is_bounded_by_the_physical_pool(self):
+        table = torch.tensor([[3, 3, 96, -1], [1, 2, 4, 76]], dtype=torch.int32)
+        for lengths, expected in (
+            ([7, 3], [[3, 3, 0, -1], [1, 0, 0, 0]]),
+            ([3, 12], [[3, 0, 0, -1], [1, 2, 4, 0]]),
+        ):
+            pages, remapped = physical_page_map(
+                table, 4, torch.tensor(lengths), fixed_shape=True, pool_pages=5
+            )
+            self.assertEqual(pages.numel(), 5)
+            self.assertEqual(remapped.tolist(), expected)
+            valid = remapped > 0
+            torch.testing.assert_close(pages[remapped[valid].long()], table[valid])
 
     def test_active_and_static_physical_pages(self):
         rows = torch.randn(

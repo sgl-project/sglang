@@ -3,6 +3,7 @@
 import torch
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import (
+    SCALES_PER_GROUP,
     decode_int8,
     encode_int8,
     metadata_bytes,
@@ -54,7 +55,23 @@ def materialize_kv_pages(
     """
     if cache.dtype != torch.uint8:
         return cache, block_table
+    fused = fixed_shape and cache.device.type == "npu"
     physical, remapped = physical_page_map(
-        block_table, cache.shape[1], lengths, fixed_shape=fixed_shape
+        block_table,
+        cache.shape[1],
+        lengths,
+        fixed_shape=fixed_shape,
+        pool_pages=cache.shape[0] if fused else None,
     )
+    if fused:
+        from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_pages
+
+        return decode_pages(
+            cache[..., ROPE_BYTES:SCALE_OFFSET].view(torch.int8),
+            cache[..., SCALE_OFFSET:_METADATA_END],
+            physical,
+            GROUP_SIZE,
+            SCALES_PER_GROUP,
+            cache[..., :ROPE_BYTES].view(torch.bfloat16),
+        ), remapped
     return unpack_kv(cache.index_select(0, physical)), remapped
