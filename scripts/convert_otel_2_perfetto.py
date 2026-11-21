@@ -127,6 +127,8 @@ def load_otel_data(path: str | Path):
     p = Path(path)
     with p.open("rt", encoding="utf-8") as f:
         first = f.read(1)
+        while first and first.isspace():
+            first = f.read(1)
         f.seek(0)
         if first == "[":
             data = json.load(f)  # JSON array
@@ -137,14 +139,20 @@ def load_otel_data(path: str | Path):
 
 def extract_all_otel_spans(otel_data):
     engine_otel_spans = []
+    smg_otel_spans = []
     for line_data in otel_data:
         for resource_spans in line_data["resourceSpans"]:
+            # filter: only keep spans which service.name is 'sglang' or 'smg'
             service_name = ""
             for attr in resource_spans["resource"]["attributes"]:
                 if attr["key"] == "service.name":
                     service_name = attr["value"]["stringValue"]
 
-            if service_name != "sglang":
+            if service_name == "sglang":
+                spans_ref = engine_otel_spans
+            elif service_name == "smg":
+                spans_ref = smg_otel_spans
+            else:
                 continue
 
             for scope_spans in resource_spans["scopeSpans"]:
@@ -159,8 +167,8 @@ def extract_all_otel_spans(otel_data):
                         span["attributes"] = attributes_dict
                     else:
                         span["attributes"] = {}
-                    engine_otel_spans.append(span)
-    return engine_otel_spans
+                    spans_ref.append(span)
+    return engine_otel_spans, smg_otel_spans
 
 
 def build_otel_span_tree(otel_spans):
@@ -221,7 +229,7 @@ def __convert_to_perfetto_span(span, rid, bootstrap_room, pid, host_id):
         __convert_to_perfetto_span(child_span, rid, bootstrap_room, pid, host_id)
 
 
-def generate_perfetto_span(engine_root_spans, thread_meta_data):
+def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
     for root_span in engine_root_spans:
         root_span["spans"] = []
 
@@ -246,6 +254,13 @@ def generate_perfetto_span(engine_root_spans, thread_meta_data):
                 __convert_to_perfetto_span(span, rid, bootstrap_room, pid, host_id)
                 root_span["spans"].append(span)
 
+    smg_pid = "smg"
+    thread_meta_data[smg_pid] = new_metadata_level1("smg", smg_pid)
+    for span in smg_otel_spans:
+        span["child"] = []
+        span["pid"] = smg_pid
+        __convert_to_perfetto_span(span, None, None, smg_pid, None)
+
 
 def __set_span_tid(span, line):
     span["perfetto_span"]["tid"] = line
@@ -254,7 +269,7 @@ def __set_span_tid(span, line):
         __set_span_tid(child_span, line)
 
 
-def generate_perfetto_span_layout(engine_root_spans, slot_meta_data):
+def generate_perfetto_span_layout(engine_root_spans, smg_otel_spans, slot_meta_data):
     for root_span in engine_root_spans:
         root_span["spans"] = sorted(
             root_span["spans"], key=lambda x: int(x["startTimeUnixNano"])
@@ -279,6 +294,22 @@ def generate_perfetto_span_layout(engine_root_spans, slot_meta_data):
                 span["startTimeUnixNano"], span["endTimeUnixNano"]
             )
             __set_span_tid(span, line)
+
+    smg_otel_spans = sorted(smg_otel_spans, key=lambda x: int(x["startTimeUnixNano"]))
+    req_thread_status = {}
+    for span in smg_otel_spans:
+        line = __find_line(
+            graph,
+            req_thread_status,
+            slot_meta_data,
+            span["perfetto_span"]["pid"],
+            span["startTimeUnixNano"],
+            span["endTimeUnixNano"],
+        )
+        graph[span["perfetto_span"]["pid"]][line].insert_span(
+            span["startTimeUnixNano"], span["endTimeUnixNano"]
+        )
+        span["perfetto_span"]["tid"] = line
 
 
 def __convert_to_perfetto_events(span):
@@ -305,15 +336,25 @@ def __convert_to_perfetto_events(span):
         __convert_to_perfetto_events(child_span)
 
 
-def generate_perfetto_events(engine_root_spans):
+def generate_perfetto_events(engine_root_spans, smg_otel_spans):
     spans = [span for root_span in engine_root_spans for span in root_span["spans"]]
 
     for span in spans:
         __convert_to_perfetto_events(span)
 
+    for span in smg_otel_spans:
+        __convert_to_perfetto_events(span)
 
-def generate_perfetto_links(engine_root_spans):
+
+def generate_perfetto_links(engine_root_spans, smg_otel_spans):
+    # build link between engine span and smg span
+    span_id_map = {span["spanId"]: span for span in smg_otel_spans}
+
     for root_span in engine_root_spans:
+        if "parentSpanId" in root_span and root_span["parentSpanId"] in span_id_map:
+            parent_span = span_id_map[root_span["parentSpanId"]]
+            root_span["spans"][0]["links"] = [parent_span]
+
         for span in root_span["spans"]:
             span["perfetto_links"] = []
 
@@ -369,13 +410,19 @@ def __gather_one_span(span):
     return elems
 
 
-def gather_all_perfetto_elems(engine_root_spans, thread_meta_data, slot_meta_data):
+def gather_all_perfetto_elems(
+    engine_root_spans, smg_otel_spans, thread_meta_data, slot_meta_data
+):
     elems = []
     elems.extend(thread_meta_data.values())
     elems.extend(slot_meta_data)
     for root_span in engine_root_spans:
         for span in root_span["spans"]:
             elems.extend(__gather_one_span(span))
+
+    for span in smg_otel_spans:
+        elems.append(span["perfetto_span"])
+        elems.extend(span["perfetto_events"])
 
     return elems
 
@@ -401,16 +448,16 @@ def write_json(perfetto_elems):
 def main():
     start_time = time.time()
     otel_data = load_otel_data(args.input_file)
-    engine_otel_spans = extract_all_otel_spans(otel_data)
+    engine_otel_spans, smg_otel_spans = extract_all_otel_spans(otel_data)
     engine_root_spans = build_otel_span_tree(engine_otel_spans)
     thread_meta_data = {}
-    generate_perfetto_span(engine_root_spans, thread_meta_data)
+    generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data)
     slot_meta_data = []
-    generate_perfetto_span_layout(engine_root_spans, slot_meta_data)
-    generate_perfetto_events(engine_root_spans)
-    generate_perfetto_links(engine_root_spans)
+    generate_perfetto_span_layout(engine_root_spans, smg_otel_spans, slot_meta_data)
+    generate_perfetto_events(engine_root_spans, smg_otel_spans)
+    generate_perfetto_links(engine_root_spans, smg_otel_spans)
     perfetto_elems = gather_all_perfetto_elems(
-        engine_root_spans, thread_meta_data, slot_meta_data
+        engine_root_spans, smg_otel_spans, thread_meta_data, slot_meta_data
     )
     write_json(perfetto_elems)
     end_time = time.time()
