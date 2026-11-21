@@ -103,6 +103,7 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
         # Share the base VAE's gate so the CUDA installer's attention fusion
         # and this tiled image decode switch together.
         self.decode_fast_path_gate = self._sgl_gate
+        self.decode_graphs = None
         register_vae_fast_path_gate(self, self.decode_fast_path_gate)
 
     def _run_tile_tasks(
@@ -132,8 +133,11 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
                 )
             # Stack up to 128 samples of tiles per decoder forward.
             chunk_size = max(1, 128 // tiles[0].shape[0])
+            decode = (
+                self.decode_graphs if self.decode_graphs is not None else self.decode
+            )
             outputs = super()._run_tile_tasks(
-                tiles, tile_indices, forward_fn, cls_agg, tile_batch=chunk_size
+                tiles, tile_indices, decode, cls_agg, tile_batch=chunk_size
             )
             if parallel_decode:
                 return self._all_gather_tiled_results(outputs, len(tiles))

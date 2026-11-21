@@ -31,7 +31,13 @@ import math
 import torch
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:  # Triton < 3.3 (e.g. MUSA 3.2.0) has no descriptor helper.
+    # The descriptor path below is only taken on Hopper and newer; MUSA reports
+    # capability 3.1 and always uses the raw-pointer kernel.
+    TensorDescriptor = None
 
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must

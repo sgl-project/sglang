@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
@@ -20,12 +21,17 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3ImageVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+    decode_graph_supported,
     maybe_optimize_minimax_h3_vae,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
     AutoencoderKLLegacy,
     DiagonalGaussianDistribution,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.norm import (
+    TemporalIsolatedGroupNorm,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.unit.test_minimax_h3_image_pipeline_config import (
     normalized_args,
 )
@@ -122,6 +128,58 @@ def test_layerwise_image_vae_preserves_fused_decode(tiny_image, monkeypatch):
             assert scale_add.call_count == 12
     for manager in model.layerwise_offload_managers:
         manager.release_all()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Tile decode graphs require a CUDA-like accelerator",
+)
+def test_decode_graph_replays_bitwise_equal_tile_batch(tiny_image):
+    if not decode_graph_supported():
+        pytest.skip("Tile decode graphs require the supported accelerator stack")
+    device = torch.device(current_platform.device_type)
+    model = maybe_optimize_minimax_h3_vae(tiny_image.to(device))
+    model.setup_forward(
+        encoder_tiling=False,
+        decoder_tiling=True,
+        parallel_tiling=False,
+        tile_size=32,
+        tile_overlap_min=16,
+        token_drop=0,
+    )
+    latent = torch.randn(1, 24, 1, 2, 2, device=device)
+    decode_graphs = model.decode_graphs
+    model.decode_graphs = None
+    with (
+        torch.inference_mode(),
+        set_forward_context(0, None),
+        use_vae_fast_path(model, True),
+    ):
+        eager = model.decode_image_raw(latent)
+    model.decode_graphs = decode_graphs
+    with (
+        torch.inference_mode(),
+        set_forward_context(0, None),
+        use_vae_fast_path(model, True),
+    ):
+        captured = model.decode_image_raw(latent)
+        replayed = model.decode_image_raw(latent)
+    assert model.decode_graphs.capture_count == 1
+    assert model.decode_graphs.replay_count == 2
+    assert torch.equal(eager, captured)
+    assert torch.equal(captured, replayed)
+
+
+def test_temporal_norm_silu_pad_fallback():
+    norm = TemporalIsolatedGroupNorm(32, 32)
+    x = torch.randn(2, 32, 3, 7, 11) * 6
+    merged = x.permute(0, 2, 1, 3, 4).contiguous().view(6, 32, 1, 7, 11)
+    normalized = F.group_norm(merged, norm.num_groups, norm.weight, norm.bias, norm.eps)
+    temporal = normalized.view(2, 3, 32, 7, 11)
+    expected = F.silu(temporal.permute(0, 2, 1, 3, 4).contiguous())
+    expected = F.pad(expected, (1, 1, 1, 1, 0, 0), mode="reflect")
+    expected = F.pad(expected, (0, 0, 0, 0, 2, 0))
+    assert torch.equal(norm(x, silu_pad=True), expected)
 
 
 def test_local_tiling_decode_matches_untiled(tiny_image):

@@ -5,6 +5,8 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 from .conv import BaseConv3d
 
 
@@ -34,11 +36,14 @@ class TemporalIsolatedGroupNorm(nn.GroupNorm):
             input = _merge_time_to_batch(input)
             output = super().forward(input)
             if silu_pad:
+                temporal = output.view(batch, depth, channels, height, width)
+                if not current_platform.is_cuda():
+                    activated = F.silu(temporal.permute(0, 2, 1, 3, 4).contiguous())
+                    activated = F.pad(activated, (1, 1, 1, 1, 0, 0), mode="reflect")
+                    return F.pad(activated, (0, 0, 0, 0, 2, 0)).contiguous()
                 from sglang.kernels.ops.diffusion import fused_silu_temporal_pad
 
-                return fused_silu_temporal_pad(
-                    output.view(batch, depth, channels, height, width)
-                )
+                return fused_silu_temporal_pad(temporal)
             return _split_time_from_batch(output, batch)
         return super().forward(input)
 

@@ -71,6 +71,14 @@ class MusaPlatformBase(Platform):
     dispatch_key: str = "MUSA"
 
     @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+            maybe_optimize_minimax_h3_vae,
+        )
+
+        return maybe_optimize_minimax_h3_vae(vae)
+
+    @classmethod
     @lru_cache(maxsize=1)
     def is_float64_supported(cls) -> bool:
         return False

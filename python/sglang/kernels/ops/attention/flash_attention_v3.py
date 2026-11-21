@@ -28,8 +28,31 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
         return kernel(*args, **kwargs)
 
 
+def _load_fa3_kernels_from_mate():
+    import mate
+
+    def _varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs):
+        kwargs.pop("sinks", None)
+        kwargs.pop("only_qv", None)
+        return mate.flash_attn_varlen_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs
+        )
+
+    def _with_kvcache(q, k_cache, v_cache, **kwargs):
+        kwargs.pop("sinks", None)
+        return mate.flash_attn_with_kvcache(q, k_cache, v_cache, **kwargs)
+
+    return {
+        "flash_attn_with_kvcache": _with_kvcache,
+        "flash_attn_varlen_func": _varlen_func,
+    }
+
+
 @cache_once
 def _load_fa3_kernels():
+    if is_musa():
+        return _load_fa3_kernels_from_mate()
+
     # By default, we use the implementation from the sgl-fa3 wheel,
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
