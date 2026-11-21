@@ -25,7 +25,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_utils import (
+    commit_accept_tokens_to_penalties,
+    eagle_sample,
+)
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
@@ -516,6 +519,9 @@ class NGRAMWorker(BaseSpecWorker):
                     grammar_mask,
                     watermark=watermark,
                 )
+            commit_accept_tokens_to_penalties(
+                batch.sampling_info, predict, accept_index
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,

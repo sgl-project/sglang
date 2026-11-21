@@ -1577,6 +1577,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The CUDA target of a JIT module whose load_jit names no cuda_arch_policy:
+    # "specific" (the local GPU's arch-specific target, e.g. sm_103a) or
+    # "family" (its family target, e.g. sm_100f: one build for 10.0 and 10.3).
+    SGLANG_JIT_CUDA_ARCH_POLICY = EnvStr("specific")
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
