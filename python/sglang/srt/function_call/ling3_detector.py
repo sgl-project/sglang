@@ -14,8 +14,10 @@ class Ling3Detector(Glm4MoeDetector):
 
     # Anchored at the first opener for the same reason as the parent patterns: a
     # later opener sees a subset of the text, so it cannot match when the first fails.
+    # `(?:\s*(?=\S))?` rather than `\s*`: a bare `\s*(.*?)` retries the lazy
+    # scan from every split of a whitespace run, quadratic in its length.
     _STREAMING_PARTIAL_PATTERN = re.compile(
-        r"\A(?:(?!<tool_call>).)*<tool_call>\s*(.*?)"
+        r"\A(?:(?!<tool_call>).)*<tool_call>(?:\s*(?=\S))?(.*?)"
         r"(?:(?:\\n|\n)\s*|(?=<arg_key>)|(?=</tool_call>))"
         r"(.*?)(</tool_call>|$)",
         re.DOTALL,
@@ -24,7 +26,8 @@ class Ling3Detector(Glm4MoeDetector):
     def __init__(self):
         super().__init__()
         self.func_detail_regex = re.compile(
-            r"\A<tool_call>\s*(.*?)(?:(?:\\n|\n)\s*|(?=<arg_key>)|(?=</tool_call>))"
+            r"\A<tool_call>(?:\s*(?=\S))?(.*?)"
+            r"(?:(?:\\n|\n)\s*|(?=<arg_key>)|(?=</tool_call>))"
             r"(<arg_key>.*?)?</tool_call>",
             re.DOTALL,
         )
