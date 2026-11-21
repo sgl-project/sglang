@@ -1,7 +1,9 @@
 export const config = {
   modelName: "Ling-3.0-tiny",
 
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "arc_b"],
+  hardware: [{ id: "arc_b", label: "BMG", vram: "", vendor: "intel" }],
+  runModes: (selection) => selection.hw === "arc_b" ? ["python"] : ["python", "docker"],
   groupHardware: false,
 
   variants: [
@@ -84,6 +86,17 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
+    ...["bf16", "fp8"].map((quant) => ({
+      match: { hw: "arc_b", variant: "default", quant, strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device xpu",
+        "--attention-backend intel_xpu",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    })),
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
