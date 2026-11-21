@@ -66,6 +66,8 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``supports_pynccl``: model-parallel groups create a PyNccl communicator
     when the caller does not choose. Read for out-of-tree platforms; in-tree
     devices decide in ``parallel_state``.
+    ``supports_flashinfer``: FlashInfer can run on this platform when the
+    package is installed and enabled.
     """
 
     supports_triton: bool = False
@@ -73,6 +75,7 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
     supports_pynccl: bool = False
+    supports_flashinfer: bool = False
 
 
 class SRTPlatform(DeviceMixin):

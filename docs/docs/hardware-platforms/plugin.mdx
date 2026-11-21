@@ -581,6 +581,11 @@ field defaults to the conservative answer.
       <td><code>False</code></td>
       <td>Model-parallel groups create a PyNccl communicator when the caller does not choose. Set it to True only if the device runs NCCL (or an NCCL-compatible library PyNccl loads).</td>
     </tr>
+    <tr>
+      <td><code>supports_flashinfer</code></td>
+      <td><code>False</code></td>
+      <td>Allows SGLang to consider FlashInfer available when the package is installed (import check) and enabled. (`SGLANG_IS_FLASHINFER_AVAILABLE=1`)</td>
+    </tr>
   </tbody>
 </table>
 
