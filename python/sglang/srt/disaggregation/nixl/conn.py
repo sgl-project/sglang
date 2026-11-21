@@ -303,6 +303,7 @@ class TransferInfo:
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     is_dummy: bool = False
+    prompt_fingerprint: Optional[str] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -343,6 +344,9 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=decode_prefix_len,
             is_dummy=is_dummy,
+            prompt_fingerprint=(
+                msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else None
+            ),
         )
 
 
@@ -536,6 +540,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     reports_transfer_latency = True
     # ABORT handler defers the ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    verifies_bootstrap_room_owner = True
     # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
     # directly; cleared on the first TypeError to expand per block instead.
     _use_strided_descs: bool = True
@@ -3616,9 +3621,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             return True
         room_to_be_aborted = notification.room
 
+        # Another request's abort leaves the room's own request running.
         room_active = (
             room_to_be_aborted in self.request_status
             and self.check_status(room_to_be_aborted) != KVPoll.Success
+            and not self._is_foreign_abort(notification)
         )
         if room_active:
             self.record_failure(
@@ -3692,27 +3699,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
+                info = TransferInfo.from_zmq(waiting_req_bytes)
+                logger.debug(
+                    f"got info {room=} {agent_name=} "
+                    f"required_dst_info_num={info.required_dst_info_num}"
                 )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                self._add_transfer_info(bootstrap_room=room, peer=agent_name, info=info)
 
         def bootstrap_thread_guarded():
             try:
@@ -3817,6 +3809,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        prompt_fingerprint: Optional[str] = None,
     ) -> List[bytes]:
         packed_state_indices = (
             pack_int_lists(
@@ -3837,6 +3830,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             packed_state_indices,
             str(decode_prefix_len or 0).encode("ascii"),
             str(int(is_dummy)).encode("ascii"),
+            (prompt_fingerprint or "").encode("ascii"),
         ]
 
 

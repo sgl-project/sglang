@@ -2175,6 +2175,7 @@ class MoriKVManager(CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        prompt_fingerprint: Optional[str] = None,
     ) -> List[bytes]:
         if is_dummy:
             kv_indices_bytes = aux_bytes = state_bytes = b""

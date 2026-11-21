@@ -196,6 +196,7 @@ class BaseKVSender(ABC):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        prompt_fingerprint: Optional[str] = None,
     ): ...
 
     @abstractmethod
@@ -283,6 +284,7 @@ class BaseKVReceiver(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        prompt_fingerprint: Optional[str] = None,
     ): ...
 
     @abstractmethod
