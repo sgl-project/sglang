@@ -24,9 +24,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
+    commit_accept_tokens_to_penalties,
     eagle_prepare_for_verify,
     eagle_sample,
 )
@@ -66,8 +68,7 @@ def _fallback_post_verify(io: Any) -> Any:
         io.logits,
         io.grammar_mask,
         uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark_state=io.watermark,
-        watermark_full_mask=io.watermark_full_mask,
+        watermark=io.watermark,
         simulated_acc_len=io.simulated_accept_length,
         simulated_acc_len_rng=io.simulated_accept_length_rng,
         sparse_bonus_argmax=io.sparse_bonus_argmax,
@@ -237,10 +238,7 @@ def make_post_verify_io(
             need_top_k_sampling=bool(sampling_info.need_top_k_sampling),
             need_top_p_sampling=bool(sampling_info.need_top_p_sampling),
             need_min_p_sampling=bool(sampling_info.need_min_p_sampling),
-            watermark_keys=sampling_info.watermark_keys,
-            watermark_context_windows=sampling_info.watermark_context_windows,
-            watermark_enabled=sampling_info.watermark_enabled,
-            has_watermark_candidates=bool(sampling_info.has_watermark_candidates),
+            **watermark_view_fields(sampling_info.watermark),
             max_top_k=sampling_info.max_top_k,
             device=torch.device(device),
         ),
@@ -269,6 +267,17 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
     from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
+
+
+def check_draft_branch_tail_copy(token_to_kv_pool, topk: int, page_size: int) -> None:
+    # duplicate_prefix_tail_to_draft_branches addresses slots raw, but DCP-collapsed
+    # rows live at loc // dcp_size: the tail page would land in rows the draft never reads.
+    if topk > 1 and page_size > 1 and token_to_kv_pool.rows_are_dcp_collapsed:
+        raise ValueError(
+            "--speculative-eagle-topk > 1 with --page-size > 1 does not support "
+            "a draft KV pool with DCP-collapsed rows; run with "
+            "--speculative-eagle-topk 1."
+        )
 
 
 def duplicate_prefix_tail_to_draft_branches(
@@ -439,7 +448,7 @@ def prepare_for_draft_extend(
         # (the `_batch_size == batch_size` assertion, see #27091); the
         # marked pre-pad metadata is used as-is, matching the proven
         # skip_attn_backend_init=True behavior.
-        # On NPU with --disable-cuda-graph, block_table shape won't match
+        # On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
         if not is_npu() or can_run_decode_cuda_graph:
@@ -853,7 +862,7 @@ def run_eagle_verify(
         # skipped here unconditionally, although eagle_prepare_for_verify
         # only plans when cuda-graph load_batch ran. Single-layer eagle
         # re-inits the non-graph path instead (post-pad); multi-layer has
-        # not adopted that fix. On NPU with --disable-cuda-graph, non-graph
+        # not adopted that fix. On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, non-graph
         # verify needs metadata init in forward_extend (post-pad); only
         # mark ready for the cuda-graph path.
         if not _is_npu or can_run_cuda_graph:
@@ -931,12 +940,20 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-        watermark_full_mask = (
-            target_worker.model_runner.attn_backend.verify_mask is None
-            or target_worker.model_runner.attn_backend.verify_mask.mode
-            == TreeMaskMode.FULL_MASK
+    watermark_full_mask = (
+        target_worker.model_runner.attn_backend.verify_mask is None
+        or target_worker.model_runner.attn_backend.verify_mask.mode
+        == TreeMaskMode.FULL_MASK
+    )
+    watermark_engine = target_worker.model_runner.watermark
+    watermark = (
+        watermark_engine.bind_verify(
+            batch.sampling_info.watermark, full_mask=watermark_full_mask
         )
+        if watermark_engine is not None
+        else None
+    )
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
         simulated_accept_length = None
@@ -953,7 +970,7 @@ def run_eagle_verify(
                 device=batch.device,
                 logits_output=logits_output,
                 grammar_mask=grammar_mask,
-                watermark=target_worker.model_runner.watermark_state,
+                watermark=watermark,
                 watermark_full_mask=watermark_full_mask,
                 return_logprob=batch.return_logprob,
                 is_idle=batch.forward_mode.is_idle(),
@@ -977,15 +994,11 @@ def run_eagle_verify(
             logits_output,
             grammar_mask,
             uno_target_max_top_k=uno_target_max_top_k,
-            watermark_state=target_worker.model_runner.watermark_state,
-            watermark_full_mask=(
-                target_worker.model_runner.attn_backend.verify_mask is None
-                or target_worker.model_runner.attn_backend.verify_mask.mode
-                == TreeMaskMode.FULL_MASK
-            ),
+            watermark=watermark,
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
         )
+    commit_accept_tokens_to_penalties(batch.sampling_info, predict, accept_index)
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:
@@ -1033,12 +1046,9 @@ def run_eagle_verify(
         prepared_step_indices=prepared_commit_steps,
     )
 
-    if (
-        not batch.forward_mode.is_idle()
-        and target_worker.model_runner.watermark_state is not None
-        and batch.sampling_info.has_watermark_candidates
-    ):
-        target_worker.model_runner.watermark_state.append_speculative(
+    if not batch.forward_mode.is_idle() and watermark is not None:
+        target_worker.model_runner.watermark.append_accept_tokens(
+            batch.sampling_info.watermark,
             batch.req_pool_indices,
             predict[accept_index],
             accept_lens,

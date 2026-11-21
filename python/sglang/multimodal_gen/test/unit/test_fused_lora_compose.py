@@ -12,8 +12,10 @@ import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.runtime.layers.linear import QKVParallelLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
+    QKVParallelLinearWithLoRA,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -238,6 +240,57 @@ def test_mis_sized_fused_lora_b_is_rejected():
         pytest.raises(ValueError, match="fused LoRA B"),
     ):
         layer.slice_lora_b_weights(torch.zeros(sum(OUTPUT_SIZES) + 1, 2))
+
+
+def _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads):
+    return QKVParallelLinear(
+        hidden_size=IN_DIM,
+        head_size=2,
+        total_num_heads=num_heads,
+        total_num_kv_heads=num_kv_heads,
+        bias=False,
+        tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+
+
+@pytest.mark.parametrize(
+    "tp_size,num_heads,num_kv_heads", [(1, 4, 2), (2, 4, 2), (4, 4, 2), (2, 4, 4)]
+)
+def test_qkv_lora_b_is_sharded_like_the_base_weight(tp_size, num_heads, num_kv_heads):
+    """A fused LoRA B must give each TP rank the rows its base weight holds,
+    including a key/value head replicated across ranks; the base layer's own
+    weight loader is the reference."""
+    torch.manual_seed(0)
+    full = torch.randn((num_heads + 2 * num_kv_heads) * 2, IN_DIM)
+    for tp_rank in range(tp_size):
+        base = _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads)
+        base.weight.weight_loader(base.weight, full)
+        layer = QKVParallelLinearWithLoRA(base)
+        with patch(_TP_RANK_PATCH, return_value=tp_rank):
+            sliced = layer.slice_lora_b_weights(full)
+            if num_heads == num_kv_heads:
+                # Equal sections may also arrive stacked as [3, rows, rank].
+                stacked = layer.slice_lora_b_weights(full.reshape(3, -1, IN_DIM))
+                assert torch.equal(stacked.reshape(-1, IN_DIM), base.weight)
+        assert torch.equal(sliced, base.weight)
+
+
+def test_qkv_unmerged_forward_applies_fused_lora():
+    torch.manual_seed(0)
+    base = _make_qkv_layer(1, 0, 4, 2)
+    full = torch.randn(base.weight.shape)
+    base.weight.weight_loader(base.weight, full)
+    layer = QKVParallelLinearWithLoRA(base, lora_rank=3, lora_alpha=3)
+    lora_a = torch.randn(3, IN_DIM)
+    lora_b = torch.randn(full.shape[0], 3)
+    layer.set_lora_weights(lora_a, lora_b, merge_weights=False)
+
+    x = torch.randn(5, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    torch.testing.assert_close(
+        out, x @ full.T + x @ lora_a.T @ lora_b.T, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_ipc_key_resolution_returns_fused_merge_index():

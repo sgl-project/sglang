@@ -5,21 +5,25 @@ from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _DIGEST_CHUNK_BYTES,
     ConditioningCache,
     cached_conditioning,
     cached_encoder_call,
     cached_vae_encode,
     invalidate_conditioning_caches,
     prefer_conditioning_cache,
+    use_gpu_conditioning_hash,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -67,21 +71,37 @@ class VisionLanguageEncoder(Encoder):
         return self.image_features(pixels) + text
 
 
+@pytest.mark.parametrize(
+    "device,gpu_hash",
+    [
+        ("cpu", False),
+        pytest.param(
+            "cuda",
+            True,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA hashing"
+            ),
+        ),
+    ],
+)
 @torch.no_grad()
-def test_changed_instruction_reuses_vision_but_not_joint_embedding():
+def test_changed_instruction_reuses_vision_but_not_joint_embedding(device, gpu_hash):
     cache = ConditioningCache(4096)
-    model = VisionLanguageEncoder().eval()
-    pixels = torch.ones(4)
-    with cache.scope():
-        first = model(torch.ones(4), pixels)
-        changed = model(torch.full((4,), 2.0), pixels)
+    model = VisionLanguageEncoder().eval().to(device)
+    pixels = torch.ones(4, device=device)
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
+        first = model(torch.ones(4, device=device), pixels)
+        changed = model(torch.full((4,), 2.0, device=device), pixels)
         assert not torch.equal(first, changed)
         assert model.calls == 2 and model.vision_calls == 1
         torch.testing.assert_close(
-            model(torch.full((4,), 2.0), pixels), changed, rtol=0, atol=0
+            model(torch.full((4,), 2.0, device=device), pixels.clone()),
+            changed,
+            rtol=0,
+            atol=0,
         )
         assert model.calls == 2
-        model(torch.ones(4), pixels + 1)
+        model(torch.ones(4, device=device), pixels + 1)
         assert model.vision_calls == 2
 
 
@@ -167,6 +187,75 @@ def test_lru_budget_and_oversized_outputs():
     assert cache.evictions == 2
     assert cache.bytes == before == 32
     assert cache.bypasses == 1
+
+
+@torch.no_grad()
+def test_partial_edit_of_request_with_more_than_128_entries_reuses_the_rest():
+    """Editing a few of a request's 148 small entries (tiled VAE references) must
+    recompute only those; a 128-entry LRU evicted all of them between requests."""
+    cache = ConditioningCache(1 << 20)
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    edited = list(tiles)
+    for index in (3, 70, 140):  # a local edit touches a few tiles
+        edited[index] = tiles[index] + 1000
+    with cache.scope():
+        for x in tiles:
+            model(x)
+        for x in edited:
+            model(x)
+    assert (model.calls, cache.hits, cache.evictions) == (151, 145, 0)
+
+
+@torch.no_grad()
+def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
+    """A grouped stage must reuse every private snapshot within the entry limit;
+    a fixed 128-entry group tier dropped the rest of a large tiled reference."""
+    cache = ConditioningCache(0)  # cross-request tier off, so only group hits count
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    with cache.scope(), cache.group_scope():
+        for _ in range(2):
+            for x in tiles:
+                model(x)
+    assert (model.calls, cache.group_hits) == (148, 148)
+
+
+@torch.no_grad()
+def test_entry_limit_evicts_lru_and_keeps_preferred_entries():
+    model = Encoder().eval()
+
+    def encode(value, *, preferred=False):
+        with prefer_conditioning_cache() if preferred else nullcontext():
+            model(torch.full((4,), float(value)))
+
+    lru = ConditioningCache(1 << 20, max_entries=2)
+    with lru.scope():
+        encode(1)
+        encode(2)
+        encode(1)  # hit: 2 becomes least recent
+        encode(3)  # evicts 2, not 1
+        encode(1)
+        assert lru.hits == 2
+        encode(2)
+        assert lru.hits == 2
+
+    protected = ConditioningCache(1 << 20, max_entries=2)
+    with protected.scope():
+        encode(10, preferred=True)
+        encode(11)
+        encode(12)  # a normal store evicts 11, never the older preferred 10
+        encode(10, preferred=True)
+        encode(12)
+        assert protected.hits == 2
+
+    full = ConditioningCache(1 << 20, max_entries=1)
+    with full.scope():
+        encode(20, preferred=True)
+        encode(21)  # only a preferred entry could make room: bypass
+        assert full.stats()["entries"] == 1 and full.bypasses == 1
+        encode(22, preferred=True)  # a preferred store may evict it
+        assert full.stats()["entries"] == 1 and full.evictions == 1
 
 
 @torch.no_grad()
@@ -264,12 +353,13 @@ def test_bypass(bypass):
     assert cache.hits == 0
 
 
+@pytest.mark.parametrize("gpu_hash", [False, True])
 @torch.no_grad()
-def test_posterior_cache_preserves_rng_and_sampling():
+def test_posterior_cache_preserves_rng_and_sampling(gpu_hash):
     cache = ConditioningCache(1024 * 1024)
     vae = VAE().eval()
     x = torch.linspace(-1, 1, 64).reshape(1, 4, 4, 4)
-    with cache.scope():
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
         posterior = vae.encode(x).latent_dist
         cold = posterior.sample(generator=torch.Generator().manual_seed(42))
         posterior.mean.add_(100)  # downstream normalization must not poison storage
@@ -374,9 +464,45 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
         torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
 @torch.no_grad()
-def test_cuda_video_condition_key_covers_every_byte():
+def test_chunked_input_digest_covers_every_byte():
+    # inputs larger than one digest chunk hash chunk by chunk on threads
+    cache = ConditioningCache(256 * 1024 * 1024)
+    vae = VAE().eval()
+    # three float32 chunks and a partial one
+    x = torch.rand(1, 2, 3 * _DIGEST_CHUNK_BYTES // 8 + 1)
+    with cache.scope():
+        vae.encode(x)
+        vae.encode(x.clone())
+        for index in (0, _DIGEST_CHUNK_BYTES // 4, x.numel() - 1):
+            changed = x.clone()
+            changed.view(-1)[index] += 1
+            vae.encode(changed)
+        vae.encode(x[..., :-1])
+    assert vae.calls == 5
+    assert cache.hits == 1
+
+    model = Encoder().eval()
+    pixels = np.random.default_rng(0).integers(0, 256, (513, 1024, 4), dtype=np.uint8)
+    changed = pixels.copy()
+    changed[-1, -1, -1] ^= 1
+    calls = []
+    with cache.scope():
+        for array in (pixels, pixels.copy(), changed):
+            cache.run(
+                model,
+                "image",
+                (Image.fromarray(array),),
+                {},
+                lambda: calls.append(1) or torch.ones(1),
+            )
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
+@pytest.mark.parametrize("gpu_hash", [False, True])
+@torch.no_grad()
+def test_cuda_video_condition_key_covers_every_byte(gpu_hash):
     cache = ConditioningCache(256 * 1024 * 1024)
     vae = VAE().eval()
     # image followed by zero frames, large enough for the sparse block digest
@@ -387,7 +513,7 @@ def test_cuda_video_condition_key_covers_every_byte():
     last_byte = video.clone()
     last_byte.view(-1)[-1] = 1
     shifted = torch.roll(video, shifts=1, dims=2)
-    with cache.scope():
+    with cache.scope(), use_gpu_conditioning_hash(enabled=gpu_hash):
         expected = vae.encode(video).latent_dist.mean
         hit = vae.encode(video.clone()).latent_dist.mean
         for changed in (negative_zero, last_byte, shifted):
@@ -511,6 +637,60 @@ def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank, gro
     mp.spawn(
         _rank_eviction,
         args=(f"file://{tmp_path / 'rendezvous'}", disabled_rank, grouped),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _rank_local_vae(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        # The CPU process group exercises independent rank-local cache state;
+        # no SGLang model-parallel group is needed by this collective-free VAE.
+        conditioning.model_parallel_is_initialized = lambda: True
+        conditioning.get_world_size = dist.get_world_size
+        cache = ConditioningCache(4096)
+        model = VAE().eval()
+        x = torch.ones(1, 4, 2, 2)
+        with torch.no_grad(), cache.scope():
+            model.encode(x)
+            model.encode(x)
+            assert model.calls == 2  # Unknown distributed VAEs still bypass.
+            model.conditioning_encode_is_rank_local = True
+            first = model.encode(x).latent_dist
+            hit = model.encode(x).latent_dist
+            assert model.calls == 3
+            for seed in (42, 1234):
+                torch.testing.assert_close(
+                    first.sample(generator=torch.Generator().manual_seed(seed)),
+                    hit.sample(generator=torch.Generator().manual_seed(seed)),
+                    rtol=0,
+                    atol=0,
+                )
+            if rank == 0:
+                cache.clear()
+            model.encode(x)
+            assert model.calls == (4 if rank == 0 else 3)
+            changed = model.encode(x + 1).latent_dist
+            assert model.calls == (5 if rank == 0 else 4)
+            assert not torch.equal(changed.mean, first.mean)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_vae_cache_preserves_sampling_and_independent_eviction(tmp_path):
+    mp.spawn(
+        _rank_local_vae,
+        args=(f"file://{tmp_path / 'vae-rendezvous'}",),
         nprocs=2,
         join=True,
     )
@@ -695,6 +875,34 @@ def test_group_cache_waits_for_producing_cuda_stream():
             output.last_hidden_state, torch.ones_like(output.last_hidden_state)
         )
     assert model.calls == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA hashing")
+@torch.no_grad()
+def test_gpu_conditioning_hash_scope_restores_after_exception():
+    cache = ConditioningCache(4096)
+    vae = VAE().eval()
+    x = torch.arange(64, device="cuda", dtype=torch.float32).reshape(1, 4, 4, 4)
+    with cache.scope():
+        expected = vae.encode(x).latent_dist.mean
+        with pytest.raises(RuntimeError, match="leave dense branch"):
+            with use_gpu_conditioning_hash():
+                actual = vae.encode(x).latent_dist.mean
+                with use_gpu_conditioning_hash():
+                    with use_gpu_conditioning_hash(enabled=False):
+                        changed = vae.encode(x + 1).latent_dist.mean
+                nested = vae.encode(x + 1).latent_dist.mean
+                assert vae.calls == 3
+                raise RuntimeError("leave dense branch")
+        with use_gpu_conditioning_hash(enabled=False):
+            disabled = vae.encode(x + 1).latent_dist.mean
+        restored = vae.encode(x).latent_dist.mean
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+    torch.testing.assert_close(nested, changed, rtol=0, atol=0)
+    torch.testing.assert_close(disabled, changed, rtol=0, atol=0)
+    assert vae.calls == 4
+    assert cache.hits == 2
 
 
 if __name__ == "__main__":

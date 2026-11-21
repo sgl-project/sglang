@@ -711,10 +711,19 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kDenseSiluAndMul = false>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait =
-      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kPackedScale, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kPackedScale,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      kDenseSiluAndMul>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means

@@ -280,16 +280,17 @@ sgl-eval run gsm8k \\
       // engine fills them from its own PD_PORTS (prefill serves on 30000, decode
       // on 30100). A literal port here will not track the engine and sends the
       // router at a port the generated decode command does not listen on.
+      // --model-id must equal the workers' served model name ({{MODEL_NAME}}
+      // unless they set --served-model-name).
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 

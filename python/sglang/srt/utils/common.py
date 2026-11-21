@@ -236,57 +236,6 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__()
 
 
-show_time_cost = False
-time_infos = {}
-
-
-def enable_show_time_cost():
-    global show_time_cost
-    show_time_cost = True
-
-
-class TimeInfo:
-    def __init__(self, name, interval=0.1, color=0, indent=0):
-        self.name = name
-        self.interval = interval
-        self.color = color
-        self.indent = indent
-
-        self.acc_time = 0
-        self.last_acc_time = 0
-
-    def check(self):
-        if self.acc_time - self.last_acc_time > self.interval:
-            self.last_acc_time = self.acc_time
-            return True
-        return False
-
-    def pretty_print(self):
-        print(f"\x1b[{self.color}m", end="")
-        print("-" * self.indent * 2, end="")
-        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
-
-
-def mark_start(name, interval=0.1, color=0, indent=0):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    if time_infos.get(name, None) is None:
-        time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.perf_counter()
-
-
-def mark_end(name):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    time_infos[name].acc_time += time.perf_counter()
-    if time_infos[name].check():
-        time_infos[name].pretty_print()
-
-
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
@@ -860,3 +809,17 @@ class TypeBasedDispatcher:
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)
         raise ValueError(f"Invalid object: {obj}")
+
+
+# TODO(zijiexia): drop once the MSA plugin pinned by MSA_COMMIT imports these from dp_attention.
+_MOVED_TO_DP_ATTENTION = frozenset(
+    {"get_cuda_graph_batch_size_alignment", "require_attn_tp_gather"}
+)
+
+
+def __getattr__(name: str):
+    if name in _MOVED_TO_DP_ATTENTION:
+        from sglang.srt.layers import dp_attention
+
+        return getattr(dp_attention, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

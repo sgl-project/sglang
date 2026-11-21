@@ -58,8 +58,8 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
     def test_dspark_still_accepted(self):
         self._validate(_lazy_view(speculative_algorithm="DSPARK"))
 
-    def test_pd_disaggregation_still_rejected(self):
-        with self.assertRaisesRegex(AssertionError, "PD disaggregation"):
+    def test_pd_decode_still_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "PD decode worker"):
             self._validate(_lazy_view(disaggregation_mode="decode"))
 
     def test_track_interval_must_cover_draft_tokens(self):

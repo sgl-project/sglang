@@ -119,20 +119,26 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
 
 
 @requires_cuda
-def test_vit_fast_path_is_gated_and_matches_reference():
+@pytest.mark.parametrize(
+    "shape,rope_dim,dtype",
+    [((2, 4, 4), 48, torch.float16), ((8, 8), 32, torch.bfloat16)],
+)
+def test_vit_fast_path_is_gated_and_matches_reference(shape, rope_dim, dtype):
     """Gate closed: bit-identical to the original forward. Gate open: the fused
     qk-norm+RoPE kernel and cuDNN SDPA run and match to rounding level."""
     device = torch.device("cuda")
-    dtype = torch.float16
-    heads, dim_head, rope_dim = 4, 64, 48
+    heads, dim_head = 4, 64
     attention = Attention(
         heads=heads, dim_head=dim_head, qk_norm_type="rms_norm", eps=1e-5
     ).to(device=device, dtype=dtype)
     assert _attn_fast_compatible(attention)
 
-    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
-    ids = create_token_ids((2, 4, 4), device, dtype)
-    ids = torch.cat([ids, torch.zeros((1, 5, 3), device=device, dtype=dtype)], 1)
+    n_dim = len(shape)
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=n_dim, use_angle=True).to(
+        device
+    )
+    ids = create_token_ids(shape, device, dtype)
+    ids = torch.cat([ids, torch.zeros((1, 5, n_dim), device=device, dtype=dtype)], 1)
     rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
     generator = torch.Generator(device="cpu").manual_seed(0)
     hidden = torch.randn((1, ids.shape[1], heads * dim_head), generator=generator)
@@ -149,20 +155,28 @@ def test_vit_fast_path_is_gated_and_matches_reference():
         assert torch.equal(attention(hidden, rotary), reference)
         gate.enabled = True
         fused = attention(hidden, rotary)
+        gate.enabled = False
+        assert torch.equal(attention(hidden, rotary), reference)
     assert attention._sgl_unit_weight is not None, "fused qk-norm+RoPE did not run"
     assert attention._sgl_cudnn_failed is False, "cuDNN SDPA fell back"
     torch.testing.assert_close(fused, reference, atol=2e-2, rtol=1e-2)
 
 
 @requires_cuda
-def test_vit_rope_batched_tiles_match_per_tile():
+@pytest.mark.parametrize(
+    "shape,rope_dim,dtype",
+    [((2, 4, 4), 48, torch.float16), ((8, 8), 32, torch.bfloat16)],
+)
+def test_vit_rope_batched_tiles_match_per_tile(shape, rope_dim, dtype):
     """Stacked decoder tiles share one RoPE row; the fused (quality) and native
     (exact) RoPE kernels over the flattened batch are bit-identical to one
     tile at a time."""
-    device, dtype = torch.device("cuda"), torch.float16
-    tiles, heads, dim_head, rope_dim = 3, 4, 64, 48
-    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
-    ids = create_token_ids((2, 4, 4), device, dtype)
+    device = torch.device("cuda")
+    tiles, heads, dim_head = 3, 4, 64
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=len(shape), use_angle=True).to(
+        device
+    )
+    ids = create_token_ids(shape, device, dtype)
     rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
     batched_rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype, batch=tiles)
     generator = torch.Generator(device="cpu").manual_seed(0)
@@ -219,6 +233,92 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
     }
     assert recording_fa.input_dtype == torch.bfloat16
     assert output.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv1d replica")
+@pytest.mark.parametrize(
+    "channels, taps, dilation", [(8, 11, 5), (16, 7, 3), (64, 3, 1)]
+)
+def test_rocm_bigvgan_conv1d_replays_fp64_naive_order(channels, taps, dilation):
+    """The Triton conv1d sums x * w in FP64, input channel outer and tap inner,
+    then rounds once; an FP64 loop in that order gives the same bytes, and the
+    gated BigVGAN conv returns the eager conv's bytes either way."""
+    from torch.nn.utils.parametrizations import weight_norm
+
+    from sglang.kernels.ops.diffusion import conv1d_fp64acc
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
+        bigvgan,
+    )
+
+    torch.manual_seed(0)
+    padding = dilation * (taps - 1) // 2
+    x = torch.randn(2, channels, 4099, device="cuda")
+    conv = weight_norm(
+        nn.Conv1d(channels, channels, taps, padding=padding, dilation=dilation)
+    ).cuda()
+    w = conv.weight.detach()
+
+    xp = nn.functional.pad(x, (padding, padding)).double()
+    ref = torch.zeros(2, channels, x.shape[-1], dtype=torch.float64, device="cuda")
+    for ic in range(channels):
+        for tap in range(taps):
+            start = tap * dilation
+            window = xp[:, ic : ic + 1, start : start + x.shape[-1]]
+            ref += window * w[None, :, ic, tap, None].double()
+    out = conv1d_fp64acc(x, w, padding=padding, dilation=dilation)
+    assert torch.equal(out, ref.float())
+
+    with torch.inference_mode():
+        assert torch.equal(bigvgan._conv1d(conv, x), conv(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv replica")
+@pytest.mark.parametrize("fp64, taps_ascending", [(True, True), (False, False)])
+def test_rocm_depthwise_conv_transpose1d_replays_miopen_orders(fp64, taps_ascending):
+    """The naive solver's FP64 sum (taps ascending) and the col2im FP32 sum of
+    FP32 products (taps descending), each against a per-tap loop in that order."""
+    from sglang.kernels.ops.diffusion import conv_transpose1d_depthwise
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 4099, device="cuda")
+    w = torch.randn(16, 1, 12, device="cuda")
+    stride = 2
+    dtype = torch.float64 if fp64 else torch.float32
+    ref = torch.zeros(2, 16, 4098 * stride + 12, dtype=dtype, device="cuda")
+    for tap in range(12) if taps_ascending else reversed(range(12)):
+        ref[..., tap : tap + 4098 * stride + 1 : stride] += x.to(dtype) * w[
+            None, :, 0, tap, None
+        ].to(dtype)
+    out = conv_transpose1d_depthwise(
+        x, w, stride=stride, fp64=fp64, taps_ascending=taps_ascending
+    )
+    assert torch.equal(out, ref.float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv replica")
+@pytest.mark.parametrize("channels", [8, 64, 256])
+def test_rocm_alias_free_resampling_keeps_eager_bytes(channels):
+    """Each depthwise filter shape returns the eager conv's bytes, through the
+    replica of MIOpen's order it matched at first sight, or eager."""
+    from sglang.multimodal_gen.runtime.models.vaes import alias_free
+
+    torch.manual_seed(0)
+    x = torch.randn(2, channels, 20261, device="cuda")
+    up = alias_free.UpSample1d(2, 12).cuda()
+    down = alias_free.DownSample1d(2, 12).cuda()
+    with torch.inference_mode():
+        with mock.patch.object(
+            alias_free.current_platform, "is_rocm", return_value=False
+        ):
+            eager = (up(x), down(x))
+        alias_free._ROCM_DEPTHWISE_REPLICA.clear()
+        for _ in range(2):  # first sight, then the adopted path
+            assert torch.equal(up(x), eager[0])
+            assert torch.equal(down(x), eager[1])
+    assert len(alias_free._ROCM_DEPTHWISE_REPLICA) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

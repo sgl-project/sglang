@@ -274,6 +274,13 @@ class FlashinferDispatcher(BaseDispatcher):
         super().set_quant_config(quant_config)
         self.prefill_dispatcher.set_quant_config(quant_config)
 
+    @property
+    def prebuild_pending(self) -> bool:
+        return self.prefill_dispatcher.prebuild_pending
+
+    def prebuild(self) -> None:
+        self.prefill_dispatcher.prebuild()
+
     def _dispatch_prefill_allgather(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
@@ -378,7 +385,7 @@ class FlashinferDispatcher(BaseDispatcher):
         if TopKOutputChecker.format_is_bypassed(topk_output):
             topk_output = topk_output.to_standard()
         # FlashInfer NVLinkOneSidedAlltoAll's expert-ID ABI is int32. This
-        # dispatcher is only selected for moe_a2a_backend="flashinfer".
+        # dispatcher is only selected for moe_a2a_backend="flashinfer_nvlink_one_sided".
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights
 

@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.token_demand import demand_windows
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -218,8 +219,9 @@ class TestStateAdmissionLimits(unittest.TestCase):
         self.assertEqual(window.available_size(), 20)
         budget = create_prefill_budget(allocator, _cache())
         self.assertTrue(budget.state_slots_fit(12))
-        self.assertGreaterEqual(budget.remaining_total, 12)
-        self.assertGreaterEqual(budget.remaining_window_tokens, 12)
+        # Each side alone takes 12 tokens; together they need not.
+        self.assertTrue(allocator.units_fit({owner.sub_pool_name: 12}))
+        self.assertTrue(allocator.units_fit({window.sub_pool_name: 12}))
         held = {p: int(window.ids.physical_to_virtual[p]) for p in window.fixed_pages()}
         fits = budget.check_prefill(
             extend_input_len=11,
@@ -243,7 +245,7 @@ class TestStateAdmissionLimits(unittest.TestCase):
                 storage = _build(window=window, lazy=True)
                 allocator = storage.allocator
                 budget = create_prefill_budget(allocator, _cache())
-                slots = allocator.state_slots_available() + 1
+                slots = largest_take(allocator, allocator.sub_pool_roles()[2]) + 1
                 self.assertFalse(
                     budget.check_prefill(
                         extend_input_len=1,
