@@ -5,7 +5,7 @@ import importlib
 import importlib.util
 import logging
 import time
-from typing import List
+from typing import List, Tuple
 
 import requests
 
@@ -31,14 +31,16 @@ def trigger_init_weights_send_group_for_remote_instance_request(
     remote_instance_weight_loader_seed_instance_service_port: int,
     remote_instance_weight_loader_send_weights_group_ports: List[int],
     remote_instance_weight_loader_client_id: str,
-):
+) -> Tuple[bool, str]:
+    # The seed answers only once both sides joined, so this runs beside the
+    # client's group init, which never learns the seed gave up: act on a False.
     seed_instance_service_url = f"http://{remote_instance_weight_loader_seed_instance_ip}:{remote_instance_weight_loader_seed_instance_service_port}"
     # Only support loading weights from instance with same parallelism strategy.
     # Per TP rank pair between seed and dst instances will build a communication group for sending weights.
     # i.e. seed TP 0 <-> dst TP 0, seed TP 1 <-> dst TP 1, etc.
     # Each communication group will have a world size 2.
     try:
-        requests.post(
+        response = requests.post(
             f"{seed_instance_service_url}/init_weights_send_group_for_remote_instance",
             json={
                 "master_address": remote_instance_weight_loader_seed_instance_ip,
@@ -54,12 +56,23 @@ def trigger_init_weights_send_group_for_remote_instance_request(
                 "backend": "nccl",
             },
             headers=_seed_admin_headers(),
-        ).raise_for_status()
-    except Exception as e:
-        logger.error(
-            f"Failed to trigger init_weights_send_group_for_remote_instance_request to seed instance {seed_instance_service_url}: {e}."
         )
-        raise
+    except Exception as e:
+        message = f"Failed to trigger init_weights_send_group_for_remote_instance_request to seed instance {seed_instance_service_url}: {e}"
+        logger.error(message)
+        return False, message
+    if response.status_code != 200:
+        try:
+            reason = response.json().get("message", response.text)
+        except ValueError:
+            reason = response.text
+        message = (
+            f"Seed instance {seed_instance_service_url} rejected the weights send "
+            f"group (HTTP {response.status_code}): {reason}"
+        )
+        logger.error(message)
+        return False, message
+    return True, ""
 
 
 def trigger_transferring_weights_request(
@@ -118,7 +131,11 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
-    if importlib.util.find_spec("torch") is None:
+    from sglang.srt.utils.device import is_xpu
+
+    # v2 merges blocks from the CUDA caching allocator's snapshot; XPU registers
+    # each weight on its own.
+    if importlib.util.find_spec("torch") is None or is_xpu():
         return register_memory_region_v1(model, transfer_engine)
     else:
         return register_memory_region_v2(model, transfer_engine)

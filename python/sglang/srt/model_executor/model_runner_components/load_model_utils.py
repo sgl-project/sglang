@@ -3,11 +3,13 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import signal
 import socket
 import threading
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import psutil
 import torch
 import torch.distributed as dist
 
@@ -136,6 +138,17 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
             raise RuntimeError("SGLang only supports sm75 and above.")
 
 
+def _init_send_group_or_abort(*trigger_args) -> None:
+    ok, message = trigger_init_weights_send_group_for_remote_instance_request(
+        *trigger_args
+    )
+    if not ok:
+        # The client ranks keep waiting in their group rendezvous after the seed
+        # gives up, so fail the server now, as a scheduler exception does.
+        logger.error(f"{message} (aborting the remote instance weight load)")
+        psutil.Process().parent().send_signal(signal.SIGQUIT)
+
+
 def maybe_trigger_remote_instance_nccl_send_group(
     *, tp_rank: int, load_format: str | None = None
 ) -> None:
@@ -150,7 +163,7 @@ def maybe_trigger_remote_instance_nccl_send_group(
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
-                target=trigger_init_weights_send_group_for_remote_instance_request,
+                target=_init_send_group_or_abort,
                 args=(
                     get_model().remote_instance_weight_loader_seed_instance_ip,
                     get_model().remote_instance_weight_loader_seed_instance_service_port,

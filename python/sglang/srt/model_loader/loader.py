@@ -105,7 +105,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.device import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike, is_xpu
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -3327,6 +3327,44 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
+        if not (is_xpu() and get_exec().features.enable_memory_saver):
+            self._receive_weights_from_remote_instance_by_nccl(
+                model, client, model_config, device_config, staged=False
+            )
+        else:
+            # Memory saver's XPU allocator returns Level Zero virtual-memory
+            # mappings, which oneCCL takes for host memory and reads on the CPU
+            # (SIGSEGV). Its pool routes allocations per thread, so receive on a
+            # helper thread, which gets the normal allocator, via staging buffers.
+            errors = []
+
+            def receive():
+                try:
+                    torch.xpu.set_device(device_config.gpu_id)
+                    self._receive_weights_from_remote_instance_by_nccl(
+                        model, client, model_config, device_config, staged=True
+                    )
+                except BaseException as e:
+                    errors.append(e)
+
+            receiver = threading.Thread(target=receive, name="rfork-xccl-receive")
+            receiver.start()
+            receiver.join()
+            if errors:
+                raise errors[0]
+        # Runs on the loading thread: anything it allocates stays in the region.
+        with set_default_torch_dtype(model_config.dtype):
+            post_load_weights(model)
+
+    def _receive_weights_from_remote_instance_by_nccl(
+        self,
+        model,
+        client,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        *,
+        staged: bool,
+    ) -> None:
         load_config = self.load_config
         instance_ip = socket.gethostbyname(socket.gethostname())
         start_build_group_tic = time.time()
@@ -3356,14 +3394,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         start_get_weights_tic = time.time()
         with set_default_torch_dtype(model_config.dtype):
             for _, tensor in model.named_parameters():
+                received = torch.empty_like(tensor.data) if staged else tensor.data
                 torch.distributed.broadcast(
-                    tensor.data,
+                    received,
                     src=0,
                     group=client._model_update_group,
                 )
+                if staged:
+                    tensor.data.copy_(received)
             current_platform.synchronize()
-
-            post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"

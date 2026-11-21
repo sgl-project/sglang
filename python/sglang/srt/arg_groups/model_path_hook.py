@@ -213,7 +213,9 @@ def handle_load_format(server_args: Any):
     if cfg.custom_weight_loader is None:
         declare_resolution(server_args, "_handle_load_format", custom_weight_loader=[])
 
-    if cfg.load_format == "remote_instance":
+    # Read before the fallbacks below rewrite load_format to "auto".
+    loads_from_remote_instance = cfg.load_format == "remote_instance"
+    if loads_from_remote_instance:
         if cfg.remote_instance_weight_loader_backend != "modelexpress" and (
             cfg.remote_instance_weight_loader_seed_instance_ip is None
             or cfg.remote_instance_weight_loader_seed_instance_service_port is None
@@ -250,6 +252,20 @@ def handle_load_format(server_args: Any):
                 "_handle_load_format",
                 load_format="auto",
             )
+
+    # A pure seed passes this flag only to serve transfer_engine clients, which
+    # memory saver rules out; a client keeps its fallback above and loads from disk.
+    if (
+        cfg.remote_instance_weight_loader_start_seed_via_transfer_engine
+        and cfg.enable_memory_saver
+        and not loads_from_remote_instance
+    ):
+        raise ValueError(
+            "--remote-instance-weight-loader-start-seed-via-transfer-engine cannot be "
+            "used with --enable-memory-saver: memory saver releases and remaps the "
+            "weight memory TransferEngine registers, so this seed could not serve any "
+            "transfer_engine client. Drop one of the two flags."
+        )
 
     # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
