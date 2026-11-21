@@ -32,6 +32,7 @@ from typing import Any, Iterator, List, Optional, Tuple
 import psutil
 import torch
 
+from sglang._apple_silicon_memory import apple_gpu_available_memory
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
@@ -570,23 +571,16 @@ def get_available_gpu_memory(
         else:
             free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":
-        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-
         num_gpus = torch.mps.device_count()
         assert gpu_id < num_gpus
 
-        if use_mlx():
-            # Torch's allocator does not track MLX Metal allocations.
-            free_gpu_memory = psutil.virtual_memory().available
-        else:
-            if empty_cache:
-                empty_device_cache(torch.mps)
-            # Bound free memory by host RAM and Metal's working-set limit.
-            total_gpu_memory = torch.mps.recommended_max_memory()
-            metal_headroom = max(
-                0, total_gpu_memory - torch.mps.driver_allocated_memory()
-            )
-            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
+        # Unified memory: Metal can only keep roughly 65-75% of system RAM
+        # resident on the GPU (recommendedMaxWorkingSetSize). Treating all
+        # free RAM as GPU-available overcommits that budget, which stalls or
+        # crashes the GPU driver under load (#21443). The shared helper
+        # reports the remaining working-set headroom as tracked by the
+        # active Apple Silicon runtime (MLX or torch-MPS).
+        free_gpu_memory = apple_gpu_available_memory(empty_cache=empty_cache)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
