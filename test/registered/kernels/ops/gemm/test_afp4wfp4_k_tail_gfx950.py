@@ -35,7 +35,7 @@ def _make_lds_fill():
         gl.store(out_ptr + gl.program_id(0), gl.sum(smem.load(layout), axis=0))
 
     def lds_fill(byte: int) -> None:
-        """Leave ``byte`` in every CU's LDS, as a previous kernel would."""
+        # Leave ``byte`` in every CU's LDS, as a previous kernel would.
         num_programs = 4096
         out = torch.empty(num_programs, dtype=torch.int32, device="cuda")
         value = int.from_bytes(bytes([byte] * 4), "little", signed=True)
@@ -71,12 +71,12 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
             )
             # Checkpoint weight scales are row-major; activation scales keep the quant layout.
             w_s = w_s.contiguous()
-            w_ref = dequant(w_q, w_s)
+            w_ref = dequant(q=w_q, scale=w_s)
             for m in ms:
                 x_q, x_s = dynamic_mxfp4_quant(
                     (torch.randn(m, k, device="cuda") * 0.05).to(torch.bfloat16)
                 )
-                ref = dequant(x_q, x_s) @ w_ref.t()
+                ref = dequant(q=x_q, scale=x_s) @ w_ref.t()
                 cls.inputs[k, m] = (x_q, x_s, w_q, w_s, ref)
         cls.lds_fill = staticmethod(_make_lds_fill())
 
@@ -121,8 +121,8 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
                     self.lds_fill(0xFF)
                     run(y)
                     err = (y.float() - ref).abs().nan_to_num(float("inf"))
-                    # BF16 output rounds at 2**-8 of max|ref|; measured error is 0.2-0.3% of it, and a stale-LDS
-                    # NaN is inf here, so 2% separates the two.
+                    # BF16 output rounds at 2**-8 of max|ref|; measured error is 0.2-0.3%,
+                    # and a stale-LDS NaN maps to inf here, so 2% separates the two.
                     self.assertLessEqual(
                         err.max().item(), 0.02 * ref.abs().max().item()
                     )
