@@ -22,6 +22,11 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
+from sglang.srt.layers.attention.qsa.flashinfer_sparse import (
+    FlashInferSparseDecode,
+    flashinfer_sparse_supports,
+    resolve_flashinfer_sparse,
+)
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -55,7 +60,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_exec, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -63,6 +68,14 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+def _qsa_decode_attention_backend() -> str:
+    """``--qsa-decode-attention-backend``, or 'auto' when no server config is published."""
+    try:
+        return str(get_exec().kernel.qsa_decode_attention_backend)
+    except (AttributeError, ValueError):
+        return "auto"
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
@@ -342,6 +355,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._trtllm_counters = {}
+        self._qsa_decode_attention_backend = _qsa_decode_attention_backend()
+        self._flashinfer_sparse: Optional[FlashInferSparseDecode] = None
+        self._flashinfer_sparse_resolved = False
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
@@ -1585,6 +1601,157 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    def _fused_kv_storage(self):
+        pool = self.token_to_kv_pool
+        if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
+            return pool.full_kv_pool
+        return pool
+
+    def _resolve_flashinfer_sparse(
+        self, layer, k_buffer
+    ) -> Optional[FlashInferSparseDecode]:
+        """Build the FlashInfer sparse decode state on first use.
+
+        None when ``--qsa-decode-attention-backend flashinfer_sparse`` does not
+        apply here; the reason is logged once and the default path is kept.
+        """
+        if self._flashinfer_sparse_resolved:
+            return self._flashinfer_sparse
+        self._flashinfer_sparse_resolved = True
+        page_size = int(getattr(self._fused_kv_storage(), "page_size", 0) or 0)
+        if not self._fused_kv_pool_eligible:
+            reason = "the KV pool is not an unquantized BF16/FP8 MHATokenToKVPool"
+        elif self._kv_shard_pool is not None:
+            reason = "KV pool sharding is enabled"
+        elif self.qsa_profile is None:
+            reason = "the model has no QSA profile"
+        elif self.max_context_len <= 0:
+            reason = "the model context length is unknown"
+        elif k_buffer.dtype != torch.bfloat16:
+            reason = (
+                f"the KV pool is {k_buffer.dtype}; only BF16 pools are supported "
+                "for now (an FP8 pool would need an FP8 query in the prims-ts kernel)"
+            )
+        elif resolve_flashinfer_sparse() is None:
+            reason = (
+                "it needs a compute-capability-10.x GPU and "
+                "flashinfer.attention.prims_ts"
+            )
+        elif not flashinfer_sparse_supports(
+            compress_ratio=self.compress_ratio,
+            block_topk=self.qsa_profile.block_topk,
+            head_dim=layer.head_dim,
+            page_size=page_size,
+        ):
+            reason = (
+                f"unsupported geometry: compress_ratio={self.compress_ratio}, "
+                f"block_topk={self.qsa_profile.block_topk}, "
+                f"head_dim={layer.head_dim}, page_size={page_size}"
+            )
+        else:
+            reason = None
+        if reason is not None:
+            logger.warning(
+                "--qsa-decode-attention-backend flashinfer_sparse does not apply: "
+                "%s; QSA decode keeps the default path",
+                reason,
+            )
+            return None
+        self._flashinfer_sparse = FlashInferSparseDecode(
+            num_qo_heads=layer.tp_q_head_num,
+            num_kv_heads=k_buffer.shape[1],
+            head_dim=layer.head_dim,
+            page_size=page_size,
+            compress_ratio=self.compress_ratio,
+            block_topk=self.qsa_profile.block_topk,
+            max_context_len=self.max_context_len,
+            device=k_buffer.device,
+            dtype=torch.bfloat16,
+        )
+        logger.info(
+            "QSA decode attention uses FlashInfer prims-ts sparse attention "
+            "(kv dtype %s, page size %d)",
+            k_buffer.dtype,
+            page_size,
+        )
+        return self._flashinfer_sparse
+
+    def _try_flashinfer_sparse_decode(self, q, k, v, layer, forward_batch, indices):
+        """FlashInfer prims-ts sparse attention straight over the paged pool, or None.
+
+        Decode rows with deferred block ids only; the new K/V is stored to the
+        pool first, as on the default path. Everything it declines falls through
+        unchanged.
+        """
+        if (
+            self._qsa_decode_attention_backend != "flashinfer_sparse"
+            or not forward_batch.forward_mode.is_decode()
+            or not q.is_cuda
+            or k is None
+            or v is None
+            or q.dtype != torch.bfloat16
+            or not self._uses_block_indices(indices)
+        ):
+            return None
+        rows = indices.shape[0]
+        if (
+            rows == 0
+            or q.shape[0] != rows
+            or rows != forward_batch.req_pool_indices.numel()
+        ):
+            return None
+        pool = self.token_to_kv_pool
+        kc = pool.layer_router.read(layer.layer_id).key()
+        vc = pool.layer_router.read(layer.layer_id).value()
+        if (
+            kc.ndim != 3
+            or vc.shape != kc.shape
+            or vc.dtype != kc.dtype
+            or not kc.is_contiguous()
+            or not vc.is_contiguous()
+            or kc.shape[2] != layer.head_dim
+        ):
+            return None
+        metadata = self._resolve_metadata(forward_batch)
+        if metadata.sequence_lengths.numel() != rows:
+            return None
+        sparse = self._resolve_flashinfer_sparse(layer, kc)
+        if (
+            sparse is None
+            or kc.shape[1] != sparse.num_kv_heads
+            or kc.dtype != sparse.dtype
+            or layer.tp_q_head_num != sparse.num_qo_heads
+        ):
+            return None
+        indexer = metadata.indexer_metadata
+        if metadata.is_cuda_graph:
+            page_table = indexer.graph_compressed_page_table
+        elif indexer.decode_page_table is not None:
+            page_table = indexer.decode_page_table
+        else:
+            page = sparse.page_size
+            page_table = (
+                (metadata.token_slot_table[:, ::page].long() // page)
+                .clamp_min(0)
+                .to(torch.int32)
+            )
+        if page_table is None:
+            return None
+        self.kv_layers.layer(layer.layer_id).store(
+            layer, forward_batch.out_cache_loc, k, v
+        )
+        return sparse.forward(
+            q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            kc,
+            vc,
+            page_table,
+            indices.to(torch.int32),
+            metadata.sequence_lengths,
+            layer.scaling,
+            layer.layer_id,
+            exact_rows=metadata.is_cuda_graph,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2053,6 +2220,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
+            sparse_output = self._try_flashinfer_sparse_decode(
+                q, k, v, layer, forward_batch, topk_indices
+            )
+            if sparse_output is not None:
+                return sparse_output
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
             )

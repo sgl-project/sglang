@@ -214,6 +214,7 @@ POSITIONAL_FIELD_ORDER = (
     "dsa_decode_backend",
     "dsa_paged_mqa_logits_backend",
     "dsa_topk_backend",
+    "qsa_decode_attention_backend",
     "disable_flashinfer_autotune",
     "flashinfer_autotune_skip_ops",
     "mamba_backend",
