@@ -148,7 +148,7 @@ def _create_state(group: GroupCoordinator, buffers: Sequence[str]) -> Optional[_
         group.unique_name,
         group.world_size,
     )
-    if envs.SGLANG_K3_SP_ATTN_RES.get():
+    if _ATTN_RES_AG in buffers:
         logger.info(
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"

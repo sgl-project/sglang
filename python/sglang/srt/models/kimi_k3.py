@@ -579,41 +579,65 @@ def _replicates_shared_experts() -> bool:
 
 
 class _SharedExpertsTp:
-    """TP-sharded shared experts: gather the group's rows in, reduce-scatter back."""
+    """TP-sharded shared experts within one attention-DP replica."""
 
-    def __init__(self, group, across_dp: bool):
+    across_dp: bool = False
+
+    def __init__(self, group):
         self.group = group
-        # Spans DP ranks: every rank's rows take the DP gather, idle ranks included.
-        self.across_dp = across_dp
-        self._k3 = (
-            k3_sp_collective.GroupCollective(group, "shared_tp_all_gather")
-            if across_dp
-            else None
-        )
 
     def gather(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
     ) -> torch.Tensor:
-        group = self.group
-        if not self.across_dp:
-            # The attention DP buffer spans the entire attention-TP replica.
-            # Size this buffer from the subgroup's actual token shards instead.
-            with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-                gathered = hidden_states.new_empty(
-                    (
-                        hidden_states.shape[0] * group.world_size,
-                        *hidden_states.shape[1:],
-                    )
+        # The attention DP buffer spans the entire attention-TP replica.
+        # Size this buffer from the subgroup's actual token shards instead.
+        with use_symmetric_memory(self.group, disabled=not is_allocation_symmetric()):
+            gathered = hidden_states.new_empty(
+                (
+                    hidden_states.shape[0] * self.group.world_size,
+                    *hidden_states.shape[1:],
                 )
-            group.all_gather_into_tensor(gathered, hidden_states)
-            return gathered
-        if forward_batch.dp_padding_mode.is_max_len():
+            )
+        self.group.all_gather_into_tensor(gathered, hidden_states)
+        return gathered
+
+    def reduce_scatter(
+        self,
+        shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+    ) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        self.group.reduce_scatter_tensor(output, shared_output)
+        return output
+
+
+class _DpSharedExpertsTp(_SharedExpertsTp):
+    """TP-sharded shared experts spanning every attention-DP rank, idle ranks included."""
+
+    across_dp: bool = True
+
+    def __init__(self, group):
+        super().__init__(group)
+        self._k3 = k3_sp_collective.GroupCollective(group, "shared_tp_all_gather")
+
+    @staticmethod
+    def _is_max_len(forward_batch: Optional[ForwardBatch]) -> bool:
+        assert (
+            forward_batch is not None and forward_batch.dp_padding_mode is not None
+        ), "DP-spanning shared-expert TP requires forward_batch.dp_padding_mode"
+        return forward_batch.dp_padding_mode.is_max_len()
+
+    def gather(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        if self._is_max_len(forward_batch):
             # The direct strategy's output stays valid until the next layer's gather.
             gathered = self._k3.all_gather(hidden_states)
             if gathered is not None:
                 _note_dp_gather_in_prefill_graph()
                 return gathered
-        gathered = get_global_dp_buffer(group)
+        gathered = get_global_dp_buffer(self.group)
         dp_gather_partial(gathered, hidden_states, forward_batch)
         return gathered
 
@@ -623,17 +647,15 @@ class _SharedExpertsTp:
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch],
     ) -> torch.Tensor:
-        if self.across_dp and forward_batch.dp_padding_mode.is_max_len():
+        if self._is_max_len(forward_batch):
             output = self._k3.reduce_scatter(shared_output)
             if output is not None:
                 return output
-        output = torch.empty_like(hidden_states)
-        if not self.across_dp:
-            self.group.reduce_scatter_tensor(output, shared_output)
-        elif forward_batch.dp_padding_mode.is_max_len():
+            output = torch.empty_like(hidden_states)
             dp_reduce_scatter_tensor(output, shared_output)
-        else:
-            dp_scatter(output, self.group.all_reduce(shared_output), forward_batch)
+            return output
+        output = torch.empty_like(hidden_states)
+        dp_scatter(output, self.group.all_reduce(shared_output), forward_batch)
         return output
 
 
@@ -820,10 +842,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     f"must be divisible by shared-expert TP size ({shared_tp})."
                 )
             if shared_tp_group is not None:
-                self._shared_experts_tp = _SharedExpertsTp(
-                    shared_tp_group,
-                    across_dp=shared_tp_group.world_size
-                    > parallel.attn_tp_size * parallel.attn_cp_size,
+                across_dp = (
+                    shared_tp_group.world_size
+                    > parallel.attn_tp_size * parallel.attn_cp_size
+                )
+                self._shared_experts_tp = (
+                    _DpSharedExpertsTp(shared_tp_group)
+                    if across_dp
+                    else _SharedExpertsTp(shared_tp_group)
                 )
             self.shared_experts = KimiK3MLP(
                 hidden_size=config.hidden_size,
@@ -1358,6 +1384,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             and envs.SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM.get()
             and self._sbo_shared_overlap
             and self._shared_experts_tp is not None
+            and not self._shared_experts_tp.across_dp
             and self.use_latent_moe
             and hidden_states.shape[0] > 0
             and get_moe_a2a_backend().is_deepep()
