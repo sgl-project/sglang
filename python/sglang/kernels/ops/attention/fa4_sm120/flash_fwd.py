@@ -123,9 +123,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             m_block,
             absolute=True,
         )
-        dynamic_splits = cute.ceil_div(
-            cutlass.max(n_block_max - n_block_min, 1),
-            self.split_kv_blocks_per_cta,
+        # A window that starts inside a tile touches one tile more than the plan
+        # counted; splits beyond the launched grid would leave that tile unread.
+        dynamic_splits = cutlass.min(
+            num_splits,
+            cute.ceil_div(
+                cutlass.max(n_block_max - n_block_min, 1),
+                self.split_kv_blocks_per_cta,
+            ),
         )
         return block_info.get_n_block_min_max(
             seqlen,

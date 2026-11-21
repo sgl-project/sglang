@@ -488,6 +488,9 @@ class Sm120ForwardPolicy:
             window_size_right=window_size_right,
             tile_n=tile_n,
         )
+        # A sliding window bounds an extend's visible KV; splitting it only adds the combine.
+        if requested_num_splits < 1 and is_local and max_seqlen_q > 1:
+            requested_num_splits = 1
         num_splits = cls.select_num_splits(
             requested_num_splits=requested_num_splits,
             head_dim=head_dim,
