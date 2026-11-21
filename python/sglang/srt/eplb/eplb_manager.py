@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, Generator, List
 
 import torch.cuda
 import torch.distributed as dist
@@ -49,6 +49,8 @@ class EPLBManager:
             get_exec().moe.eplb_rebalance_layers_per_chunk
         )
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
+        self._rebalance_max_count = get_exec().moe.eplb_max_rebalance_count
+        self._recorder_stopped_by_freeze = False
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
 
@@ -63,9 +65,10 @@ class EPLBManager:
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
 
-        logger.info(
-            f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
-        )
+        msg = f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations"
+        if self._rebalance_max_count > 0:
+            msg += f", at most {self._rebalance_max_count} times"
+        logger.info(msg + ".")
 
         self._main_generator = self._entrypoint()
 
@@ -73,6 +76,11 @@ class EPLBManager:
         next(self._main_generator)
 
     def reset_generator(self):
+        # A fresh generator restarts the rebalance budget, which needs the
+        # recorder that a previous freeze stopped.
+        if self._recorder_stopped_by_freeze:
+            get_global_expert_distribution_recorder().start_record()
+            self._recorder_stopped_by_freeze = False
         self._main_generator = self._entrypoint()
 
     def disable_rebalance(self, reason: str):
@@ -87,13 +95,31 @@ class EPLBManager:
 
     # can be more complex if needed
     def _entrypoint(self):
-        while True:
+        num_rebalances = 0
+        while (
+            self._rebalance_max_count == 0 or num_rebalances < self._rebalance_max_count
+        ):
             for _ in range(self._rebalance_num_iterations):
                 yield
 
-            yield from self.rebalance()
+            if (yield from self.rebalance()):
+                num_rebalances += 1
 
-    def rebalance(self):
+        yield from self._freeze_layout(num_rebalances)
+
+    def _freeze_layout(self, num_rebalances: int):
+        logger.info(
+            f"[EPLBManager] reached {num_rebalances} rebalances, "
+            "freezing the expert layout and stopping the distribution recorder."
+        )
+        # The frozen layout stays applied: the logical->physical remap in
+        # select_experts is keyed on enable_eplb, not on the recorder.
+        get_global_expert_distribution_recorder().stop_record()
+        self._recorder_stopped_by_freeze = True
+        while True:
+            yield
+
+    def rebalance(self) -> Generator[None, None, bool]:
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -101,7 +127,7 @@ class EPLBManager:
                     self._rebalance_disabled_reason,
                 )
                 self._rebalance_disabled_logged = True
-            return
+            return False
 
         elastic_state = ElasticEPStateManager.instance()
         is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
@@ -110,7 +136,7 @@ class EPLBManager:
             elastic_state.pending_ep_size is not None
             or elastic_state.scale_phase not in ("serving_expanded", "failed")
         ):
-            return
+            return False
 
         logger.info("[EPLBManager] rebalance start")
 
@@ -130,7 +156,7 @@ class EPLBManager:
 
         # Check whether rebalancing is needed
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
-            return
+            return False
 
         expert_location_metadata = self._compute_expert_location_metadata(
             logical_count,
@@ -183,6 +209,7 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+        return True
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool
