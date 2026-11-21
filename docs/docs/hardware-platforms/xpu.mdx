@@ -396,6 +396,61 @@ the `cuda_graph` tag is a no-op there.
 > allocator accounting, and the second stays flat because torch keeps the freed block
 > cached. Query actual device memory via sysman (`ZES_ENABLE_SYSMAN=1`) instead.
 
+## Hierarchical Cache (HiCache) on Intel XPU [Experimental]
+
+[HiCache](../advanced_features/hicache) extends the radix cache with a host-memory tier (L2) and an optional storage tier (L3). On Intel XPU, transfers between L1 and L2 work with both `--hicache-io-backend kernel` (default) and `direct`, and the XPU Docker image includes two L3 backends: [NIXL](https://github.com/ai-dynamo/nixl) with its POSIX file plugin, and the [Mooncake](https://github.com/kvcache-ai/Mooncake) store. See [HiCache best practices](../advanced_features/hicache_best_practices) for sizing the host pool and choosing a memory layout and prefetch policy.
+
+**Tested configurations:**
+
+| Model | L3 backend | Notes |
+|:---:|:---:|:---:|
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | NIXL (POSIX plugin) | L2 reload and L3 restore after `flush_cache`; `direct` and `kernel` io backends with `layer_first`, `page_first`, `page_first_direct` and `page_head` layouts; XPU nightly tests |
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Mooncake store (TCP) | L2 reload and L3 restore after `flush_cache` |
+
+### NIXL backend
+
+NIXL's POSIX plugin stores KV pages as files under the directories in `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR` (comma-separated). See the [NIXL backend README](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/nixl/README.md) for the full configuration.
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/l3_store
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-1.5B-Instruct --device xpu \
+    --enable-hierarchical-cache --hicache-size 4 --page-size 64 \
+    --hicache-storage-backend nixl \
+    --hicache-storage-backend-extra-config '{"plugin": {"posix": {"active": true, "use_aio": true}}, "use_direct_io": false}'
+```
+
+- **I/O queue:** the POSIX plugin uses Linux AIO (`use_aio`) or io_uring (`use_uring`). Docker's default seccomp profile blocks io_uring, so inside a container use `use_aio`, which is also the default of the NIXL build in the XPU image, or run the container with `--security-opt seccomp=unconfined`. If the requested queue cannot start, the server fails at startup with `Failed to create NIXL backend`.
+- **O_DIRECT:** `use_direct_io` is a top-level key of the extra config, next to `plugin`; it defaults to `SGLANG_HICACHE_NIXL_USE_DIRECT_IO` (on). O_DIRECT writes sourced from the XPU pinned host pool fail with `EFAULT`, so when O_DIRECT is requested the backend checks this at startup and falls back to buffered I/O for the affected pools.
+- **Cleaner:** for file-backed plugins, a background cleaner deletes the oldest cache entries once the storage filesystem is more than 80% full. Set `"l3_cleaner_enabled": false` in the extra config to turn it off, for example for benchmarks on a shared disk.
+
+### Mooncake store backend
+
+The XPU Docker image builds the Mooncake store, so `mooncake_master`, `mooncake_client` and `python -m mooncake.http_metadata_server` are available in it. Start the metadata server, the master and a standalone store service, which holds the cached KV in host memory, then point the SGLang server at them over TCP:
+
+```bash
+HOST_IP=$(hostname -i)
+python3 -m mooncake.http_metadata_server --host 127.0.0.1 --port 8080 &
+mooncake_master --port 50051 --metrics_port 9003 &
+MC_MS_AUTO_DISC=0 mooncake_client --host=$HOST_IP --port=50052 \
+    --master_server_address=127.0.0.1:50051 \
+    --metadata_server=http://127.0.0.1:8080/metadata \
+    --protocol=tcp --global_segment_size=34359738368 \
+    --enable_http_server=true --http_port=8081 &
+
+MOONCAKE_MASTER=127.0.0.1:50051 MOONCAKE_PROTOCOL=tcp MOONCAKE_DEVICE="" MC_MS_AUTO_DISC=0 \
+MOONCAKE_LOCAL_HOSTNAME=$HOST_IP MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=0 \
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-1.5B-Instruct --device xpu \
+    --enable-hierarchical-cache --hicache-size 4 --page-size 64 \
+    --hicache-storage-backend mooncake
+```
+
+`MOONCAKE_GLOBAL_SEGMENT_SIZE=0` keeps the SGLang server from contributing memory of its own; the store service's `--global_segment_size` (32 GiB above) sets the L3 capacity.
+
+### Comparing restored outputs
+
+To check that output restored from L2 or L3 matches a freshly computed one token for token, launch with `--enable-deterministic-inference --attention-backend triton`. With the default Triton decode, a prefix-cache hit can be reduced in a different order than the request that built the cache, so greedy outputs can differ slightly even though the restored KV is exact. Pass `--attention-backend triton` explicitly: deterministic inference otherwise selects `intel_xpu`, which disables the radix cache that HiCache needs.
+
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
 SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](https://github.com/kvcache-ai/Mooncake) and [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backends. Both are covered by the XPU nightly P/D test.
@@ -411,7 +466,7 @@ SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](h
 
 ### Mooncake backend
 
-Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image builds Mooncake without its store (`-DWITH_STORE=OFF`), so the Mooncake store HiCache L3 backend (`--hicache-storage-backend mooncake`) is not available on XPU.
+Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image also builds the Mooncake store, which HiCache can use as its L3 backend; see [HiCache on Intel XPU](#hierarchical-cache-hicache-on-intel-xpu-experimental).
 
 **Prerequisites:** Mooncake with XPU support (above) and the `sgl-router` binary, which the XPU Docker image installs at `/usr/local/bin/sgl-router` (outside the image, install it with `pip install sgl-router` or see [installing sgl-router](../advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router)).
 

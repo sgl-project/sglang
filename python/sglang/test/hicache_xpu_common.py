@@ -1,7 +1,10 @@
 """Shared helpers for the Intel XPU HiCache E2E tests."""
 
+import functools
+import json
 import os
 import time
+from typing import Optional
 
 import requests
 import torch
@@ -14,6 +17,44 @@ from sglang.test.test_utils import (
 )
 
 XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False
+
+
+# POSIX I/O queues to try, in order. Docker's default seccomp profile blocks io_uring
+# but allows Linux AIO, so AIO keeps NIXL storage usable in the XPU CI containers.
+_NIXL_POSIX_IO_QUEUES = ("use_uring", "use_aio")
+
+
+@functools.cache
+def _nixl_posix_probe() -> tuple[Optional[str], Optional[str]]:
+    """(io-queue parameter a POSIX backend starts with, None), or (None, why none does).
+
+    Starts the backend the way nixl_posix_config() asks the server to, so a usable
+    queue here means the server can start too.
+    """
+    try:
+        from nixl._api import nixl_agent, nixl_agent_config
+    except ImportError as e:
+        # Includes the meta package picking a missing nixl_cuXX backend.
+        return None, f"NIXL not importable: {e}"
+    errors = []
+    for param in _NIXL_POSIX_IO_QUEUES:
+        agent = nixl_agent(
+            f"hicache_xpu_probe_{os.getpid()}_{param}", nixl_agent_config(backends=[])
+        )
+        if "POSIX" not in agent.get_plugin_list():
+            return None, "NIXL POSIX plugin not installed"
+        try:
+            agent.create_backend("POSIX", {param: "true"})
+            return param, None
+        except Exception as e:
+            errors.append(f"{param}: {e}")
+    return None, "NIXL POSIX backend cannot start: " + "; ".join(errors)
+
+
+def nixl_posix_unavailable_reason() -> Optional[str]:
+    """Why NIXL-POSIX storage cannot run in this process, or None if it can."""
+    return _nixl_posix_probe()[1]
+
 
 # Device KV pool, in tokens. --mem-fraction-static cannot size it small enough
 # to evict anything on a 22 GB Arc; 1024 tokens (64 pages at --page-size 16) is
@@ -28,12 +69,46 @@ EVICT_HICACHE_RATIO = 8
 # for ~30 tokens, so 16 leaves margin. Exact identity is checked in
 # test_hicache_transfer_round_trip_xpu.py.
 COMPARE_TOKENS = 16
+# Server args for tests that compare a restored continuation against a golden.
+# Triton's default decode picks its KV split count at runtime, and with the
+# overlap scheduler a prefix-cache hit can decode with a different reduction
+# order than the request that built the cache, even with no HiCache. On a prompt
+# with bf16 near-ties (Qwen2.5-1.5B on B60) that flips a token within the first
+# few, so a golden-vs-restore mismatch would not mean the KV was corrupted.
+# Fixed split sizes make the two decodes bit-identical, so equality is exact.
+DETERMINISTIC_DECODE_ARGS = [
+    "--enable-deterministic-inference",
+    # The XPU default under deterministic inference is intel_xpu, which turns
+    # the radix cache off; HiCache needs it.
+    "--attention-backend",
+    "triton",
+]
 
 
 def resolve_base_url() -> str:
     """A probed-free port, so back-to-back launches in one file cannot collide."""
     default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
     return f"http://127.0.0.1:{find_available_port(default_port)}"
+
+
+def nixl_posix_config() -> str:
+    """Fully-qualified NIXL config -- the first plugin with active=True is
+    selected. use_direct_io=False avoids the O_DIRECT alignment requirement;
+    SGLang reads it at the top level, not from the plugin section.
+    The I/O queue is the first one _nixl_posix_probe() could start.
+    The flat ``{"plugin": "posix"}`` form raises AttributeError at construction.
+    """
+    return json.dumps(
+        {
+            "plugin": {
+                "posix": {
+                    "active": True,
+                    _nixl_posix_probe()[0] or "use_uring": True,
+                }
+            },
+            "use_direct_io": False,
+        }
+    )
 
 
 def launch_server(model: str, base_url: str, other_args: list, env_extra=None):
@@ -80,6 +155,25 @@ def prime_cache(base_url, model, prompt, max_tokens=COMPARE_TOKENS, timeout=90) 
     complete(base_url, model, prompt, max_tokens=max_tokens, timeout=timeout)
 
 
+def flush_cache(base_url, timeout_s: float = 30.0) -> None:
+    """Flush the radix cache, waiting until it actually happens.
+
+    `timeout` makes the endpoint wait out in-flight requests rather than decline
+    the flush; a declined flush answers 400, which raise_for_status catches.
+
+    Resets tiers 1 and 2 only: HiRadixCache.reset clears the tree, controller
+    and host pool but not the storage backend, and cached_tokens counts storage
+    hits. A prompt reused across a flush in one server can therefore still come
+    back cached -- keep prompts unique per scenario.
+    """
+    resp = requests.post(
+        f"{base_url}/flush_cache",
+        params={"timeout": timeout_s},
+        timeout=timeout_s + 30,
+    )
+    resp.raise_for_status()
+
+
 def load_back_tokens(base_url) -> float:
     """Tokens loaded host (L2) -> device (L1) since launch, all pools summed.
 
@@ -107,6 +201,27 @@ def wait_load_back_tokens(base_url, above: float, timeout_s: float = 20.0) -> fl
     while seen <= above and time.time() < deadline:
         time.sleep(0.5)
         seen = load_back_tokens(base_url)
+    return seen
+
+
+def count_storage_files(storage_dir) -> int:
+    n = 0
+    for _root, _dirs, names in os.walk(storage_dir):
+        n += len(names)
+    return n
+
+
+def wait_storage_settled(storage_dir, above: int = 0, timeout_s: float = 30.0) -> int:
+    """Wait until the file count passes `above` and stops growing, then return it.
+
+    Write-through backs up to storage on the cache controller's thread after the
+    request returns, one node at a time, so an immediate count can miss pages.
+    """
+    deadline = time.time() + timeout_s
+    prev, seen = -1, count_storage_files(storage_dir)
+    while (seen <= above or seen != prev) and time.time() < deadline:
+        time.sleep(1.0)
+        prev, seen = seen, count_storage_files(storage_dir)
     return seen
 
 
