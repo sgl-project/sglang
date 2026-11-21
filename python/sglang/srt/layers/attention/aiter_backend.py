@@ -191,8 +191,6 @@ logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
-# The operator's request; _use_mla_ps_kernel is later cleared by capability checks.
-_mla_persist_requested = _use_mla_ps_kernel
 
 
 # Use fp8 prefill only on gfx95
@@ -882,6 +880,7 @@ class AiterAttnBackend(AttentionBackend):
             and self.mla_decode_backend == "asm"
         )
         self.mla_verify_backend = envs.SGLANG_AITER_MLA_VERIFY_BACKEND.get().lower()
+        self.mla_persist_requested = envs.SGLANG_AITER_MLA_PERSIST.get()
         if self.mla_verify_backend not in ("gluon", "asm"):
             raise ValueError(
                 "SGLANG_AITER_MLA_VERIFY_BACKEND must be 'gluon' or 'asm', "
@@ -2341,7 +2340,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def _asm_cprr_verify_requested(self) -> bool:
         return (
-            _mla_persist_requested
+            self.mla_persist_requested
             and self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
@@ -2362,8 +2361,7 @@ class AiterAttnBackend(AttentionBackend):
         self._cprr_supports_cache: dict[tuple[int, int], tuple[bool, str]] = {}
         self.cprr_v_head_dim = 0
         self.cprr_kernel_heads = 0
-        # Only the asm cp verify asks aiter. Decided from the request, not from
-        # _use_mla_ps_kernel, which the later persist block sets from these answers.
+        # Ask from the request; the persist block may clear _use_mla_ps_kernel later.
         self._cprr_ask_aiter = False
         if not (self.use_mla and self.dcp_world_size > 1):
             return

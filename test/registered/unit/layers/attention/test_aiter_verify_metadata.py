@@ -186,6 +186,7 @@ def _dcp_backend(*, use_mla=True, dcp_world_size=8, num_draft_tokens=8, verify="
     backend.num_head = 12
     backend.num_draft_tokens = num_draft_tokens
     backend.mla_verify_backend = verify
+    backend.mla_persist_requested = envs.SGLANG_AITER_MLA_PERSIST.get()
     backend.kv_cache_dtype = aiter_backend.fp8_dtype
     backend.cprr_fast_mode = True
     backend.cprr_intra_batch_mode = False
@@ -197,10 +198,12 @@ class TestAiterCprrKernelHeads(CustomTestCase):
     """The DCP verify pads its gathered heads only where aiter would fold them."""
 
     def setUp(self):
-        for flag in ("_use_mla_ps_kernel", "_mla_persist_requested"):
-            patcher = patch.object(aiter_backend, flag, True)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patcher = patch.object(aiter_backend, "_use_mla_ps_kernel", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        persist = envs.SGLANG_AITER_MLA_PERSIST.override(True)
+        persist.__enter__()
+        self.addCleanup(persist.__exit__, None, None, None)
 
     def _query(self, query):
         patcher = patch.object(aiter_backend, "get_mla_decode_shape_support", query)
@@ -338,7 +341,7 @@ class TestAiterCprrKernelHeads(CustomTestCase):
                 self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
 
     def test_unconfirmed_kernel_off_gfx950_keeps_the_table_verdict(self):
-        # Off gfx950 aiter's None leaves the dispatch as it was: the table decides,
+        # Off gfx950, aiter's None falls back to the table verdict alone,
         # so gfx1250 is not sent to a Gluon fallback that asserts gfx950.
         unknown = _ShapeSupport({(128, 6), (128, 8)}, supported=None, arch="gfx1250")
         with patch.object(aiter_backend, "get_mla_decode_shape_support", unknown):
@@ -349,7 +352,7 @@ class TestAiterCprrKernelHeads(CustomTestCase):
         # SGLANG_AITER_MLA_PERSIST=0 keeps the verify on Gluon; the query (which can
         # need aiter's planner extension) must not run.
         support = self._query(_ShapeSupport({(96, 8)}))
-        with patch.object(aiter_backend, "_mla_persist_requested", False):
+        with envs.SGLANG_AITER_MLA_PERSIST.override(False):
             backend = _dcp_backend(num_draft_tokens=8)
         self.assertFalse(backend._cprr_ask_aiter)
         self.assertEqual(support.calls, [])
