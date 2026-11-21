@@ -1,0 +1,59 @@
+name: Upload CI metrics
+description: |
+  Uploads what sglang.test.ci.metrics.record wrote in this job, with the
+  job's identity (job.json), for the workflow's ci-metrics job to print.
+  Run with `if: always()`: a failing test's metrics matter most. Uploads
+  nothing if no metric was recorded.
+
+inputs:
+  stage:
+    description: The stage, as in the ci-metrics job's download pattern (the stage workflow's self_name)
+    required: true
+  partition:
+    description: The matrix partition, or another name unique to this job within the stage
+    required: false
+    default: "0"
+  gpu-config:
+    description: The runner config (GPU_CONFIG)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Describe the job
+      id: job
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        PARTITION: ${{ inputs.partition }}
+        GPU_CONFIG_INPUT: ${{ inputs.gpu-config }}
+      run: |
+        dir="${SGLANG_CI_METRICS_DIR:-}"
+        if [ -z "$dir" ] || ! ls "$dir"/*.jsonl >/dev/null 2>&1; then
+          echo "No metrics recorded."
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        python3 - "$dir/job.json" <<'PY'
+        import json, os, sys
+        json.dump({
+            "name": f"{os.environ['STAGE']} ({os.environ['PARTITION']})",
+            "partition": os.environ["PARTITION"],
+            "runner": os.environ.get("RUNNER_NAME"),
+            "gpu_config": os.environ.get("GPU_CONFIG_INPUT") or None,
+        }, open(sys.argv[1], "w"))
+        PY
+        echo "Recorded $(cat "$dir"/*.jsonl | wc -l) metrics."
+        echo "found=true" >> "$GITHUB_OUTPUT"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+    - name: Upload
+      if: steps.job.outputs.found == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        # Double dashes delimit the stage, so one stage's pattern can't match
+        # another whose name it prefixes.
+        name: ci-metrics--${{ inputs.stage }}--${{ inputs.partition }}--a${{ github.run_attempt }}
+        path: ${{ steps.job.outputs.dir }}
+        retention-days: 7
+        if-no-files-found: ignore
