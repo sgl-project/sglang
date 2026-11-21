@@ -1,5 +1,7 @@
+import asyncio
 import json
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -203,6 +205,71 @@ class TestHandlerRequestSemantics(CustomTestCase):
         self.assertEqual(
             self._prompt(chat, reasoning_effort="low", **thinking).prompt_ids, low
         )
+
+    def test_reasoning_effort_matches_across_endpoints(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            ResponsesRequest,
+            TokenizeRequest,
+        )
+        from sglang.srt.entrypoints.openai.serving_responses import (
+            OpenAIServingResponses,
+        )
+        from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
+
+        chat = _serving(self, self.tokenizer)
+        responses = OpenAIServingResponses(
+            chat.tokenizer_manager, chat.template_manager
+        )
+        tokenize = OpenAIServingTokenize.__new__(OpenAIServingTokenize)
+        tokenize.chat_serving = chat
+        tokenize.tokenizer_manager = chat.tokenizer_manager
+
+        for effort, native_effort, budget in (
+            ("low", None, 50),
+            ("max", None, 100),
+            (30, None, 30),
+            ("low", "max", 50),
+            (None, "low", 50),
+        ):
+            with self.subTest(effort=effort, native_effort=native_effort):
+                template_kwargs = {"thinking": True}
+                if effort is not None:
+                    template_kwargs["reasoning_effort"] = effort
+                body = dict(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=native_effort,
+                    chat_template_kwargs=template_kwargs,
+                )
+                generated, _ = chat._convert_to_internal_request(
+                    ChatCompletionRequest(**deepcopy(body))
+                )
+                token_ids = tokenize._tokenize_chat_request(
+                    TokenizeRequest(**deepcopy(body))
+                )
+                _, _, engine_prompts, _ = asyncio.run(
+                    responses._make_request(
+                        ResponsesRequest(
+                            model=MODEL,
+                            input="hi",
+                            reasoning=(
+                                {"effort": native_effort} if native_effort else None
+                            ),
+                            chat_template_kwargs=template_kwargs,
+                        ),
+                        None,
+                        self.tokenizer,
+                    )
+                )
+                self.assertIn(
+                    f"Reasoning Effort: {budget} ",
+                    self.tokenizer.decode(
+                        generated.input_ids, skip_special_tokens=False
+                    ),
+                )
+                self.assertEqual(token_ids, generated.input_ids)
+                self.assertEqual(engine_prompts, [generated.input_ids])
 
     def test_trailing_assistant_follows_sglang_rules(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

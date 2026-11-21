@@ -1207,6 +1207,29 @@ class OpenAIServingChat(OpenAIServingBase):
             and not processed_messages.modalities
         )
 
+    def _prepare_reasoning_effort(self, request: ChatCompletionRequest) -> None:
+        reasoning_effort = None
+        if not uses_hunyuan_reasoning_effort(
+            self.reasoning_parser, self.template_manager.reasoning_config
+        ):
+            template_kwargs = request.chat_template_kwargs or {}
+            reasoning_effort = template_kwargs.get("reasoning_effort")
+            # Keep an explicit effort for template rendering and output parsing.
+            if (
+                reasoning_effort is None
+                or self.chat_encoding_spec is not None
+                or self.template_manager.chat_template_name is not None
+            ):
+                template_kwargs.pop("reasoning_effort", None)
+
+        if self.is_gpt_oss and reasoning_effort == "none":
+            raise ValueError(
+                f"Harmony does not support reasoning effort {reasoning_effort}"
+            )
+
+        if reasoning_effort is not None:
+            request.reasoning_effort = reasoning_effort
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -1222,23 +1245,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if raw_request.headers.get("x-sglext-return-output-ids") == "1":
                 request.return_output_ids_in_sglext = True
 
-        reasoning_effort = None
-        if not uses_hunyuan_reasoning_effort(
-            self.reasoning_parser, self.template_manager.reasoning_config
-        ):
-            reasoning_effort = (
-                request.chat_template_kwargs.pop("reasoning_effort", None)
-                if request.chat_template_kwargs
-                else None
-            )
-
-        if self.is_gpt_oss and reasoning_effort == "none":
-            raise ValueError(
-                f"Harmony does not support reasoning effort {reasoning_effort}"
-            )
-
-        if reasoning_effort is not None:
-            request.reasoning_effort = reasoning_effort
+        self._prepare_reasoning_effort(request)
 
         if request.stream:
             if request.return_prompt_token_ids:
