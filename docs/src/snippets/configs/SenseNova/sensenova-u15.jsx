@@ -5,11 +5,15 @@ export const config = (() => {
     })[s.checkpoint || "default"];
   const plan = (s) => {
     const flags = ["--model-path " + modelOf(s), ...["--port {{PORT}}"]];
-    let gpus = 1;
-    let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
+    let gpus = s.hw === "arc_b" ? 2 : 1;
+    let t = { tp_size: gpus, ulysses_degree: 1, ring_degree: 1 };
     const env = [];
     const warnings = [];
     const errors = [];
+    if (s.hw === "arc_b") {
+      flags.push("--num-gpus 2", "--tp-size 2");
+      warnings.push("BF16 weights (32.7 GiB) exceed one 24 GB card; the decoder runs tensor parallel over two XPUs. Pick two cards whose PCIe links train at Gen5.");
+    }
     if (s.batching === "on") flags.push("--batching-max-size 2", "--batching-delay-ms 100");
     return { flags, gpus, topology: t, env, warnings, errors };
   };
@@ -25,8 +29,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "SenseNova-U1.5-8B-MoT",
-    supportedHardware: ["cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["cuda", "arc_b"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "arc_b", label: "Intel BMG", vram: "", vendor: "intel" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -44,8 +51,8 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 1 } },
-        verifiedRecipes: ["cuda"].map((hw) => {
+        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
+        verifiedRecipes: ["cuda", "arc_b"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
@@ -64,7 +71,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 1)
+          if (!Number.isInteger(count) || count < 1 || count > 2)
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))

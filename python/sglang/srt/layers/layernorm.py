@@ -109,6 +109,11 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+
+    if _is_xpu:
+        from sglang.kernels.ops.layernorm.rmsnorm_cast_before_mul import (
+            rmsnorm_cast_before_mul,
+        )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -429,6 +434,14 @@ def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     if input_scale is None or input_scale.numel() != 1:
         return None
     return input_scale
+
+
+def _matches_layout(tensor: torch.Tensor, reference: torch.Tensor) -> bool:
+    return (
+        tensor.shape == reference.shape
+        and tensor.dtype == reference.dtype
+        and tensor.is_contiguous()
+    )
 
 
 def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
@@ -1048,6 +1061,35 @@ class RMSNorm(BaseFusedOp):
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
+            return self.forward_native(x, residual, post_residual_addition)
+        if self.cast_x_before_out_mul:
+            # XPU rmsnorm kernels apply the weight before rounding; HF rounding has its own kernel.
+            if (
+                x.is_xpu
+                and not is_batch_invariant_mode_enabled()
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and self.weight.dtype == x.dtype
+                and self.override_orig_dtype is None
+                and x.stride(-1) == 1
+                and (
+                    residual is None
+                    or (
+                        not self.fp32_residual
+                        and _matches_layout(residual, x)
+                        and (
+                            post_residual_addition is None
+                            or _matches_layout(post_residual_addition, x)
+                        )
+                    )
+                )
+            ):
+                return rmsnorm_cast_before_mul(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    residual=residual,
+                    post_residual_addition=post_residual_addition,
+                )
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if residual is not None:
