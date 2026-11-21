@@ -4945,6 +4945,31 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
             handle_kv_cache_sharding(args)
 
+    def test_mooncake_storage_needs_buffer_mode_and_mla(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        args.hicache_storage_backend = "mooncake"
+        args.hicache_host_memory_mode = "buffer_only"
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        cases = (
+            (
+                {"hicache_host_memory_mode": "cache"},
+                "requires --hicache-host-memory-mode buffer_only",
+            ),
+            ({"hicache_host_memory_mode": "buffer_only"}, "supports only MLA models"),
+        )
+        for overrides, error in cases:
+            with self.subTest(overrides=overrides):
+                args = self._args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="mooncake",
+                    **overrides,
+                )
+                with self.assertRaisesRegex(ValueError, error):
+                    handle_kv_cache_sharding(args)
+
     def test_incompatible_cache_tree_modes_are_rejected(self):
         cases = (
             ({"radix_cache_backend": "custom"}, "built-in UnifiedRadixCache"),

@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -468,6 +469,9 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    # Logical-page KV sharding: the striped anchor host pool, or None.
+    kv_shard_host_pool: Optional[PageInterleaveHostPool] = None
+
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -878,6 +882,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if isinstance(mem_pool_host, PageInterleaveHostPool):
+            self.kv_shard_host_pool = mem_pool_host
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
@@ -1461,7 +1467,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
-            return self._batch_io_v2(transfers, is_set=False)
+            return self._on_owned_transfers(
+                transfers, lambda owned: self._batch_io_v2(owned, is_set=False)
+            )
 
     def batch_set_v2(
         self,
@@ -1475,7 +1483,46 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             session_id = (
                 (extra_info.extra_info or {}).get("session_id") if extra_info else None
             )
-            return self._batch_io_v2(transfers, is_set=True, session_id=session_id)
+            return self._on_owned_transfers(
+                transfers,
+                lambda owned: self._batch_io_v2(
+                    owned, is_set=True, session_id=session_id
+                ),
+            )
+
+    def _on_owned_transfers(self, transfers: List[PoolTransfer], io) -> dict:
+        """Logical-page KV sharding: run ``io`` on this rank's pages only, as
+        local host rows. A page another rank owns reports success: its owner
+        moves it, and the controller reduces the ranks' prefixes with MIN."""
+        pool = self.kv_shard_host_pool
+        if pool is None:
+            return io(transfers)
+        owned, positions = [], {}
+        for transfer in transfers:
+            pages, rows = pool.owned_storage_pages(transfer.host_indices)
+            positions[transfer.name] = (pages, len(transfer.keys))
+            if pages:
+                keys = [transfer.keys[i] for i in pages]
+                owned.append(replace(transfer, keys=keys, host_indices=rows))
+        owned_results = io(owned) if owned else {}
+        results = {}
+        for name, (pages, num_pages) in positions.items():
+            results[name] = [True] * num_pages
+            for page, ok in zip(pages, owned_results.get(name, ())):
+                results[name][page] = ok
+        return results
+
+    def _on_owned_pages(self, keys: List[str], host_indices: torch.Tensor, io):
+        """``_on_owned_transfers`` for a KV batch of the anchor pool."""
+        pool = self.kv_shard_host_pool
+        if pool is None:
+            return io(keys, host_indices)
+        pages, rows = pool.owned_storage_pages(host_indices)
+        results = [True] * len(keys)
+        if pages:
+            for page, ok in zip(pages, io([keys[i] for i in pages], rows)):
+                results[page] = ok
+        return results
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1614,6 +1661,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        return self._on_owned_pages(
+            keys,
+            host_indices,
+            lambda owned, rows: self._batch_get_v1(owned, rows, extra_info),
+        )
+
+    def _batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> List[bool]:
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1650,6 +1709,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        return self._on_owned_pages(
+            keys,
+            host_indices,
+            lambda owned, rows: self._batch_set_v1(owned, rows, extra_info),
+        )
+
+    def _batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo],
     ) -> List[bool]:
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.

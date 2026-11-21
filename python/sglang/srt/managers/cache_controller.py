@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -900,6 +901,12 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        if isinstance(self.storage_host_pool, PageInterleaveHostPool):
+            # Logical-page KV sharding: a shard rank alone holds its pages, so
+            # every shard rank writes; under CP, attention-TP peers of one CP
+            # rank hold the same pages and its first one writes.
+            parallel = get_parallel()
+            return parallel.attn_cp_size > 1 and parallel.attn_tp_rank != 0
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(

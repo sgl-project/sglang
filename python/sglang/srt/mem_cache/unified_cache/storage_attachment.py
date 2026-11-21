@@ -14,13 +14,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
+from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_error
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -89,15 +90,17 @@ class StorageAttachment:
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
-        if page_interleave_shard_size(
-            cache.token_to_kv_pool_allocator
-        ) > 1 and not kv_shard_storage_backend_supported(storage_backend):
+        if page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1:
             # Runtime attach bypasses kv_shard_hook.py's startup validation.
-            return (
-                False,
-                "--enable-kv-cache-sharding does not support a HiCache storage "
-                "backend yet.",
+            error = kv_shard_storage_error(
+                storage_backend,
+                cache.host_memory_mode,
+                is_mla=isinstance(
+                    controller.storage_host_pool.host_pool, MLATokenToKVPoolHost
+                ),
             )
+            if error is not None:
+                return False, error
 
         # Write-back can retain auxiliary host rows without FULL, or backed
         # descendants below an unbacked FULL ancestor. Those states are invalid
