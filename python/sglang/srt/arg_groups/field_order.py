@@ -586,5 +586,9 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_persistence_config",
     "enable_hi_engram",
     "hi_engram_config",
+    "shortest_prefill_boundary_halving_chunks",
+    "shortest_prefill_boundary_decay_start_chunks",
+    "shortest_prefill_budget_min_ratio",
+    "shortest_prefill_budget_doubling_chunks",
 )
 # fmt: on
