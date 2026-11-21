@@ -100,8 +100,8 @@ def _moe(*, prepared: bool | None):
 
 
 def _toy_runtime() -> ExitStack:
-    """Replace only the external GEMM and distributed boundaries, and scale the
-    2048-token MXFP4 floor down to toy batches of 2 tokens."""
+    # Replace only the external GEMM and distributed boundaries,
+    # and scale the 2048-token MXFP4 floor down to toy batches of 2 tokens.
     stack = ExitStack()
     stack.enter_context(get_context().override_server_args(tp_size=1))
     stack.enter_context(get_parallel().override(tp_group=None))

@@ -91,8 +91,8 @@ class LatentMXFP4Projections(nn.Module):
             self.down_weight, self.down_scale = down, down_scale
             self.up_weight, self.up_scale = up, up_scale
             return
-        # A reload (e.g. a weight update) refills the copies in place: captured
-        # CUDA graphs hold their addresses.
+        # A reload (e.g. a weight update) refills the copies in place:
+        # captured CUDA graphs hold their addresses.
         for dst, src in (
             (self.down_weight, down),
             (self.down_scale, down_scale),

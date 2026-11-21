@@ -119,6 +119,12 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
                         scale=scale[:rows, : k // 32].contiguous(),
                     )
 
+    def test_rejects_activations_that_are_not_on_the_gpu(self):
+        _, packed, scale = self.projections[0]
+        x = torch.ones((1, 7168), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "scales must match"):
+            latent_mxfp4_aiter_hip.run(x=x, weight=packed.cpu(), scale=scale.cpu())
+
     def test_rejects_scales_that_are_not_e8m0(self):
         _, packed, scale = self.projections[0]
         x = torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device)
