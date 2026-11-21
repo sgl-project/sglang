@@ -4,6 +4,7 @@ import threading
 import unittest
 from collections import defaultdict
 from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -23,7 +24,9 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AbortNotification, AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori.conn import (
+    BatchTransferPlan,
     MoriKVManager,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
@@ -295,6 +298,44 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             bootstrap_room=11,
             failure_reason="Transfer submission failed: later target failed",
         )
+
+    def test_coalesced_post_failure_never_acks(self):
+        """A chunk's writes go out in one batch_write. If it raises, the entries
+        it already posted have no status to drain, so the room must never ACK."""
+        manager = _manager()
+        manager._coalesce_transfers = True
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status[11] = KVPoll.WaitingForInput
+        manager.transfer_infos[11] = {
+            "decode": SimpleNamespace(
+                engine_key="decode", is_dummy=False, dst_kv_indices=np.array([1])
+            )
+        }
+        manager.decode_kv_args_table = {
+            "decode": SimpleNamespace(requires_dcp_relayout=False)
+        }
+        plan = BatchTransferPlan([0], [0], [8])
+        manager.send_kvcache = lambda *args: [
+            status
+            for layer in ("0", "1")
+            for status in manager._submit_batch_transfer_plan(
+                "src" + layer, "dst" + layer, plan
+            )
+        ]
+        manager.engine = MagicMock()
+        manager.engine.batch_write.side_effect = RuntimeError("CreateSession failed")
+        manager.conclude_failure = MagicMock()
+        chunk = _chunk()
+        manager._mark_transfer_started(chunk)
+
+        with self.assertRaises(_MoriTransferSubmissionError) as raised:
+            manager._submit_transfer_chunk(chunk)
+        manager._handle_submission_failure(chunk, raised.exception)
+        manager._handle_abort_message(_abort_message())
+
+        manager.engine.batch_write.assert_called_once()
+        self.assertEqual(manager.engine.batch_write.call_args.args[0], ["src0", "src1"])
+        self.assertEqual(manager._sent, [])
 
     def test_drain_worker_retries_same_item_after_exception(self):
         manager = _manager()
