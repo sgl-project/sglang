@@ -17,6 +17,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
 )
 from sglang.srt.models.gemma import GemmaForCausalLM
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -116,6 +117,7 @@ class TestTensorUpdateRebuildsEachIpcTensorOnce(CustomTestCase):
                         [] if draft is None else [("draft", draft)]
                     )
                 ),
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
                 memory_saver_adapter=None,
                 flush_cache=flush_cache or (lambda **kwargs: True),
                 is_fully_idle=lambda **kwargs: True,

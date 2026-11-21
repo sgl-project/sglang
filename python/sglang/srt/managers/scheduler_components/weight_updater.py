@@ -145,6 +145,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
+    spec_algorithm: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -156,9 +157,17 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    # the same on every PP stage, unlike draft_worker: only the last stage hosts the draft runners
+    has_draft_model: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+        # NGRAM and UNO draft without a model of their own
+        self.has_draft_model = not (
+            self.spec_algorithm.is_none()
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_uno()
+        )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -244,8 +253,9 @@ class SchedulerWeightUpdaterManager:
         return runners
 
     def _empty_selection_error(self, selector: str) -> Optional[str]:
-        # a load into no runner would still succeed and record the weight version
-        if self._select_runners(selector):
+        # a load into no runner would still succeed and record the weight version;
+        # judged for the server, not this PP stage's runners, so every stage answers alike
+        if "target" in _parse_runner_selector(selector) or self.has_draft_model:
             return None
         return (
             f"selector {selector!r} selects no model runner; "

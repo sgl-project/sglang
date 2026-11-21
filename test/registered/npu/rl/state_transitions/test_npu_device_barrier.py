@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
     begin_weight_update,
@@ -72,6 +73,7 @@ def _make_manager(events):
         return SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
             draft_worker=None,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             memory_saver_adapter=SimpleNamespace(
                 pause=lambda tag: events.append(("pause", tag)),
                 resume=lambda tag: events.append(("resume", tag)),
