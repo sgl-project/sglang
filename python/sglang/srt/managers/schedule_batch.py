@@ -1657,6 +1657,8 @@ class Req(ReqDllmMixin):
             "return_logprob": False,
             "stream": False,
             "rid": self.rid,
+            # The recomputed KV must come from the same adapter as the original prefill.
+            "lora_path": self.lora_name,
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,

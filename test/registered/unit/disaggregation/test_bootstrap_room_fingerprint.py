@@ -17,7 +17,9 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
@@ -146,6 +148,60 @@ class TestEmbeddingsInFingerprint(CustomTestCase):
             _decode_req(positional_embed_overrides=override()),
             _prefill_req(positional_embed_overrides=override()),
         )
+        self.assertEqual(decode_fp, prefill_fp)
+
+
+def _real_decode_req(origin_input_ids, output_ids, lora_name=None):
+    """A real Req, so build_rebootstrap_payload and truncation run as in production."""
+    req = Req(
+        "decode",
+        "",
+        array("q", origin_input_ids),
+        SamplingParams(max_new_tokens=8),
+        vocab_size=128,
+        bootstrap_host="10.0.0.9",
+        bootstrap_port=8998,
+        bootstrap_room=ROOM,
+    )
+    req.lora_name = lora_name
+    req.output_ids = list(output_ids)
+    return req
+
+
+def _prefill_req_from_payload(payload, max_req_input_len=1 << 20):
+    """The prefill request a rebootstrap /generate payload turns into.
+
+    The tokenizer maps the payload's lora_path to lora_name, see TokenizerManager._tokenize_one_request.
+    The receiving scheduler then validates the length as Scheduler._handle_generate_request does.
+    """
+    req = Req(
+        "prefill",
+        "",
+        array("q", payload["input_ids"]),
+        SamplingParams(max_new_tokens=1),
+        vocab_size=128,
+        bootstrap_host=payload["bootstrap_host"],
+        bootstrap_port=payload["bootstrap_port"],
+        bootstrap_room=payload["bootstrap_room"],
+    )
+    req.lora_name = payload.get("lora_path")
+    error = validate_input_length(req, max_req_input_len, allow_auto_truncate=True)
+    assert error is None, error
+    return req
+
+
+class TestRebootstrapFingerprint(CustomTestCase):
+    def _rebootstrap_fingerprints(self, decode_req, max_req_input_len=1 << 20):
+        payload = Req.build_rebootstrap_payload(decode_req)
+        prefill_req = _prefill_req_from_payload(payload, max_req_input_len)
+        return _fingerprints(decode_req, prefill_req, is_rebootstrap=True)
+
+    def test_lora_rebootstrap_agrees(self):
+        decode_req = _real_decode_req(PROMPT * 10, [7, 8], lora_name="adapter-a")
+        self.assertEqual(
+            Req.build_rebootstrap_payload(decode_req)["lora_path"], "adapter-a"
+        )
+        decode_fp, prefill_fp = self._rebootstrap_fingerprints(decode_req)
         self.assertEqual(decode_fp, prefill_fp)
 
 
