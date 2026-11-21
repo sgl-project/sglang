@@ -985,6 +985,10 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if insert_params.mamba_explicit_snapshot is not None:
+            depth, slot = insert_params.mamba_explicit_snapshot
+            insert_params.mamba_value = slot
+            return depth
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -1079,6 +1083,13 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if (
+            insert_params is not None
+            and insert_params.mamba_explicit_snapshot is not None
+        ):
+            if insert_result is None or insert_result.mamba_exist:
+                self._free_mamba_value(insert_params.mamba_value)
+            return
         if self._mamba_host_only_checkpoint():
             self._release_unused_host_checkpoint(insert_result, insert_params)
         if is_finished:
