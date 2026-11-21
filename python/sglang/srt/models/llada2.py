@@ -53,7 +53,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
@@ -1059,6 +1059,7 @@ class LLaDA2MoeBlock(nn.Module):
             alt_stream=alt_stream,
         )
         self.layer_id = layer_id
+        self.is_last_layer = layer_id == config.num_hidden_layers - 1
 
         self.is_layer_sparse = self._is_layer_sparse(config, layer_id=layer_id)
 
@@ -1125,6 +1126,9 @@ class LLaDA2MoeBlock(nn.Module):
         )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        if self.is_last_layer and forward_batch.dllm_kv_only_prefill:
+            return hidden_states
+
         hidden_states = self.ffn_boundary.prepare(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -1207,6 +1211,11 @@ class LLaDA2MoeModel(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            if forward_batch.dllm_kv_only_prefill:
+                # The final attention has persisted KV. Discard its unused residual
+                # contribution before the batch can be reused for a denoising step.
+                residual_batch.clear(forward_batch)
+                return hidden_states
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = residual_batch.final_norm(
@@ -1253,6 +1262,8 @@ def _prepare_llada2_language_weights(
 
 
 class LLaDA2MoeModelLM(nn.Module):
+    supports_dllm_kv_only_prefill = True
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1326,6 +1337,8 @@ class LLaDA2MoeModelLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
+            if forward_batch.dllm_kv_only_prefill:
+                return LogitsProcessorOutput(next_token_logits=None)
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
             )
