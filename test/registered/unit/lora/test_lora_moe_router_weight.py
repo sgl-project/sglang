@@ -1,9 +1,11 @@
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
+from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
 from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -151,3 +153,21 @@ def test_build_lora_hooks_router_weight_numeric(
 
     torch.testing.assert_close(gate_up_out.float(), exp_gate_up, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(down_out.float(), exp_down, atol=1e-2, rtol=1e-2)
+
+
+def test_marlin_lora_runner_rejects_apply_router_weight_on_input():
+    with pytest.raises(NotImplementedError, match="apply_router_weight_on_input"):
+        MarlinLoraRunnerCore(SimpleNamespace(apply_router_weight_on_input=True))
+
+    runner = MarlinLoraRunnerCore(SimpleNamespace(apply_router_weight_on_input=False))
+    with pytest.raises(NotImplementedError, match="apply_router_weight_on_input"):
+        runner.run_from_dispatch(
+            dispatch_output=SimpleNamespace(),
+            quant_info=SimpleNamespace(),
+            runner_config=SimpleNamespace(apply_router_weight_on_input=True),
+            hooks=SimpleNamespace(),
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

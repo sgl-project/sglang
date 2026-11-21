@@ -11,11 +11,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import DispatchMoeRunnerCore, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -52,6 +52,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
     """
 
     def __init__(self, config: MoeRunnerConfig):
+        if config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "MarlinLoraRunnerCore does not support apply_router_weight_on_input=True."
+            )
         self.config = config
 
     @property
@@ -68,6 +72,10 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         assert hooks is not None, "hooks must be provided for MarlinLoraRunnerCore"
+        if runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "MarlinLoraRunnerCore does not support apply_router_weight_on_input=True."
+            )
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
