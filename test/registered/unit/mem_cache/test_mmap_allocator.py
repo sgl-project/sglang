@@ -314,7 +314,13 @@ class TestHugetlbPool(unittest.TestCase):
         # co-located ranks populate their pools concurrently, so only
         # free - resv can back a new mapping.
         pool_2mb = (6144 - 1000) * 2 * 1024**2
-        with tempfile.TemporaryDirectory() as root:
+        # The synthetic pool must not inherit the host container's cgroup limit.
+        with (
+            tempfile.TemporaryDirectory() as root,
+            unittest.mock.patch.object(
+                mmap_allocator, "cgroup_hugetlb_headroom_bytes", return_value=None
+            ),
+        ):
             self._sysfs(root, free_2mb=6144, free_1gb=3, resv_2mb=1000)
             with unittest.mock.patch.object(
                 mmap_allocator, "_HUGEPAGE_SYSFS_DIR", root

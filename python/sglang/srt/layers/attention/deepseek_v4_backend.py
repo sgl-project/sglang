@@ -4,6 +4,7 @@ import enum
 import functools
 import logging
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -109,6 +110,7 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
+from sglang.srt.layers.cp.cp_decode_attn_dp import cp_decode_query_layout
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
     interleave_rows_per_request,
@@ -1247,6 +1249,20 @@ class DSV4Metadata:
 
 
 @dataclass
+class DSV4DecodeDPMetadata(DSV4Metadata):
+    # Full-query and query-DP shapes must never share FlashMLA schedules.
+    decode_dp_flashmla_metadata: dict = field(default_factory=dict, repr=False)
+
+    def copy_(self, other: DSV4Metadata):
+        self.decode_dp_flashmla_metadata.clear()
+        super().copy_(other)
+
+    def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        self.decode_dp_flashmla_metadata.clear()
+        super().refresh_for_breakable_cuda_graph_replay_(static_metadata)
+
+
+@dataclass
 class DSV4RawVerifyMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
@@ -1329,6 +1345,8 @@ class DeepseekV4AttnBackend(
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
     mega_attn: bool = False
+    use_cp_decode_attn_dp: bool = False
+    metadata_type = DSV4Metadata
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1350,6 +1368,12 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        self.use_cp_decode_attn_dp = (
+            not model_runner.is_draft_worker
+            and getattr(get_parallel(), "cp_decode_attn_mode", None) == "dp"
+        )
+        if self.use_cp_decode_attn_dp:
+            self.metadata_type = DSV4DecodeDPMetadata
         # Run at every KV store-location read; the DSpark deferred draft KV store
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
@@ -1832,7 +1856,7 @@ class DeepseekV4AttnBackend(
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
-        metadata = DSV4Metadata(
+        metadata = self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
@@ -2463,7 +2487,7 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
         rows_per_request = 1 if is_ragged else num_draft_tokens
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
@@ -2533,7 +2557,7 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=c1_indexer_metadata,
@@ -2594,7 +2618,7 @@ class DeepseekV4AttnBackend(
             # Captures store_cache's cached path instead of a per-layer
             # in-graph mapping translate.
             core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
-        return DSV4Metadata(
+        return self.metadata_type(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
         )
@@ -3575,6 +3599,8 @@ class DeepseekV4AttnBackend(
         if isinstance(metadata, DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
+            if self.use_cp_decode_attn_dp:
+                metadata.decode_dp_flashmla_metadata.clear()
             core = metadata.core_attn_metadata
             core.c0_flashmla_metadata = _create_flashmla_metadata()
             if core.has_c4:
@@ -3695,7 +3721,23 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            layout = (
+                cp_decode_query_layout(forward_batch, x.shape[0])
+                if self.use_cp_decode_attn_dp
+                else None
+            )
+            if layout is None:
+                self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            elif layout.actual_rows:
+                self._low_ratio_index_topk(
+                    layer,
+                    layout.select(x, pad=False),
+                    layout.select(q_lora, pad=False),
+                    layout.select(req, pad=False),
+                    layout.select(pos, pad=False),
+                    forward_batch,
+                    query_rows=layout.query_rows,
+                )
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -4101,6 +4143,7 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        query_rows=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -4119,7 +4162,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, mode, query_rows=query_rows
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -4165,7 +4208,9 @@ class DeepseekV4AttnBackend(
             inputs, self.forward_metadata.candidate_metadata
         )
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, mode, *, query_rows=None
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -4173,6 +4218,14 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+        output = self.forward_metadata.core_metadata.sparse_page_indices(ratio)
+        if query_rows is not None:
+            # Do not run PagedIndexerMetadata.__post_init__: SM90's DeepSelect
+            # needs just the corresponding page rows and the same static width.
+            metadata = copy(metadata)
+            metadata.page_table = metadata.page_table[query_rows]
+            metadata.compressed_seq_lens = metadata.compressed_seq_lens[query_rows]
+            output = output[query_rows]
         return DecodeInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -4184,9 +4237,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
-            out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
-                ratio
-            ),
+            out_page_indices=output,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
@@ -4394,6 +4445,7 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        query_layout=None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -4450,16 +4502,27 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
             def match_num_queries(x, value):
-                if x is None or x.shape[0] == q.shape[0]:
+                rows = query_layout.rows if query_layout is not None else q.shape[0]
+                if x is None or x.shape[0] == rows:
                     return x
-                if x.shape[0] > q.shape[0]:
-                    return x[: q.shape[0]]
-                return _pad_tensor_to_size(x, q.shape[0], value=value)
+                if x.shape[0] > rows:
+                    return x[:rows]
+                return _pad_tensor_to_size(x, rows, value=value)
 
             swa_page_indices = match_num_queries(swa_page_indices, value=0)
             swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
+            if query_layout is not None:
+                # Metadata may omit model padding rows. Normalize its global
+                # shape first, then apply this rank's actual row offset.
+                swa_page_indices = query_layout.select(swa_page_indices)
+                swa_topk_lengths = query_layout.select(swa_topk_lengths, value=1)
+                if extra_indices is not None:
+                    extra_indices = query_layout.select(extra_indices, value=-1)
+                    extra_topk_lengths = query_layout.select(
+                        extra_topk_lengths, value=1
+                    )
 
             if self.trtllm_attn:
                 # The uniform-FP8 pool is readable only by trtllm-gen.
@@ -4485,6 +4548,11 @@ class DeepseekV4AttnBackend(
             assert attn_sink is not None
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
+            if query_layout is not None:
+                schedules = metadata.decode_dp_flashmla_metadata
+                if compress_ratio not in schedules:
+                    schedules[compress_ratio] = _create_flashmla_metadata()
+                flashmla_metadata = schedules[compress_ratio]
 
             assert swa_page_indices.shape[-1] % 64 == 0, (
                 f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
