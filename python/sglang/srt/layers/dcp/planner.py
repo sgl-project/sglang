@@ -119,9 +119,17 @@ def prepare_decode_context_parallel_metadata(
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
     runner_ids = get_attn_backend().runner_ids
     if interleave_size == 1:
-        # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
+        # Prefill rows are dcp_size-aligned (widened allocator page) so no
+        # nonzero(), but a mixed batch's decode rows are not; cut each row
+        # from its own (zero) start with the same helper as the interleave
+        # branch below.
         dcp_local_prefix_kv_indices = runner_ids.translate_dcp_read_ids(
-            dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
+            filter_dcp_local_chunk_kv_indices(
+                dcp_prefix_kv_indices,
+                torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),
+                torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64),
+                interleave_size=interleave_size,
+            )
         )
     else:
         # Interleaved pools are written rank-local, never through translated ids.
