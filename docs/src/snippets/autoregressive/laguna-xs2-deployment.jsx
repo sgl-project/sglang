@@ -13,7 +13,8 @@ export const LagunaXS2Deployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
-        { id: 'b200', label: 'B200/GB200', default: false }
+        { id: 'b200', label: 'B200/GB200', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
@@ -23,6 +24,11 @@ export const LagunaXS2Deployment = () => {
         { id: 'bf16',  label: 'BF16',  default: true },
         { id: 'fp8',   label: 'FP8',   default: false },
         { id: 'nvfp4', label: 'NVFP4', default: false }
+      ],
+      getDynamicItems: (values) => [
+        { id: 'bf16', label: 'BF16', default: true },
+        { id: 'fp8', label: 'FP8', default: false, disabled: values.hardware === 'xeon' },
+        { id: 'nvfp4', label: 'NVFP4', default: false, disabled: values.hardware === 'xeon' }
       ]
     },
     reasoning: {
@@ -44,6 +50,7 @@ export const LagunaXS2Deployment = () => {
     dpAttention: {
       name: 'dpAttention',
       title: 'DP Attention',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',     default: true },
         { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput', default: false }
@@ -103,6 +110,9 @@ export const LagunaXS2Deployment = () => {
           if (fallback) next[key] = fallback.id;
         }
       });
+      if (next.hardware === 'xeon') {
+        next.dpAttention = 'disabled';
+      }
       return next;
     });
   };
@@ -117,7 +127,7 @@ export const LagunaXS2Deployment = () => {
     const modelId = modelByQuant[quantization];
     if (!modelId) return `# Error: Unknown quantization: ${quantization}`;
 
-    const tp = 8;
+    const tp = hardware !== 'xeon' ? 8 : 4;
     const lines = [
       'sglang serve \\',
       `  --model-path ${modelId} \\`,
@@ -140,6 +150,13 @@ export const LagunaXS2Deployment = () => {
       lines.push('  --tool-call-parser poolside_v1');
     }
 
+    if (hardware === 'xeon') {
+      if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
+      lines[lines.length - 1] += ' \\';
+      lines.push('  --disable-overlap-schedule \\');
+      lines.push('  --device cpu')
+    }
+
     lines[lines.length - 1] += ' \\';
     lines.push('  --host 0.0.0.0 \\');
     lines.push('  --port 30000');
@@ -160,6 +177,7 @@ export const LagunaXS2Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (option.condition && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>

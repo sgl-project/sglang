@@ -5,6 +5,7 @@ export const InternS2PreviewDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
+        { id: 'xeon', label: 'XEON', default: false },
       ],
     },
     reasoning: {
@@ -64,24 +65,34 @@ export const InternS2PreviewDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.mtp = 'disabled';
+      }
+      return next;
+    });
   };
 
   const generateCommand = () => {
     const { reasoning, toolcall, mtp } = values;
-    const tpValue = 8;
+    const tpValue = values.hardware !== 'xeon' ? 8 : 4;
 
     const flags = [];
     flags.push('  --model-path internLM/Intern-S2-Preview');
     flags.push(`  --tp ${tpValue}`);
     if (reasoning === 'enabled') flags.push('  --reasoning-parser qwen3');
     if (toolcall === 'enabled') flags.push('  --tool-call-parser qwen3_coder');
-    if (mtp === 'enabled') {
+    if (mtp === 'enabled' && values.hardware !== 'xeon') {
       flags.push('  --mamba-radix-cache-strategy extra_buffer');
       flags.push("  --speculative-algo 'NEXTN'");
       flags.push('  --speculative-eagle-topk 1');
       flags.push('  --speculative-num-steps 3');
       flags.push('  --speculative-num-draft-tokens 4');
+    }
+    if (values.hardware === 'xeon') {
+      flags.push('  --device cpu');
+      flags.push('  --disable-overlap-schedule')
     }
     flags.push('  --mem-fraction-static 0.8');
     flags.push('  --host 0.0.0.0');
@@ -123,6 +134,7 @@ export const InternS2PreviewDeployment = () => {
     color: isDark ? '#e5e7eb' : 'inherit',
   };
   const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
+  const disabledStyle = { opacity: 0.45, cursor: 'not-allowed' };
   const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
   const commandDisplayStyle = {
     flex: 1,
@@ -147,13 +159,20 @@ export const InternS2PreviewDeployment = () => {
           <div style={itemsStyle}>
             {option.items.map((item) => {
               const isChecked = values[option.name] === item.id;
+              const isDisabled = values.hardware === 'xeon' && key === 'mtp' && item.id === 'enabled';
+              const labelStyle = {
+                ...labelBaseStyle,
+                ...(isChecked ? checkedStyle : {}),
+                ...(isDisabled ? disabledStyle : {}),
+              };
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label key={item.id} style={labelStyle}>
                   <input
                     type="radio"
                     name={option.name}
                     value={item.id}
                     checked={isChecked}
+                    disabled={isDisabled}
                     onChange={() => handleRadioChange(option.name, item.id)}
                     style={{ display: 'none' }}
                   />
