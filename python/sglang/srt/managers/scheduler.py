@@ -532,6 +532,8 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # Class-level default so stub schedulers built via __new__ skip the GC freeze.
+    gc_freezer: Optional[GCFreezer] = None
 
     def __init__(
         self,
@@ -2863,9 +2865,13 @@ class Scheduler(
         )
 
     def init_gc_freezer(self) -> None:
-        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        """Freeze the heap when idle or every N batches; warn on heap growth and
+        frozen garbage."""
+        device = get_device()
         self.gc_freezer = GCFreezer(
-            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
+            freeze_on_idle_secs=device.gc_freeze_on_idle_secs,
+            freeze_after_batches=device.gc_freeze_after_batches,
+            freeze_every_batches=device.gc_freeze_every_batches,
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -5123,6 +5129,8 @@ class Scheduler(
         carries to `_on_step_processed`."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
+        if self.gc_freezer is not None:
+            self.gc_freezer.on_batch(self.forward_ct)
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
