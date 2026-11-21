@@ -219,6 +219,7 @@ impl CacheAwarePolicy {
         engines: &'e [Arc<Worker>],
         request: &PickRequest<'_>,
         uncached: &HashMap<&str, u64>,
+        media_winners: &[String],
         load: &EngineReportedLoadSnapshot,
     ) -> Vec<Candidate<'e>> {
         let config = &self.config;
@@ -230,9 +231,10 @@ impl CacheAwarePolicy {
                 let matched = input - uncached_tokens;
                 let ratio = matched as f64 / input.max(1) as f64;
                 let hit = matched > 0
-                    && config
-                        .cache_affinity_min_matched_tokens
-                        .is_none_or(|min| matched >= min)
+                    && (media_winners.contains(&engine.url)
+                        || config
+                            .cache_affinity_min_matched_tokens
+                            .is_none_or(|min| matched >= min))
                     && config
                         .cache_affinity_min_match_ratio
                         .is_none_or(|min| ratio >= min);
@@ -324,7 +326,10 @@ impl Policy for CacheAwarePolicy {
             // Capture load after remote I/O; selection and admission share it.
             let load = self.engine_load.capture_snapshot(Instant::now());
             let uncached = uncached_by_url(signal.as_deref(), request.input_tokens);
-            let candidates = self.candidates(engines, request, &uncached, &load);
+            let media_winners = signal
+                .as_ref()
+                .map_or(&[][..], |s| s.media_winners.as_slice());
+            let candidates = self.candidates(engines, request, &uncached, media_winners, &load);
             let mut rejections = Vec::new();
             let admitted = self.admit(&candidates, &load, &mut rejections)?;
             let affinity = admitted.first().map(|c| Pick {
