@@ -632,6 +632,8 @@ class TestDPShutdownVote(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(
                     num_dp_ranks=2,
+                    attn_dp_size=2,
+                    pp_size=1,
                     attn_tp_size=1,
                     attn_cp_size=1,
                     dwdp_size=1,
@@ -794,6 +796,8 @@ class TestDPDrainColumn(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(
                     num_dp_ranks=2,
+                    attn_dp_size=2,
+                    pp_size=1,
                     attn_tp_size=1,
                     attn_cp_size=1,
                     dwdp_size=1,
@@ -849,6 +853,189 @@ class TestDPDrainColumn(CustomTestCase):
         self.assertEqual(info.tp0_info_cpu[:, 12].tolist(), [5])
 
 
+class TestDPStepCounter(CustomTestCase):
+    """A step that every attention-DP rank launches together gets the same id
+    on every rank, from that step's MLP-sync gather."""
+
+    @staticmethod
+    def _adapter(last_step_id: int = 0):
+        adapter = dp_attn.SchedulerDPAttnAdapter(
+            model_runner=SimpleNamespace(
+                prefill_cuda_graph_runner=None,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            ),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            offload_tags=set(),
+            model_config=None,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            get_require_mlp_sync=lambda: True,
+        )
+        adapter.step_counter.last = last_step_id
+        return adapter
+
+    @staticmethod
+    def _batch(forward_mode, num_reqs: int = 1, dp_step_id=None):
+        return SimpleNamespace(
+            forward_mode=forward_mode,
+            batch_size=lambda: num_reqs,
+            spec_info=None,
+            reqs=[SimpleNamespace(rid=f"req-{i}", seqlen=1) for i in range(num_reqs)],
+            seq_lens_cpu=None,
+            dp_balance_stats=None,
+            inner_idle_batch=None,
+            dp_step_id=dp_step_id,
+        )
+
+    def _gather(
+        self,
+        adapter,
+        batch,
+        *,
+        peer_tokens: int,
+        peer_last_step_id: int,
+        num_dp_ranks: int = 2,
+        attn_dp_size: int = 2,
+        pp_size: int = 1,
+        skip_gather: bool = False,
+        world_gather: bool = False,
+    ):
+        """One rank's gather against a peer row built from its own row."""
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
+        tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
+
+        def peer_row(local):
+            peer = local.clone()
+            peer[0] = peer[1] = peer_tokens
+            peer[13] = peer_last_step_id
+            return peer
+
+        def fake_exchange(output, local, group, **_):
+            output.copy_(torch.stack([local, peer_row(local)]).flatten())
+
+        def fake_all_reduce(tensor, op, group):
+            rows = tensor.view(2, -1)
+            rows[1] += peer_row(rows[0])
+
+        cpu_group = SimpleNamespace(
+            device_group=object(),
+            device="cpu",
+            cpu_group=object(),
+            active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+        )
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=world_gather),
+            patch.object(
+                dp_attn, "_resolve_elastic_world_num_dp_ranks", return_value=2
+            ),
+            patch.object(dist, "get_rank", return_value=0),
+            patch.object(dist, "all_reduce", side_effect=fake_all_reduce),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=num_dp_ranks,
+                    attn_dp_size=attn_dp_size,
+                    pp_size=pp_size,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    dwdp_size=1,
+                    tp_group=cpu_group,
+                    world_group=cpu_group,
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "cuda_graph_fully_disabled", return_value=True),
+            patch.object(dp_attn, "require_mlp_tp_gather", return_value=True),
+            patch.object(
+                dp_attn,
+                "get_schedule",
+                return_value=SimpleNamespace(disable_overlap_schedule=True),
+            ),
+            patch.object(
+                dp_attn.SchedulerDPAttnAdapter,
+                "get_idle_batch",
+                return_value=self._batch(ForwardMode.IDLE, num_reqs=0),
+            ),
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+        ):
+            return adapter.prepare_mlp_sync_batch(batch)
+
+    def test_ranks_whose_counts_differ_number_the_step_alike(self):
+        # One rank is behind (a replacement process that rejoined its slot);
+        # each sees the other's count in the gathered rows. The rank without
+        # requests runs an idle batch.
+        behind, ahead = self._adapter(3), self._adapter(10)
+        for expected in (11, 12):
+            sent_behind = behind.step_counter.last
+            sent_ahead = ahead.step_counter.last
+            busy = self._gather(
+                behind,
+                self._batch(ForwardMode.DECODE, num_reqs=2),
+                peer_tokens=0,
+                peer_last_step_id=sent_ahead,
+            )
+            idle = self._gather(
+                ahead, None, peer_tokens=2, peer_last_step_id=sent_behind
+            )
+            self.assertTrue(idle.forward_mode.is_idle())
+            self.assertEqual((busy.dp_step_id, idle.dp_step_id), (expected, expected))
+
+    def test_a_gather_that_launches_no_step_uses_no_id(self):
+        # An idle engine keeps gathering, and with speculative decoding one
+        # iteration can gather twice: only the gather that launches numbers.
+        adapter = self._adapter()
+        self.assertIsNone(
+            self._gather(adapter, None, peer_tokens=0, peer_last_step_id=0)
+        )
+        launched = self._gather(
+            adapter, self._batch(ForwardMode.DECODE), peer_tokens=0, peer_last_step_id=0
+        )
+        self.assertEqual(launched.dp_step_id, 1)
+
+    def test_prebuilt_batch_carries_the_id_only_when_peers_launch_too(self):
+        # The scheduler runs and reports the prebuilt batch, not the inner
+        # idle batch that syncs with the peers; and the batch object outlives a
+        # step, so an id from an earlier step must not stay on it.
+        adapter = self._adapter(5)
+        batch = self._batch(ForwardMode.PREBUILT, dp_step_id=5)
+        self._gather(adapter, batch, peer_tokens=0, peer_last_step_id=5)
+        self.assertIsNone(batch.inner_idle_batch)
+        self.assertIsNone(batch.dp_step_id)
+        self._gather(adapter, batch, peer_tokens=3, peer_last_step_id=5)
+        self.assertTrue(batch.inner_idle_batch.forward_mode.is_idle())
+        self.assertEqual(batch.dp_step_id, 6)
+
+    def test_no_id_without_a_gather_across_attention_dp_ranks(self):
+        # No other rank is known to launch the same step, so a consumer must
+        # not be told to pair it: the batch loses the id of its previous step
+        # and no id is used up.
+        for name, config in (
+            ("one DP rank", dict(num_dp_ranks=1, attn_dp_size=1)),
+            ("gather skipped by configuration", dict(skip_gather=True)),
+            ("replicas of a non-attention DP deployment", dict(attn_dp_size=1)),
+            ("pipeline parallel", dict(pp_size=2)),
+            ("elastic WORLD gather", dict(world_gather=True)),
+        ):
+            with self.subTest(name):
+                adapter = self._adapter(4)
+                batch = self._gather(
+                    adapter,
+                    self._batch(ForwardMode.DECODE, dp_step_id=4),
+                    peer_tokens=1,
+                    peer_last_step_id=9,
+                    **config,
+                )
+                self.assertIsNone(batch.dp_step_id)
+                self.assertEqual(adapter.step_counter.last, 4)
+
+
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)
 _EXCHANGE_ROUNDS = 4
 
@@ -892,6 +1079,7 @@ def _exchange_worker(rank, world, port, out_q):
                         round_idx == _EXCHANGE_ROUNDS - 1 and rank == sub - 1
                     ),
                     drain_state=(rank + round_idx) % 8,
+                    last_step_id=10 * rank + round_idx,
                 )
                 local = info._get_local_tensor(device="cpu")
                 reference = torch.zeros(sub * local.numel(), dtype=torch.int64)
@@ -922,6 +1110,7 @@ def _exchange_worker(rank, world, port, out_q):
                         info.can_run_decode_cuda_graph,
                         info.any_shutting_down,
                         info.tp0_info_cpu[:, 12].tolist(),
+                        info.tp0_info_cpu[:, 13].tolist(),
                     )
                 )
     finally:
@@ -953,17 +1142,8 @@ class TestSyncRowExchangeGloo(CustomTestCase):
             for proc in procs:
                 proc.start()
             for _ in range(sum(_EXCHANGE_WORLDS) * _EXCHANGE_ROUNDS):
-                sub, round_idx, rank, same, tokens, pairs, graph, stop, drain = (
-                    out_q.get(timeout=240)
-                )
-                results[(sub, round_idx, rank)] = (
-                    same,
-                    tokens,
-                    pairs,
-                    graph,
-                    stop,
-                    drain,
-                )
+                key = out_q.get(timeout=240)
+                results[key[:3]] = key[3:]
             for proc in procs:
                 proc.join(timeout=60)
                 self.assertEqual(proc.exitcode, 0)
@@ -976,7 +1156,7 @@ class TestSyncRowExchangeGloo(CustomTestCase):
         for sub in _EXCHANGE_WORLDS:
             for round_idx in range(_EXCHANGE_ROUNDS):
                 for rank in range(sub):
-                    same, tokens, pairs, graph, stop, drain = results[
+                    same, tokens, pairs, graph, stop, drain, step_ids = results[
                         (sub, round_idx, rank)
                     ]
                     self.assertTrue(
@@ -994,6 +1174,8 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     self.assertEqual(stop, round_idx == _EXCHANGE_ROUNDS - 1)
                     # Every rank's drain state, one row per DP rank.
                     self.assertEqual(drain, [(r + round_idx) % 8 for r in range(sub)])
+                    # Every rank's last step id, likewise.
+                    self.assertEqual(step_ids, [10 * r + round_idx for r in range(sub)])
 
 
 if __name__ == "__main__":
