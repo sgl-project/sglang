@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -121,7 +120,16 @@ def _mamba_host_row_bytes(params: CacheInitParams) -> int:
         params.token_to_kv_pool_allocator.state.pool,
         *params.mtp_draft_mamba_pools,
     )
-    return sum(_leaf_bytes(pool) // device_capacity_tokens(pool) for pool in pools)
+    # Unified views size host storage from their configured token cap, not the buffer.
+    return sum(
+        _leaf_bytes(pool)
+        // (
+            pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens
+        )
+        for pool in pools
+    )
 
 
 @contextmanager

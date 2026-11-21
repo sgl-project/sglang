@@ -177,11 +177,11 @@ class TestHiCacheAutoSize(CustomTestCase):
                 device="cpu",
             )
 
-        target = make_pool([0, 1], draft_tokens=4)
+        target = make_pool(layer_ids=[0, 1], draft_tokens=4)
         target.register_slot_state(
             NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
         )
-        draft = make_pool([2])
+        draft = make_pool(layer_ids=[2])
         kv = _leaf(
             Mock(
                 spec=MHATokenToKVPool,
@@ -211,7 +211,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         self.addCleanup(host.destroy)
         self.assertEqual(
-            sizing._estimate_hicache_bytes(params, None),
+            sizing._estimate_hicache_bytes(params=params, draft_plan=None),
             1024 + target.size * host.size_per_token,
         )
 

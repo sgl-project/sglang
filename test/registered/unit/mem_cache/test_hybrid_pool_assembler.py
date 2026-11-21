@@ -2207,7 +2207,7 @@ class TestMambaHostShare(CustomTestCase):
         )
 
     def _device_pools(self):
-        mamba_pool = self._make_pool([0, 1], draft_tokens=4)
+        mamba_pool = self._make_pool(layer_ids=[0, 1], draft_tokens=4)
         mamba_pool.register_slot_state(
             NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
         )
@@ -2221,7 +2221,7 @@ class TestMambaHostShare(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
         )
-        return mamba_pool, (self._make_pool([2]),), kv
+        return mamba_pool, (self._make_pool(layer_ids=[2]),), kv
 
     @staticmethod
     def _cache_params(drafts):
@@ -2240,7 +2240,6 @@ class TestMambaHostShare(CustomTestCase):
         )
 
     def _enter_host_patches(self, stack):
-        """Enter the context managers that let the stack build real Mamba host pools on CPU."""
         stack.enter_context(
             get_context().override_server_args(
                 enable_hierarchical_cache=True,

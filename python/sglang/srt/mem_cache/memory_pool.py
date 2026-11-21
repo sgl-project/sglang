@@ -1122,12 +1122,12 @@ class MambaPool:
     def host_capacity_bytes(self) -> int:
         # Host mirror bytes, including side states registered after __init__;
         # spec verify scratch and ReplaySSM rings are device-only, so excluded.
-        from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
-
-        return (
-            device_capacity_tokens(self)
-            * self._checkpoint_buffer_info().checkpoint_bytes_per_slot()
+        slots = (
+            self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens
         )
+        return slots * self._checkpoint_buffer_info().checkpoint_bytes_per_slot()
 
     def _checkpoint_buffer_info(self) -> MambaStateBufferInfo:
         from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
