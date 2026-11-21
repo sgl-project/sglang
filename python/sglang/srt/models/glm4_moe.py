@@ -90,7 +90,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_npu,
@@ -99,7 +98,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
@@ -584,7 +583,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if (
+                not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ) and not is_routed_scaling_factor_fused_in_topk(self.topk.topk_config):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -605,7 +606,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
+        if not _is_cuda and not is_routed_scaling_factor_fused_in_topk(
+            self.topk.topk_config
+        ):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(

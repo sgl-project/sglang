@@ -75,12 +75,7 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         config = _make_wna16_moe_config(PER_LAYER_EXPERT_TARGETS, num_bits=4)
         self._assert_wna16_moe(config, expected_bits=4)
 
-    def test_w4afp8_reads_matched_group_without_linear_target(self):
-        """W4AFP8 MoE loads a config whose groups target the experts by regex.
-
-        Such a config has no "Linear" entry; bits and group size then come from
-        the matched expert group.
-        """
+    def test_w4afp8_uses_the_matched_expert_group(self):
         config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
         config["config_groups"]["group_0"]["input_activations"] = {
             "num_bits": 8,
@@ -89,16 +84,21 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             "strategy": "token",
             "dynamic": True,
         }
-        quant_config = CompressedTensorsConfig.from_config(config)
-        self.assertNotIn("Linear", quant_config.target_scheme_map)
+        for has_linear in (False, True):
+            with self.subTest(has_linear=has_linear):
+                if has_linear:
+                    config["config_groups"]["linear"] = _make_wna16_moe_config(
+                        ["Linear"], num_bits=8, group_size=64
+                    )["config_groups"]["group_0"]
+                quant_config = CompressedTensorsConfig.from_config(config)
+                layer = torch.nn.Module()
+                scheme = quant_config.get_moe_scheme(layer, layer_name=EXPERTS_LAYER)
 
-        scheme = quant_config.get_moe_scheme(
-            torch.nn.Module(), layer_name=EXPERTS_LAYER
-        )
-
-        self.assertIsInstance(scheme, CompressedTensorsW4AFP8MoE)
-        self.assertEqual(scheme.num_bits, 4)
-        self.assertEqual(scheme.group_size, 128)
+                self.assertIsInstance(scheme, CompressedTensorsW4AFP8MoE)
+                scheme.create_weights(layer, 1, 4096, 256, torch.float16)
+                self.assertEqual(layer.w13_weight_packed.shape[-1], 512)
+                self.assertEqual(layer.w13_weight_scale.shape[-1], 32)
+                self.assertEqual(layer.w2_weight_scale.shape[-1], 2)
 
     def test_unsupported_bits_error_is_one_message(self):
         """The unsupported-bits error reads as a sentence, not a tuple repr."""

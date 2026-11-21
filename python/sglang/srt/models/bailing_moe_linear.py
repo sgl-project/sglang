@@ -954,12 +954,12 @@ class BailingMoELinearForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.lm_head = (
                 self.model.word_embeddings
-                if config.tie_word_embeddings
+                if config.tie_word_embeddings and self.pp_group.is_first_rank
                 else ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
                     params_dtype=torch.float32,
-                    quant_config=quant_config,
+                    quant_config=None if config.tie_word_embeddings else quant_config,
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             )
@@ -1331,6 +1331,13 @@ class BailingMoELinearForCausalLM(nn.Module):
                 continue
 
             weight_names.append(name)
+            if (
+                name == "model.word_embeddings.weight"
+                and self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and not self.pp_group.is_first_rank
+            ):
+                name = "lm_head.weight"
 
             if is_nextn:
                 if not name.startswith(nextn_layer_prefix):

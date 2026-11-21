@@ -13,7 +13,7 @@ from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import publish
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -75,6 +75,18 @@ class _ContextTestCase(CustomTestCase):
 
 
 class TestExaone4GetWeightsByName(_ContextTestCase):
+    def test_tp_replicated_kv_heads_return_the_local_rows(self):
+        with parallel_scope(tp_size=4, attn_tp_size=4):
+            model = _exaone4()
+            qkv = model.model.layers[0].self_attn.qkv_proj.weight.data
+            q, k, v = qkv.split(HEAD_DIM, dim=0)
+            for proj, rows in (("q", q), ("k", k), ("v", v)):
+                with self.subTest(proj=proj):
+                    name = f"model.layers.0.self_attn.{proj}_proj.weight"
+                    self.assertEqual(
+                        model.get_weights_by_name(name, tp_size=4), rows.tolist()
+                    )
+
     def test_checkpoint_names_resolve_to_their_slice_of_the_packed_tensor(self):
         """A lookup by checkpoint name (q_proj, up_proj, ...) returns that
         tensor's rows of the packed parameter, not None."""

@@ -606,20 +606,16 @@ class Exaone4ForCausalLM(nn.Module):
             param = params_dict[mapped_name]
             if mapped_shard_id is not None:
                 if mapped_shard_id in ["q", "k", "v"]:
-                    num_heads = self.config.num_attention_heads // tp_size
-                    num_kv_heads = self.config.num_key_value_heads // tp_size
-                    head_dim = (
-                        self.config.hidden_size // self.config.num_attention_heads
-                    )
+                    attn = self.get_submodule(mapped_name.rsplit(".", 2)[0])
                     if mapped_shard_id == "q":
                         offset = 0
-                        size = num_heads * head_dim
+                        size = attn.q_size
                     elif mapped_shard_id == "k":
-                        offset = num_heads * head_dim
-                        size = num_kv_heads * head_dim
+                        offset = attn.q_size
+                        size = attn.kv_size
                     elif mapped_shard_id == "v":
-                        offset = (num_heads + num_kv_heads) * head_dim
-                        size = num_kv_heads * head_dim
+                        offset = attn.q_size + attn.kv_size
+                        size = attn.kv_size
                     weight = param.data.narrow(0, offset, size)
                 elif mapped_shard_id in [0, 1]:
                     intermediate_size = self.config.intermediate_size
