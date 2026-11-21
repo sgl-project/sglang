@@ -196,6 +196,25 @@ def _worker() -> int:
                 f"({list(usp._A2A_STAGING_BUFFERS)}, {len(IPC_A2A.staging)} IPC pairs)"
             )
 
+        # a new shape the pool already covers is checked the same way, but
+        # keeps the pool (each rank has room for both) instead of re-sharing
+        # every buffer over IPC
+        pool = IPC_A2A_MULTI.pools.get(torch.bfloat16)
+        checked = len(IPC_A2A_MULTI.verified)
+        q, k, v = (shard(1, s_local + 32, heads, 70 + i) for i in range(3))
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = 2
+        with torch.inference_mode(), set_forward_context(0, None, None):
+            layer(q, k, v)
+        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = -1
+        if len(IPC_A2A_MULTI.verified) != checked + 1:
+            failures.append(f"{name}: a new shape within the pool was not checked")
+        if pool is None or IPC_A2A_MULTI.pools.get(torch.bfloat16) is not pool:
+            failures.append(f"{name}: a first sight within the pool rebuilt it")
+        if usp._A2A_STAGING_BUFFERS or IPC_A2A.staging:
+            failures.append(
+                f"{name}: the in-pool first-sight check left sequential staging behind"
+            )
+
     # a comparison where every arm quietly fell back would pass while testing
     # nothing: the pipeline must have run and verified every layout
     if not ran:

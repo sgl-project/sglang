@@ -19,6 +19,7 @@ of slots (see ``_PipelinePool``).
 import dataclasses
 import functools
 import logging
+import math
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -52,6 +53,10 @@ _MIN_GROUP_WAVES = 3
 # below, 30 us per peer loses to NCCL's one kernel. Pairs have ipc_a2a; larger
 # groups are not measured
 _AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
+# A pool that grows takes this much more than the call needs: every regrowth
+# re-shares the buffers over IPC (0.38 s of cudaIpcOpenMemHandle on 8 x B300),
+# and requests differ by a few percent.
+_POOL_HEADROOM = 1.25
 
 
 @functools.lru_cache(maxsize=None)
@@ -575,7 +580,8 @@ class IpcA2AMultiState:
         only if every rank sees the same bytes, so a backend that does not
         treat a head group as it treats those heads in the full call never
         changes a result. It runs the sequential exchange first, with the
-        pool released, so that call never holds both at once.
+        pool released so that call never holds both at once, unless the pool
+        already covers this call and every rank has room for both.
         """
         world, r = self.world, self.rank
         filled = fill is not None or fill_all is not None
@@ -624,31 +630,45 @@ class IpcA2AMultiState:
         if pool is not None:
             sizes = tuple(map(max, sizes, pool.sizes))
         reference = None
-        if pool is None or pool.sizes != sizes or check is not None:
+        grow = pool is None or pool.sizes != sizes
+        if grow:
+            sizes = (
+                math.ceil(sizes[0] * _POOL_HEADROOM),
+                math.ceil(sizes[1] * _POOL_HEADROOM),
+                sizes[2],
+            )
+        if grow or check is not None:
             if torch.cuda.is_current_stream_capturing() or key in self.declined:
                 return None
             esz = q.element_size()
-            held = 0 if pool is None else pool.nbytes(esz)
             need = (sizes[0] + sizes[1]) * esz
             if filled:
                 need += plan.world * groups * slots.send_numel * esz
-            if auto and not self._fits_on_every_rank(need, reclaimable=held):
-                logger.info(
-                    "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
-                    "sequential exchange for this shape",
-                    need / 2**30,
-                )
-                self.declined.add(key)
-                return None
-            if pool is not None:
-                # queued copies may still target the old mappings
-                torch.cuda.synchronize()
-                del self.pools[q.dtype]
-                pool = None
-                self._release_shared()
+            # A first sight the pool already covers keeps the pool through the
+            # sequential reference when every rank has room for both: dropping
+            # it re-shares every buffer over IPC, 0.17-0.23 s per new shape on
+            # 4 x B300.
+            keep = not grow and self._fits_on_every_rank(need)
+            if not keep:
+                held = 0 if pool is None else pool.nbytes(esz)
+                if auto and not self._fits_on_every_rank(need, reclaimable=held):
+                    logger.info(
+                        "Ulysses pipeline buffers (%.1f GiB) do not fit; using the "
+                        "sequential exchange for this shape",
+                        need / 2**30,
+                    )
+                    self.declined.add(key)
+                    return None
+                if pool is not None:
+                    # queued copies may still target the old mappings
+                    torch.cuda.synchronize()
+                    del self.pools[q.dtype]
+                    pool = None
+                    self._release_shared()
             if check is not None:
                 reference = sequential()
-            pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
+            if pool is None:
+                pool = self.pools[q.dtype] = _PipelinePool(self, q.dtype, *sizes)
         if self.pipe_in is None:
             self.pipe_in = torch.cuda.Stream()
         while len(self.pipe_group_streams) < groups:

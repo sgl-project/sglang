@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import math
 import os
 import subprocess
 import sys
@@ -287,19 +288,19 @@ def _worker() -> int:
         layout_case(1, 40, 16, 16, 0, 11, True, 2, 330 + call)
         layout_case(2, 40, 16, 8, 5, 5, True, 2, 340 + call)
 
-    # one pool per dtype serves every plan above, sized for the largest of them
+    # the auto-group case grows both buffers to their widest plan plus 25% headroom
     pools = IPC_A2A_MULTI.pools
     if list(pools) != [torch.bfloat16]:
         failures.append(f"pipeline pools per dtype: {list(pools)}")
     else:
         slots = list(IPC_A2A_MULTI.slots.values())
-        widest = (
-            max(s.in_total for s in slots),
-            max(s.out_total for s in slots),
+        expected = (
+            math.ceil(max(s.in_total for s in slots) * 1.25),
+            math.ceil(max(s.out_total for s in slots) * 1.25),
             max(s.plan.groups for s in slots),
         )
-        if pools[torch.bfloat16].sizes != widest:
-            failures.append(f"pool sizes {pools[torch.bfloat16].sizes} != {widest}")
+        if pools[torch.bfloat16].sizes != expected:
+            failures.append(f"pool sizes {pools[torch.bfloat16].sizes} != {expected}")
 
     # one set of slots is enough: a peer cannot write a call's rows or output
     # blocks before this rank has read the previous call's, however far ahead
