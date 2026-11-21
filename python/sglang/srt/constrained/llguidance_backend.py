@@ -181,9 +181,9 @@ class GuidanceGrammar(BaseGrammarObject):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             apply_token_bitmask_inplace(logits, vocab_mask)
 
@@ -209,8 +209,9 @@ class GuidanceBackend(BaseGrammarBackend):
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
         eos_token_ids: Optional[Union[int, Iterable[int]]] = None,
+        cache_limit_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
 
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
