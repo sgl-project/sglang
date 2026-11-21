@@ -80,10 +80,6 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
                     )
                     with (
                         parallel_scope(tp_group=tp, attn_tp_group=attn),
-                        # ROCm CI enables AITER globally. These projections run on CPU.
-                        patch(
-                            "sglang.srt.layers.quantization.unquant._use_aiter", False
-                        ),
                         patch(
                             "sglang.srt.layers.linear.is_allocation_symmetric",
                             return_value=False,
