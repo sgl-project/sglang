@@ -474,13 +474,17 @@ async def _maybe_url_image(
 _MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
+class _ImageDownloadTooLarge(ValueError):
+    pass
+
+
 async def _download_capped_to_temp_file(
     response: httpx.Response, directory: str
 ) -> str:
     too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
     declared = response.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
-        raise ValueError(too_large)
+        raise _ImageDownloadTooLarge(too_large)
     fd, part_path = tempfile.mkstemp(dir=directory)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -488,7 +492,7 @@ async def _download_capped_to_temp_file(
             async for chunk in response.aiter_bytes():
                 total += len(chunk)
                 if total > _MAX_IMAGE_DOWNLOAD_BYTES:
-                    raise ValueError(too_large)
+                    raise _ImageDownloadTooLarge(too_large)
                 await asyncio.to_thread(f.write, chunk)
     except BaseException:
         os.remove(part_path)
@@ -516,12 +520,11 @@ async def _save_url_image_to_path(
             ),
         )
 
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
     max_attempts = 3
     backoff_seconds = 0.2
 
     try:
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for attempt in range(1, max_attempts + 1):
                 part_path = None
@@ -580,12 +583,11 @@ async def _save_url_image_to_path(
                         raise
                     wait_s = backoff_seconds * (2 ** (attempt - 1))
                     logger.warning(
-                        "Retrying image download (%s/%s) for %s after %.1fs due to: %s",
+                        "Retrying image download (%s/%s) after %.1fs (%s)",
                         attempt,
                         max_attempts,
-                        image_url,
                         wait_s,
-                        e,
+                        type(e).__name__,
                     )
                     await asyncio.sleep(wait_s)
                 finally:
@@ -593,7 +595,18 @@ async def _save_url_image_to_path(
                         with suppress(FileNotFoundError):
                             os.remove(part_path)
     except Exception as e:
-        raise Exception(f"Failed to download image from URL {image_url}: {e}")
+        if isinstance(e, _ImageDownloadTooLarge):
+            reason = str(e)  # Constructed locally from the configured limit.
+        elif isinstance(e, IsADirectoryError):
+            reason = "destination is a directory"
+        elif isinstance(e, httpx.HTTPStatusError):
+            reason = f"HTTP {e.response.status_code}"
+        elif isinstance(e, ValueError):
+            reason = "invalid or disallowed image source"
+        else:
+            reason = type(e).__name__
+    # Do not attach HTTPX's request/response or a raw filesystem exception.
+    raise RuntimeError(f"Failed to download image: {reason}") from None
 
 
 async def process_generation_batch(

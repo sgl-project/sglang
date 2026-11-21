@@ -706,9 +706,22 @@ def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
     assert set(tmp_path.iterdir()) == {target, part_dir}
 
 
+def test_image_download_http_error_reports_only_status(monkeypatch, tmp_path):
+    _patch_download(monkeypatch, tmp_path, lambda _: httpx.Response(403))
+    target = tmp_path / "in" / "image.png"
+    with pytest.raises(
+        RuntimeError, match=r"^Failed to download image: HTTP 403$"
+    ) as exc:
+        asyncio.run(
+            utils._save_url_image_to_path("https://x.test/a?sig=fixture", str(target))
+        )
+    assert exc.value.__context__ is None and exc.value.__cause__ is None
+    assert not list(target.parent.iterdir())
+
+
 @pytest.mark.parametrize("recover", [False, True])
 def test_image_download_retry_keeps_only_complete_output(
-    monkeypatch, tmp_path, recover
+    monkeypatch, tmp_path, caplog, recover
 ):
     """Failed attempts must leave neither partial files nor a truncated destination."""
     attempts = 0
@@ -728,12 +741,20 @@ def test_image_download_retry_keeps_only_complete_output(
     part_dir = _patch_download(monkeypatch, tmp_path, handler)
     target = tmp_path / "image.png"
     target.write_bytes(b"existing image")
-    request = utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    request = utils._save_url_image_to_path(
+        "https://x.test/a.png?signature=synthetic-private-marker", str(target)
+    )
     if recover:
         assert asyncio.run(request) == str(target)
     else:
-        with pytest.raises(Exception, match="incomplete response"):
+        with pytest.raises(
+            RuntimeError, match=r"^Failed to download image: ReadError$"
+        ) as exc:
             asyncio.run(request)
+        assert exc.value.__context__ is None and exc.value.__cause__ is None
+    assert sum("Retrying image download" in msg for msg in caplog.messages) == 2
+    assert "synthetic-private-marker" not in caplog.text
+    assert "incomplete response" not in caplog.text
     assert attempts == 3
     assert target.read_bytes() == (b"complete image" if recover else b"existing image")
     assert not list(part_dir.iterdir())
