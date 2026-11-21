@@ -4,7 +4,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import os
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,6 +21,7 @@ from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
 from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
+from sglang.srt.models.kimi_k3_amd import env_defaults
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
@@ -265,6 +268,40 @@ class TestHipFusedDecodeArming(CustomTestCase):
         with mock.patch.object(kimi_k3, "print_warning_once") as warn:
             self.assertIsNone(KimiK3DeltaAttention._fused_decode_f_b_weight(attention))
         warn.assert_called_once()
+
+
+class TestKimiK31RocmEnvDefaults(CustomTestCase):
+    """Kimi-K3.1 turns radix-4 top-k on unless the user set either of its names."""
+
+    def _radix4_after_defaults(self, **env):
+        # AITER_CONFIG_GEMM_BF16 and AITER_OPUS_STAGE2_FP8 are preset so the
+        # defaults skip the tuned-table install.
+        names = {"AITER_CONFIG_GEMM_BF16": "x", "AITER_OPUS_STAGE2_FP8": "0", **env}
+        with mock.patch.dict(os.environ, names):
+            for name in ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK"):
+                if name not in names:
+                    os.environ.pop(name, None)
+            env_defaults.apply_kimi_k31_rocm_env_defaults()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                value = envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.get()
+        return value, [w.category for w in caught]
+
+    def test_default_is_on_when_neither_name_is_set(self):
+        self.assertTrue(self._radix4_after_defaults()[0])
+
+    def test_a_value_set_under_the_old_name_still_wins(self):
+        value, categories = self._radix4_after_defaults(SGLANG_K3_RADIX4_TOPK="0")
+
+        self.assertFalse(value)
+        self.assertIn(FutureWarning, categories)
+
+    def test_the_new_name_wins_over_the_old_one(self):
+        value, _ = self._radix4_after_defaults(
+            SGLANG_OPT_HIP_K3_RADIX4_TOPK="0", SGLANG_K3_RADIX4_TOPK="1"
+        )
+
+        self.assertFalse(value)
 
 
 if __name__ == "__main__":

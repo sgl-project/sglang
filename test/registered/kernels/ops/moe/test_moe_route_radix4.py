@@ -254,7 +254,7 @@ def test_select_experts_preserves_offset_fp32_bias(
     with (
         get_context().override_server_args(),
         envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
-        envs.SGLANG_K3_RADIX4_TOPK.override(radix4),
+        envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.override(radix4),
     ):
         weights, ids, _ = select_experts(
             torch.zeros((num_tokens, 8), device="cuda"), scores, config

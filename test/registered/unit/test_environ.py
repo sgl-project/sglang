@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -219,6 +220,41 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestOptRenamedEnvAliases(CustomTestCase):
+    """Pre-rename env names keep working with a FutureWarning."""
+
+    RENAMED = (
+        # (new name, old name, value set on the old name, parsed value)
+        ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True),
+        ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK", "1", True),
+    )
+
+    def test_old_name_forwards_with_warning(self):
+        for new_name, old_name, raw, expected in self.RENAMED:
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ.pop(new_name, None)
+                os.environ[old_name] = raw
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    self.assertEqual(field.get(), expected)
+                self.assertEqual(len(caught), 1)
+                self.assertIs(caught[0].category, FutureWarning)
+                self.assertIn(old_name, str(caught[0].message))
+                self.assertIn(new_name, str(caught[0].message))
+
+    def test_new_name_wins_without_warning(self):
+        for new_name, old_name, raw, _ in self.RENAMED:
+            field = vars(type(envs))[new_name]
+            with self.subTest(new_name=new_name), patch.dict(os.environ):
+                os.environ[old_name] = raw
+                with field.override(field.default):
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        self.assertEqual(field.get(), field.default)
+                    self.assertEqual(caught, [])
 
 
 class TestDocumentedBooleanKnobs(unittest.TestCase):

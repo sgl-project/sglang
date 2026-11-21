@@ -2,6 +2,8 @@
 
 import os
 
+from sglang.srt.environ import envs
+
 K31_BF16_TUNED_GEMM = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "kimi_k31_bf16_tuned_gemm.csv"
 )
@@ -12,8 +14,11 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     # AITER's opus MoE stage 2 otherwise stores per-slot down outputs in fp8 before the
     # top-k sum: 11x the error of the bf16 partials the reference keeps.
     os.environ.setdefault("AITER_OPUS_STAGE2_FP8", "0")
-    # the same experts as AITER's biased top-k, in under half its time
-    os.environ.setdefault("SGLANG_K3_RADIX4_TOPK", "1")
+    # the same experts as AITER's biased top-k, in under half its time; a value set
+    # under the deprecated name still wins
+    radix4_topk = envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK
+    if not radix4_topk.is_set() and radix4_topk.deprecated_name not in os.environ:
+        radix4_topk.set(True)
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         from sglang.srt.utils.aiter_tuned_tables import GEMM_BF16, install_intree_table
 

@@ -176,7 +176,7 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
         aggregate_stream_hip,
