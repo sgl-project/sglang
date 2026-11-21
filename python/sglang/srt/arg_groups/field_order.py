@@ -584,5 +584,6 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_skip_first_ngram_calls",
     "cuda_graph_persistence",
     "cuda_graph_persistence_config",
+    "_prefill_delayer_max_delay_passes_explicitly_set",
 )
 # fmt: on

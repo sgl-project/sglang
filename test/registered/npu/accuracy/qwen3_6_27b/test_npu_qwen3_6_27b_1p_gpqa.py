@@ -67,6 +67,8 @@ QWEN3_6_27B_64K_PREFIX_OTHER_ARGS = [
     0.5,
     "--prefill-delayer-max-delay-ms",
     30000,
+    "--prefill-delayer-max-delay-passes",
+    30,
     "--dtype",
     "bfloat16",
     "--mamba-ssm-dtype",

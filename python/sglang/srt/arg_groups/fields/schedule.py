@@ -253,8 +253,13 @@ class Schedule(msgspec.Struct):
     ] = False
     prefill_delayer_max_delay_passes: A[
         int,
-        "Maximum forward passes to delay prefill.",
+        "Maximum forward passes to delay prefill. Queue-triggered delays are "
+        "bounded by --prefill-delayer-max-delay-ms, and by this only when it "
+        "is set explicitly.",
     ] = 30
+    # The value alone cannot distinguish the default from an explicit 30,
+    # which also bounds queue-triggered delays.
+    _prefill_delayer_max_delay_passes_explicitly_set: A[bool, Arg(no_cli=True)] = False
     prefill_delayer_token_usage_low_watermark: A[
         Optional[float], "Token usage low watermark for prefill delayer."
     ] = None
@@ -271,9 +276,9 @@ class Schedule(msgspec.Struct):
         (
             "Opt-in to the adaptive queue-based delay trigger (independent of the "
             "slot-based one). Delays prefill until the waiting queue reaches "
-            "min(running_req * ratio, prefill_max_requests), falling back to the "
-            "observed max_prefill_bs when no request limit is set. Unset (default) "
-            "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
+            "min(running_req * ratio, prefill_max_requests), or until "
+            "--prefill-delayer-max-delay-ms elapses. Unset (default) keeps the "
+            "original slot-only behavior. Typical: 0.1 ~ 0.5."
         ),
     ] = None
     prefill_delayer_max_delay_ms: A[
