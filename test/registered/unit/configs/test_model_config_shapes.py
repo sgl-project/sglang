@@ -2,6 +2,8 @@ import math
 import unittest
 from types import SimpleNamespace
 
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
@@ -25,6 +27,37 @@ def _make_text_config(**overrides):
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+def _k31_model_config():
+    # Dimensions from moonshotai/Kimi-K3.1-Pro's pinned text config.
+    # NoPE disables rotation; its 64-dimensional unrotated tail remains in KV.
+    text_config = KimiLinearConfig(
+        hidden_size=7168,
+        num_attention_heads=96,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        mla_use_nope=True,
+        linear_attn_config={"kda_layers": [1], "full_attn_layers": [0]},
+        dsa_config={
+            "dsa_layers": [0],
+            "index_topk": 2048,
+            "index_head_dim": 128,
+            "index_num_heads": 32,
+            "index_rope_dim": 0,
+        },
+    )
+    model_config = ModelConfig.__new__(ModelConfig)
+    model_config.hf_config = SimpleNamespace(
+        architectures=["KimiK31ForConditionalGeneration"],
+        model_type="kimi_k31",
+        text_config=text_config,
+    )
+    model_config.hf_text_config = text_config
+    model_config._derive_model_shapes()
+    return model_config
 
 
 class TestModelConfigShapes(CustomTestCase):
@@ -133,6 +166,23 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 128)
         self.assertEqual(model_config.qk_rope_head_dim, 64)
+        self.assertEqual(model_config.scaling, 1 / math.sqrt(192))
+
+    def test_k31_nope_keeps_the_unrotated_tail_and_attention_scale(self):
+        """Unlike Ling's, Kimi-K3.1's NoPE keeps its 64 tail dims, just unrotated,
+        in the KV row (576 wide, 656 bytes as fp8_ds_mla) and the attention scale."""
+        model_config = _k31_model_config()
+
+        self.assertTrue(model_config.hf_text_config.mla_use_nope)
+        self.assertEqual(model_config.get_num_attention_heads(8), 12)
+        self.assertEqual(model_config.qk_rope_head_dim, 64)
+        self.assertEqual(model_config.kv_lora_rank + model_config.qk_rope_head_dim, 576)
+        self.assertEqual(
+            fp8_ds_mla_row_width(
+                d_nope=model_config.kv_lora_rank, d_rope=model_config.qk_rope_head_dim
+            ),
+            656,
+        )
         self.assertEqual(model_config.scaling, 1 / math.sqrt(192))
 
     def test_sarvam_mla_shapes(self):

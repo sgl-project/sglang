@@ -13,6 +13,10 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-large-amd")
 
+# Pre-fills the draft-extend outputs, so an element the kernel skips is seen;
+# a recycled allocation would otherwise still hold an earlier case's values.
+_UNWRITTEN = -1
+
 
 def _cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     out = torch.empty(seqlens.numel() + 1, dtype=torch.int32, device=seqlens.device)
@@ -262,15 +266,23 @@ class TestDSAMetadataKernels(CustomTestCase):
         max_extend_len: int,
         max_total_len: int,
         static_extend_len: bool,
+        req_pool_indices_values=None,
+        seq_lens_dtype: torch.dtype = torch.int64,
     ):
         bs = len(seq_lens_values)
         total_len = sum(extend_seq_lens_values)
         pool_size = max(bs + 4, 8)
-        seq_lens = torch.tensor(seq_lens_values, dtype=torch.int64, device=self.device)
+        seq_lens = torch.tensor(
+            seq_lens_values, dtype=seq_lens_dtype, device=self.device
+        )
         extend_seq_lens = torch.tensor(
             extend_seq_lens_values, dtype=torch.int32, device=self.device
         )
         req_pool_indices = torch.arange(bs, dtype=torch.int64, device=self.device) + 2
+        if req_pool_indices_values is not None:
+            req_pool_indices = torch.tensor(
+                req_pool_indices_values, dtype=torch.int64, device=self.device
+            )
         req_to_token = _make_req_to_token(pool_size + 4, max_seqlen_k, self.device)
 
         cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
@@ -299,6 +311,16 @@ class TestDSAMetadataKernels(CustomTestCase):
             if physical_page_size > 1
             else page_table_1
         )
+        for out in (
+            cache_seqlens,
+            cu_seqlens_k,
+            page_table_1,
+            seqlens_expanded,
+            dsa_cache_seqlens,
+            dsa_cu_seqlens_k,
+            real_page_table,
+        ):
+            out.fill_(_UNWRITTEN)
 
         fused_dsa_draft_extend_metadata(
             seq_lens=seq_lens,
@@ -384,6 +406,27 @@ class TestDSAMetadataKernels(CustomTestCase):
                 "draft real_page_table (live [:kv_len] prefix)",
             )
 
+    def _check_packed_verify(
+        self, *, prefix_lens, verify_lens, req_pool_indices, num_draft_tokens: int
+    ):
+        # Packed target verify's call: int32 kv lengths (prefix + rows) per slot,
+        # max_extend_len = draft block, and total_len = max_total_len = tier rows.
+        kv_lens = [
+            prefix + rows for prefix, rows in zip(prefix_lens, verify_lens, strict=True)
+        ]
+        self._check_draft_extend(
+            kv_lens,
+            verify_lens,
+            max_seqlen_k=193,
+            dsa_index_topk=64,
+            physical_page_size=64,
+            max_extend_len=num_draft_tokens,
+            max_total_len=sum(verify_lens),
+            static_extend_len=False,
+            req_pool_indices_values=req_pool_indices,
+            seq_lens_dtype=torch.int32,
+        )
+
     def test_decode_matches_eager_reference(self):
         for physical_page_size in (1, 64):
             with self.subTest(physical_page_size=physical_page_size):
@@ -433,8 +476,8 @@ class TestDSAMetadataKernels(CustomTestCase):
         )
 
     def test_draft_extend_variable_width_defensive_path(self):
-        # The production draft-extend-v2 replay path uses static_extend_len=True.
-        # Keep this case to guard the generic variable-width kernel branch.
+        # Draft-extend-v2 replay passes static_extend_len=True;
+        # packed target verify replays through this variable-width branch.
         self._check_draft_extend(
             [12, 31, 80],
             [3, 5, 2],
@@ -456,6 +499,38 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_extend_len=5,
             max_total_len=16,
             static_extend_len=False,
+        )
+
+    def test_draft_extend_packed_verify_padding_slots(self):
+        """8 batch slots padded to 10 for a 16-row tier of 6-row blocks;
+        padding slots sit on pool row 0 behind a 1-token prefix and may own no row."""
+        # Three live requests; six padding slots take a row each, the last none.
+        self._check_packed_verify(
+            prefix_lens=[127, 62, 125] + [1] * 7,
+            verify_lens=[1, 3, 6] + [1] * 6 + [0],
+            req_pool_indices=[5, 2, 7] + [0] * 7,
+            num_draft_tokens=6,
+        )
+
+    def test_draft_extend_packed_verify_empty_slot_before_rows(self):
+        """A slot without rows owns no row and shifts none, wherever it sits;
+        packed verify only puts empty slots last, which the kernel cannot check."""
+        self._check_packed_verify(
+            prefix_lens=[62, 150, 127] + [1] * 7,
+            verify_lens=[3, 0, 6] + [0, 0, 3, 0, 2, 1, 1],
+            req_pool_indices=[3, 9, 2] + [0] * 7,
+            num_draft_tokens=6,
+        )
+
+    def test_draft_extend_packed_verify_more_than_64_slots(self):
+        """64 batch slots padded to 120 for a 512-row tier of 8-row blocks:
+        more than 64 slots; some requests fill a block."""
+        self._check_packed_verify(
+            # Arbitrary spread over 1..150, both sides of topk and a 128-column block.
+            prefix_lens=[(37 * i) % 150 + 1 for i in range(64)] + [1] * 56,
+            verify_lens=[1, 8, 3, 2] * 16 + [6] * 8 + [5] * 48,
+            req_pool_indices=list(range(2, 66)) + [0] * 56,
+            num_draft_tokens=8,
         )
 
     def test_empty_batch(self):
