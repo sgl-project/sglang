@@ -24,6 +24,7 @@ rather than silently diverge.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 
@@ -38,13 +39,41 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@contextmanager
+def _drop_unknown_autotune_keys():
+    """Drop ``triton.autotune`` keys that are not kernel arguments.
+
+    quant-videogen 0.1.0 tunes some kernels on a key (``N``) that is not one
+    of their arguments. Triton 3.8 and earlier skipped such keys; Triton 3.9
+    rejects them when the module is imported. Skipping them here keeps the
+    old behavior on every Triton version.
+    """
+    import triton
+
+    original = triton.autotune
+
+    def autotune(configs, key, *args, **kwargs):
+        def decorator(fn):
+            valid_key = [name for name in key if name in fn.arg_names]
+            return original(configs, valid_key, *args, **kwargs)(fn)
+
+        return decorator
+
+    triton.autotune = autotune
+    try:
+        yield
+    finally:
+        triton.autotune = original
+
+
 @cache
 def _qvg_functions():
     try:
-        from quant_videogen.functions import (
-            triton_prq_dequantize_tensor,
-            triton_prq_quantize_tensor,
-        )
+        with _drop_unknown_autotune_keys():
+            from quant_videogen.functions import (
+                triton_prq_dequantize_tensor,
+                triton_prq_quantize_tensor,
+            )
     except ImportError as e:
         raise ImportError(
             "Quant-VideoGen KV-cache quantization requires its optional "
