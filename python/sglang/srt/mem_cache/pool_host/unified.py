@@ -489,3 +489,102 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             buffer.data_ptr() % page_size_bytes == 0
             and self.item_bytes % page_size_bytes == 0
         )
+
+
+import heapq
+from collections.abc import Iterable
+
+
+def _reserve_logical_pages_fast(
+    extents: list[tuple[int, int]], page_count: int
+) -> list[int] | None:
+    if page_count == 0:
+        return []
+    remaining = page_count
+    pages = []
+    for idx, (start, end) in enumerate(extents):
+        capacity = end - start
+        take = min(remaining, capacity)
+        pages.extend(range(start, start + take))
+        remaining -= take
+        if remaining == 0:
+            if start + take < end:
+                extents[: idx + 1] = [(start + take, end)]
+            else:
+                del extents[: idx + 1]
+            return pages
+    return None
+
+
+def _merge_sorted_extents(
+    extents: Iterable[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    merged = []
+    for start, end in extents:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _merge_extents_fast(cls, extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    return cls._merge_sorted_extents(sorted(extents))
+
+
+def _take_physical_pages_fast(self, side, page_count: int) -> list[int]:
+    if page_count == 0:
+        return []
+    reverse = side.grow_direction == "down"
+    hole_count = len(side.free_physical_pages)
+    if hole_count == 0:
+        pages = []
+    elif page_count >= hole_count:
+        pages = sorted(side.free_physical_pages, reverse=reverse)
+        side.free_physical_pages.clear()
+    else:
+        select = heapq.nlargest if reverse else heapq.nsmallest
+        pages = select(page_count, side.free_physical_pages)
+        side.free_physical_pages.difference_update(pages)
+    remaining = page_count - len(pages)
+    if remaining == 0:
+        return pages
+
+    if side.grow_direction == "up":
+        pages.extend(range(side.watermark, side.watermark + remaining))
+        side.watermark += remaining
+    else:
+        pages.extend(range(side.watermark, side.watermark - remaining, -1))
+        side.watermark -= remaining
+    return pages
+
+
+def _free_fast(self, name: str, indices: torch.Tensor) -> int:
+    with self.lock:
+        side = self.sides[name]
+        logical_pages = self._page_ids(indices, side.page_size)
+        if len(logical_pages) != len(set(logical_pages)):
+            raise AssertionError("Host pages cannot be freed more than once.")
+        if any(page not in side.logical_to_physical for page in logical_pages):
+            raise AssertionError(f"Host pages are not allocated in {name!r}.")
+        for logical_page in logical_pages:
+            physical_page = side.logical_to_physical.pop(logical_page)
+            del side.physical_to_logical[physical_page]
+            side.free_physical_pages.add(physical_page)
+        freed_extents = ((page, page + 1) for page in sorted(logical_pages))
+        side.free_logical_extents = self._merge_sorted_extents(
+            heapq.merge(side.free_logical_extents, freed_extents)
+        )
+        self._release_center_holes(side)
+        return len(indices)
+
+
+_SharedPageEnvelopeHostBacking._reserve_logical_pages = staticmethod(
+    _reserve_logical_pages_fast
+)
+_SharedPageEnvelopeHostBacking._merge_sorted_extents = staticmethod(
+    _merge_sorted_extents
+)
+_SharedPageEnvelopeHostBacking._merge_extents = classmethod(_merge_extents_fast)
+_SharedPageEnvelopeHostBacking._take_physical_pages = _take_physical_pages_fast
+_SharedPageEnvelopeHostBacking.free = _free_fast
