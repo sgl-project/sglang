@@ -269,6 +269,7 @@ def _init_mha_backend(kv_cache_layout):
         head_dim=128,
         get_num_kv_heads=lambda _tp_size: 8,
         attention_arch=AttentionArch.MHA,
+        hf_config=SimpleNamespace(model_type="llama"),
         context_len=4096,
     )
     model_runner = SimpleNamespace(
@@ -282,7 +283,10 @@ def _init_mha_backend(kv_cache_layout):
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
     )
     spec = SimpleNamespace(
-        speculative_num_draft_tokens=None, speculative_num_steps=None
+        speculative_algorithm=None,
+        speculative_eagle_topk=None,
+        speculative_num_draft_tokens=None,
+        speculative_num_steps=None,
     )
     parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1)
     exec_config = SimpleNamespace(
