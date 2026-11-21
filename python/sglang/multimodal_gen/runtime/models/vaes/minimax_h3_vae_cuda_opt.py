@@ -18,11 +18,15 @@ are not gated here: they mount at every quality level behind their own
 first-sight verification. Install is all-or-nothing per layer and fail-closed.
 """
 
+from collections import OrderedDict
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import MethodType
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging.version import Version
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.diffusion import (
@@ -47,9 +51,130 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils im
     apply_rotary_pos_emb_qk,
     native_rope_cache,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+MINIMAX_H3_DECODE_GRAPH_MIN_TORCH_VERSION = Version("2.11")
+
+
+def decode_graph_supported() -> bool:
+    if not current_platform.is_cuda_alike():
+        return False
+    if current_platform.is_musa():
+        torch_version = Version(torch.__version__.split("+", 1)[0])
+        if torch_version < MINIMAX_H3_DECODE_GRAPH_MIN_TORCH_VERSION:
+            logger.warning_once(
+                "MiniMax-H3 VAE decode graphs require PyTorch >= 2.11 on MUSA; "
+                "using the eager fast path with torch %s.",
+                torch.__version__,
+            )
+            return False
+    return True
+
+
+@dataclass
+class DecodeGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    static_input: torch.Tensor
+    static_output: torch.Tensor
+    stream: torch.cuda.Stream
+
+
+class DecodeGraphs:
+    """Capture one tile-batch decode graph per input shape."""
+
+    def __init__(
+        self,
+        decode: Callable[[torch.Tensor], torch.Tensor],
+        module: nn.Module,
+        *,
+        max_shapes: int = 4,
+    ) -> None:
+        self.decode = decode
+        self.module = module
+        self.max_shapes = max_shapes
+        self.entries: OrderedDict[
+            tuple[tuple[int, ...], torch.dtype, torch.device], DecodeGraphEntry
+        ] = OrderedDict()
+        self.weight_signature = ()
+        self.capture_count = 0
+        self.replay_count = 0
+
+    def _can_capture(self, latent: torch.Tensor) -> bool:
+        if (
+            not decode_graph_supported()
+            or latent.device.type != current_platform.device_type
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+        ):
+            return False
+        return not any(module._forward_pre_hooks for module in self.module.modules())
+
+    def _weight_signature(self) -> tuple[tuple[int, torch.dtype, torch.device], ...]:
+        return tuple(
+            (tensor.data_ptr(), tensor.dtype, tensor.device)
+            for module in self.module.modules()
+            for tensor in (
+                *module.parameters(recurse=False),
+                *module.buffers(recurse=False),
+            )
+        )
+
+    def _capture(self, latent: torch.Tensor) -> DecodeGraphEntry:
+        static_input = latent.clone()
+        stream = torch.cuda.Stream(device=latent.device)
+        stream.wait_stream(torch.cuda.current_stream(latent.device))
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.decode(static_input)
+        torch.cuda.current_stream(latent.device).wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            static_output = self.decode(static_input)
+        torch.cuda.current_stream(latent.device).wait_stream(stream)
+        self.capture_count += 1
+        logger.info(
+            "MiniMax-H3 VAE: captured decode graph for tile batch shape %s",
+            tuple(static_input.shape),
+        )
+        return DecodeGraphEntry(graph, static_input, static_output, stream)
+
+    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
+        if not self._can_capture(latent):
+            return self.decode(latent)
+
+        weight_signature = self._weight_signature()
+        if weight_signature != self.weight_signature:
+            self.entries.clear()
+            self.weight_signature = weight_signature
+
+        key = (tuple(latent.shape), latent.dtype, latent.device)
+        entry = self.entries.get(key)
+        if entry is None:
+            if len(self.entries) == self.max_shapes:
+                self.entries.popitem(last=False)
+            entry = self.entries[key] = self._capture(latent)
+            current_stream = torch.cuda.current_stream(latent.device)
+            entry.stream.wait_stream(current_stream)
+            with torch.cuda.stream(entry.stream):
+                entry.graph.replay()
+                output = entry.static_output.clone()
+            current_stream.wait_stream(entry.stream)
+            self.replay_count += 1
+            return output
+
+        current_stream = torch.cuda.current_stream(latent.device)
+        entry.stream.wait_stream(current_stream)
+        with torch.cuda.stream(entry.stream):
+            entry.static_input.copy_(latent)
+            entry.graph.replay()
+            output = entry.static_output.clone()
+        current_stream.wait_stream(entry.stream)
+        self.replay_count += 1
+        return output
 
 
 def _fused_qknorm_rope(self, query, key, rotary_pos_emb) -> bool:
@@ -181,7 +306,10 @@ def _fast_attention_modules(decoder: nn.Module) -> list[nn.Module]:
 
 def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
     """Install the quality-gated CUDA MiniMax-H3 VAE decoder fast path."""
-    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
+        MiniMaxH3ImageVAE,
+        MiniMaxH3VideoVAE,
+    )
 
     if not isinstance(vae, MiniMaxH3VideoVAE):
         return vae
@@ -196,6 +324,8 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
         vae.decoder._sgl_gate = gate
     attention_modules = _fast_attention_modules(vae.decoder)
     _install_fast_attention(attention_modules, gate)
+    if isinstance(vae, MiniMaxH3ImageVAE):
+        vae.decode_graphs = DecodeGraphs(vae.decode, vae)
     logger.info(
         "MiniMax-H3 VAE: installed quality-gated fast path (%s; %s tiles and %s "
         "windows per decoder forward).",
