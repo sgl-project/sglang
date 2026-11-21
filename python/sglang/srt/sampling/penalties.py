@@ -1,32 +1,17 @@
-"""Penalty history in per-request rows, found through a slot -> row table.
+"""Sampling-penalty history: per-request rows of output-token counts and lengths.
 
-`PenaltyStatusPool` is one per scheduler: `admit` gives a penalized request a row
-on `req.penalty_row` and (re)sets it to the history of its `output_ids`
-each time the request enters an extend step; the scheduler's request exit
-(`RequestRetirer`) gives the row back with `free`. A retraction keeps the row:
-the request's next admission maps its new slot to it and replays its outputs.
+Host calls (`admit`, `free`, `StepPenalties.build`) only queue writes; the
+tables are written, grown, and read on the sampling stream, so a step sees the
+tokens of every step sampled before it.
 
-Invariants:
-- Only a request whose params use a penalty holds a row; a step without one
-  has no `StepPenalties`.
-- A row holds history only (per-token output counts and the output length);
-  penalty values come from the request's params at build.
-- Host calls (`admit`, `free`, `build`) touch no table or row on the device:
-  they queue the writes, and the tables and the rows are written, grown,
-  reset, and read only on the sampling stream, so a step sees exactly the
-  tokens of the steps sampled before it.
-- A step finds its rows in the table at sampling, from its slots. `free`
-  leaves the table entry, so a step still holding a freed row (a finished
-  request's last decode under overlap) reads the row it was built with; no
-  admission runs between the build of a step and that step's sampling. A row
-  freed in between may still take the step's commit, and its next `admit`
-  resets it.
-- Freeing the last live row drops the tables on the host at once and starts
-  row numbering over; the tables grow again from the next penalized request.
-  This is safe because the tables are allocated on the sampling stream, so
-  their blocks go only to later allocations there, after the kernels already
-  issued; a step whose rows were all freed since its build reads zero counts
-  and lengths at sampling, and its commit counts nothing.
+A penalized request takes a row at its first extend admission, and every extend
+admission resets the row and replays `output_ids` into it. A retraction keeps
+the row; the request's exit (`RequestRetirer`) frees it.
+
+Freeing the last live row drops the tables at once. That is safe because they
+were allocated on the sampling stream, so their memory goes only to later
+allocations there, after the kernels already issued; a step whose rows were all
+freed reads zeros and commits nothing.
 """
 
 from __future__ import annotations
@@ -51,8 +36,6 @@ def apply_scaling_penalties(logits, scaling_penalties):
 
 
 def _penalty_kinds(sampling_params) -> Tuple[bool, bool, bool, bool]:
-    """Whether the params use the frequency, presence, repetition, and
-    min_new_tokens penalties."""
     return (
         sampling_params.frequency_penalty != 0.0,
         sampling_params.presence_penalty != 0.0,
@@ -71,13 +54,10 @@ class PenaltyStatusPool:
         self.device = device
         self.num_rows = 0
         self.free_rows: List[int] = []
-        # Table entries to write before their next device use.
         self.pending_slots: Dict[int, int] = {}
-        # Rows to reset before their next device use, with the tokens to replay.
         self.pending_init: Dict[int, List[int]] = {}
-        # The row of each request slot, like req_to_token: -1 until the slot's
-        # first penalized request; a freed row keeps its entries until the next
-        # admission into the slot.
+        # Slot -> row. `free` leaves the entry, so a step built before the free
+        # still reads that row; the slot's next `admit` rewrites it.
         self.slot_to_row = torch.full(
             (num_slots,), -1, dtype=torch.int32, device=device
         )
@@ -85,9 +65,6 @@ class PenaltyStatusPool:
         self.lens = torch.zeros((0,), dtype=torch.int32, device=device)
 
     def admit(self, req) -> None:
-        """Admit a request into an extend step: a penalized one takes a row if
-        it holds none, and the row is (re)set to the history of its outputs."""
-        # Sampling params do not change after admission, so each step reads this.
         req.uses_penalty = uses_penalty(req.sampling_params)
         if not req.uses_penalty:
             return
@@ -101,9 +78,7 @@ class PenaltyStatusPool:
         self.pending_init[req.penalty_row] = list(req.output_ids)
 
     def free(self, req) -> None:
-        """Give back the request's row, if it holds one."""
         if self.num_rows == 0:
-            # No row is live, as on a server whose requests use no penalty.
             return
         row = req.penalty_row
         if row is None:
@@ -165,12 +140,10 @@ class PenaltyStatusPool:
             )
 
     def rows(self, slots: torch.Tensor) -> torch.Tensor:
-        """The rows of the requests in the slots."""
         self._flush()
         return self.slot_to_row[slots]
 
     def gather_counts(self, rows: torch.Tensor) -> torch.Tensor:
-        """The rows' token counts; zeros when the tables went with every row."""
         self._flush()
         if self.num_rows == 0:
             return torch.zeros(
@@ -179,7 +152,6 @@ class PenaltyStatusPool:
         return self.counts[rows]
 
     def gather_lens(self, rows: torch.Tensor) -> torch.Tensor:
-        """The rows' output lengths; zeros when the tables went with every row."""
         self._flush()
         if self.num_rows == 0:
             return torch.zeros((rows.shape[0],), dtype=torch.int32, device=self.device)
@@ -191,22 +163,19 @@ class PenaltyStatusPool:
         token_ids: torch.Tensor,
         accept_mask: Optional[torch.Tensor],
     ) -> None:
-        """Count token_ids[i, j] into rows[i] where accept_mask[i, j] (all if None)."""
         self._flush()
         if self.num_rows == 0:
-            # Every row of the step was freed, and the tables went with them.
             return
         token_ids = token_ids.view(rows.shape[0], -1).long()
-        # An id outside the vocab (a NaN-logit sample, which finishes the
-        # request on the host, or a masked draft slot) counts nothing.
+        # A NaN-logit sample or a masked draft slot can hold an id outside the vocab.
         counted = (token_ids >= 0) & (token_ids < self.vocab_size)
         if accept_mask is not None:
             counted &= accept_mask.view(token_ids.shape)
         weights = counted.to(torch.int32)
         token_ids = token_ids.clamp(0, self.vocab_size - 1)
         if token_ids.shape[1] == 1:
-            # One token per row over distinct rows: no (row, token) pair
-            # repeats, so a plain add counts them without a sorted accumulate.
+            # Rows are distinct, so with one token per row no index repeats
+            # and a plain add is exact.
             self.counts[rows, token_ids.view(-1)] += weights.view(-1)
         else:
             self.counts.index_put_(
@@ -222,12 +191,9 @@ class PenaltyStatusPool:
 
 @dataclasses.dataclass(frozen=True)
 class StepPenalties:
-    """The penalized requests of one step: their slots and penalty params."""
-
     pool: PenaltyStatusPool
     batch_size: int
-    # [n] indices into the step's batch of the penalized requests, and their
-    # slots; their rows are read from the pool's table at sampling.
+    # [n] batch positions and slots of the n penalized requests.
     batch_indices: torch.Tensor
     slots: torch.Tensor
     # [n, 1] per penalized request, None when none of them uses that penalty.
@@ -242,7 +208,6 @@ class StepPenalties:
     def build(
         cls, reqs: Sequence, req_pool_indices: torch.Tensor, pool: PenaltyStatusPool
     ) -> Optional[StepPenalties]:
-        """req_pool_indices: the step's slots on the device, in request order."""
         batch_indices = [i for i, r in enumerate(reqs) if r.uses_penalty]
         if not batch_indices:
             return None
@@ -301,12 +266,11 @@ class StepPenalties:
         )
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Return (additive, scaling) [batch_size, vocab] penalties, each None if unused."""
+        """(additive, scaling) [batch_size, vocab] penalties, each None if unused."""
         rows = self.pool.rows(self.slots)
         counts = self.pool.gather_counts(rows)
         vocab_size = self.pool.vocab_size
         device = counts.device
-        # The tokens each row has output, for presence and repetition.
         present = (
             counts > 0
             if self.presence is not None or self.repetition is not None
@@ -320,8 +284,6 @@ class StepPenalties:
             or self.min_new_tokens is not None
         ):
             additive = torch.zeros(counts.shape, dtype=torch.float32, device=device)
-            # addcmul_ with value=-1 subtracts a product in one kernel; on these
-            # operands it rounds as the product and the subtraction would.
             if self.frequency is not None:
                 additive.addcmul_(counts, self.frequency, value=-1)
             if self.presence is not None:
@@ -359,16 +321,12 @@ class StepPenalties:
     def commit(
         self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
     ) -> None:
-        """Count this step's output tokens into the rows of its requests.
-
-        token_ids: [batch_size] sampled ids, or [batch_size, k] with `accept_mask`
-        marking the ids that count (speculative verify).
-        """
+        """token_ids: [batch_size] sampled ids, or [batch_size, k] verify tokens
+        with `accept_mask` marking the ones that count."""
         token_ids = token_ids.view(self.batch_size, -1)
         if accept_mask is not None:
             accept_mask = accept_mask.view(self.batch_size, -1)
         if self.batch_indices.numel() != self.batch_size:
-            # Only some requests are penalized: take their rows of the step.
             token_ids = token_ids[self.batch_indices]
             if accept_mask is not None:
                 accept_mask = accept_mask[self.batch_indices]
@@ -386,8 +344,7 @@ def _stop_token_ids(req, vocab_size: int) -> List[int]:
             else set()
         )
     )
-    # Out-of-vocab ids can never be sampled; scattering them would index
-    # outside the penalty tensor.
+    # Out-of-vocab ids can never be sampled and would index outside the penalty tensor.
     return [
         token_id
         for token_id in stop_ids

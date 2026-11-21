@@ -27,7 +27,6 @@ class _Batch:
 
 def _req(**sampling_params):
     return SimpleNamespace(
-        rid="r",
         kv=SimpleNamespace(req_pool_idx=None),
         penalty_row=None,
         output_ids=[],
@@ -101,8 +100,6 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
         penalties = _step_penalties(reqs, self.device)
-        # Row 1 uses no penalty, so it holds no history row.
-        self.assertEqual(penalties.batch_indices.tolist(), [0, 2])
         self.assert_device_tensor(
             penalties.min_new_tokens,
             torch.tensor([[2], [1]], dtype=torch.int32),

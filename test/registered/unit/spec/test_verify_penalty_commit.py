@@ -1,5 +1,3 @@
-"""A verify writes exactly its accept tokens into the penalty history."""
-
 import unittest
 from types import SimpleNamespace
 
@@ -52,7 +50,6 @@ class TestVerifyPenaltyCommit(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.pool = PenaltyStatusPool(VOCAB_SIZE, 4, "cpu")
-        # The middle request uses no penalty and holds no row.
         self.reqs = [
             _req(1, frequency_penalty=1.0),
             _req(2),
@@ -74,7 +71,6 @@ class TestVerifyPenaltyCommit(CustomTestCase):
         )
 
     def test_tree_verify_commits_accept_index_rows(self):
-        # Three draft positions per request; -1 marks a position not accepted.
         predict = torch.tensor([4, 4, 6, 1, 2, 3, 5, 9, 9])
         accept_index = torch.tensor([[0, 1, -1], [3, 4, 5], [6, -1, -1]])
         commit_accept_tokens_to_penalties(

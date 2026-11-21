@@ -37,7 +37,6 @@ class FakeReq(SimpleNamespace):
 
 
 def idle_penalty_status_pool() -> PenaltyStatusPool:
-    """A `PenaltyStatusPool` for a scheduler whose requests use no penalty."""
     return PenaltyStatusPool(vocab_size=1, num_slots=1, device="cpu")
 
 

@@ -59,8 +59,7 @@ class DllmAlgorithm:
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
         """Return an error for unsupported request features, if any."""
-        # A dLLM step does not sample through the sampler, so it keeps no
-        # penalty history.
+        # A dLLM step bypasses the sampler, which keeps the penalty history.
         if uses_penalty(req.sampling_params):
             return (
                 "Diffusion LLMs do not support sampling penalties "

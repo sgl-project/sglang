@@ -116,8 +116,6 @@ class UocrSchedulerRuntime:
         return self._prefetch.request_lists()
 
     def validate_request(self, req: Req) -> Optional[str]:
-        """Return an error for request features a split-document window cannot
-        serve, if any."""
         return validate_reuse_request(req)
 
     def on_req_dropped(self, req: Req) -> None:

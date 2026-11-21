@@ -270,8 +270,6 @@ def test_append_auxiliary_output_ignores_absent_outputs():
     assert append_auxiliary_output(output, None) is output
 
 
-# ModelRunner.sample hands the sampled tokens to the penalty history; no
-# request here uses a penalty.
 _SAMPLING_INFO = SimpleNamespace(commit_sampled_tokens=lambda token_ids: None)
 
 

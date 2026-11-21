@@ -153,9 +153,8 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
 
-    # This step's penalized requests, set by the scheduler at each launch
-    # (`set_step_penalties`), and their [bs, vocab] logit penalties, built
-    # from the penalty history by `acc_penalties` for `acc_penalties_step`.
+    # Set by the scheduler at each launch; the acc_* fields cache the
+    # [bs, vocab] logit penalties built for acc_penalties_step.
     step_penalties: Optional[StepPenalties] = None
     acc_additive_penalties: Optional[torch.Tensor] = None
     acc_scaling_penalties: Optional[torch.Tensor] = None
@@ -444,9 +443,7 @@ class SamplingBatchInfo:
         self.step_penalties = step_penalties
 
     def acc_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """This step's (additive, scaling) [bs, vocab] logit penalties, each None
-        if unused. Built from the penalty history on the first call of the step,
-        which must be on the sampling stream."""
+        """Built on the step's first call, which must run on the sampling stream."""
         if self.acc_penalties_step is not self.step_penalties:
             self.acc_additive_penalties, self.acc_scaling_penalties = (
                 (None, None)
@@ -459,7 +456,6 @@ class SamplingBatchInfo:
     def commit_sampled_tokens(
         self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
     ) -> None:
-        """Write this step's output tokens into the penalty history."""
         if self.step_penalties is not None:
             self.step_penalties.commit(token_ids, accept_mask)
 
@@ -720,15 +716,13 @@ class SamplingBatchInfo:
         return merged
 
     def copy_for_forward(self):
-        """A copy for one forward, carrying this step's logit penalties; call on
-        the sampling stream, where they read the penalty history."""
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
             new = object.__new__(SamplingBatchInfo)
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
         else:
             new = dataclasses.replace(self)
         # Built at launch, while the step's rows are live; spec readers and
-        # provider views read the fields.
+        # provider views read the acc_* fields directly.
         new.acc_penalties()
         return new
 

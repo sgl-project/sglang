@@ -143,9 +143,7 @@ class TestRelease(CustomTestCase):
 
 class TestPenaltyRowExit(CustomTestCase):
     def _penalized(self, finished_reason):
-        retirer = release_only_retirer(
-            MagicMock(), beam_coordinator=SimpleNamespace(retire_group=lambda r: None)
-        )
+        retirer = release_only_retirer(MagicMock())
         retirer.send_abort_output = lambda abort_req, req: None
         req = _req(finished_reason, [])
         req.kv.req_pool_idx = 0
@@ -162,9 +160,8 @@ class TestPenaltyRowExit(CustomTestCase):
         self.assertIsNone(req.penalty_row)
         self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
 
-    def test_abort_retracted_frees_the_row_after_the_kv_record_left(self):
-        # A retracted streaming turn hands its KV record to the session slot;
-        # the row stays with the request.
+    def test_abort_retracted_frees_the_row(self):
+        # A retracted request holds no KV but keeps its row.
         retirer, req = self._penalized(FINISH_ABORT())
         req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         with patch.object(request_retirer, "make_abort_req"):

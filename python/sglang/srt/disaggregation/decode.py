@@ -4456,8 +4456,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        # The history row replays the prefill node's output token (and a
-        # retracted request's earlier outputs).
+        # Replays the prefill node's output token into the penalty history.
         self.admit_penalty_rows(new_batch)
         return new_batch
 

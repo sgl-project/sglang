@@ -537,12 +537,9 @@ def _doc_params(req) -> Optional[dict]:
 
 
 def validate_reuse_request(req: Req) -> Optional[str]:
-    """Return an error for request features a follow-up window cannot serve."""
     cp = _doc_params(req)
     if cp is None or not cp.get(KEY_REUSE):
         return None
-    # The splice writes a window's first outputs on the host, past the sampler
-    # that counts outputs into the penalty history.
     if uses_penalty(req.sampling_params):
         return (
             "Unlimited-OCR document reuse does not support sampling penalties "

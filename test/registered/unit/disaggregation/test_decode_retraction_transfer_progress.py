@@ -47,10 +47,10 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
-from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -183,11 +183,7 @@ class _DecodeNode:
             last_batch=None,
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
-            penalty_status_pool=PenaltyStatusPool(
-                vocab_size=16,
-                num_slots=self.req_to_token_pool.req_to_token.shape[0],
-                device="cpu",
-            ),
+            penalty_status_pool=idle_penalty_status_pool(),
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             max_running_requests=ROWS,

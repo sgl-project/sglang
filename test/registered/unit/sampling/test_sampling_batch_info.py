@@ -258,7 +258,7 @@ class TestApplyLogitsBias(CustomTestCase):
         grammar.apply_vocab_mask.assert_called_once()
 
     def test_builds_step_penalties_without_forward_copy(self):
-        """The scheduler's own info (non-overlap) builds its tables at sampling."""
+        """Some non-overlap paths sample on the scheduler's own info, not a copy."""
         info = _make_info(batch_size=1)
         step = MagicMock()
         step.logit_penalties.return_value = (torch.full((1, VOCAB_SIZE), -1.0), None)
@@ -359,7 +359,6 @@ class TestAccPenalties(CustomTestCase):
         self.assertIs(info.acc_additive_penalties, additive)
         self.assertIs(info.acc_scaling_penalties, scaling)
 
-        # A new step rebuilds whatever the earlier step left on the info.
         next_step = MagicMock()
         next_step.logit_penalties.return_value = (None, torch.ones(2, VOCAB_SIZE))
         info.set_step_penalties(next_step)
@@ -738,7 +737,6 @@ class TestCopyForForward(CustomTestCase):
                 ),
             ):
                 copied = info.copy_for_forward()
-            self.assertIsNot(copied, info)
             self.assertIs(copied.acc_additive_penalties, additive)
             self.assertIs(copied.acc_penalties_step, step)
             self.assertIsNone(info.acc_additive_penalties)

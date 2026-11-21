@@ -302,8 +302,6 @@ def commit_block_accept_tokens_to_penalties(
     out_tokens: torch.Tensor,
     commit_lens: torch.Tensor,
 ) -> None:
-    """Write a block verify's accept tokens, out_tokens[i, :commit_lens[i]],
-    into the penalty history."""
     if sampling_info.step_penalties is not None:
         # Guarded here: building the mask launches device work.
         positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
@@ -1324,8 +1322,7 @@ def build_speculative_verify_target_probs(
 def validate_dflash_request(
     req: Req, enable_overlap: bool, bound_runtime: bool
 ) -> Optional[str]:
-    """bound_runtime: a kernel build's runtime runs the decode round; it is the
-    same on every rank, so every rank rejects alike."""
+    """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 

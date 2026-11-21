@@ -1197,8 +1197,6 @@ def commit_accept_tokens_to_penalties(
     predict: torch.Tensor,
     accept_index: torch.Tensor,
 ) -> None:
-    """Write a verify's accept tokens (accept_index >= 0) into the penalty
-    history, after whichever post-verify path produced them."""
     if sampling_info.step_penalties is not None:
         # Guarded here: building the arguments launches device work.
         sampling_info.commit_sampled_tokens(

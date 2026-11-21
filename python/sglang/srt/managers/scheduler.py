@@ -4605,7 +4605,6 @@ class Scheduler(
             ).release_state_slot(req)
 
     def admit_penalty_rows(self, batch: ScheduleBatch) -> None:
-        """Each admission (re)sets a penalized request's history from its outputs."""
         for req in batch.reqs:
             self.penalty_status_pool.admit(req)
 
@@ -5442,8 +5441,6 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            # Penalty params come from this step's requests; the history they
-            # read lives on the device and is read and written at sampling.
             batch.sampling_info.set_step_penalties(
                 StepPenalties.build(
                     batch.reqs, batch.req_pool_indices, self.penalty_status_pool
