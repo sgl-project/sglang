@@ -461,10 +461,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     triton_attention_num_kv_splits: A[
         Optional[int],
-        Arg(
-            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. Defaults to 16 on ROCm and 8 elsewhere.",
-            fallback=8,
-        ),
+        "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. Defaults to 16 on ROCm and 8 elsewhere; for MLA models the Triton backend raises the default with the device's compute unit count and the context length.",
     ] = None
     triton_attention_split_tile_size: A[
         Optional[int],

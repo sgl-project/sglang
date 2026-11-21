@@ -27,6 +27,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "validate_response_store",
         "validate_uocr_document_config",
         "validate_sampling_mask_max_tokens",
+        "validate_triton_attention_num_kv_splits",
         "handle_aux_hidden_state_capture",
         "validate_prefill_cp_platform",
         "handle_hardware_runtime_validation",
