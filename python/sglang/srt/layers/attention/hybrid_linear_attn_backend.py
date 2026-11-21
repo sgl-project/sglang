@@ -130,6 +130,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        # The conv state shape with the conv window length (kernel size - 1) last,
+        # which extra_buffer conv-state tracking reads; set by each backend.
         self.conv_states_shape: tuple[int, int] = None
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
@@ -486,6 +488,12 @@ class MambaAttnBackendBase(AttentionBackend):
     ):
         """Flattened input positions of conv states to track during extend (up to
         the last complete chunk boundary, mamba_track_mask rows only)."""
+        if self.conv_states_shape is None:
+            raise ValueError(
+                f"{type(self).__name__} supports the extra_buffer mamba radix cache "
+                "strategy but does not set conv_states_shape (the conv state shape "
+                "with the conv window length last), which conv-state tracking reads"
+            )
         conv_state_len = self.conv_states_shape[-1]
 
         # Shared with the Qwen4-Exp PLE side states so the boundary can never
