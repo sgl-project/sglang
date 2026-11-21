@@ -537,10 +537,11 @@ class OPTForCausalLM(nn.Module):
                     "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
                 )
                 return (
-                    self.model.embed_tokens.weight.cpu()
+                    self.model.embed_tokens.weight[:truncate_size]
+                    .cpu()
                     .to(torch.float32)
                     .numpy()
-                    .tolist()[:truncate_size]
+                    .tolist()
                 )
 
             mapped_name = name
@@ -584,11 +585,12 @@ class OPTForCausalLM(nn.Module):
                     weight = param.data
             else:
                 weight = param.data
+            weight = weight[:truncate_size]
             if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
                 gathered_weights = [torch.zeros_like(weight) for _ in range(tp_size)]
                 torch.distributed.all_gather(gathered_weights, weight)
                 weight = torch.cat(gathered_weights, dim=1)
-            return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+            return weight.cpu().to(torch.float32).numpy().tolist()
 
         except Exception:
             logger.error(
