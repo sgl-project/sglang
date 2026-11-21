@@ -128,8 +128,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store = self._store(registered=(PoolName.SWA, PoolName.MAMBA, PoolName.INDEXER))
         store.mem_pool_host = self._host_pool()
         mamba = store.registered_pools[PoolName.MAMBA]
-        mamba.conv_buffer = [object(), object()]
-        mamba.temporal_state_elem_size = 1
+        mamba.get_page_component_names = lambda: ["temporal", "conv_0", "conv_1"]
         mamba.get_page_buffer_meta = self._host_pool(3).get_page_buffer_meta
         scheduler = self._scheduler(store)
         scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(

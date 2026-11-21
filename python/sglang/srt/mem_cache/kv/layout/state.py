@@ -274,10 +274,14 @@ class StateView:
             self.extra_views[part.name].movedim(part.row_axis, 0)
             for part in spec.extra_parts
         )
+        self._checkpoint_extra_names = tuple(
+            f"{part.name}_0" for part in spec.extra_parts
+        )
         if spec.draft_region is not None:
             begin = spec.draft_offset_in_entry()
             end = begin + spec.draft_region.entry_bytes()
             self._checkpoint_extra_buffers += (arena.entries(spec.name)[:, begin:end],)
+            self._checkpoint_extra_names += ("draft_state_0",)
         for part in spec.extra_parts:
             self.extra_views[part.name].select(part.row_axis, 0).fill_(part.reset_value)
 
@@ -465,6 +469,7 @@ class StateView:
                     temporal=self.mamba_cache.temporal,
                     conv=tuple(self.mamba_cache.conv),
                     extra_checkpoint_buffers=self._checkpoint_extra_buffers,
+                    extra_checkpoint_names=self._checkpoint_extra_names,
                 ),
             ),
         )
@@ -529,6 +534,7 @@ class DraftStateView(StateView):
         self._entry_bytes = spec.entry_bytes()
         self.layer_lanes = dict(layer_lanes)
         self._checkpoint_extra_buffers = ()
+        self._checkpoint_extra_names = ()
         self.mamba_layer_ids = layer_ids
         self.num_mamba_layers = len(layer_ids)
         self.conv_slice_axis = spec.conv_slice_axis
