@@ -247,6 +247,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.transfer_bytes_lock = threading.Lock()
+        self.load_bytes: dict[str, int] = {}
+        self.offload_bytes: dict[str, int] = {}
         self.load_io_executor = ThreadPoolExecutor(
             self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
         )
@@ -341,8 +344,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 None,
             )
             received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
+            self._record_load_bytes(transfer.name, received)
             # Require every byte of every layer, including short reads.
-            if list(received) != [sum(s) if isinstance(s, list) else s for s in sizes]:
+            expected = [sum(s) if isinstance(s, list) else s for s in sizes]
+            if list(received) != expected:
                 return False
         return True
 
@@ -561,9 +566,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 offsets[start : start + step],
             )
 
-    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets, *, pool=None):
         store = self.storage.store
         result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        self._record_load_bytes(pool, result)
         if result is None or isinstance(result, int):
             return result
         result = list(result)
@@ -596,6 +602,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 [sizes[i] for i in expired],
                 [offsets[i] for i in expired],
             )
+            self._record_load_bytes(pool, retried)
             if retried is None or isinstance(retried, int):
                 return retried
             retried = list(retried)
@@ -608,7 +615,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return result
 
     def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
-        result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
+        result = self._get_layer_ranges(keys, ptrs, sizes, offsets, pool=name)
         expected = [sum(item) for item in sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
             raise RuntimeError(
@@ -647,6 +654,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else None
                 )
                 results = self.storage.batch_set_v2(expanded, extra_info)
+                for pool, num_bytes in self.storage.last_put_bytes_by_pool.items():
+                    self._add_transfer_bytes(self.offload_bytes, pool, num_bytes)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
@@ -658,6 +667,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def _record_load_bytes(self, pool, result) -> None:
+        if pool is not None and result is not None and not isinstance(result, int):
+            self._add_transfer_bytes(
+                self.load_bytes, pool, sum(max(0, value) for value in result)
+            )
+
+    def _add_transfer_bytes(self, totals: dict[str, int], pool, num_bytes: int):
+        with self.transfer_bytes_lock:
+            totals[str(pool)] = totals.get(str(pool), 0) + num_bytes
+
+    def pop_transfer_bytes(self) -> tuple[dict[str, int], dict[str, int]]:
+        with self.transfer_bytes_lock:
+            load, offload = self.load_bytes.copy(), self.offload_bytes.copy()
+            self.load_bytes.clear()
+            self.offload_bytes.clear()
+        return load, offload
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()

@@ -1,5 +1,6 @@
 """Regression tests for batched Mooncake load sessions."""
 
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestLayerWiseLoadSessions(CustomTestCase):
     def setUp(self):
         self.linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        self.linker.transfer_bytes_lock = threading.Lock()
+        self.linker.load_bytes, self.linker.offload_bytes = {}, {}
         self.store = Mock()
         self.linker.storage = SimpleNamespace(
             store=self.store,

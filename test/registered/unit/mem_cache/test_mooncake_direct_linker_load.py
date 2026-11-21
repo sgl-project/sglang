@@ -94,6 +94,8 @@ class RecordingCounter(LayerWiseLoadCounter):
 
 def make_linker(store, *, num_layers, layer_group, threads, pools):
     linker = object.__new__(MooncakeDirectLinker)
+    linker.transfer_bytes_lock = threading.Lock()
+    linker.load_bytes, linker.offload_bytes = {}, {}
     linker.num_layers = num_layers
     linker.load_layer_group = layer_group
     linker.load_threads = threads
@@ -115,6 +117,36 @@ def load(linker, request_transfers):
 
 
 class TestGroupedLoad(CustomTestCase):
+    def test_transfer_snapshot_survives_writer_across_drain(self):
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.transfer_bytes_lock = threading.Lock()
+        linker.load_bytes, linker.offload_bytes = {}, {}
+        totals = linker.load_bytes
+        linker._add_transfer_bytes(totals, PoolName.KV, 8)
+        snapshot, _ = linker.pop_transfer_bytes()
+        # A writer may have captured the dictionary before the drain.
+        linker._add_transfer_bytes(totals, PoolName.KV, 4)
+        self.assertEqual(snapshot, {str(PoolName.KV): 8})
+        self.assertEqual(linker.pop_transfer_bytes()[0], {str(PoolName.KV): 4})
+        self.assertEqual(linker.pop_transfer_bytes(), ({}, {}))
+
+    def test_partial_range_read_is_counted_before_renewal_fails(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.transfer_bytes_lock = threading.Lock()
+        linker.load_bytes, linker.offload_bytes = {}, {}
+        store = Mock()
+        store.batch_get_into_multi_buffer_ranges.return_value = [8, -707]
+        store.batch_get_session_start.return_value = [-1]
+        linker.storage = SimpleNamespace(store=store)
+        with self.assertRaisesRegex(RuntimeError, "renewal failed"):
+            linker._range_get(
+                PoolName.KV, ["a", "b"], [[1], [2]], [[8], [8]], [[0], [0]]
+            )
+        self.assertEqual(linker.pop_transfer_bytes()[0], {str(PoolName.KV): 8})
+
     def test_every_layer_range_is_read_once_per_key(self):
         store = FakeStore()
         linker = make_linker(
