@@ -155,7 +155,6 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "--attention-backend",
                 "ascend_sparse_attn",
                 "--attention-backend-config",
-                # Keep the first 10 and last 5 denoising steps dense.
                 shlex.quote(
                     '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,'
                     '"skip_first_steps":10,"skip_last_steps":5,'
