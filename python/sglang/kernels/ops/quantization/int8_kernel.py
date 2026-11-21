@@ -120,6 +120,7 @@ def _per_token_group_quant_int8(
     int8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -128,6 +129,9 @@ def _per_token_group_quant_int8(
     """
     # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
+    # int64 only when x has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        g_id = g_id.to(tl.int64)
     y_ptr += g_id * y_stride
     y_q_ptr += g_id * y_stride
     y_s_ptr += g_id
@@ -197,6 +201,7 @@ def per_token_group_quant_int8(
         int8_min=int8_min,
         int8_max=int8_max,
         BLOCK=BLOCK,
+        USE_INT64_OFFSETS=x.numel() >= 2**31,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -80,6 +80,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -97,6 +98,9 @@ def _w8a8_block_fp8_matmul(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -134,6 +138,8 @@ def _w8a8_block_fp8_matmul(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -174,6 +180,7 @@ def _w8a8_block_fp8_matmul_hopper(
     needs_masking: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
     SPLIT_K: tl.constexpr = 1,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     split = tl.program_id(axis=1)
@@ -190,6 +197,9 @@ def _w8a8_block_fp8_matmul_hopper(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -246,6 +256,8 @@ def _w8a8_block_fp8_matmul_hopper(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -298,6 +310,7 @@ def _w8a8_block_fp8_matmul_gfx1250(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """
     gfx1250 (RDNA4) block-fp8 matmul.
@@ -320,6 +333,9 @@ def _w8a8_block_fp8_matmul_gfx1250(
 
     # No modulo-wrap on gfx1250; use explicit masks instead.
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     m_mask = offs_am < M
     n_mask = offs_bn < N
@@ -363,6 +379,8 @@ def _w8a8_block_fp8_matmul_gfx1250(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -693,6 +711,7 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(0),
         **config,
         needs_masking=needs_masking,
+        USE_INT64_OFFSETS=max(A.numel(), partials.numel()) >= 2**31,
     )
 
     if split_k > 1:
