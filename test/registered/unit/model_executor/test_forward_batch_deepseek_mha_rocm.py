@@ -155,6 +155,22 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         self.assertEqual(fb.prefix_chunk_len, capacity // len(prefix_lens))
         self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
 
+    def test_capacity_below_batch_size_packs_on_hip_and_raises_elsewhere(self):
+        # capacity // batch_size is 0, so no request-major chunk exists.
+        prefix_lens, capacity = [5, 1, 1], 2
+        with mock.patch.object(mix, "_is_hip", False):
+            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_KV_CHUNK_CAPACITY"):
+                _prepare(prefix_lens=prefix_lens, capacity=capacity)
+        with mock.patch.object(mix, "_is_hip", True):
+            fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
+        self.assertEqual(fb.prefix_chunk_len, capacity)
+        self._assert_valid_layout(
+            prefix_lens=prefix_lens,
+            capacity=capacity,
+            starts=fb.prefix_chunk_starts,
+            seq_lens=fb.prefix_chunk_seq_lens,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
