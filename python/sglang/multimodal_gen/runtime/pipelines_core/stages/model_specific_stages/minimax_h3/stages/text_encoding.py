@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -19,7 +20,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -430,7 +434,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
         # The SAME prepared target-canvas images feed
         # Qwen and the visual-condition tokenizer; preparation is cached per request.
-        prepared = minimax_h3_prepared_keyframes(batch, plan)
+        prepared = minimax_h3_prepared_keyframes(
+            batch,
+            plan,
+            keyframe_fit=get_global_server_args().pipeline_config.keyframe_fit,
+        )
         images = [item["image"] for item in prepared["images"]]
         frame_indices = tuple(prepared.get("semantic_frame_indices") or ())
         if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES or len(
@@ -471,6 +479,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             }
         }
 
+    @use_gpu_conditioning_hash()
     def _encode_ref2va(
         self,
         batch: Req,

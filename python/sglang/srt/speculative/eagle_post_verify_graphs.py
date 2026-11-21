@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -127,7 +128,6 @@ class EaglePostVerifyGraphs:
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
-        watermark = self._target_worker.model_runner.watermark_state
         if (
             not can_run_cuda_graph
             or batch.forward_mode.is_idle()
@@ -135,12 +135,11 @@ class EaglePostVerifyGraphs:
             or batch.has_grammar
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or info.acc_additive_penalties is not None
-            or info.acc_scaling_penalties is not None
+            or has_acc_penalties(info)
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling
-            or (watermark is not None and info.has_watermark_candidates)
+            or info.watermark is not None
             # compute_spec_logprobs reads the gathered logits off logits_output
             or (
                 batch.return_logprob
@@ -271,7 +270,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         acc_scaling_penalties=None,
         logit_bias=None,
         sampling_seed=None,
-        has_watermark_candidates=False,
+        watermark=None,
         is_all_greedy=slot.is_all_greedy,
         need_top_k_sampling=slot.need_top_k,
         need_top_p_sampling=slot.need_top_p,
@@ -281,9 +280,6 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
         top_ps=staged.get("top_ps", unused),
         min_ps=unused,
         max_top_k=None,
-        watermark_keys=None,
-        watermark_context_windows=None,
-        watermark_enabled=None,
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],
