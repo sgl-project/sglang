@@ -71,16 +71,17 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
-from sglang.srt.speculative.bench_drafter import EAGER_STEP as BENCH_EAGER_STEP
-from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
 from sglang.srt.speculative.bench_drafter import GRAPH_STEP as BENCH_GRAPH_STEP
 from sglang.srt.speculative.bench_drafter import (
     bench_drafter_enabled,
-    bench_drafter_temperature,
     bench_head_noise,
+    bench_token_mode,
+    check_dflash_drafts,
+    gather_candidates,
     gumbel_argmax,
-    opt_out_hint,
+    head_row_temperatures,
     override_draft_sampling,
+    sample_head,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
@@ -233,11 +234,13 @@ class _DflashDraftSampler:
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        self.max_bs = int(max_bs)
+        max_tokens = self.max_bs * (self.block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
-        # SGLANG_BENCH_DRAFTER_TEMPERATURE: a fused Gumbel-max over the padded shard
-        # replaces the argmax; the in-graph offset advances the noise every replay.
+        # SGLANG_BENCH_ACC_DRAFT_TEMPERATURE: a fused Gumbel-max over the padded shard
+        # replaces the argmax, at per-row temperatures staged before each replay; the
+        # in-graph offset advances the noise every replay.
         self.bench_noise = bench_noise
         if bench_noise is not None:
             # The padded width gives every rank the same candidate shape to gather.
@@ -245,14 +248,11 @@ class _DflashDraftSampler:
             self.bench_gather = (
                 None
                 if self.tp_size == 1
-                else functools.partial(_gather_candidates, tp_group)
+                else functools.partial(gather_candidates, tp_group)
             )
             self.bench_offset = torch.zeros(1, dtype=torch.int64, device=device)
-            self.bench_temperatures = torch.full(
-                (max_tokens,),
-                bench_noise.temperature,
-                dtype=torch.float32,
-                device=device,
+            self.bench_temperatures = torch.ones(
+                (max_tokens,), dtype=torch.float32, device=device
             )
             return
         if self.tp_size > 1:
@@ -275,6 +275,18 @@ class _DflashDraftSampler:
             self.selected_ids = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
+
+    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
+        if self.bench_noise is None:
+            return
+        rows = head_row_temperatures(
+            sampling_info=sampling_info,
+            bs=bs,
+            rows_per_request=self.block_size - 1,
+            noise=self.bench_noise,
+            device=self.out.device,
+        )
+        self.bench_temperatures[: rows.numel()].copy_(rows)
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -322,26 +334,6 @@ class _DflashDraftSampler:
         self.out[:n].copy_(selected.view(-1))
 
 
-def _gather_candidates(tp_group, partial: torch.Tensor) -> torch.Tensor:
-    """All-gathers every rank's Gumbel-max candidates, rank-major."""
-    gathered = torch.empty(
-        (tp_group.world_size * partial.shape[0], partial.shape[1]),
-        dtype=partial.dtype,
-        device=partial.device,
-    )
-    tp_group.all_gather_into_tensor(gathered, partial)
-    return gathered
-
-
-def _padded_org_width(lm_head) -> int:
-    """Rows of the rank's original-vocabulary shard, padding included: equal on every
-    TP rank, so their Gumbel-max candidates gather in one shape."""
-    shard = getattr(lm_head, "shard_indices", None)
-    if shard is not None:
-        return int(shard.num_org_elements_padded)
-    return int(lm_head.weight.shape[0])
-
-
 def _commit_accept(candidates, accept_len, bonus_tokens):
     """The committed block: drafted tokens shifted left, the bonus at the accept
     boundary. Returns it with the commit lengths."""
@@ -374,10 +366,8 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 
 def _sim_acc_token_mode() -> str:
-    """SGLANG_BENCH_DRAFTER_TEMPERATURE commits the sampled drafts: the default 'fixed'
-    mode would commit one fixed token id however the drafts are drawn. A function, not
-    worker state, so the accept path also runs on worker stand-ins."""
-    return "real-draft-token" if bench_drafter_enabled() else SIMULATE_ACC_TOKEN_MODE
+    """The token mode simulated acceptance commits with (see bench_token_mode)."""
+    return bench_token_mode(SIMULATE_ACC_TOKEN_MODE)
 
 
 def _is_all_greedy(sampling_info) -> bool:
@@ -499,7 +489,9 @@ class _SelectorDraftSampler:
                 )
             )
         if self.sampling_enabled:
-            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
+            override_draft_sampling(
+                temperatures=self.temperatures[:bs], greedy_mask=self.greedy_mask[:bs]
+            )
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -601,6 +593,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     _hosts_draft: bool = True
     _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
+    _bench_head_noise = None  # see speculative/bench_drafter.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
 
@@ -702,7 +695,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
-        # SGLANG_BENCH_DRAFTER_TEMPERATURE on the plain argmax head; None when off.
+        # SGLANG_BENCH_ACC_DRAFT_TEMPERATURE on the plain argmax head; None when off.
         self._bench_head_noise = bench_head_noise(
             random_seed=target_worker.random_seed,
             vocab_limit=self.model_runner.model_config.token_id_vocab_size,
@@ -909,77 +902,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
-        self._check_bench_drafter_temperature()
-
-    def _check_bench_drafter_temperature(self) -> None:
-        """Refuses the draft temperature (default under simulated acceptance) for drafts
-        it cannot sample, and logs on TP rank 0 what it changes. The env-only
-        preconditions (simulated acceptance, static verify) are checked with the
-        server args, before any weights load."""
-        temperature = bench_drafter_temperature()
-        if temperature <= 0.0:
-            return
-        name = BENCH_DRAFTER_ENV
-        if self._is_domino:
-            raise ValueError(
-                f"{name} does not support Domino drafts (a sequential argmax "
-                f"rollout){opt_out_hint()}."
+        if bench_drafter_enabled():
+            plain_head = self.selector is None and self.lilicorr is None
+            check_dflash_drafts(
+                is_domino=self._is_domino,
+                selector_sampling=(
+                    None if self.selector is None else self._selector_sampling_enabled
+                ),
+                lilicorr_sampling=(
+                    None if self.lilicorr is None else self._lilicorr_sampling_enabled
+                ),
+                lm_head=(
+                    unwrap_lora_layer(self._target_worker.model_runner.model.lm_head)
+                    if plain_head
+                    else None
+                ),
+                is_npu=_is_npu,
+                runtime=self._runtime,
+                log=self._target_tp_rank == 0,
+                configured_token_mode=SIMULATE_ACC_TOKEN_MODE,
             )
-        if self.selector is not None and not self._selector_sampling_enabled:
-            raise ValueError(
-                f"{name} needs selector sampling, which this backend does not "
-                f"support{opt_out_hint()}."
-            )
-        if self.lilicorr is not None and not self._lilicorr_sampling_enabled:
-            raise ValueError(
-                f"{name} with LiLiCorr requires SGLANG_ENABLE_LILICORR_SAMPLING=1, so "
-                f"the draft graph captures its sampled walk{opt_out_hint()}."
-            )
-        if self.selector is None and self.lilicorr is None:
-            # The plain argmax head samples with DSpark's fused Gumbel-max, whose
-            # NPU kernel does not take the bias-free draw.
-            if _is_npu:
-                raise ValueError(
-                    f"{name} does not support the plain DFLASH head on NPU"
-                    f"{opt_out_hint()}."
-                )
-            # Its noise covers global token ids in quads, so every TP shard must
-            # start on a multiple of 4; the shard size is alike on all ranks.
-            lm_head = unwrap_lora_layer(
-                getattr(self._target_worker.model_runner.model, "lm_head", None)
-            )
-            shard = getattr(lm_head, "shard_indices", None)
-            if shard is not None and int(shard.num_org_elements_padded) % 4:
-                raise ValueError(
-                    f"{name} needs the target lm_head's vocab shards in multiples of "
-                    f"4 rows, got {int(shard.num_org_elements_padded)} per TP rank"
-                    f"{opt_out_hint()}."
-                )
-        if self._target_tp_rank != 0:
-            return
-        if SIMULATE_ACC_TOKEN_MODE != "real-draft-token":
-            logger.warning(
-                "%s overrides SGLANG_SIMULATE_ACC_TOKEN_MODE=%s: simulated acceptance "
-                "commits the sampled drafts (real-draft-token), not a fixed token id.",
-                name,
-                SIMULATE_ACC_TOKEN_MODE,
-            )
-        if self._runtime is not None:
-            # TODO(next PR): the megakernel's DFlash runtime should sample its drafts
-            # at the benchmark temperature too; until then they stay greedy.
-            logger.warning(
-                "%s is not applied by the megakernel's DFlash runtime (%s) yet: the "
-                "drafts it samples stay greedy.",
-                name,
-                type(self._runtime).__name__,
-            )
-            return
-        logger.warning(
-            "BENCHMARK: DFLASH drafts sample at temperature %s; acceptance is "
-            "simulated (SGLANG_SIMULATE_ACC_LEN=%s, real-draft-token mode).",
-            temperature,
-            SIMULATE_ACC_LEN,
-        )
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
@@ -1520,12 +1462,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # No shard metadata to recover per-rank vocab offsets from.
                 return _eager("tp>1 without shard_indices")
             num_org = int(lm_head.weight.shape[0])
+            padded_width = num_org
             org_vocab_start = 0
         else:
             shard = lm_head.shard_indices
             if int(shard.num_added_elements) != 0:
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
+            padded_width = int(shard.num_org_elements_padded)
             org_vocab_start = int(shard.org_vocab_start_index)
         if self._target_tp_rank == 0:
             logger.info(
@@ -1540,7 +1484,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
             bench_noise=self._bench_head_noise,
-            bench_padded_width=_padded_org_width(lm_head),
+            bench_padded_width=padded_width,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -2093,7 +2037,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
         if self._selector_sampling_enabled:
-            override_draft_sampling(temperatures, greedy_mask)
+            override_draft_sampling(temperatures=temperatures, greedy_mask=greedy_mask)
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
@@ -2158,60 +2102,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_probs.scatter_(-1, candidate_ids, 0.0)
         return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
 
-    def _bench_sample_from_head(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        lm_head,
-        chunk_size: int,
-    ) -> torch.Tensor:
-        """SGLANG_BENCH_DRAFTER_TEMPERATURE on the eager head: the draft graph sampler's
-        fused Gumbel-max over each rank's padded shard, on the eager noise stream. The
-        offset advances per chunk, so no two rows of one draft call share noise. Added
-        vocabulary is skipped: its ids lie past the token vocabulary the draws cover."""
-        noise = self._bench_head_noise
-        weight = getattr(lm_head, "weight", None)
-        shard = getattr(lm_head, "shard_indices", None)
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        quantized = not is_dense_head_weight(weight)
-        if quantized and tp_size != 1:
-            raise RuntimeError(
-                "DFLASH with a quantized target lm_head is only supported at "
-                f"tp=1, got tp_size={tp_size}."
-            )
-        width = None if quantized else _padded_org_width(lm_head)
-        gather = (
-            None if tp_size == 1 else functools.partial(_gather_candidates, tp_group)
-        )
-        chunk_size = int(chunk_size)
-        num_tokens = int(hidden_states.shape[0])
-        device = hidden_states.device
-        temperatures = torch.full(
-            (min(chunk_size, num_tokens),),
-            noise.temperature,
-            dtype=torch.float32,
-            device=device,
-        )
-        out_tokens = torch.empty((num_tokens,), dtype=torch.long, device=device)
-        for start in range(0, num_tokens, chunk_size):
-            hs = hidden_states[start : start + chunk_size]
-            if quantized:
-                logits = lm_head.quant_method.apply(lm_head, hs, None)
-            else:
-                logits = torch.matmul(hs.to(weight.dtype), weight[:width].T)
-            out_tokens[start : start + hs.shape[0]] = gumbel_argmax(
-                logits,
-                noise=noise,
-                temperatures=temperatures[: hs.shape[0]],
-                offset=self._bench_eager_offset,
-                step=BENCH_EAGER_STEP,
-                vocab_start=0 if shard is None else int(shard.org_vocab_start_index),
-                gather=gather,
-            )
-            self._bench_eager_offset.add_(1)
-        return out_tokens
-
     def _greedy_sample_from_quantized_head(
         self,
         *,
@@ -2264,10 +2154,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
-        if bench_drafter_enabled():
-            return self._bench_sample_from_head(
-                hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
-            )
 
         if not is_dense_head_weight(getattr(lm_head, "weight", None)):
             return self._greedy_sample_from_quantized_head(
@@ -3630,6 +3516,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_feature = self._draft_confidence = None
             # Consumed by the in-graph sample; must be staged before the replay.
             self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
+        elif self._bench_head_noise is not None:
+            # The plain head's per-row draft temperatures, read in the graph.
+            self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         self._join_aux()
         with (
@@ -3753,13 +3642,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            hidden = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
             with draft_tp_context(self.draft_parallel_layout):
-                draft_next = self._greedy_sample_from_vocab_parallel_head(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
-                    ),
-                    lm_head=lm_head,
-                ).view(bs, int(self.block_size) - 1)
+                if self._bench_head_noise is None:
+                    draft_next = self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=hidden, lm_head=lm_head
+                    )
+                else:
+                    draft_next = sample_head(
+                        hidden_states=hidden,
+                        lm_head=lm_head,
+                        noise=self._bench_head_noise,
+                        temperatures=head_row_temperatures(
+                            sampling_info=batch.sampling_info,
+                            bs=bs,
+                            rows_per_request=int(self.block_size) - 1,
+                            noise=self._bench_head_noise,
+                            device=hidden.device,
+                        ),
+                        offset=self._bench_eager_offset,
+                        tp_group=get_parallel().tp_group,
+                    )
+            draft_next = draft_next.view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         if not (

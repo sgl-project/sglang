@@ -653,8 +653,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _apply_bench_drafter_temperature(self) -> None:
-        """SGLANG_BENCH_DRAFTER_TEMPERATURE overrides SGLANG_DSPARK_USE_GREEDY_DRAFT.
-        Runs before anything reads ``self._greedy_draft``."""
+        """Under simulated acceptance greedy draft rows sample (bench_drafter.py); an
+        explicit temperature also overrides SGLANG_DSPARK_USE_GREEDY_DRAFT. Runs before
+        anything reads ``self._greedy_draft``."""
         temperature = bench_drafter_temperature()
         if temperature <= 0.0:
             return
@@ -663,13 +664,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         if overridden:
             logger.warning(
-                "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample at the "
-                "benchmark temperature instead of taking the argmax.",
+                "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample instead "
+                "of taking the argmax.",
                 BENCH_DRAFTER_ENV,
             )
         logger.warning(
-            "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "
-            "simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
+            "BENCHMARK: DSpark greedy drafts sample at temperature %s, sampled requests "
+            "at their own; acceptance is simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
             temperature,
             self._simulate_acc_len,
         )

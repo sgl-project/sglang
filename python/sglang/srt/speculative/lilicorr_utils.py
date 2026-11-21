@@ -227,7 +227,7 @@ def propose_lilicorr_block(
         else torch.ones(bs, dtype=torch.bool, device=device)
     )
     if sampling_enabled:
-        override_draft_sampling(temperatures, greedy_mask)
+        override_draft_sampling(temperatures=temperatures, greedy_mask=greedy_mask)
     selected, q_rows = head.select_with_proposal(
         uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
         temperatures=temperatures,
@@ -322,7 +322,9 @@ class LiLiCorrDraftSampler:
                     bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
                 )
             )
-        override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
+        override_draft_sampling(
+            temperatures=self.temperatures[:bs], greedy_mask=self.greedy_mask[:bs]
+        )
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids

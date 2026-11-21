@@ -254,8 +254,8 @@ def _launch_partial(
 
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
-    the rank's padded shard ``base_logits``, or adds nothing when None (``vocab_limit``
-    still masks the tail). Sharded, ``gather`` exchanges
+    the rank's padded shard ``base_logits``, or adds nothing when None (CUDA and CPU
+    only; ``vocab_limit`` still masks the tail). Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
     ``has_sampled_rows=False`` argmaxes every row."""
@@ -264,6 +264,11 @@ class MarkovSampleStep:
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
             if _is_npu:
+                if kwargs.get("bias") is None:
+                    raise NotImplementedError(
+                        "MarkovSampleStep on NPU needs a bias; bias=None is CUDA and "
+                        "CPU only."
+                    )
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
                 return markov_sample_step_triton(**kwargs)

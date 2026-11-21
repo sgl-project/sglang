@@ -1,13 +1,16 @@
-"""DFLASH under confidence-scheduled verify on the device: sampling acceptance
-stops at the planned verify length, and the lagged confidence relay resolves
-the same copy on every rank."""
+"""DFLASH on the device: under confidence-scheduled verify, sampling acceptance
+stops at the planned verify length and the lagged confidence relay resolves the
+same copy on every rank; under simulated acceptance, the plain head's sampled
+drafts get fresh noise on every CUDA-graph replay."""
 
 import types
 import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import overlap_utils
+from sglang.srt.speculative import bench_drafter
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -116,6 +119,54 @@ class TestDFlashRaggedVerify(CustomTestCase):
         self.assertIsNotNone(resolved)
         torch.testing.assert_close(resolved.confidence, torch.full((2, 3), 1.0))
         torch.cuda.synchronize()
+
+
+class TestPlainHeadSampling(CustomTestCase):
+    def test_graph_replays_draw_fresh_noise(self):
+        torch.manual_seed(0)
+        block, hidden_size, vocab = 4, 8, 40
+        weight = torch.randn(vocab, hidden_size, device=DEVICE)
+        hidden = torch.randn(2 * block, hidden_size, device=DEVICE)
+        noise = bench_drafter.BenchHeadNoise(
+            key=7, output_multiplier=1.0, softcap=None, vocab_limit=vocab
+        )
+        sampler = worker_mod._DflashDraftSampler(
+            weight=weight,
+            block_size=block,
+            num_org=vocab,
+            org_vocab_start=0,
+            max_bs=2,
+            bench_noise=noise,
+            bench_padded_width=vocab,
+        )
+        greedy = types.SimpleNamespace(
+            temperatures=torch.zeros(2, 1, device=DEVICE),
+            top_ks=torch.ones(2, dtype=torch.int32, device=DEVICE),
+        )
+        with envs.SGLANG_BENCH_ACC_DRAFT_TEMPERATURE.override("1000"):
+            bench_drafter.bench_drafter_temperature.cache_clear()
+            sampler.stage_sampling_params(bs=2, sampling_info=greedy)
+        bench_drafter.bench_drafter_temperature.cache_clear()
+        sampler(hidden)  # compile the kernels before capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden)
+        sampler.bench_offset.zero_()
+        rows = hidden.view(2, block, hidden_size)[:, 1:, :].reshape(-1, hidden_size)
+        logits = (rows @ weight.T).cpu()
+        n = rows.shape[0]
+        for step in range(2):
+            graph.replay()
+            expected = bench_drafter.gumbel_argmax(
+                logits,
+                noise=noise,
+                temperatures=torch.full((n,), 1000.0),
+                offset=torch.tensor([step], dtype=torch.int64),
+                step=bench_drafter.GRAPH_STEP,
+                vocab_start=0,
+            )
+            self.assertTrue(torch.equal(sampler.out[:n].cpu(), expected))
+        self.assertEqual(int(sampler.bench_offset), 2)
 
 
 if __name__ == "__main__":

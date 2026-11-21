@@ -227,6 +227,42 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
+    def test_bias_free_draw_replays_like_the_torch_reference(self):
+        # bias=None (an argmax head with no Markov bias) under CUDA-graph replay,
+        # where the device offset gives every replay fresh noise.
+        g = torch.Generator(device=DEVICE).manual_seed(4)
+        base = torch.randn(7, 3000, generator=g, device=DEVICE).to(torch.bfloat16)
+        temps = torch.full((7,), 1000.0, device=DEVICE)
+        offset = _offset(0)
+        out = torch.empty(7, dtype=torch.int64, device=DEVICE)
+
+        def draw(impl, offset_tensor):
+            return impl(
+                base_logits=base,
+                bias=None,
+                temperatures=temps,
+                key=99,
+                offset=offset_tensor,
+                step=0,
+                step_dtype=torch.float32,
+                vocab_limit=2999,
+            )
+
+        def step():
+            out.copy_(draw(MarkovSampleStep.triton, offset))
+            offset.add_(1)
+
+        step()  # compile before capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            step()
+        offset.zero_()
+        for replay in range(3):
+            graph.replay()
+            expected = draw(MarkovSampleStep.torch, _offset(replay))
+            self.assertTrue(torch.equal(out, expected))
+        self.assertEqual(int(offset.item()), 3)
+
     def test_kept_sharded_logits_match_full_vocab(self):
         # Kept logits are gathered whole and every rank picks from them: the
         # same tokens and the same logits as the full vocab, both backends.
