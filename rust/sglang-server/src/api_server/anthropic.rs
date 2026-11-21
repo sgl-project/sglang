@@ -716,6 +716,11 @@ impl Anthropic<'_> {
                 },
                 tool_parser: parser,
                 tools,
+                uses_tool_call_json_schema: !uses_tool_call_structural_tag
+                    && matches!(
+                        tool_choice,
+                        DynamoToolChoice::Required | DynamoToolChoice::Named(_)
+                    ),
             },
             tool_choice: chat_request.tool_choice,
             uses_tool_call_structural_tag,

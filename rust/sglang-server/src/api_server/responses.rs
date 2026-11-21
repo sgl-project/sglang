@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1 as api;
+use sglang_processor::dynamo_parsers::ToolChoice as DynamoToolChoice;
 use sglang_processor::dynamo_protocols::types::{
     ChatCompletionMessageContent, CreateChatCompletionRequest, CreateChatCompletionResponse,
     CreateChatCompletionStreamResponse,
@@ -1178,6 +1179,11 @@ impl Responses<'_> {
         if let Some(schema) = plan.json_schema.clone() {
             sampling.json_schema = Some(schema);
         }
+        let uses_tool_call_json_schema = sampling.structural_tag.is_none()
+            && matches!(
+                dynamo_choice,
+                DynamoToolChoice::Required | DynamoToolChoice::Named(_)
+            );
         let starts_in_reasoning =
             starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
         let routing = PDRoutingFields {
@@ -1228,6 +1234,7 @@ impl Responses<'_> {
                 },
                 tool_parser: parser,
                 tools,
+                uses_tool_call_json_schema,
             },
         })
     }
