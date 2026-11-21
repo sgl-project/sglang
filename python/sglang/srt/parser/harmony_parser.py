@@ -232,16 +232,19 @@ class CanonicalStrategy:
         channel_header = text[channel_start:channel_end]
 
         channel_type = self._extract_channel_type(channel_header)
-        if channel_type != "analysis":
+        if channel_type != "analysis" or "to=" in channel_header.lower():
             return None  # Only stream analysis content - tool calls wait for completion
 
-        # Extract partial content after <|message|>
+        # Extract partial content after <|message|>, holding back any partial structural token suffix
         content_start = tokens[message_pos].end
         content = text[content_start:]
+        emit, hold = prefix_hold(content, self.guard_tokens)
+        if not emit:
+            return None
 
         # Return partial reasoning content and preserve the channel structure for next parse
-        remaining_text = text[tokens[start_pos].start : content_start]
-        return Event("reasoning", content), remaining_text
+        remaining_text = text[tokens[start_pos].start : content_start] + hold
+        return Event("reasoning", emit), remaining_text
 
     def _extract_channel_type(self, header_text: str) -> Optional[str]:
         """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
@@ -510,6 +513,7 @@ class HarmonyParser:
         self._partial_commentary = (
             ""  # Track partial commentary being built across chunks
         )
+        self._partial_commentary_raw = ""
 
     def parse(self, chunk: str) -> List[Event]:
         self._buffer += chunk
@@ -555,18 +559,28 @@ class HarmonyParser:
                         # Complete commentary found - filter it
                         should_filter = True
                         self._partial_commentary = ""  # Reset
+                        self._partial_commentary_raw = ""
                         self._should_filter_commentary = False  # Done filtering
                     elif "commentary".startswith(potential_commentary):
                         # Partial match - accumulate and filter this chunk
                         should_filter = True
                         self._partial_commentary = potential_commentary
+                        self._partial_commentary_raw += event.content
                     else:
-                        # Not commentary - reset and keep the event
+                        # Not commentary - restore any held raw prefix, reset, and keep the event
+                        if self._partial_commentary_raw:
+                            event = Event(
+                                event.event_type,
+                                self._partial_commentary_raw + event.content,
+                                event.raw_text,
+                            )
                         self._partial_commentary = ""
+                        self._partial_commentary_raw = ""
                         self._should_filter_commentary = False
                 else:
                     # Not in commentary filtering state - reset partial state
                     self._partial_commentary = ""
+                    self._partial_commentary_raw = ""
 
             if should_filter:
                 # Skip this commentary filler
@@ -578,6 +592,7 @@ class HarmonyParser:
                     True  # Filter commentary after tool calls
                 )
                 self._partial_commentary = ""  # Reset on tool call
+                self._partial_commentary_raw = ""
             elif buffer_has_call_token:
                 self._should_filter_commentary = (
                     True  # Filter commentary after <|call|> token
