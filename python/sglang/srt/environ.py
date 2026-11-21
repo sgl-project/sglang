@@ -2402,6 +2402,10 @@ class Envs:
     # extend forward (--enable-mixed-chunk) instead of a separate decode round.
     SGLANG_ENABLE_DFLASH_MIXED_VERIFY = EnvBool(False)
 
+    # Opt-in SM90 small-M BF16 GEMV (TileLang) for the unquantized linear method,
+    # on the (N, K) shapes in hopper_bf16_small_m_gemv's tables.
+    SGLANG_HOPPER_SMALL_M_GEMV = EnvBool(False)
+
     # ===================================================================
     # Muse Spark
     # ===================================================================
