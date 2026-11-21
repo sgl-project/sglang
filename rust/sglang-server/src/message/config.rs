@@ -641,10 +641,29 @@ impl DeploymentInfo {
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct RustServerEndpoint {
     pub dp_rank: u32,
     pub endpoint: String,
+    /// The secret this listener's control relay route requires (see
+    /// `api_server::core::peer`), drawn at launch by the rank that hosts the
+    /// listener and shared with the other ranks only through their startup
+    /// all-gather. Never serialized, so `/server_info` does not publish it.
+    #[serde(default, skip_serializing)]
+    pub peer_token: Option<String>,
+}
+
+impl std::fmt::Debug for RustServerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustServerEndpoint")
+            .field("dp_rank", &self.dp_rank)
+            .field("endpoint", &self.endpoint)
+            .field(
+                "peer_token",
+                &self.peer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

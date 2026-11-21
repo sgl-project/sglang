@@ -64,6 +64,7 @@ See [`test_npu_sampling_backend.py`](https://github.com/sgl-project/sglang/tree/
 2. Extend `CustomTestCase` (from `sglang.test.test_utils`) for CI retry support.
 3. Launch server with `popen_launch_server()` in `setUpClass` and clean up with `kill_process_tree()` in `tearDownClass`.
 4. Register your test with `register_npu_ci()`:
+
    ```python
    from sglang.test.ci.ci_register import register_npu_ci
    register_npu_ci(est_time=400, suite="extra-b-test-1-npu-a3")
@@ -123,6 +124,7 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
+
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/manual/eval/test_eval_accuracy_large.py)
 
 ## Benchmark the speed
@@ -211,6 +213,7 @@ Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled ["good first issue" or "help wanted"](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase.
 
 Also check out the following materials as startup guide:
+
 - [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of sglang.
 - [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 - [GTC-2026 Training Lab](https://drive.google.com/file/d/1mwOZEtipNLJzrflCTodj34KhuOZEoEw5/view?usp=drive_link) for hands-on practices of how to do optimization, benchmarking, or profiling on a launched SGLang instance.

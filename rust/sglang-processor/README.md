@@ -94,8 +94,10 @@ inferred from the model path, then the tokenizer config's Jinja template; with a
 error string is returned so the host can report it per request.
 
 `render_prompt` is pass-through to `OAIPromptFormatter::render_prompt` for
-Jinja and native formatters. It keeps Dynamo's segments so Kimi K3 can encode
-with `encode_segments`.
+native formatters. It keeps Dynamo's segments so Kimi K3 can encode with
+`encode_segments`. Jinja templates render to one string, since SGLang tokenizes
+the rendered prompt whole: a control-token spelling in request text encodes as
+that control token, Harmony templates included.
 `render_request` takes the SGLang request body, because DeepSeek-V4 and V4.1 read
 `task`, `continue_final_message` and the `reasoning` object, which
 `OAIChatLikeRequest` lacks, and GLM-5.3, MiniMax-M3, Qwen3.8 and StepFun build their
