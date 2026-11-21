@@ -13,7 +13,6 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
@@ -21,6 +20,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
@@ -35,6 +35,7 @@ class TestCohereEmbedding(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.process = None
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(
             cls.model, revision=cls.model_revision
@@ -60,7 +61,8 @@ class TestCohereEmbedding(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def post(self, path, body):
         response = requests.post(self.base_url + path, json=body, timeout=120)

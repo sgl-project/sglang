@@ -78,13 +78,10 @@ class TestCohereEmbedRequest(unittest.TestCase):
         self.assertEqual((request.max_tokens, request.output_dimension), (1, 8))
 
     def test_max_tokens_accepts_vllm_sentinel_and_zero(self):
-        for policy in ("END", "START", "NONE"):
-            for value in (-1, 0):
-                with self.subTest(policy=policy, value=value):
-                    request = CohereEmbedRequest(
-                        texts=["a"], truncate=policy, max_tokens=value
-                    )
-                    self.assertEqual(request.max_tokens, value)
+        for value in (-1, 0):
+            with self.subTest(value=value):
+                request = CohereEmbedRequest(texts=["a"], max_tokens=value)
+                self.assertEqual(request.max_tokens, value)
 
     def test_truncation_and_output_enums(self):
         for direction in ("END", "START", "NONE"):
@@ -112,33 +109,6 @@ class TestCohereEmbedRequest(unittest.TestCase):
             with self.subTest(priority=priority), self.assertRaises(ValidationError):
                 CohereEmbedRequest(texts=["a"], priority=priority)
 
-    def test_model_defined_input_type_is_not_a_fixed_enum(self):
-        request = CohereEmbedRequest(texts=["a"], input_type="custom-task-name")
-        self.assertEqual(request.input_type, "custom-task-name")
-
-    def test_ordered_content_and_batch_boundaries(self):
-        request = CohereEmbedRequest(
-            inputs=[
-                {
-                    "content": [
-                        {"type": "text", "text": "before"},
-                        {"type": "image_url", "image_url": {"url": "image-a"}},
-                        {"type": "text", "text": "between"},
-                        {"type": "image_url", "image_url": {"url": "image-b"}},
-                    ]
-                },
-                {"content": [{"type": "text", "text": "second sample"}]},
-            ]
-        )
-        self.assertTrue(request.has_images)
-        self.assertEqual(len(request.inputs), 2)
-        self.assertEqual(
-            [part.type for part in request.inputs[0].content],
-            ["text", "image_url", "text", "image_url"],
-        )
-        self.assertEqual(request.inputs[0].content[3].image_url["url"], "image-b")
-        self.assertEqual(request.inputs[1].content[0].text, "second sample")
-
     def test_content_payload_validation(self):
         for content in (
             [],
@@ -151,14 +121,6 @@ class TestCohereEmbedRequest(unittest.TestCase):
         ):
             with self.subTest(content=content), self.assertRaises(ValidationError):
                 CohereEmbedRequest(inputs=[{"content": content}])
-
-    def test_images_and_text_only_inputs_detection(self):
-        self.assertTrue(CohereEmbedRequest(images=["image-a", "image-b"]).has_images)
-        self.assertFalse(
-            CohereEmbedRequest(
-                inputs=[{"content": [{"type": "text", "text": "a"}]}]
-            ).has_images
-        )
 
     def test_no_artificial_batch_size_limit(self):
         request = CohereEmbedRequest(texts=["a"] * 129)

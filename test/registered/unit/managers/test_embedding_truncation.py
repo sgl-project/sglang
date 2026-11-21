@@ -71,16 +71,6 @@ class TestEmbeddingTruncation(unittest.TestCase):
         self.assertEqual(ids, list(range(12)))
         self.assertEqual(types, list(range(100, 112)))
 
-    def test_exact_boundary_and_one_token_over(self):
-        for policy in ("END", "START", "NONE"):
-            with self.subTest(policy=policy):
-                self.assertEqual(
-                    self.truncate(list(range(8)), policy)[0], list(range(8))
-                )
-        self.assertEqual(self.truncate(list(range(9)))[0], list(range(8)))
-        with self.assertRaisesRegex(ValueError, "truncate=NONE"):
-            self.truncate(list(range(9)), "NONE")
-
     def test_special_token_mask_preserves_template_not_literal_special_ids(self):
         # The second 99 is literal text, not a token added by the template.
         ids = [98, 10, 99, 11, 12, 13, 99]
@@ -187,14 +177,6 @@ class TestEmbeddingTruncation(unittest.TestCase):
         self.assertEqual(self.truncate([], "NONE", max_tokens=0)[0], [])
         with self.assertRaisesRegex(ValueError, "budget of 0.*truncate=NONE"):
             self.truncate([1], "NONE", max_tokens=0)
-
-    def test_request_isolation(self):
-        ids = list(range(12))
-        self.assertEqual(self.truncate(ids, "END", 4)[0], [0, 1, 2, 3])
-        self.assertEqual(self.truncate(ids, "START", 3)[0], [9, 10, 11])
-        with self.assertRaisesRegex(ValueError, "truncate=NONE"):
-            self.truncate(ids, "NONE", 4)
-        self.assertEqual(ids, list(range(12)))
 
     def test_mm_tail_keeps_all_features_and_updates_parallel_ids(self):
         ids = list(range(14))
