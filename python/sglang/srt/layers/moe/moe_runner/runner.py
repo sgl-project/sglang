@@ -223,6 +223,7 @@ class MoeRunner:
                 hidden_states,
                 lora_info,
                 topk_ids,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
             )
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
