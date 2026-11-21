@@ -182,7 +182,7 @@ from sglang.srt.layers.attention.aiter_utils import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
-from sglang.srt.utils import get_bool_env_var, print_info_once, print_warning_once
+from sglang.srt.utils import get_bool_env_var, print_warning_once
 
 logger = logging.getLogger(__name__)
 
