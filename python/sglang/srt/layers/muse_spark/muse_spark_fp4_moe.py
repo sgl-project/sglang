@@ -31,6 +31,10 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
 )
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.muse_spark.muse_spark_humming_moe import (
+    HummingTuning,
+    humming_expert_outputs,
+)
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
@@ -131,14 +135,28 @@ class MuseSpark1xFp4Experts(nn.Module):
 
         capability = get_device_capability() if is_cuda() else None
         self.use_marlin = self.moe_runner_backend.is_marlin()
+        self.use_humming = self.moe_runner_backend.is_humming()
+        # Both run the experts as W4A16 GEMMs on BF16 activations.
+        self.use_w4a16 = self.use_marlin or self.use_humming
         self._sm_major = capability[0] if capability is not None else 0
-        if not self.use_marlin and capability is not None and capability < (10, 0):
+        if not self.use_w4a16 and capability is not None and capability < (10, 0):
             raise ValueError(
                 f"--moe-runner-backend {self.moe_runner_backend.value} needs a "
                 f"Blackwell (SM100+) device for packed NVFP4 experts, but this "
                 f"device reports SM{capability[0]}{capability[1]}. Launch with "
-                "--moe-runner-backend marlin, or with auto, which selects marlin "
-                "on SM80-SM90."
+                "--moe-runner-backend marlin or humming, or with auto, which "
+                "selects marlin on SM80-SM90."
+            )
+        if (
+            self.use_humming
+            and capability is not None
+            and not ((8, 0) <= capability < (10, 0))
+        ):
+            raise ValueError(
+                "--moe-runner-backend humming runs packed NVFP4 experts on "
+                "SM80-SM90 only, where auto selects marlin; this device reports "
+                f"SM{capability[0]}{capability[1]}. On Blackwell, launch with "
+                "auto or flashinfer_trtllm."
             )
         if self.use_marlin:
             assert hidden_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
@@ -160,7 +178,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         self._post_expert_norm_weight_first = True
         self._fused_finalize_op = (
             None
-            if self.use_marlin
+            if self.use_w4a16
             else FusedPostExpertNormWeightedSumTRTLLM(
                 topk=top_k, hidden_dim=hidden_size, eps=1e-8, weight_first=False
             )
@@ -177,7 +195,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.register_buffer("_expert_map", expert_map, persistent=False)
 
         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
-        if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:
+        if not self.use_w4a16 and not self.quant_method.enable_flashinfer_trtllm_moe:
             raise ValueError(
                 "Packed NVFP4 experts need the FlashInfer TRT-LLM MoE backend, "
                 "which prepares the shuffled FP4 weights this forward reads. "
@@ -192,9 +210,11 @@ class MuseSpark1xFp4Experts(nn.Module):
             params_dtype=self.params_dtype,
             extra_weight_attrs={},
         )
-        if self.use_marlin:
+        if self.use_w4a16:
             self.w13_blockscale_swizzled = None
             self.w2_blockscale_swizzled = None
+        # Set when the weights are processed for Humming.
+        self.humming_tuning: Optional[HummingTuning] = None
 
     @torch.no_grad()
     def set_post_expert_norm(self, post_expert_norm: Optional[nn.Module]) -> None:
@@ -267,13 +287,13 @@ class MuseSpark1xFp4Experts(nn.Module):
         post_expert_norm: Optional[nn.Module],
     ) -> FlashinferCombineInput:
         """Run expert-owned SP rows and build the BF16 A2A combine payload."""
-        if self.use_marlin:
+        if self.use_w4a16:
             raise ValueError(
                 "Muse Spark sequence-parallel prefill dispatches the routed "
                 "experts through the TRT-LLM FP4 MoE runner, which needs a "
                 f"Blackwell (SM100+) device; this device reports SM{self._sm_major}x "
-                "and resolved the Marlin W4A16 backend. Launch without "
-                "sequence-parallel prefill on SM80-SM90."
+                f"and resolved the {self.moe_runner_backend.value} W4A16 backend. "
+                "Launch without sequence-parallel prefill on SM80-SM90."
             )
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
@@ -517,7 +537,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             has_inactive_prefix_count=expert_map is None,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
-    def _forward_marlin(
+    def _forward_w4a16(
         self,
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
@@ -527,10 +547,10 @@ class MuseSpark1xFp4Experts(nn.Module):
     ) -> torch.Tensor:
         if post_expert_norm is None:
             raise ValueError(
-                "The NVFP4 Marlin fallback requires moe_use_post_expert_norm=True. "
-                "Marlin carries one NVFP4 global scale per expert, so "
-                "w13_weight_scale_2 is collapsed to its gate column and every "
-                "expert output picks up a constant gain 1/r with "
+                "The NVFP4 W4A16 fallbacks (Marlin, Humming) require "
+                "moe_use_post_expert_norm=True. Both carry one NVFP4 global scale "
+                "per expert, so w13_weight_scale_2 is collapsed to its gate column "
+                "and every expert output picks up a constant gain 1/r with "
                 "r = w3_weight_scale_2 / w1_weight_scale_2. The post-expert "
                 "RMSNorm cancels that gain exactly; without it the expert "
                 "outputs are mis-scaled per expert. Run this checkpoint on "
@@ -538,9 +558,21 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
         if pre_expert_norm is not None:
             hidden_states = pre_expert_norm(hidden_states)
-        expert_outputs, local_topk_ids = self._marlin_expert_outputs(
-            hidden_states, topk_scores, topk_ids
-        )
+        if self.use_humming:
+            expert_outputs, local_topk_ids = humming_expert_outputs(
+                self,
+                tuning=self.humming_tuning,
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                expert_map=self._expert_map,
+                num_local_experts=self.num_local_experts,
+                num_global_experts=self.global_num_experts,
+                intermediate_size=self.intermediate_size_per_partition,
+            )
+        else:
+            expert_outputs, local_topk_ids = self._marlin_expert_outputs(
+                hidden_states, topk_scores, topk_ids
+            )
         if self._post_expert_norm is not post_expert_norm:
             self.set_post_expert_norm(post_expert_norm)
         if self._post_expert_norm_weight is not None:
@@ -645,8 +677,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         *,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
-        if self.use_marlin:
-            return self._forward_marlin(
+        if self.use_w4a16:
+            return self._forward_w4a16(
                 hidden_states,
                 topk_scores,
                 topk_ids,

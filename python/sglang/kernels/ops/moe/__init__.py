@@ -230,6 +230,17 @@ register_kernel(
     )
 )
 
+# Single-CTA alignment of one expert-parallel rank's routes: maps global ids
+# through the expert map and aligns the local routes in the same launch.
+register_kernel(
+    KernelSpec(
+        op="moe.moe_align_ep_local",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_align_ep_local:moe_align_ep_local",
+        capabilities=CUDA_ONLY,
+    )
+)
+
 # One gather for a quantized activation and its group scales: replaces the pair
 # of shuffle_rows launches the cutlass fp8 blockwise MoE used to walk the same
 # dst2src map with. Byte-identical to those calls.

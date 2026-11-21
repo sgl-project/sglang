@@ -1250,6 +1250,7 @@ def test_muse_marlin_inactive_routes(
     torch.nn.Module.__init__(layer)
     layer.quant_config = SimpleNamespace(group_size=16)
     layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.use_humming = False
     layer.params_dtype = dtype
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = local_experts
@@ -1324,7 +1325,7 @@ def test_muse_marlin_inactive_routes(
         side_effect=record_projection_buffer,
     ):
         expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
-        actual = layer._forward_marlin(x, weights, ids, norm)
+        actual = layer._forward_w4a16(x, weights, ids, norm)
     for gate_up_buffer, down_buffer in zip(
         projection_buffers[::2], projection_buffers[1::2]
     ):

@@ -2424,7 +2424,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
+            use_marlin_fallback = self._runs_below_blackwell(moe_runner_backend)
         if not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
@@ -2441,6 +2441,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
+
+    @staticmethod
+    def _runs_below_blackwell(moe_runner_backend: MoeRunnerBackend) -> bool:
+        """Whether this method serves NVFP4 experts on this runner before SM100."""
+        return moe_runner_backend.is_marlin()
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
