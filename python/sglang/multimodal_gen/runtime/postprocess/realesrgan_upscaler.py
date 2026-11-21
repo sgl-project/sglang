@@ -22,17 +22,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DEFAULT_UPSCALING_REPO,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_get,
     cache_put,
+)
+from sglang.multimodal_gen.runtime.postprocess.served_model_paths import (
+    check_served_model_path,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 # Default HuggingFace repo and filename for Real-ESRGAN weights
-_DEFAULT_REALESRGAN_HF_REPO = "ai-forever/Real-ESRGAN"
+_DEFAULT_REALESRGAN_HF_REPO = DEFAULT_UPSCALING_REPO
 _DEFAULT_REALESRGAN_FILENAME = "RealESRGAN_x4.pth"
 _DEFAULT_REALESRGAN_FILENAMES_BY_SCALE = {
     2: "RealESRGAN_x2.pth",
@@ -571,6 +577,7 @@ class ImageUpscaler:
 
     def _ensure_model_loaded(self) -> UpscalerModel:
         """Download/load Real-ESRGAN weights, detect arch, and cache globally."""
+        check_served_model_path("upscaling_model_path", self._model_path)
         model_path = self._model_path or _default_model_path_for_scale(self._scale)
 
         # Resolve: local .pth pass-through, or HF repo → download single file

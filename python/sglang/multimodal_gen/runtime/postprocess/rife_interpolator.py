@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DEFAULT_FRAME_INTERPOLATION_REPO,
     validate_frame_interpolation_exp,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -28,12 +29,16 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_get,
     cache_put,
 )
+from sglang.multimodal_gen.runtime.postprocess.served_model_paths import (
+    check_served_model_path,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 # Default HuggingFace repo for RIFE 4.22.lite weights
-_DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
+_DEFAULT_RIFE_HF_REPO = DEFAULT_FRAME_INTERPOLATION_REPO
+_RIFE_WEIGHTS_FILENAME = "flownet.pkl"
 
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: "OrderedDict[str, Model]" = OrderedDict()
@@ -293,7 +298,7 @@ class Model:
             strip_module_prefix: If True, strip the ``module.`` prefix that
                 ``DataParallel`` / ``DistributedDataParallel`` adds to keys.
         """
-        flownet_path = os.path.join(path, "flownet.pkl")
+        flownet_path = os.path.join(path, _RIFE_WEIGHTS_FILENAME)
         if not os.path.isfile(flownet_path):
             raise FileNotFoundError(
                 f"RIFE weight file not found: {flownet_path}\n"
@@ -310,7 +315,13 @@ class Model:
             else:
                 return {k: v for k, v in param.items() if "module." not in k}
 
+        # weights_only=True: a checkpoint must never run pickled code on load.
         state = torch.load(flownet_path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError(
+                f"RIFE weights at {flownet_path} must be a state dict, "
+                f"got {type(state).__name__}"
+            )
         self.flownet.load_state_dict(convert(state), strict=False)
         logger.info("Loaded RIFE weights from %s", flownet_path)
 
@@ -367,16 +378,21 @@ class FrameInterpolator:
 
         Accepts a local directory **or** a HuggingFace repo ID.  When *None*
         (the default) the weights are downloaded (and cached) automatically
-        from ``elfgum/RIFE-4.22.lite`` via ``maybe_download_model()``.
+        from ``elfgum/RIFE-4.22.lite`` via ``maybe_download_model()``. On a
+        server, any other path must be listed in ``--postprocess-model-paths``.
         """
         from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
             maybe_download_model,
         )
 
+        check_served_model_path("frame_interpolation_model_path", self._model_path)
         model_path = self._model_path or _DEFAULT_RIFE_HF_REPO
 
-        # Resolve: local path pass-through, HF repo ID → download & cache
-        model_path = maybe_download_model(model_path)
+        # Resolve: local path pass-through, HF repo ID → download & cache.
+        # Only the weight file is fetched, not the rest of the repo.
+        model_path = maybe_download_model(
+            model_path, allow_patterns=[_RIFE_WEIGHTS_FILENAME]
+        )
 
         cached_model = cache_get(_MODEL_CACHE, model_path)
         if cached_model is not None:
