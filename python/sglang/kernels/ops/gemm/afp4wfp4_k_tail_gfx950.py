@@ -25,9 +25,10 @@ _MIN_BLOCK_K = 128
 
 def k_tail_in_unfilled_stage(block_k: int, k: int, num_stages: int) -> bool:
     # True when ``k`` FP4 elements leave a masked K-tail block in an LDS stage no full K block filled.
-    # The pipeline cycles K blocks through num_stages LDS buffers (Triton 3.7.0 TTGIR). With more K blocks
-    # than stages, the tail's stale lanes hold an earlier block's finite scales over zero-filled data;
-    # otherwise they hold what the previous kernel left: every NaN of an MI355X sweep (N=7168, K <= 8192).
+    # The pipeline cycles K blocks through num_stages LDS buffers (Triton 3.7.0 TTGIR).
+    # With more K blocks than stages, the tail's stale lanes hold an earlier block's finite scales
+    # over zero-filled data; otherwise they hold what the previous kernel left,
+    # which was every NaN of an MI355X sweep (N=7168, K <= 8192).
     return k % block_k != 0 and -(-k // block_k) <= num_stages
 
 
@@ -78,8 +79,8 @@ def k_tail_safe_config(m: int, n: int, k_packed: int) -> Optional[dict]:
         # aiter's get_gemm_config: no M bucket (KeyError) or no DEFAULT.json (AssertionError).
         return None
     if config["NUM_KSPLIT"] != 1:
-        # Split-K configs are left to AITER's get_splitk; its uneven one-split fallback (M <= 8 defaults)
-        # loads scales via registers, not direct-to-LDS, so triton#11256 does not hit it (Triton 3.7.0).
+        # Split-K configs are left to AITER's get_splitk. Its uneven one-split fallback (M <= 8 defaults) loads
+        # scales via registers, not direct-to-LDS, so triton#11256 does not hit it (Triton 3.7.0).
         return None
     k = 2 * k_packed
     tiling = k_tail_safe_tiling(

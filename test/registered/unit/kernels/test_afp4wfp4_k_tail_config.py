@@ -54,6 +54,8 @@ class TestKTailSafeTiling(CustomTestCase):
         )
         # One masked block cannot share a stage with a full one.
         self.assertIsNone(k_tail.k_tail_safe_tiling(block_k=256, k=96, num_stages=3))
+        # K below the minimum block is raised to 128 first, as the kernel wrapper does, so it has no safe tiling either.
+        self.assertIsNone(k_tail.k_tail_safe_tiling(block_k=256, k=64, num_stages=3))
 
 
 class TestKTailSafeConfig(CustomTestCase):
@@ -65,7 +67,9 @@ class TestKTailSafeConfig(CustomTestCase):
         "NUM_KSPLIT": 1,
     }
 
-    def _config(self, get_config, gcn_arch_name="gfx950:sramecc+:xnack-", k_packed=768):
+    def _config(
+        self, *, get_config, gcn_arch_name="gfx950:sramecc+:xnack-", k_packed=768
+    ):
         k_tail.k_tail_safe_config.cache_clear()
         try:
             with (
@@ -84,7 +88,7 @@ class TestKTailSafeConfig(CustomTestCase):
     def test_narrows_the_kernels_own_config(self):
         get_config = self._decode_config()
 
-        config = self._config(get_config, k_packed=768)
+        config = self._config(get_config=get_config, k_packed=768)
 
         # gemm_afp4wfp4's _get_config takes packed K, as gemm_afp4wfp4 passes it.
         get_config.assert_called_once_with(m=16, n=7168, k_packed=768)
@@ -95,26 +99,42 @@ class TestKTailSafeConfig(CustomTestCase):
         for gcn_arch_name in ("gfx942:sramecc+:xnack-", "gfx951", "gfx1250"):
             with self.subTest(arch=gcn_arch_name):
                 get_config = self._decode_config()
-                self.assertIsNone(self._config(get_config, gcn_arch_name))
+                self.assertIsNone(
+                    self._config(get_config=get_config, gcn_arch_name=gcn_arch_name)
+                )
                 get_config.assert_not_called()
 
     def test_tail_in_a_filled_stage_keeps_aiters_config(self):
         # Kimi-K3 TP8 dense down_proj, K=4224.
-        self.assertIsNone(self._config(self._decode_config(), k_packed=2112))
+        self.assertIsNone(self._config(get_config=self._decode_config(), k_packed=2112))
 
     def test_no_config_keeps_the_default_path(self):
         for error in (KeyError("no M bucket"), AssertionError("no DEFAULT.json")):
             with self.subTest(error=type(error).__name__):
-                self.assertIsNone(self._config(mock.Mock(side_effect=error)))
+                self.assertIsNone(self._config(get_config=mock.Mock(side_effect=error)))
 
     def test_a_changed_private_getter_raises(self):
         # _get_config is private aiter API: a changed signature fails loudly, not silently unfixed.
         with self.assertRaises(TypeError):
-            self._config(mock.Mock(side_effect=TypeError("changed signature")))
+            self._config(
+                get_config=mock.Mock(side_effect=TypeError("changed signature"))
+            )
+
+    def test_no_safe_tiling_keeps_aiters_config_and_warns_once(self):
+        k_tail._warn_no_k_tail_safe_tiling.cache_clear()
+        with self.assertLogs(k_tail.logger, level="WARNING") as logs:
+            for _ in range(2):
+                self.assertIsNone(
+                    self._config(get_config=self._decode_config(), k_packed=32)
+                )
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("K=64", logs.records[0].getMessage())
 
     def test_split_k_config_is_left_to_aiter(self):
         split_k = {"BLOCK_SIZE_K": 512, "num_stages": 2, "NUM_KSPLIT": 4}
-        self.assertIsNone(self._config(mock.Mock(return_value=(split_k, False))))
+        self.assertIsNone(
+            self._config(get_config=mock.Mock(return_value=(split_k, False)))
+        )
 
 
 if __name__ == "__main__":
