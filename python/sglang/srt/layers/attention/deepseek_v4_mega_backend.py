@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 HEAD_DIM = 512
+_CURRENT_MEGA_PREFILL = envs.SGLANG_OPT_DSV41_CURRENT_MEGA_PREFILL.get()
 
 
 def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -170,6 +171,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             self.softmax_scale,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            use_legacy=not self._swa_interleaved,
+            # Prefill consumes gathered BF16, independently of packed KV layout.
+            use_legacy=not (
+                self._swa_interleaved or (_CURRENT_MEGA_PREFILL and self.is_dsv41)
+            ),
         )
         return data, scale
