@@ -369,6 +369,22 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _drop_null_defaults(model: type[BaseModel], values: Any) -> Any:
+    # OpenAI documents these fields as nullable: an explicit null on a field
+    # with a non-None default reads as an omitted key, not a type error.
+    if not isinstance(values, dict):
+        return values
+    fields = model.model_fields
+    return {
+        key: value
+        for key, value in values.items()
+        if value is not None
+        or key not in fields
+        or fields[key].is_required()
+        or fields[key].default is None
+    }
+
+
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -461,6 +477,11 @@ class CompletionRequest(PDRoutingFields):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_null_defaults(cls, values):
+        return _drop_null_defaults(model=cls, values=values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -1148,6 +1169,11 @@ class ChatCompletionRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_null_defaults(cls, values):
+        return _drop_null_defaults(model=cls, values=values)
 
     @model_validator(mode="wrap")
     @classmethod
