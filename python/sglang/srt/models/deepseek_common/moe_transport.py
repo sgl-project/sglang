@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
+    dp_gather_replicate_zero_pad,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
     dp_scatter,
@@ -187,11 +188,17 @@ class MoeRowTransport(ComputeTransport):
                 _shared_local = moe._forward_shared_experts(local_hidden_states)
             # Pad rows are not refreshed during graph replay. Stale bf16-max
             # values can overflow the MoE and contaminate the combine output.
-            if _is_hip:
-                _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            if not (
+                _is_hip
+                and dp_gather_replicate_zero_pad(
+                    hidden_states, local_hidden_states, forward_batch
+                )
+            ):
+                if _is_hip:
+                    _mask_dp_pad_rows(local_hidden_states, forward_batch)
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
