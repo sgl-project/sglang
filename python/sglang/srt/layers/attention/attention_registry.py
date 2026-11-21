@@ -69,8 +69,8 @@ class NonCausalDraftAttention(msgspec.Struct, frozen=True):
     default_on_this_device: Callable[[], bool]
 
 
-# Backends that declared NonCausalDraftAttention; they serve a DSpark draft only when
-# --speculative-draft-attention-backend names them.
+# Backends that declared NonCausalDraftAttention.
+# They serve a DSpark draft only when --speculative-draft-attention-backend names them.
 NONCAUSAL_DRAFT_ATTENTION_BACKENDS: dict[str, NonCausalDraftAttention] = {}
 
 

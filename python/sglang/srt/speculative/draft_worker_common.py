@@ -60,7 +60,7 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     )
     draft_backend = get_spec().speculative_draft_attention_backend
     noncausal_draft = NONCAUSAL_DRAFT_ATTENTION_BACKENDS.get(draft_backend)
-    if noncausal_draft is not None and _is_dspark():
+    if noncausal_draft is not None and _is_dspark() and not _draft_is_compressed_kv():
         reject_reason = _dspark_draft_reject_reason(noncausal_draft)
         if reject_reason is not None:
             raise ValueError(
@@ -96,6 +96,14 @@ def _is_dspark() -> bool:
     return SpeculativeAlgorithm.from_string(
         get_spec().speculative_algorithm
     ).is_dspark()
+
+
+def _draft_is_compressed_kv() -> bool:
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_uses_compressed_kv_attention,
+    )
+
+    return draft_uses_compressed_kv_attention()
 
 
 def _dspark_draft_reject_reason(

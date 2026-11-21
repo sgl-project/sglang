@@ -57,8 +57,8 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             "--speculative-draft-attention-backend to trtllm_mha."
         )
 
-    # A backend that declared NonCausalDraftAttention also runs the DSpark draft where
-    # it is the default on this device and accepts the draft checkpoint; else triton.
+    # A backend that declared NonCausalDraftAttention also runs the DSpark draft;
+    # only where it is the default on this device and accepts the draft checkpoint.
     if (
         cfg.speculative_algorithm == "DSPARK"
         and cfg.speculative_draft_attention_backend is None
@@ -67,18 +67,28 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             NONCAUSAL_DRAFT_ATTENTION_BACKENDS,
         )
         from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_attention_traits_of_args,
+            draft_attention_traits,
         )
 
         target_backend = attention_backends_of(resolved_view(server_args))[0]
         noncausal_draft = NONCAUSAL_DRAFT_ATTENTION_BACKENDS.get(target_backend)
         if noncausal_draft is not None and noncausal_draft.default_on_this_device():
-            draft_is_mla, draft_has_sliding_window = draft_attention_traits_of_args(cfg)
-            reject_reason = noncausal_draft.reject_reason(
-                draft_is_mla=draft_is_mla,
-                draft_has_sliding_window=draft_has_sliding_window,
-                enable_unified_memory=cfg.enable_unified_memory,
-                enable_deterministic_inference=cfg.enable_deterministic_inference,
+            traits = draft_attention_traits(
+                draft_model_path=cfg.speculative_draft_model_path,
+                trust_remote_code=cfg.trust_remote_code,
+                revision=cfg.speculative_draft_model_revision,
+                json_model_override_args=cfg.json_model_override_args,
+                model_config_parser=cfg.model_config_parser,
+            )
+            reject_reason = (
+                "no --speculative-draft-model-path names a checkpoint to check"
+                if traits is None
+                else noncausal_draft.reject_reason(
+                    draft_is_mla=traits[0],
+                    draft_has_sliding_window=traits[1],
+                    enable_unified_memory=cfg.enable_unified_memory,
+                    enable_deterministic_inference=cfg.enable_deterministic_inference,
+                )
             )
             if reject_reason is None:
                 declare_resolution(

@@ -89,8 +89,8 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
         v_cache = torch.zeros_like(k_cache)
         keys, values = [], []
         for i, seq_len in enumerate(seq_lens):
-            # The verify block's K/V sit in the cache already, as the write
-            # before attention leaves them.
+            # The verify block's K/V already sit in the cache,
+            # as the write before attention leaves them.
             k, v = (
                 torch.randn(
                     seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device

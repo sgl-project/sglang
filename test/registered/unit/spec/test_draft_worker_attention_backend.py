@@ -19,6 +19,60 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+_GET_CONFIG = "sglang.srt.hf_transformers.get_config"
+
+
+def _dspark_draft_config(*, mla=False, sliding_window=None):
+    config = {
+        "architectures": ["DSparkDraftModel"],
+        "num_hidden_layers": 2,
+        "block_size": 5,
+        "dflash_config": {
+            "target_layer_ids": [1],
+            "mask_token_id": 3,
+            "attention_mode": "mla" if mla else "gqa",
+        },
+    }
+    if sliding_window is not None:
+        config |= dict(
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=sliding_window,
+        )
+    return config
+
+
+def _inkling2_draft_config(*, local_layer_ids):
+    mtp_config = dict(
+        max_position_embeddings=4096,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        q_bias=False,
+        o_bias=False,
+        intermediate_size=128,
+        rms_norm_eps=1e-6,
+        rope_theta=1e4,
+        local_layer_ids=local_layer_ids,
+        sliding_window_size=128,
+        block_size=8,
+        markov_rank=4,
+        markov_head_type="rnn_hidden",
+        target_layer_ids=[1, 4],
+    )
+    return {
+        "architectures": ["Inkling2ForConditionalGeneration"],
+        "text_config": {
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "vocab_size": 100,
+            "n_layers_per_attn_res_block": 2,
+            "local_layer_ids": [0],
+        },
+        "mtp_config": mtp_config,
+    }
+
 
 class TestDraftWorkerAttentionBackend(CustomTestCase):
     def _resolve(
@@ -76,6 +130,15 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "cannot run this DSpark draft"):
                     self._resolve(**case)
 
+    def test_compressed_kv_draft_keeps_its_override_for_a_named_aiter(self):
+        """A compressed-KV draft skips the aiter checks and keeps main's fallback, not a raise."""
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_config."
+            "draft_uses_compressed_kv_attention",
+            return_value=True,
+        ):
+            self.assertEqual(self._resolve(draft_is_mla=True), "triton")
+
     def test_aiter_is_taken_only_when_named_for_a_dspark_draft(self):
         """An inherited aiter, or aiter named for another algorithm's draft, keeps the
         platform fallback: triton on HIP, flashinfer elsewhere."""
@@ -95,12 +158,13 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
         is_gfx950=True,
         aiter_non_causal=True,
         declared=None,
-        draft_traits=(False, False),
+        draft_config=None,
         **server_args,
     ):
         server_args = (
             dict(
                 speculative_algorithm="DSPARK",
+                speculative_draft_model_path="draft",
                 prefill_attention_backend="aiter",
                 decode_attention_backend="aiter",
                 linear_attn_verify_backend="triton",
@@ -123,11 +187,7 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
             patch.dict(
                 attention_registry.NONCAUSAL_DRAFT_ATTENTION_BACKENDS, declared or {}
             ),
-            patch(
-                "sglang.srt.speculative.dspark_components.dspark_config."
-                "draft_attention_traits_of_args",
-                return_value=draft_traits,
-            ),
+            patch(_GET_CONFIG, return_value=draft_config or _dspark_draft_config()),
         ):
             apply_kimi_k3_spec_backend_defaults(args)
         return resolution_result(args, "speculative_draft_attention_backend")
@@ -140,8 +200,9 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
             dict(is_gfx950=False),
             dict(aiter_non_causal=False),
             dict(enable_deterministic_inference=True),
-            dict(draft_traits=(True, False)),
-            dict(draft_traits=(False, True)),
+            dict(draft_config=_dspark_draft_config(mla=True)),
+            dict(draft_config=_dspark_draft_config(sliding_window=128)),
+            dict(speculative_draft_model_path=None),
             dict(speculative_draft_attention_backend="triton"),
             dict(prefill_attention_backend="triton"),
             dict(speculative_algorithm="EAGLE"),
@@ -176,7 +237,9 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
         )
         self.assertFalse(reasons[-1]["draft_is_mla"])
         self._declared_draft_backend(
-            declared=declared(), draft_traits=(True, True), **fake_target
+            declared=declared(),
+            draft_config=_dspark_draft_config(mla=True, sliding_window=128),
+            **fake_target,
         )
         self.assertTrue(reasons[-1]["draft_is_mla"])
         self.assertTrue(reasons[-1]["draft_has_sliding_window"])
@@ -234,27 +297,51 @@ class TestAiterDSparkDraftDefault(CustomTestCase):
         )
 
 
-class TestTranslatedDSparkDraftConfig(CustomTestCase):
-    def test_bundled_drafts_are_read_as_the_draft_model_is_built(self):
-        """Checks on a draft checkpoint read the config ModelConfig builds the draft from."""
-        from sglang.srt.configs.model_config import translated_dspark_draft_config
+class TestDraftAttentionTraits(CustomTestCase):
+    def _traits(self, config):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            draft_attention_traits,
+        )
 
-        for arch, module in (
-            (
-                "DSparkMiniMaxDraftModel",
-                "sglang.srt.configs.minimax_vl.configure_minimax_m3_dspark",
-            ),
-            (
-                "Inkling2ForConditionalGeneration",
-                "sglang.srt.configs.inkling2.Inkling2MTPConfig.from_target",
-            ),
-        ):
-            config = SimpleNamespace(architectures=[arch])
-            with self.subTest(arch=arch), patch(module, return_value="built") as build:
-                self.assertEqual(translated_dspark_draft_config(config), "built")
-                build.assert_called_once_with(config)
-        plain = SimpleNamespace(architectures=["DSparkDraftModel"])
-        self.assertIs(translated_dspark_draft_config(plain), plain)
+        with patch(_GET_CONFIG, return_value=config):
+            return draft_attention_traits(
+                draft_model_path="draft",
+                trust_remote_code=False,
+                revision=None,
+                json_model_override_args="{}",
+                model_config_parser=None,
+            )
+
+    def test_reads_mla_and_sliding_window_from_the_checkpoint(self):
+        self.assertEqual(self._traits(_dspark_draft_config()), (False, False))
+        self.assertEqual(self._traits(_dspark_draft_config(mla=True)), (True, False))
+        self.assertEqual(
+            self._traits(_dspark_draft_config(sliding_window=128)), (False, True)
+        )
+
+    def test_inkling2_draft_is_read_as_the_draft_model_is_built(self):
+        """The bundled Inkling2 draft is translated before its traits are read."""
+        self.assertEqual(
+            self._traits(_inkling2_draft_config(local_layer_ids=[0])), (False, True)
+        )
+        self.assertEqual(
+            self._traits(_inkling2_draft_config(local_layer_ids=[])), (False, False)
+        )
+
+    def test_no_named_checkpoint_has_no_traits(self):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            draft_attention_traits,
+        )
+
+        self.assertIsNone(
+            draft_attention_traits(
+                draft_model_path=None,
+                trust_remote_code=False,
+                revision=None,
+                json_model_override_args="{}",
+                model_config_parser=None,
+            )
+        )
 
 
 if __name__ == "__main__":
