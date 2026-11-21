@@ -204,6 +204,21 @@ class TestRebootstrapFingerprint(CustomTestCase):
         decode_fp, prefill_fp = self._rebootstrap_fingerprints(decode_req)
         self.assertEqual(decode_fp, prefill_fp)
 
+    def test_truncated_rebootstrap_within_the_limit_agrees(self):
+        # Both servers cut the prompt to 32 tokens; with one output the payload stays at 32.
+        decode_req = _real_decode_req(PROMPT * 10, [7])
+        self.assertIsNone(validate_input_length(decode_req, 32, True))
+        decode_fp, prefill_fp = self._rebootstrap_fingerprints(decode_req, 32)
+        self.assertEqual(decode_fp, prefill_fp)
+
+    def test_rebootstrap_past_the_prefill_limit_differs(self):
+        # The prefill cuts the 33-token payload back to 32, so the recomputed KV misses a position.
+        # The mismatch is intended: the decode must not continue from incomplete KV.
+        decode_req = _real_decode_req(PROMPT * 10, [7, 8])
+        self.assertIsNone(validate_input_length(decode_req, 32, True))
+        decode_fp, prefill_fp = self._rebootstrap_fingerprints(decode_req, 32)
+        self.assertNotEqual(decode_fp, prefill_fp)
+
 
 class TestSchedulerKeepsLoraName(CustomTestCase):
     """The fingerprint reads req.lora_name, so every scheduler path must set it from the wire."""
