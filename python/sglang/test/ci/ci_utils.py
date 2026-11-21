@@ -360,6 +360,8 @@ def run_unittest_files(
                 )
                 was_retried = True
 
+            # Read by sglang.test.ci.metrics, so a retried file's records say which run they came from.
+            os.environ["SGLANG_CI_TEST_ATTEMPT"] = str(attempt)
             try:
                 ret_code = run_with_timeout(
                     run_one_file,

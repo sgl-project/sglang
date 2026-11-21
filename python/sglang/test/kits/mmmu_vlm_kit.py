@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import is_cuda, kill_process_tree
 from sglang.srt.utils.common import temp_set_env
+from sglang.test.ci.metrics import record
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -218,6 +219,14 @@ class MMMUMixin:
                 mmmu_accuracy,
                 labels={"model": self.model, "eval": "mmmu", "api": "lmms-eval"},
             )
+            record(
+                "eval_score",
+                mmmu_accuracy,
+                bound=self.accuracy,
+                model=self.model,
+                eval="mmmu",
+                variant="lmms-eval",
+            )
 
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
@@ -408,6 +417,13 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 "mmmu_score",
                 mmmu_accuracy,
                 labels={"model": model.model, "eval": "mmmu", "api": "lmms-eval"},
+            )
+            record(
+                "eval_score",
+                mmmu_accuracy,
+                model=model.model,
+                eval="mmmu",
+                variant="lmms-eval",
             )
 
             # Capture server output if requested

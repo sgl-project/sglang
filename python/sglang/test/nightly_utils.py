@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.metrics import record
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,6 +17,25 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+
+def record_benchmark_result(result: BenchmarkResult) -> None:
+    """Records each number in one batch size's result, labelled with the case."""
+    labels = {
+        "model": result.model_path,
+        "variant": result.run_name,
+        "batch_size": result.batch_size,
+        "input_len": result.input_len,
+        "output_len": result.output_len,
+    }
+    record("bench_latency", result.latency, **labels)
+    record("bench_input_throughput", result.input_throughput, **labels)
+    record("bench_output_throughput", result.output_throughput, **labels)
+    record("bench_overall_throughput", result.overall_throughput, **labels)
+    record("bench_last_ttft", result.last_ttft, **labels)
+    record("bench_last_gen_throughput", result.last_gen_throughput, **labels)
+    if result.acc_length is not None and result.acc_length > 0:
+        record("accept_length", result.acc_length, **labels)
 
 
 class NightlyBenchmarkRunner:
@@ -186,6 +206,8 @@ class NightlyBenchmarkRunner:
             print(
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
+            for benchmark_result in benchmark_results:
+                record_benchmark_result(benchmark_result)
 
             # Note: JSON files are preserved for metrics collection by CI scripts
             # They will be collected by scripts/ci/utils/save_metrics.py
@@ -305,6 +327,7 @@ class NightlyBenchmarkRunner:
                     accept_length = internal_states[0].get("avg_spec_accept_length")
                     if accept_length is not None:
                         print(f"  avg_spec_accept_length={accept_length:.2f}")
+                        record("accept_length", accept_length, variant="server_avg")
                         return accept_length
         except Exception as e:
             print(f"  Warning: Could not fetch spec accept length: {e}")

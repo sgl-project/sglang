@@ -10,6 +10,7 @@ import statistics
 import time
 import warnings
 
+from sglang.test.ci.metrics import record
 from sglang.test.sgl_eval_utils import (
     SGL_EVAL_BENCHMARKS,
     THINKING_MODE_CHOICES,
@@ -207,6 +208,11 @@ def run_eval(args):
             latency,
             labels={"model": sampler.model, "eval": args.eval_name},
         )
+        labels = {"model": sampler.model, "eval": args.eval_name}
+        record("eval_score", metrics["score"], **labels)
+        record("eval_latency", latency, **labels)
+        if "output_throughput" in metrics:
+            record("eval_output_throughput", metrics["output_throughput"], **labels)
     else:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -256,6 +262,13 @@ def run_eval(args):
                 "repeat": args.repeat,
             },
         )
+        labels = {
+            "model": sampler.model,
+            "eval": args.eval_name,
+            "variant": f"mean of {args.repeat}",
+        }
+        record("eval_score", mean_score, **labels)
+        record("eval_latency", mean_latency, **labels)
 
         executor.shutdown()
 

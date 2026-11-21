@@ -3,6 +3,7 @@ from typing import Optional
 
 import requests
 
+from sglang.test.ci.metrics import record
 from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
@@ -18,6 +19,7 @@ def _check_accept_length(test_case, base_url, threshold=None):
     except (KeyError, IndexError, requests.RequestException):
         return
     print(f"avg_spec_accept_length={val:.4f}")
+    record("accept_length", val, bound=threshold, variant="server_avg")
     if threshold is not None:
         test_case.assertGreater(val, threshold)
 

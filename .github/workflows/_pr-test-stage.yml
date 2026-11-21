@@ -134,6 +134,11 @@ jobs:
         with:
           ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
+      # Metrics never fail a test job: a run of an older git_ref has no
+      # ci-metrics actions, and its tests record nothing.
+      - uses: ./.github/actions/ci-metrics-start
+        continue-on-error: true
+
       - name: Resolve runner_config
         id: rc
         env:
@@ -285,6 +290,39 @@ jobs:
           tracker-issue: "26340"
           bot-token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
 
+      - uses: ./.github/actions/ci-metrics-upload
+        if: always()
+        continue-on-error: true
+        with:
+          stage: ${{ inputs.self_name }}
+          partition: ${{ matrix.partition }}
+          gpu-config: ${{ inputs.runner_config }}
+
       - name: Cleanup venv
         if: always()
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
+
+  # Prints every metric this stage's test jobs recorded (sglang.test.ci.metrics),
+  # one JSON object per line: the whole log is the stage's metrics.
+  ci-metrics:
+    name: ci-metrics (${{ inputs.self_name }})
+    needs: run
+    if: always() && needs.run.result != 'skipped'
+    # Never fails the stage it reports on.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+          sparse-checkout: scripts/ci/utils/publish_ci_metrics.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ci-metrics--${{ inputs.self_name }}--*--a${{ github.run_attempt }}
+          path: ci-metrics
+
+      - name: Print metrics
+        run: python3 scripts/ci/utils/publish_ci_metrics.py ci-metrics
