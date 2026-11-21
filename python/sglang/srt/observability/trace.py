@@ -329,11 +329,11 @@ def get_thread_caller_info() -> Optional[Tuple[str, str]]:
     registered via ``trace_set_thread_info``; otherwise ``None``.
 
     ``caller_role`` is the thread's ``thread_label`` (e.g. ``"Prefetch"`` /
-    ``"Backup"``). ``caller_id`` mirrors the rank+host segment of the scheduler
-    thread-span name (without the leading label, so it does not duplicate
-    ``caller_role``) and is forwarded to Mooncake so per-RPC spans attribute to
-    a specific dummy-client / TP rank. Returns ``None`` on threads that never
-    registered, so callers can omit the fields cleanly.
+    ``"Backup"``). ``caller_id`` is the thread's ranks, host and pid (without
+    the label, so it does not duplicate ``caller_role``) and is forwarded to
+    Mooncake so per-RPC spans attribute to a specific dummy-client / TP rank.
+    Returns ``None`` on threads that never registered, so callers can omit the
+    fields cleanly.
     """
     info = threads_info.get(threading.get_native_id())
     if info is None:
@@ -347,6 +347,30 @@ def get_thread_caller_info() -> Optional[Tuple[str, str]]:
         parts.append(f"[DP {info.dp_rank}]")
     parts.append(f"(host:{info.host_id[:8]} | pid:{info.pid})")
     return " ".join(parts), info.thread_label
+
+
+def start_root_span(
+    *,
+    rid: str,
+    role: str,
+    module_name: str,
+    bootstrap_room: Optional[int],
+    external_trace_header: Optional[Dict[str, str]],
+    ts: int,
+) -> trace.span.Span:
+    external_trace_context = _trace_context_propagator.extract(
+        external_trace_header or {}
+    )
+
+    attrs = {"rid": rid, "module": f"sglang::{module_name}"}
+    if bootstrap_room:
+        attrs["bootstrap_room"] = str(hex(bootstrap_room))
+    return tracer.start_span(
+        name="Req" if role == "unified" else f"{role} Req",
+        start_time=ts,
+        context=external_trace_context,
+        attributes=attrs,
+    )
 
 
 class TraceReqContext:
@@ -411,12 +435,11 @@ class TraceReqContext:
 
         thread_name = f"{thread_info.thread_label}"
         if thread_info.tp_rank is not None:
-            thread_name += f" [TP {thread_info.tp_rank}] "
+            thread_name += f" [TP {thread_info.tp_rank}]"
         if thread_info.pp_rank is not None:
-            thread_name += f" [PP {thread_info.pp_rank}] "
+            thread_name += f" [PP {thread_info.pp_rank}]"
         if thread_info.dp_rank is not None:
-            thread_name += f" [DP {thread_info.dp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+            thread_name += f" [DP {thread_info.dp_rank}]"
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
@@ -582,26 +605,15 @@ class TraceReqContext:
 
         # create req context and root span
         self.start_time_ns = ts
-
-        external_trace_context = _trace_context_propagator.extract(
-            self.external_trace_header or {}
+        self.root_span = start_root_span(
+            rid=self.rid,
+            role=self.role,
+            module_name=self.module_name,
+            bootstrap_room=self.bootstrap_room,
+            external_trace_header=self.external_trace_header,
+            ts=ts,
         )
-
-        # Drop the worker_id added by MultiTokenizer
-        orig_rid = self.rid.split("_")[-1]
-        role = "" if self.role == "unified" else self.role
-        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
-        if self.bootstrap_room:
-            attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
-        root_span = tracer.start_span(
-            name=f"{role} Req {orig_rid[:8]}",
-            start_time=ts,
-            context=external_trace_context,
-            attributes=attrs,
-        )
-
-        self.root_span = root_span
-        self.root_span_context = trace.set_span_in_context(root_span)
+        self.root_span_context = trace.set_span_in_context(self.root_span)
 
         # create thread context and thread span
         self.thread_context = self.__create_thread_context(ts)
