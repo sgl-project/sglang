@@ -35,3 +35,10 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+    # The residual stream uses contiguous attention-TP token slices this forward.
+    token_sharded: bool = False
+
+
+def dcp_token_sharded(forward_batch) -> bool:
+    metadata = getattr(forward_batch, "attn_dcp_metadata", None)
+    return metadata is not None and metadata.token_sharded

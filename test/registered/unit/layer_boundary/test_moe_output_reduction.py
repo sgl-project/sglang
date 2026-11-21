@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
+    post_experts_all_reduce,
     post_experts_output_is_complete,
     reduce_moe_output,
     should_add_replicated_moe_output,
@@ -77,6 +78,25 @@ class TestReduceMoeOutput(CustomTestCase):
             count, output = self.all_reduces()
         self.assertEqual(count, 1)
         torch.testing.assert_close(output, torch.full((2, 3), 2.0))
+
+    def test_dcp_token_shard_reduce_scatters_to_local_rows(self):
+        full = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+        parallel = types.SimpleNamespace(attn_tp_size=4, attn_tp_rank=2)
+        local = full.chunk(4)[2]
+        expected = local * 2
+        with (
+            get_forward().scoped(dcp_token_sharded=True),
+            patch.object(moe_utils, "get_parallel", return_value=parallel),
+            patch.object(
+                moe_utils,
+                "attn_tp_reduce_scatter_tensor",
+                side_effect=lambda out, value: out.copy_(value.chunk(4)[2] * 2),
+            ) as reduce_scatter,
+        ):
+            output = post_experts_all_reduce(full)
+        torch.testing.assert_close(output, expected)
+        self.assertEqual(output.data_ptr(), local.data_ptr())
+        reduce_scatter.assert_called_once()
 
     def test_a_later_step_owns_the_sum(self):
         for flags, config in (

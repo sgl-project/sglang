@@ -44,6 +44,39 @@ class TestMLPParallelGroups(CustomTestCase):
         )
         self.x = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16
 
+    def test_deepseek_token_shards_match_a_dense_ffn(self):
+        from sglang.srt.models import deepseek_v2
+
+        torch.manual_seed(42)
+        full = F.pad(torch.randn(10, 4), (0, 0, 0, 2))
+        gate, up, down = torch.randn(8, 4), torch.randn(8, 4), torch.randn(4, 8)
+        expected = F.linear(F.silu(F.linear(full, gate)) * F.linear(full, up), down)
+        partials = []
+        batch = SimpleNamespace(attn_dcp_metadata=SimpleNamespace(token_sharded=True))
+        for rank in range(4):
+            gate_up = torch.cat([gate.chunk(4)[rank], up.chunk(4)[rank]])
+            down_local = down.chunk(4, dim=1)[rank]
+            layer = SimpleNamespace(
+                is_replicated=False,
+                swiglu_limit=None,
+                allow_fused_down=False,
+                use_fused_clamp_act_mul=False,
+                gate_up_proj=lambda value: (F.linear(value, gate_up), None),
+                act_fn=lambda value: (
+                    F.silu(value.chunk(2, dim=-1)[0]) * value.chunk(2, dim=-1)[1]
+                ),
+                down_proj=lambda value: (F.linear(value, down_local), None),
+            )
+            local = full.chunk(4)[rank]
+            with patch.object(
+                deepseek_v2, "attn_tp_gather", side_effect=lambda value, owned: full
+            ) as gather:
+                partials.append(deepseek_v2.DeepseekV2MLP.forward(layer, local, batch))
+            gather.assert_called_once_with(local, owned=True)
+        summed = torch.stack(partials).sum(0)
+        for actual, reference in zip(summed.chunk(4), expected.chunk(4)):
+            torch.testing.assert_close(actual, reference)
+
     def test_model_layout_math_reload_and_row_policy(self):
         tp = Mock()
         tp.all_reduce.side_effect = lambda x: x * 2
