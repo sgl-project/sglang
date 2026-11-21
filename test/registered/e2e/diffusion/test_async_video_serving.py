@@ -193,7 +193,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
     )
 
     # fail output persistence after admission, not input validation or GPU compute
-    bad_output = tmp_path / "unwritable-output"
+    bad_output = tmp_path / "videos" / "unwritable-output"
     bad_output.mkdir()
     with _paused(workers):
         failed_save = submit(output_path=str(bad_output))
