@@ -26,6 +26,7 @@ def _override_cfg(**kw):
         enable_hierarchical_cache=True,
         disaggregation_mode="null",
         speculative_eagle_topk=1,
+        speculative_algorithm=None,
         dsa_prefill_backend="triton",
         dsa_decode_backend="triton",
         dcp_replicate_q_proj=None,

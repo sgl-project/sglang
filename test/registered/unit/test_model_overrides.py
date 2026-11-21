@@ -42,7 +42,7 @@ from sglang.srt.runtime_context import (
     override_platform,
     reset_context,
 )
-from sglang.srt.server_args import _declared_default
+from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
 
@@ -3062,7 +3062,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             # user-set prefill survives; only decode defaulted
             self.assertEqual(
-                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                _dsa_split_backend_resolution(
+                    _view(dsa_prefill_backend="flashmla_sparse")
+                ),
                 {"dsa_decode_backend": "flashmla_kv"},
             )
             # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
@@ -4386,6 +4388,49 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+
+    def test_dsa_family_detection_and_backend_guards(self):
+        mistral = SimpleNamespace(
+            architectures=["MistralLarge4ForCausalLM"],
+            index_topk=2048,
+            nope_layer_flags=[True],
+        )
+        configs = (
+            (mistral, "NoPE, SSMax or KV-sharing", {"attention_backend": "fa3"}),
+            (
+                SimpleNamespace(
+                    architectures=["PixtralForConditionalGeneration"],
+                    text_config=mistral,
+                ),
+                "NoPE, SSMax or KV-sharing",
+                {"attention_backend": "fa3"},
+            ),
+            (
+                SimpleNamespace(
+                    architectures=["HYV4FlashForConditionalGeneration"], index_topk=2048
+                ),
+                "Hy4-Flash does not support speculative decoding",
+                {"speculative_algorithm": "DSPARK"},
+            ),
+        )
+        with override_platform(is_npu=False, is_xpu=False, is_hip=False):
+            for config, error, invalid in configs:
+                arch = config.architectures[0]
+                with self.subTest(arch=arch):
+                    declarations = collect_model_override_declarations(
+                        arch, ServerArgs(model_path="dummy"), config
+                    )
+                    self.assertIn(
+                        (
+                            "_deepseek_family_overrides",
+                            {"attention_backend": "dsa", "page_size": 64},
+                        ),
+                        declarations,
+                    )
+                    with self.assertRaisesRegex(ValueError, error):
+                        collect_model_override_declarations(
+                            arch, ServerArgs(model_path="dummy", **invalid), config
+                        )
 
     def test_deepseek_family_order_safe_declarations(self):
         from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (

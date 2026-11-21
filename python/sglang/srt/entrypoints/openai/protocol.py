@@ -604,6 +604,20 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
+
+
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -720,6 +734,7 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -831,10 +846,45 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reasoning_alias(cls, data):
+        # Prior-turn reasoning may arrive as `reasoning`; reasoning_content wins
+        # if both are given.
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("role"), str)
+            and data["role"].lower() == "assistant"
+            and isinstance(data.get("reasoning"), str)
+            and data.get("reasoning_content") is None
+        ):
+            data = {**data, "reasoning_content": data["reasoning"]}
+        return data
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if self.role != "assistant" and isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -980,6 +1030,7 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
+    _continuation_prefix: Optional[str] = PrivateAttr(default=None)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1273,6 +1324,15 @@ class ChatCompletionRequest(PDRoutingFields):
             }
 
         return values
+
+    def continuation_prefix(self) -> str:
+        """The text continue_final_message resumes: the prefix rendering took from
+        the final assistant message, else its string content. Content left as
+        parts is not a prefix."""
+        if self._continuation_prefix is not None:
+            return self._continuation_prefix
+        content = self.messages[-1].content if self.messages else None
+        return content if isinstance(content, str) else ""
 
     @property
     def effective_max_tokens(self) -> Optional[int]:

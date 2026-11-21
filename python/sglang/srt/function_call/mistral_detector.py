@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 from typing import Any, List, Optional, Tuple
@@ -13,6 +14,13 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
+
+
+# get_vocab() materializes the full vocab dict, and parsers are created per request.
+# Keyed by tokenizer identity; tokenizers are not mutated after load.
+@functools.lru_cache(maxsize=8)
+def _has_args_token(tokenizer) -> bool:
+    return "[ARGS]" in tokenizer.get_vocab()
 
 
 class MistralDetector(BaseFormatDetector):
@@ -31,7 +39,7 @@ class MistralDetector(BaseFormatDetector):
     Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer=None):
         """Initialize tokens and streaming state."""
         super().__init__()
         # Canonical Mistral prefix for JSON-array tool calls.
@@ -40,6 +48,10 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        # Models whose tokenizer has [ARGS] (Mistral tokenizer v11+) were trained on
+        # the compact format; older ones on the JSON array. Without a tokenizer, keep
+        # the JSON array.
+        self._compact_format = tokenizer is not None and _has_args_token(tokenizer)
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -336,6 +348,14 @@ class MistralDetector(BaseFormatDetector):
         return None
 
     def structure_info(self) -> _GetInfoFunc:
+        if self._compact_format:
+            # `[TOOL_CALLS]name[ARGS]{...}` has no closing marker; repeated calls
+            # parse as separate calls.
+            return lambda name: StructureInfo(
+                begin="[TOOL_CALLS]" + name + "[ARGS]",
+                end="",
+                trigger="[TOOL_CALLS]",
+            )
         return lambda name: StructureInfo(
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
             end="}]",
