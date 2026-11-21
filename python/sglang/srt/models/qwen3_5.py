@@ -990,6 +990,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
+        use_xpu_prefill_views = (
+            _is_xpu
+            and get_exec().mamba.linear_attn_backend == "intel_xpu"
+            and forward_batch.logical_forward_mode.is_extend_without_speculative()
+        )
         use_strided_prefill_z = False
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
@@ -1015,7 +1020,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
-        elif use_fused_contiguous_unpack:
+        elif use_fused_contiguous_unpack or use_xpu_prefill_views:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -1025,7 +1030,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda or _is_hip
+                _is_cuda or _is_hip or use_xpu_prefill_views
             ) and forward_batch.logical_forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views

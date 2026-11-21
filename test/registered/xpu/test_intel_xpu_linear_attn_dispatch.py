@@ -271,6 +271,107 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
         )
         triton.assert_not_called()
 
+    @unittest.skipUnless(torch.xpu.is_available(), "requires XPU")
+    def test_prefill_views_match_materialized_conv_recurrence_and_norm(self):
+        from sgl_kernel.mamba import causal_conv1d_fn_xpu
+
+        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+        from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+            fused_qkv_split_gdn_prefill,
+            qwen3_5_gdn_prefill_projection_views,
+        )
+
+        torch.manual_seed(42)
+        dtype, key_heads, value_heads, width = torch.bfloat16, 4, 12, 128
+        key_dim, value_dim = key_heads * width, value_heads * width
+        indices = torch.tensor([1], device="xpu", dtype=torch.int32)
+        weights = (
+            torch.randn(2 * key_dim + value_dim, 4, device="xpu", dtype=dtype) * 0.1
+        )
+        norm = RMSNorm(width, device="xpu", dtype=dtype, norm_before_gate=True)
+        for length, prefix in ((8192, 0), (2053, 17)):
+            with self.subTest(length=length, prefix=prefix):
+                packed = torch.randn(
+                    length, 2 * key_dim + 2 * value_dim, device="xpu", dtype=dtype
+                )
+                gates = (
+                    torch.randn(length, 2 * value_heads, device="xpu", dtype=dtype)
+                    * 0.1
+                )
+                mixed, gate, beta, alpha = qwen3_5_gdn_prefill_projection_views(
+                    packed, gates, key_heads, value_heads, width, width
+                )
+                original_gate, original_gates = gate.clone(), gates.clone()
+                self.assertEqual(
+                    mixed.untyped_storage().data_ptr(),
+                    packed.untyped_storage().data_ptr(),
+                )
+                self.assertEqual(
+                    gate.untyped_storage().data_ptr(),
+                    packed.untyped_storage().data_ptr(),
+                )
+                self.assertFalse(beta.is_contiguous())
+                starts = torch.tensor([0, length], device="xpu", dtype=torch.int32)
+                seeded = torch.tensor([prefix > 0], device="xpu")
+                conv = (
+                    torch.randn(2, mixed.shape[1], 3, device="xpu", dtype=dtype) * 0.1
+                )
+                ssm = torch.randn(2, value_heads, width, width, device="xpu") * 0.01
+                reference_conv, reference_ssm = conv.clone(), ssm.clone()
+                outputs = []
+                for is_reference, source, conv_state, recurrent_state in (
+                    (True, mixed.contiguous(), reference_conv, reference_ssm),
+                    (False, mixed, conv, ssm),
+                ):
+                    convolved = causal_conv1d_fn_xpu(
+                        source.transpose(0, 1),
+                        weights,
+                        conv_states=conv_state,
+                        query_start_loc=starts,
+                        cache_indices=indices,
+                        has_initial_state=seeded,
+                        activation="silu",
+                    ).transpose(0, 1)
+                    query, key, value = fused_qkv_split_gdn_prefill(
+                        convolved,
+                        key_heads,
+                        key_heads,
+                        value_heads,
+                        width,
+                        width,
+                        width,
+                    )
+                    output = torch.empty_like(value)
+                    gdn_xpu.gated_delta_rule(
+                        output.reshape(length, value_heads, width),
+                        query.reshape(length, key_heads, width),
+                        key.reshape(length, key_heads, width),
+                        value.reshape(length, value_heads, width),
+                        beta.contiguous() if is_reference else beta,
+                        alpha.contiguous() if is_reference else alpha,
+                        torch.zeros(value_heads, device="xpu"),
+                        torch.zeros(value_heads, device="xpu", dtype=dtype),
+                        recurrent_state,
+                        starts,
+                        indices,
+                        num_prefills=1,
+                        num_decodes=0,
+                        has_initial_state=seeded,
+                        token_indx=torch.arange(length, device="xpu", dtype=torch.int32)
+                        if is_reference
+                        else None,
+                    )
+                    output = output.reshape(-1, width)
+                    norm_gate = (
+                        original_gate.reshape(-1, width) if is_reference else gate
+                    )
+                    outputs.append(norm(output, norm_gate))
+                torch.testing.assert_close(outputs[1], outputs[0], atol=0.05, rtol=0.03)
+                torch.testing.assert_close(conv, reference_conv, atol=0, rtol=0)
+                torch.testing.assert_close(ssm, reference_ssm, atol=0.0005, rtol=0.03)
+                torch.testing.assert_close(gate, original_gate, atol=0, rtol=0)
+                torch.testing.assert_close(gates, original_gates, atol=0, rtol=0)
+
     def test_decode_clamps_padded_state_indices(self):
         kernel = XpuGDNKernel()
         x = torch.zeros(1, 3, 1, 2)
