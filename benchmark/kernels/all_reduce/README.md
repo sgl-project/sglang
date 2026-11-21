@@ -19,6 +19,16 @@ Currently supported configurations: **TP=8** (single-node) and **TP=16** (two-no
 
 The benchmark compares all-reduce latency across torch/NCCL (eager), MSCCL++ (eager and graph), and PyNccl (graph) for power-of-two message sizes.
 
+Every timed path is checked bit-exactly against an untimed NCCL all-reduce, a captured MSCCL++ graph is also replayed on new input, and a graph captured through `GroupCoordinator.all_reduce` is checked against NCCL as well. The table reports which backend `GroupCoordinator.all_reduce` dispatched to in eager mode and under CUDA graph capture. It exits non-zero on any mismatch, a failed `--expect-graph-backend`, or if the MSCCL++ communicator is unavailable, which is how CI runs it (`test/registered/kernels/ops/communication/test_mscclpp_wrapper.py`, with `--mscclpp-algorithms all --expect-graph-backend mscclpp`).
+
+Options:
+- `--dtypes {float16,bfloat16,float32} ...`: data types to run (default `bfloat16`).
+- `--min-bytes N` / `--max-bytes N`: message-size range in bytes (default 2 KiB to 1 MiB).
+- `--backends ...`: paths to time and check, from `torch-eager`, `mscclpp-eager`, `mscclpp-graph`, `pynccl-graph` (default all).
+- `--mscclpp-algorithms ...`: `tuned` (default, the tuning winner per size), `all` (every MSCCL++ all-reduce algorithm that supports the size, using the tuned launch for the winner and the first tuning launch for the rest), or algorithm names such as `default_allreduce_packet`.
+- `--expect-graph-backend mscclpp`: fail unless `GroupCoordinator.all_reduce` dispatches to MSCCL++ under CUDA graph capture. The backend actually used is shown in the `sglang eager dispatch` and `sglang graph dispatch` columns of the printed results table; only `mscclpp` can be asserted.
+- `--enable-symm-mem`: allocate collective inputs from NCCL symmetric memory.
+
 ```bash
 torchrun --nproc_per_node 8 \
     --nnodes 1 \
