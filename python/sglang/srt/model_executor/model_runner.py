@@ -79,7 +79,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.kernel_plugins.amd.binding import (
+from sglang.srt.kernel_plugins.mono import (
     install_monokernel_forward,
 )
 from sglang.srt.kernel_plugins.nvidia.binding import (

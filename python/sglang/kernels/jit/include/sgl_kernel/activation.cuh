@@ -106,10 +106,15 @@ SGL_DEVICE float tanh(float x) {
 }
 
 SGL_DEVICE float erf(float x) {
-#ifndef USE_ROCM
-  return __nv_erff(x);
-#else
+#if defined(USE_ROCM) || defined(PPU_DEFAULT) || defined(PPU_COMPATIBLE)
+  // ROCm and the PPU (SAIL) libdevice both lack __nv_erff; each toolchain's own
+  // erff links fine. PPU_DEFAULT/PPU_COMPATIBLE are the PPU family macros (the
+  // layout variant tilelang's libgens pick between; contrib/nvcc.py only names
+  // the generation, so this checks both family spellings, and jit/utils/arch.py
+  // adds PPU_DEFAULT for the SAIL runtime where no tilelang injection runs).
   return erff(x);
+#else
+  return __nv_erff(x);
 #endif
 }
 
