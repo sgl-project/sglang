@@ -247,7 +247,7 @@ class TestDerivedBufferIpcContract(CustomTestCase):
                 patch.object(
                     model_loader,
                     "get_parallel",
-                    return_value=SimpleNamespace(tp_rank=0),
+                    return_value=SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0),
                 ),
                 patch.object(
                     model_loader, "_get_quantization_config", return_value=None
