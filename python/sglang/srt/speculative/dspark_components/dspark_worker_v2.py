@@ -699,6 +699,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
                     self._draft_sampler = self._maybe_build_draft_sampler()
+                    if self._verify_epilogue is not None:
+                        self._verify_epilogue.residual_draft_sampler = (
+                            self._draft_sampler
+                        )
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
