@@ -115,6 +115,8 @@ def bcg_dcp_extend_kv_gather(
     if is_in_prefill_graph_scope():
         forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
+    if metadata is None or metadata.dcp_kv_buffer is None:
+        return
     if metadata.dcp_extend_prefix_lens_sum == 0:
         # No prefix KV on any DCP rank: skip the collective. The buffer holds the
         # real tokens; a replayed k_nope/k_pe is padded to the bucket.
