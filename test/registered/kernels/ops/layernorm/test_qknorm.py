@@ -13,7 +13,7 @@ register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-s
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-small")
 # backend-specific: ROCm tensors must pass the JIT launchers' DLPack device checks.
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def sglang_aot_qknorm(
