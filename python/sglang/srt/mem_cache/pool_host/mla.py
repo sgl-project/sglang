@@ -209,35 +209,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_buffers = buffer_info.buffers
                 self._native_infos = infos
                 native = self._native_buffers
-                self._v_dtype = self.dtype
-                if (
-                    layout in ("page_first_kv_split", "layer_first_kv_split")
-                    and self.dtype == torch.float8_e4m3fn
-                    and not self.dsa_kv_cache_store_fp8
-                    and native.v is not None
-                    and native.v.dtype == torch.bfloat16
-                ):
-                    # ModelSlim MLA stores FP8 latent and BF16 RoPE separately.
-                    self._v_dtype = native.v.dtype
+                self._v_dtype = (
+                    native.v.dtype if native.v is not None else native.k.dtype
+                )
+                if layout in ("page_first_kv_split", "layer_first_kv_split"):
                     self._size_per_token = self.layer_num * (
-                        self.kv_lora_rank * self.dtype.itemsize
-                        + self.qk_rope_head_dim * self._v_dtype.itemsize
+                        native.k_width * native.k.element_size()
+                        + native.v_width * self._v_dtype.itemsize
                     )
-                index_layers = len(native.index_layer_indices)
-                if (
-                    layout in ("page_first_kv_split", "layer_first_kv_split")
-                    and native.index_k is not None
-                ):
-                    index_page_size = native.index_k.shape[2]
-                    index_compress_ratio = page_size // index_page_size
-                    self._size_per_token += (
-                        native.index_width
-                        * self.dtype.itemsize
-                        * index_layers
-                        // index_compress_ratio
-                    )
-                    if native.index_scales is not None:
-                        self._size_per_token += 4 * index_layers // index_compress_ratio
+                    if native.index_k is not None:
+                        ratio = page_size // native.index_k.shape[2]
+                        index_bytes = native.index_width * native.index_k.element_size()
+                        if native.index_scales is not None:
+                            index_bytes += native.index_scales.element_size()
+                        self._size_per_token += (
+                            index_bytes * len(native.index_layer_indices) // ratio
+                        )
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -370,17 +357,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if self.layout != "page_first_kv_split" or self._native_buffers is None:
             return super().get_mapping_lengths()
         native = self._native_buffers
-        k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        k_width = native.k_width
         lengths = [
             self.page_num
             * self.page_size
             * self.layer_num
             * k_width
-            * self.dtype.itemsize,
+            * native.k.element_size(),
             self.page_num
             * self.page_size
             * self.layer_num
-            * self.qk_rope_head_dim
+            * native.v_width
             * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
@@ -390,14 +377,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * native.index_k.shape[2]
                 * index_layers
                 * native.index_width
-                * self.dtype.itemsize
+                * native.index_k.element_size()
             )
         if native.index_scales is not None:
-            # FP32 scale mirror
             lengths.append(
-                self.page_num * native.index_scales.shape[2] * index_layers * 4
+                self.page_num
+                * native.index_scales.shape[2]
+                * index_layers
+                * native.index_scales.element_size()
             )
-        return lengths
+        return [length for length in lengths if length]
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -527,9 +516,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         native = self._native_buffers
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-        k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        k_width = native.k_width
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
-        v_dtype = self.dtype
+        v_dtype = self._v_dtype
         if v_width and native.v.dtype != native.k.dtype:
             v_dtype = native.v.dtype
 
@@ -539,13 +528,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             num_layers=self.layer_num,
             k_width=k_width,
             v_width=v_width,
-            dtype=self.dtype,
+            dtype=native.k.dtype,
             v_dtype=v_dtype,
             buffers=native,
         )
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
-            dtype=self.dtype,
+            dtype=native.k.dtype,
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
@@ -555,7 +544,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # data. Keep a 5-D zero-element tensor (not None) so component
             # builders can safely check ``numel() > 0`` without extra guards.
             self.v_buffer = torch.empty(
-                (*base_dims, 0), dtype=self.dtype, device=self.device
+                (*base_dims, 0), dtype=native.k.dtype, device=self.device
             )
         else:
             self.v_buffer = alloc_func(
@@ -569,17 +558,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if native.index_k is not None:
             self.index_k_buffer = alloc_func(
                 (*indexer_dims, native.index_width),
-                dtype=self.dtype,
+                dtype=native.index_k.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-        # Host-side mirror of the NPU quantized-Indexer FP32 scale cache.
+        # Host-side mirror of the NPU quantized indexer scale cache.
         self.index_k_scale_buffer = None
         if native.index_scales is not None:
             self.index_k_scale_buffer = alloc_func(
                 (*indexer_dims, 1),
-                dtype=torch.float32,
+                dtype=native.index_scales.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
@@ -1344,8 +1333,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         v_buffer_data_ptr
                         + indices[index]
                         * self.layer_num
-                        * self.qk_rope_head_dim
-                        * self.dtype.itemsize
+                        * self.v_buffer.shape[-1]
+                        * self.v_buffer.element_size()
                     )
                     ptr_list.append(v_ptr)
                 if index_k_buffer_data_ptr is not None:
@@ -1373,9 +1362,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
                 self.layer_num
-                * self.dtype.itemsize
+                * self.v_buffer.element_size()
                 * self.page_size
-                * self.qk_rope_head_dim
+                * self.v_buffer.shape[-1]
             )
             index_k_element_size = (
                 num_indexer_layers * index_k_item_size * index_page_size * index_k_width

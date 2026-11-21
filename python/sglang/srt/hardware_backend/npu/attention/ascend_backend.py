@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import resolve_npu_kv_capability
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -350,6 +351,7 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_capability = resolve_npu_kv_capability(self.kv_cache_dtype)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         modelslim_cache_layout = (
             model_runner.kv_cache_configurator.modelslim_cache_layout
@@ -1889,7 +1891,7 @@ class AscendAttnBackend(AttentionBackend):
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_fp8_sparse(
+            return self._forward_packed_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -1922,7 +1924,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out
 
-    def _forward_fp8_sparse(
+    def _forward_packed_sparse(
         self,
         q_nope,
         q_pe,
@@ -1932,8 +1934,9 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        q_nope = q_nope.to(torch.bfloat16)
+        q_pe = q_pe.to(torch.bfloat16)
+        packed = packed_kv.view(self.kv_capability.kv_cache_dtype)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed,
@@ -2170,8 +2173,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
-                attn_out = self._forward_fp8_sparse(
+            if self.kv_capability.main_kv_packed:
+                attn_out = self._forward_packed_sparse(
                     q_nope,
                     q_pe,
                     k_nope,
