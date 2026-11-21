@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime import server_warmup
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     AutoResidencyReq,
@@ -391,18 +392,16 @@ class TestAutoResidencyWarmup(unittest.TestCase):
                 server_warmup, "auto_residency_skip_reason", return_value=None
             ),
             mock.patch.object(
-                server_warmup,
-                "should_include_warmup_image",
-                return_value=False,
-            ),
-            mock.patch.object(
                 server_warmup, "build_client_warmup_reqs", return_value=[req]
             ),
             mock.patch.object(server_warmup, "_degrade_after_oom") as degrade,
         ):
             asyncio.run(
                 server_warmup.run_async_client_warmup(
-                    SimpleNamespace(scheduler_endpoints=["replica-0"]),
+                    SimpleNamespace(
+                        scheduler_endpoints=["replica-0"],
+                        pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2I),
+                    ),
                     forward,
                     fail_open=True,
                 )
@@ -428,11 +427,6 @@ class TestAutoResidencyWarmup(unittest.TestCase):
                 return_value="not auto",
             ),
             mock.patch.object(
-                server_warmup,
-                "should_include_warmup_image",
-                return_value=False,
-            ),
-            mock.patch.object(
                 server_warmup, "build_client_warmup_reqs", return_value=[req]
             ),
             mock.patch.object(
@@ -441,7 +435,11 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(
                 server_warmup.run_async_client_warmup(
-                    SimpleNamespace(scheduler_endpoints=["replica-0"]), forward
+                    SimpleNamespace(
+                        scheduler_endpoints=["replica-0"],
+                        pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2I),
+                    ),
+                    forward,
                 )
             )
 
