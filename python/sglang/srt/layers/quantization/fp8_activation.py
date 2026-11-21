@@ -1,5 +1,5 @@
-"""Dense activation/quantization fusion: the block-FP8 DeepGEMM path on CUDA, and
-on gfx95 the aiter bpreshuffle block-FP8 path and per-tensor FP8 down projections."""
+"""Dense activation/quantization fusion: CUDA per-token FP8 and SM100 block-FP8
+DeepGEMM paths, plus gfx95 aiter bpreshuffle block-FP8 and per-tensor FP8 paths."""
 
 from __future__ import annotations
 
@@ -83,8 +83,15 @@ class DenseSiluAndMulQuant:
         # ROCm: whether down_proj's weights turned out per-tensor, without a
         # static input scale; known only once they have loaded.
         self._per_tensor = None
+        # CUDA dynamic per-token FP8 (SM89/90/100/120, any TP, decode & prefill).
+        self._cuda_per_token = False
+        self._cuda_per_token_ready: bool | None = None
         if _is_hip:
             self.enabled = self._rocm_candidate(down_proj)
+            return
+        if is_cuda() and self._cuda_per_token_candidate(down_proj):
+            self._cuda_per_token = True
+            self.enabled = True
             return
         if not (is_cuda() and get_platform().is_sm100 and get_parallel().tp_size == 1):
             return
@@ -121,6 +128,91 @@ class DenseSiluAndMulQuant:
                 self.weight_shape, method.weight_block_size, torch.bfloat16
             )
         )
+
+    @property
+    def supports_all_modes(self) -> bool:
+        """Whether this fusion is beneficial across both decode and prefill."""
+        return self._cuda_per_token
+
+    def _cuda_per_token_candidate(self, down_proj: RowParallelLinear) -> bool:
+        from sglang.srt.layers.linear import RowParallelLinear
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        method = self.quant_method
+        return (
+            type(down_proj) is RowParallelLinear
+            and type(method) is Fp8LinearMethod
+            and method.weight_block_size is None
+            and method.quant_config.activation_scheme == "dynamic"
+            and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
+            and down_proj.input_is_parallel
+        )
+
+    def forward_per_token(
+        self,
+        x: torch.Tensor,
+        act_fn: SiluAndMul,
+        down_proj: RowParallelLinear,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+        """Fused SiLU-and-mul + dynamic per-token FP8 quant on CUDA (decode & prefill)."""
+        if not self._cuda_per_token or torch.compiler.is_compiling():
+            return act_fn(x)
+
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers.activation import SiluAndMul
+
+        if self._cuda_per_token_ready is None:
+            weight_scale = getattr(down_proj, "weight_scale", None)
+            self._cuda_per_token_ready = (
+                weight_scale is not None
+                and getattr(down_proj, "input_scale", None) is None
+                and not hasattr(down_proj, "base_layer")
+            )
+
+        deterministic = get_exec().deterministic
+        hidden_dim = down_proj.input_size_per_partition
+        if (
+            not self._cuda_per_token_ready
+            or down_proj is not self.down_proj
+            or down_proj.quant_method is not self.quant_method
+            or type(act_fn) is not SiluAndMul
+            or (act_fn._forward_method or act_fn._resolve_forward_method())
+            != act_fn.forward_cuda
+            or act_fn.is_torch_compile
+            or get_fused_op_backend() is not None
+            or deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+            or is_batch_invariant_mode_enabled()
+            or get_lora().enable_lora
+            or get_forward().sp_active
+            or not x.is_cuda
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or x.ndim != 2
+            or x.shape[0] == 0
+            or not x.is_contiguous()
+            or x.data_ptr() % 8 != 0
+            or x.device != down_proj.weight.device
+            or hidden_dim % 4 != 0
+            or x.shape[1] != 2 * hidden_dim
+        ):
+            return act_fn(x)
+
+        from sglang.kernels.ops.quantization import (
+            sgl_silu_and_mul_per_token_quant_fp8,
+        )
+
+        q = torch.empty(
+            (x.shape[0], hidden_dim),
+            device=x.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scale = torch.empty(
+            (x.shape[0], 1),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        sgl_silu_and_mul_per_token_quant_fp8(x, q, scale)
+        return q, scale, x.dtype
 
     def _rocm_candidate(self, down_proj: RowParallelLinear) -> bool:
         from sglang.srt.layers.linear import RowParallelLinear
@@ -201,6 +293,8 @@ class DenseSiluAndMulQuant:
             return act_fn(x)
         if _is_hip:
             return self._forward_decode_rocm(x, act_fn, down_proj)
+        if self._cuda_per_token:
+            return self.forward_per_token(x, act_fn, down_proj)
 
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
         from sglang.srt.layers.activation import SiluAndMul

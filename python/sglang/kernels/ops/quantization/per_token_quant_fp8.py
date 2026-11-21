@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -43,3 +48,41 @@ def per_token_quant_fp8(
     """Dynamically quantize each row to FP8 E4M3."""
     module = _jit_per_token_quant_fp8_module(input.dtype)
     module.per_token_quant_fp8(input, output_q, output_s.view(output_s.shape[0], 1))
+
+
+@cache_once
+def _jit_silu_and_mul_per_token_quant_fp8_module(dtype: torch.dtype) -> Module:
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: float16, bfloat16")
+    use_fast_math = current_arch().is_sm(9, 0)
+    math_mode = "fast_math" if use_fast_math else "precise_math"
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True)
+    return load_jit(
+        "silu_and_mul_per_token_quant_fp8",
+        math_mode,
+        *args,
+        cuda_files=["gemm/silu_and_mul_per_token_quant_fp8.cuh"],
+        cuda_wrappers=[
+            (
+                "silu_and_mul_per_token_quant_fp8",
+                f"silu_and_mul_per_token_quant_fp8<{args}>",
+            )
+        ],
+        extra_cuda_cflags=["--use_fast_math"] if use_fast_math else [],
+    )
+
+
+@register_custom_op(
+    op_name="silu_and_mul_per_token_quant_fp8",
+    mutates_args=["output_q", "output_s"],
+)
+def silu_and_mul_per_token_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    """Fused SiLU-and-mul followed by dynamic per-token FP8 E4M3 quantization."""
+    module = _jit_silu_and_mul_per_token_quant_fp8_module(input.dtype)
+    module.silu_and_mul_per_token_quant_fp8(
+        input, output_q, output_s.view(output_s.shape[0], 1)
+    )

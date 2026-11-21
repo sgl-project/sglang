@@ -35,6 +35,15 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="quantization.silu_and_mul_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.per_token_quant_fp8:silu_and_mul_per_token_quant_fp8",
+        capabilities=CUDA_ONLY,
+    )
+)
 # fp8 / int8 are legacy aliases of the same 8bit kernel in the wheel.
 for _name in (
     "sgl_per_token_group_quant_8bit",
@@ -69,6 +78,17 @@ def sgl_per_token_quant_fp8(
     return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
+
+
+def sgl_silu_and_mul_per_token_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    """Fused SiLU-and-mul + per-token FP8 quantization."""
+    return get_kernel(
+        "quantization.silu_and_mul_per_token_quant_fp8", KernelBackend.JIT
+    )(input, output_q, output_s)
 
 
 def sgl_per_token_group_quant_8bit(

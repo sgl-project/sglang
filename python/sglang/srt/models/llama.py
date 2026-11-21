@@ -142,6 +142,10 @@ class LlamaMLP(nn.Module):
                 x = self.activation_quant.forward_decode(
                     gate_up, self.act_fn, self.down_proj
                 )
+            elif self.activation_quant.supports_all_modes:
+                x = self.activation_quant.forward_per_token(
+                    gate_up, self.act_fn, self.down_proj
+                )
             else:
                 x = self.act_fn(gate_up)
 
