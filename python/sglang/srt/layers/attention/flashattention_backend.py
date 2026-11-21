@@ -217,7 +217,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata: FlashAttentionMetadata = None
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
-        self.max_context_len = model_runner.model_config.context_len
+        # Speculative decoding reads past context_len at the length cap,
+        # into the req_to_token row headroom, so page tables span the whole row.
+        self.max_context_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}

@@ -873,7 +873,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # Parse constants
-        self.max_context_len = model_runner.model_config.context_len
+        # Speculative decoding reads past context_len at the length cap,
+        # into the req_to_token row headroom, so page tables span the whole row.
+        self.max_context_len = self.req_to_token.shape[1]
         self.skip_prefill = skip_prefill
 
         max_bs = model_runner.req_to_token_pool.size
