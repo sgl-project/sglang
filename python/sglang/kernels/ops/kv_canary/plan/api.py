@@ -117,7 +117,9 @@ def launch_canary_plan_kernels(
             "kv-canary: launch_canary_plan_kernels requires full_to_swa_index_mapping when swa_window_size > 0"
         )
 
-    if use_torch_reference(verify_plan_out.verify_slot_indices.device):
+    device = verify_plan_out.verify_slot_indices.device
+    # XPU runs the Triton offsets kernel below and a tensor version of the CUDA-only entries kernel.
+    if use_torch_reference(device) and device.type != "xpu":
         from sglang.kernels.ops.kv_canary.plan_ref import (
             launch_canary_plan_kernels_torch_reference,
         )
@@ -144,7 +146,6 @@ def launch_canary_plan_kernels(
             f"kv-canary: launch_canary_plan_kernels supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
             f"got bs={bs}. Bump _PLAN_BS_BLOCK_SIZE if real workloads need this."
         )
-    device = verify_plan_out.verify_slot_indices.device
     verify_offsets_scratch = torch.empty(
         _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int64, device=device
     )
@@ -174,7 +175,13 @@ def launch_canary_plan_kernels(
         verify_capacity=verify_capacity,
     )
 
-    launch_plan_entries_kernel(
+    if device.type == "xpu":
+        from sglang.kernels.ops.kv_canary._tensor_fallback import (
+            launch_plan_entries_tensor_fallback as launch_entries,
+        )
+    else:
+        launch_entries = launch_plan_entries_kernel
+    launch_entries(
         req_pool_indices=req_pool_indices,
         prefix_lens=prefix_lens,
         req_to_token=req_to_token,
