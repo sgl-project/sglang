@@ -100,6 +100,8 @@ class AttnTpContext:
     def use_input_scattered(self, forward_batch: ForwardBatch):
         return (
             self.allow_input_scattered
+            # Prefill graphs are captured unscattered.
+            and not get_forward().prefill_graph_replay
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.input_ids is not None
