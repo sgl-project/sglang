@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Tuple
 
+import psutil
 import torch
 
 from sglang.srt.environ import envs
@@ -56,6 +57,24 @@ def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
     return max(1, budget)
 
 
+def _is_integrated_device(device_index: int) -> bool:
+    if is_xpu():
+        return False
+    return bool(get_device_module().get_device_properties(device_index).is_integrated)
+
+
+def mqa_logits_cap_by_host_memory(budget_bytes: int, *, device_index: int) -> int:
+    """On an integrated GPU, lower the budget to fit available host memory too."""
+    if not _is_integrated_device(device_index):
+        return budget_bytes
+    # Device memory is host memory here, and mem_get_info misses host use
+    # (ROCm gfx1151); psutil, as in get_available_gpu_memory, needs no sync.
+    host_budget = int(
+        psutil.virtual_memory().available * mqa_logits_free_mem_fraction()
+    )
+    return max(1, min(budget_bytes, host_budget))
+
+
 def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     """Static budget capped by current free memory; mem_get_info syncs, so
     callers pass allow_sync=False under CUDA graph capture."""
@@ -63,6 +82,7 @@ def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     if allow_sync and not is_xpu():
         free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
+        budget = mqa_logits_cap_by_host_memory(budget, device_index=device_index)
     if is_hip():
         budget = min(budget, MQA_LOGITS_MAX_BYTES_ROCM)
     return max(1, budget)
