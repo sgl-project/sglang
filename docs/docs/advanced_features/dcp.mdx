@@ -136,6 +136,10 @@ Normally each layer all-gathers its absorbed and rotary query components. `--dcp
 
 When `--dcp-comm-backend` is unset, every DCP launch resolves it the same way: `fi_a2a` where the DCP group shares one MNNVL domain on Blackwell, otherwise `a2a` on CUDA/ROCm/XPU, and `ag_rs` only on platforms without the a2a path. Query replication stays model-resolved: Kimi K3 enables it by default on the a2a family, and its decode backend is `cutedsl_mla`.
 
+### Ascend NPU
+
+A DSA extend on Ascend picks one of two paths per forward. It either gathers the query and merges partial outputs, as decode does, or it all-gathers the cached prefix KV once per layer and attends locally. The query path moves every head's query plus an FP32 `[out, lse]` merge per new token. The KV path moves one latent row per prefix token whatever the head count, and nothing at all when there is no cached prefix. Each extend takes whichever moves fewer bytes: for GLM-5.2 (64 heads) that is the KV gather once the new tokens exceed about 1/178 of the cached prefix. Above 4,096 new tokens (`SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS`) the KV gather is taken regardless, because the query path's FP32 merge grows with the new tokens and stops fitting beside a long context. The KV path is BF16/FP16 only; any other KV cache dtype keeps the query path. `SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS` caps the rows per gather collective, which bounds the scratch buffer next to the gathered context. Size `--mem-fraction-static` with that buffer in mind: running the KV pool close to full turns the gather into multi-minute stalls rather than a slowdown.
+
 DCP adds a context-independent decode collective while cutting context-dependent KV storage and reads by about `c`. Extend is outside that decode cost model: it may gather cached prefix shards, restore token order, and append new tokens, and that work grows with prefix length.
 
 ## Compositions
