@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 as mla_gfx950
+import sglang.kernels.ops.attention.dsa.triton_sparse_mla as tsm
 from sglang.kernels.ops.attention.dsa import sparse_mla_prefill_gfx950
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
@@ -15,6 +16,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _IS_FNUZ,
     _cu_count,
     _cu_count_for_device,
+    _decode_splitk_splits,
     _is_gfx950_sparse_mla_fp8,
     _page_offsets_fit_i32,
     _reduce_d_chunk,
@@ -137,6 +139,83 @@ def test_short_prefill_index_bound_matches_full_scan(topk):
     expected = triton_sparse_mla_fwd(*args)
     actual = triton_sparse_mla_fwd(*args, max_topk_length=128)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _snr_db(ref, out):
+    noise = (out.float() - ref).pow(2).mean()
+    return float(10 * torch.log10(ref.pow(2).mean() / noise))
+
+
+def _fp8_64h_decode_inputs(seq, tail_invalid):
+    """GLM-5.2 decode inputs: 64 heads, fp8 576-wide rows, topk 2048."""
+    torch.manual_seed(seq)
+    heads, value_dim, tail_dim, topk = 64, 512, 64, 2048
+
+    def fp8_randn(*shape):
+        return torch.randn(*shape, device="cuda").clamp_(-4, 4).to(torch.float8_e4m3fn)
+
+    kv = fp8_randn(1 << 16, 1, value_dim + tail_dim)
+    q_nope = fp8_randn(seq, heads, value_dim)
+    q_rope = fp8_randn(seq, heads, tail_dim)
+    indices = torch.randint(
+        0, kv.shape[0], (seq, 1, topk), device="cuda", dtype=torch.int32
+    )
+    if tail_invalid:
+        lengths = torch.randint(256, topk, (seq,), device="cuda")
+        pos = torch.arange(topk, device="cuda")
+        indices[:, 0] = torch.where(pos < lengths[:, None], indices[:, 0], -1)
+    return q_nope, q_rope, kv, indices
+
+
+@pytest.mark.skipif(not _IS_GFX950, reason="decode plan is gfx950-only")
+@pytest.mark.parametrize("seq", [15, 16, 48, 60, 96, 128])
+@pytest.mark.parametrize("tail_invalid", [False, True])
+def test_gfx950_fp8_64h_decode_plan_matches_reference(seq, tail_invalid, monkeypatch):
+    """GLM-5.2 decode / MTP-verify shape (64 heads, fp8 cache, topk 2048): the
+    BLOCK_H == H split-K plan serves exactly the rows that get 2..16 KV splits
+    (16..128 rows on 256 CUs), and every row count stays within fp8 tolerance
+    of an fp32 reference, with and without a -1 tail on the index rows."""
+    launches = []
+    splitk = tsm._triton_sparse_mla_fwd_splitk
+
+    def spy(*args, **kwargs):
+        launches.append(kwargs.get("decode_tuned", False))
+        return splitk(*args, **kwargs)
+
+    monkeypatch.setattr(tsm, "_triton_sparse_mla_fwd_splitk", spy)
+    q_nope, q_rope, kv, indices = _fp8_64h_decode_inputs(seq, tail_invalid)
+    out = triton_sparse_mla_fwd(q_nope, q_rope, kv, indices, 0.0625, 512)
+    splits = _cu_count(q_nope.device) // seq
+    assert any(launches) == (2 <= splits <= 16)
+    q = torch.cat([q_nope, q_rope], dim=-1)
+    ref, _ = _sparse_mla_reference(q, kv, indices[:, 0], 0.0625, 512)
+    assert _snr_db(ref, out.reshape(ref.shape)) > 35.0
+
+
+@pytest.mark.skipif(not _IS_GFX950, reason="decode plan is gfx950-only")
+@pytest.mark.parametrize("seq", [48, 96])
+def test_gfx950_fp8_64h_return_lse_matches_reference(seq):
+    """The 64-head fp8 decode shape with return_lse, which bypasses the
+    output-only decode plan: output and natural-log LSE match an fp32 reference."""
+    q_nope, q_rope, kv, indices = _fp8_64h_decode_inputs(seq, tail_invalid=True)
+    out, lse = triton_sparse_mla_fwd(
+        q_nope, q_rope, kv, indices, 0.0625, 512, return_lse=True
+    )
+    q = torch.cat([q_nope, q_rope], dim=-1)
+    ref, ref_lse = _sparse_mla_reference(q, kv, indices[:, 0], 0.0625, 512)
+    assert _snr_db(ref, out.reshape(ref.shape)) > 35.0
+    torch.testing.assert_close(lse, ref_lse * math.log(2), rtol=0, atol=1e-2)
+
+
+def test_decode_plan_leaves_few_rows_to_the_block_h16_path():
+    """At 1-15 rows on 256 CUs the decode plan would need more than 16 splits,
+    where it measured slower than the BLOCK_H=16 path."""
+    assert _decode_splitk_splits(6, 2048, 64, 256) is None
+    assert _decode_splitk_splits(15, 2048, 64, 256) is None
+    assert _decode_splitk_splits(16, 2048, 64, 256) == 16
+    assert _decode_splitk_splits(60, 2048, 64, 256) == 4
+    assert _decode_splitk_splits(128, 2048, 64, 256) == 2
+    assert _decode_splitk_splits(129, 2048, 64, 256) is None
 
 
 @pytest.mark.parametrize("active_splits", [2, 4])
