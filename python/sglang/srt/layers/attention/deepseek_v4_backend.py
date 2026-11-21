@@ -354,11 +354,17 @@ def _flashmla_v41_splits_kv(
 
 
 def _low_ratio_source_projections(
-    layer, x, q_lora, positions, bufs, run_compressor, run_indexer
+    layer, x, q_lora, positions, bufs, run_compressor, run_indexer, *, cp_layout=None
 ):
-    real = (
-        get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
-    )
+    batch = get_tc_piecewise_forward_context().forward_batch
+    real = batch.global_num_token_non_padded_cpu
+    if cp_layout is not None:
+        lengths = _as_int_list(batch.extend_seq_lens_cpu)
+        if cp_layout == "local":
+            lengths = interleave_rows_per_request(
+                lengths, get_parallel().attn_cp_rank, get_parallel().attn_cp_size
+            )
+        real = sum(lengths)
     if real is None:
         real = x.shape[0]
 
@@ -388,7 +394,12 @@ def _low_ratio_source_projections(
         # Only the captured consumers read these; a full top-k layer projects
         # once inside its eager break (_index_q_and_weights), so skip them there.
         indexer = layer.indexer
-        put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
+        put(
+            "q",
+            indexer.queries(
+                _first_rows(q_lora, real), layer.freqs_cis[positions[:real]]
+            ),
+        )
         put("w", indexer.head_weights(x[:real]))
 
 
@@ -1431,7 +1442,7 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         # Prefill CUDA graph source projection buffers per ratio, newest first.
-        self._source_proj_bufs: Dict[int, list] = {}
+        self._source_proj_bufs: Dict[tuple, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         self._cutedsl_h16_c128_combined_topk: Optional[int] = None
@@ -1842,10 +1853,16 @@ class DeepseekV4AttnBackend(
             real_num_tokens=real_num_tokens,
         )
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
-            metadata.low_ratio_req_indices = req_pool_indices_repeated.to(torch.int64)
-            metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
-                torch.int64
-            )
+            # Compression consumes global write rows, whereas indexer Q and
+            # page tables have already been reindexed to the local CP shard.
+            metadata.low_ratio_req_indices = req_pool_indices_repeated[
+                :num_write_tokens
+            ].to(torch.int64)
+            metadata.low_ratio_pos_i64 = (
+                (seq_lens_casual[:num_write_tokens] - 1).clamp_min(0)
+                if cp_active
+                else core_attn_metadata.positions_casual
+            ).to(torch.int64)
             # One slot per request the bucket can hold. DP padding extends
             # extend_seq_lens past the requests; those rows belong to no slot.
             num_reqs = extend_start_loc.shape[0]
@@ -1875,6 +1892,14 @@ class DeepseekV4AttnBackend(
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
         if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
+            return False
+        if (
+            is_cp_active(forward_batch)
+            and self.low_ratio_prefill_graph
+            and int(seq_lens_cpu.max().item()) < max(self.low_ratios)
+        ):
+            # The source cannot publish a candidate table when the batch has
+            # no complete compressed group (e.g. all first-token requests).
             return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -3428,31 +3453,37 @@ class DeepseekV4AttnBackend(
                     retained.insert(0, value)
                 setattr(core, name, retained[0][: value.shape[0]])
 
-    def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
+    def _source_projection_buffers(
+        self, num_tokens: int, ratio: int, *, part: str = "both"
+    ) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
         heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
         sets = self._source_proj_bufs
-        have = sets.get(ratio)
-        if have is None or have[0]["q"].shape[0] < num_tokens:
+        key = (ratio, part)
+        have = sets.get(key)
+        if have is None or next(iter(have[0].values())).shape[0] < num_tokens:
             latent = self.model_runner.model_config.head_dim
             zeros = lambda *shape, dtype: torch.zeros(
                 *shape, dtype=dtype, device=self.device
             )
-            bufs = {
-                "q": zeros(num_tokens, heads, dim, dtype=torch.bfloat16),
-                "w": zeros(num_tokens, heads, dtype=torch.bfloat16),
-            }
-            if ratio == 1:
-                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.bfloat16)
-            elif fused_low_ratio_compress_supported():
-                # The fused compressor reads | kv | score | rows.
-                bufs["kv_score"] = zeros(num_tokens, 2 * latent, dtype=torch.float32)
-            else:
-                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.float32)
-                bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
+            bufs = {}
+            if part != "compressor":
+                bufs["q"] = zeros(num_tokens, heads, dim, dtype=torch.bfloat16)
+                bufs["w"] = zeros(num_tokens, heads, dtype=torch.bfloat16)
+            if part != "indexer":
+                if ratio == 1:
+                    bufs["kv"] = zeros(num_tokens, latent, dtype=torch.bfloat16)
+                elif fused_low_ratio_compress_supported():
+                    # The fused compressor reads | kv | score | rows.
+                    bufs["kv_score"] = zeros(
+                        num_tokens, 2 * latent, dtype=torch.float32
+                    )
+                else:
+                    bufs["kv"] = zeros(num_tokens, latent, dtype=torch.float32)
+                    bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
             # Keep the previous allocations alive: captured graphs still hold them.
-            sets[ratio] = [bufs] + (have or [])
-        bufs = sets[ratio][0]
+            sets[key] = [bufs] + (have or [])
+        bufs = sets[key][0]
         return {name: buf[:num_tokens] for name, buf in bufs.items()}
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
@@ -3604,6 +3635,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        cp_x_global=None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
@@ -3622,6 +3654,7 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                x_global=cp_x_global,
             )
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
@@ -3698,15 +3731,35 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        x_global=None,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
-        cp_meta = forward_batch.attn_cp_metadata
-        total = int(cp_meta.total_seq_lens)
         tail = self.forward_metadata.late_layer_tail
+        if tail is None and self._low_ratio_in_prefill_graph():
+            self._forward_low_ratio_sources_cp_captured(
+                layer,
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                run_compressor=run_compressor,
+                run_indexer=run_indexer,
+                x_global=x_global,
+            )
+            return
         if tail is not None:
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
+            total = sum(tail.extend_seq_lens_cpu)
         else:
             extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
             # BCG gathers the capture bucket; compressed state belongs to live rows.
@@ -3720,21 +3773,84 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
+            self._low_ratio_compress_torch(
+                layer, x_global[:total], req_global, pos_global
+            )
         if run_indexer and layer.indexer is not None:
             # A rank's local rows are not the batch's, so no req_rows to pass.
             self._low_ratio_index_topk(
                 layer,
                 x[:num_local],
-                q_lora[:num_local],
+                _first_rows(q_lora, num_local),
                 None,
                 positions[:num_local].to(torch.int64),
                 forward_batch,
                 rows_per_request=q_lens_cpu,
             )
+
+    def _forward_low_ratio_sources_cp_captured(
+        self,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        *,
+        run_compressor,
+        run_indexer,
+        x_global=None,
+    ) -> None:
+        ratio = layer.compress_ratio
+        meta = self.forward_metadata
+        layer_has_compressor = run_compressor and layer.compressor is not None
+        if layer_has_compressor:
+            req, pos = meta.low_ratio_req_indices, meta.low_ratio_pos_i64
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
+            x_global = x_global[: pos.shape[0]]
+            bufs = self._source_projection_buffers(
+                pos.shape[0], ratio, part="compressor"
+            )
+            _bcg_low_ratio_source_projections(
+                layer, x_global, None, pos, bufs, True, False, cp_layout="global"
+            )
+            if layer.compressor.use_fused_gate:
+                self._low_ratio_compress_fused(
+                    layer,
+                    x_global,
+                    req,
+                    pos,
+                    projected=bufs["kv_score"],
+                    extend_offsets=meta.low_ratio_extend_offsets.unbind(),
+                )
+            else:
+                self._low_ratio_compress_torch(
+                    layer, x_global, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                )
+        if not run_indexer or layer.indexer is None:
+            return
+        if layer.indexer.uses_candidates:
+            bufs = self._source_projection_buffers(x.shape[0], ratio, part="indexer")
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, positions, bufs, False, True, cp_layout="local"
+            )
+            self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+        elif layer.indexer.is_candidate_source:
+            candidates = self.prefill_candidates
+            table = candidates.prefill_graph_table(layer.layer_id, x.shape[0])
+            assert table is not None or _current_capture_var.get() is None
+            _bcg_prefill_graph_full_topk(layer, x, q_lora, positions, table)
+            if table is None:
+                table = candidates.prefill_graph_table(layer.layer_id, x.shape[0])
+            meta.candidate_metadata = candidates.bind_prefill_graph_table(table)
+        else:
+            _bcg_prefill_graph_full_topk(layer, x, q_lora, positions, None)
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
         if forward_batch.forward_mode.is_decode():
@@ -4314,15 +4430,25 @@ class DeepseekV4AttnBackend(
             real = forward_batch.extend_num_tokens
         # The metadata in use holds the rows x has: the late-layer tail's when the
         # source is the tail's first layer, which are not the extend's leading rows.
-        req = self.forward_metadata.low_ratio_req_indices[:real]
+        rows_per_request = None
+        req = None
+        if is_cp_active(forward_batch):
+            rows_per_request = interleave_rows_per_request(
+                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            real = sum(rows_per_request)
+        else:
+            req = self.forward_metadata.low_ratio_req_indices[:real]
         inputs = self._make_low_ratio_prefill_indexer_inputs(
             layer,
             x[:real],
-            q_lora[:real],
+            _first_rows(q_lora, real),
             req,
             pos[:real],
             forward_batch,
-            None,
+            rows_per_request,
             allow_row_shard=False,
         )
         if not indexer.is_candidate_source:
