@@ -27,6 +27,11 @@ class TranscriptionAdapter(ABC):
         return ""
 
     @property
+    def supports_translation(self) -> bool:
+        """Whether this adapter can translate source audio into English."""
+        return False
+
+    @property
     def supports_language_detection(self) -> bool:
         """Whether this model supports automatic language detection.
 
@@ -48,7 +53,11 @@ class TranscriptionAdapter(ABC):
 
     @staticmethod
     def parse_fused_output(
-        text: str, *, ts_variant: bool = False, strip: bool = True
+        text: str,
+        *,
+        ts_variant: bool = False,
+        strip: bool = True,
+        task: str = "transcribe",
     ) -> tuple[Optional[str], Optional[str]]:
         """Parse the fused output into ``(language_code, user_visible_text)``.
 
@@ -57,6 +66,7 @@ class TranscriptionAdapter(ABC):
         requested (the caller knows from ``request.timestamp_granularities``);
         adapters use it to disambiguate variants whose detokenized prefix
         differs in shape from their token-id prefix.
+        ``task`` selects the requested transcription or translation prefix.
 
         * ``(None, None)`` — the forced prefix is not yet locatable.
           Streaming callers keep buffering; non-streaming / end-of-stream
