@@ -984,6 +984,15 @@ mod tests {
             ProposalKind::CacheAffinity,
             "300 matched tokens are under the floor"
         );
+        let outside = signal(vec!["http://outside:30000".into()]);
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&[1, 2, 3, 4]))
+            .with_input_tokens(300)
+            .with_external_prefix(Some(&outside));
+        assert_ne!(
+            policy.propose(&workers, &ctx).unwrap().kind,
+            ProposalKind::CacheAffinity
+        );
         let remembered = signal(vec!["http://hot:30000".into()]);
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4]))

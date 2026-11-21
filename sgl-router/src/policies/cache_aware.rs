@@ -48,6 +48,7 @@ impl CacheAwarePolicy {
             .collect();
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
+        let remembered = !signal.media_winners.is_empty();
         for entry in matches {
             let Some(worker) = by_url.get(entry.address.as_str()) else {
                 continue;
@@ -62,7 +63,6 @@ impl CacheAwarePolicy {
                 signal.query_blocks,
                 matched_prefix_blocks,
             );
-            let remembered = !signal.media_winners.is_empty();
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens, remembered) {
                 continue;
             }
@@ -83,6 +83,17 @@ impl CacheAwarePolicy {
                     selector.prepare_prefill_cache_candidate(candidate, request)
                 })
                 .collect();
+        }
+
+        // The floor exemption also admits peers for the pressure guard, but only
+        // when the current candidate set still contains a remembered owner.
+        if remembered
+            && !candidates
+                .iter()
+                .any(|c| signal.media_winners.contains(&c.worker.url))
+        {
+            candidates
+                .retain(|c| self.passes_cache_gate(input_tokens, c.matched_prefix_tokens, false));
         }
 
         let limit = self.candidate_limit(workers.len());
