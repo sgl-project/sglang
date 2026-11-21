@@ -600,6 +600,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
+                        processor_kwargs=request.processor_kwargs,
+                        mm_process_config=request.mm_process_config,
+                        io_kwargs=request.io_kwargs,
                         require_reasoning=require_reasoning,
                     )
 
@@ -761,6 +764,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             stop=request.stop,
             reasoning_effort=(request.reasoning.effort if request.reasoning else None),
             chat_template_kwargs=request.chat_template_kwargs,
+            processor_kwargs=request.processor_kwargs,
+            mm_process_config=request.mm_process_config,
+            io_kwargs=request.io_kwargs,
         )
         chat_request._template_tools = self._response_tools_to_template_tools(request)
 

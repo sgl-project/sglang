@@ -281,6 +281,7 @@ class MultimodalProcessorMixin:
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
         video_decode_device: Optional[str] = None,
+        frame_count_limit: Optional[int] = None,
     ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
         """
         Simple version: For one modal data submit IO load task.
@@ -314,7 +315,7 @@ class MultimodalProcessorMixin:
                 self.__class__._load_single_item,
                 data,
                 modality,
-                None,  # frame_count_limit: no consider for fast path
+                frame_count_limit,
                 audio_sample_rate,
                 discard_alpha_channel,
                 **load_kwargs,
@@ -376,6 +377,7 @@ class MultimodalProcessorMixin:
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
         video_decode_device: Optional[str] = None,
+        video_frame_count_limit: Optional[int] = None,
     ) -> Tuple[List[Any], List[Any], List[Any]]:
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
@@ -393,6 +395,9 @@ class MultimodalProcessorMixin:
                     audio_sample_rate,
                     discard_alpha_channel,
                     video_decode_device=video_decode_device,
+                    frame_count_limit=(
+                        video_frame_count_limit if modality == Modality.VIDEO else None
+                    ),
                 )
             )
 

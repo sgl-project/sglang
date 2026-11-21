@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextvars
 import copy
 import threading
 from typing import Any, Callable, Optional, TypeVar
@@ -39,8 +40,9 @@ class MultimodalProcessorExecutor:
 
     async def run(self, function: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
         return await loop.run_in_executor(
-            self._executor, self._run, function, args, kwargs
+            self._executor, ctx.run, self._run, function, args, kwargs
         )
 
     def _run(

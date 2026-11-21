@@ -34,8 +34,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     DeltaMessage,
     Function,
     FunctionResponse,
+    ResponsesRequest,
     Tool,
     ToolCall,
+    TranscriptionRequest,
     UsageInfo,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -245,6 +247,22 @@ class TestChatCompletionRequest(CustomTestCase):
             model="test-model", messages=messages, tools=tools
         )
         self.assertEqual(request2.tool_choice, "auto")
+
+    def test_chat_completion_runtime_mm_kwargs(self):
+        """Test chat completion with runtime multimodal kwargs."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"image": {"discard_alpha_channel": False}},
+        )
+        self.assertEqual(
+            request.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(request.mm_process_config, {"image": {"max_pixels": 2048}})
+        self.assertEqual(request.io_kwargs, {"image": {"discard_alpha_channel": False}})
 
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
@@ -770,6 +788,35 @@ class TestModelSerialization(CustomTestCase):
         self.assertNotIn("token_ids", data)
         self.assertEqual(data["response_token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
+
+class TestResponsesAndTranscriptionRequests(CustomTestCase):
+    def test_responses_request_runtime_mm_kwargs(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="hello",
+            processor_kwargs={"images_kwargs": {"max_pixels": 1024}},
+            mm_process_config={"image": {"max_pixels": 2048}},
+            io_kwargs={"video": {"frame_count_limit": 8}},
+        )
+        self.assertEqual(
+            request.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
+        )
+        self.assertEqual(request.mm_process_config, {"image": {"max_pixels": 2048}})
+        self.assertEqual(request.io_kwargs, {"video": {"frame_count_limit": 8}})
+
+    def test_transcription_request_runtime_mm_kwargs(self):
+        request = TranscriptionRequest(
+            model="whisper",
+            processor_kwargs={"audio_kwargs": {"padding": "longest"}},
+            mm_process_config={"audio": {"sample_rate": 16000}},
+            io_kwargs={"audio": {"audio_sample_rate": 22050}},
+        )
+        self.assertEqual(
+            request.processor_kwargs, {"audio_kwargs": {"padding": "longest"}}
+        )
+        self.assertEqual(request.mm_process_config, {"audio": {"sample_rate": 16000}})
+        self.assertEqual(request.io_kwargs, {"audio": {"audio_sample_rate": 22050}})
 
 
 class TestFunctionDeferLoading(CustomTestCase):

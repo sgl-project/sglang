@@ -1393,13 +1393,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                    request_context = getattr(
+                        self.mm_processor, "request_context", None
                     )
+                    with (
+                        request_context(obj)
+                        if request_context is not None
+                        else nullcontext()
+                    ):
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=mm_processor_input,
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 get_disagg().language_only
                 and get_disagg().encoder_transfer_backend
@@ -1408,13 +1416,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                request_context = getattr(self.mm_processor, "request_context", None)
+                with (
+                    request_context(obj)
+                    if request_context is not None
+                    else nullcontext()
+                ):
+                    mm_inputs = await self.mm_processor.process_mm_data_async(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text=mm_processor_input,
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
