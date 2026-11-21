@@ -187,7 +187,7 @@ _FP32_ROUTER_MAX_TOKENS = 8
 
 @functools.lru_cache(maxsize=1)
 def _split_bf16_router_supported() -> bool:
-    return is_cuda() and get_device_capability()[0] == 9
+    return is_cuda() and get_device_capability()[0] in (9, 10)
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
