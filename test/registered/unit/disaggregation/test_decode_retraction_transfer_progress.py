@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase, enter_override
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -182,12 +183,14 @@ class _DecodeNode:
             last_batch=None,
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
+            penalty_status_pool=idle_penalty_status_pool(),
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             max_running_requests=ROWS,
             model_config=SimpleNamespace(
                 context_len=self.pool_size,
                 vocab_size=16,
+                token_id_vocab_size=16,
                 is_encoder_decoder=False,
                 is_multimodal=False,
                 num_key_value_heads=1,
@@ -212,6 +215,7 @@ class _DecodeNode:
             beam_coordinator=SimpleNamespace(retire_group=lambda req: None),
             hisparse_coordinator=None,
             uocr_runtime=None,
+            penalty_status_pool=s.penalty_status_pool,
             send_abort_output=lambda abort_req, req: None,
             stream_output=lambda *a, **k: None,
         )

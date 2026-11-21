@@ -105,6 +105,15 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
+    from sglang.srt.layers.quantization.unquant_hip import (
+        a16w16_into,
+        prefer_hipblaslt,
+    )
+
+_use_tlx_gemm = _is_gfx95 and envs.SGLANG_USE_TLX_GEMM.get()
+if _use_tlx_gemm:
+    from sglang.kernels.ops.gemm import tlx as tlx_gemm
+
 if _rowmajor_ok:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
         flydsl_gemm,
@@ -1011,6 +1020,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # _skip_aiter_unquant marks deterministic mode; the TLX plan also varies with M.
+        if (
+            _use_tlx_gemm
+            and bias is None
+            and not _skip_aiter_unquant
+            and type(layer.weight.data) is torch.Tensor
+            and tlx_gemm.mm_supported(x, layer.weight)
+        ):
+            return tlx_gemm.linear(x, layer.weight)
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1036,9 +1054,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             _use_aiter
+            and x.is_cuda
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
+            if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
+                return F.linear(x, layer.weight, bias)
             if (
                 _rowmajor_ok
                 and _is_gfx1250
@@ -1160,6 +1183,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)
