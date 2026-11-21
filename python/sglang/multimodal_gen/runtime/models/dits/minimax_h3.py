@@ -265,6 +265,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "rope_cache",
         "unique_timesteps",
         "adaln_cache_slot",
+        "adaln_timestep_bits",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -2544,7 +2545,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         cache.invalidate()
 
     def _adaln_memo_params(
-        self, adaln_input: torch.Tensor, unique_timesteps: torch.Tensor
+        self, adaln_input: torch.Tensor, timestep_bits: tuple[int, ...] | None
     ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
         """Per-block AdaLN parameters memoized by the step's exact timesteps.
 
@@ -2563,7 +2564,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         """
         max_entries = 32
         if (
-            self.adaln_cache is not None
+            timestep_bits is None
+            or self.adaln_cache is not None
             or get_tp_world_size() > 1
             or torch.compiler.is_compiling()
             # CUDA only: torch.cuda's capture query is a stub on other builds
@@ -2591,14 +2593,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             self.__dict__["_adaln_memo"] = memo
         entries = memo[1]
         key = (
-            tuple(
-                unique_timesteps.detach()
-                .view(-1)
-                .float()
-                .cpu()
-                .view(torch.int32)
-                .tolist()
-            ),
+            timestep_bits,
             tuple(adaln_input.shape),
             adaln_input.dtype,
             adaln_input.device,
@@ -3563,7 +3558,9 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     num_timesteps=adaln_input.shape[0],
                 )
             elif (
-                memo := self._adaln_memo_params(adaln_input, unique_timesteps)
+                memo := self._adaln_memo_params(
+                    adaln_input, kwargs.get("adaln_timestep_bits")
+                )
             ) is not None:
                 block_adaln_params = memo
             elif self._can_batch_block_adaln():
