@@ -313,6 +313,18 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
         _munlock_host_buffer(buffer)
 
 
+def host_buffer_is_one_pinned_range(buffer: torch.Tensor) -> bool:
+    """Whether a device copy may span any two rows of ``buffer``.
+
+    ``_cuda_host_register`` splits a large pool into several registrations, and
+    one copy must stay inside one of them.
+    """
+    # The registration record sits on the tensor the allocator returned.
+    root = buffer if buffer._base is None else buffer._base
+    registered_ranges = getattr(root, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+    return registered_ranges is None or len(registered_ranges) <= 1
+
+
 @lru_cache(maxsize=1)
 def _libc() -> ctypes.CDLL:
     lib = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
