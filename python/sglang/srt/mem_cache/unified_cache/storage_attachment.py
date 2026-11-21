@@ -200,6 +200,9 @@ class StorageAttachment:
             enable_storage_metrics=cache._enable_metrics_flag,
             extra_metric_labels=cache.extra_metric_labels,
         )
+        # Presence beliefs describe the previous backend; a retained positive
+        # would skip that page's backup to the new one forever.
+        cache.storage_existence_cache.clear()
         return True, "Attached HiCache storage backend successfully."
 
     def detach(self) -> tuple[bool, str]:

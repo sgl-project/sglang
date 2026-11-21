@@ -83,7 +83,6 @@ class ComfyUICheckpointSpec:
 _ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
 
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
-_SPECS_DISCOVERED = False
 
 
 # Per-layer comfy_quant formats verified on the H3 single-file path: Comfy-Org's
@@ -97,28 +96,11 @@ def register_comfyui_checkpoint(
     _SPEC_REGISTRY[pipeline_name] = spec
 
 
-def _discover_checkpoint_specs() -> None:
-    global _SPECS_DISCOVERED
-    if _SPECS_DISCOVERED:
-        return
-    _SPECS_DISCOVERED = True
-    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
-        flux,
-        ltx_2,
-        minimax_h3,
-        qwen_image,
-        qwen_image21,
-        zimage,
-    )
-
-
 def get_comfyui_checkpoint_spec(pipeline_name: str) -> ComfyUICheckpointSpec | None:
-    _discover_checkpoint_specs()
     return _SPEC_REGISTRY.get(pipeline_name)
 
 
 def get_registered_comfyui_pipeline_names() -> list[str]:
-    _discover_checkpoint_specs()
     return sorted(_SPEC_REGISTRY)
 
 

@@ -487,6 +487,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -722,6 +723,8 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -1068,6 +1071,16 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
+    # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_GEMM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: residual-stream boundaries that need no FP8 or router copy of their output run the
+    # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel,
+    # and the fused unpooler + FFN boundary (2-16 rows) runs the TLX mm before it. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_BOUNDARY_NORM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: FP32 MoE router logits outside the shared router + pooler front run the vendored
+    # tlx.ops.router_gemm (plain Triton) on an [E, K] copy of each router weight, 8 MiB per MoE layer.
+    SGLANG_USE_TLX_ROUTER_GEMM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
@@ -1564,6 +1577,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The CUDA target of a JIT module whose load_jit names no cuda_arch_policy:
+    # "specific" (the local GPU's arch-specific target, e.g. sm_103a) or
+    # "family" (its family target, e.g. sm_100f: one build for 10.0 and 10.3).
+    SGLANG_JIT_CUDA_ARCH_POLICY = EnvStr("specific")
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1831,7 +1848,7 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
-    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
@@ -1853,8 +1870,6 @@ class Envs:
     # Defer the TP gather of an unsoftcapped target-verify vocab shard. The DFLASH
     # sampled and megakernel accept paths defer it unless this is set to 0.
     SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
-    # Capture the megakernel post-verify tail as CUDA graphs.
-    SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH = EnvBool(False)
     # Split the DFLASH draft's context fc across TP by output columns.
     SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
@@ -2054,6 +2069,7 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
@@ -2163,11 +2179,15 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Use the shared FP8 scorer and ragged top-k for Hopper prefill candidates.
+    SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2250,6 +2270,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
@@ -2299,6 +2322,22 @@ class Envs:
     # directive is always emitted.
     SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    # MTP verify attention up to 64 tokens through the split-KV relative-bias
+    # decode kernel, all draft tokens of a sequence in one launch; changes the
+    # softmax reduction order.
+    SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
+    # Decode and MTP verify attention all-reduce through the push all-reduce
+    # (rank-order FP32 sum) instead of the multimem one-shot.
+    SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
+    # the FP32 token sums.
+    SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
+    # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
+    # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
+    SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
@@ -2517,12 +2556,11 @@ class Envs:
     # Gemma 4
     # ===================================================================
     # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
-    # quant of the dense layer stack as one NVLS kernel per site, for extend
-    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
-    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
-    # srt/layers/communication/gemma4_ar_fusion.py).
+    # quant of the dense layer stack as one NVLS kernel per site, for extend,
+    # mixed and decode batches of up to MAX tokens (SM90 with NVLink multicast,
+    # block-FP8 weights). MAX also sizes the symmetric buffers; keep it at least
+    # the chunked prefill size so every prefill chunk is fused.
     SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
-    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
     SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
 
     # ===================================================================
