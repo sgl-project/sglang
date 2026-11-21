@@ -65,6 +65,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -76,7 +77,6 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import current_device_stream
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -1587,7 +1587,7 @@ class MMEncoder:
                 offset += num_tokens
 
             if is_epd_accelerator(self.device):
-                current_device_stream(self.device).synchronize()
+                current_platform.synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1638,7 +1638,7 @@ class MMEncoder:
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
         if is_epd_accelerator(mm_embedding.device):
-            current_device_stream(mm_embedding.device).synchronize()
+            current_platform.synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -2210,7 +2210,7 @@ class MMEncoder:
             # transfer_sync bypasses device streams, so device writes (forward and
             # the per-request clones) must land before /send reads the buffers.
             if keep_on_gpu and is_epd_accelerator(mm_embedding.device):
-                current_device_stream(mm_embedding.device).synchronize()
+                current_platform.synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
         except BaseException:
