@@ -110,6 +110,7 @@ def _detokenizer(capacity=16):
     detok.disable_tokenizer_batch_decode = False
     detok.is_tool_call_parser_gpt_oss = False
     detok.tool_close_token_ids = frozenset()
+    detok.enable_trace = False
     return detok
 
 
@@ -276,6 +277,19 @@ class TestDetokenizeState(CustomTestCase):
         delivered = _deliver(detok, outputs)
 
         self.assertEqual(delivered, [("worker-a", "r", "3.", True)])
+
+    def test_a_batch_carries_its_detokenize_duration_only_when_tracing(self):
+        detok = _detokenizer()
+        sent = {}
+
+        out = detok.handle_batch_token_id_out(
+            _output(sent, [("r", [3], _header([1]), False)])
+        )
+        self.assertIsNone(out.detokenize_duration)
+
+        detok.enable_trace = True
+        out = detok.handle_batch_token_id_out(_output(sent, [("r", [4], None, True)]))
+        self.assertGreater(out.detokenize_duration, 0.0)
 
     def test_header_prompt_tail_is_clamped_to_the_vocab(self):
         """Multimodal placeholder ids in the prompt tail decode as 0."""
