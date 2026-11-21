@@ -189,6 +189,9 @@ class DemandPurpose(enum.Enum):
     LOAD_BACK = "load_back"
     # A decode node's preallocation of a transferred request.
     DECODE_PREALLOC = "decode_prealloc"
+    # What a running request may still add as it decodes, which each
+    # admission pass commits beside the requests it admits.
+    RUNNING = "running"
 
 
 class StateSlots(enum.Enum):
@@ -208,6 +211,9 @@ class DemandRule(msgspec.Struct, frozen=True, kw_only=True):
     # Whether evictable cached entries count as room. A load-back reclaims
     # first and asks what is free then; a ceiling asks an empty pool.
     credits_evictable: bool
+    # Whether the request still has a prompt to place, whose chunks window
+    # retirement lags (``prefill_retire_lag``); a running request has none.
+    prefills: bool = True
 
 
 DEMAND_RULES: Mapping[DemandPurpose, DemandRule] = {
@@ -230,6 +236,12 @@ DEMAND_RULES: Mapping[DemandPurpose, DemandRule] = {
         estimates_decode=True,
         state_slots=StateSlots.PENDING,
         credits_evictable=True,
+    ),
+    DemandPurpose.RUNNING: DemandRule(
+        estimates_decode=True,
+        state_slots=StateSlots.PENDING,
+        credits_evictable=True,
+        prefills=False,
     ),
 }
 
@@ -365,6 +377,10 @@ def demand_inputs(
     rule = DEMAND_RULES[purpose]
     if purpose is DemandPurpose.CEILING and (cached_tokens or host_hit_lengths):
         raise ValueError("a ceiling prices a request with nothing cached")
+    if not rule.prefills:
+        if input_tokens:
+            raise ValueError(f"a {purpose.value} request has no prompt left to place")
+        prefill_retire_lag = 0
     if rule.estimates_decode:
         max_new_tokens = decode_estimate_tokens(max_new_tokens)
     return DemandInputs(
