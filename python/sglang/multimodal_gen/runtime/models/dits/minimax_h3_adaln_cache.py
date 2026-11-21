@@ -103,6 +103,16 @@ class MiniMaxH3AdalnCacheStats(msgspec.Struct):
     host_evicted_groups: int = 0
     host_pressure_skips: int = 0
 
+    def snapshot(self) -> dict[str, int]:
+        """Copy local cumulative counters without touching device state."""
+        return {
+            "gpu_hit_plans": self.gpu_hit_plans,
+            "host_hit_plans": self.host_hit_plans,
+            "built_plans": self.built_plans,
+            "host_evicted_groups": self.host_evicted_groups,
+            "host_pressure_skips": self.host_pressure_skips,
+        }
+
 
 class _HostPlan(msgspec.Struct):
     pages: list[int]
