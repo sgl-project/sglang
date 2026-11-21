@@ -64,7 +64,16 @@ def _request_quality_is_exact() -> bool:
     # Split versus unsplit flash only moves rounding, which "lossless" allows;
     # the slower unsplit kernel is reserved for "exact" requests.
     context = get_forward_context_or_none()
-    return context is not None and context.quality == "exact"
+    if context is None:
+        return False
+    # Many stages pass forward_batch without quality=; the request's own tier wins.
+    batch = context.forward_batch
+    quality = (
+        batch.sampling_params.quality
+        if batch is not None and batch.sampling_params is not None
+        else context.quality
+    )
+    return not quality_allows(quality, "lossless")
 
 
 def torch_default_sdpa_backends():

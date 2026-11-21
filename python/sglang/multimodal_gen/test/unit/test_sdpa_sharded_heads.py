@@ -7,6 +7,7 @@ the per-shard outputs must then equal the unsharded output bit for bit.
 The padding serves "exact" quality requests only."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -124,6 +125,20 @@ class TestSDPAShardedHeads(CustomTestCase):
         with self.subTest("lossless request"), _request("lossless"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
+        # Stages that pass forward_batch without quality= keep the context default
+        # "exact"; the request's own tier must still decide.
+        for quality, expect_padding in (("lossless", False), ("exact", True)):
+            request = set_forward_context(
+                current_timestep=0,
+                attn_metadata=None,
+                forward_batch=SimpleNamespace(
+                    sampling_params=SimpleNamespace(quality=quality)
+                ),
+            )
+            with self.subTest(f"{quality} request via forward_batch"), request:
+                impl = _impl(heads=6, global_num_heads=24)
+                padded = impl._unsplit_query_len(query, 1025) > 1025
+                self.assertEqual(padded, expect_padding)
         with (
             self.subTest("no forward context"),
             patch.object(forward_context, "_forward_context", None),

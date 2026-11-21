@@ -1299,9 +1299,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
         # multiview attention layout and temporal wrap period).
         self._extra_transformer_kwargs: dict[str, Any] = {}
-        # The running request's quality tier, which attention reads from the
-        # forward context that ``_run_transformer`` opens.
-        self._request_quality = "exact"
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1415,11 +1412,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
-        with set_forward_context(
-            current_timestep=current_timestep,
-            attn_metadata=None,
-            quality=self._request_quality,
-        ):
+        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -1661,7 +1654,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         self._extra_transformer_kwargs = dict(
             batch.extra.get("transformer_extra_kwargs") or {}
         )
-        self._request_quality = batch.sampling_params.quality
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)

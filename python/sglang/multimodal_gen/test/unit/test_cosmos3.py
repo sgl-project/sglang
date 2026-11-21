@@ -59,7 +59,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
     SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3OmniTransformer,
     DomainAwareLinear,
@@ -2063,7 +2062,6 @@ class TestCosmos3CfgParallelUndCache(unittest.TestCase):
             sampling_params=types.SimpleNamespace(
                 guidance_interval=guidance_interval,
                 control_guidance=control_guidance,
-                quality="exact",
             ),
             extra={
                 "cond_text_ids": text,
@@ -2430,31 +2428,6 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
 
         self.assertEqual(tuple(captured["timestep"].shape), (6,))
         self.assertEqual(tuple(output.shape), tuple(latents.shape))
-
-    def test_run_transformer_carries_request_quality(self):
-        """The transformer's forward context carries the request's quality tier,
-        which quality-gated attention paths read."""
-        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
-        stage._extra_transformer_kwargs = {}
-        stage._share_vision_temporal_positions = True
-        seen = []
-
-        def fake_transformer(**kwargs):
-            seen.append(get_forward_context().quality)
-            return kwargs["hidden_states"]
-
-        stage.transformer = fake_transformer
-        for quality in ("exact", "lossless"):
-            stage._request_quality = quality
-            stage._run_transformer(
-                latents=torch.zeros(1),
-                timestep=torch.ones(1),
-                text_ids=torch.ones(1, 4, dtype=torch.long),
-                text_mask=torch.ones(1, 4, dtype=torch.long),
-                video_shape=(1, 1, 1),
-                fps=20.0,
-            )
-        self.assertEqual(seen, ["exact", "lossless"])
 
     def test_visual_i2v_keeps_single_conditioning_image(self):
         seen, image = self._preprocess_images(DataType.VIDEO)
