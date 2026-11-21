@@ -679,6 +679,9 @@ class Envs:
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
+    # ROCm + aiter: replay prefix extends (cache hits, chunked-prefill continuations)
+    # under breakable prefill graphs for models with MHA companion layers.
+    SGLANG_ROCM_BCG_PREFIX_EXTEND = EnvBool(False)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so
     # gfx950 fp8 hd256 takes aiter's paged-varlen asm kernel. That kernel is
     # compiled for 4D LINEAR [N, 64, H, D], so it serves --page-size 64 and
