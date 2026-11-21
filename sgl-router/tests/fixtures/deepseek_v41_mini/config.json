@@ -1,0 +1,6 @@
+{
+  "model_type": "deepseek_v41",
+  "architectures": [
+    "DeepseekV41ForCausalLM"
+  ]
+}
