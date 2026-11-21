@@ -5,12 +5,18 @@ export const config = (() => {
     })[s.checkpoint || "default"];
   const plan = (s) => {
     const flags = ["--model-path " + modelOf(s), ...["--port {{PORT}}"]];
-    let gpus = 1;
+    const gpus = Number(s.gpus_per_node);
     let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
     const env = [];
     const warnings = [];
     const errors = [];
-    if (s.batching === "on") flags.push("--batching-max-size 2", "--batching-delay-ms 100");
+    if (gpus === 2) {
+      flags.push("--num-gpus 2", "--enable-cfg-parallel");
+      warnings.push(
+        "CFG parallelism runs one guidance branch per GPU; requests with guidance_scale 1 compute the same branch on both GPUs.",
+      );
+      if (s.batching === "on") errors.push("Dynamic batching does not support CFG parallelism yet; use one GPU.");
+    } else if (s.batching === "on") flags.push("--batching-max-size 2", "--batching-delay-ms 100");
     return { flags, gpus, topology: t, env, warnings, errors };
   };
   const defaults = {
@@ -44,7 +50,7 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 1 } },
+        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
         verifiedRecipes: ["cuda"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
@@ -64,7 +70,7 @@ export const config = (() => {
           if (!config.supportedHardware.includes(s.hw)) errors.push("Choose a listed hardware platform.");
           if (Number(s.nodes) !== 1) errors.push("This recipe covers one node.");
           const count = Number(s.gpus_per_node);
-          if (!Number.isInteger(count) || count < 1 || count > 1)
+          if (!Number.isInteger(count) || count < 1 || count > 2)
             errors.push("Choose an integer GPU count within the documented limits.");
           if (Number(s.gpus_per_node) !== p.gpus) errors.push("This recipe requires " + p.gpus + " GPUs / node.");
           if (["tp_size", "ulysses_degree", "ring_degree"].some((key) => Number(t[key]) !== p.topology[key]))
