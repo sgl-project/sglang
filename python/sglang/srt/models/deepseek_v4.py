@@ -1020,6 +1020,9 @@ class MqaAttentionBase(nn.Module):
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
     use_mega_attention: bool = False
+    # ROCm q_norm state, read by _normalize_q_lora through _hip.q_norm_for_wq_b.
+    # __init__ resolves it from the quant config on HIP.
+    fused_rmsnorm_fake_quant: bool = False
 
     def __init__(
         self,
@@ -1056,6 +1059,12 @@ class MqaAttentionBase(nn.Module):
         self.eps = config.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
         self.q_head_norm = config.q_head_norm
+
+        # _normalize_q_lora below is this base's, and on HIP it reads the state that
+        # init_mqa_layer resolves. Every subclass goes through it -- DSparkAttention
+        # among them -- so the state is initialised here rather than in MQALayer.
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
         self.compress_ratio: int = (
             compress_ratio
@@ -1607,9 +1616,6 @@ class MQALayer(MqaAttentionBase):
             and self.qk_rope_head_dim == 64
             and self.head_dim == 512
         )
-        if _is_hip:
-            _hip.init_mqa_layer(self, quant_config)
-
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
@@ -3944,8 +3950,9 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
-    # Class-level default for instances built without running __init__.
+    # Class-level defaults for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    engram_kv_stream = None
 
     def __init__(
         self,
