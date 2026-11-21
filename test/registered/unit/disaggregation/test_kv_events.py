@@ -141,8 +141,72 @@ class TestResolveLoadPubRange(CustomTestCase):
                 self.assertIn("--kv-events-config", no_cfg)
 
 
+# Pinned copies of vLLM's KV event types (vllm/distributed/kv_events.py, vLLM
+# main at bca3871c5a); SGLang CI cannot import vLLM. medium and lora_name are
+# required there, so SGLang must always send them.
+class _VllmKVEvent(msgspec.Struct, omit_defaults=True, gc=False, tag=True):
+    pass
+
+
+class _VllmBlockStored(_VllmKVEvent, tag="BlockStored"):
+    block_hashes: list[int]
+    parent_block_hash: int | None
+    token_ids: list[int]
+    block_size: int
+    lora_id: int | None
+    medium: str | None
+    lora_name: str | None
+    cache_salt: str | None = None
+
+
+class _VllmBlockRemoved(_VllmKVEvent, tag="BlockRemoved"):
+    block_hashes: list[int]
+    medium: str | None
+
+
+class _VllmAllBlocksCleared(_VllmKVEvent, tag="AllBlocksCleared"):
+    pass
+
+
+class _VllmKVEventBatch(msgspec.Struct, array_like=True, gc=False):
+    ts: float
+    events: list[_VllmBlockStored | _VllmBlockRemoved | _VllmAllBlocksCleared]
+    data_parallel_rank: int | None = None
+
+
 class TestBlockStoredWireFormat(CustomTestCase):
-    def _event(self, **extra):
+    def test_vllm_typed_decoder_reads_sglang_events(self):
+        batch = KVEventBatch(
+            ts=1.0,
+            events=[
+                self._event(),
+                self._event(lora_name="adapter-a"),
+                self._event(cache_salt="tenant-a"),
+                BlockRemoved(block_hashes=[123], medium=StorageMedium.GPU),
+                AllBlocksCleared(),
+            ],
+            attn_dp_rank=3,
+        )
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(batch), type=_VllmKVEventBatch
+        )
+        stored = decoded.events[:3]
+        self.assertEqual([e.lora_name for e in stored], [None, "adapter-a", None])
+        self.assertEqual({e.medium for e in stored}, {"GPU"})
+        self.assertIsInstance(decoded.events[3], _VllmBlockRemoved)
+        self.assertIsInstance(decoded.events[4], _VllmAllBlocksCleared)
+        # attn_dp_rank is vLLM's data_parallel_rank: same positional slot.
+        self.assertEqual(decoded.data_parallel_rank, 3)
+
+    def test_required_fields_sent_and_optional_omitted(self):
+        wire = msgspec.msgpack.decode(msgspec.msgpack.encode(self._event()))
+        self.assertIn("lora_name", wire)
+        self.assertIsNone(wire["lora_name"])
+        self.assertEqual(wire["medium"], "GPU")
+        for key in ("cache_salt", "session_id", "mm_routing_spans"):
+            self.assertNotIn(key, wire)
+
+    def _event(self, lora_name=None, **extra):
         return BlockStored(
             block_hashes=[123],
             parent_block_hash=None,
@@ -150,6 +214,7 @@ class TestBlockStoredWireFormat(CustomTestCase):
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
+            lora_name=lora_name,
             **extra,
         )
 
