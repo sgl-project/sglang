@@ -15,7 +15,8 @@ discovers engines from a static URL list or Kubernetes EndpointSlices.
 - [Add a new policy](#add-a-new-policy)
 - [Other features](#other-features)
 
-Related docs: [ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
+Related docs: [MIGRATION.md](MIGRATION.md) (upgrading from `sgl-model-gateway`),
+[ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
 configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
 [monitoring/README.md](monitoring/README.md) (metrics and
 Grafana), [BENCHMARKS.md](BENCHMARKS.md),
