@@ -1,6 +1,8 @@
 //! Multimodal preprocessing over `dynamo-multimodal`.
 
+use dynamo_multimodal::audio::decode::{DecodeLimits as AudioDecodeLimits, decode_wav_pcm16};
 use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
+use dynamo_multimodal::models::qwen3_asr::MAX_SAMPLES;
 use dynamo_multimodal::processor::{
     DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
 };
@@ -12,7 +14,7 @@ use crate::ProcessorError;
 /// PIL raises `DecompressionBombError` above twice its default `MAX_IMAGE_PIXELS`.
 const PIL_DECOMPRESSION_BOMB_PIXELS: usize = 2 * 89_478_485;
 
-/// One model's image pipeline, resolved once at boot and shared by every request.
+/// One model's media pipeline, resolved once at boot and shared by every request.
 pub struct MmProcessor {
     family: Box<dyn MmFamilyProcessor>,
     limits: DecodeLimits,
@@ -22,7 +24,7 @@ pub struct MmProcessor {
 pub struct MmOutput {
     /// The prompt with each placeholder expanded to its item's feature tokens.
     pub input_ids: Vec<i32>,
-    /// One per image, in prompt order.
+    /// One per media item, in prompt order.
     pub items: Vec<MmOutputItem>,
     /// Inclusive token range of each item, as Python's `get_mm_items_offset`.
     pub offsets: Vec<(u32, u32)>,
@@ -66,7 +68,33 @@ impl MmProcessor {
             .iter()
             .map(|bytes| self.process_image(bytes))
             .collect::<Result<Vec<_>, _>>()?;
+        self.finish(input_ids, items, hashes)
+    }
 
+    /// Process one PCM16 WAV through the selected shared audio family.
+    pub fn process_audio(
+        &self,
+        input_ids: &[i32],
+        bytes: &[u8],
+    ) -> Result<MmOutput, ProcessorError> {
+        let decoded = decode_wav_pcm16(
+            bytes,
+            &AudioDecodeLimits {
+                max_bytes: 1024 * 1024,
+                max_frames: MAX_SAMPLES,
+            },
+        )
+        .map_err(mm_error)?;
+        let item = self.family.process_item(&decoded).map_err(mm_error)?;
+        self.finish(input_ids, vec![item], vec![content_hash_bytes(bytes)])
+    }
+
+    fn finish(
+        &self,
+        input_ids: &[i32],
+        items: Vec<ProcessedItem>,
+        hashes: Vec<u64>,
+    ) -> Result<MmOutput, ProcessorError> {
         let layout = self.family.layout(input_ids, &items).map_err(mm_error)?;
         let token_counts: Vec<usize> = items.iter().map(|item| item.feature_token_count).collect();
         let expanded = token_layout::apply_layout(input_ids, &layout, &token_counts, usize::MAX)
