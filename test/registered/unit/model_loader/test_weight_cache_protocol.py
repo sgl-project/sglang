@@ -5,6 +5,7 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
+  - protocol version checks before config or weight transfer
   - CacheConfig compatibility matching / (de)serialization
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
@@ -20,22 +21,29 @@ in any of these branches before it reaches the expensive GPU path.
 import os
 import socket
 import struct
+import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weight_cache.protocol import (
+    PROTOCOL_VERSION,
     CacheConfig,
+    ProtocolVersionError,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
+    check_protocol_version,
     cleanup_stale_daemon_files,
     compute_global_rank,
     compute_local_gpu_id,
     get_quant_method_name,
     get_ready_path,
     get_socket_path,
+    handshake_with_daemon,
     hash_quant_config,
     is_ipc_quant_supported,
     recv_msg,
@@ -160,6 +168,199 @@ class TestTransportBackend(CustomTestCase):
         finally:
             a.close()
             b.close()
+
+
+class TestProtocolVersion(CustomTestCase):
+    def _socket_pair(self):
+        client, daemon = socket.socketpair()
+        client.settimeout(5)
+        daemon.settimeout(5)
+        return client, daemon
+
+    def test_requires_the_same_integer_version(self):
+        check_protocol_version(PROTOCOL_VERSION)
+        for version in (None, 0, PROTOCOL_VERSION + 1, "1", True, 1.0):
+            with self.subTest(version=version):
+                with self.assertRaises(ProtocolVersionError):
+                    check_protocol_version(version)
+
+    def test_client_rejects_an_unversioned_daemon(self):
+        client, daemon = self._socket_pair()
+        with client, daemon:
+            # The old daemon replies to an unknown request, then closes.
+            send_msg(
+                daemon,
+                {"status": "error", "message": "Unknown request type: handshake"},
+            )
+            with self.assertRaises(ProtocolVersionError):
+                handshake_with_daemon(client)
+            self.assertEqual(
+                recv_msg(daemon),
+                {"type": "handshake", "protocol_version": PROTOCOL_VERSION},
+            )
+
+    def test_client_checks_daemon_version_even_on_ok(self):
+        for version in (None, 0, PROTOCOL_VERSION + 1, "1", True, 1.0):
+            with self.subTest(version=version):
+                client, daemon = self._socket_pair()
+                with client, daemon:
+                    send_msg(daemon, {"status": "ok", "protocol_version": version})
+                    with self.assertRaises(ProtocolVersionError):
+                        handshake_with_daemon(client)
+
+    def test_client_does_not_accept_a_failed_handshake(self):
+        client, daemon = self._socket_pair()
+        with client, daemon:
+            send_msg(
+                daemon,
+                {
+                    "status": "error",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "message": "Daemon is not ready",
+                },
+            )
+            with self.assertRaises(RuntimeError):
+                handshake_with_daemon(client)
+
+
+class TestDaemonProtocolVersion(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+
+        # Test the real socket handler without model or GPU setup.
+        self.daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        self.daemon.gpu_id = 0
+        self.daemon.config = _make_cache_config()
+        self.daemon.state_entries = {}
+        self.daemon.preloaded_weights_bytes = 0
+        backend = TorchIpcTransportBackend()
+        self.daemon.transport_backend = SimpleNamespace(
+            name=backend.name,
+            send_fetch_state_response=mock.Mock(
+                side_effect=backend.send_fetch_state_response
+            ),
+        )
+
+    def _exchange(self, request):
+        client, server = socket.socketpair()
+        with client, server:
+            client.settimeout(5)
+            server.settimeout(5)
+            send_msg(client, request)
+            self.daemon._handle_connection(server)
+            return recv_msg(client)
+
+    def _fetch_after_handshake(self, version):
+        client, server = socket.socketpair()
+        with client, server, ThreadPoolExecutor(max_workers=1) as executor:
+            client.settimeout(5)
+            server.settimeout(5)
+            handler = executor.submit(self.daemon._handle_connection, server)
+            handshake_with_daemon(client)
+            send_msg(
+                client,
+                {
+                    "type": "fetch_state",
+                    "protocol_version": version,
+                    "config": self.daemon.config.to_dict(),
+                },
+            )
+            response = recv_msg(client)
+            handler.result(timeout=5)
+            return response
+
+    def test_matching_handshake_and_fetch_share_one_connection(self):
+        response = self._fetch_after_handshake(PROTOCOL_VERSION)
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["config"], self.daemon.config.to_dict())
+        self.assertEqual(response["entries"], {})
+        self.daemon.transport_backend.send_fetch_state_response.assert_called_once()
+
+    def test_loader_fetches_from_the_daemon(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache import ipc_loader
+
+        config = self.daemon.config
+        model_config = SimpleNamespace(
+            model_path=config.model_path,
+            hf_config=SimpleNamespace(
+                architectures=[config.model_arch], quantization_config=None
+            ),
+            quantization=None,
+            revision=None,
+            dtype=config.dtype,
+        )
+        parallel = SimpleNamespace(**config.to_dict(), moe_ep_size=config.ep_size)
+        execution = SimpleNamespace(
+            moe=SimpleNamespace(moe_a2a_backend=config.moe_a2a_backend)
+        )
+        env_stamp = {
+            "device_capability": config.device_capability,
+            "torch_version": config.torch_version,
+        }
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
+        ):
+            socket_path = os.path.join(tmpdir, "daemon.sock")
+            listener.settimeout(5)
+            listener.bind(socket_path)
+            listener.listen(1)
+
+            def serve_client():
+                conn, _ = listener.accept()
+                with conn:
+                    conn.settimeout(5)
+                    self.daemon._handle_connection(conn)
+
+            loader = ipc_loader.IpcModelLoader(
+                load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+                socket_path=socket_path,
+            )
+            with (
+                ThreadPoolExecutor(max_workers=1) as executor,
+                mock.patch.multiple(
+                    ipc_loader,
+                    get_parallel=mock.Mock(return_value=parallel),
+                    get_exec=mock.Mock(return_value=execution),
+                    compute_env_stamp=mock.Mock(return_value=env_stamp),
+                ),
+            ):
+                daemon = executor.submit(serve_client)
+                response = loader._fetch_from_cache(model_config, device_config=None)
+                daemon.result(timeout=5)
+        self.assertEqual(response["config"], config.to_dict())
+        self.assertEqual(response["transport_backend"], TORCH_IPC_BACKEND)
+        self.daemon.transport_backend.send_fetch_state_response.assert_called_once()
+
+    def test_invalid_client_version_is_rejected_before_config_parse(self):
+        for request_type in ("handshake", "fetch_state"):
+            for version in (None, 0, PROTOCOL_VERSION + 1, "1", True, 1.0):
+                with self.subTest(request_type=request_type, version=version):
+                    # No config: a version check after config access would fail.
+                    request = {"type": request_type}
+                    if version is not None:
+                        request["protocol_version"] = version
+                    response = self._exchange(request)
+                    self.assertEqual(response["status"], "protocol_mismatch")
+                    self.assertEqual(response["protocol_version"], PROTOCOL_VERSION)
+        self.daemon.transport_backend.send_fetch_state_response.assert_not_called()
+
+    def test_fetch_cannot_change_version_after_handshake(self):
+        response = self._fetch_after_handshake(PROTOCOL_VERSION + 1)
+        self.assertEqual(response["status"], "protocol_mismatch")
+        self.daemon.transport_backend.send_fetch_state_response.assert_not_called()
+
+    def test_health_requests_still_work_after_a_rejected_client(self):
+        self.assertEqual(
+            self._exchange({"type": "fetch_state"})["status"], "protocol_mismatch"
+        )
+        self.assertEqual(self._exchange({"type": "ping"})["status"], "ok")
+        response = self._exchange({"type": "query_config"})
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["config"], self.daemon.config.to_dict())
+        self.daemon.transport_backend.send_fetch_state_response.assert_not_called()
 
 
 class TestCacheConfig(CustomTestCase):
@@ -514,6 +715,48 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
             )
         get_uuid.assert_called_once_with(5)
         self.assertIsNone(result)  # no real daemon at that socket -> absent
+
+    def test_old_daemon_does_not_trigger_a_disk_fallback(self):
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        def reply_as_old_daemon(listener):
+            conn, _ = listener.accept()
+            with conn:
+                conn.settimeout(5)
+                self.assertEqual(recv_msg(conn)["type"], "handshake")
+                send_msg(
+                    conn,
+                    {"status": "error", "message": "Unknown request type: handshake"},
+                )
+
+        for mode in ("client", "daemon"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmpdir:
+                socket_path = os.path.join(tmpdir, "daemon.sock")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.settimeout(5)
+                    listener.bind(socket_path)
+                    listener.listen(1)
+                    loader = IpcModelLoader(
+                        load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
+                        socket_path=socket_path,
+                        weight_cache_mode=mode,
+                    )
+                    with (
+                        ThreadPoolExecutor(max_workers=1) as executor,
+                        mock.patch.object(loader, "_fallback_load") as fallback,
+                        mock.patch(
+                            "sglang.srt.weight_cache.ipc_loader.get_parallel"
+                        ) as get_parallel,
+                    ):
+                        daemon = executor.submit(reply_as_old_daemon, listener)
+                        with self.assertRaises(ProtocolVersionError):
+                            loader.load_model(
+                                model_config=self._model_config(), device_config=None
+                            )
+                        daemon.result(timeout=5)
+                    fallback.assert_not_called()
+                    get_parallel.assert_not_called()
 
 
 if __name__ == "__main__":
