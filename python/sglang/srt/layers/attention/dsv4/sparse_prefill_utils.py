@@ -86,8 +86,9 @@ class SparsePrefillKVBuffer:
     extent is needed.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, dim: int = WORKSPACE_DIM):
         self.device = device
+        self.dim = dim
         self._buffer: Optional[torch.Tensor] = None
         self._head_source: Optional[tuple] = None
 
@@ -118,7 +119,7 @@ class SparsePrefillKVBuffer:
         current_dtype = self._buffer.dtype if self._buffer is not None else None
         if num_tokens > current_capacity or dtype != current_dtype:
             self._buffer = torch.empty(
-                (num_tokens, 1, WORKSPACE_DIM),
+                (num_tokens, 1, self.dim),
                 dtype=dtype,
                 device=self.device,
             )

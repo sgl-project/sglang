@@ -314,7 +314,8 @@ def fused_k_norm_rope_flashmla(
     q: Optional[torch.Tensor] = None,
 ) -> None:
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
-    cache at ``out_loc``."""
+    cache at ``out_loc``. ``q`` (ROCm): the same tokens' query heads [B, H, head_dim],
+    or their RoPE dims alone [B, H, rope_dim], roped in place by the same launch."""
     layout = KVLayout.parse(layout)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
