@@ -686,6 +686,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if processor.__class__.__name__ in {
+                "Apertus1p5Processor",
                 "Gemma3nProcessor",
                 "Gemma4Processor",
                 "Gemma4UnifiedProcessor",
