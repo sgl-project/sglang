@@ -188,6 +188,7 @@ class _DecodeNode:
             model_config=SimpleNamespace(
                 context_len=self.pool_size,
                 vocab_size=16,
+                token_id_vocab_size=16,
                 is_encoder_decoder=False,
                 is_multimodal=False,
                 num_key_value_heads=1,

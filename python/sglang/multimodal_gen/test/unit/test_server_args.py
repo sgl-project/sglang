@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
@@ -181,6 +184,35 @@ class TestExplicitCliArgs(unittest.TestCase):
                 self.assertEqual(
                     ServerArgs.get_provided_args(parsed, unknown), {field: value}
                 )
+
+    def test_abbreviated_flags_keep_their_value(self):
+        """argparse accepts an unambiguous prefix of a flag (--tp 2 sets tp_size);
+        the value must count as provided instead of being dropped for the default."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--tp", "2"], "tp_size", 2),
+            (["--num-gpu=4"], "num_gpus", 4),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(getattr(parsed, field), value)
+                self.assertEqual(unknown, [])
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+    def test_full_flag_registered_later_is_not_taken_for_an_abbreviation(self):
+        """A flag another module adds to the same parser is matched exactly by
+        argparse; it must not be resolved to a server flag it happens to prefix."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.add_argument("--tp", type=int)
+        argv = ["--tp", "2"]
+        with patch.object(sys, "argv", ["sglang", *argv]):
+            parsed, unknown = parser.parse_known_args(argv)
+            self.assertIsNone(parsed.tp_size)
+            self.assertEqual(ServerArgs.get_provided_args(parsed, unknown), {"tp": 2})
 
 
 class _CudaPlatformTestCase(unittest.TestCase):
@@ -1261,6 +1293,119 @@ class TestMiniMaxH3Routing(unittest.TestCase):
                 args._adjust_attention_backend()
                 self.assertEqual(args.component_attention_backends, components)
                 self.assertEqual(args.component_attention_backend_roles, roles)
+
+    def _routing_args(self, kwargs):
+        # These tests cover ServerArgs routing, not device/backend validation.
+        # This helper mocks CUDA; Ascend sparse attention is NPU-only.
+        with patch.object(
+            MiniMaxH3PipelineConfig, "validate_server_args", return_value=None
+        ):
+            return _from_dict_without_model_resolution(
+                kwargs,
+                pipeline_config=MiniMaxH3PipelineConfig(),
+            )
+
+    def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
+        for backend in ("laser_attn", "ascend_sparse_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "torch_sdpa"},
+                )
+                self.assertIsNone(
+                    args.requested_component_attention_backend("text_encoder")
+                )
+
+    def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
+        for backend in ("laser_attn", "ascend_sparse_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                        "component_attention_backends": {"text_encoder": "fa"},
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "fa"},
+                )
+                self.assertEqual(
+                    args.requested_component_attention_backend("text_encoder"), "fa"
+                )
+
+    def test_ascend_sparse_native_config_is_preserved(self):
+        configs = (
+            {"sparse_type": "rf_v2", "precision": "bf16", "block_size": 128},
+            {"sparse_type": "ada_bsa", "keep_sink": False, "cdf_threshold": 0.9},
+            {"sparse_type": "rf_v3", "precision": "mix", "block_size": 128},
+            {"sparse_type": "rf_v3", "precision": "mxfp4", "block_size": 256},
+            {
+                "dense_kwargs": {"precision": "mxfp8", "pre_tokens": 2147483647},
+            },
+        )
+        for config in configs:
+            with self.subTest(config=config):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": "ascend_sparse_attn",
+                        "attention_backend_config": config,
+                    }
+                )
+                self.assertEqual(dict(args.attention_backend_config), config)
+
+    def test_component_ascend_sparse_keeps_native_config(self):
+        config = {"sparse_type": "rf_v2", "precision": "bf16", "block_size": 256}
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "fa",
+                "component_attention_backends": {"transformer": "ascend_sparse_attn"},
+                "attention_backend_config": config,
+            }
+        )
+        self.assertEqual(dict(args.attention_backend_config), config)
+        self.assertEqual(
+            args.component_attention_backends["transformer"], "ascend_sparse_attn"
+        )
+
+    def test_ascend_sparse_dense_tail_config_is_preserved(self):
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "ascend_sparse_attn",
+                "attention_backend_config": {"skip_last_steps": 3},
+            }
+        )
+        self.assertEqual(args.attention_backend_config["skip_last_steps"], 3)
+
+    def test_ascend_sparse_migration_aliases_are_preserved_for_metadata(self):
+        config = {"dense_last_steps": 3, "dense_precision": "fp8"}
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "ascend_sparse_attn",
+                "attention_backend_config": config,
+            }
+        )
+        self.assertEqual(dict(args.attention_backend_config), config)
 
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
@@ -3099,19 +3244,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
-                "num_gpus": 2,
-                "performance_mode": "auto",
-            },
-        )
+        # num_gpus counts every node, but each node probes only its own GPUs;
+        # probing past them fails with an invalid device id on node rank > 0.
+        multi_node = {
+            "num_gpus": 4,
+            "nnodes": 2,
+            "node_rank": 1,
+            "dist_init_addr": "127.0.0.1:5000",
+        }
+        for nodes_kwargs in ({"num_gpus": 2}, multi_node):
+            with self.subTest(**nodes_kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    available_memory_gb={1: 50, 2: 80},
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "base_gpu_id": 1,
+                        "performance_mode": "auto",
+                        **nodes_kwargs,
+                    },
+                )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
@@ -3998,6 +4153,28 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+    def test_enable_torch_compile_reaches_server_args_for_joy_image_edit(self):
+        """A pipeline config attribute named like a server flag takes the value
+        and removes it from the server args, so the flag does nothing."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+            "--enable-torch-compile",
+            "true",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertIsInstance(server_args.pipeline_config, JoyImageEditPipelineConfig)
+        self.assertTrue(server_args.enable_torch_compile)
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):

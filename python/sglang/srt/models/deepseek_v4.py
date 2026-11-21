@@ -2487,7 +2487,10 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 normalizes each query head before RoPE; V4.1 (q_head_norm
+            # False) does not -- its only q norm is the q_lora one above.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2724,6 +2727,9 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # V4.1 runs the compressor + indexer as one ordered call, which the
+            # NPU multi-stream split does not model.
+            and not self.is_dsv41
         )
 
         low_ratio_multi_stream = (
