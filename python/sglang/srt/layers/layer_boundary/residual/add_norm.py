@@ -193,6 +193,38 @@ def _update_and_read_residual_plain(
     return norm(hidden_states, residual, post_residual_addition)
 
 
+MXFP8_SWIZZLED = "mxfp8_swizzled"
+
+
+def _update_and_read_residual_mxfp8_swizzled(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """The add + Gemma RMSNorm handed over as Mxfp8SwizzledInput: bitwise the
+    plain kernel followed by the MXFP8 quant of its bf16 output."""
+    from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+    if (
+        residual is None
+        or post_residual_addition is not None
+        or type(norm) is not GemmaRMSNorm
+        or not (hidden_states.is_contiguous() and residual.is_contiguous())
+        or hidden_states.dtype != torch.bfloat16
+        or hidden_states.numel() >= 2**31
+    ):
+        return _update_and_read_residual_plain(
+            norm, hidden_states, residual, post_residual_addition
+        )
+    from sglang.kernels.ops.layernorm.fused_add_rmsnorm_mxfp8 import (
+        gemma_fused_add_rmsnorm_mxfp8,
+    )
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+
+    quantized, scales = gemma_fused_add_rmsnorm_mxfp8(
+        hidden_states, residual, norm.weight.data, norm.variance_epsilon
+    )
+    return Mxfp8SwizzledInput(quantized, scales), residual
+
+
 def _update_and_read_residual_aiter_mxfp4(
     norm, hidden_states, residual, post_residual_addition
 ):
@@ -277,6 +309,8 @@ def _norm_quant_kernel(quant_format: str):
         return _update_and_read_residual_aiter_fp8_group
     if _use_aiter and quant_format == "fp8_per_token":
         return _update_and_read_residual_aiter_fp8_per_token
+    if quant_format == MXFP8_SWIZZLED:
+        return _update_and_read_residual_mxfp8_swizzled
     return _update_and_read_residual_plain
 
 
