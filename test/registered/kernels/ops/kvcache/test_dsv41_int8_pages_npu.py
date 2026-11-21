@@ -1,5 +1,7 @@
 """Check captured DSv4.1 page reconstruction on changing logical and physical pages."""
 
+import unittest
+
 import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
@@ -87,3 +89,7 @@ class TestDSV41Int8Pages(CustomTestCase):
                                 rtol=0,
                                 atol=0,
                             )
+
+
+if __name__ == "__main__":
+    unittest.main()
