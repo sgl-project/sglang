@@ -38,8 +38,6 @@ class CohereEmbedContent(BaseModel):
             not self.image_url or not self.image_url.get("url")
         ):
             raise ValueError("Image content requires a non-empty image_url.url")
-        if self.type != "text" and self.type != "image_url":
-            raise ValueError("Content type must be either 'text' or 'image_url'")
         return self
 
 

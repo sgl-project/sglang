@@ -94,6 +94,18 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
         obj.normalize_batch_and_arguments()
         return obj
 
+    def async_tokenizer(self, tokenizer):
+        async_tokenizer = AsyncDynamicbatchTokenizer(tokenizer)
+
+        async def close():
+            async_tokenizer._batcher_task.cancel()
+            await asyncio.gather(async_tokenizer._batcher_task, return_exceptions=True)
+            async_tokenizer._executor.shutdown()
+            self.manager.async_dynamic_batch_tokenizer = None
+
+        self.addAsyncCleanup(close)
+        return async_tokenizer
+
     async def test_none_cannot_be_overridden_by_global_auto_truncation(self):
         ids = list(range(18))
         req = self.request(input_ids=ids, embedding_truncate="NONE")
@@ -356,48 +368,33 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
                 expected = oracle(texts, truncation=True, max_length=5)["input_ids"]
                 for mode in modes:
                     with self.subTest(template=template, policy=policy, mode=mode):
-                        async_tokenizer = (
-                            AsyncDynamicbatchTokenizer(tokenizer)
-                            if mode == "async"
-                            else None
+                        self.manager.async_dynamic_batch_tokenizer = (
+                            self.async_tokenizer(tokenizer) if mode == "async" else None
                         )
-                        self.manager.async_dynamic_batch_tokenizer = async_tokenizer
-                        try:
-                            if mode == "batch":
-                                request = self.request(
+                        if mode == "batch":
+                            results = await self.manager._batch_tokenize_and_process(
+                                2,
+                                self.request(
                                     text=texts,
                                     embedding_truncate=policy,
                                     embedding_max_tokens=5,
-                                )
-                                results = (
-                                    await self.manager._batch_tokenize_and_process(
-                                        2, request
-                                    )
-                                )
-                            else:
-                                results = await asyncio.gather(
-                                    *(
-                                        self.manager._tokenize_one_request(
-                                            self.request(
-                                                text=text,
-                                                embedding_truncate=policy,
-                                                embedding_max_tokens=5,
-                                            )
+                                ),
+                            )
+                        else:
+                            results = await asyncio.gather(
+                                *(
+                                    self.manager._tokenize_one_request(
+                                        self.request(
+                                            text=text,
+                                            embedding_truncate=policy,
+                                            embedding_max_tokens=5,
                                         )
-                                        for text in texts
                                     )
+                                    for text in texts
                                 )
-                            self.assertEqual([r.input_ids for r in results], expected)
-                            self.assertEqual(tokenizer.truncation_side, "right")
-                        finally:
-                            if async_tokenizer is not None:
-                                async_tokenizer._batcher_task.cancel()
-                                await asyncio.gather(
-                                    async_tokenizer._batcher_task,
-                                    return_exceptions=True,
-                                )
-                                async_tokenizer._executor.shutdown()
-                            self.manager.async_dynamic_batch_tokenizer = None
+                            )
+                        self.assertEqual([r.input_ids for r in results], expected)
+                        self.assertEqual(tokenizer.truncation_side, "right")
 
     async def test_explicit_ids_and_disabled_special_tokens_remain_literal(self):
         self.manager.tokenizer = self.text_tokenizer("[BOS] $A [EOS]")
@@ -499,43 +496,31 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
             expected = [list(text.encode())[kept] for text in texts]
             for mode in ("single", "batch", "async"):
                 with self.subTest(policy=policy, budget=budget, mode=mode):
-                    async_tokenizer = (
-                        AsyncDynamicbatchTokenizer(tokenizer)
-                        if mode == "async"
-                        else None
+                    self.manager.async_dynamic_batch_tokenizer = (
+                        self.async_tokenizer(tokenizer) if mode == "async" else None
                     )
-                    self.manager.async_dynamic_batch_tokenizer = async_tokenizer
-                    try:
-                        if mode == "batch":
-                            results = await self.manager._batch_tokenize_and_process(
-                                2,
+                    if mode == "batch":
+                        results = await self.manager._batch_tokenize_and_process(
+                            2,
+                            self.request(
+                                text=texts,
+                                embedding_truncate=policy,
+                                embedding_max_tokens=budget,
+                            ),
+                        )
+                    else:
+                        # Sequential awaits keep each async call a lone string.
+                        results = [
+                            await self.manager._tokenize_one_request(
                                 self.request(
-                                    text=texts,
+                                    text=text,
                                     embedding_truncate=policy,
                                     embedding_max_tokens=budget,
-                                ),
-                            )
-                        else:
-                            # Sequential awaits keep each async call a lone string.
-                            results = [
-                                await self.manager._tokenize_one_request(
-                                    self.request(
-                                        text=text,
-                                        embedding_truncate=policy,
-                                        embedding_max_tokens=budget,
-                                    )
                                 )
-                                for text in texts
-                            ]
-                        self.assertEqual([r.input_ids for r in results], expected)
-                    finally:
-                        if async_tokenizer is not None:
-                            async_tokenizer._batcher_task.cancel()
-                            await asyncio.gather(
-                                async_tokenizer._batcher_task, return_exceptions=True
                             )
-                            async_tokenizer._executor.shutdown()
-                        self.manager.async_dynamic_batch_tokenizer = None
+                            for text in texts
+                        ]
+                    self.assertEqual([r.input_ids for r in results], expected)
 
     async def test_embedding_gemma_eos_is_included_in_special_mask(self):
         self.manager.model_config.is_embedding_gemma = True

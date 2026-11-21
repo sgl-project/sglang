@@ -17,7 +17,6 @@ import base64
 import math
 import struct
 from collections.abc import Sequence
-from typing import Optional
 
 import numpy as np
 
@@ -72,9 +71,7 @@ def build_typed_embeddings(
 
 
 def build_embed_response(
-    request: CohereEmbedRequest,
-    results: list[dict],
-    request_id: Optional[str] = None,
+    request: CohereEmbedRequest, results: list[dict]
 ) -> CohereEmbedResponse:
     embeddings = build_typed_embeddings(
         [item["embedding"] for item in results], request.embedding_types or ["float"]
@@ -86,10 +83,8 @@ def build_embed_response(
         input_tokens=0 if request.has_images else token_count,
         image_tokens=token_count if request.has_images else 0,
     )
-    kwargs = {"id": request_id} if request_id is not None else {}
     return CohereEmbedResponse(
         embeddings=embeddings,
         texts=request.texts,
         meta=CohereMeta(billed_units=billed_units),
-        **kwargs,
     )

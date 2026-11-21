@@ -71,11 +71,10 @@ class TestCohereResponse(unittest.TestCase):
 
     def test_texts_echo_original_input_and_keep_result_order(self):
         request = CohereEmbedRequest(texts=["first", "second"])
-        result = build_embed_response(request, self.results(), request_id="embd-test")
+        result = build_embed_response(request, self.results())
         self.assertEqual(
-            result.model_dump(exclude_none=True),
+            result.model_dump(exclude_none=True, exclude={"id"}),
             {
-                "id": "embd-test",
                 "embeddings": {"float": [[1.0] * 8, [-1.0] * 8]},
                 "texts": ["first", "second"],
                 "meta": {
