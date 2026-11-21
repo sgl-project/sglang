@@ -132,9 +132,19 @@ def _release_preprocess_cache() -> None:
     holding reserved-but-unused memory that other work in the process cannot
     reuse, so reserved memory only ever grows.
     """
-    if not torch.cuda.is_available():
+    # Runs twice per request on the tokenizer side. A process that never
+    # preprocessed on the GPU has no cached blocks to release.
+    if not torch.cuda.is_initialized():
         return
-    idle = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    # memory_reserved() and memory_allocated() each flatten the full stats
+    # dict in Python. Next to the multimodal loader threads, that loses the
+    # GIL for milliseconds per call and showed up in median TTFT. The nested
+    # dict is built in C++, so read both counters from one call.
+    stats = torch.cuda.memory_stats_as_nested_dict()
+    idle = (
+        stats["reserved_bytes"]["all"]["current"]
+        - stats["allocated_bytes"]["all"]["current"]
+    )
     if idle > _PREPROCESS_CACHE_RELEASE_BYTES:
         torch.cuda.empty_cache()
 

@@ -61,13 +61,21 @@ class TestEstimate(CustomTestCase):
 
 class TestReleasePreprocessCache(CustomTestCase):
     def _run(self, reserved, allocated):
+        stats = {
+            "reserved_bytes": {"all": {"current": reserved}},
+            "allocated_bytes": {"all": {"current": allocated}},
+        }
         with (
-            patch.object(torch.cuda, "is_available", return_value=True),
-            patch.object(torch.cuda, "memory_reserved", return_value=reserved),
-            patch.object(torch.cuda, "memory_allocated", return_value=allocated),
+            patch.object(torch.cuda, "is_initialized", return_value=True),
+            patch.object(torch.cuda, "memory_stats_as_nested_dict", return_value=stats),
+            patch.object(torch.cuda, "memory_reserved") as reserved_api,
+            patch.object(torch.cuda, "memory_allocated") as allocated_api,
             patch.object(torch.cuda, "empty_cache") as empty,
         ):
             qwen_vl._release_preprocess_cache()
+        # The flattening stats APIs stall the tokenizer process; stay off them.
+        reserved_api.assert_not_called()
+        allocated_api.assert_not_called()
         return empty
 
     def test_releases_when_idle_cache_large(self):
@@ -76,12 +84,14 @@ class TestReleasePreprocessCache(CustomTestCase):
     def test_keeps_small_idle_cache(self):
         self._run(1 << 30, 1 << 29).assert_not_called()
 
-    def test_noop_without_cuda(self):
+    def test_noop_without_cuda_context(self):
         with (
-            patch.object(torch.cuda, "is_available", return_value=False),
+            patch.object(torch.cuda, "is_initialized", return_value=False),
+            patch.object(torch.cuda, "memory_stats_as_nested_dict") as stats,
             patch.object(torch.cuda, "empty_cache") as empty,
         ):
             qwen_vl._release_preprocess_cache()
+        stats.assert_not_called()
         empty.assert_not_called()
 
 
