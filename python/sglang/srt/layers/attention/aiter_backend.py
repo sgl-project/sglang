@@ -280,7 +280,7 @@ def _asm_cprr_shape_verdict(
     if supported is None:
         # aiter cannot confirm a kernel (a failed asm query, or a backend it has no
         # table for). Only gfx950 takes the copied table together with the fold
-        # veto; other archs keep the table's verdict alone, as before.
+        # veto; other archs keep the table's verdict alone.
         if support.arch != "gfx950":
             return table_verdict
         supported = in_table
@@ -300,7 +300,6 @@ def _in_asm_cprr_native_table(*, heads: int, q_len: int) -> bool:
 def _asm_cprr_kernel_heads(
     *, gathered_heads: int, supports: Callable[[int], bool]
 ) -> int:
-    # The smallest head count at or above the gathered one that supports, or 0.
     for heads in sorted(_MLA_ASM_CPRR_NATIVE_QLENS):
         if heads >= gathered_heads and supports(heads):
             return heads

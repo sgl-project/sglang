@@ -197,9 +197,10 @@ class TestAiterCprrKernelHeads(CustomTestCase):
     """The DCP verify pads its gathered heads only where aiter would fold them."""
 
     def setUp(self):
-        patcher = patch.object(aiter_backend, "_use_mla_ps_kernel", True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for flag in ("_use_mla_ps_kernel", "_mla_persist_requested"):
+            patcher = patch.object(aiter_backend, flag, True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _query(self, query):
         patcher = patch.object(aiter_backend, "get_mla_decode_shape_support", query)
