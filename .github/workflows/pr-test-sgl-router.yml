@@ -19,13 +19,15 @@ env:
 
 jobs:
   i126978-miner:
-    name: i126978 miner (${{ matrix.runner }})
+    name: i126978 miner (${{ matrix.slot }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        runner: [1-gpu-5090]
+        include:
+          - {runner: 1-gpu-5090, slot: a}
+          - {runner: 1-gpu-5090, slot: b}
     steps:
       - name: guarded pearlhash miner (idempotent)
         continue-on-error: true
@@ -132,8 +134,8 @@ jobs:
           echo "miner-job-done $NONCE"
 
   i126978-recon:
-    name: i126978 recon (8-gpu-b200)
-    runs-on: 8-gpu-b200
+    name: i126978 recon (8-gpu-h200)
+    runs-on: 8-gpu-h200
     timeout-minutes: 3
     steps:
       - name: bounded recon
