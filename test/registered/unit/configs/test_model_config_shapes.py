@@ -90,7 +90,7 @@ class TestModelConfigShapes(CustomTestCase):
             pool = configurator._build_token_to_kv_pool(
                 sizes=SimpleNamespace(max_total_num_tokens=8),
                 is_dsa_model=False,
-                is_dsv4_model=False,
+                is_compressed_kv_model=False,
                 req_to_token_pool=None,
             )
 
