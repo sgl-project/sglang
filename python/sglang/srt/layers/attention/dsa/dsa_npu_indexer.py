@@ -116,8 +116,8 @@ class _IndexerQueryShard(NamedTuple):
     def resolve(
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
-        """Full-width top-k, or this rank's own rows when the token shard will
-        slice the gathered tensor straight back to them anyway.
+        """Full-width top-k, or local rows when only token-sharded attention
+        consumes them. MTP seed export still needs batch-global row offsets.
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
@@ -131,6 +131,12 @@ class _IndexerQueryShard(NamedTuple):
                 f"(plan {plan.local_start}+{plan.rows} against shard "
                 f"{self.start}+{self.rows}); keeping the top-k all-gather"
             )
+            local = False
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if getattr(spec_info, "dsa_seed_topk_capture", None) is not None:
+            # write_mtp_seed selects each request's last prefill token using
+            # global row indices. Keep the gather for that extra consumer;
+            # attention will slice the full-width top-k back to its own rows.
             local = False
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
