@@ -239,7 +239,7 @@ def throughput_test_once(
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r.prompt_len for r in reqs),
+        "total_input_tokens": -1,
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -299,9 +299,29 @@ def throughput_test_once(
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
 
+    for output in gen_out:
+        finish_reason = output["meta_info"].get("finish_reason") or {}
+        if finish_reason.get("type") == "abort":
+            raise RuntimeError(
+                "Benchmark request was aborted; token counts are incomplete."
+            )
+
     server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
+    # The backend tokenizes the final prompt text (e.g. re-adding special
+    # tokens the sampler subtracted), so count the tokens it actually received
+    # instead of the dataset's nominal sampling length. With parallel sampling
+    # (n > 1) each request fans out into n consecutive outputs that all report
+    # the same prompt_tokens; count the prompt once per original request.
+    # Beam search collapses the fan-out to one output per request, so fall
+    # back to per-output counting when the expanded size does not match.
+    num_samples = sampling_params[0].get("n", 1) if sampling_params else 1
+    if len(gen_out) != len(reqs) * num_samples:
+        num_samples = 1
+    measurement_results["total_input_tokens"] = sum(
+        o["meta_info"]["prompt_tokens"] for o in gen_out[::num_samples]
+    )
     measurement_results["total_output_tokens"] = sum(
         o["meta_info"]["completion_tokens"] for o in gen_out
     )
@@ -475,35 +495,37 @@ def throughput_test(
         dataset_path=bench_args.dataset_path,
     )
 
-    # Warm up
-    if not bench_args.skip_warmup:
-        logging.info("\nWarmup...")
-        throughput_test_once(
+    try:
+        # Warm up
+        if not bench_args.skip_warmup:
+            logging.info("\nWarmup...")
+            throughput_test_once(
+                backend_name=bench_args.backend,
+                backend=backend,
+                reqs=warmup_requests,
+                ignore_eos=not bench_args.disable_ignore_eos,
+                extra_request_body=extra_request_body,
+                profile=False,
+                return_logprob=bench_args.return_logprob,
+                logprob_start_len=bench_args.logprob_start_len,
+            )
+            time.sleep(0.5)
+
+        logging.info("\nBenchmark...")
+        result = throughput_test_once(
             backend_name=bench_args.backend,
             backend=backend,
-            reqs=warmup_requests,
+            reqs=input_requests,
             ignore_eos=not bench_args.disable_ignore_eos,
             extra_request_body=extra_request_body,
-            profile=False,
+            profile=bench_args.profile,
+            profile_activities=bench_args.profile_activities,
+            profile_steps=bench_args.profile_steps,
             return_logprob=bench_args.return_logprob,
             logprob_start_len=bench_args.logprob_start_len,
         )
-        time.sleep(0.5)
-
-    logging.info("\nBenchmark...")
-    result = throughput_test_once(
-        backend_name=bench_args.backend,
-        backend=backend,
-        reqs=input_requests,
-        ignore_eos=not bench_args.disable_ignore_eos,
-        extra_request_body=extra_request_body,
-        profile=bench_args.profile,
-        profile_activities=bench_args.profile_activities,
-        profile_steps=bench_args.profile_steps,
-        return_logprob=bench_args.return_logprob,
-        logprob_start_len=bench_args.logprob_start_len,
-    )
-    backend.shutdown()
+    finally:
+        backend.shutdown()
 
     if bench_args.result_filename:
         with open(bench_args.result_filename, "a") as fout:
