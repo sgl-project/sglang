@@ -16,7 +16,7 @@
 import dataclasses
 import logging
 from enum import Enum, auto
-from typing import Optional
+from typing import List, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 
@@ -75,14 +75,25 @@ def set_completion_template(template_name: str) -> None:
         completion_template_name = template_name
 
 
-def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
+def generate_completion_prompt_from_request(
+    request: CompletionRequest,
+) -> Union[str, List[str], List[int], List[List[int]]]:
     global completion_template_name
-    if request.suffix == "":
+    # suffix defaults to None, so treat None and "" alike: no FIM formatting.
+    if not request.suffix:
         return request.prompt
 
-    return generate_completion_prompt(
-        request.prompt, request.suffix, completion_template_name
-    )
+    prompt = request.prompt
+    if isinstance(prompt, str):
+        return generate_completion_prompt(
+            prompt, request.suffix, completion_template_name
+        )
+    if isinstance(prompt, list) and all(isinstance(p, str) for p in prompt):
+        return [
+            generate_completion_prompt(p, request.suffix, completion_template_name)
+            for p in prompt
+        ]
+    raise ValueError("suffix requires a text prompt when a completion template is set.")
 
 
 def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> str:

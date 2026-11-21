@@ -103,6 +103,29 @@ class ServingCompletionTestCase(unittest.TestCase):
                         error, f"logprobs must be in [0, 32000], got {logprobs}."
                     )
 
+    def test_validate_request_rejects_suffix_with_token_ids_under_template(self):
+        """A suffix needs a text prompt when a completion template is set."""
+        self.template_manager.completion_template_name = "deepseek_coder"
+        for prompt, ok in (
+            ([1, 2, 3], False),
+            ([[1, 2], [3, 4]], False),
+            ("def f():", True),
+            (["a", "b"], True),
+        ):
+            with self.subTest(prompt=prompt):
+                req = CompletionRequest(model="x", prompt=prompt, suffix="pass")
+                error = self.sc._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(
+                        error,
+                        "suffix requires a text prompt when a completion template is set.",
+                    )
+        # Without a suffix, token-id prompts are fine.
+        req = CompletionRequest(model="x", prompt=[1, 2, 3])
+        self.assertIsNone(self.sc._validate_request(req))
+
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
