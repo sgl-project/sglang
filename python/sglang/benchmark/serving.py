@@ -850,7 +850,8 @@ async def async_request_openai_embeddings(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    await response.json()
+                    data = await response.json()
+                    _record_server_prompt_len(data, output)
                     output.latency = time.perf_counter() - st
                     output.success = True
                     output.output_len = 0
