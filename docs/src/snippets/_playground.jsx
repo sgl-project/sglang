@@ -1969,7 +1969,7 @@ export const Playground = ({ config }) => {
         || di[`${sel.hw}|${sel.quant}|${sel.strategy}`]
         || di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const dockerRunCommand = typeof config.dockerRunCommand === "function"
-        ? config.dockerRunCommand(sel)
+        ? config.dockerRunCommand(sel, cellEnv)
         : (config.dockerRunCommand || "sglang serve");
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
@@ -2062,7 +2062,14 @@ export const Playground = ({ config }) => {
       const envBlock = pdMode && pgFeatures.pdDisagg?.exportEnv
         ? cellEnv.map((e) => `export ${e}\n`).join("")
         : cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
-      cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
+      const pythonSetupCommand = typeof config.pythonSetupCommand === "function"
+        ? config.pythonSetupCommand(sel)
+        : (config.pythonSetupCommand || "");
+      const pythonCommand = typeof config.pythonCommand === "function"
+        ? config.pythonCommand(sel)
+        : (config.pythonCommand || "sglang serve");
+      const setupBlock = pythonSetupCommand ? `${pythonSetupCommand} &&\n` : "";
+      cmd = `${setupBlock}${envBlock}${pythonCommand} \\\n${flagBlock}`;
     }
     const cellHints = (cell.pd ? cell.hints || [] : []).filter(() =>
       f.some((x) => x === "--enable-unified-cache-external-linker"));
