@@ -9,7 +9,10 @@ import unittest
 import torch
 
 from sglang.srt.eplb.expert_location import (
+    _compact_candidates,
     _compute_logical_to_all_physical_map,
+    _find_nearest_expert,
+    _nearest_expert_dispatch,
     append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
@@ -222,6 +225,89 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
             )
 
         self.assertEqual(logical_to_physical[0, :16, 0].tolist(), list(range(64, 80)))
+
+
+def _random_logical_to_all_physical(gen, num_layers, num_logical, num_physical):
+    """[num_layers, num_logical, width] map, -1 padded: every physical slot holds one
+    logical expert, every logical expert has at least one slot, and each candidate
+    list is shuffled so the earliest-match order is exercised."""
+    rows = []
+    for _ in range(num_layers):
+        owner = torch.cat(
+            [
+                torch.arange(num_logical),
+                torch.randint(
+                    0, num_logical, (num_physical - num_logical,), generator=gen
+                ),
+            ]
+        )
+        owner = owner[torch.randperm(num_physical, generator=gen)]
+        row = []
+        for expert in range(num_logical):
+            slots = torch.nonzero(owner == expert).flatten()
+            row.append(slots[torch.randperm(slots.numel(), generator=gen)].tolist())
+        rows.append(row)
+    width = max(len(slots) for row in rows for slots in row)
+    mapping = torch.full((num_layers, num_logical, width), -1, dtype=torch.int64)
+    for layer, row in enumerate(rows):
+        for expert, slots in enumerate(row):
+            mapping[layer, expert, : len(slots)] = torch.tensor(slots)
+    return mapping
+
+
+class TestNearestExpertDispatch(CustomTestCase):
+    def test_matches_find_nearest_expert(self):
+        """_nearest_expert_dispatch equals the scalar _find_nearest_expert for every
+        (layer, logical expert, rank) on random single- and multi-node layouts."""
+        gen = torch.Generator().manual_seed(0)
+        # (layers, logical experts, ep size, physical experts per GPU, GPUs per node)
+        configs = [
+            (2, 4, 4, 2, 2),
+            (3, 12, 8, 3, 4),
+            (2, 24, 8, 4, None),
+            (4, 64, 32, 3, 4),
+            (2, 40, 16, 4, 8),
+        ]
+        outcomes = set()
+        for num_layers, num_logical, ep_size, per_gpu, per_node in configs:
+            per_node_experts = per_gpu * per_node if per_node is not None else None
+            mapping = _random_logical_to_all_physical(
+                gen, num_layers, num_logical, ep_size * per_gpu
+            )
+            candidates, num_valid = _compact_candidates(mapping)
+            actual = _nearest_expert_dispatch(
+                candidates,
+                num_valid,
+                ep_size=ep_size,
+                num_local_gpu_physical_experts=per_gpu,
+                num_gpus_per_node=per_node,
+                num_local_node_physical_experts=per_node_experts,
+            )
+            for layer in range(num_layers):
+                for expert in range(num_logical):
+                    cands = mapping[layer, expert][
+                        mapping[layer, expert] != -1
+                    ].tolist()
+                    for rank in range(ep_size):
+                        expected = _find_nearest_expert(
+                            cands, per_gpu, rank, per_node, per_node_experts
+                        )
+                        self.assertEqual(
+                            actual[layer, expert, rank].item(),
+                            expected,
+                            f"config {(num_layers, num_logical, ep_size, per_gpu, per_node)} "
+                            f"layer {layer} expert {expert} rank {rank} candidates {cands}",
+                        )
+                        if len(cands) == 1:
+                            outcomes.add("single")
+                        elif expected == -1:
+                            outcomes.add("unresolved")
+                        elif expected // per_gpu == rank:
+                            outcomes.add("same_gpu")
+                        else:
+                            outcomes.add("same_node")
+        # The layouts reach every branch of _find_nearest_expert.
+        self.assertEqual(outcomes, {"single", "unresolved", "same_gpu", "same_node"})
 
 
 if __name__ == "__main__":
