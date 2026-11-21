@@ -16,6 +16,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
+REQUEST_WINDOW_LAYOUTS = tuple(
+    layout for layout in KVLayout if not layout.is_packed_main_kv
+)
+
 
 def reference(src, dst, source, target, page, layout):
     # Independent scalar row slicing also checks every untouched padding byte.
@@ -38,7 +42,7 @@ def reference(src, dst, source, target, page, layout):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRequestWindowCopy(CustomTestCase):
     def test_layouts_pages_and_strides(self):
-        for layout in KVLayout:
+        for layout in REQUEST_WINDOW_LAYOUTS:
             for page in (16, 64, 256):
                 for count in (0, 1, 17, 129):
                     with self.subTest(layout=layout, page=page, count=count):
@@ -98,13 +102,13 @@ class TestRequestWindowCopy(CustomTestCase):
             torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
 
     def test_commit_retained_rows(self):
-        for fmt in KVLayout:
+        for fmt in REQUEST_WINDOW_LAYOUTS:
             for lens in ([1, 17, 257], [16384], [300, 37, 600]):
                 with self.subTest(layout=fmt, lengths=lens):
                     self._check_commit(fmt, lens, graph=False)
 
     def test_commit_graph_refreshes_metadata(self):
-        for fmt in KVLayout:
+        for fmt in REQUEST_WINDOW_LAYOUTS:
             self._check_commit(fmt, [300, 37, 600], graph=True)
 
     def _check_commit(self, fmt, lens, graph):

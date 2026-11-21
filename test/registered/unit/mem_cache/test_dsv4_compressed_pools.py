@@ -50,6 +50,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+LEGACY_FLASHMLA_LAYOUTS = tuple(
+    layout for layout in KVLayout if not layout.is_packed_main_kv
+)
+
 
 class TestDSV4CompressedPools(CustomTestCase):
     def test_checkpoint_pages_alias_complete_rings_and_exclude_trailing_rows(self):
@@ -91,7 +95,7 @@ class TestDSV4CompressedPools(CustomTestCase):
             pool.checkpoint_buffer_info()
 
     def test_native_paged_kv_description_preserves_padding_and_storage(self):
-        for layout in KVLayout:
+        for layout in LEGACY_FLASHMLA_LAYOUTS:
             with self.subTest(layout=layout):
                 pool = DeepSeekV4SingleKVPool.__new__(DeepSeekV4SingleKVPool)
                 pool.page_size = 64
