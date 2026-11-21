@@ -260,13 +260,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if batch.return_hidden_states:
             raise NotImplementedError("UNO does not support returned hidden states.")
 
-        penalizer = sampling_info.penalizer_orchestrator
-        penalties_active = (
-            (penalizer is not None and penalizer.is_required)
-            or sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-        )
-        if penalties_active:
+        if sampling_info.step_penalties is not None:
             raise NotImplementedError("UNO does not support sampling penalties.")
 
         if sampling_info.logit_bias is not None:
