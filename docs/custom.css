@@ -940,3 +940,42 @@ html.dark :not(pre) > code,
   background-color: rgba(255, 255, 255, 0.13);
   font-weight: 600;
 }
+
+/* Keep long Ascend cookbook table headers readable at narrow widths. */
+.qwen3-ascend-table,
+.qwen3-ascend-table div {
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: auto;
+}
+
+.qwen3-ascend-table::-webkit-scrollbar,
+.qwen3-ascend-table div::-webkit-scrollbar {
+  height: 8px;
+}
+
+.qwen3-ascend-table table {
+  table-layout: fixed;
+}
+
+.qwen3-ascend-table table:has(th:nth-child(6)) {
+  min-width: 780px;
+}
+
+.qwen3-ascend-table table:has(th:nth-child(8)) {
+  min-width: 1000px;
+}
+
+.qwen3-ascend-table th {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.qwen3-ascend-table td {
+  overflow-wrap: anywhere;
+}
+
+.qwen3-ascend-table td code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
