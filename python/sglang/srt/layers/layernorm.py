@@ -185,7 +185,7 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+        from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that

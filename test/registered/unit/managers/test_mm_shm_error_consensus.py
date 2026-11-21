@@ -99,7 +99,6 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
 def _receiver() -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,

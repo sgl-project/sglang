@@ -390,11 +390,11 @@ def _segmented_matmul_launch(M: int, N: int) -> tuple:
     """
     if N < 1024:
         return 32, 64, 4, 2, True
+    if M <= 32:
+        return 32, 128, 4, 3, True
+    if M <= 64:
+        return 64, 128, 8, 3, True
     if N <= 8192:
-        if M <= 32:
-            return 32, 64, 4, 2, True
-        if M <= 64:
-            return 64, 64, 4, 2, True
         if M <= 256:
             return 128, 128, 8, 3, True
         if M <= 1024:
@@ -402,10 +402,6 @@ def _segmented_matmul_launch(M: int, N: int) -> tuple:
         if M <= 2048:
             return 128, 128, 8, 1, False
         return 128, 256, 8, 1, False
-    if M <= 32:
-        return 32, 64, 4, 2, True
-    if M <= 64:
-        return 64, 64, 4, 2, True
     if M <= 128:
         return 128, 128, 8, 2, True
     return 256, 128, 8, 1, False
@@ -458,7 +454,8 @@ def _matmul_segmented_triton(
         matrix_instr_nonkdim=16,
     )
     if split:
-        block = 4096
+        # Measured on MI350X: the smaller block is faster up to M = 64.
+        block = 1024 if M <= 64 else 4096
         _segment_reduce_kernel[(triton.cdiv(M * N, block),)](
             partial,
             c,

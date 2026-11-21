@@ -131,9 +131,8 @@ _SHAPES = (
             speculative_num_draft_tokens=3,
         ),
     ),
-    # The multimodal transport handler reads `is_set()` on the legacy
-    # SGLANG_USE_CUDA_IPC_TRANSPORT, so the shape that exercises it belongs in
-    # the dual-resolve matrix.
+    # The multimodal transport handler auto-selects the transport, so the
+    # shape that exercises it belongs in the dual-resolve matrix.
     ("multimodal", _MULTIMODAL_MINI_CONFIG, {}),
     # device="cpu" is the one device every host can resolve, and it is what
     # reaches `_handle_cpu_backends` — the golden device="cuda" default never
@@ -155,11 +154,9 @@ if torch.cuda.is_available():
 # Since #34662 made cuda_ipc opt-in, no auto-resolution reaches the handler's
 # cuda_ipc arm any more -- an explicit request is the only way in, so without
 # this shape that arm (two raises and the pool-budget logging) is resolved by
-# nothing in this file. It is also the only shape whose transport differs from
-# what the *next* resolution picks on its own, which is what keeps the
-# transport half of `test_a_resolution_does_not_leak_into_the_next` from being
-# vacuous. Gated on `is_cuda()` rather than `torch.cuda.is_available()`: the
-# handler raises for cuda_ipc off NVIDIA CUDA, ROCm included.
+# nothing in this file. Gated on `is_cuda()` rather than
+# `torch.cuda.is_available()`: the handler raises for cuda_ipc off NVIDIA CUDA,
+# ROCm included.
 _CUDA_IPC_SHAPES = ()
 if is_cuda():
     _CUDA_IPC_SHAPES = (
@@ -178,10 +175,8 @@ _NOT_COMPARABLE = frozenset({"random_seed"})
 
 
 class _RestoresProcessState:
-    """Resolution leaves process state behind, so a case that resolves has to
-    put it back: `handle_environment_variables` exports several decisions as
-    environment variables, and handlers read `is_set()` on others.
-    """
+    """Resolution may leave process state behind, so a case that resolves
+    has to put it back."""
 
     def _process_state(self):
         """What a resolution may leave behind: the environment and the
@@ -207,11 +202,9 @@ class _RestoresProcessState:
             getattr(type(envs), name)._set_to_none = was_none
 
     def setUp(self):
-        # Resolution writes process state on the way through
-        # (`handle_environment_variables` exports decisions as environment
-        # variables). These cases restore what they touched, and it is a
-        # standing caveat on the determinism pinned here: the guarantee holds
-        # per raw input *and* the process state a previous resolution left.
+        # Resolution can write process state on the way through, which would
+        # make one resolution visible to the next one in this process. These
+        # cases restore what they touched.
         self._pristine_state = self._process_state()
         self.addCleanup(self._restore_process_state, self._pristine_state)
 
@@ -307,21 +300,16 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         )
 
         # A backend probe only diverges on the kernel fields. The shapes whose
-        # handlers touch process state on the way through -- the multimodal
-        # transport one reads `is_set()` on the legacy
-        # SGLANG_USE_CUDA_IPC_TRANSPORT, DSA fans out the furthest -- are the
-        # ones that can leave something the *next* default reads, so each gets
-        # its own turn as the intermediate. Whether those writes actually fire
-        # is device-dependent, which is why this case is registered on the GPU
+        # handlers branch on the most state -- the multimodal transport one,
+        # DSA fans out the furthest -- are the ones that could leave something
+        # the *next* default reads, so each gets its own turn as the
+        # intermediate. Whether those writes actually fire is
+        # device-dependent, which is why this case is registered on the GPU
         # runners as well as CPU.
         intermediates = (
             ("multimodal", _MULTIMODAL_MINI_CONFIG, {}),
             ("torch_compile", _MINI_CONFIG, dict(enable_torch_compile=True)),
         )
-        # Auto-resolution picks cpu on every runner this case runs on now that
-        # cuda_ipc is opt-in, so the auto shape above resolves what the next
-        # resolution picks anyway; the explicit shape is the one whose
-        # transport would be observable if it carried over.
         intermediates += _CUDA_IPC_SHAPES
         if torch.cuda.is_available():
             # Same device gate as _SHAPES: the DSA arm probes the device
@@ -330,13 +318,10 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         for label, config, kwargs in intermediates:
             with self.subTest(intermediate=label):
                 # Each intermediate starts from the pristine process: it must
-                # not inherit what the previous iteration left. `default_before`
-                # is the control precisely because it was taken on this state.
+                # not inherit what the previous iteration left.
                 self._restore_process_state(self._pristine_state)
                 self._resolved(self._config_dir(config), **kwargs)
                 after = self._resolved(model_path)
-                # Every field, the multimodal transport included: an explicit
-                # cuda_ipc must not become the next text model's transport.
                 self.assertEqual(
                     self._comparable(after), self._comparable(default_before)
                 )
