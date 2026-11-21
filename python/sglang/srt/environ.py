@@ -1415,6 +1415,7 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+    SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE = EnvInt(4)
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
     # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)

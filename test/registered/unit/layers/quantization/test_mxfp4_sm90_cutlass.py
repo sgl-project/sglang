@@ -843,14 +843,20 @@ def test_dsv4_apply_matches_flashinfer_direct(
     not HAS_CORRECTED_HUMMING_API,
     reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
 )
-def test_dsv4_process_weights_humming_matches_flashinfer_direct():
+@pytest.mark.parametrize("chunk_size", [1, 4, 16])
+def test_dsv4_process_weights_humming_matches_flashinfer_direct(
+    chunk_size, monkeypatch
+):
     """DSv4's native [up; gate] layout must use the same #3738 transform."""
     from types import SimpleNamespace
 
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
     from sglang.srt.runtime_context import get_context
 
-    num_experts, hidden, inter = 4, 256, 256
+    monkeypatch.setenv(
+        "SGLANG_FLASHINFER_MXFP4_PREPROCESS_EXPERT_CHUNK_SIZE", str(chunk_size)
+    )
+    num_experts, hidden, inter = 5, 256, 256
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
     w1, w3 = w13.chunk(2, dim=1)
     w1_s, w3_s = w13_s.chunk(2, dim=1)
@@ -885,6 +891,36 @@ def test_dsv4_process_weights_humming_matches_flashinfer_direct():
     assert torch.equal(layer.w2_weight_scale_inv, ref_w2_s)
     assert torch.equal(layer.w13_humming_residual_scale, ref_w13_residual * 64.0)
     assert torch.equal(layer.w2_humming_residual_scale, ref_w2_residual * 64.0)
+
+
+@pytest.mark.skipif(not HAS_CORRECTED_HUMMING_API, reason="Humming API required")
+def test_humming_expert_chunks_reduce_peak_memory():
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        _preprocess_humming_in_expert_chunks,
+    )
+
+    weight, _, scale, _ = _make_random_dsv4_mxfp4(9, 512, 512)
+    weight, scale = weight.view(torch.uint8), scale.view(torch.uint8)
+    preprocess_humming(weight[:1], scale[:1])
+
+    def measure(operation):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        initial = torch.cuda.memory_allocated()
+        outputs = operation()
+        torch.cuda.synchronize()
+        return outputs, torch.cuda.max_memory_allocated() - initial
+
+    reference, whole_peak = measure(lambda: preprocess_humming(weight, scale))
+    actual, chunked_peak = measure(
+        lambda: _preprocess_humming_in_expert_chunks(
+            weight, scale, preprocess_humming, 4
+        )
+    )
+    for output, expected in zip(actual, reference):
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert chunked_peak < whole_peak * 0.7
 
 
 class _MockDispatchOutput:
