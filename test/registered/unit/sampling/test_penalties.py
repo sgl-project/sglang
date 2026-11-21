@@ -1,4 +1,4 @@
-"""Unit tests for srt/sampling/penaltylib/ — no server, no model loading."""
+"""Unit tests for srt/sampling/penalties.py — no server, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -10,16 +10,10 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.sampling.penaltylib.frequency_penalty import (
+from sglang.srt.sampling.penalties import (
     BatchedFrequencyPenalizer,
-)
-from sglang.srt.sampling.penaltylib.min_new_tokens import (
     BatchedMinNewTokensPenalizer,
-)
-from sglang.srt.sampling.penaltylib.orchestrator import (
     BatchedPenalizerOrchestrator,
-)
-from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
 from sglang.test.test_utils import CustomTestCase
