@@ -1417,10 +1417,13 @@ class CommonKVManager(BaseKVManager):
         ``AbortReq``.
         """
         with kv_receiver._lifecycle_lock:
-            if self.defer_decode_allocation and (
-                not kv_receiver._owns_bootstrap_room
-                or kv_receiver.conclude_state == KVPoll.Success
+            if (
+                kv_receiver.conclude_state == KVPoll.Success
                 or self.request_status.get(kv_receiver.bootstrap_room) == KVPoll.Success
+                or (
+                    self.defer_decode_allocation
+                    and not kv_receiver._owns_bootstrap_room
+                )
             ):
                 # The HTTP response can arrive after KV transfer has succeeded.
                 # Serialize errors with polling/retirement so an old callback
