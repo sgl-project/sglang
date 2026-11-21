@@ -12,9 +12,11 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.test_utils import publish_build_topology
 
 from .common_utils import get_model_config
@@ -79,14 +81,18 @@ def fused_moe_sglang_api(
     a2_scale=None,
     block_shape=None,
 ):
+    # Keep routing in the timed call, as in the vLLM provider.
+    topk_output = select_experts(
+        hidden_states=x,
+        router_logits=input_gating,
+        topk_config=TopKConfig(top_k=topk, renormalize=True),
+    )
     return fused_moe_sglang(
         x,
         w1,
         w2,
-        input_gating,
-        topk,
-        renormalize=True,
-        inplace=True,
+        topk_output,
+        moe_runner_config=MoeRunnerConfig(inplace=True),
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
