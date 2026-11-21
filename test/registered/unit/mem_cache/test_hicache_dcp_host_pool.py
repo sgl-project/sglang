@@ -192,6 +192,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                                     tp_size=4,
                                     pp_rank=0,
                                     pp_size=1,
+                                    attn_tp_rank=tp_rank,
                                     attn_dcp_size=dcp_size,
                                     attn_dcp_rank=tp_rank % dcp_size,
                                 ),
