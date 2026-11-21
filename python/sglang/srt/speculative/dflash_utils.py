@@ -24,7 +24,11 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
+from sglang.srt.sampling.penalties import uses_penalty
+from sglang.srt.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    apply_acc_penalties,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -291,6 +295,19 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(logit_bias[:, None, :])
+
+
+def commit_block_accept_tokens_to_penalties(
+    sampling_info: SamplingBatchInfo,
+    out_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    if sampling_info.step_penalties is not None:
+        # Guarded here: building the mask launches device work.
+        positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
+        sampling_info.step_penalties.commit(
+            out_tokens, accept_mask=positions < commit_lens[:, None]
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -1302,8 +1319,18 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, bound_runtime: bool
+) -> Optional[str]:
+    """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if bound_runtime and uses_penalty(req.sampling_params):
+        return (
+            "DFLASH speculative decoding with the megakernel decode runtime does "
+            "not support sampling penalties (frequency_penalty, presence_penalty, "
+            "repetition_penalty, min_new_tokens)."
+        )
 
     return None

@@ -95,10 +95,7 @@ class UocrGreedyGraph:
             sampling_info.logit_bias is not None
             or sampling_info.grammar_mask is not None
             or sampling_info.has_custom_logit_processor
-            or (
-                sampling_info.penalizer_orchestrator is not None
-                and sampling_info.penalizer_orchestrator.is_required
-            )
+            or sampling_info.step_penalties is not None
         ):
             return None
         rows = int(logits_output.next_token_logits.shape[0])

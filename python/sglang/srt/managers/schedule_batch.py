@@ -509,8 +509,6 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
-        # Leading output_ids already fed to the batch's penalizers.
-        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -570,6 +568,9 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Index in the scheduler's PenaltyStatusPool, held while the request uses
+        # a penalty; a retraction keeps it.
+        self.penalty_index: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None
@@ -1551,8 +1552,6 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
-        # The re-prefill batch starts the penalizers from zero.
-        self.penalty_cumulated_len = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
@@ -3277,28 +3276,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions[i] = -1
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
-    def cumulate_penalty_output_tokens(self):
-        # Feed every output token since the last call: one per request in a
-        # decode step, a variable number after a speculative verify round. Under
-        # overlap, the step in flight is not in output_ids yet and is fed on the
-        # next call.
-        output_ids, req_indices = [], []
-        for i, req in enumerate(self.reqs):
-            new_tokens = req.output_ids[req.penalty_cumulated_len :]
-            output_ids.extend(new_tokens)
-            req_indices.extend([i] * len(new_tokens))
-            req.penalty_cumulated_len = len(req.output_ids)
-        if not output_ids:
-            return
-        output_ids, req_indices = torch.tensor(
-            [output_ids, req_indices],
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            output_ids, req_indices
-        )
-
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
@@ -3316,9 +3293,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
-
-        if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
@@ -3495,9 +3469,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
-        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
-        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
-        # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos

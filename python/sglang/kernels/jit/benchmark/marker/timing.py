@@ -29,9 +29,18 @@ def _get_benchmark_stream(device_id: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=device_id)
 
 
+def _clone_strided(t: torch.Tensor) -> torch.Tensor:
+    # `clone()` densifies a view with gaps (e.g. TMA-padded column-major scales),
+    # so a kernel that reads the layout from strides would see another one.
+    if t.numel() == 0:
+        return t.clone()
+    span = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return torch.as_strided(t, (span,), (1,)).clone().as_strided(t.shape, t.stride())
+
+
 def _clone_recursive(in_: Any) -> Any:
     if isinstance(in_, torch.Tensor):
-        return in_.clone()
+        return _clone_strided(in_)
     elif isinstance(in_, (list, tuple)):
         return type(in_)(_clone_recursive(x) for x in in_)
     elif isinstance(in_, dict):
