@@ -1,16 +1,27 @@
+"""Sampling-penalty history: output-token counts and lengths, one table row per
+penalized request, addressed by the request's penalty index.
+
+- Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only queue
+  writes; the tables are written, grown, and read on the sampling stream.
+- A request takes an index at its first extend admission; every extend admission
+  resets its row and replays `output_ids`. A retraction keeps the index;
+  `RequestRetirer` frees it at exit.
+- A step reads and commits the indices it was built with. No request is admitted
+  between a step's build and its sampling, so none of them is reused before then.
+- Freeing the last live index drops the tables at once. That is safe because they
+  were allocated on the sampling stream, so their memory goes only to later
+  allocations there. A step whose indices were all freed sees no live index:
+  it reads zeros and commits nothing.
+"""
+
 from __future__ import annotations
 
-import abc
-import weakref
-from typing import TYPE_CHECKING, Optional, Set, Type
+import dataclasses
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.utils import get_compiler_backend, is_npu
-from sglang.srt.utils.device import is_pin_memory_available
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.utils.device import async_h2d, get_compiler_backend, is_npu
 
 _is_npu = is_npu()
 
@@ -24,580 +35,301 @@ def apply_scaling_penalties(logits, scaling_penalties):
     )
 
 
-class BatchedPenalizerOrchestrator:
-    def __init__(
-        self,
-        vocab_size: int,
-        batch: ScheduleBatch,
-        penalizers: Set[Type[_BatchedPenalizer]],
-    ):
+def _penalty_kinds(sampling_params) -> Tuple[bool, bool, bool, bool]:
+    return (
+        sampling_params.frequency_penalty != 0.0,
+        sampling_params.presence_penalty != 0.0,
+        sampling_params.repetition_penalty != 1.0,
+        sampling_params.min_new_tokens > 0,
+    )
+
+
+def uses_penalty(sampling_params) -> bool:
+    return any(_penalty_kinds(sampling_params))
+
+
+class PenaltyStatusPool:
+    def __init__(self, vocab_size: int, device):
         self.vocab_size = vocab_size
-        self._batch_ref = weakref.ref(batch)
-        self.device = batch.device
-        self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        self.device = device
+        self.num_indices = 0
+        self.free_indices: List[int] = []
+        self.pending_init: Dict[int, List[int]] = {}
+        self.counts = torch.zeros((0, vocab_size), dtype=torch.int32, device=device)
+        self.lens = torch.zeros((0,), dtype=torch.int32, device=device)
 
-        is_required = False
-        for penalizer in self.penalizers.values():
-            pen_is_required = penalizer.prepare_if_required()
-            is_required |= pen_is_required
-        self.is_required = is_required
-
-    @property
-    def batch(self) -> ScheduleBatch | None:
-        return self._batch_ref()
-
-    @batch.setter
-    def batch(self, value: Optional[ScheduleBatch]):
-        if value is None:
-            self._batch_ref = lambda: None
-        else:
-            self._batch_ref = weakref.ref(value)
-
-    def reqs(self):
-        return self.batch.reqs
-
-    def cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        """
-        Feed the output tokens to the penalizers.
-
-        Args:
-            output_ids (torch.Tensor): The output tokens.
-            req_indices (torch.Tensor): The batch row of each token.
-        """
-        for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(
-                output_ids=output_ids, req_indices=req_indices
-            )
-
-    def apply(self, logits: torch.Tensor):
-        """Apply all penalizers to the logits in-place."""
-        for penalizer in self.penalizers.values():
-            penalizer.apply(logits)
-
-    def accumulate_additive_penalties(self, logits: torch.Tensor):
-        """Apply only additive (non-multiplicative) penalizers."""
-        for penalizer in self.penalizers.values():
-            if not penalizer.is_multiplicative:
-                penalizer.apply(logits)
-
-    def accumulate_scaling_penalties(self) -> Optional[torch.Tensor]:
-        """Accumulate all multiplicative penalty tensors into one, or None if none active."""
-        result = None
-        for penalizer in self.penalizers.values():
-            if not penalizer._is_prepared or not penalizer.is_multiplicative:
+    def alloc(self, reqs: Sequence) -> None:
+        for req in reqs:
+            if req.penalty_index is not None or not uses_penalty(req.sampling_params):
                 continue
-            if result is None:
-                result = penalizer.get_scaling_penalties().clone()
+            if self.free_indices:
+                req.penalty_index = self.free_indices.pop()
             else:
-                result *= penalizer.get_scaling_penalties()
-        return result
+                req.penalty_index = self.num_indices
+                self.num_indices += 1
 
-    def filter(self, keep_indices: torch.Tensor):
-        """
-        Filter the penalizers based on the indices to keep in the batch.
+    def reset_history(self, reqs: Sequence) -> None:
+        for req in reqs:
+            if req.penalty_index is not None:
+                self.pending_init[req.penalty_index] = list(req.output_ids)
 
-        Args:
-            keep_indices (torch.Tensor): Tensor of indices to keep in the batch.
-        """
-        if not self.is_required:
+    def free(self, req) -> None:
+        if self.num_indices == 0:
             return
-
-        if len(keep_indices) == 0:
-            # No requests left in the batch, fully release orchestrator resources
-            self.release()
+        index = req.penalty_index
+        if index is None:
             return
-
-        is_required = False
-        for penalizer in self.penalizers.values():
-            tmp_is_required = penalizer.is_required()
-            is_required |= tmp_is_required
-            if tmp_is_required:
-                penalizer.filter(keep_indices=keep_indices)
-            else:
-                penalizer.teardown()
-        self.is_required = is_required
-
-    # Resource management helpers
-    def release(self) -> None:
-        """Release all penalizers and break references so GC can reclaim promptly."""
-        for penalizer in self.penalizers.values():
-            penalizer.teardown()
-        self.penalizers.clear()
-        # Break reference to ScheduleBatch
-        self._batch_ref = None
-        self.is_required = False
-
-    # Context manager support
-    def __enter__(self) -> BatchedPenalizerOrchestrator:
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.release()
-
-    def merge(self, their: BatchedPenalizerOrchestrator):
-        """
-        Merge the penalizers of another orchestrator into this one.
-
-        Note that this function **must** be called _before_ self.batch.reqs is updated (filtered).
-        Each unprepared penalizers would have to be prepared (creating tensors, etc.) first before merging.
-        This step requires the original batch.reqs, before it gets merged with other batch.reqs.
-
-        Args:
-            their (BatchedPenalizerOrchestrator): The orchestrator to merge into this one.
-        """
-        if not self.is_required and not their.is_required:
-            return
-
-        self.is_required = True
-        for penalizer, their_penalizer in their.penalizers.items():
-            self.penalizers[penalizer].merge(their_penalizer)
-
-
-class _BatchedPenalizer(abc.ABC):
-    """
-    An abstract class for a batched penalizer.
-    """
-
-    is_multiplicative: bool = False
-
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self._orchestrator_ref: weakref.ReferenceType[BatchedPenalizerOrchestrator] = (
-            weakref.ref(orchestrator)
-        )
-        self._is_prepared = False
-
-    @property
-    def orchestrator(self) -> BatchedPenalizerOrchestrator:
-        orch: Optional[BatchedPenalizerOrchestrator] = self._orchestrator_ref()
-        # This should never happen, but we need to handle it gracefully
-        if orch is None:
-            raise RuntimeError(
-                "BatchedPenalizerOrchestrator has been garbage-collected"
+        req.penalty_index = None
+        self.pending_init.pop(index, None)
+        self.free_indices.append(index)
+        if len(self.free_indices) == self.num_indices:
+            self.num_indices = 0
+            self.free_indices.clear()
+            self.counts = torch.empty(
+                (0, self.vocab_size), dtype=torch.int32, device=self.device
             )
-        return orch
+            self.lens = torch.empty((0,), dtype=torch.int32, device=self.device)
 
-    def is_prepared(self) -> bool:
-        return self._is_prepared
-
-    def is_required(self) -> bool:
-        return self._is_required()
-
-    def prepare(self):
-        if not self._is_prepared:
-            self._prepare()
-            self._is_prepared = True
-
-    def prepare_if_required(self):
-        if self._is_required():
-            self.prepare()
-            return True
-        else:
-            return False
-
-    def teardown(self):
-        self._teardown()
-        self._is_prepared = False
-
-    def cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        if not self._is_prepared:
-            return
-
-        self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
-
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if not self._is_prepared:
-            return
-
-        self._apply(logits=logits)
-
-    def filter(self, keep_indices: torch.Tensor):
-        if not self._is_prepared:
-            return
-
-        self._filter(keep_indices=keep_indices)
-
-    def merge(self, their: _BatchedPenalizer):
-        if not self._is_prepared and not their._is_prepared:
-            return
-
-        self.prepare()
-        their.prepare()
-        self._merge(their)
-
-    @abc.abstractmethod
-    def _is_required(self) -> bool:
-        """
-        Check if the penalizer is required to be prepared.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _prepare(self):
-        """
-        Prepare the penalizer.
-        Usually, this is where the penalizer initializes its tensors.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        """
-        Cumulate the output tokens; output_ids[j] belongs to batch row req_indices[j].
-        Orchestrator will call this function to feed the output tokens to the penalizer.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Apply the penalizer to the logits.
-        Penalizers can modify the logits in-place if needed.
-        """
-        pass
-
-    def get_scaling_penalties(self) -> torch.Tensor:
-        """
-        Return the accumulated scaling penalty tensor for multiplicative penalizers.
-        Only meaningful when is_multiplicative is True. Subclasses should override.
-        """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def _filter(self, keep_indices: torch.Tensor):
-        """
-        Filter the penalizer (tensors or underlying data) based on the indices to keep in the batch.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _merge(self, their: _BatchedPenalizer):
-        """
-        Merge the penalizer with another penalizer.
-        """
-        pass
-
-    @abc.abstractmethod
-    def _teardown(self):
-        """
-        Teardown the penalizer.
-        """
-        pass
-
-
-class BatchedFrequencyPenalizer(_BatchedPenalizer):
-    """
-    Frequency penalizer penalizes tokens based on their frequency in the output.
-    """
-
-    def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.frequency_penalty != 0.0
-            for req in self.orchestrator.reqs()
-        )
-
-    def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
-        self.cumulated_frequency_penalties = torch.zeros(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        )
-
-        self.frequency_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.frequency_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                pin_memory=pin_memory,
+    def _flush(self) -> None:
+        capacity = self.counts.shape[0]
+        if capacity < self.num_indices:
+            new_capacity = max(self.num_indices, 2 * capacity)
+            counts = torch.zeros(
+                (new_capacity, self.vocab_size), dtype=torch.int32, device=self.device
             )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
+            counts[:capacity] = self.counts
+            lens = torch.zeros((new_capacity,), dtype=torch.int32, device=self.device)
+            lens[:capacity] = self.lens
+            self.counts, self.lens = counts, lens
+
+        if not self.pending_init:
+            return
+        indices = list(self.pending_init)
+        histories = list(self.pending_init.values())
+        self.pending_init.clear()
+        indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
+        self.counts[indices_device] = 0
+        self.lens[indices_device] = async_h2d(
+            [len(h) for h in histories], dtype=torch.int32, device=self.device
         )
-
-    def _cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        self.cumulated_frequency_penalties.index_put_(
-            (req_indices, output_ids),
-            self.frequency_penalties[req_indices, 0],
-            accumulate=True,
-        )
-
-    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        logits.sub_(self.cumulated_frequency_penalties)
-
-    def _filter(self, keep_indices: torch.Tensor):
-        self.frequency_penalties = self.frequency_penalties[keep_indices]
-        self.cumulated_frequency_penalties = self.cumulated_frequency_penalties[
-            keep_indices
-        ]
-
-    def _merge(self, their: BatchedFrequencyPenalizer):
-        self.frequency_penalties = torch.cat(
-            [self.frequency_penalties, their.frequency_penalties], dim=0
-        )
-        self.cumulated_frequency_penalties = torch.cat(
-            [self.cumulated_frequency_penalties, their.cumulated_frequency_penalties],
-            dim=0,
-        )
-
-    def _teardown(self) -> None:
-        for name in ("frequency_penalties", "cumulated_frequency_penalties"):
-            if hasattr(self, name):
-                delattr(self, name)
-
-
-class BatchedPresencePenalizer(_BatchedPenalizer):
-    """
-    Presence penalizer penalizes tokens based on their presence in the output.
-    """
-
-    def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.presence_penalty != 0.0
-            for req in self.orchestrator.reqs()
-        )
-
-    def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
-        self.cumulated_presence_penalties = torch.zeros(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        )
-
-        self.presence_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.presence_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                pin_memory=pin_memory,
+        replay_indices = [index for index, h in zip(indices, histories) for _ in h]
+        if replay_indices:
+            replay_tokens = [token for h in histories for token in h]
+            self.counts.index_put_(
+                (
+                    async_h2d(replay_indices, dtype=torch.int64, device=self.device),
+                    async_h2d(replay_tokens, dtype=torch.int64, device=self.device),
+                ),
+                torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
+                accumulate=True,
             )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
-        )
 
-    def _cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        self.cumulated_presence_penalties[req_indices, output_ids] = (
-            self.presence_penalties[req_indices, 0]
-        )
-
-    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        logits.sub_(self.cumulated_presence_penalties)
-
-    def _filter(self, keep_indices: torch.Tensor):
-        self.presence_penalties = self.presence_penalties[keep_indices]
-        self.cumulated_presence_penalties = self.cumulated_presence_penalties[
-            keep_indices
-        ]
-
-    def _merge(self, their: BatchedPresencePenalizer):
-        self.presence_penalties = torch.cat(
-            [self.presence_penalties, their.presence_penalties], dim=0
-        )
-        self.cumulated_presence_penalties = torch.cat(
-            [self.cumulated_presence_penalties, their.cumulated_presence_penalties],
-            dim=0,
-        )
-
-    def _teardown(self) -> None:
-        for name in ("presence_penalties", "cumulated_presence_penalties"):
-            if hasattr(self, name):
-                delattr(self, name)
-
-
-class BatchedRepetitionPenalizer(_BatchedPenalizer):
-    """
-    Repetition penalizer penalizes tokens based on their presence in the generated output.
-    """
-
-    is_multiplicative: bool = True
-
-    def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.repetition_penalty != 1.0
-            for req in self.orchestrator.reqs()
-        )
-
-    def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
-        self.cumulated_repetition_penalties = torch.ones(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        )
-        self.repetition_penalties = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.repetition_penalty
-                    for req in self.orchestrator.reqs()
-                ],
-                dtype=torch.float32,
-                pin_memory=pin_memory,
-            )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
-        )
-
-    def _cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        self.cumulated_repetition_penalties[req_indices, output_ids] = (
-            self.repetition_penalties[req_indices, 0]
-        )
-
-    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
-        apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
-        return logits
-
-    def get_scaling_penalties(self) -> torch.Tensor:
-        return self.cumulated_repetition_penalties
-
-    def _filter(self, keep_indices: torch.Tensor):
-        self.repetition_penalties = self.repetition_penalties[keep_indices]
-        self.cumulated_repetition_penalties = self.cumulated_repetition_penalties[
-            keep_indices
-        ]
-
-    def _merge(self, their: BatchedRepetitionPenalizer):
-        self.repetition_penalties = torch.cat(
-            [self.repetition_penalties, their.repetition_penalties], dim=0
-        )
-        self.cumulated_repetition_penalties = torch.cat(
-            [self.cumulated_repetition_penalties, their.cumulated_repetition_penalties],
-            dim=0,
-        )
-
-    def _teardown(self) -> None:
-        for name in ("repetition_penalties", "cumulated_repetition_penalties"):
-            if hasattr(self, name):
-                delattr(self, name)
-
-
-class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
-    """
-    Min new tokens penalizer penalizes tokens based on the length of the output.
-    """
-
-    def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.min_new_tokens > 0 for req in self.orchestrator.reqs()
-        )
-
-    def _prepare(self):
-        pin_memory = is_pin_memory_available(self.orchestrator.device)
-        self.min_new_tokens = (
-            torch.tensor(
-                data=[
-                    req.sampling_params.min_new_tokens
-                    for req in self.orchestrator.reqs()
-                ],
+    def gather_counts(self, indices: torch.Tensor) -> torch.Tensor:
+        self._flush()
+        if self.num_indices == 0:
+            return torch.zeros(
+                (indices.shape[0], self.vocab_size),
                 dtype=torch.int32,
-                pin_memory=pin_memory,
+                device=self.device,
             )
-            .to(self.orchestrator.device, non_blocking=True)
-            .unsqueeze_(1)
+        return self.counts[indices]
+
+    def gather_lens(self, indices: torch.Tensor) -> torch.Tensor:
+        self._flush()
+        if self.num_indices == 0:
+            return torch.zeros(
+                (indices.shape[0],), dtype=torch.int32, device=self.device
+            )
+        return self.lens[indices]
+
+    def accumulate(
+        self,
+        indices: torch.Tensor,
+        token_ids: torch.Tensor,
+        accept_mask: Optional[torch.Tensor],
+    ) -> None:
+        self._flush()
+        if self.num_indices == 0:
+            return
+        token_ids = token_ids.view(indices.shape[0], -1).long()
+        # A NaN-logit sample or a masked draft slot can hold an id outside the vocab.
+        counted = (token_ids >= 0) & (token_ids < self.vocab_size)
+        if accept_mask is not None:
+            counted &= accept_mask.view(token_ids.shape)
+        weights = counted.to(torch.int32)
+        token_ids = token_ids.clamp(0, self.vocab_size - 1)
+        if token_ids.shape[1] == 1:
+            # Indices are distinct, so no (index, token) pair repeats: a plain add is exact.
+            self.counts[indices, token_ids.view(-1)] += weights.view(-1)
+        else:
+            self.counts.index_put_(
+                (
+                    indices.unsqueeze(1).expand_as(token_ids).reshape(-1),
+                    token_ids.reshape(-1),
+                ),
+                weights.reshape(-1),
+                accumulate=True,
+            )
+        self.lens.index_add_(0, indices, weights.sum(dim=1, dtype=torch.int32))
+
+
+@dataclasses.dataclass
+class StepPenalties:
+    pool: PenaltyStatusPool
+    batch_size: int
+    # [n] batch positions and penalty indices of the n penalized requests.
+    batch_indices: torch.Tensor
+    penalty_indices: torch.Tensor
+    # [n, 1] per penalized request, None when none of them uses that penalty.
+    frequency: Optional[torch.Tensor]
+    presence: Optional[torch.Tensor]
+    repetition: Optional[torch.Tensor]
+    min_new_tokens: Optional[torch.Tensor]
+    # [n, k] stop token ids, padded with vocab_size; set with min_new_tokens.
+    stop_token_ids: Optional[torch.Tensor]
+    _tables: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = (
+        dataclasses.field(default=None, init=False, repr=False, compare=False)
+    )
+
+    @classmethod
+    def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
+        batch_indices = [i for i, r in enumerate(reqs) if r.penalty_index is not None]
+        if not batch_indices:
+            return None
+        penalty_indices = [reqs[i].penalty_index for i in batch_indices]
+
+        device = pool.device
+        params = [reqs[i].sampling_params for i in batch_indices]
+        uses_frequency, uses_presence, uses_repetition, uses_min_new_tokens = (
+            any(kind) for kind in zip(*(_penalty_kinds(p) for p in params))
         )
 
-        vocab_size = self.orchestrator.vocab_size
-        padded_stop_token_ids_cpu = torch.nn.utils.rnn.pad_sequence(
-            sequences=[
-                torch.tensor(
-                    data=[
-                        token_id
-                        for token_id in (
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.eos_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | (
-                                {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
-                                else set()
-                            )
-                        )
-                        # Out-of-vocab ids can never be sampled;
-                        # scattering them would index outside the penalty tensor.
-                        if token_id is not None and 0 <= token_id < vocab_size
-                    ],
-                    dtype=torch.int64,
-                )
-                for req in self.orchestrator.reqs()
-            ],
-            batch_first=True,
-            padding_value=self.orchestrator.vocab_size,
-        )
-        if pin_memory:
-            padded_stop_token_ids_cpu = padded_stop_token_ids_cpu.pin_memory()
-        padded_stop_token_ids = padded_stop_token_ids_cpu.to(
-            self.orchestrator.device, non_blocking=True
-        )
-        self.stop_token_penalties = torch.zeros(
-            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
-            dtype=torch.float32,
-            device=self.orchestrator.device,
-        ).scatter_add_(
-            dim=1,
-            index=padded_stop_token_ids,
-            src=torch.full_like(
-                input=padded_stop_token_ids,
-                dtype=torch.float32,
-                fill_value=float("-inf"),
-                device=self.orchestrator.device,
+        def per_request(values, dtype, needed):
+            if not needed:
+                return None
+            return async_h2d(values, dtype=dtype, device=device).unsqueeze_(1)
+
+        stop_token_ids = None
+        if uses_min_new_tokens:
+            stop_sets = [
+                _stop_token_ids(reqs[i], pool.vocab_size) for i in batch_indices
+            ]
+            width = max(1, max(len(s) for s in stop_sets))
+            padded = [s + [pool.vocab_size] * (width - len(s)) for s in stop_sets]
+            stop_token_ids = async_h2d(padded, dtype=torch.int64, device=device)
+
+        return cls(
+            pool=pool,
+            batch_size=len(reqs),
+            batch_indices=async_h2d(batch_indices, dtype=torch.int64, device=device),
+            penalty_indices=async_h2d(
+                penalty_indices, dtype=torch.int64, device=device
             ),
-        )[:, : self.orchestrator.vocab_size]
-
-        self.len_output_tokens = torch.zeros(
-            size=(len(self.orchestrator.reqs()), 1),
-            dtype=torch.int32,
-            device=self.orchestrator.device,
+            frequency=per_request(
+                [p.frequency_penalty for p in params], torch.float32, uses_frequency
+            ),
+            presence=per_request(
+                [p.presence_penalty for p in params], torch.float32, uses_presence
+            ),
+            repetition=per_request(
+                [p.repetition_penalty for p in params], torch.float32, uses_repetition
+            ),
+            min_new_tokens=per_request(
+                [p.min_new_tokens for p in params], torch.int32, uses_min_new_tokens
+            ),
+            stop_token_ids=stop_token_ids,
         )
 
-    def _cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: torch.Tensor
-    ):
-        self.len_output_tokens.index_add_(
-            0,
-            req_indices,
-            req_indices.new_ones((len(req_indices), 1), dtype=torch.int32),
+    def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """(additive, scaling) [batch_size, vocab] penalties, each None if unused;
+        built on the first call, which must run on the sampling stream."""
+        if self._tables is None:
+            self._tables = self._build_tables()
+        return self._tables
+
+    def _build_tables(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        counts = self.pool.gather_counts(self.penalty_indices)
+        vocab_size = self.pool.vocab_size
+        device = counts.device
+        present = (
+            counts > 0
+            if self.presence is not None or self.repetition is not None
+            else None
         )
 
-    def _apply(self, logits: torch.Tensor):
-        # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
-        # device-to-host sync every decode step; torch.where is a plain
-        # elementwise select with no sync (and no -inf*0=nan).
-        mask = self.len_output_tokens < self.min_new_tokens
-        logits.add_(torch.where(mask, self.stop_token_penalties, 0.0))
+        additive = None
+        if (
+            self.frequency is not None
+            or self.presence is not None
+            or self.min_new_tokens is not None
+        ):
+            additive = torch.zeros(counts.shape, dtype=torch.float32, device=device)
+            if self.frequency is not None:
+                additive.addcmul_(counts, self.frequency, value=-1)
+            if self.presence is not None:
+                additive.addcmul_(present, self.presence, value=-1)
+            if self.min_new_tokens is not None:
+                lens = self.pool.gather_lens(self.penalty_indices)
+                stop_penalties = torch.zeros(
+                    (counts.shape[0], vocab_size + 1),
+                    dtype=torch.float32,
+                    device=device,
+                ).scatter_(1, self.stop_token_ids, float("-inf"))[:, :vocab_size]
+                # torch.where, not a boolean index: no host sync, no -inf * 0.
+                additive.add_(
+                    torch.where(
+                        lens.unsqueeze(1) < self.min_new_tokens, stop_penalties, 0.0
+                    )
+                )
+            additive = self._to_batch(additive, 0.0)
 
-    def _filter(self, keep_indices: torch.Tensor):
-        self.min_new_tokens = self.min_new_tokens[keep_indices]
-        self.stop_token_penalties = self.stop_token_penalties[keep_indices]
-        self.len_output_tokens = self.len_output_tokens[keep_indices]
+        scaling = None
+        if self.repetition is not None:
+            scaling = torch.where(present, self.repetition, 1.0)
+            scaling = self._to_batch(scaling, 1.0)
+        return additive, scaling
 
-    def _merge(self, their: BatchedMinNewTokensPenalizer):
-        self.min_new_tokens = torch.cat(
-            [self.min_new_tokens, their.min_new_tokens], dim=0
+    def _to_batch(self, values: torch.Tensor, fill: float) -> torch.Tensor:
+        if self.batch_indices.numel() == self.batch_size:
+            return values
+        out = torch.full(
+            (self.batch_size, values.shape[1]),
+            fill,
+            dtype=values.dtype,
+            device=values.device,
         )
-        self.stop_token_penalties = torch.cat(
-            [self.stop_token_penalties, their.stop_token_penalties], dim=0
-        )
-        self.len_output_tokens = torch.cat(
-            [self.len_output_tokens, their.len_output_tokens], dim=0
-        )
+        out[self.batch_indices] = values
+        return out
 
-    # Explicit resource cleanup to aid GC and free CUDA memory promptly
-    def _teardown(self) -> None:
-        for name in ("min_new_tokens", "stop_token_penalties", "len_output_tokens"):
-            if hasattr(self, name):
-                delattr(self, name)
+    def commit(
+        self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
+    ) -> None:
+        """token_ids: [batch_size] sampled ids, or [batch_size, k] verify tokens
+        with `accept_mask` marking the ones that count."""
+        token_ids = token_ids.view(self.batch_size, -1)
+        if accept_mask is not None:
+            accept_mask = accept_mask.view(self.batch_size, -1)
+        if self.batch_indices.numel() != self.batch_size:
+            token_ids = token_ids[self.batch_indices]
+            if accept_mask is not None:
+                accept_mask = accept_mask[self.batch_indices]
+        self.pool.accumulate(self.penalty_indices, token_ids, accept_mask)
+
+
+def _stop_token_ids(req, vocab_size: int) -> List[int]:
+    stop_ids = (
+        (req.sampling_params.stop_token_ids or set())
+        | (req.eos_token_ids or set())
+        | (req.tokenizer.additional_stop_token_ids or set())
+        | (
+            {req.tokenizer.eos_token_id}
+            if req.tokenizer.eos_token_id is not None
+            else set()
+        )
+    )
+    # Out-of-vocab ids would index outside the penalty tensor.
+    return [
+        token_id
+        for token_id in stop_ids
+        if token_id is not None and 0 <= token_id < vocab_size
+    ]

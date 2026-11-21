@@ -28,6 +28,7 @@ from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
+    commit_accept_tokens_to_penalties,
     eagle_prepare_for_verify,
     eagle_sample,
 )
@@ -997,6 +998,7 @@ def run_eagle_verify(
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
         )
+    commit_accept_tokens_to_penalties(batch.sampling_info, predict, accept_index)
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:
