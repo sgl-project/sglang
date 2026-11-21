@@ -131,6 +131,14 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             if cfg.moe_runner_backend == "auto":
                 overrides["moe_runner_backend"] = "deep_gemm"
         overrides.update(page_size=128)
+        # CUTLASS MXFP8 ships prebuilt and runs prefill faster; CuTe-DSL compiles
+        # one kernel per tuned tactic at every start but decodes large batches
+        # faster, so decode-only servers keep it.
+        if (
+            cfg.fp8_gemm_runner_backend == "auto"
+            and cfg.disaggregation_mode != "decode"
+        ):
+            overrides["fp8_gemm_runner_backend"] = "flashinfer_cutlass"
         if cfg.kv_cache_dtype == "auto":
             overrides["kv_cache_dtype"] = "fp8_e4m3"
         elif cfg.kv_cache_dtype != "fp8_e4m3":
