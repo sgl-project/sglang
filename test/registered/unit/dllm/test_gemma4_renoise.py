@@ -193,13 +193,14 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertEqual(algorithm.step(batch, logits, states), [False])
         self.assertEqual(algorithm.step(batch, logits, states), [True])
 
-    def test_launch_constraints_are_owned_by_algorithm(self):
+    @staticmethod
+    def _launch_args(device):
         hf_config = SimpleNamespace(
             tie_word_embeddings=True,
             text_config=SimpleNamespace(tie_word_embeddings=True),
         )
-        server_args = SimpleNamespace(
-            device="cuda",
+        return SimpleNamespace(
+            device=device,
             _model_config=SimpleNamespace(hf_config=hf_config, quantization=None),
             model_path="diffusiongemma",
             pp_size=1,
@@ -215,6 +216,9 @@ class TestGemma4Renoise(unittest.TestCase):
             ),
             chunked_prefill_size=128,
         )
+
+    def test_launch_constraints_are_owned_by_algorithm(self):
+        server_args = self._launch_args("cuda")
 
         Gemma4Renoise.configure_server_args(server_args)
 
@@ -232,6 +236,14 @@ class TestGemma4Renoise(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "GPU execution"):
             Gemma4Renoise.configure_server_args(SimpleNamespace(device="cpu"))
+
+    def test_xpu_passes_the_device_gate(self):
+        """Intel XPU was rejected with "supports CUDA/ROCm GPU execution only"."""
+        server_args = self._launch_args("xpu")
+
+        Gemma4Renoise.configure_server_args(server_args)
+
+        self.assertEqual(resolving_view(server_args).chunked_prefill_size, -1)
 
     def test_required_attention_backend_uses_generic_override_pass(self):
         view = SimpleNamespace(
