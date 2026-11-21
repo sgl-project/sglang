@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     PrefillAdder,
+    mamba_branch_chunk_grid,
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
@@ -45,6 +46,7 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    branching_seqlen: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -64,7 +66,7 @@ def _prepare_extend(
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
@@ -365,6 +367,111 @@ class TestMambaTrackGrid(unittest.TestCase):
 
     def test_grid_stays_on_the_chunk_size(self):
         self.assertEqual(self._grid(interval=192, tree_page=64, chunk=128) % 128, 0)
+
+
+class TestMambaBranchChunkAlignment(unittest.TestCase):
+    """REGRESSION (#51902): chunk cuts before `mamba_branching_seqlen` must leave
+    the chunk covering the fork point on the checkpoint grid so
+    `branch_checkpoint` captures the fork state instead of dropping it."""
+
+    def _adder(self, branch_grid: int = CHUNK) -> PrefillAdder:
+        adder = object.__new__(PrefillAdder)
+        adder.mamba_branch_grid = branch_grid
+        return adder
+
+    def _req(self, branching_seqlen: int | None) -> SimpleNamespace:
+        return SimpleNamespace(mamba_branching_seqlen=branching_seqlen)
+
+    def test_off_grid_chunks_before_fork_align_so_branch_is_captured(self):
+        # Exact #51902 scenario: chunk size 1000, fork at 2368, prompt 2416.
+        adder = self._adder()
+        req = self._req(2368)
+        prefix, total, budget = 0, 2416, 1000
+        cuts = []
+        while prefix < total:
+            raw = min(budget, total - prefix)
+            step = adder.align_branch_chunk_tokens(
+                req, prefix, raw, allow_new_split=True
+            )
+            cuts.append((prefix, step))
+            prefix += step
+
+        # Chunks: [0, 960), [960, 1920), [1920, 2416).
+        self.assertEqual(cuts, [(0, 960), (960, 960), (1920, 496)])
+        # The chunk covering 2368 starts at 1920, so the tracker captures 2368.
+        entry, tracked_req = _prepare_extend(
+            tree_page=1,
+            prefix_len=1920,
+            extend_len=496,
+            branching_seqlen=2368,
+        )
+        self.assertTrue(entry.track_mask)
+        self.assertEqual(tracked_req.kv.mamba_last_track_seqlen, 2368)
+
+    def test_off_grid_prefix_hit_splits_before_fork_when_allowed(self):
+        # Request resumed from an off-grid checkpoint at 1448 with fork at 2368.
+        adder = self._adder()
+        req = self._req(2368)
+        # Splitting allowed: cuts at 2368 - 64 = 2304 (extend_len = 856).
+        first = adder.align_branch_chunk_tokens(req, 1448, 1052, allow_new_split=True)
+        self.assertEqual(first, 2304 - 1448)
+        # Next chunk starts at 2304 -> (2368 - 2304) % 64 == 0.
+        second = adder.align_branch_chunk_tokens(req, 2304, 196, allow_new_split=True)
+        self.assertEqual(second, 196)
+        # When splitting is disallowed (another chunked req already in flight),
+        # leave the chunk untouched.
+        unsplit = adder.align_branch_chunk_tokens(
+            req, 1448, 1052, allow_new_split=False
+        )
+        self.assertEqual(unsplit, 1052)
+        # Under strict_chunk_grid, do not split to a chunk shorter than grid.
+        strict_adder = self._adder()
+        strict_adder.strict_chunk_grid = True
+        self.assertEqual(
+            strict_adder.align_branch_chunk_tokens(
+                req, 2280, 200, allow_new_split=True
+            ),
+            200,
+        )
+
+    def test_no_branch_or_tiny_chunk_is_untouched(self):
+        adder = self._adder()
+        self.assertEqual(
+            adder.align_branch_chunk_tokens(
+                self._req(None), 0, 1000, allow_new_split=True
+            ),
+            1000,
+        )
+        # Tiny budget shorter than one grid drop must still make progress.
+        self.assertEqual(
+            adder.align_branch_chunk_tokens(
+                self._req(2368), 0, 32, allow_new_split=True
+            ),
+            32,
+        )
+        # Past the fork point, cuts are untouched.
+        self.assertEqual(
+            adder.align_branch_chunk_tokens(
+                self._req(960), 960, 1000, allow_new_split=True
+            ),
+            1000,
+        )
+
+    def test_mamba_branch_chunk_grid_respects_extra_buffer_flag(self):
+        tree = SimpleNamespace(page_size=16)
+        with get_context().override_server_args(
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer",
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            self.assertEqual(mamba_branch_chunk_grid(tree), CHUNK)
+        with get_context().override_server_args(
+            disable_radix_cache=True,
+            mamba_radix_cache_strategy="extra_buffer",
+            _mamba_cache_chunk_size=CHUNK,
+        ):
+            self.assertEqual(mamba_branch_chunk_grid(tree), 1)
+        self.assertEqual(mamba_branch_chunk_grid(None), 1)
 
 
 if __name__ == "__main__":

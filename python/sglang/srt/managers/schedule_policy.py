@@ -989,6 +989,21 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     return 1
 
 
+def mamba_branch_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> int:
+    """Checkpoint grid used to keep chunk cuts aligned ahead of a request's
+    `mamba_branching_seqlen`, or 1 when mamba extra-buffer caching is off."""
+    ctx = get_context()
+    page_size = getattr(tree_cache, "page_size", None)
+    if not (
+        isinstance(page_size, int)
+        and page_size > 0
+        and ctx.is_config_namespace_published("exec")
+        and get_exec().mamba.enable_mamba_extra_buffer
+    ):
+        return 1
+    return mamba_checkpoint_grid(page_size)
+
+
 def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> bool:
     """Whether a prefill retires window rows only behind the state checkpoints
     its chunks take, so no chunk but a prompt's last may be cut below the grid."""
@@ -1034,6 +1049,7 @@ class PrefillAdder:
         # Without DCP the prefix-relative depth rule already donates, and
         # rounding would only shorten the chunk.
         self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
+        self.mamba_branch_grid = mamba_branch_chunk_grid(tree_cache)
         # Whether every cut must land on that grid, never below it.
         self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -1299,6 +1315,53 @@ class PrefillAdder:
             return limit
         grid = self.mamba_chunk_grid
         return max(limit // grid * grid, min(grid, remaining))
+
+    def align_branch_chunk_tokens(
+        self,
+        req: Req,
+        prefix_len: int,
+        extend_len: int,
+        *,
+        allow_new_split: bool,
+        align_size: Optional[int] = None,
+    ) -> int:
+        """Keep chunk cuts before `req.mamba_branching_seqlen` aligned so the
+        chunk covering the fork point starts on a `mamba_checkpoint_grid`
+        offset from the fork and can capture the fork-point Mamba checkpoint.
+        """
+        branch = req.mamba_branching_seqlen
+        grid = getattr(self, "mamba_branch_grid", 1)
+        if branch is None or prefix_len >= branch or grid <= 1 or extend_len <= 0:
+            return extend_len
+        step = math.lcm(grid, align_size) if align_size and align_size > 1 else grid
+        strict = getattr(self, "strict_chunk_grid", False)
+        end = prefix_len + extend_len
+        if end < branch:
+            # Intermediate chunk strictly before the fork: round its end down
+            # so `(branch - new_end) % step == 0`.
+            rem = (branch - end) % step
+            if rem != 0:
+                drop = step - rem
+                new_len = extend_len - drop
+                if new_len > 0 and (not strict or new_len >= grid):
+                    return new_len
+            return extend_len
+        # This chunk reaches or crosses `branch`. If `prefix_len` started off
+        # the checkpoint grid relative to `branch` (e.g. from an earlier
+        # off-grid checkpoint or tiny chunk), cut at `branch - grid` when
+        # splitting is allowed so the next chunk lands on `branch`.
+        if (
+            allow_new_split
+            and (branch - prefix_len) % grid != 0
+            and branch - grid > prefix_len
+        ):
+            cut_len = (branch - grid) - prefix_len
+            if strict and cut_len < grid:
+                return extend_len
+            if align_size and align_size > 1 and cut_len % align_size != 0:
+                return extend_len
+            return cut_len
+        return extend_len
 
     @capacity_decision
     def budget_state(self):
@@ -1731,6 +1794,17 @@ class PrefillAdder:
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
+        if self.dllm_config is None and not self.kv_shard_granule:
+            branch_len = self.align_branch_chunk_tokens(
+                req,
+                req.prefix_len,
+                new_len,
+                allow_new_split=True,
+                align_size=self.mamba_chunk_grid if self.mamba_chunk_grid > 1 else None,
+            )
+            if branch_len < new_len:
+                new_len = branch_len
+                truncated = True
         if new_len <= 0:
             # No progress this pass: wait rather than run an empty chunk.
             return req
@@ -2317,6 +2391,24 @@ class PrefillAdder:
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
+
+        if (
+            self.dllm_config is None
+            and not self.kv_shard_granule
+            and self.rem_chunk_tokens is not None
+        ):
+            branch_len = self.align_branch_chunk_tokens(
+                req,
+                prefix_len,
+                extend_len,
+                allow_new_split=is_chunked or not has_chunked_req,
+                align_size=truncation_align_size,
+            )
+            if branch_len < extend_len:
+                extend_len = branch_len
+                is_chunked = True
+                max_new_tokens = 0
+                tile_tokens = extend_len
 
         if (
             self.dllm_config is None
