@@ -43,6 +43,9 @@ docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
 # Ascend NPU (A2/A3 Series)
 docker pull lmsysorg/sglang:dsv32-a2
 docker pull lmsysorg/sglang:dsv32-a3
+
+# Ascend NPU A3 Series, 4-node PD disaggregation (reference recipe; see Section 3.3)
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 ```
 
 ## 3. Model Deployment
@@ -51,7 +54,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, and AMD MI300X/MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, AMD MI300X/MI355X GPUs, and Ascend A3 NPUs. For Ascend A3, select the node role and node rank to get the command for each node in the 4-node PD disaggregated deployment described in [Section 3.3](#3-3-ascend-npu-deployment).
 
 import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32-deployment.jsx";
 
@@ -74,6 +77,107 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
     --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
   ```
 - **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
+
+### 3.3 Ascend NPU Deployment
+
+This section documents the upstream 4-node A3 recipe: two 8-card prefill nodes and two 8-card decode nodes. Each node contributes 16 dies, so each PD instance spans two nodes with TP 32; the deployment uses 32 cards (64 dies) total. The accuracy and performance results below are reported results from [PR #46271](https://github.com/sgl-project/sglang/pull/46271) for this 4-node 2P2D configuration.
+
+The checkpoint source reports a download size of 695 GB. One available checkpoint copy occupied 647 GB on disk; that measurement applies to that copy. Disk size alone does not establish device-memory fit; each PD role distributes its weights across 32 dies.
+
+<Warning>
+The flags below reproduce the [DeepSeek-V3.2 Ascend best practice](../../../docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2), frozen at `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Treat this as a reference recipe, not an end-to-end validation by this Cookbook's author. Validate it on the target 4-node cluster before production use.
+</Warning>
+
+#### 3.3.1 Target Test Configuration (4 × A3)
+
+The following is the target configuration used for the four-node 2P2D recipe. The benchmark results below are reported in [PR #46271](https://github.com/sgl-project/sglang/pull/46271); they are not a fresh validation run by this Cookbook page.
+
+| Component | Target configuration |
+| --- | --- |
+| Hardware | Atlas 800T A3 ×4; 8 cards (16 dies) per node |
+| Deployment | 2 prefill nodes + 2 decode nodes; TP 32 per instance |
+| Image | `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3` |
+| Checkpoint | DeepSeek-V3.2-W8A8; revision `8c4f13004d0742b650b9f2c51b751dbef7d0c1ee` |
+
+#### 3.3.2 Target Topology
+
+| Role | Nodes | Cards / dies | Parallelism | Key features |
+| --- | --- | --- | --- | --- |
+| Prefill | 2 | 16 cards / 32 dies | TP 32, CP 32 (zigzag) | DeepEP normal mode, INT8 dispatch, MTP (1 step) |
+| Decode | 2 | 16 cards / 32 dies | TP 32, DP attention 8, EP 32 | DeepEP low-latency mode, NPU graph, MTP (3 steps) |
+| Router | any host | — | — | `sglang_router` in PD mode, `cache_aware` policy |
+
+On A3, each card has two dies, so `--tp 32` uses all 16 cards of a two-node instance. See the [Ascend NPU glossary](../../../docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+
+#### 3.3.3 Prerequisites
+
+The table above is the four-node target recipe. The accuracy and performance values below are planning estimates for that same 4-node 2P2D topology, not recorded test results.
+
+1. Set up four A3 servers with eight cards (16 dies) each as described in the [Ascend NPU quick start](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start). Start each container with its eight local `davinci` devices mounted, as shown in the [DeepSeek-V3.2 Ascend tutorial](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2#installation). The launch script tunes kernel parameters with `sysctl`, so the container must run with `--privileged=true --net=host`.
+2. Download [DeepSeek-V3.2-W8A8](https://www.modelscope.cn/models/sgl-npu/DeepSeek-V3.2-W8A8) (source-listed size 695 GB) to storage readable by all four nodes, and mount it into each container.
+
+#### 3.3.4 Launch
+
+In the [Interactive Command Generator](#3-1-basic-configuration), select **Ascend A3** as the hardware platform, then:
+
+1. For each prefill node, select **Prefill** and its **Node Rank**, replace the `<...>` placeholders and the model path, and run the command. Do the same for each decode node with **Decode**.
+2. Wait until the logs of both prefill and decode node 0 print `The server is fired up and ready to roll!`.
+3. Select **Router** and run the router command. It listens on port `6688`.
+
+Node 0 of each instance is its head node: `--dist-init-addr` points to it, and the router connects to it. `ASCEND_MF_STORE_URL` must point to prefill node 0 on all four nodes.
+
+The prefill and decode servers listen on port `30000`, instead of the best-practice ports `8000` and `8001`. The generator adapts node addressing and port selection; review the generated command against the upstream recipe when changing other flags.
+
+#### 3.3.5 Reported Accuracy (4-node 2P2D)
+
+Four Atlas A3 nodes with PD disaggregated deployment (2 Prefill workers + 2 Decode workers), managed through one Router.
+
+The table below reports the full GSM8K result from PR #46271. It combines the reported thinking on/off runs; rerun the command on the target cluster to obtain a result for the current image and configuration.
+
+| Deployment | Reported correct | Reported score | Request errors |
+| --- | --- | --- | --- |
+| 4×A3, PD disaggregated (2P2D) | approximately 1256/1319 | 95.22% | 0 |
+
+The PR reports that the generated commands were launched on this setup after replacing the placeholders (Prefill node 0, Prefill node 1, Decode node 0, Decode node 1, and Router). Functional checks (plain, streaming, multi-turn, reasoning, and concurrent chat requests) passed, and the logs of all four workers and the Router showed no errors or hangs during the reported accuracy and speed runs.
+
+#### 3.3.6 Estimated Speed (4-node 2P2D)
+
+Three consecutive runs of the best-practice benchmark (random dataset, 131072 input / 1024 output tokens, `--random-range-ratio 1`) through the Router against one running service, with no restart or tuning between runs. Mean TPOT per run:
+
+| Workload | Run 1 | Run 2 | Run 3 | Average |  Reference |
+| --- | --- | --- | --- | --- | --- |
+| Co-located (896 req, concurrency 224) | 50.77 | 53.06 | 54.13 | 52.65 ms | 50 ms |
+| 4×A3 2P2D (1664 req, concurrency 416) | 43.85 | 44.32 | 44.06 | 44.08 ms | 50 ms |
+| 4×A3 2P2D (3328 req, concurrency 832) | 46.82 | 47.35 | 46.94 | 47.04 ms | 50 ms |
+
+A total of 20,736 requests were included across the three consecutive runs for each deployment configuration. The 4×A3 2P2D deployment achieved an average TPOT of 44.08 ms at concurrency 416 and 47.04 ms at concurrency 832, remaining below the 50 ms reference in all six runs. In contrast, the co-located deployment averaged 52.65 ms, slightly exceeding the reference. The estimated 2P2D results suggest that the deployment can maintain stable TPOT performance even when concurrency is doubled.
+
+#### 3.3.7 Verification
+
+Send a request through the router:
+
+```bash Command
+curl http://127.0.0.1:6688/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+An HTTP 200 response whose content mentions "Paris" confirms that the prefill, decode, and KV transfer paths all work.
+
+For an accuracy run on the target cluster, use the full GSM8K test set with the same sampling settings reported above and record the result before comparing it with the PR result:
+
+```bash Command
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:6688/v1 \
+  --num-examples 1319 \
+  --temperature 1.0 \
+  --top-p 0.95 \
+  --max-tokens 1000
+```
 
 ## 4. Model Invocation
 
