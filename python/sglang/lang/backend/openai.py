@@ -133,7 +133,7 @@ class OpenAI(BaseBackend):
                     "sampling parameters should be consistent if turn on api speculative execution."
                 )
         self.spec_format.append(
-            {"text": "", "stop": params["stop"], "name": spec_var_name}
+            {"text": "", "stop": params["stop"], "name": spec_var_name, "is_gen": True}
         )
         return "", {}
 
@@ -223,26 +223,45 @@ class OpenAI(BaseBackend):
 
     def spec_fill(self, value: str):
         assert self.is_chat_model
-        self.spec_format.append({"text": value, "stop": None, "name": None})
+        self.spec_format.append(
+            {"text": value, "stop": None, "name": None, "is_gen": False}
+        )
 
     def spec_pattern_match(self, comp):
+        for term in self.spec_format:
+            if term.setdefault("is_gen", term["text"] == ""):
+                term["text"] = ""
+
+        captured = {}
         for i, term in enumerate(self.spec_format):
-            text = term["text"]
-            if text != "":
+            if not term["is_gen"]:
+                text = term["text"]
                 if comp.startswith(text):
                     comp = comp[len(text) :]
                 else:
                     return False
             else:
-                pos = comp.find(term["stop"])
-                if pos != -1:
-                    term["text"] = comp[:pos]
-                    comp = comp[pos:]
+                stop = term["stop"]
+                if isinstance(stop, str):
+                    pos = comp.find(stop) if stop else -1
+                elif isinstance(stop, (list, tuple)):
+                    positions = [comp.find(s) for s in stop if s]
+                    valid_positions = [p for p in positions if p != -1]
+                    pos = min(valid_positions) if valid_positions else -1
                 else:
-                    if i == len(self.spec_format) - 1:
-                        term["text"] = comp
-                    else:
-                        return False
+                    pos = -1
+
+                if pos != -1:
+                    captured[i] = comp[:pos]
+                    comp = comp[pos:]
+                elif i == len(self.spec_format) - 1:
+                    captured[i] = comp
+                    comp = ""
+                else:
+                    return False
+
+        for i, val in captured.items():
+            self.spec_format[i]["text"] = val
         return True
 
     def role_end_generate(
@@ -348,7 +367,7 @@ class OpenAI(BaseBackend):
             ret_str = ret.choices[0].text
             ret_token = self.tokenizer.encode(ret_str)[0]
             self.token_usage.prompt_tokens += ret.usage.prompt_tokens
-            self.token_usage.completion_tokens = ret.usage.completion_tokens
+            self.token_usage.completion_tokens += ret.usage.completion_tokens
 
             # TODO:
             # 1. return logits as the scores
