@@ -87,6 +87,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
+    commit_block_accept_tokens_to_penalties,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
@@ -303,10 +304,9 @@ def _is_all_greedy(sampling_info) -> bool:
 
 
 def _verify_logits_unadjusted(sampling_info) -> bool:
-    penalizer = sampling_info.penalizer_orchestrator
     return not (
         sampling_info.has_custom_logit_processor
-        or (penalizer is not None and penalizer.is_required)
+        or sampling_info.step_penalties is not None
         or sampling_info.grammar_mask is not None
         or sampling_info.logit_bias is not None
         or sampling_info.sampling_mask_batch_indices is not None
@@ -520,6 +520,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
+
+    @property
+    def has_bound_runtime(self) -> bool:
+        return self._runtime is not None
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -3690,6 +3694,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
+        commit_block_accept_tokens_to_penalties(
+            batch.sampling_info, out_tokens, commit_lens
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(

@@ -1334,6 +1334,7 @@ class PrefillAdder:
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
         reuses_kv: bool = False,
+        commit_unfinished: bool = False,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -1381,6 +1382,7 @@ class PrefillAdder:
             # prefix before the chunk cached (``prefix_len`` by default).
             admitted_chunk_limit=admitted_chunk_limit,
             cached_tokens=prefix_len if cached_tokens is None else cached_tokens,
+            commit_unfinished=commit_unfinished,
         )
         self.rem_input_tokens -= compute_charge
 
@@ -1789,6 +1791,9 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=_rem_tokens,
+            # Under a chunk cap, requests are admitted after a chunk cut short;
+            # holding its rest and decode keeps them off the KV later passes need.
+            commit_unfinished=truncated and self.chunked_req_limit is not None,
         )
 
         # Return if chunked prefill not finished
