@@ -100,15 +100,17 @@ class Device(msgspec.Struct):
         "garbage-collection generations and freeze the surviving objects, so full collections "
         "stop scanning the long-lived heap. Unlike --gc-freeze-on-idle-secs it needs no idle "
         "time, so it also works on a scheduler that is never idle. Frozen objects are never "
-        "cycle-collected: once every 10 minutes, and after a cache flush or PD role switch, a "
-        "freeze instead unfreezes the heap and runs one full collection first (a pause like "
-        "one full GC), which bounds the cyclic garbage kept frozen; the 10-minute pass also "
-        "checks heap growth, which walks the frozen objects. Choose a value past warm-up. Set "
-        "to 0 to disable.",
+        "cycle-collected, so every this many batches after the first freeze, a full pass "
+        "unfreezes the heap and runs one full collection before freezing again: this bounds "
+        "the cyclic garbage kept frozen, costs one full-GC pause, and can trigger the "
+        "--gc-warning-threshold-secs warning. A cache flush or PD role switch unfreezes the "
+        "heap and runs one full collection while the queues are empty. Each rank counts its "
+        "own launched batches. Choose a value past warm-up, in the thousands. Set to 0 to "
+        "disable.",
     ] = 0
     gc_freeze_every_batches: A[
         int,
-        "With --gc-freeze-after-batches, freeze again every this many batches, so objects "
-        "that became long-lived since are frozen too; a few tens to a few hundred batches "
-        "keeps each freeze short. Set to 0 to freeze once.",
+        "With --gc-freeze-after-batches, also freeze every this many batches between the full "
+        "passes, so objects that became long-lived since are frozen too; a few tens to a few "
+        "hundred batches keeps each freeze short. Set to 0 to freeze only at the full passes.",
     ] = 0
