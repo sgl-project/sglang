@@ -6,3 +6,12 @@ metatags:
 - [Hicache Best Practices](./hicache_best_practices)
 - [Hicache Design](./hicache_design)
 - [Hicache Storage Runtime Attach Detach](./hicache_storage_runtime_attach_detach)
+
+
+## Independent draft host budget
+
+Use `--hicache-draft-size` to set additional draft KV host memory per rank in decimal GB. The default, `0`, preserves existing sizing and packing. A positive value accepts fractional GB and selects a separate host pool for one full-attention MHA/MLA draft, including a draft that would otherwise be packed with the target. Enable HiCache and a speculative draft model first. Fused drafts, SWA-only or hybrid drafts, multiple draft models, and external linkers are not supported by this option.
+
+The draft shares the target's host indices, so its page-aligned token capacity must cover the target's logical host capacity. An insufficient budget fails before allocating the draft payload. Increase `--hicache-draft-size` or reduce the target cache capacity; extra draft slots do not increase target capacity.
+
+This budget is additional to `--hicache-size`. Page alignment, indexer buffers, staging, and allocator metadata can add memory. As with an explicit target size or ratio, a positive draft size disables automatic ratio reduction through `--hicache-host-memory-fraction`.
