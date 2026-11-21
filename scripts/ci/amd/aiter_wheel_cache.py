@@ -57,7 +57,7 @@ def build_environment():
 
 
 def installed_packages():
-    """Every installed distribution except AITER: a rebuild that installs one is not reproducible from the wheel."""
+    # AITER is excluded: the rebuild replaces it, and the wheel carries it.
     return json.dumps(
         sorted(
             f"{distribution.metadata['Name'].lower()}=={distribution.version}"

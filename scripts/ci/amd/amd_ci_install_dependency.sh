@@ -446,6 +446,21 @@ aiter_evict_cache_entry() {
         || { echo "[CI-AITER-CHECK] Cannot evict cache entry; rebuilding without cache"; AITER_CACHE_KEY=""; }
 }
 
+# The rebuilt wheel is only reusable if the rebuild changed neither the tracked ABI nor any installed package.
+aiter_rebuild_is_cacheable() {
+    local built_environment built_packages
+    built_environment=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
+    if [[ "$built_environment" != "$AITER_ENVIRONMENT" ]]; then
+        echo "[CI-AITER-CHECK] Build changed dependency ABI; not caching this wheel"
+        return 1
+    fi
+    built_packages=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" packages 2>/dev/null || true)
+    if [[ "$built_packages" != "$AITER_PACKAGES" ]]; then
+        echo "[CI-AITER-CHECK] Build installed other packages; not caching this wheel"
+        return 1
+    fi
+}
+
 AITER_CACHE_KEY=""
 AITER_CACHE_LOCK=""
 AITER_CACHE_ROOT=/sgl-data/aiter-wheels
@@ -458,10 +473,11 @@ if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SK
     AITER_NAMESPACE="${GITHUB_EVENT_NAME:-local}:${GITHUB_REF:-local}"
     if [[ -n "$AITER_CACHE_HOST" ]] && command -v flock >/dev/null 2>&1; then
         AITER_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
+        # A cache hit installs only the wheel, so the consumer's other packages are part of the key.
         AITER_PACKAGES=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" packages 2>/dev/null || true)
-        AITER_CACHE_KEY=$(python3 scripts/ci/amd/aiter_wheel_cache.py key \
+        [[ -n "$AITER_PACKAGES" ]] && AITER_CACHE_KEY=$(python3 scripts/ci/amd/aiter_wheel_cache.py key \
             --commit "$REPO_AITER_COMMIT" --image "$AITER_IMAGE" --arch "$IMAGE_GFX" \
-            --namespace "$AITER_NAMESPACE" --abi "$AITER_ENVIRONMENT" \
+            --namespace "$AITER_NAMESPACE" --abi "$AITER_ENVIRONMENT $AITER_PACKAGES" \
             --input scripts/ci/amd/amd_ci_install_dependency.sh \
             --input scripts/ci/amd/aiter_wheel_cache.py \
             --input python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
@@ -586,12 +602,8 @@ PY
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS='"$IMAGE_GFX"' PREBUILD_KERNELS=0 \
                 pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/aiter-wheel .
         '; then
-            AITER_BUILT_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
-            if [[ "$AITER_BUILT_ENVIRONMENT" != "$AITER_ENVIRONMENT" ]]; then
-                echo "[CI-AITER-CHECK] Build changed dependency ABI; not caching this wheel"
-            elif [[ -z "$AITER_PACKAGES" || "$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" packages 2>/dev/null || true)" != "$AITER_PACKAGES" ]]; then
-                # A cache hit installs only the wheel, so the rebuild must not have needed other packages.
-                echo "[CI-AITER-CHECK] Build installed other packages; not caching this wheel"
+            if ! aiter_rebuild_is_cacheable; then
+                :
             elif docker exec "$CI_CONTAINER_NAME" bash -c '
                 python3 '"$AITER_CACHE_TOOL"' publish --root '"$AITER_CACHE_ROOT"' \
                     --key '"$AITER_CACHE_KEY"' --wheel /tmp/aiter-wheel/*.whl

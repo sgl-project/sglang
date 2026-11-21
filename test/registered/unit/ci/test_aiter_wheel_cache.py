@@ -65,6 +65,34 @@ echo "[$AITER_CACHE_KEY]"
         self.assertIn("[]", self._evict(docker_status=1))
         self.assertIn("[key]", self._evict(docker_status=0))
 
+    def _cacheable(self, *, environment, packages):
+        installer = (ROOT / "scripts/ci/amd/amd_ci_install_dependency.sh").read_text()
+        function = re.search(
+            r"^aiter_rebuild_is_cacheable\(\) \{.*?^\}$", installer, re.M | re.S
+        ).group(0)
+        script = f"""
+docker() {{
+    case "${{@: -1}}" in
+        environment) echo "{environment}" ;;
+        packages) echo "{packages}" ;;
+    esac
+}}
+CI_CONTAINER_NAME=ci AITER_CACHE_TOOL=tool AITER_ENVIRONMENT=abi AITER_PACKAGES=pkgs
+{function}
+aiter_rebuild_is_cacheable
+"""
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True
+        ).returncode
+
+    def test_rebuild_is_published_only_if_nothing_but_aiter_changed(self):
+        """A cache hit installs only the wheel, so a rebuild that changed the ABI or pulled packages must not publish."""
+        self.assertEqual(self._cacheable(environment="abi", packages="pkgs"), 0)
+        self.assertNotEqual(self._cacheable(environment="abi2", packages="pkgs"), 0)
+        self.assertNotEqual(
+            self._cacheable(environment="abi", packages="pkgs+ninja"), 0
+        )
+
     def _make_wheel(self, directory, complete=True):
         wheel = Path(directory) / "amd_aiter-1-py3-none-any.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
