@@ -1823,17 +1823,6 @@ def max_prefill_buffer_tokens() -> int:
     return prefill_buffer_ceiling_of(get_server_args(), tokens)
 
 
-def max_prefill_forward_tokens() -> int:
-    """Largest token count one prefill forward runs on one DP rank, graph capture included."""
-    from sglang.srt.model_executor.cuda_graph_config import Backend
-
-    tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    cg_config = get_exec().graph.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend != Backend.DISABLED:
-        tokens = max(tokens, cg_config.prefill.max_bs or 0)
-    return tokens
-
-
 def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
     """Return the activation reserve in MB before CUDA graph capture, using current config."""
     schedule = get_schedule()

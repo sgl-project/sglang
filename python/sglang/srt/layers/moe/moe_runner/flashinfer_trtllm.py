@@ -49,10 +49,11 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
-    max_prefill_forward_tokens,
+    get_schedule,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils.device import is_flashinfer_available
-from sglang.srt.utils.log_utils import print_info_once, print_warning_once
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.triton_utils import next_power_of_2
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -1559,10 +1560,6 @@ def _run_cuda_mxfp4_decode_moe(
 _MXFP4_MOE_WORKSPACE = "trtllm_gen_mxfp4_moe_workspace"
 
 
-def _mxfp4_moe_workspace_tokens() -> int:
-    return next_power_of_2(max_prefill_forward_tokens() * deployment_attn_dp_size())
-
-
 def reserve_trtllm_mxfp4_moe_workspace(
     *, layer: Module, hidden_size: int, intermediate_size: int, precision: str
 ) -> None:
@@ -1571,7 +1568,8 @@ def reserve_trtllm_mxfp4_moe_workspace(
 
     if get_disagg().disaggregation_mode == "decode":
         return
-    max_num_tokens = _mxfp4_moe_workspace_tokens()
+    prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    max_num_tokens = next_power_of_2(prefill_tokens * deployment_attn_dp_size())
     activation_type = (
         ActivationType.Situ
         if layer.moe_runner_config.activation == "situ"
@@ -1602,17 +1600,6 @@ def reserve_trtllm_mxfp4_moe_workspace(
         f"trtllm-gen MXFP4 MoE workspace reserved: {num_bytes / (1 << 30):.2f} GiB "
         f"for {max_num_tokens} tokens"
     )
-
-
-def _mxfp4_moe_workspace(num_tokens: int) -> Optional[torch.Tensor]:
-    workspace_buffer = get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
-    if workspace_buffer is not None and num_tokens > _mxfp4_moe_workspace_tokens():
-        print_warning_once(
-            f"trtllm-gen MXFP4 MoE forward of {num_tokens} tokens exceeds the "
-            f"{_mxfp4_moe_workspace_tokens()}-token workspace; "
-            "the overflow is allocated per call."
-        )
-    return workspace_buffer
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1804,7 +1791,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
                 # flashinfer rejects workspace_buffer with do_finalize=False.
                 workspace_buffer=(
-                    None if defer_finalize else _mxfp4_moe_workspace(x_quant.shape[0])
+                    None
+                    if defer_finalize
+                    else get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
                 ),
             )
             if defer_finalize:
@@ -1856,7 +1845,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-            workspace_buffer=_mxfp4_moe_workspace(x_quant.shape[0]),
+            workspace_buffer=get_resources().buffers.get(_MXFP4_MOE_WORKSPACE),
         )
         return StandardCombineInput(hidden_states=symm_output)
 
@@ -1892,7 +1881,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-        workspace_buffer=_mxfp4_moe_workspace(x_quant.shape[0]),
+        workspace_buffer=get_resources().buffers.get(_MXFP4_MOE_WORKSPACE),
     )[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 
