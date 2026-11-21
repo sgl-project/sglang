@@ -513,6 +513,14 @@ On AWS, assign the serving workload an IAM role scoped to its output bucket.
 Leave both SGLang credential variables unset so [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)
 can obtain and refresh the role's temporary credentials.
 
+The video exporter and MiniMax H3 launch their local FFmpeg/FFprobe processes
+with executable and library paths, locale, temporary-directory, device and
+thread settings. They do not copy arbitrary service environment variables into
+these children. Custom codec wrappers should not depend on storage credentials.
+This is not a sandbox: use separate identities and filesystem and network
+restrictions for workloads that do not trust each other. Third-party libraries
+that launch their own processes are outside this guarantee.
+
 ```bash Command
 export SGLANG_CLOUD_STORAGE_TYPE=s3
 export SGLANG_S3_BUCKET_NAME=my-bucket
