@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -19,6 +20,9 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
+
+_DLLM_STAGING_PHASES = (DllmReqPhase.STAGING_PREFILL, DllmReqPhase.STAGING_DECODE)
+_DLLM_INCOMING_PHASES = (DllmReqPhase.INCOMING_PREFILL, DllmReqPhase.INCOMING_DECODE)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -37,6 +41,36 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
             abort=self._abort_dllm_req,
         )
+        # Counted unconditionally so the disabled case reports a real zero
+        # rather than a missing field in get_internal_state.
+        self.dllm_num_rounds = 0
+        self.dllm_num_mixed_rounds = 0
+        self.dllm_mixed_batch_enabled = False
+        if self.dllm_config is not None and envs.SGLANG_ENABLE_DLLM_MIXED_BATCH.get():
+            # FDFO only: a round is one denoise step, so a prompt-only row
+            # self-finishes on it. The synchronous loop forwards until every
+            # block resolves, which a prompt row would ride for no reason.
+            # Separate context encoding runs prefill rows as their own EXTEND
+            # forward, which a mixed DLLM_EXTEND round cannot carry.
+            self.dllm_mixed_batch_enabled = (
+                self.dllm_config.first_done_first_out_mode
+                and not self.dllm_config.requires_separate_context_encoding
+            )
+            if self.dllm_mixed_batch_enabled:
+                logger.info(
+                    "dLLM prefill and decode rows are scheduled into one round."
+                )
+            elif not self.dllm_config.first_done_first_out_mode:
+                logger.warning(
+                    "SGLANG_ENABLE_DLLM_MIXED_BATCH needs --dllm-fdfo; "
+                    "keeping the prefill-first dLLM rounds."
+                )
+            else:
+                logger.warning(
+                    "SGLANG_ENABLE_DLLM_MIXED_BATCH cannot mix rounds for an "
+                    "algorithm that encodes context in a separate EXTEND "
+                    "forward; keeping the prefill-first dLLM rounds."
+                )
 
     def _abort_dllm_req(self: Scheduler, req: Req) -> None:
         self.request_retirer.abort(req)
@@ -289,8 +323,19 @@ class SchedulerDllmMixin:
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
     ) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
-        # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
+        if self.dllm_mixed_batch_enabled and self._should_mix_dllm_batches(
+            num_prefill_reqs=len(prefill_reqs),
+            num_decode_reqs=len(self.dllm_manager.get_decode_requests()),
+            round_capacity=max(
+                self.dllm_manager.max_running_reqs - len(running_batch.reqs), 0
+            ),
+            priority_preemption_enabled=self.enable_priority_preemption,
+        ):
+            self._process_dllm_batches_mixed(adder, running_batch=running_batch)
+            return ForwardMode.DLLM_EXTEND
+
+        # Try prefill batch first
         if prefill_reqs:
             self._process_batch_by_phase(
                 adder,
@@ -315,6 +360,92 @@ class SchedulerDllmMixin:
                 running_batch=running_batch,
             )
             return ForwardMode.DLLM_EXTEND
+
+    @staticmethod
+    def _should_mix_dllm_batches(
+        *,
+        num_prefill_reqs: int,
+        num_decode_reqs: int,
+        round_capacity: int,
+        priority_preemption_enabled: bool,
+    ) -> bool:
+        """Whether this round has decode work that would otherwise sit behind a
+        partially filled prefill round.
+
+        The mixed path is a restriction of the either/or path, not a
+        replacement: it walks the waiting queue in arrival order rather than
+        prefill-first, and it does not attempt preemption when the round fills.
+
+        Priority preemption is the one difference that is not just a
+        trade-off: taking the mixed path would silently drop it. Until it is
+        wired there, a scheduler running with it enabled keeps every round on
+        the either/or path.
+        """
+        if priority_preemption_enabled:
+            return False
+        return (
+            num_prefill_reqs > 0
+            and num_decode_reqs > 0
+            and num_prefill_reqs < round_capacity
+        )
+
+    def _process_dllm_batches_mixed(
+        self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
+    ) -> AddReqResult:
+        """Build one mixed round from all phases: staging rows first (they
+        already hold KV/slots and must keep progressing), then incoming rows
+        up to the allocatable-request cap. Per-request treatment is identical
+        to the either/or path; only the round composition changes.
+
+        Returns the refusal signal the same way the either/or path's
+        `_process_batch_by_phase` reports it: the staging pass's non-CONTINUE
+        result, and NO_TOKEN when the incoming gate refused a row for lack of
+        capacity. A mixed round must not swallow that signal — a caller that
+        watches for capacity-refused zero-admission rounds has to see them
+        whichever round shape was built.
+
+        ``dllm_num_mixed_rounds`` is counted here, at composition, because
+        only this composer can put both phases in one round on purpose. An
+        either/or round can also end up two-phased — ``determine_dllm_phase``
+        flips an incoming prefill row to STAGING_DECODE during admission when
+        the cached prefix covers its first blocks — but that is cache luck,
+        not scheduling, so counting by phases at ``_update_state_for_batch``
+        made the flags-off counter flaky. Counting here keeps the flags-off
+        counter structurally zero and the flags-on counter a statement about
+        what this composer built.
+        """
+        reqs = self.dllm_manager.waiting_queue
+
+        staging_result = AddReqResult.CONTINUE
+        staging_reqs = [req for req in reqs if req.dllm_phase in _DLLM_STAGING_PHASES]
+        if staging_reqs:
+            staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
+
+        # A refused staging row stalls the round shape: skip the incoming pass
+        # (as the either/or path does), but still count what was admitted — a
+        # staging-only round can already carry both phases.
+        incoming_reqs = [req for req in reqs if req.dllm_phase in _DLLM_INCOMING_PHASES]
+        if staging_result == AddReqResult.CONTINUE and incoming_reqs:
+            # The sibling admission gate charges can_run_list against the free
+            # slot pool plus the rows its requests already hold, so the staging
+            # rows carried here do not starve the incoming ones. Its preemption
+            # branch is unreachable: _should_mix_dllm_batches keeps every round
+            # with priority preemption on the either/or path.
+            incoming_result = self.process_dllm_incoming_reqs(
+                adder, incoming_reqs, running_batch=running_batch
+            )
+            if incoming_result == AddReqResult.NO_TOKEN:
+                # A capacity-refused incoming row stalls the same way a
+                # refused staging row does; report it identically.
+                staging_result = incoming_result
+
+        # Phases are final once admission ends (nothing re-derives them before
+        # the forward), so this sees exactly the round that will run. An empty
+        # or single-phase admission counts nothing.
+        num_prefill_rows = sum(req.is_dllm_prefill() for req in adder.can_run_list)
+        if 0 < num_prefill_rows < len(adder.can_run_list):
+            self.dllm_num_mixed_rounds += 1
+        return staging_result
 
     def _process_batch_by_phase(
         self,
@@ -345,6 +476,13 @@ class SchedulerDllmMixin:
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        if can_run_list:
+            self.dllm_num_rounds += 1
+            # dllm_num_mixed_rounds is counted in _process_dllm_batches_mixed,
+            # at composition: an either/or round can carry a phase-flipped row
+            # (cached prefix turned an incoming prefill into STAGING_DECODE),
+            # which is not a round the mixed scheduler composed.
 
     def _create_dllm_batch(
         self: Scheduler,
