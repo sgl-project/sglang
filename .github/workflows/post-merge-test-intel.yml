@@ -1,0 +1,143 @@
+name: Post-Merge CI Test (Intel)
+
+on:
+  schedule:
+    # Every 3 hours.
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      continue_on_error:
+        description: 'Continue on error (do not fail the workflow on test failures)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: post-merge-test-intel-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  post-merge-test-1-gpu-xpu:
+    # sglang built from main on the latest-main-main image, then the PR CI suite.
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: sgl-ci-post-merge
+    env:
+      CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Start CI container (pull intel/sglang-dev:latest-main-main)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh --image-tag latest-main-main --container-name "${CONTAINER_NAME}"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install Dependency (build sglang from main)
+        # Mirrors pr-test-xpu.yml: swap the image's sglang for one built from the checkout.
+        timeout-minutes: 60
+        run: |
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get update
+          docker exec -e DEBIAN_FRONTEND=noninteractive "${CONTAINER_NAME}" apt-get install -y libssl-dev
+          # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
+          docker exec "${CONTAINER_NAME}" bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
+          docker exec "${CONTAINER_NAME}" uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
+          docker exec "${CONTAINER_NAME}" cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
+          # Fetch tags so setuptools_scm resolves a real version.
+          docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
+          docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
+          docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          # HF /whoami-v2 is rate-limited; retry with backoff + jitter.
+          docker exec "${CONTAINER_NAME}" /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
+
+      - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
+        continue-on-error: true
+        run: |
+          docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache ".[checkpoint-engine]"
+
+      - name: PR CI suite (extra-test-1-gpu-xpu)
+        # Same suite, budget and timeout overrides as pr-test-xpu.yml.
+        timeout-minutes: 180
+        env:
+          XPU_TIMEOUT_OVERRIDES: >-
+            --timeout-override xpu/test_xpu_basic.py=180
+            --timeout-override xpu/test_layernorm_xpu.py=120
+            --timeout-override xpu/test_intel_xpu_backend.py=360
+            --timeout-override e2e/xpu/test_xpu_fp8_linear.py=240
+            --timeout-override kv_canary/test_self_unit_req_to_expected_token_ids_manager.py=120
+            --timeout-override kv_canary/test_self_unit_plan_input.py=120
+            --timeout-override kernels/ops/kvcache/test_hisparse.py=120
+        run: |
+          touch github_summary_ci.md extra-test-1-gpu-xpu-metrics.jsonl
+          docker exec "${CONTAINER_NAME}" bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
+            SGLANG_IS_IN_CI=true \
+            SGLANG_TEST_METRICS_FILE=/sglang-checkout/extra-test-1-gpu-xpu-metrics.jsonl \
+            python3 run_suite.py --hw xpu --suite extra-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES} ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary_ci.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Upload per-file metrics jsonl
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-merge-test-1-gpu-xpu-metrics
+          path: extra-test-1-gpu-xpu-metrics.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          # Build artifacts are root-owned on the host; chown before rm.
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf \
+            python/build \
+            python/dist \
+            python/sglang.egg-info \
+            python/sglang/*.egg-info \
+            test/result.jsonl \
+            test/results \
+            test/.pytest_cache \
+            .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          # SIGTERM sglang and drain GPU context before `docker rm -f` (SIGKILL triggers a GT reset on B580).
+          if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+            docker exec "${CONTAINER_NAME}" bash -c '
+              pkill -TERM -f "sglang|run_suite|python3.*test_" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                pgrep -f "sglang::|sglang.launch_server" >/dev/null || break
+                sleep 1
+              done
+              pkill -KILL -f "sglang|run_suite" 2>/dev/null || true
+            ' || true
+          fi
+          docker rm -f "${CONTAINER_NAME}" || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
