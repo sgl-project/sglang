@@ -1666,15 +1666,15 @@ class PrefillAdder:
         return AddReqResult.NO_TOKEN if exhausted else AddReqResult.CONTINUE
 
     @capacity_decision
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         """Add the unfinished chunked request's next chunk; returns it while it is
         unfinished. Returned but not added, it waits and closes this pass."""
-        result = self._add_chunked_req(req)
+        result = self._add_chunked_req(req, truncation_align_size)
         if result is req and not any(r is req for r in self.can_run_list):
             self.chunked_req_waits = True
         return result
 
-    def _add_chunked_req(self, req: Req):
+    def _add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1736,6 +1736,22 @@ class PrefillAdder:
         if new_len <= 0:
             # No progress this pass: wait rather than run an empty chunk.
             return req
+        if truncated and truncation_align_size is not None:
+            # Same absolute grid as the first chunk. A chunk that cannot reach the
+            # next grid point would start the following chunk off the grid, so it
+            # waits when only memory or a cap held it back this pass; only a chunk
+            # size below one grid step keeps its length, to make progress.
+            aligned_end = (
+                (req.prefix_len + new_len)
+                // truncation_align_size
+                * truncation_align_size
+            )
+            if aligned_end > req.prefix_len:
+                new_len = aligned_end - req.prefix_len
+            elif self.rem_chunk_tokens >= truncation_align_size - (
+                req.prefix_len % truncation_align_size
+            ):
+                return req
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -2306,16 +2322,15 @@ class PrefillAdder:
                 # capped.
                 extend_len = chunk_tokens_limit
                 if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
+                    # Align the absolute end: a cached prefix can end off the grid.
+                    end = (prefix_len + extend_len) // truncation_align_size
+                    extend_len = end * truncation_align_size - prefix_len
             else:
                 extend_len = chunk_tokens_limit // self.page_size * self.page_size
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
+                if truncation_align_size is not None:
+                    # Align the absolute end: a cached prefix can end off the grid.
+                    end = end // truncation_align_size * truncation_align_size
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER

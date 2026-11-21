@@ -82,6 +82,7 @@ except ImportError:
 import traceback
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -1911,9 +1912,16 @@ class Scheduler(
         }
         prefill_backend, _ = attention_backends()
         env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        aligns = []
+        if env_var:
+            aligns.append(get_int_env_var(env_var, default_size))
+        if hybrid_gdn_config(self.model_config) is not None:
+            # Gated DeltaNet prefill sums each chunk in blocks counted from the chunk
+            # start, so a split off this grid changes the result.
+            from sglang.kernels.ops.attention.fla.chunk import CHUNK_SIZE
+
+            aligns.append(CHUNK_SIZE)
+        self.truncation_align_size = math.lcm(*aligns) if aligns else None
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
@@ -4735,7 +4743,12 @@ class Scheduler(
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
             )
-            if adder.add_chunked_req(resumed_req) is None:
+            if (
+                adder.add_chunked_req(
+                    resumed_req, truncation_align_size=self.truncation_align_size
+                )
+                is None
+            ):
                 # Its last chunk is in this batch.
                 move([resumed_req], self.prefill_launched_reqs)
 
