@@ -294,6 +294,7 @@ impl PendingAssistant {
 
 fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), String> {
     let mut pending = PendingAssistant::default();
+    let mut inflate_budget = super::MAX_REASONING_STATE_BYTES;
     for (i, item) in items.into_iter().enumerate() {
         let Value::Object(mut obj) = item else {
             return Err(format!("input[{i}] must be an object"));
@@ -402,7 +403,7 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                 if pending.content.is_some() && pending.tool_calls.is_empty() {
                     pending.flush(messages);
                 }
-                let text = reasoning_text(&obj);
+                let text = reasoning_text(&obj, &mut inflate_budget);
                 if !text.is_empty() {
                     match &mut pending.reasoning {
                         Some(r) => {
@@ -482,7 +483,7 @@ fn coalesce_system(messages: &mut Vec<Value>) {
 /// `summary[].text`, else `content[].text`, else the trace packed into
 /// `encrypted_content` by an earlier reply (a `store: false` client may
 /// replay only the blob). The engine reads them in the same order.
-fn reasoning_text(obj: &Map<String, Value>) -> String {
+fn reasoning_text(obj: &Map<String, Value>, budget: &mut usize) -> String {
     let join = |key: &str| -> String {
         obj.get(key)
             .and_then(Value::as_array)
@@ -504,7 +505,7 @@ fn reasoning_text(obj: &Map<String, Value>) -> String {
     }
     obj.get("encrypted_content")
         .and_then(Value::as_str)
-        .and_then(super::decode_reasoning_state)
+        .and_then(|blob| super::decode_reasoning_state_within(blob, budget))
         .unwrap_or_default()
 }
 

@@ -178,18 +178,34 @@ pub(crate) fn encode_reasoning_state(text: &str) -> String {
     )
 }
 
-/// `None` for a blob this engine family did not produce, or a damaged one.
+/// Maximum decoded reasoning state retained across the input items of one request.
+pub(crate) const MAX_REASONING_STATE_BYTES: usize = 16 << 20;
+
+#[cfg(test)]
 pub(crate) fn decode_reasoning_state(blob: &str) -> Option<String> {
+    let mut budget = MAX_REASONING_STATE_BYTES;
+    decode_reasoning_state_within(blob, &mut budget)
+}
+
+pub(crate) fn decode_reasoning_state_within(blob: &str, budget: &mut usize) -> Option<String> {
     use base64::Engine;
     use std::io::Read;
     let packed = base64::engine::general_purpose::URL_SAFE
         .decode(blob.strip_prefix(REASONING_STATE_PREFIX)?)
         .ok()?;
-    let mut text = String::new();
-    flate2::read::ZlibDecoder::new(&packed[..])
-        .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+    let limit = *budget;
+    let mut inflated = Vec::new();
+    let read = flate2::read::ZlibDecoder::new(&packed[..])
+        .take(limit as u64 + 1)
+        .read_to_end(&mut inflated);
+    // A decoder error can still leave bytes in the output buffer.
+    if inflated.len() > limit {
+        *budget = 0;
+        return None;
+    }
+    *budget = limit - inflated.len();
+    read.ok()?;
+    String::from_utf8(inflated).ok()
 }
 
 pub(crate) fn output_text_part(text: &str) -> Value {
@@ -312,6 +328,19 @@ mod tests {
             decode_reasoning_state(full["encrypted_content"].as_str().unwrap()).as_deref(),
             Some("t")
         );
+    }
+
+    #[test]
+    fn replay_budget_is_shared_between_items() {
+        let mut remaining = 5;
+        let item = encode_reasoning_state("abc");
+        assert_eq!(
+            decode_reasoning_state_within(&item, &mut remaining).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(remaining, 2);
+        assert!(decode_reasoning_state_within(&item, &mut remaining).is_none());
+        assert_eq!(remaining, 0);
     }
 
     #[test]
