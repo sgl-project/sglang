@@ -78,6 +78,7 @@ def _torch_to_mlx(
             torch.mps.synchronize()
         return mx.asarray(tensor, copy=copy)
     if tensor.device.type == "cpu":
+        tensor = tensor.resolve_conj().resolve_neg()
         # CPU tensors always get MLX-owned storage.  In particular, do not
         # expose a NumPy/memoryview alias whose lifetime is controlled by the
         # caller.

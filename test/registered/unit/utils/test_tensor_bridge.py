@@ -128,6 +128,124 @@ class TestTensorBridgeCpu(unittest.TestCase):
                 device="cpu",
             )
 
+    def test_cpu_conjugate_views_preserve_values_and_source(self):
+        import mlx.core as mx
+
+        real = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        imaginary = real + 0.5
+        source = torch.complex(real, imaginary).requires_grad_()
+        tensor = source.conj().T
+        expected = torch.complex(real.T, -imaginary.T)
+        pointer = tensor.data_ptr()
+        with mx.stream(mx.cpu):
+            array = torch_to_mlx(tensor)
+            actual = mlx_to_torch(array, device="cpu")
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(actual.dtype, torch.complex64)
+        self.assertFalse(actual.requires_grad)
+        self.assertTrue(tensor.is_conj())
+        self.assertEqual(tensor.data_ptr(), pointer)
+        self.assertTrue(source.requires_grad)
+        self.assertIsNone(source.grad)
+        torch.testing.assert_close(source.real, real, rtol=0, atol=0)
+        torch.testing.assert_close(source.imag, imaginary, rtol=0, atol=0)
+
+    def test_cpu_negative_views_keep_values_and_precision(self):
+        import mlx.core as mx
+
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                imaginary = torch.tensor(
+                    [0.25, -1.5, 3.25, 7.0, -2.5, 9.5], dtype=dtype
+                )
+                source = torch.complex(torch.ones_like(imaginary), imaginary)
+                tensor = source.conj().imag[1::2]
+                self.assertTrue(tensor.is_neg())
+                self.assertFalse(tensor.is_contiguous())
+                expected = -imaginary[1::2]
+                with mx.stream(mx.cpu):
+                    actual = mlx_to_torch(torch_to_mlx(tensor), device="cpu")
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(actual.dtype, dtype)
+                self.assertTrue(tensor.is_neg())
+                torch.testing.assert_close(source.imag, imaginary, rtol=0, atol=0)
+
+    def test_cpu_calls_accept_lazy_view_inputs(self):
+        import mlx.core as mx
+
+        source = torch.tensor([1 + 2j, -3 + 4j, 0.5 - 1j], dtype=torch.complex64)
+        with mx.stream(mx.cpu):
+            product = mlx_call(lambda x: x * mx.conj(x), source.conj(), device="cpu")
+            first, second = mlx_call_multi(
+                lambda x: (x + 2, x * 3), source.conj().imag, device="cpu"
+            )
+        torch.testing.assert_close(
+            product, torch.tensor([5, 25, 1.25], dtype=torch.complex64), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            first, torch.tensor([0.0, -2.0, 3.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            second, torch.tensor([-6.0, -12.0, 3.0]), rtol=0, atol=0
+        )
+
+    def test_cpu_lazy_view_import_owns_independent_storage(self):
+        import mlx.core as mx
+
+        for negative in (False, True):
+            with self.subTest(negative=negative):
+                source = torch.tensor([1 + 2j, -3 + 4j], dtype=torch.complex64)
+                tensor = source.conj().imag if negative else source.conj()
+                expected = (
+                    torch.tensor([-2.0, -4.0])
+                    if negative
+                    else torch.tensor([1 - 2j, -3 - 4j], dtype=torch.complex64)
+                )
+                with mx.stream(mx.cpu):
+                    array = torch_to_mlx(tensor)
+                    source.zero_()
+                    actual = mlx_to_torch(array, device="cpu")
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(torch.count_nonzero(source).item(), 0)
+
+    def test_cpu_scalar_conjugate_and_empty_views(self):
+        import mlx.core as mx
+
+        for shape in ((), (0, 2)):
+            with self.subTest(shape=shape):
+                source = torch.full(shape, 2 + 3j, dtype=torch.complex64)
+                tensor = source.conj()
+                with mx.stream(mx.cpu):
+                    array = torch_to_mlx(tensor)
+                    mx.eval(array)
+                self.assertEqual(array.shape, shape)
+                self.assertEqual(array.dtype, mx.complex64)
+                self.assertEqual(array.tolist(), (2 - 3j) if shape == () else [])
+                self.assertTrue(tensor.is_conj())
+
+    def test_cpu_ordinary_input_dtypes_remain_unchanged(self):
+        import mlx.core as mx
+
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.complex64,
+        ):
+            with self.subTest(dtype=dtype):
+                source = torch.tensor([1, -2, 0.25], dtype=dtype)
+                with mx.stream(mx.cpu):
+                    actual = mlx_to_torch(torch_to_mlx(source), device="cpu")
+                self.assertEqual(actual.dtype, dtype)
+                torch.testing.assert_close(actual, source, rtol=0, atol=0)
+
+    def test_cpu_conjugate_complex128_still_requires_explicit_narrowing(self):
+        tensor = torch.tensor([1 + 2j], dtype=torch.complex128).conj()
+        with self.assertRaisesRegex(ValueError, "complex128"):
+            torch_to_mlx(tensor)
+
 
 @unittest.skipUnless(_HAS_SUPPORTED_RUNTIME, "requires MLX >= 0.32 and Torch MPS")
 class TestTensorBridgeMetalSharing(unittest.TestCase):
