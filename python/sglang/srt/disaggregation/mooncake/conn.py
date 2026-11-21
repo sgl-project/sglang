@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 )
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
+    ABORT_REASON_DECODE,
     align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
@@ -3304,12 +3305,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._handle_legacy_abort_notification(notification, room_active)
         return True
 
+    def _mark_aborted_by_decode(self, room: int) -> None:
+        # Record the reason so the request concludes as an abort, not an error.
+        self.record_failure(room, ABORT_REASON_DECODE)
+        self.update_status(room, KVPoll.Failed)
+
     def _handle_deferred_abort_notification(
         self, notification: AbortNotification, room_active: bool
     ) -> None:
         room = notification.room
         if room_active:
-            self.update_status(room, KVPoll.Failed)
+            self._mark_aborted_by_decode(room)
 
         ack_target = notification.deferred_ack_target()
         if ack_target is None:
@@ -3328,7 +3334,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> None:
         room = notification.room
         if room_active:
-            self.update_status(room, KVPoll.Failed)
+            self._mark_aborted_by_decode(room)
             logger.debug(
                 "Received abort notification for room %s, marked as Failed", room
             )
