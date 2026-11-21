@@ -151,36 +151,44 @@ def route_radix4(
     return out_w, out_i
 
 
+@cache_once
+def _hip_runtime() -> Optional[ctypes.CDLL]:
+    # libamdhip64 with hipExtStreamGetCUMask typed, or None where it cannot be loaded.
+    try:
+        hip = ctypes.CDLL("libamdhip64.so")
+        hip.hipExtStreamGetCUMask.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        return hip
+    except (OSError, AttributeError):
+        logger.warning("hipExtStreamGetCUMask unavailable; assuming the whole device")
+        return None
+
+
+# The last CU count read for a stream, for a graph capture that cannot ask.
 _enabled_cus_by_stream: dict[tuple[int, int], int] = {}
 
 
 def _enabled_cus(device: torch.device) -> Optional[int]:
-    # CUs the current stream may run on: its CU mask (hipExtStreamGetCUMask) where HIP
-    # answers, else the device's. Asked once per stream; None inside a graph capture
-    # that has not seen the stream, since the query cannot run there.
+    # The CUs the current stream may run on: its CU mask (hipExtStreamGetCUMask), else the device's.
+    # Eager calls ask every time, since a stream handle can be reused after its stream is destroyed;
+    # a capture answers from the last read of its stream, or None.
+    device = torch.device(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
     stream = torch.cuda.current_stream(device).cuda_stream
-    key = (torch.device(device).index or 0, stream)
-    count = _enabled_cus_by_stream.get(key)
-    if count is None:
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        count = torch.cuda.get_device_properties(device).multi_processor_count
-        try:
-            hip = ctypes.CDLL("libamdhip64.so")
-            words = (count + 31) // 32
-            mask = (ctypes.c_uint32 * words)()
-            hip.hipExtStreamGetCUMask.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.POINTER(ctypes.c_uint32),
-            ]
-            if hip.hipExtStreamGetCUMask(ctypes.c_void_p(stream), words, mask) == 0:
-                count = sum(bin(word).count("1") for word in mask)
-        except (OSError, AttributeError):
-            logger.warning(
-                "hipExtStreamGetCUMask unavailable; assuming the whole device"
-            )
-        _enabled_cus_by_stream[key] = count
+    key = (index, stream)
+    if torch.cuda.is_current_stream_capturing():
+        return _enabled_cus_by_stream.get(key)
+    count = current_arch().num_sms
+    hip = _hip_runtime()
+    if hip is not None:
+        words = (count + 31) // 32
+        mask = (ctypes.c_uint32 * words)()
+        if hip.hipExtStreamGetCUMask(ctypes.c_void_p(stream), words, mask) == 0:
+            count = sum(bin(word).count("1") for word in mask)
+    _enabled_cus_by_stream[key] = count
     return count
 
 

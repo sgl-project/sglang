@@ -12,6 +12,13 @@ import torch
 
 from sglang.srt.layers.moe import route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
+from sglang.srt.layers.moe.moe_runner.aiter import (
+    AiterMoeQuantInfo,
+    AiterQuantType,
+    AiterRunnerCore,
+    AiterRunnerInput,
+)
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -292,6 +299,92 @@ class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):
             patch.object(aiter_route_sort, "_cfg_api", return_value=None),
         ):
             self.assertFalse(aiter_route_sort.available())
+
+
+class TestAiterRunnerRouteSort(CustomTestCase):
+    def _runner(self, *, moe_ep_size=1, available=True):
+        patcher = patch.object(aiter_route_sort, "available", lambda: available)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        layer = SimpleNamespace(moe_ep_size=moe_ep_size)
+        return AiterRunnerCore(MoeRunnerConfig(activation="silu", layer=layer))
+
+    def _fake_aiter(self, fused_moe):
+        fake_aiter = ModuleType("aiter")
+        fake_aiter.__path__ = []
+        fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
+        fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+        fake_fused_moe = ModuleType("aiter.fused_moe")
+        fake_fused_moe.fused_moe = fused_moe
+        fake_ops = ModuleType("aiter.ops")
+        fake_ops.__path__ = []
+        fake_flydsl = ModuleType("aiter.ops.flydsl")
+        fake_flydsl.__path__ = []
+        fake_moe_common = ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = SimpleNamespace(
+            INTERLEAVE=SimpleNamespace(value="INTERLEAVE")
+        )
+        patcher = patch.dict(
+            sys.modules,
+            {
+                "aiter": fake_aiter,
+                "aiter.fused_moe": fake_fused_moe,
+                "aiter.ops": fake_ops,
+                "aiter.ops.flydsl": fake_flydsl,
+                "aiter.ops.flydsl.moe_common": fake_moe_common,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_declares_a_consumer_only_without_ep(self):
+        """AITER drops a registered sort under EP's expert mask, and an AITER without
+        register_presorted_moe cannot take one, so only then is there no consumer."""
+        consumer = self._runner().route_sort_consumer()
+        self.assertIsInstance(consumer, aiter_route_sort.AiterRouteSortConsumer)
+        self.assertIsNone(self._runner(moe_ep_size=2).route_sort_consumer())
+        self.assertIsNone(self._runner(available=False).route_sort_consumer())
+
+    def test_a_second_lookup_keeps_the_same_consumer(self):
+        runner = self._runner()
+        self.assertIs(runner.route_sort_consumer(), runner.route_sort_consumer())
+
+    def test_shows_its_staged_consumer_its_fused_moe_call(self):
+        """The consumer asks AITER for the config of exactly the call its own
+        layer's fused_moe gets."""
+        captured = []
+
+        def fused_moe(**kwargs):
+            captured.append(kwargs)
+            return kwargs["hidden_states"]
+
+        self._fake_aiter(fused_moe)
+        runner = self._runner()
+        consumer = runner.route_sort_consumer()
+        calls = []
+        consumer.observe = calls.append
+        topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+        runner_input = AiterRunnerInput(
+            hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+            topk_ids=topk_ids,
+            topk_weights=torch.ones(topk_ids.shape, dtype=torch.float32),
+            quant_type=AiterQuantType.PER_1X32,
+        )
+        quant_info = AiterMoeQuantInfo(
+            w13_weight=torch.empty((2, 8, 2)),
+            w2_weight=torch.empty((2, 4, 2)),
+            quant_type=AiterQuantType.PER_1X32,
+        )
+        # The scope drops the sort no fused_moe consumed through AITER's registrar.
+        with patch.object(aiter_route_sort, "_registrar", lambda: lambda sort: None):
+            for staged in (consumer, aiter_route_sort.AiterRouteSortConsumer()):
+                with route_sort.scope(staged):
+                    runner.run(runner_input, quant_info, {})
+        # Shown its own layer's call only, not another staged layer's.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].keys(), captured[0].keys())
+        for name, value in captured[0].items():
+            self.assertIs(calls[0][name], value)
 
 
 if __name__ == "__main__":
