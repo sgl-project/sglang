@@ -602,8 +602,7 @@ class Cosmos3SamplingParams(SamplingParams):
                     )
 
     def _set_output_file_name(self) -> None:
-        # Action outputs never need a visual filename. This also avoids hashing
-        # in-memory observation images while base visual adjustment is running.
+        # Action outputs do not need a visual filename.
         if self.action_mode in ("policy", "inverse_dynamics"):
             return
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to
