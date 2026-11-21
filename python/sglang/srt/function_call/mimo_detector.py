@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
 from sglang.srt.function_call.utils import (
+    convert_string_union_value,
     get_schema_properties,
     safe_literal_eval,
 )
@@ -56,6 +57,15 @@ def _convert_param_value(
     param_type = _get_param_type(func_name, param_name, tools)
 
     if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+        for tool in tools:
+            if tool.function.name == func_name:
+                props = get_schema_properties(tool.function.parameters)
+                if param_name in props:
+                    return convert_string_union_value(
+                        value=param_value,
+                        schema=props[param_name],
+                        root_schema=tool.function.parameters,
+                    )
         return param_value
     elif (
         param_type.startswith("int")
