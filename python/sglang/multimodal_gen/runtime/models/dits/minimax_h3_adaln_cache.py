@@ -495,6 +495,11 @@ class MiniMaxH3AdalnCache(nn.Module):
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
 
+        # The file's shape is its capacity: warmup must not prefetch a grid the
+        # file cannot cover, and path mode has no rebuild to fall back on.
+        self.max_plans = plan_timesteps.shape[0]
+        self.max_plan_width = plan_timesteps.shape[1]
+
         for slot in range(plan_timesteps.shape[0]):
             length = int(plan_lengths[slot])
             self._slots[_plan_key(plan_timesteps[slot, :length])] = slot

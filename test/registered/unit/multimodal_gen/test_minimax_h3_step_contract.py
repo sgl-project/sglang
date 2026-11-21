@@ -212,10 +212,36 @@ def test_offline_adaln_builder_prepares_one_plan_per_transition(steps, mode):
             imgvid_cond_noise_aug=0.999,
             audio_cond_noise_aug=1.0,
             mode=mode,
+            pdd_config=None,
         )
     )
     assert len(plans) == steps
     assert all(plan.numel() > 0 for plan in plans)
+
+
+def test_offline_adaln_builder_covers_both_image_tasks(tmp_path):
+    sigmas = [1.0, 0.875, 0.75, 0.5, 0.25, 0.125, 0.0]
+    config_path = tmp_path / "pdd_config.json"
+    config_path.write_text(
+        json.dumps({"num_inference_steps": len(sigmas) - 1, "sigmas": sigmas})
+    )
+    plans = build_minimax_h3_adaln_cache._cache_timestep_plans(
+        SimpleNamespace(
+            timesteps=None,
+            num_inference_steps=len(sigmas) - 1,
+            flow_shift=12.0,
+            audio_flow_shift=3.0,
+            imgvid_cond_noise_aug=0.999,
+            audio_cond_noise_aug=1.0,
+            mode="image",
+            pdd_config=config_path,
+        )
+    )
+    timesteps = [1.0 - sigma for sigma in sigmas[:-1]]
+    assert [plan.tolist() for plan in plans[0::2]] == [[t] for t in timesteps]
+    assert [plan.tolist() for plan in plans[1::2]] == [
+        torch.tensor([t, 0.999], dtype=torch.float32).tolist() for t in timesteps
+    ]
 
 
 def test_fused_pdd_config_and_warmup_match_head_count(tmp_path, admission):

@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_image_pdd_grid,
     minimax_h3_time_shift_sigmas,
 )
 
@@ -33,6 +34,12 @@ _CACHE_MODES = {
     "ref2va-image": ("video", "audio", "image"),
     "ref2va-audio": ("video", "audio", "audio_ref"),
     "ref2va-mixed": ("video", "audio", "image", "audio_ref"),
+    # One image sidecar covers both declared tasks; see _image_timestep_plans.
+    "image": ("video", "image"),
+}
+_IMAGE_TASK_FIELDS = {
+    "t2i": ("video",),
+    "edit": ("video", "image"),
 }
 _MODE_VARIANTS = {
     "t2va": "fl2va",
@@ -40,6 +47,7 @@ _MODE_VARIANTS = {
     "ref2va-image": "ref2va",
     "ref2va-audio": "ref2va",
     "ref2va-mixed": "ref2va",
+    "image": "image",
 }
 
 
@@ -49,11 +57,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--transformer-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--model-variant", choices=("fl2va", "ref2va"), required=True)
+    parser.add_argument(
+        "--model-variant", choices=("fl2va", "ref2va", "image"), required=True
+    )
     parser.add_argument("--mode", choices=tuple(_CACHE_MODES), default="t2va")
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--flow-shift", type=float, default=12.0)
     parser.add_argument("--audio-flow-shift", type=float, default=3.0)
+    parser.add_argument(
+        "--pdd-config",
+        type=Path,
+        help="Image releases list their distilled sigma grid here; this "
+        "replaces --num-inference-steps/--flow-shift.",
+    )
     parser.add_argument(
         "--imgvid-cond-noise-aug",
         type=float,
@@ -78,14 +94,28 @@ def _cache_timestep_plans(args: argparse.Namespace) -> list[torch.Tensor]:
     if args.timesteps is not None:
         return [torch.tensor(args.timesteps, dtype=torch.float32).unique(sorted=True)]
 
-    video_sigmas = minimax_h3_time_shift_sigmas(
-        num_steps=args.num_inference_steps,
-        shift_scale=args.flow_shift,
-    )
-    audio_sigmas = minimax_h3_time_shift_sigmas(
-        num_steps=args.num_inference_steps,
-        shift_scale=args.audio_flow_shift,
-    )
+    if args.pdd_config is not None:
+        # Image releases step the distilled grid; no audio branch, so both
+        # sigma lists are the same.
+        with args.pdd_config.open() as f:
+            video_sigmas = list(minimax_h3_image_pdd_grid(json.load(f)))
+        audio_sigmas = video_sigmas
+    else:
+        video_sigmas = minimax_h3_time_shift_sigmas(
+            num_steps=args.num_inference_steps,
+            shift_scale=args.flow_shift,
+        )
+        audio_sigmas = minimax_h3_time_shift_sigmas(
+            num_steps=args.num_inference_steps,
+            shift_scale=args.audio_flow_shift,
+        )
+    if args.mode == "image":
+        return _dedupe(
+            _image_timestep_plans(
+                video_sigmas, cond_timestep=args.imgvid_cond_noise_aug
+            )
+        )
+
     fields = _CACHE_MODES[args.mode]
     plans = []
     for video_sigma, audio_sigma in zip(video_sigmas[:-1], audio_sigmas[:-1]):
@@ -102,7 +132,28 @@ def _cache_timestep_plans(args: argparse.Namespace) -> list[torch.Tensor]:
                 [candidates[field] for field in fields], dtype=torch.float32
             ).unique(sorted=True)
         )
+    return _dedupe(plans)
 
+
+def _image_timestep_plans(
+    sigmas: list[float], *, cond_timestep: float
+) -> list[torch.Tensor]:
+    """Plans the image loop looks up: t2i the step's timestep, edit also the
+    pinned reference timestep (``pin_imgvid_cond``)."""
+    plans = []
+    for sigma in sigmas[:-1]:
+        timestep = 1.0 - sigma
+        candidates = {"video": timestep, "image": cond_timestep}
+        for fields in _IMAGE_TASK_FIELDS.values():
+            plans.append(
+                torch.tensor(
+                    [candidates[field] for field in fields], dtype=torch.float32
+                ).unique(sorted=True)
+            )
+    return plans
+
+
+def _dedupe(plans: list[torch.Tensor]) -> list[torch.Tensor]:
     deduplicated = []
     seen = set()
     for plan in plans:
@@ -154,6 +205,11 @@ def main() -> None:
     mode_variant = _MODE_VARIANTS[args.mode]
     if args.model_variant != mode_variant:
         raise ValueError(f"--mode {args.mode} requires {mode_variant}")
+    if (args.model_variant == "image") != (args.pdd_config is not None):
+        raise ValueError(
+            "--model-variant image takes the distilled grid from --pdd-config "
+            "(the release's pdd_config.json); no other variant accepts one"
+        )
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise ValueError("MiniMax H3 AdaLN cache must be built on CUDA")
