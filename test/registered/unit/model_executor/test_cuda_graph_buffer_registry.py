@@ -1547,6 +1547,90 @@ class TestComputedSlots(unittest.TestCase):
             )
         )
 
+    def _decode_registry_with_host_count(self, *, sharded, global_count, padded_tokens):
+        """A decode registry filled from a batch that carries both copies of the
+        global count, returning (host_path_buffer, device_path_value)."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            compute_local_num_token_non_padded,
+        )
+
+        def build():
+            return build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=max(8, padded_tokens),
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=False,
+                attn_tp_sharded_fn=lambda num_tokens: sharded,
+            )
+
+        device_tensor = torch.tensor([global_count], dtype=torch.int32)
+        # Host twin set: post_fill takes the int fast path and fills the slot.
+        host_reg = build()
+        host_reg.fill_from(
+            _MiniForwardBatch(
+                batch_size=2,
+                global_num_token_non_padded=device_tensor.clone(),
+                global_num_token_non_padded_cpu=global_count,
+            ),
+            raw_bs=2,
+            padded_bs=2,
+            raw_num_tokens=global_count,
+            padded_num_tokens=padded_tokens,
+        )
+        # Host twin absent: post_fill copies the device computation instead.
+        device_reg = build()
+        device_reg.fill_from(
+            _MiniForwardBatch(
+                batch_size=2,
+                global_num_token_non_padded=device_tensor.clone(),
+            ),
+            raw_bs=2,
+            padded_bs=2,
+            raw_num_tokens=global_count,
+            padded_num_tokens=padded_tokens,
+        )
+        expected = compute_local_num_token_non_padded(
+            device_tensor, padded_tokens, sharded=sharded
+        )
+        return (
+            host_reg.get_slot("num_token_non_padded").buffer,
+            device_reg.get_slot("num_token_non_padded").buffer,
+            expected,
+        )
+
+    def test_num_token_non_padded_host_count_matches_device_replicated(self):
+        """The int fast path and the device path agree on a replicated decode.
+
+        The fast path exists because every writer of the global scalar keeps its
+        host twin equal, so the two must not diverge.
+        """
+        host, device, expected = self._decode_registry_with_host_count(
+            sharded=False, global_count=7, padded_tokens=8
+        )
+        self.assertTrue(torch.equal(host, device))
+        self.assertTrue(torch.equal(host, expected))
+
+    def test_num_token_non_padded_host_count_matches_device_sharded(self):
+        """The same equality on a sequence-sharded decode, where the local count
+        is this attn-TP rank's slice of the global one rather than a passthrough."""
+        from sglang.srt.runtime_context import get_parallel
+
+        # A sharded slice is this rank's, so the widths have to be stated.
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=1):
+            host, device, expected = self._decode_registry_with_host_count(
+                sharded=True, global_count=7, padded_tokens=8
+            )
+        self.assertTrue(torch.equal(host, device))
+        self.assertTrue(torch.equal(host, expected))
+        # rank 1 of 2 over 8 padded tokens: offset 4, width 4, so 7 - 4 = 3.
+        self.assertTrue(torch.equal(host, torch.tensor([3], dtype=torch.int32)))
+
 
 if __name__ == "__main__":
     unittest.main()
