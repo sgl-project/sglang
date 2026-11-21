@@ -137,16 +137,19 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    QUANT_HEADS: tl.constexpr = 0,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
-    # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    # Map the program id to the starting row of X and Y it should compute. A QUANT
+    # program owns the QUANT_HEADS rows of one token; the tile pads them to a power of two.
+    row_start = tl.program_id(0) * (QUANT_HEADS if QUANT else ROWS_PER_BLOCK)
     group = tl.program_id(1)
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
-    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    tile_rows = tl.arange(0, ROWS_PER_BLOCK)
+    rows = row_start + tile_rows
     cols = tl.arange(0, BLOCK_N)
 
     # Compute offsets for 2D tile
@@ -158,7 +161,10 @@ def _layer_norm_fwd_1pass_kernel(
     Y_base = Y + rows[:, None] * stride_y_row + col_offsets
 
     # Create mask for valid rows and columns
-    row_mask = rows[:, None] < M
+    row_valid = rows < M
+    if QUANT and QUANT_HEADS < ROWS_PER_BLOCK:
+        row_valid = row_valid & (tile_rows < QUANT_HEADS)
+    row_mask = row_valid[:, None]
     col_mask = cols[None, :] < N
     mask = row_mask & col_mask
 
@@ -184,8 +190,7 @@ def _layer_norm_fwd_1pass_kernel(
         mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
         # Store mean for each row
         mean_offsets = group * M + rows
-        mean_mask = rows < M
-        tl.store(Mean + mean_offsets, mean, mask=mean_mask)
+        tl.store(Mean + mean_offsets, mean, mask=row_valid)
         # Broadcast mean back to 2D for subtraction
         xbar = tl.where(mask, x - mean[:, None], 0.0)
         var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
@@ -198,8 +203,7 @@ def _layer_norm_fwd_1pass_kernel(
 
     # Store rstd for each row
     rstd_offsets = group * M + rows
-    rstd_mask = rows < M
-    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+    tl.store(Rstd + rstd_offsets, rstd, mask=row_valid)
 
     # Load weights and biases (broadcast across rows)
     w_offsets = cols + group * N
@@ -267,6 +271,21 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     return rows_per_block
 
 
+def quant_heads_num_warps(
+    M: int, N: int, quant_heads: int, device: torch.device
+) -> int | None:
+    """num_warps of a ``_layer_norm_fwd(quant_heads=...)`` launch whose rows round as the unfused launch's,
+    or None where there is none. A row's bits depend on the tile its warp holds, so the power-of-two row
+    tile has to split into warps of ``calc_rows_per_block(M)`` rows: at most 16 warps, and rows of 128
+    columns, the only width checked."""
+    tile_rows = triton.next_power_of_2(quant_heads)
+    rows_per_block = calc_rows_per_block(M, device)
+    if N != 128 or tile_rows < rows_per_block:
+        return None
+    num_warps = tile_rows // rows_per_block
+    return num_warps if num_warps <= 16 else None
+
+
 def _layer_norm_fwd(
     x,
     weight,
@@ -324,18 +343,23 @@ def _layer_norm_fwd(
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
         assert ngroups == 1 and M % quant_heads == 0
+        tile_rows = triton.next_power_of_2(quant_heads)
         # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
-        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
-        rows_per_block = quant_heads
+        num_warps = min(num_warps * tile_rows // rows_per_block, 16)
+        if tile_rows != quant_heads:
+            assert num_warps == quant_heads_num_warps(
+                M, group_size, quant_heads, x.device
+            ), "quant_heads: no launch rounds as the unfused one does"
+        rows_per_block = tile_rows
         q = torch.empty(
             (M // quant_heads, quant_heads * N),
             dtype=torch.float8_e4m3fn,
             device=x.device,
         )
         s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
-        quant = {"Q": q, "S": s, "QUANT": True}
+        quant = {"Q": q, "S": s, "QUANT": True, "QUANT_HEADS": quant_heads}
     # Update grid to use rows_per_block
-    grid = (cdiv(M, rows_per_block), ngroups)
+    grid = (M // quant_heads if quant_heads else cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
@@ -386,6 +410,112 @@ def _layer_norm_fwd(
 
 if _is_npu:
     from sgl_kernel_npu.operators.norm import layer_norm_fwd as _layer_norm_fwd
+
+
+@triton.jit
+def _rms_norm_gated_tile(
+    X, Z, W, rows, sx, sz, eps, N: tl.constexpr, ACT: tl.constexpr
+):
+    """Rows ``rows`` (heads) of one token: _layer_norm_fwd_1pass_kernel's values for
+    IS_RMS_NORM and NORM_BEFORE_GATE with a 3-D z, rounded to bf16 as the unfused
+    launch stores them, as fp32. X and Z point at the token's first head."""
+    cols = tl.arange(0, N)
+    x = tl.load(X + rows[:, None] * sx + cols[None, :]).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / N
+    rstd = tl.rsqrt(var + eps)
+    w = tl.load(W + cols).to(tl.float32)
+    y = x * rstd[:, None] * w[None, :]
+    z = tl.load(Z + rows[:, None] * sz + cols[None, :]).to(tl.float32)
+    if ACT == "swish" or ACT == "silu":
+        y *= z * tl.sigmoid(z)
+    elif ACT == "sigmoid":
+        y *= tl.sigmoid(z)
+    return y.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _rms_norm_gated_fp8_kernel(
+    X,
+    Z,
+    W,
+    Q,
+    S,
+    stride_x_row,
+    stride_z_token,
+    stride_z_head,
+    stride_q_row,
+    eps,
+    N: tl.constexpr,
+    HEADS: tl.constexpr,
+    TILE: tl.constexpr,
+    ACT: tl.constexpr,
+):
+    # One token a program, its HEADS = 3 * TILE rows as three tiles on TILE / 4
+    # warps: every warp holds 4 rows, the unfused launch's [4, N] one-warp tile,
+    # so each row reduces in its order. The tiles stay in registers for the
+    # token's amax, then quantize as _per_token_group_quant_8bit does.
+    token = tl.program_id(0).to(tl.int64)
+    x = X + token * HEADS * stride_x_row
+    z = Z + token * stride_z_token
+    sx, sz = stride_x_row, stride_z_head
+    r0 = tl.arange(0, TILE)
+    r1 = r0 + TILE
+    r2 = r1 + TILE
+    y0 = _rms_norm_gated_tile(x, z, W, r0, sx, sz, eps, N, ACT)
+    y1 = _rms_norm_gated_tile(x, z, W, r1, sx, sz, eps, N, ACT)
+    y2 = _rms_norm_gated_tile(x, z, W, r2, sx, sz, eps, N, ACT)
+    amax = tl.maximum(tl.maximum(tl.abs(y0), tl.abs(y1)), tl.abs(y2))
+    y_s = tl.maximum(tl.max(amax), 1e-10) / 448.0
+    y_s_inv = 1.0 / y_s
+    q = Q + token * stride_q_row + tl.arange(0, N)[None, :]
+    q_ty = Q.dtype.element_ty
+    tl.store(q + r0[:, None] * N, tl.clamp(y0 * y_s_inv, -448.0, 448.0).to(q_ty))
+    tl.store(q + r1[:, None] * N, tl.clamp(y1 * y_s_inv, -448.0, 448.0).to(q_ty))
+    tl.store(q + r2[:, None] * N, tl.clamp(y2 * y_s_inv, -448.0, 448.0).to(q_ty))
+    tl.store(S + token, y_s)
+
+
+def rms_norm_gated_fp8_supported(
+    rows: int, heads: int, head_dim: int, device: torch.device
+) -> bool:
+    """Whether rms_norm_gated_fp8 gives the unfused norm + quant's bits for
+    ``rows`` (tokens x heads) norm rows: head dim 128, three tiles of 4, 8 or 16
+    heads, and the unfused launch on its 4-row tile (on 1- and 2-row tiles each
+    thread holds 2 or 4 columns, not 8, so a row sums in another order)."""
+    return (
+        head_dim == 128
+        and heads in (12, 24, 48)
+        and calc_rows_per_block(rows, device) == 4
+    )
+
+
+def rms_norm_gated_fp8(x, weight, z, eps, activation):
+    """RMSNormGated(x, z) (norm before gate, one group, bf16 out) followed by the
+    per-token FP8 quant of each token's heads (per_token_group_quant_fp8 with
+    the token as the group), in one launch: (q [T, H * N] e4m3fn, s [T, 1] fp32).
+    x is [T * H, N], z the 3-D [T, H, N] gate; both need unit last strides."""
+    T, H, N = z.shape
+    q = torch.empty((T, H * N), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((T, 1), dtype=torch.float32, device=x.device)
+    with device_context(x.device):
+        _rms_norm_gated_fp8_kernel[(T,)](
+            x,
+            z,
+            weight,
+            q,
+            s,
+            x.stride(0),
+            z.stride(0),
+            z.stride(1),
+            q.stride(0),
+            eps,
+            N=N,
+            HEADS=H,
+            TILE=H // 3,
+            ACT=activation,
+            num_warps=H // 12,
+        )
+    return q, s
 
 
 def rms_norm_gated(

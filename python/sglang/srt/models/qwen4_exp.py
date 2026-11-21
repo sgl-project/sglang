@@ -92,6 +92,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
+    _fp8_tuple_input,
     _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -2216,7 +2217,9 @@ class Qwen4ExpAttentionDecoderLayer(
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
-            if attn_output.is_cuda:
+            if _fp8_tuple_input(self.o_proj, attn_output.shape[0], attn_output.dtype):
+                attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
