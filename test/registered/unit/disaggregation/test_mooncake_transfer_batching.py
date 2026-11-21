@@ -647,6 +647,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             transfer_queues=[queue],
             send_record=MagicMock(),
             note_send_enqueued=MagicMock(),
+            transfer_worker_health=None,
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -710,6 +711,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
             note_send_finished=MagicMock(),
+            transfer_worker_health=None,
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue
