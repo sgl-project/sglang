@@ -4757,6 +4757,9 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        # DCP MLA already returns (output, LSE); callers pass this so the
+        # prefill graph wrapper knows to expect the pair.
+        return_lse: bool = False,
     ):
         self.logits_soft_cap = layer.logit_cap
 
@@ -5798,6 +5801,9 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        # DCP MLA already returns (output, LSE); callers pass this so the
+        # prefill graph wrapper knows to expect the pair.
+        return_lse: bool = False,
     ):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 

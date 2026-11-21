@@ -1053,6 +1053,7 @@ class DeepseekMLARocmForwardMixin:
                         k_nope,
                         k_nope,
                         forward_batch,
+                        return_lse=True,
                         q_rope=q_pe,
                         k_rope=k_pe,
                         **extra_args,
@@ -1106,6 +1107,7 @@ class DeepseekMLARocmForwardMixin:
                 k_window,
                 v_window,
                 forward_batch,
+                return_lse=True,
                 save_kv_cache=False,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
