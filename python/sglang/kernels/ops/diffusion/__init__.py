@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.rmsnorm_mean_square_bitexact",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_cast_before_weight_bitexact:rmsnorm_mean_square_bitexact",
+        _CUDA,
+    ),
+    (
         "diffusion.depthwise_conv3x3_bias_glu",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.sana_depthwise_glu_triton:fused_depthwise_conv3x3_bias_glu",
@@ -761,6 +767,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_scale_residual_norm_scale_shift_fp8": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "try_fused_scale_residual_norm_scale_shift_nvfp4": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
+    "can_use_rmsnorm_mean_square": "norm.rmsnorm_cast_before_weight_bitexact",
+    "rmsnorm_mean_square_bitexact": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_rmsnorm_cast_before_weight": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_rmsnorm_cast_before_weight_scale": "norm.rmsnorm_cast_before_weight_bitexact",
     "can_use_rmsnorm_cast_before_weight_modulate": "norm.rmsnorm_cast_before_weight_bitexact",
