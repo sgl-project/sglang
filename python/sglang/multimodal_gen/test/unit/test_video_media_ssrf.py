@@ -49,6 +49,19 @@ def _reset_media_url_policy():
 
 
 class TestEntrypointMediaValidation:
+    def test_policy_error_detail_is_not_forwarded(self):
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.entrypoints.openai.utils.validate_remote_media_url",
+                side_effect=ValueError("synthetic operator configuration"),
+            ),
+            pytest.raises(HTTPException) as error,
+        ):
+            _validate_remote_media_paths({"video_path": PUBLIC_VIDEO_URL})
+        assert error.value.status_code == 400
+        assert error.value.detail == "video_path points to a disallowed media URL"
+        assert error.value.__cause__ is None and error.value.__context__ is None
+
     @pytest.mark.parametrize("field", MEDIA_FIELDS)
     @pytest.mark.parametrize("url", [PRIVATE_URL, METADATA_URL])
     def test_private_url_is_rejected(self, field, url):
@@ -197,11 +210,44 @@ class TestAvOpenGuard:
                 list(_iter_video_frames_pyav(PRIVATE_URL, 1))
         fake_av.open.assert_not_called()
 
-    def test_local_path_still_reaches_av_open(self):
+    def test_local_path_still_reaches_av_open(self, tmp_path):
         fake_av = self._fake_av()
+        path = tmp_path / "clip.mp4"
+        path.write_bytes(b"fixture")
         with mock.patch.dict("sys.modules", {"av": fake_av}):
-            assert list(_iter_video_frames_pyav("/srv/media/clip.mp4", 1)) == []
-        fake_av.open.assert_called_once_with("/srv/media/clip.mp4")
+            assert list(_iter_video_frames_pyav(str(path), 1)) == []
+        source = fake_av.open.call_args.args[0]
+        assert source.name == str(path) and source.closed
+        assert fake_av.open.call_args.kwargs == {
+            "options": {"protocol_whitelist": "data"}
+        }
+
+    def test_approved_download_hands_decoder_local_bytes(self):
+        fake_av = self._fake_av()
+        opened = []
+
+        def open_stream(stream, *, options):
+            assert stream.seekable() and stream.read() == b"fixture clip"
+            assert options == {"protocol_whitelist": "data"}
+            opened.append(stream)
+            return fake_av.open.return_value
+
+        fake_av.open.side_effect = open_stream
+        with (
+            mock.patch.dict("sys.modules", {"av": fake_av}),
+            mock.patch.object(
+                vision, "validate_remote_media_url", return_value=PUBLIC_VIDEO_URL
+            ) as policy,
+            mock.patch.object(
+                vision.requests,
+                "get",
+                return_value=_FakeResponse(chunks=[b"fixture clip"]),
+            ) as download,
+        ):
+            assert list(_iter_video_frames_pyav(PUBLIC_VIDEO_URL, 1)) == []
+        policy.assert_called_once_with(PUBLIC_VIDEO_URL)
+        download.assert_called_once()
+        assert len(opened) == 1 and opened[0].closed
 
 
 class _ImageHandler(http.server.BaseHTTPRequestHandler):

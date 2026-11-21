@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable
 from contextlib import closing
 from io import BytesIO
+from typing import BinaryIO
 from urllib.parse import unquote, urljoin, urlparse
 
 import imageio
@@ -187,8 +188,8 @@ _VIDEO_DOWNLOAD_MAX_REDIRECTS = 5
 _VIDEO_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 
-def _download_video_to_file(video: str, video_path: str) -> None:
-    """Fetch a remote video to ``video_path`` under the media URL policy.
+def download_video_to_stream(video: str, output: BinaryIO) -> None:
+    """Fetch a remote video into a caller-owned stream under the media URL policy.
 
     Redirects are followed manually so every hop is validated (scheme and
     resolved IP) before a connection is made, and the body is streamed to
@@ -209,8 +210,7 @@ def _download_video_to_file(video: str, video_path: str) -> None:
             if response.status_code in _VIDEO_REDIRECT_STATUS_CODES and location:
                 if redirect_count == _VIDEO_DOWNLOAD_MAX_REDIRECTS:
                     raise requests.exceptions.TooManyRedirects(
-                        f"Video URL exceeded {_VIDEO_DOWNLOAD_MAX_REDIRECTS} "
-                        f"redirects: {video}"
+                        f"Video URL exceeded {_VIDEO_DOWNLOAD_MAX_REDIRECTS} redirects"
                     )
                 current_url = urljoin(response.url, location)
                 continue
@@ -219,17 +219,16 @@ def _download_video_to_file(video: str, video_path: str) -> None:
                     f"Failed to download video. Status code: {response.status_code}"
                 )
             total_bytes = 0
-            with open(video_path, "wb") as temp_file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    total_bytes += len(chunk)
-                    if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
-                        raise ValueError(
-                            "Video exceeds the "
-                            f"{_VIDEO_DOWNLOAD_MAX_BYTES} byte download limit"
-                        )
-                    temp_file.write(chunk)
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+                if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
+                    raise ValueError(
+                        "Video exceeds the "
+                        f"{_VIDEO_DOWNLOAD_MAX_BYTES} byte download limit"
+                    )
+                output.write(chunk)
             return
     raise AssertionError("unreachable")
 
@@ -274,7 +273,8 @@ def load_video(
         suffix = os.path.splitext(file_name)[1] or ".mp4"
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
-            _download_video_to_file(video, video_path)
+            with open(video_path, "wb") as output:
+                download_video_to_stream(video, output)
             pil_images = _read_video_frames(video_path, max_frames)
     else:
         pil_images = _read_video_frames(video, max_frames)

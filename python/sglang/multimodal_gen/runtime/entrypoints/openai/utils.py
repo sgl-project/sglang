@@ -298,22 +298,19 @@ def _validate_remote_media_value(field_name: str, value: str) -> None:
     (``file:``, ``concat:``, ``ftp:``, ...) is rejected: loaders such as
     PyAV/FFmpeg would interpret it as a fetch protocol.
     """
-    scheme = urlparse(value).scheme.lower()
-    if scheme in ("http", "https"):
-        try:
+    try:
+        scheme = urlparse(value).scheme.lower()
+        if scheme in ("http", "https"):
             validate_remote_media_url(value)
-        except ValueError as exc:
+        elif scheme != "data" and ("://" in value or len(scheme) > 1):
             raise _bad_request(
-                f"{field_name} points to a disallowed media URL: {exc}"
-            ) from exc
-    elif scheme == "data":
-        # Self-contained payload; no fetch happens.
+                f"{field_name} must be a local path, a base64 payload, or an http(s) media URL"
+            )
         return
-    elif "://" in value or (scheme and len(scheme) > 1):
-        raise _bad_request(
-            f"{field_name} must be a local path, a base64 payload, or an "
-            f"http(s) media URL, not {scheme or 'an unknown scheme'!r}"
-        )
+    except ValueError:
+        pass
+    # Parser and policy diagnostics can include request data or operator configuration.
+    raise _bad_request(f"{field_name} points to a disallowed media URL")
 
 
 def _validate_remote_media_paths(kwargs: dict[str, Any]) -> None:
