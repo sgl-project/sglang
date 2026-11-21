@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use tch::{Kind, Tensor};
 
 use crate::cache_action::{
-    FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull,
-    SwaRebuild,
+    CacheAction, FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild,
 };
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, Family, SWA};
@@ -21,6 +21,23 @@ use crate::unified_tree_core::{
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
+
+/// Boolean env var with Python `EnvBool` semantics: `true/1/yes/y` → true,
+/// `false/0/no/n` → false (case-insensitive); anything else is invalid and
+/// keeps `default`, mirroring `EnvField.get`'s warn-and-default. The literal
+/// sets are the ones `sglang-server`'s `utils::environ::env_bool` mirrors;
+/// this crate is excluded from the root workspace and cannot depend on it, so
+/// the parse is kept in sync by hand and pinned by a unit test.
+fn env_bool(name: &str, default: bool) -> bool {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.to_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => true,
+        "false" | "0" | "no" | "n" => false,
+        _ => default,
+    }
+}
 
 /// SWA component driver; owns the SWA device/host value slots.
 pub struct SwaComponent {
@@ -91,6 +108,63 @@ impl SwaComponent {
             cache_actions.push(Box::new(action));
         }
         Some(new_parent)
+    }
+
+    /// Cap the part of a live, unlocked SWA node that a lock walk pins at what
+    /// the trailing window still needs (device tier). Mirrors Python
+    /// `_maybe_split_for_window_lock`: the node keeps its id and becomes the
+    /// in-window tail, so a lock receipt anchored on it stays valid. A node
+    /// with a buffer-mode backup pending is left whole, as in Python: that
+    /// write reads all of it, and the backup's own pin is the walk itself.
+    fn maybe_split_for_window_lock_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        uncovered: usize,
+        cache_actions: &mut CacheActions,
+    ) {
+        let (is_root, already_locked, has_device_value, write_pending, node_len) = {
+            let node = tree_core.arena.node(node_id);
+            (
+                node.is_root(),
+                node.device_lock_ref(SWA) > 0,
+                node.has_device_value(SWA),
+                // A write-through backup reads the node as it is now. The
+                // buffer-mode guard lives on the Python side
+                // (`inflight_backup_pools`), which the Rust core cannot see.
+                node.write_through_pending_id.is_some(),
+                node.key.atom_len(),
+            )
+        };
+        if is_root || already_locked || !has_device_value || write_pending {
+            return;
+        }
+        let page_size = tree_core.page_size;
+        // Smallest page-aligned size that still covers the remaining window.
+        let tail_size = uncovered.div_ceil(page_size) * page_size;
+        if node_len <= tail_size {
+            return;
+        }
+        let split_at = node_len - tail_size;
+        if page_size > 1
+            && (!split_at.is_multiple_of(page_size) || !node_len.is_multiple_of(page_size))
+        {
+            return;
+        }
+        let (_, action) = tree_core.split_node_(node_id, split_at);
+        if let Some(action) = action {
+            assert!(
+                action.ack_id.is_none(),
+                "a node without write-through cannot return an acked action"
+            );
+            cache_actions.push(Box::new(action) as Box<dyn CacheAction>);
+        }
+    }
+
+    /// The window-only lock split is on by default, matching Python
+    /// `SGLANG_SWA_LOCK_WINDOW_ONLY` (an EnvBool defaulting to True).
+    fn swa_lock_window_only() -> bool {
+        env_bool("SGLANG_SWA_LOCK_WINDOW_ONLY", true)
     }
 
     // Tier-selected SWA slot reads for the lock walks; `host` picks the host slot.
@@ -227,7 +301,7 @@ impl SwaComponent {
 
     /// Fill the prefetched SWA window onto the leaf→anchor path.
     ///
-    /// All-or-nothing over the staged window: `loaded_pages` is the cross-rank
+    /// All-or-nothing over one full window: `loaded_pages` is the cross-rank
     /// MIN, so `loaded_pages < window_pages` drops the whole window (keeps the
     /// tree identical across TP ranks). Otherwise map the buffer to token range
     /// `[loaded_start, total_len)` and walk leaf→anchor, filling SWA
@@ -272,6 +346,15 @@ impl SwaComponent {
             }
             return;
         };
+        // Cache-mode graft commit only (buffer fills never reach here):
+        // a hit-shrunk window mid-tree is missing its head, so drop it.
+        // Root anchors are complete windows of their own.
+        if node_id != tree_core.arena.root()
+            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
+        {
+            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
+            return;
+        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;
@@ -352,27 +435,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             LRURefreshPhase::Walkdown => {}
             LRURefreshPhase::MatchEnd | LRURefreshPhase::InsertEnd => {
                 let window = self.sliding_window_size + tree_core.page_size;
-                let stamps_joint_lru = tree_core.joint_lru.is_some();
-                let mut refreshed = Vec::new();
                 let (lru, arena) = tree_core.device_lru_list_mut_with_arena(SWA);
                 lru.reset_node_and_window_ancestors_mru(node_id, window, arena, |node| {
-                    let included = node.has_device_value(SWA);
-                    if included && stamps_joint_lru {
-                        refreshed.push(node.idx);
-                    }
-                    included
+                    node.has_device_value(SWA)
                 });
-                if !refreshed.is_empty() {
-                    // The first refreshed (deepest) node is the newest, as in the
-                    // refreshed SWA LRU order.
-                    let newest_tick = tree_core
-                        .arena
-                        .get_and_batch_bump_access_counter(refreshed.len() as i64);
-                    let joint_lru = tree_core.joint_lru.as_mut().expect("checked above");
-                    for (i, idx) in refreshed.into_iter().enumerate() {
-                        joint_lru.set_swa_tick(idx, newest_tick - i as i64);
-                    }
-                }
             }
         }
     }
@@ -468,8 +534,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             return prefix_len;
         }
 
-        // Never recover below the request's protected prefix: its incoming ids are the node's own.
-        let swa_evicted_seqlen = params.swa_evicted_seqlen.max(params.prev_prefix_len);
+        let swa_evicted_seqlen = params.swa_evicted_seqlen;
         // A locked tombstone is legal (segment locks count every node); the
         // full-value swap below is safe because full lock_ref >= swa
         // lock_ref, so a locked-SWA node always takes the Recover branch.
@@ -805,9 +870,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // The SWA LRU filters its own transfer/request locks. A Full load
             // pin can also cover an ancestor outside the loaded SWA window,
             // whose separately restored SWA rows remain independently evictable.
-            if !tree_core.component_state(SWA).evict_device_strip_only
-                && tree_core.evictable_device_leaves.contains(x)
-            {
+            if tree_core.evictable_device_leaves.contains(x) {
                 break 'step Some(x);
             }
             let node = tree_core.arena.node(x);
@@ -1205,6 +1268,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         let sliding_window_size = self.sliding_window_size;
         let mut covered = 0;
         let mut swa_uuid = None;
+        // Read once per walk, like Python (`window_only = not lock_host and
+        // envs.SGLANG_SWA_LOCK_WINDOW_ONLY.get()`, above its loop).
+        let window_only = !lock_host && Self::swa_lock_window_only();
 
         let mut cur = node_id;
         loop {
@@ -1212,10 +1278,23 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if node.is_root() || covered >= sliding_window_size {
                 break;
             }
+            // Cap what the walk pins of a long live SWA ancestor at the
+            // trailing window (device tier). Split before locking: the guard
+            // requires the node to be unlocked. `cur` keeps its id as the
+            // in-window tail, so the walk continues into the split-off parent.
+            if window_only {
+                self.maybe_split_for_window_lock_(
+                    tree_core,
+                    cur,
+                    sliding_window_size - covered,
+                    &mut result.cache_actions,
+                );
+            }
+            let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
+            let node = tree_core.arena.node_mut(cur);
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);
-            let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
             let newly_locked = Self::lock_ref(node, lock_host) == 0;
             Self::inc_lock_ref(tree_core.arena.node_mut(cur), lock_host);
             if newly_locked && has_value {
