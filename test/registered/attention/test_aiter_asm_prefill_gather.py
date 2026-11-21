@@ -1,17 +1,23 @@
-"""Index arithmetic for the aiter ASM context-chunk prefill KV gather.
+"""Index and layout arithmetic for the aiter prefill paths.
 
 kv_indptr/kv_indices are token-level for every page_size, so the gather must
-resolve token t of sequence i to kv_indices[kv_indptr[i] + t]. Pure indexing,
-so this runs on CPU.
+resolve token t of sequence i to kv_indices[kv_indptr[i] + t]. The NHD batch
+prefill hands q to its kernel as a view when q's layout allows. Pure indexing
+and a stand-in kernel, so this runs on CPU.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.attention.aiter_backend import (
+    AiterAttnBackend,
     _asm_context_prefill_gather_indices,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
@@ -100,6 +106,92 @@ class TestAsmPrefillGatherIndices(unittest.TestCase):
         self.assertIsNone(
             _asm_context_prefill_gather_indices(kv_indptr, kv_indices, lens, 16)
         )
+
+
+class TestBatchPrefillQLayout(unittest.TestCase):
+    """What ``forward_extend`` hands ``mha_batch_prefill_func`` as q."""
+
+    num_heads, head_dim, num_kv_heads, tokens = 4, 8, 2, 37
+
+    def _run(self, q):
+        """Run the NHD batch prefill on q with a stand-in kernel; return the q it got."""
+        kv_cache = torch.zeros(self.tokens, self.num_kv_heads, self.head_dim)
+        kv = SimpleNamespace(kv=lambda: (kv_cache, kv_cache))
+        backend = object.__new__(AiterAttnBackend)
+        backend.use_mla = False
+        backend.kv_cache_is_vectorized_5d = False
+        backend.use_triton_unified_attention = False
+        backend._use_unified_verify = False
+        backend.kv_cache_dtype = torch.float32
+        backend.input_dtype = torch.float32
+        backend.page_size = 1
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(read=lambda layer_id: kv)
+        )
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=torch.tensor([0, self.tokens], dtype=torch.int32),
+            kv_indptr=torch.tensor([0, self.tokens], dtype=torch.int32),
+            kv_indices=torch.arange(self.tokens, dtype=torch.int32),
+            swa_page_table=None,
+            paged_kv_view=None,
+            max_q_len=self.tokens,
+            max_kv_len=self.tokens,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=self.num_heads,
+            tp_k_head_num=self.num_kv_heads,
+            tp_v_head_num=self.num_kv_heads,
+            qk_head_dim=self.head_dim,
+            v_head_dim=self.head_dim,
+            head_dim=self.head_dim,
+            scaling=self.head_dim**-0.5,
+            logit_cap=0.0,
+            sliding_window_size=None,
+            is_cross_attention=False,
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            forward_mode=ForwardMode.EXTEND,
+            attn_attend_prefix_cache=False,
+            extend_prefix_lens_cpu=[0],
+            out_cache_loc=None,
+        )
+        seen = []
+
+        def kernel(q_heads, *args, **kwargs):
+            seen.append(q_heads)
+            return torch.zeros(q_heads.shape)
+
+        with (
+            patch.object(aiter_backend, "mha_batch_prefill_func", kernel, create=True),
+            patch.object(aiter_backend, "is_gfx95_supported", lambda: False),
+        ):
+            backend.forward_extend(
+                q, None, None, layer, forward_batch, save_kv_cache=False
+            )
+        (q_heads,) = seen
+        return q_heads
+
+    def test_fused_qkv_slice_is_not_copied(self):
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        qkv = torch.randn(self.tokens, q_size + 2 * kv_size)
+        q, _, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        expected = q.clone().view(-1, self.num_heads, self.head_dim)
+
+        q_heads = self._run(q)
+        self.assertEqual(q_heads.data_ptr(), qkv.data_ptr())
+        self.assertEqual(q_heads.stride(), (qkv.stride(0), self.head_dim, 1))
+        torch.testing.assert_close(q_heads, expected, rtol=0, atol=0)
+
+    def test_strided_head_dim_is_still_copied(self):
+        q = torch.randn(self.num_heads * self.head_dim, self.tokens).t()
+        expected = q.clone().view(-1, self.num_heads, self.head_dim)
+
+        q_heads = self._run(q)
+        self.assertTrue(q_heads.is_contiguous())
+        torch.testing.assert_close(q_heads, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

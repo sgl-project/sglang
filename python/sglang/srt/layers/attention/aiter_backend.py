@@ -5758,8 +5758,10 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = self.forward_metadata.max_q_len
             if self.deterministic_prefill_max_q is not None:
                 max_q_len = max(max_q_len, self.deterministic_prefill_max_q)
+            # The CK batch prefill kernel also reads q through its token and head
+            # strides, so the fused-QKV column slice goes in without a copy.
             o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                _unified_extend_q(q, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
                 self.forward_metadata.qo_indptr[:bs0],
