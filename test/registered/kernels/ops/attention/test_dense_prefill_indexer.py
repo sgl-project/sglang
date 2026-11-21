@@ -542,11 +542,25 @@ class TestDensePrefillIndexer(CustomTestCase):
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 
         world = 4
-        for context, fast in ((15, True), (25, True), (65, True), (65, False)):
-            with self.subTest(context=context, fast=fast):
+        for context, fast, signed, tied in (
+            (15, True, False, False),
+            (25, True, False, False),
+            (65, True, False, False),
+            (65, False, False, False),
+            (65, False, True, False),
+            (15, True, True, True),
+        ):
+            with self.subTest(context=context, fast=fast, signed=signed, tied=tied):
                 cases = [(3, 5), (6, context)]
-                source = make_inputs(cases)
-                consumer = make_inputs(cases, seed=29)
+                source = make_inputs(cases, zero_queries=tied)
+                consumer = make_inputs(cases, zero_queries=tied, seed=29)
+                source["topk"] = consumer["topk"] = 8
+                consumer["kv"] = source["kv"]
+                if signed:
+                    # Real head weights are unconstrained. Center their scores
+                    # across heads to exercise cancellation near the cutoff.
+                    for fixture in (source, consumer):
+                        fixture["weights"] -= fixture["weights"].mean(1, keepdim=True)
                 data = prefill_data(source)
                 rows = data.num_rows
                 packed_k = source["kv"]
@@ -678,19 +692,44 @@ class TestDensePrefillIndexer(CustomTestCase):
                 gathered = [
                     torch.cat([c[i] for c in captures]) for i in range(len(expected))
                 ]
-                for got, want in zip(gathered, expected):
-                    torch.testing.assert_close(
-                        got[:rows].sort(-1).values, want.sort(-1).values
+                if tied:
+                    # Every score is zero and all visible blocks are selected.
+                    # Ties may choose different valid IDs; compare score values
+                    # and uniqueness, not arbitrary tie-breaking order/IDs.
+                    self.assert_topk(source, gathered[0][:rows], dense_scores(source))
+                    self.assert_topk(
+                        consumer, flattened(gathered[2][:rows]), dense_scores(consumer)
                     )
+                    torch.testing.assert_close(
+                        gathered[1][:rows].sort(-1).values,
+                        expect_blocks.sort(-1).values,
+                    )
+                else:
+                    for got, want in zip(gathered, expected):
+                        torch.testing.assert_close(
+                            got[:rows].sort(-1).values, want.sort(-1).values
+                        )
                 for rank in range(world):
                     group = Group(rank, gathered)
-                    for got, want in zip(
-                        run(rank, row_shard(rank, group)),
-                        (expect_src, expect_blocks, expect_dst),
-                    ):
-                        torch.testing.assert_close(
-                            got.sort(-1).values, want.sort(-1).values
+                    got = run(rank, row_shard(rank, group))
+                    if signed:
+                        self.assert_topk(
+                            source, flattened(got[0]), dense_scores(source)
                         )
+                    if tied:
+                        self.assert_topk(
+                            consumer, flattened(got[2]), dense_scores(consumer)
+                        )
+                        torch.testing.assert_close(
+                            got[1].sort(-1).values, expect_blocks.sort(-1).values
+                        )
+                    else:
+                        for actual, want in zip(
+                            got, (expect_src, expect_blocks, expect_dst)
+                        ):
+                            torch.testing.assert_close(
+                                actual.sort(-1).values, want.sort(-1).values
+                            )
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_scores_match_the_fp4_operands(self):
