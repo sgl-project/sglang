@@ -758,6 +758,9 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = orjson.loads(sse_data)
+                            if "error" in data:
+                                output.error = data["error"]["message"]
+                                break
 
                             _meta_info = data.get("meta_info") or {}
                             if _meta_info.get("spec_accept_length") is not None:
@@ -799,10 +802,11 @@ async def async_request_sglang_generate(
                                 most_recent_timestamp = timestamp
                                 last_output_len = output_len
 
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+                    else:
+                        output.generated_text = generated_text
+                        output.success = True
+                        output.latency = latency
+                        output.output_len = output_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
