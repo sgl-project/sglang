@@ -4,7 +4,7 @@ This directory contains the **NIXL (NVIDIA Inference Xfer Library)** integration
 
 NIXL provides a unified API for accessing various storage plugins, including but not limited to:
 
-- POSIX for file based operations, including AIO / io_uring / POSIX AIO.
+- POSIX for file based operations, including Linux AIO and io_uring.
 - **Deepseek's 3FS APIs** for high-throughput file operations
 - **GPU Direct Storage (GDS)** for direct data movement between storage and GPU memory, bypassing CPU memory copies
 - **Amazon S3-compatible object storage** for key-value access patterns
@@ -501,13 +501,12 @@ active = true
 #### Description
 
 Configures the POSIX file-system-based backend.
-This backend supports multiple asynchronous I/O mechanisms and automatically selects the most performant option supported by the system.
+This backend supports Linux AIO and `io_uring`. If neither is configured, NIXL automatically selects an available I/O engine.
 
-**Backend priority (highest to lowest):**
+**Preferred I/O engines (highest to lowest):**
 
 1. Linux AIO
 2. `io_uring`
-3. POSIX AIO
 
 
 #### Configuration Keys
@@ -515,14 +514,13 @@ This backend supports multiple asynchronous I/O mechanisms and automatically sel
 | Key             | Type    | Default   | Description                                                                                              |
 | --------------- | ------- | --------- | -------------------------------------------------------------------------------------------------------- |
 | `use_uring`     | string  | `"false"` | Enables Linux `io_uring` for asynchronous I/O when set to `"true"`. Recommended on modern Linux kernels. |
-| `use_posix_aio` | string  | `"false"` | Enables POSIX AIO as an alternative async I/O mechanism.                                                 |
 | `use_aio`       | string  | `"false"` | Enables generic Linux AIO.                                                                               |
 | `active`        | boolean |    N/A    | Controls whether this plugin is eligible for backend selection.                                          |
 
 **Notes**
 
 * Boolean-like options use **string values** (`"true"` / `"false"`) for compatibility.
-* **Only one backend** (i.e., only one of `use_uring`, `use_aio`, `use_posix_aio`) should be included in the config.
+* **Only one I/O engine** (`use_uring` or `use_aio`) should be included in the config.
 
 
 ### 3. NVIDIA GPUDirect Storage Backend (`plugin.gds`)
