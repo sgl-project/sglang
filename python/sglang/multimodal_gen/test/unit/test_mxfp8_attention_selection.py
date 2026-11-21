@@ -3,6 +3,7 @@
 
 import os
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,14 +25,16 @@ class ModelSlimConfig:
 
 class TestMXFP8AttentionSelection(unittest.TestCase):
     def setUp(self):
-        self.enterContext(
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
             patch.dict(os.environ, SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION="true")
         )
-        self.is_npu = self.enterContext(
+        self.is_npu = stack.enter_context(
             patch.object(ascend_fa.current_platform, "is_npu", return_value=True)
         )
         # Ascend 950 (Atlas A5) by default; individual tests override this.
-        self.enterContext(
+        stack.enter_context(
             patch(
                 "sglang.srt.hardware_backend.npu.utils.is_ascend_950",
                 return_value=True,
@@ -40,15 +43,15 @@ class TestMXFP8AttentionSelection(unittest.TestCase):
         self.ops = SimpleNamespace(
             npu_dynamic_mx_quant=object(), npu_fused_infer_attention_score_v2=object()
         )
-        self.enterContext(patch.object(torch.ops, "npu", self.ops))
+        stack.enter_context(patch.object(torch.ops, "npu", self.ops))
         self.server_args = SimpleNamespace(attention_backend=None)
-        self.enterContext(
+        stack.enter_context(
             patch.object(
                 selector, "get_global_server_args", return_value=self.server_args
             )
         )
-        self.enterContext(patch.object(selector, "forced_attn_backend", None))
-        self.enterContext(
+        stack.enter_context(patch.object(selector, "forced_attn_backend", None))
+        stack.enter_context(
             patch.object(selector, "_cached_get_attn_backend", self._backend)
         )
 
