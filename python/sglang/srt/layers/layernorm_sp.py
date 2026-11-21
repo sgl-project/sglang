@@ -504,7 +504,10 @@ def take_partial_sink(like: torch.Tensor) -> Optional[torch.Tensor]:
 def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
     """Allocate the TP2 symmetric-memory comm at startup, before the KV pool is
     sized, at the largest prefill the server admits; skipped when that is below
-    the SP threshold."""
+    the SP threshold or the TP2 pair is not in one NVLink domain (NCCL then)."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
     from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
         recommended_max_tokens,
     )
@@ -515,12 +518,15 @@ def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
     )
     if tp_group.world_size != 2 or max_tokens < min_tokens:
         return
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not in_one_nvlink_domain(tp_group.cpu_group, device):
+        return
     get_resources().layernorm_sp_push_comm = _PushComm(
         group=tp_group,
         max_tokens=max_tokens,
         hidden=hidden,
         dtype=torch.bfloat16,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=device,
         gather_mxfp8=hidden % 128 == 0,
     )
 
