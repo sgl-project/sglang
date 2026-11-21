@@ -116,6 +116,7 @@ def _k31_layer_rows(pages=3):
 def _metadata_backend(req_to_token, runner_ids):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
     backend.__dict__.update(
+        draft_decode_len=0,
         device=torch.device("cpu"),
         runner_ids=runner_ids,
         req_to_token=req_to_token,

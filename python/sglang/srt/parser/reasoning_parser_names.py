@@ -41,6 +41,7 @@ REASONING_PARSER_NAMES = [
     "flint",
     "cohere_command4",
     "gigachat35",
+    "gigachat4",
     "response_template",
     "xing4_0",
 ]

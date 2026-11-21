@@ -40,7 +40,7 @@ metatags:
   <Card
     title="GigaChat"
     mode="card"
-    href="/cookbook/autoregressive/GigaChat/GigaChat3.5"
+    href="/cookbook/autoregressive/GigaChat/GigaChat4"
     img="/cards/logos/gigachat.png"
   />
   <Card

@@ -32,6 +32,7 @@ def inputs(lengths, requests):
 def make_backend(mode, seq, req, *, fusion=True):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = torch.device("cuda")
+    backend.draft_decode_len = 0
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
     backend.physical_page_size = 64

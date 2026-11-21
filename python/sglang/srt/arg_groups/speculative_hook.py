@@ -1328,6 +1328,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "GigaChat35ForCausalLM",
+        "GigaChat4ForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
@@ -1377,6 +1379,18 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             speculative_eagle_topk=topk,
             speculative_num_draft_tokens=draft_tokens,
         )
+
+    if cfg.speculative_eagle_topk > 1 and cfg.speculative_draft_model_path:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        draft_hf_config = _load_draft_hf_config(cfg)
+        if getattr(
+            draft_hf_config, "dsa_draft_attends_to_own_chain", False
+        ) and is_deepseek_dsa(draft_hf_config):
+            raise ValueError(
+                "DSA draft attention to its own chain requires "
+                "--speculative-eagle-topk 1; tree drafting is not supported."
+            )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if cfg.speculative_eagle_topk > 1:

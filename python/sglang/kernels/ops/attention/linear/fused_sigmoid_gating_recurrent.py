@@ -253,6 +253,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    ROUND_BETA_TO_INPUT_DTYPE: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -423,6 +424,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_beta = b_b
         else:
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+            if ROUND_BETA_TO_INPUT_DTYPE:
+                b_beta = b_beta.to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -634,6 +637,8 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    # Match the input-dtype sigmoid materialized by packed GDN decode.
+    round_beta_to_input_dtype: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -825,6 +830,7 @@ def fused_sigmoid_gating_delta_rule_update(
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,
+        ROUND_BETA_TO_INPUT_DTYPE=round_beta_to_input_dtype,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

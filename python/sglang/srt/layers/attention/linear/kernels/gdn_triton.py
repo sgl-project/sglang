@@ -49,6 +49,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
 
+    def __init__(self, *, round_beta_to_input_dtype: bool = False):
+        self._recurrent_kwargs = (
+            {"round_beta_to_input_dtype": True} if round_beta_to_input_dtype else {}
+        )
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -170,6 +175,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            **self._recurrent_kwargs,
         )
 
     def extend(
@@ -274,6 +280,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            **self._recurrent_kwargs,
             is_kda=False,
             # target_verify specific parameters
             disable_state_update=True,

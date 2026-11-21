@@ -900,12 +900,12 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 
 def _architecture_parser_defaults(server_args) -> Dict[str, str]:
-    """Parser defaults implied by an architecture when the caller omitted them."""
+    """Parser settings implied by an architecture for omitted or auto fields."""
     cfg = resolving_view(server_args)
     missing = tuple(
         attr
         for attr in ("reasoning_parser", "tool_call_parser")
-        if getattr(cfg, attr) is None
+        if getattr(cfg, attr) in (None, "auto")
     )
     if not missing:
         return {}
@@ -916,10 +916,14 @@ def _architecture_parser_defaults(server_args) -> Dict[str, str]:
     config = model_config.hf_config
     architectures = getattr(config, "architectures", None) or []
     arch = architectures[0] if architectures else ""
-    if arch != "MuseSparkForConditionalGeneration":
+    if arch == "MuseSparkForConditionalGeneration":
+        parser, unresolved = "muse", None
+    elif arch in ("GigaChat4ForCausalLM", "GigaChat4ForCausalLMNextN"):
+        parser, unresolved = "gigachat4", "auto"
+    else:
         return {}
 
-    defaults = {attr: "muse" for attr in missing}
+    defaults = {attr: parser for attr in missing if getattr(cfg, attr) == unresolved}
     for attr, value in defaults.items():
         logger.info(
             "Defaulting --%s to '%s' for model architecture '%s'",

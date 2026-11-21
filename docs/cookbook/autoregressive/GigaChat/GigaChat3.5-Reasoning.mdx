@@ -1,7 +1,6 @@
 ---
 title: GigaChat 3.5 Reasoning
 description: "Deploy GigaChat 3.5 Reasoning with SGLang — the 432B-A28B hybrid MLA + GDN Mixture-of-Experts thinking model with reasoning parsing, MTP speculative decoding and tool calling, on H100 and H200 in FP8."
-tag: NEW
 ---
 
 ## Deployment

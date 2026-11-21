@@ -1315,7 +1315,8 @@
                     "group": "GigaChat",
                     "pages": [
                       "cookbook/autoregressive/GigaChat/GigaChat3.5",
-                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning"
+                      "cookbook/autoregressive/GigaChat/GigaChat3.5-Reasoning",
+                      "cookbook/autoregressive/GigaChat/GigaChat4"
                     ]
                   },
                   {
