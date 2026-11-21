@@ -1316,12 +1316,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-    @staticmethod
     def _split_prefill_qkv(
-        layer: RadixLinearAttention, mixed_qkv: torch.Tensor
+        self, layer: RadixLinearAttention, mixed_qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """forward_extend's q / k / v split for a plain extend on CUDA."""
-        if layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        """q / k / v for a plain extend on CUDA: the split views when the extend
+        kernel reads them strided, else one fused contiguous split."""
+        seq_len = mixed_qkv.shape[0]
+        query, key, value = torch.split(
+            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
+        query = query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
+        if layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM and (
+            not self.kernel_dispatcher.extend_kernel.extend_reads_strided_qkv(
+                q=query, k=key
+            )
+        ):
             return fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1331,15 +1342,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 layer.head_v_dim,
             )
-        seq_len = mixed_qkv.shape[0]
-        query, key, value = torch.split(
-            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
-        return (
-            query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim),
-            key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
-            value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
-        )
+        return query, key, value
 
     def _forward_extend_in_graph(
         self,
@@ -1532,10 +1535,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
         if (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
+            and (
+                is_target_verify
+                or not self.kernel_dispatcher.extend_kernel.extend_reads_strided_qkv(
+                    q=query, k=key
+                )
+            )
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1546,15 +1563,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 layer.head_v_dim,
             )
-        else:
-            query, key, value = torch.split(
-                mixed_qkv,
-                [layer.q_dim, layer.k_dim, layer.v_dim],
-                dim=-1,
-            )
-            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
@@ -1668,6 +1676,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if h_track_buf is not None
                     else None
                 ),
+                # Rows past the batch's real tokens (e.g. DP-attention padding)
+                # belong to no sequence and must stay zero.
+                no_padding_rows=(forward_metadata.logical_num_tokens == actual_seq_len),
             )
 
             if is_npu() and last_recurrent_state is not None:

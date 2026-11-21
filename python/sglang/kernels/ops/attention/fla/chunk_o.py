@@ -253,6 +253,7 @@ def chunk_fwd_o(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
     chunk_indices: Optional[torch.LongTensor] = None,
+    no_padding_rows: bool = False,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -267,7 +268,12 @@ def chunk_fwd_o(
 
     if (out is None) != (output_indices is None):
         raise ValueError("out and output_indices must be supplied together")
-    o = torch.zeros_like(v) if out is None else out
+    if out is not None:
+        o = out
+    else:
+        # The kernel stores every row of every sequence; only rows past
+        # cu_seqlens[-1] (a padded batch) rely on the zero fill.
+        o = torch.empty_like(v) if no_padding_rows else torch.zeros_like(v)
 
     use_grouped = output_indices is None and _use_grouped_three_head(
         q, k, v, h, g, cu_seqlens, chunk_size, NT
