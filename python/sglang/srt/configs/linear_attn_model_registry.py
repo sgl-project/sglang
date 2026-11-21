@@ -33,14 +33,13 @@ decides whether overlap scheduling can run:
   same forward, for every row of ``forward_batch.mamba_track_mask``:
 
   - Extend: the conv state there, from the inputs before it
-    (``forward_metadata.track_conv_indices``; set ``conv_states_shape`` so its last
+    (``track_conv_states_extend``; set ``conv_states_shape`` so its last
     dim is the conv window length), and the recurrent state there, which
     ``forward_batch.mamba_track_aligned_lens()`` new tokens into the extend need
-    not end (a kernel output at a chunk boundary).
-    ``MambaAttnBackendBase._track_mamba_state_extend`` copies it from per-chunk
-    states or the final state.
+    not end (a kernel output at a chunk boundary), in the slot
+    ``extend_track_slots`` gives.
   - Decode: the slot's states after the step;
-    ``MambaAttnBackendBase._track_mamba_state_decode`` copies them.
+    ``MambaAttnBackendBase.track_mamba_state_decode`` copies them.
 
   The destinations are ``MambaAttnBackendBase.state_tracking_indices``. A backend that
   declares the strategy without filling the track slots leaves stale states in the

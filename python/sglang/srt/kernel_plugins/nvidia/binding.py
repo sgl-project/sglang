@@ -438,7 +438,7 @@ class MegakernelBinding:
         req_pool = linear.req_to_token_pool
         last_layer = max(req_pool.mamba_map)
         state = linear.state_layer_cache(last_layer)
-        linear._track_mamba_state_decode(
+        linear.track_mamba_state_decode(
             forward_batch,
             state.conv[0],
             state.temporal,

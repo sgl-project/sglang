@@ -511,7 +511,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 f"linear backend: {self.linear_backend} is not support for now"
             )
 
-        self._track_mamba_state_decode(
+        self.track_mamba_state_decode(
             forward_batch,
             mamba_cache_params.conv[0],
             ssm_states,

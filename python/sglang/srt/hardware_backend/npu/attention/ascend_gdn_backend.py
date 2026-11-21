@@ -163,7 +163,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        self._track_mamba_state_decode(
+        self.track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices
         )
         return core_attn_out

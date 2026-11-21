@@ -146,6 +146,43 @@ class MambaAttnBackendBase(AttentionBackend):
             else self.forward_metadata.mamba_track_indices
         )
 
+    def extend_track_slots(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """extra_buffer: each extend row's track slot, -1 for rows not tracked; None
+        when this forward tracks no row. A tracked row's recurrent state after
+        ``forward_batch.mamba_track_aligned_lens()`` of its new tokens goes there."""
+        if not self.forward_metadata.has_mamba_track_mask:
+            return None
+        return torch.where(
+            forward_batch.mamba_track_mask, self.state_tracking_indices, -1
+        )
+
+    def track_conv_states_extend(
+        self,
+        forward_batch: ForwardBatch,
+        inputs: torch.Tensor,
+        conv_states: torch.Tensor,
+    ) -> None:
+        """extra_buffer: copy each tracked extend row's conv state at its tracked
+        position (the conv window of inputs before it) into its track slot.
+
+        ``inputs`` is ``[num_tokens, dim]``; ``conv_states`` is a layer's conv pool,
+        ``[num_slots, conv_window, dim]``."""
+        md = self.forward_metadata
+        if not md.has_mamba_track_mask:
+            return
+        if md.conv_states_mask_indices is None:
+            if md.mamba_track_mask_indices is None:
+                # nonzero syncs; once per forward, shared by every layer.
+                md.mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                    as_tuple=True
+                )[0]
+            md.conv_states_mask_indices = md.mamba_track_indices[
+                md.mamba_track_mask_indices
+            ]
+        conv_states[md.conv_states_mask_indices] = inputs[md.track_conv_indices].to(
+            conv_states.dtype
+        )
+
     def forward_state_slots(
         self, num_requests: int, track_ids: Optional[torch.Tensor]
     ) -> ForwardStateSlots:
@@ -1095,7 +1132,7 @@ class MambaAttnBackendBase(AttentionBackend):
             cached = pools
         return cached
 
-    def _track_mamba_state_decode(
+    def track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
         conv_states: torch.Tensor,

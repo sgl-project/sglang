@@ -221,7 +221,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 lower_bound=layer.lower_bound,
             )
 
-        self._track_mamba_state_decode(
+        self.track_mamba_state_decode(
             forward_batch,
             conv_states,
             ssm_states,
