@@ -1,7 +1,7 @@
 """takes_fp8_dcp_verify_q must reach the backend that runs target verify through every wrapper.
 
-A wrapper that falls back to the base default, or asks the wrong child, would leave the model
-gathering a bf16 query for a cprr kernel (or an fp8 one for a Gluon consumer that needs the window).
+A wrapper that falls back to the base default, or asks the wrong child,
+leaves the model gathering bf16 for cprr or fp8 for a Gluon consumer that needs the window.
 """
 
 import unittest

@@ -223,6 +223,8 @@ class TestAiterDcpVerifyGraphReplay(CustomTestCase):
         # The planner localizes its KV lengths in place; the batch's must survive.
         self.assertEqual(seq_lens.tolist(), _DCP_SEQ_LENS.tolist())
 
+        # Only the cprr route takes the fp8 query and skips the window.
+        self.assertEqual(backend.takes_fp8_dcp_verify_q(), asm_cprr)
         metadata = backend.forward_metadata
         shard_lens = metadata.local_kv_lens.view(_BATCH_SIZE, _DRAFT_TOKENS)[:, 0]
         self.assertLessEqual(
