@@ -2333,8 +2333,12 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_entry.host_pool.shared_allocation_domain is None
             or anchor_entry.host_evict_fn is None
         ):
-            host_avail = self.cache_controller.mem_pool_host.available_size()
+            mem_pool_host = self.cache_controller.mem_pool_host
+            host_avail = mem_pool_host.available_size()
             if host_avail < kv_tokens:
+                # Evicting cannot fit a backup larger than the whole pool.
+                if kv_tokens > mem_pool_host.logical_size:
+                    return None
                 needed = kv_tokens - host_avail
                 if self.evict_host(needed) < needed:
                     return None
