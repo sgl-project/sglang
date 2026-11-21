@@ -215,6 +215,10 @@ def validate_vmm_layout(
 
     slots = set()
     for name, entry in entries.items():
+        if isinstance(entry, Mapping) and entry.get("is_plain_value", False):
+            if type(entry.get("value")) not in (bool, int, float):
+                raise ValueError(f"malformed vmm_fd plain value {name!r}")
+            continue
         try:
             alloc_index = entry["alloc_index"]
             offset = entry["offset"]
