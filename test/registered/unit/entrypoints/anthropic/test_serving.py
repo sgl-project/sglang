@@ -4,7 +4,7 @@ import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -128,6 +128,281 @@ async def _collect_anthropic_events(serving, anthropic_request):
             if line.startswith("data: "):
                 events.append(json.loads(line[6:]))
     return events
+
+
+class TestToolArgumentIntegrity(CustomTestCase):
+    def test_invalid_model_tool_arguments_return_an_error(self):
+        for arguments in ('{"unfinished":', "[]", "null", "1"):
+            with self.subTest(arguments=arguments):
+                response = ChatCompletionResponse(
+                    id="chatcmpl-test",
+                    created=1,
+                    model="test-model",
+                    choices=[
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    usage={
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                )
+
+                class Backend(_FakeNonStreamingErrorOpenAI):
+                    async def _chat_completion_response(self, *args):
+                        return response
+
+                serving = AnthropicServing(Backend())
+                request = AnthropicMessagesRequest(
+                    model="test-model",
+                    max_tokens=16,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+                chat = ChatCompletionRequest(
+                    model="test-model", messages=[{"role": "user", "content": "Hi"}]
+                )
+                result = asyncio.run(
+                    serving._handle_non_streaming(chat, request, object())
+                )
+                self.assertEqual(result.status_code, 502)
+                body = json.loads(result.body)
+                self.assertEqual(body["error"]["type"], "api_error")
+                self.assertNotIn("content", body)
+
+    def test_empty_string_tool_arguments_convert_to_empty_input(self):
+        response = ChatCompletionResponse(
+            id="chatcmpl-test",
+            created=1,
+            model="test-model",
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "ping", "arguments": ""},
+                            }
+                        ],
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        )
+
+        class Backend(_FakeNonStreamingErrorOpenAI):
+            async def _chat_completion_response(self, *args):
+                return response
+
+        serving = AnthropicServing(Backend())
+        request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        chat = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "Hi"}]
+        )
+        result = asyncio.run(serving._handle_non_streaming(chat, request, object()))
+        self.assertEqual(result.status_code, 200)
+        body = json.loads(result.body)
+        self.assertEqual(body["content"][0]["input"], {})
+
+    def test_stream_invalid_tool_arguments_emit_api_error_before_stop_reason(self):
+        for fragments in (
+            ['{"unfinished":'],
+            ['{"a": ', "unclosed"],
+            ["[]"],
+            ["null"],
+            ["1"],
+        ):
+            with self.subTest(fragments=fragments):
+                chunks = [
+                    _chunk(
+                        [
+                            _choice(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "lookup",
+                                                "arguments": fragments[0],
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        ]
+                    )
+                ]
+                for frag in fragments[1:]:
+                    chunks.append(
+                        _chunk(
+                            [
+                                _choice(
+                                    {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "function": {"arguments": frag},
+                                            }
+                                        ]
+                                    }
+                                )
+                            ]
+                        )
+                    )
+                chunks.append(_chunk([_choice({}, finish_reason="tool_calls")]))
+                chunks.append("data: [DONE]\n\n")
+
+                serving = AnthropicServing(_FakeOpenAIServingChat(stream_lines=chunks))
+                request = AnthropicMessagesRequest(
+                    model="test-model",
+                    max_tokens=16,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+                events = asyncio.run(_collect_anthropic_events(serving, request))
+                types = [event["type"] for event in events]
+                self.assertNotIn("message_delta", types)
+                self.assertIn("content_block_stop", types)
+                self.assertEqual(types[-2:], ["error", "message_stop"])
+                error_event = events[-2]
+                self.assertEqual(error_event["error"]["type"], "api_error")
+                self.assertEqual(
+                    error_event["error"]["message"],
+                    "Model emitted invalid JSON tool arguments",
+                )
+
+    def test_stream_invalid_tool_arguments_abort_before_next_block(self):
+        chunks = [
+            _chunk(
+                [
+                    _choice(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_a",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "alpha",
+                                        "arguments": '{"broken":',
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                ]
+            ),
+            _chunk(
+                [
+                    _choice(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 1,
+                                    "id": "call_b",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "beta",
+                                        "arguments": '{"ok": true}',
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                ]
+            ),
+            _chunk([_choice({}, finish_reason="tool_calls")]),
+            "data: [DONE]\n\n",
+        ]
+        serving = AnthropicServing(_FakeOpenAIServingChat(stream_lines=chunks))
+        request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        tool_starts = [
+            e["content_block"]["name"]
+            for e in events
+            if e["type"] == "content_block_start"
+        ]
+        self.assertEqual(tool_starts, ["alpha"])
+        types = [event["type"] for event in events]
+        self.assertNotIn("message_delta", types)
+        self.assertEqual(types[-2:], ["error", "message_stop"])
+
+    def test_stream_valid_fragmented_tool_arguments_succeed(self):
+        chunks = [
+            _chunk(
+                [
+                    _choice(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"query": ',
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                ]
+            ),
+            _chunk(
+                [
+                    _choice(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {"arguments": '"sglang"}'},
+                                }
+                            ]
+                        }
+                    )
+                ]
+            ),
+            _chunk([_choice({}, finish_reason="tool_calls")]),
+            "data: [DONE]\n\n",
+        ]
+        serving = AnthropicServing(_FakeOpenAIServingChat(stream_lines=chunks))
+        request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        events = asyncio.run(_collect_anthropic_events(serving, request))
+        self.assertFalse(any(event["type"] == "error" for event in events))
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+        self.assertEqual(message_delta["delta"]["stop_reason"], "tool_use")
 
 
 class TestAnthropicServing(unittest.TestCase):
