@@ -225,6 +225,12 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA's visual grounding/detection model (MoonViT vision encoder + Qwen2 backbone) that emits &lt;ref&gt;label&lt;/ref&gt;&lt;box&gt;...&lt;/box&gt; outputs with coordinates normalized to [0, 1000]. Covers object detection, phrase grounding, scene-text detection, GUI grounding, and pointing.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--trust-remote-code</code>. Set <code>skip_special_tokens=false</code> so the &lt;ref&gt;/&lt;box&gt; grounding tokens survive in the output. Constrained &lt;box&gt; decoding is opt-in and client-side: start the server with <code>--enable-custom-logit-processor</code>, then pass <code>custom_logit_processor</code> (a top-level request field) and <code>custom_params</code> (inside <code>sampling_params</code>) together — use <code>LocateAnythingBoxGrammarLogitProcessor.build_sampling_params(config)</code> to build both from the config token ids.</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Molmo2</strong> (4B, 8B)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>allenai/Molmo2-8B</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AllenAI's vision-language model: a SigLIP-style ViT whose features from two layers are attention-pooled over 2x2 patches into image tokens, with a Qwen3 language model. Supports single and multi-image inputs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use <code>--trust-remote-code</code> (loads the checkpoint's image processor). Video inputs and Molmo2-O-7B (OLMo backbone) are not supported yet.</td>
+    </tr>
 </tbody>
 </table>
 
