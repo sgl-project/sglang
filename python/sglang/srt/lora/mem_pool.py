@@ -1003,6 +1003,8 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
@@ -1445,6 +1447,8 @@ class LoRAMemoryPool:
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
                 if (
                     target_module == "embed_tokens"

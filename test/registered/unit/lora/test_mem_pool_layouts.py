@@ -447,5 +447,56 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
                 )
 
 
+class TestLenientAdapterLoad(unittest.TestCase):
+    def test_copies_attention_weights_and_skips_unmatched_weights(self):
+        pool = _make_pool(tp_size=1, attn_tp_size=1, moe_tp_size=1)
+        pool.num_layer = 1
+        pool.max_lora_rank = 2
+        pool.target_modules = {"o_proj"}
+        pool.strict_loading = False
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.max_rank_spaced_layout = False
+        pool.base_model = object()
+        pool.base_hf_config.vocab_size = 16
+        a = torch.ones(2, 3)
+        b = torch.ones(5, 2)
+        pool.A_buffer = {"o_proj": [torch.zeros_like(a).unsqueeze(0)]}
+        pool.B_buffer = {"o_proj": [torch.zeros_like(b).unsqueeze(0)]}
+        prefix = "model.layers.0.self_attn.o_proj"
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=2, lora_added_tokens_size=0),
+            scaling=1.0,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        f"{prefix}.lora_A.weight": a,
+                        f"{prefix}.lora_B.weight": b,
+                        "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": a,
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={"model.embed_tokens.lora_embedding_A": torch.ones(2, 16)},
+            pinned_embedding_layers={},
+            pinned_added_tokens_embeddings={},
+            added_tokens_embeddings={},
+        )
+        module = types.SimpleNamespace(
+            slice_lora_a_weights=torch.as_tensor, slice_lora_b_weights=torch.as_tensor
+        )
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="all-linear",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{prefix: module}],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+        self.assertTrue(torch.equal(pool.A_buffer["o_proj"][0][0], a))
+        self.assertTrue(torch.equal(pool.B_buffer["o_proj"][0][0], b))
+
+
 if __name__ == "__main__":
     unittest.main()
