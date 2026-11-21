@@ -1,4 +1,6 @@
 import importlib.util
+import re
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -41,6 +43,27 @@ class TestAiterWheelCache(CustomTestCase):
                         cache.visible_mount(host_root=host, container="ci"), shared
                     )
                 self.assertEqual(list((host / "aiter-wheels/.locks").iterdir()), [])
+
+    def _evict(self, docker_status):
+        installer = (ROOT / "scripts/ci/amd/amd_ci_install_dependency.sh").read_text()
+        function = re.search(
+            r"^aiter_evict_cache_entry\(\) \{.*?^\}$", installer, re.M | re.S
+        ).group(0)
+        script = f"""set -e
+docker() {{ return {docker_status}; }}
+CI_CONTAINER_NAME=ci AITER_CACHE_ROOT=/cache AITER_CACHE_KEY=key
+{function}
+aiter_evict_cache_entry
+echo "[$AITER_CACHE_KEY]"
+"""
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, check=True
+        ).stdout
+
+    def test_failed_eviction_disables_the_cache_instead_of_aborting_the_job(self):
+        """Under `set -e` a stale entry that cannot be removed must fall back to the source rebuild."""
+        self.assertIn("[]", self._evict(docker_status=1))
+        self.assertIn("[key]", self._evict(docker_status=0))
 
     def _make_wheel(self, directory, complete=True):
         wheel = Path(directory) / "amd_aiter-1-py3-none-any.whl"
