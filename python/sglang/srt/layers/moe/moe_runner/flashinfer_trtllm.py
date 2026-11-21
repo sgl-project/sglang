@@ -49,8 +49,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
-    get_schedule,
-    max_prefill_buffer_tokens,
+    max_prefill_forward_tokens,
 )
 from sglang.srt.utils.device import is_flashinfer_available
 from sglang.srt.utils.log_utils import print_info_once, print_warning_once
@@ -1560,30 +1559,19 @@ def _run_cuda_mxfp4_decode_moe(
 _MXFP4_MOE_WORKSPACE = "trtllm_gen_mxfp4_moe_workspace"
 
 
-# Largest DP-gathered prefill forward, at the bucket the calls tune for.
 def _mxfp4_moe_workspace_tokens() -> int:
-    from sglang.srt.model_executor.cuda_graph_config import Backend
-
-    prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    cg_config = get_exec().graph.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend != Backend.DISABLED:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    return next_power_of_2(prefill_tokens * deployment_attn_dp_size())
+    return next_power_of_2(max_prefill_forward_tokens() * deployment_attn_dp_size())
 
 
 def reserve_trtllm_mxfp4_moe_workspace(
     *, layer: Module, hidden_size: int, intermediate_size: int, precision: str
 ) -> None:
-    """Grow the scratch buffer the trtllm-gen MXFP4 MoE layers share to fit the
-    largest prefill forward. Runs at weight load, so KV sizing sees it."""
     from flashinfer.fused_moe import trtllm_fused_moe_workspace_size
     from flashinfer.tllm_enums import ActivationType
 
-    # PD decode servers run no prefill, so they keep allocating per call.
     if get_disagg().disaggregation_mode == "decode":
         return
     max_num_tokens = _mxfp4_moe_workspace_tokens()
-    # Only the SiTU launches pass an activation; the rest run the Swiglu default.
     activation_type = (
         ActivationType.Situ
         if layer.moe_runner_config.activation == "situ"
