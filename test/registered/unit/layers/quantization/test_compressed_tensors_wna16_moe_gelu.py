@@ -1,12 +1,17 @@
 """A W4A16 compressed-tensors MoE with a GELU expert activation (Gemma 4) must run on
 the Marlin and Triton runners and match a dequantized reference."""
 
+import copy
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.compressed_tensors import (
+    compressed_tensors as ct_module,
+)
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -177,6 +182,28 @@ class TestWNA16MoEGelu(CustomTestCase):
             for activation in ACTIVATIONS:
                 with self.subTest(backend=backend.value, activation=activation):
                     self._run(backend, activation)
+
+
+class TestRocmWNA16MoESchemeSelection(unittest.TestCase):
+    """The ROCm Triton runner passes no zero points, so it must refuse asymmetric checkpoints."""
+
+    def _scheme(self, symmetric):
+        cfg = copy.deepcopy(QUANT_CONFIG)
+        cfg["config_groups"]["group_0"]["weights"]["symmetric"] = symmetric
+        config = CompressedTensorsConfig.from_config(cfg)
+        with mock.patch.object(ct_module, "_is_hip", True):
+            return config.get_moe_scheme(
+                torch.nn.Module(), "model.layers.0.mlp.experts"
+            )
+
+    def test_rejects_asymmetric_checkpoint(self):
+        with self.assertRaisesRegex(ValueError, "zero points"):
+            self._scheme(symmetric=False)
+
+    def test_keeps_symmetric_checkpoint_on_triton(self):
+        self.assertIs(
+            type(self._scheme(symmetric=True)), CompressedTensorsWNA16TritonMoE
+        )
 
 
 if __name__ == "__main__":
