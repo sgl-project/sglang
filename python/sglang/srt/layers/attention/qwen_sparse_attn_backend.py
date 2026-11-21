@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -55,8 +56,17 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_sm100_supported,
+    is_sm120,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +122,80 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
+
+
+# TODO(aiter#7556): remove the API probe once ROCm/aiter#7556 is in the aiter pin; until
+# then aiter.ops.qsa lacks the FlyDSL sparse prefill API and QSA extends stay on Triton.
+@lru_cache(maxsize=1)
+def _resolve_flydsl_sparse_prefill():
+    """aiter.ops.qsa when SGLANG_ROCM_QSA_FLYDSL_PREFILL is set on gfx950 and aiter
+    has the FlyDSL sparse prefill API (ROCm/aiter#7556), else None."""
+    if not (envs.SGLANG_ROCM_QSA_FLYDSL_PREFILL.get() and is_gfx95_supported()):
+        return None
+    try:
+        import aiter.ops.qsa as qsa
+
+        qsa.qsa_sparse_prefill_problem, qsa.qsa_sparse_prefill_warmup
+    except (ImportError, AttributeError) as e:
+        logger.warning(
+            "SGLANG_ROCM_QSA_FLYDSL_PREFILL is set, but aiter has no FlyDSL QSA "
+            "sparse prefill API (ROCm/aiter#7556); QSA extend stays on Triton: %s",
+            e,
+        )
+        return None
+    return qsa
+
+
+def _flydsl_sparse_prefill(q, k, v, indices, query_lens, prefix_lens, scale):
+    """QSA extend attention on AITER's FlyDSL sparse prefill, from the operands the
+    Triton kernels take, or None to keep Triton: the op unavailable, a prefill graph
+    run, or an operand rule the op names."""
+    op = _resolve_flydsl_sparse_prefill()
+    # Prefill graph runs keep Triton: their capture warm-ups run dummy batches whose
+    # selections do not match their lengths, which the op does not validate, and the
+    # op plans each new layout on the host.
+    if op is None or is_in_prefill_graph_scope():
+        return None
+    kwargs = dict(
+        query_lens=tuple(query_lens),
+        prefix_lens=tuple(prefix_lens),
+        softmax_scale=scale,
+    )
+    problem = op.qsa_sparse_prefill_problem(q, k, v, indices, **kwargs)
+    if problem is not None:
+        logger.warning_once("QSA extend attention stays on Triton: %s", problem)
+        return None
+    return op.qsa_sparse_prefill(q, k, v, indices, **kwargs)
+
+
+@lru_cache(maxsize=None)
+def _warm_flydsl_sparse_prefill(heads, kv_heads, head_dim, scale, width, device):
+    """Compile the FlyDSL sparse prefill kernels of one attention geometry, once per
+    process, through the served call."""
+
+    def run(q, indices, query_lens, prefix_lens):
+        k = q.new_zeros(q.shape[0], kv_heads, head_dim)
+        out = _flydsl_sparse_prefill(
+            q, k, torch.zeros_like(k), indices, query_lens, prefix_lens, scale
+        )
+        return out is not None
+
+    warmed = _resolve_flydsl_sparse_prefill().qsa_sparse_prefill_warmup(
+        run,
+        num_q_heads=heads,
+        num_kv_heads=kv_heads,
+        selection_width=width,
+        device=device,
+    )
+    logger.info(
+        "QSA FlyDSL sparse prefill warmed for %d query heads, %d KV heads, head dim "
+        "%d, selection width %d: request lengths %s",
+        heads,
+        kv_heads,
+        head_dim,
+        width,
+        warmed,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -348,6 +432,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+        if _resolve_flydsl_sparse_prefill() is not None:
+            self._warm_flydsl_prefill_geometries()
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1585,6 +1671,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    def _warm_flydsl_prefill_geometries(self) -> None:
+        """Compile the FlyDSL sparse prefill kernels of the model's attention
+        geometries at startup, so that no served extend compiles them."""
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        model = getattr(self.runner, "model", None)
+        if model is None or self.qsa_profile is None:
+            return
+        width = self.qsa_profile.budget + self.qsa_profile.compress_ratio - 1
+        geometries = {
+            (m.tp_q_head_num, m.tp_k_head_num, m.qk_head_dim, m.scaling)
+            for m in model.modules()
+            if isinstance(m, RadixAttention)
+        }
+        for geometry in sorted(geometries):
+            _warm_flydsl_sparse_prefill(*geometry, width, self.device)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1656,16 +1759,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
             (1, 0),
         ).contiguous()
+        q = q.contiguous()
         if not any(prefix_lens):
-            output = sparse_gqa_fwd_interface_triton(
-                q.contiguous(),
-                k[:num_valid_rows].contiguous(),
-                v[:num_valid_rows].contiguous(),
-                max(sequence_lens, default=1),
-                topk_indices,
-                cu_seqlens_q,
-                layer.scaling,
+            k = k[:num_valid_rows].contiguous()
+            v = v[:num_valid_rows].contiguous()
+            output = _flydsl_sparse_prefill(
+                q, k, v, topk_indices, extend_lens, prefix_lens, layer.scaling
             )
+            if output is None:
+                output = sparse_gqa_fwd_interface_triton(
+                    q,
+                    k,
+                    v,
+                    max(sequence_lens, default=1),
+                    topk_indices,
+                    cu_seqlens_q,
+                    layer.scaling,
+                )
             return self._pad_extend_output(output, num_output_rows)
 
         # Current-chunk K/V has already been committed to the cache above.
@@ -1692,16 +1802,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
         )
-        output = sparse_gqa_fwd_interface_triton_ck(
-            q.contiguous(),
-            packed_k,
-            packed_v,
-            topk_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            sequence_lens_tensor,
-            layer.scaling,
+        output = _flydsl_sparse_prefill(
+            q, packed_k, packed_v, topk_indices, extend_lens, prefix_lens, layer.scaling
         )
+        if output is None:
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q,
+                packed_k,
+                packed_v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+            )
         return self._pad_extend_output(output, num_output_rows)
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
