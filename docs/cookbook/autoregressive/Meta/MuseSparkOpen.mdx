@@ -451,9 +451,12 @@ python3 -m dynamo.sglang \
 
 DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–40: TP8·EP8 with the AMD monokernels at low concurrency, TP4·EP4 with HiCache at high concurrency.
 
+Concurrency 58 is submitted in [InferenceX #5155](https://github.com/SemiAnalysisAI/InferenceX/pull/5155) and not yet measured there; its fragment below follows the [submitted recipe at `44057012ab37`](https://github.com/SemiAnalysisAI/InferenceX/blob/44057012ab372c7715e49d037898dd8c935742c2/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/musespark/sglang/mi355x-fp4-mtp/agentic.yaml), with benchmark harness settings removed.
+
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-mi355-1106`.
 - **Monokernels.** At low concurrency, add the monokernel flags below.
 - **HiCache.** At high concurrency, add the TP4 HiCache flags below instead. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
+- **Concurrency 58.** Use the concurrency 58 HiCache flags instead. They add `SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1`, which frees SWA KV slots that have left the sliding window so the SWA pool does not saturate above concurrency 40, and `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0`.
 
 ```bash Command
 SGLANG_USE_AITER=1 \
@@ -498,6 +501,31 @@ python -m sglang.launch_server \
 PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+  --tp-size 4 \
+  --ep-size 4 \
+  --page-size 128 \
+  --mem-fraction-static 0.86 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
+  --prefill-decode-interval 24 \
+  --max-running-requests 80 \
+  --cuda-graph-max-bs-decode 80 \
+  --swa-full-tokens-ratio 0.2 \
+  --schedule-policy shortest-prefill-first \
+  --stream-interval 20 \
+  --enable-hierarchical-cache \
+  --hicache-size 310 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first
+```
+
+```bash HiCache (concurrency 58)
+PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
+SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
+HSA_ENABLE_SCRATCH_ASYNC_RECLAIM=0 \
   --tp-size 4 \
   --ep-size 4 \
   --page-size 128 \
