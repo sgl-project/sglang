@@ -285,6 +285,25 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
         self.assertEqual(_round_trip(output), output)
 
 
+class TestSequencedControlReqWire(CustomTestCase):
+    def test_decodes_the_layout_the_rust_server_writes(self):
+        # rust/sglang-server/src/message/types.rs writes a numbered message as
+        # [tag, rid, http_worker_ipc, seq, payload] with no `pickled` element.
+        wire = msgspec.msgpack.encode(
+            [
+                "SequencedControlReq",
+                "rid-7",
+                None,
+                7,
+                io_struct.msgpack_encode(io_struct.FlushCacheReqInput(rid="rid-7")),
+            ]
+        )
+        numbered = io_struct.msgpack_decode(wire)
+        self.assertIsInstance(numbered, io_struct.SequencedControlReq)
+        self.assertEqual((numbered.rid, numbered.seq), ("rid-7", 7))
+        self.assertEqual(numbered.unwrap().rid, "rid-7")
+
+
 class TestWeightVersionSpansRoundTrip(CustomTestCase):
     """The per-request weight-version spans ride the same msgpack IPC path."""
 

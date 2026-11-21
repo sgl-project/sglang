@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    WORK_REQ_TYPES,
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -333,34 +334,8 @@ class SchedulerRequestReceiver:
     def _split_work_and_control_reqs(self, recv_reqs: List):
         # An AbortReq arrives behind its request on this DP group's own socket;
         # the work channel keeps that order, the broadcast from global rank 0 does not.
-        work_reqs = [
-            req
-            for req in recv_reqs
-            if isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                    AbortReq,
-                ),
-            )
-        ]
-        control_reqs = [
-            req
-            for req in recv_reqs
-            if not isinstance(
-                req,
-                (
-                    TokenizedGenerateReqInput,
-                    TokenizedEmbeddingReqInput,
-                    BatchTokenizedGenerateReqInput,
-                    BatchTokenizedEmbeddingReqInput,
-                    AbortReq,
-                ),
-            )
-        ]
+        work_reqs = [req for req in recv_reqs if isinstance(req, WORK_REQ_TYPES)]
+        control_reqs = [req for req in recv_reqs if not isinstance(req, WORK_REQ_TYPES)]
         return work_reqs, control_reqs
 
 

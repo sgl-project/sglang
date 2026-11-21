@@ -246,6 +246,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler.enable_lmcache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
+    scheduler.pause_state = PauseState()
 
     def poll():
         if state == "batch":

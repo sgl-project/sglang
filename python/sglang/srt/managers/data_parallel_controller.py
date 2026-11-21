@@ -38,6 +38,7 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    WORK_REQ_TYPES,
     AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -45,6 +46,7 @@ from sglang.srt.managers.io_struct import (
     BlockReqInput,
     ElasticScaleUpdateReq,
     ProfileReq,
+    SequencedControlReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -255,6 +257,9 @@ class DataParallelController:
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+        # The number of the last control request sent, when each DP group
+        # receives control requests on its own socket.
+        self.last_control_seq: int | None = 0 if is_control_broadcast_local() else None
 
         self.init_dispatcher()
 
@@ -269,15 +274,28 @@ class DataParallelController:
             start_cpu_monitor_thread("data_parallel_controller")
 
     def send_to_all_workers(self, obj):
+        obj = self._sequence_control_req(obj)
         for i, worker in enumerate(self.workers):
             if worker is not None and self.status[i]:
                 sock_send(worker, obj)
 
     def send_control_message(self, obj):
+        obj = self._sequence_control_req(obj)
         for i in self._active_workers[:: self.control_message_step]:
             worker = self.workers[i]
             if worker is not None:
                 sock_send(worker, obj)
+
+    def _sequence_control_req(self, obj):
+        """Number a control request every DP group receives on its own socket,
+        so the groups apply it in the same step. A BlockReqInput is consumed by
+        the input blocker before control requests are split off."""
+        if self.last_control_seq is None or isinstance(
+            obj, (*WORK_REQ_TYPES, BlockReqInput)
+        ):
+            return obj
+        self.last_control_seq += 1
+        return SequencedControlReq.wrap(obj, self.last_control_seq)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:

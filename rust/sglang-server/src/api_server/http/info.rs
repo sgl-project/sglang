@@ -26,12 +26,14 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::auth::DeclaredRoute;
 use super::native_api::native_error;
-use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::core::fanout::RelayRefusal;
+use crate::api_server::core::{CONTROL_SEQ_PATH, CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::{
     ExpertDistributionAction, LoggingConfig, PdRoleSwitch, ProfileOptions, SessionOpen,
 };
+use crate::message::types::SequencedControlReq;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -100,6 +102,9 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
         .declared_route(FORWARD_PEER_PATH, post(forward_control_req))
+        // Listener-to-listener: rank 0's listener numbers another listener's
+        // control request (see `api_server::core::control_seq`).
+        .declared_route(CONTROL_SEQ_PATH, post(issue_control_seq))
 }
 
 /// `POST|PUT /set_internal_state` — Python's `SetInternalStateReq` body; the
@@ -437,20 +442,12 @@ async fn update_weight_version(
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
 async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "not a control message a peer listener relays",
-        )
-            .into_response();
-    };
-    // Without an admin key the forced admin routes refuse before relaying,
-    // so only a request sent straight to this route carries their message;
-    // refuse it too, or the peer route would bypass that refusal.
-    if state.server_args.api_keys.admin_api_key.is_none()
-        && routes.iter().copied().any(super::auth::is_admin_force)
-    {
-        return super::auth::admin_key_missing();
+    match peer_relay_refusal(&body, state.server_args.api_keys.admin_api_key.is_some()) {
+        Some(refusal @ RelayRefusal::NotRelayed) => {
+            return (StatusCode::BAD_REQUEST, refusal.to_string()).into_response();
+        }
+        Some(RelayRefusal::AdminKeyMissing) => return super::auth::admin_key_missing(),
+        None => {}
     }
     match state.core.forward_control_req(body).await {
         Ok(reply) => (
@@ -549,6 +546,20 @@ const RELAYED_BY: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Why `/internal/peer` refuses a control message (its wire bytes), or `None`:
+/// it relays only a message some route fans out, and, without an admin key, no
+/// admin-only one (those routes refuse before relaying, so such a message on
+/// the peer route was sent straight to it, past that refusal). A numbered
+/// fan-out checks it at the origin before taking a number (see
+/// `CoreHandle::control_numbered`).
+pub(crate) fn peer_relay_refusal(body: &[u8], admin_key_configured: bool) -> Option<RelayRefusal> {
+    let Some(routes) = forwarded_tag(body).and_then(|tag| relayed_by(&tag)) else {
+        return Some(RelayRefusal::NotRelayed);
+    };
+    (!admin_key_configured && routes.iter().copied().any(super::auth::is_admin_force))
+        .then_some(RelayRefusal::AdminKeyMissing)
+}
+
 fn relayed_by(tag: &str) -> Option<&'static [&'static str]> {
     RELAYED_BY
         .iter()
@@ -556,8 +567,27 @@ fn relayed_by(tag: &str) -> Option<&'static [&'static str]> {
         .map(|(_, routes)| *routes)
 }
 
-/// A forwarded control message's type tag, the first element of its array.
+/// `POST /internal/control_seq`: the next control-request number, msgpack.
+async fn issue_control_seq(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.issue_control_seq().and_then(|seq| {
+        rmp_serde::to_vec(&seq).map_err(|error| CoreError::Internal(error.to_string()))
+    }) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/msgpack")],
+            body,
+        )
+            .into_response(),
+        Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
+}
+
+/// A forwarded control message's type tag, the first element of its array;
+/// for a numbered message, the tag of the message it numbers.
 fn forwarded_tag(body: &[u8]) -> Option<String> {
+    if let Some(numbered) = SequencedControlReq::parse(body).ok()? {
+        return forwarded_tag(&numbered.header);
+    }
     match rmpv::decode::read_value(&mut &body[..]).ok()? {
         rmpv::Value::Array(items) => items.first()?.as_str().map(str::to_owned),
         _ => None,
@@ -1635,7 +1665,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
         let (state, intake_rx, abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
@@ -1748,7 +1778,7 @@ mod tests {
             rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
         let (state, _intake_rx, _abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
@@ -2462,7 +2492,8 @@ mod tests {
 
     /// Without an admin key, the peer route refuses the operations of the
     /// forced admin routes, as those routes do, before they reach the
-    /// scheduler; other control messages still go through.
+    /// scheduler, numbered or not; other control messages still go through,
+    /// a numbered one as numbered.
     #[tokio::test]
     async fn peer_route_refuses_forced_admin_operations_without_an_admin_key() {
         use crate::message::io_struct::{
@@ -2489,46 +2520,100 @@ mod tests {
             )),
             ControlRequest::ProfileReq(ProfileReq::stop(rid())),
         ];
-        let post = |state: Arc<AppState>, message: &ControlRequest| {
+        let numbered = |message: &ControlRequest| {
+            SequencedControlReq {
+                seq: 1,
+                rid: rid(),
+                header: message.encode().unwrap(),
+            }
+            .encode()
+            .unwrap()
+        };
+        let post = |state: Arc<AppState>, body: Bytes| {
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(message.encode().unwrap()))
+                    .body(Body::from(body))
                     .unwrap(),
             )
         };
 
         let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
         for message in &forced {
-            // A relayed operation would wait on the scheduler's reply forever.
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                post(state.clone(), message),
-            )
-            .await
-            .expect("refused without waiting on the scheduler")
-            .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{message:?}");
-            let body = to_bytes(response.into_body(), 1024).await.unwrap();
-            assert!(
-                String::from_utf8_lossy(&body).contains("requires admin API key"),
-                "{body:?}"
-            );
+            for body in [message.encode().unwrap(), numbered(message)] {
+                // A relayed operation would wait on the scheduler's reply forever.
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    post(state.clone(), body),
+                )
+                .await
+                .expect("refused without waiting on the scheduler")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{message:?}");
+                let body = to_bytes(response.into_body(), 1024).await.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("requires admin API key"),
+                    "{body:?}"
+                );
+            }
         }
         assert!(intake_rx.is_empty(), "refused before the scheduler");
 
-        // With an admin key, the relayed detach reaches the scheduler.
+        // With an admin key, the relayed detach reaches the scheduler, and a
+        // numbered one keeps its number.
         let mut args = ServerArgs::default();
         args.api_keys.admin_api_key = Some("sk-admin".into());
         let (state, intake_rx, _abort_rx) = test_state(args);
-        let response = tokio::spawn(post(state, &forced[1]));
-        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
-            panic!("the detach must reach the scheduler");
+        for (body, expect_numbered) in [
+            (forced[1].encode().unwrap(), false),
+            (numbered(&forced[1]), true),
+        ] {
+            let response = tokio::spawn(post(state.clone(), body));
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("the detach must reach the scheduler");
+            };
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            assert_eq!(
+                matches!(control.as_ref(), ControlRequest::Sequenced(n) if n.seq == 1),
+                expect_numbered
+            );
+            assert!(admission.try_accept());
+            drop(request);
+            let _ = response.await;
+        }
+    }
+
+    /// The peers a listener builds refuse at the origin what the peer route
+    /// refuses, so a numbered fan-out the peers would refuse never takes a
+    /// number (see `CoreHandle::control_numbered`).
+    #[test]
+    fn built_peers_refuse_what_the_peer_route_refuses() {
+        use crate::message::io_struct::{ControlRequest, FlushCacheReqInput, ProfileReq};
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![endpoint(1, "http://127.0.0.1:1")],
+            ..Default::default()
         };
-        assert!(admission.try_accept());
-        drop(request);
-        let _ = response.await;
+        let admin_only = ControlRequest::ProfileReq(ProfileReq::stop("rid".into()))
+            .encode()
+            .unwrap();
+        let open = ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new("rid".into(), None))
+            .encode()
+            .unwrap();
+        let without_key =
+            peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
+        assert_eq!(
+            without_key[0].relay_refusal(&admin_only),
+            Some(RelayRefusal::AdminKeyMissing)
+        );
+        assert_eq!(without_key[0].relay_refusal(&open), None);
+        let keys = crate::message::config::ApiKeys::new(None, Some("sk-admin".into()));
+        let with_key = peer_endpoints(&info, 0, &keys, peer_relay_refusal).unwrap();
+        assert_eq!(with_key[0].relay_refusal(&admin_only), None);
     }
 
     #[test]

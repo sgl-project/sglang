@@ -27,7 +27,8 @@ use super::frontend_state::FrontendState;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
-    AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, RequestLog,
+    AbortHook, ControlSequencer, CoreError, DrainEnd, DrainState, FrontendMetrics,
+    GenerateValidator, RequestLog,
 };
 
 /// How long the listeners keep open connections after a drain's requests
@@ -175,6 +176,13 @@ pub(super) struct CoreInner {
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    /// Whether control requests fanned out to every rank are numbered: the
+    /// attention-DP groups apply them in the same step (see `core::control_seq`).
+    pub(super) sequences_control_reqs: bool,
+    pub(super) control_sequencer: ControlSequencer,
+    /// The peer that gives out the numbers: DP rank 0's listener, when this
+    /// listener is another rank's.
+    pub(super) control_seq_issuer: Option<Arc<dyn ControlTarget>>,
     pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
     pub(super) abort_hook: Option<Arc<dyn AbortHook>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
@@ -214,7 +222,15 @@ impl CoreHandle {
                 metrics: config.metrics,
                 request_log: config.request_log,
                 dp_rank,
+                sequences_control_reqs: metadata.deployment_info.enable_dp_attention
+                    && !config.peer_endpoints.is_empty(),
+                control_seq_issuer: config
+                    .peer_endpoints
+                    .iter()
+                    .find(|peer| peer.ranks().contains(&0))
+                    .cloned(),
                 peer_endpoints: config.peer_endpoints,
+                control_sequencer: ControlSequencer::default(),
                 generate_validator: config.generate_validator,
                 abort_hook: config.abort_hook,
                 drain: Arc::default(),

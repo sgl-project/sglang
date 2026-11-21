@@ -8,7 +8,8 @@ use futures::future::BoxFuture;
 use http::StatusCode;
 
 use super::CoreError;
-use super::fanout::{ControlTarget, RankId, RankReply, RequestBuilder};
+use super::control_seq::CONTROL_SEQ_PATH;
+use super::fanout::{ControlTarget, RankId, RankReply, RelayRefusal, RequestBuilder};
 use crate::message::config::{ApiKeys, DeploymentInfo};
 
 /// The route a listener serves forwarded control requests on.
@@ -19,20 +20,51 @@ pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
 /// either, so a response is waited for as long as it takes.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The rule a listener relays a peer's control message by, from its wire
+/// bytes and whether an admin key is configured; the HTTP layer owns it.
+pub(crate) type RelayRule = fn(&[u8], bool) -> Option<RelayRefusal>;
+
 /// One DP rank's listener, reached over HTTP.
 pub(crate) struct Peer {
     ranks: [RankId; 1],
-    url: String,
+    base_url: String,
     client: reqwest::Client,
+    /// The rule this peer relays by, with the deployment's admin-key state.
+    relay_rule: Option<(RelayRule, bool)>,
 }
 
 impl Peer {
     pub(crate) fn new(client: reqwest::Client, dp_rank: RankId, base_url: &str) -> Self {
         Self {
             ranks: [dp_rank],
-            url: format!("{}{FORWARD_PEER_PATH}", base_url.trim_end_matches('/')),
+            base_url: base_url.trim_end_matches('/').to_owned(),
             client,
+            relay_rule: None,
         }
+    }
+
+    async fn fetch_control_seq(&self) -> Result<u64, CoreError> {
+        let response = self
+            .client
+            .post(format!("{}{CONTROL_SEQ_PATH}", self.base_url))
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(transport_error)?;
+        if !status.is_success() {
+            return Err(CoreError::Internal(format!(
+                "dp rank {}: control number: {}",
+                self.ranks[0],
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        rmp_serde::from_slice(&body).map_err(|error| {
+            CoreError::InvalidResponse(format!(
+                "dp rank {}: control number: {error}",
+                self.ranks[0]
+            ))
+        })
     }
 
     async fn forward(&self, build: &RequestBuilder<'_>) -> Result<Bytes, CoreError> {
@@ -41,7 +73,7 @@ impl Peer {
             .map_err(|error| CoreError::Internal(error.to_string()))?;
         let response = self
             .client
-            .post(&self.url)
+            .post(format!("{}{FORWARD_PEER_PATH}", self.base_url))
             .header(http::header::CONTENT_TYPE, "application/msgpack")
             .body(header)
             .send()
@@ -87,15 +119,28 @@ impl ControlTarget for Peer {
             }]
         })
     }
+
+    fn relay_refusal(&self, message: &[u8]) -> Option<RelayRefusal> {
+        let (rule, admin_key_configured) = self.relay_rule?;
+        rule(message, admin_key_configured)
+    }
+
+    fn next_control_seq(&self) -> Option<BoxFuture<'_, Result<u64, CoreError>>> {
+        // Only DP rank 0's listener gives numbers out; another refuses.
+        Some(Box::pin(self.fetch_control_seq()))
+    }
 }
 
 /// The target endpoints for every DP rank other than `own`. Peers check the
 /// relay against the same keys as clients, at the admin-optional level, so it
-/// presents the admin key when one is configured, else the API key.
+/// presents the admin key when one is configured, else the API key. The origin
+/// checks each one's `relay_rule` before a numbered fan-out (see
+/// `ControlTarget::relay_refusal`).
 pub(crate) fn peer_endpoints(
     deployment_info: &DeploymentInfo,
     own: RankId,
     keys: &ApiKeys,
+    relay_rule: RelayRule,
 ) -> Result<Vec<Arc<dyn ControlTarget>>, String> {
     let endpoints: Vec<_> = deployment_info
         .rust_server_endpoints
@@ -123,11 +168,9 @@ pub(crate) fn peer_endpoints(
     Ok(endpoints
         .into_iter()
         .map(|endpoint| {
-            Arc::new(Peer::new(
-                client.clone(),
-                endpoint.dp_rank,
-                &endpoint.endpoint,
-            )) as Arc<dyn ControlTarget>
+            let mut peer = Peer::new(client.clone(), endpoint.dp_rank, &endpoint.endpoint);
+            peer.relay_rule = Some((relay_rule, keys.admin_api_key.is_some()));
+            Arc::new(peer) as Arc<dyn ControlTarget>
         })
         .collect())
 }
@@ -249,11 +292,16 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            peer_endpoints(&DeploymentInfo::default(), 0, &ApiKeys::default())
-                .unwrap()
-                .is_empty()
+            peer_endpoints(
+                &DeploymentInfo::default(),
+                0,
+                &ApiKeys::default(),
+                |_, _| None
+            )
+            .unwrap()
+            .is_empty()
         );
-        let peers = peer_endpoints(&info, 1, &ApiKeys::default()).unwrap();
+        let peers = peer_endpoints(&info, 1, &ApiKeys::default(), |_, _| None).unwrap();
         assert_eq!(peers.len(), 2);
         let replies = fan_out(1, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
         let messages: Vec<String> = replies
@@ -322,7 +370,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0, &ApiKeys::default()).unwrap();
+        let peers = peer_endpoints(&info, 0, &ApiKeys::default(), |_, _| None).unwrap();
         let reply = peers[0].control(&build).await.remove(0).outcome;
         assert_eq!(reply.unwrap(), "reply");
         assert_eq!(seen.lock().unwrap().len(), 1);

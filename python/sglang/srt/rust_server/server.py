@@ -30,7 +30,11 @@ import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    SequencedControlReq,
+    ShutdownReq,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -895,6 +899,11 @@ class RustServer:
         its client and raise."""
         try:
             obj = msgpack_decode_explained(header)
+            if isinstance(obj, SequencedControlReq):
+                # Decode the wrapped request too: a malformed one gets the same
+                # 400 as an unnumbered one instead of failing in PauseState, and
+                # every DP group drops the same number and goes on from the next.
+                msgpack_decode_explained(obj.payload)
         except MsgpackDecodeError as e:
             # Return 400 for malformed request field (e.g. token_ids_logprob=[[0]].
             logger.warning(

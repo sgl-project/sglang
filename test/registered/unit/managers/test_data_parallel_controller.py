@@ -5,7 +5,7 @@ test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
 inject only the attrs the schedulers read (`workers`, `_active_workers`,
-`round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
+`round_robin_counter`, `dp_budget`, `last_control_seq`). `status` / `dp_active` / `max_dp_size` are for
 `update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
 attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
 refresh-throttle tests inject `load_snapshot_reader` and `_last_refresh_time` on top of
@@ -91,6 +91,7 @@ def _make_controller(
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
+    ctl.last_control_seq = None
     return ctl
 
 
@@ -774,6 +775,30 @@ class TestDPAttentionAbortRoute(CustomTestCase):
 
                 self.assertEqual(first[1] + second[1], [gen, abort])
                 self.assertEqual((first[0] + second[0]).count(abort), 1)
+
+
+class TestControlRequestNumbering(CustomTestCase):
+    def test_each_control_request_gets_one_number_for_every_group(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.last_control_seq = 0
+        ctl.control_message_step = 1
+        sent = []
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.sock_send",
+            side_effect=lambda worker, obj: sent.append(obj),
+        ):
+            ctl.send_control_message(io_struct.FlushCacheReqInput())
+            ctl.send_to_all_workers(io_struct.FlushCacheReqInput())
+            ctl.send_control_message(io_struct.AbortReq(rid="a"))
+            ctl.send_to_all_workers(
+                io_struct.BlockReqInput(req_type=io_struct.BlockReqType.BLOCK)
+            )
+
+        self.assertEqual(
+            [getattr(obj, "seq", None) for obj in sent],
+            [1, 1, 2, 2, None, None, None, None],
+        )
+        self.assertIsInstance(sent[0].unwrap(), io_struct.FlushCacheReqInput)
 
 
 if __name__ == "__main__":
