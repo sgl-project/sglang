@@ -277,6 +277,28 @@ jobs:
             bash scripts/ci/npu/npu_nightly_eval_deps.sh
           fi
 
+          # sgl_eval downloads the MMLU archive with its own httpx client
+          # (ignores HF_ENDPOINT, no progress, no retries), so stage it here for
+          # both dependency paths instead of only the nightly one: the tests read
+          # SGLANG_EVAL_ARCHIVE_DIR and fall back to sgl_eval's own download when
+          # the copy is missing or stale. Xet storage is not proxied by the
+          # mirror (401), hence the classic HTTP path below.
+          SGLANG_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
+          mkdir -p "${SGLANG_EVAL_ARCHIVE_DIR}"
+          export HF_HUB_DISABLE_XET=1
+          if { command -v hf >/dev/null 2>&1 \
+                 && hf download cais/mmlu --repo-type dataset --include data.tar \
+                      --local-dir "${SGLANG_EVAL_ARCHIVE_DIR}"; } \
+             || curl -fL --retry 5 --retry-delay 5 --connect-timeout 10 \
+                  -o "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar" \
+                  "${HF_ENDPOINT:-https://huggingface.co}/datasets/cais/mmlu/resolve/main/data.tar"; then
+            ls -lh "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
+            sha256sum "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
+          else
+            echo "::warning::MMLU archive prefetch failed; sgl_eval will download it itself"
+          fi
+          echo "SGLANG_EVAL_ARCHIVE_DIR=${SGLANG_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
+
           # The hicache_hash_cpp JIT build includes <openssl/sha.h>.
           apt-get install -y libssl-dev
 

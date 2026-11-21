@@ -194,6 +194,7 @@ NIGHTLY_SUITES = {
         "nightly-test-4-npu-a3",
         "nightly-test-8-npu-a3",
         "nightly-test-16-npu-a3",
+        "nightly-mmlu-npu-a3",
         "nightly-acc-test-2-npu-a3",
         "nightly-acc-test-8-npu-a3",
         "nightly-acc-test-16-npu-a3",
