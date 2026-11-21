@@ -1726,6 +1726,46 @@ class TestHicacheMambaSize(CustomTestCase):
         self.assertAlmostEqual(kv_sizes["swa_host_size"], 122 / 3)
         self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
 
+    def test_mamba_stack_gives_the_pin_to_mamba_and_the_rest_to_kv(self):
+        """The non-SWA hybrid builder splits through the same pin as the SWA one."""
+        kv_pool = self._pool(8 << 30)
+        params = SimpleNamespace(
+            page_size=1, mtp_draft_device_pools=(), mtp_draft_mamba_pools=()
+        )
+        with (
+            self._hicache_args(mamba_size=70),
+            patch.object(hybrid_pool_assembler, "_mamba_info"),
+            patch.object(
+                hybrid_pool_assembler, "_mamba_layer_mapping", return_value={2: 0}
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "prepare_host_pool_config",
+                return_value=SimpleNamespace(
+                    root=kv_pool, packed_draft_device_pools=()
+                ),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_kv_budget_index_bytes", return_value=0
+            ),
+            patch.object(hybrid_pool_assembler, "build_kv_host_pool") as kv_host,
+            patch.object(hybrid_pool_assembler, "_build_pool_entries", return_value=[]),
+            patch.object(hybrid_pool_assembler, "HostPoolGroup"),
+            patch.object(hybrid_pool_assembler, "_mamba_entry") as mamba_entry,
+            patch.object(hybrid_pool_assembler, "_build_cache_controller"),
+        ):
+            hybrid_pool_assembler.build_hybrid_mamba_stack(
+                params=params,
+                kv_pool=kv_pool,
+                mamba_pool=self._pool(6 << 30),
+                full_layer_mapping={0: 0},
+                start_layer=0,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        self.assertEqual(kv_host.call_args.kwargs["host_size"], 122)
+        self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
+
     def test_pin_below_one_mamba_slot_is_rejected(self):
         """Host sizing pads by one slot,
         so a pin smaller than one state slot would silently build a one-slot pool."""
@@ -1821,6 +1861,14 @@ class TestHicacheMambaSize(CustomTestCase):
             host_pool_group=SimpleNamespace(entry_map={PoolName.KV: object()}),
         )
         no_group = Mock(spec=UnifiedRadixCache, host_pool_group=None)
+        with self._hicache_args(mamba_size=0):
+            with (
+                self.subTest(tree_cache="no pin"),
+                self.assertNoLogs(logger, "WARNING"),
+            ):
+                kv_cache_builder._warn_unused_hicache_mamba_size(
+                    tree_cache=without_mamba
+                )
         with self._hicache_args(mamba_size=70):
             with self.subTest(tree_cache="mamba host pool"):
                 with self.assertNoLogs(logger, "WARNING"):

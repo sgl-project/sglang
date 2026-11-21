@@ -2859,7 +2859,7 @@ class TestSSLArgs(unittest.TestCase):
 class TestHiCacheArgs(CustomTestCase):
     @staticmethod
     def _resolve_mamba_size(**kwargs):
-        """Resolve on the dummy model, so the check must run before its early return."""
+        # The dummy model returns early, so the check must run before that.
         args = ServerArgs(model_path="dummy", **kwargs)
         args.resolve_once()
 

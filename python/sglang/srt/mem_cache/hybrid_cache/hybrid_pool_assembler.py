@@ -256,7 +256,7 @@ def _split_hicache_size_with_mamba(
     return (*kv_sizes, mamba_size)
 
 
-def _require_pinned_mamba_slot(host_pool: MambaPoolHost, *, host_size: float) -> None:
+def _require_pinned_mamba_slot(*, host_pool: MambaPoolHost, host_size: float) -> None:
     # Ratio sizing (host_size 0) never carries a pin;
     # sizing pads each host pool by one slot, so a sub-slot pin builds a 1-slot pool.
     if host_size <= 0 or get_memory().hicache_mamba_size == 0:
@@ -1200,7 +1200,7 @@ def _mamba_entry(
         layout=_state_host_layout(),
         mtp_draft_device_pools=drafts,
     )
-    _require_pinned_mamba_slot(host_pool, host_size=host_size)
+    _require_pinned_mamba_slot(host_pool=host_pool, host_size=host_size)
     return build_pool_entry(
         name=PoolName.MAMBA,
         host_pool=host_pool,
