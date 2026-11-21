@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import SiglipVisionConfig
 
-from sglang.srt.layers.activation import QuickGELU
+from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -64,7 +64,7 @@ class SiglipMLP(nn.Module):
     def __init__(
         self,
         config,
-        act_layer: Callable[[], nn.Module] = QuickGELU,
+        act_layer: Optional[Callable[[], nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -77,7 +77,12 @@ class SiglipMLP(nn.Module):
             prefix=add_prefix("fc1", prefix),
             parallel_group="replicated" if use_data_parallel else "tp",
         )
-        self.act = act_layer()
+        if act_layer is not None:
+            self.act = act_layer()
+        elif config.hidden_act == "quick_gelu":
+            self.act = QuickGELU()
+        else:
+            self.act = get_act_fn(config.hidden_act)
         self.fc2 = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
@@ -98,7 +103,7 @@ class SiglipEncoderLayer(nn.Module):
     def __init__(
         self,
         config: SiglipVisionConfig,
-        act_layer: Callable[[], nn.Module] = QuickGELU,
+        act_layer: Optional[Callable[[], nn.Module]] = None,
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -176,7 +181,7 @@ class SiglipEncoder(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         qkv_backend: Optional[str] = None,
-        act_layer: Callable[[], nn.Module] = QuickGELU,
+        act_layer: Optional[Callable[[], nn.Module]] = None,
         flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ) -> None:
@@ -231,7 +236,7 @@ class SiglipVisionTransformer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         qkv_backend: Optional[str] = None,
-        act_layer: Callable[[], nn.Module] = QuickGELU,
+        act_layer: Optional[Callable[[], nn.Module]] = None,
         flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ) -> None:
@@ -296,7 +301,7 @@ class SiglipVisionModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         qkv_backend: Optional[str] = None,
-        act_layer: Callable[[], nn.Module] = QuickGELU,
+        act_layer: Optional[Callable[[], nn.Module]] = None,
         flatten_batch: bool = True,
         use_data_parallel: bool = False,
     ):
