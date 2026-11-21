@@ -270,6 +270,11 @@ def test_append_auxiliary_output_ignores_absent_outputs():
     assert append_auxiliary_output(output, None) is output
 
 
+# ModelRunner.sample hands the sampled tokens to the penalty history; no
+# request here uses a penalty.
+_SAMPLING_INFO = SimpleNamespace(commit_sampled_tokens=lambda token_ids: None)
+
+
 def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
     runner = _model_runner_for_sampling_path()
     runner.sampling_observer = SimpleNamespace(
@@ -286,7 +291,7 @@ def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
         auxiliary_device_output=DeviceOutput(torch.tensor([99.0])),
     )
     forward_batch = SimpleNamespace(
-        sampling_info=object(),
+        sampling_info=_SAMPLING_INFO,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -322,7 +327,7 @@ def test_sampling_publishes_observer_output_for_the_sampled_tokens():
     )
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
     forward_batch = SimpleNamespace(
-        sampling_info=object(),
+        sampling_info=_SAMPLING_INFO,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -396,7 +401,7 @@ def test_sampling_without_active_observer_preserves_preprocess_override(
     )
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
     forward_batch = SimpleNamespace(
-        sampling_info=object(),
+        sampling_info=_SAMPLING_INFO,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,

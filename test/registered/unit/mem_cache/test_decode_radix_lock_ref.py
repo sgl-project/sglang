@@ -600,6 +600,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             model_config=None,
             enable_overlap=False,
             spec_algorithm=None,
+            # The patched batch admits no request.
+            admit_penalty_rows=lambda batch: None,
         )
         with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(

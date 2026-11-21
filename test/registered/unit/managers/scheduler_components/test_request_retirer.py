@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -138,6 +139,38 @@ class TestRelease(CustomTestCase):
         calls = []
         self._release(_req(FINISH_LENGTH(length=0), calls), calls)
         self.assertEqual(calls, [False])
+
+
+class TestPenaltyRowExit(CustomTestCase):
+    def _penalized(self, finished_reason):
+        retirer = release_only_retirer(
+            MagicMock(), beam_coordinator=SimpleNamespace(retire_group=lambda r: None)
+        )
+        retirer.send_abort_output = lambda abort_req, req: None
+        req = _req(finished_reason, [])
+        req.kv.req_pool_idx = 0
+        req.penalty_row = None
+        req.sampling_params = SamplingParams(presence_penalty=1.0)
+        req.output_ids = []
+        retirer.penalty_store.admit(req)
+        return retirer, req
+
+    def test_release_frees_the_row(self):
+        retirer, req = self._penalized(FINISH_LENGTH(length=0))
+        with patch.object(request_retirer, "release_kv_cache"):
+            retirer.release(req, checkpoint=False)
+        self.assertIsNone(req.penalty_row)
+        self.assertEqual(retirer.penalty_store.num_rows, 0)
+
+    def test_abort_retracted_frees_the_row_after_the_kv_record_left(self):
+        # A retracted streaming turn hands its KV record to the session slot;
+        # the row stays with the request.
+        retirer, req = self._penalized(FINISH_ABORT())
+        req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        with patch.object(request_retirer, "make_abort_req"):
+            retirer.abort_retracted(req, reason=FINISH_ABORT())
+        self.assertIsNone(req.penalty_row)
+        self.assertEqual(retirer.penalty_store.num_rows, 0)
 
 
 class TestTakeOutWithoutRelease(CustomTestCase):

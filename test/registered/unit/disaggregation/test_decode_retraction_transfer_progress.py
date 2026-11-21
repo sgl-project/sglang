@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.sampling.penalties import PenaltyStore
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -182,6 +183,11 @@ class _DecodeNode:
             last_batch=None,
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
+            penalty_store=PenaltyStore(
+                vocab_size=16,
+                num_slots=self.req_to_token_pool.req_to_token.shape[0],
+                device="cpu",
+            ),
             token_to_kv_pool_allocator=self.allocator,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             max_running_requests=ROWS,
@@ -213,9 +219,11 @@ class _DecodeNode:
             beam_coordinator=SimpleNamespace(retire_group=lambda req: None),
             hisparse_coordinator=None,
             uocr_runtime=None,
+            penalty_store=s.penalty_store,
             send_abort_output=lambda abort_req, req: None,
             stream_output=lambda *a, **k: None,
         )
+        s.admit_penalty_rows = lambda batch: Scheduler.admit_penalty_rows(s, batch)
         s._set_or_validate_priority = lambda req: True
         s._reqs_finishing_inflight = lambda batch: Scheduler._reqs_finishing_inflight(
             s, batch

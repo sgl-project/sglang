@@ -396,6 +396,7 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
+from sglang.srt.sampling.penalties import PenaltyStore, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -700,6 +701,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self.init_penalty_store()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1391,6 +1393,13 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def init_penalty_store(self) -> None:
+        self.penalty_store = PenaltyStore(
+            vocab_size=self.model_config.vocab_size,
+            num_slots=self.req_to_token_pool.req_to_token.shape[0],
+            device=self.req_to_token_pool.device,
+        )
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -3010,6 +3019,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
+            penalty_store=self.penalty_store,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
@@ -3553,7 +3563,12 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                bound_runtime=isinstance(self.draft_worker, BaseSpecWorker)
+                and self.draft_worker.has_bound_runtime,
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3566,6 +3581,12 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
+                return
+
+        if self.uocr_runtime is not None:
+            error_msg = self.uocr_runtime.validate_request(req)
+            if error_msg is not None:
+                self._reject_bad_request(req, error_msg)
                 return
 
         if (
@@ -4583,6 +4604,11 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
+    def admit_penalty_rows(self, batch: ScheduleBatch) -> None:
+        """Each admission (re)sets a penalized request's history from its outputs."""
+        for req in batch.reqs:
+            self.penalty_store.admit(req)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4976,6 +5002,7 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        self.admit_penalty_rows(new_batch)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5313,9 +5340,8 @@ class Scheduler(
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
            only need sampling_info restored - V1 carries spec_info forward as
            next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
-           shares the pre-accumulated penalty buffer) so V2's multiple init_new
-           calls don't double-accumulate penalties.
+        2. Substitute sampling_info with a forward-only copy that carries this
+           step's logit penalties, built on the forward stream.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
@@ -5416,6 +5442,13 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            # Penalty params come from this step's requests; the history they
+            # read lives on the device and is read and written at sampling.
+            batch.sampling_info.set_step_penalties(
+                StepPenalties.build(
+                    batch.reqs, batch.req_pool_indices, self.penalty_store
+                )
+            )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

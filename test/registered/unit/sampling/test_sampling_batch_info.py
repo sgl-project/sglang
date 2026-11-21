@@ -44,7 +44,6 @@ def _make_info(batch_size=2, **overrides):
         need_min_p_sampling=False,
         vocab_size=VOCAB_SIZE,
         device=DEVICE,
-        penalizer_orchestrator=MagicMock(is_required=False),
     )
     defaults.update(overrides)
     return SamplingBatchInfo(**defaults)
@@ -258,13 +257,16 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         grammar.apply_vocab_mask.assert_called_once()
 
-    def test_applies_penalizer_orchestrator(self):
-        """Test that a required orchestrator's apply() is called on logits."""
-        orch = MagicMock(is_required=True)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+    def test_builds_step_penalties_without_forward_copy(self):
+        """The scheduler's own info (non-overlap) builds its tables at sampling."""
+        info = _make_info(batch_size=1)
+        step = MagicMock()
+        step.logit_penalties.return_value = (torch.full((1, VOCAB_SIZE), -1.0), None)
+        info.set_step_penalties(step)
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
-        orch.apply.assert_called_once_with(logits)
+        step.logit_penalties.assert_called_once_with()
+        self.assertTrue(torch.equal(logits, torch.full_like(logits, -1.0)))
 
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
@@ -276,14 +278,6 @@ class TestApplyLogitsBias(CustomTestCase):
         original = logits.clone()
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
-
-    def test_apply_logits_bias_without_penalizer_orchestrator(self):
-        info = _make_info(batch_size=1, penalizer_orchestrator=None)
-        logits = torch.zeros(1, VOCAB_SIZE)
-
-        info.apply_logits_bias(logits)
-
-        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
 
     def test_observer_sees_production_constraint_boundary(self):
         events = []
@@ -349,27 +343,29 @@ class TestApplyLogitsBias(CustomTestCase):
         self.assertTrue(torch.equal(observed_logits, ordinary_logits))
 
 
-# update_penalties
-class TestUpdatePenalties(CustomTestCase):
-    def test_required_creates_penalties_tensor(self):
-        """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
-        orch = MagicMock(is_required=True)
-        orch.accumulate_scaling_penalties.return_value = None
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNotNone(info.acc_additive_penalties)
-        self.assertEqual(info.acc_additive_penalties.shape, (2, VOCAB_SIZE))
-        orch.accumulate_additive_penalties.assert_called_once_with(
-            info.acc_additive_penalties
+# acc_penalties
+class TestAccPenalties(CustomTestCase):
+    def test_builds_tables_once_per_step(self):
+        info = _make_info(batch_size=2)
+        step = MagicMock()
+        step.logit_penalties.return_value = (
+            torch.zeros(2, VOCAB_SIZE),
+            torch.ones(2, VOCAB_SIZE),
         )
-        orch.accumulate_scaling_penalties.assert_called_once()
+        info.set_step_penalties(step)
+        additive, scaling = info.acc_penalties()
+        self.assertEqual(info.acc_penalties(), (additive, scaling))
+        step.logit_penalties.assert_called_once_with()
+        self.assertIs(info.acc_additive_penalties, additive)
+        self.assertIs(info.acc_scaling_penalties, scaling)
 
-    def test_not_required_sets_none(self):
-        """Test that update_penalties sets acc_additive_penalties to None when not required."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNone(info.acc_additive_penalties)
+        # A new step rebuilds whatever the earlier step left on the info.
+        next_step = MagicMock()
+        next_step.logit_penalties.return_value = (None, torch.ones(2, VOCAB_SIZE))
+        info.set_step_penalties(next_step)
+        self.assertEqual(info.acc_penalties(), next_step.logit_penalties.return_value)
+        info.set_step_penalties(None)
+        self.assertEqual(info.acc_penalties(), (None, None))
 
 
 # update_regex_vocab_mask
@@ -724,12 +720,16 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy_without_orchestrator(self):
-        """Both copy implementations preserve every field except the forward-only
-        penalizer removal, including fields declared with init=False."""
+    def test_returns_copy_with_step_tables(self):
+        """Both copy implementations preserve every field, including fields
+        declared with init=False; only the copy carries the step's tables."""
+        tables = ("acc_additive_penalties", "acc_penalties_step")
         for fast_path in (False, True):
-            orch = MagicMock(is_required=False)
-            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+            additive = torch.zeros(1, VOCAB_SIZE)
+            info = _make_info(batch_size=1)
+            step = MagicMock()
+            step.logit_penalties.return_value = (additive, None)
+            info.set_step_penalties(step)
             with (
                 self.subTest(fast_path=fast_path),
                 patch(
@@ -738,10 +738,13 @@ class TestCopyForForward(CustomTestCase):
                 ),
             ):
                 copied = info.copy_for_forward()
-            self.assertIsNone(copied.penalizer_orchestrator)
-            self.assertIs(info.penalizer_orchestrator, orch)
+            self.assertIsNot(copied, info)
+            self.assertIs(copied.acc_additive_penalties, additive)
+            self.assertIs(copied.acc_penalties_step, step)
+            self.assertIsNone(info.acc_additive_penalties)
+            self.assertIsNone(info.acc_penalties_step)
             for name, value in info.__dict__.items():
-                if name != "penalizer_orchestrator":
+                if name not in tables:
                     self.assertIs(copied.__dict__[name], value, name)
 
 

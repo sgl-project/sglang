@@ -2317,6 +2317,7 @@ class ModelRunner:
         )
         if watermark is not None:
             watermark.commit(next_token_ids)
+        forward_batch.sampling_info.commit_sampled_tokens(next_token_ids)
         return next_token_ids
 
     def compute_logprobs_only(
