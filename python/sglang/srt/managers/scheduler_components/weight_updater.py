@@ -581,6 +581,12 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            if self.memory_saver_adapter.enabled:
+                # CUDA graph padding uses row zero, so restore it to zero
+                # after resuming the unbacked KV allocation.
+                with torch.inference_mode():
+                    for _, runner in self._select_runners():
+                        runner.req_to_token_pool.req_to_token[0].zero_()
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:

@@ -777,6 +777,30 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
         manager.memory_saver_adapter.pause.assert_not_called()
 
 
+class TestResumeMemoryOccupation(_WeightUpdaterManagerTestBase):
+    def test_kv_resume_restores_padding(self):
+        with torch.inference_mode():
+            req_to_token = torch.tensor([[0, 0], [11, 11]], dtype=torch.int32)
+
+        def resume(tag):
+            # Simulate remapping without preserving the padding row.
+            with torch.inference_mode():
+                req_to_token[0].fill_(123)
+
+        target = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        manager = self._manager(target, session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = SimpleNamespace(enabled=True, resume=resume)
+        manager.offload_tags.add("kv_cache")
+        manager.resume_memory_occupation(
+            ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        )
+
+        self.assertEqual(req_to_token.tolist(), [[0, 0], [11, 11]])
+
+
 class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
     def test_a_failed_release_retries_only_unreleased_tags(self):
         """A tag released before a later tag failed is not released again on retry."""
@@ -804,15 +828,22 @@ class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
 
     def test_a_failed_resume_retries_only_released_tags(self):
         """A tag resumed before a later tag failed is not resumed again on retry."""
-        manager = self._manager(Mock(), session=False)
+        with torch.inference_mode():
+            req_to_token = torch.tensor([[123, 123], [11, 11]], dtype=torch.int32)
+        target = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        manager = self._manager(target, session=False)
         manager.scheduler = None
-        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter = Mock(enabled=True)
         manager.memory_saver_adapter.resume.side_effect = [None, RuntimeError, None]
         manager.offload_tags.update({"kv_cache", "cuda_graph"})
         request = ResumeMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
 
         with self.assertRaises(RuntimeError):
             manager.resume_memory_occupation(request)
+        self.assertEqual(manager.offload_tags, {"kv_cache"})
+        self.assertEqual(req_to_token.tolist(), [[123, 123], [11, 11]])
         manager.resume_memory_occupation(request)
 
         self.assertEqual(
@@ -820,6 +851,7 @@ class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
             ["cuda_graph", "kv_cache", "kv_cache"],
         )
         self.assertEqual(manager.offload_tags, set())
+        self.assertEqual(req_to_token.tolist(), [[0, 0], [11, 11]])
 
 
 class _RecordingStream:
