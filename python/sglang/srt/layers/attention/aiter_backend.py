@@ -1008,9 +1008,9 @@ class AiterAttnBackend(AttentionBackend):
             self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
         )
 
-        # When topk == 1 the draft chain is linear, so target_verify needs only the
-        # causal mask (or none, for ENCODER_ONLY drafts) and can go through
-        # unified_attention instead of the legacy triton extend_attention_fwd.
+        # With topk == 1 the draft chain is linear, so target_verify can use
+        # unified_attention, not the legacy extend_attention_fwd:
+        # it needs only a causal mask (none for ENCODER_ONLY drafts).
         # Gated on non-MLA (MLA has its own verify path) and env var for opt-out.
         self._use_unified_verify = (
             self.use_triton_unified_attention

@@ -225,8 +225,8 @@ class _FakeKVPool:
 
 
 class TestUnifiedVerifyCausalFlag(CustomTestCase):
-    """aiter unified verify masks causally only for non-ENCODER_ONLY layers; the GPU
-    reference cannot see this on an AITER without causal=False."""
+    """aiter unified verify masks causally only for non-ENCODER_ONLY layers;
+    the GPU reference cannot see this on an AITER without causal=False."""
 
     def _verify(
         self,
@@ -511,6 +511,7 @@ def _init_mha_backend(
         get_num_kv_heads=lambda _tp_size: 8,
         attention_arch=AttentionArch.MHA,
         context_len=4096,
+        hf_config=None,
     )
     model_runner = SimpleNamespace(
         model_config=model_config,

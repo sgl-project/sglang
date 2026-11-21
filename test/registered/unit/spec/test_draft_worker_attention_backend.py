@@ -140,8 +140,8 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
             self.assertEqual(self._resolve(draft_is_mla=True), "triton")
 
     def test_aiter_is_taken_only_when_named_for_a_dspark_draft(self):
-        """An inherited aiter, or aiter named for another algorithm's draft, keeps the
-        platform fallback: triton on HIP, flashinfer elsewhere."""
+        """An inherited aiter, or aiter named for another algorithm's draft,
+        keeps the platform fallback: triton on HIP, flashinfer elsewhere."""
         for hip_version, fallback in (("7.2", "triton"), (None, "flashinfer")):
             with (
                 self.subTest(hip=hip_version),
@@ -193,8 +193,8 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
         return resolution_result(args, "speculative_draft_attention_backend")
 
     def test_kimi_k3_names_aiter_for_its_dspark_draft_on_gfx950(self):
-        """The hook names aiter for the DSpark draft on gfx950 only, and not for a draft
-        the worker would reject or an operator-named backend."""
+        """The hook names aiter for the DSpark draft on gfx950 only,
+        and not for a rejected draft or an operator-named backend."""
         self.assertEqual(self._declared_draft_backend(), "aiter")
         for case in (
             dict(is_gfx950=False),
@@ -211,8 +211,8 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
                 self.assertNotEqual(self._declared_draft_backend(**case), "aiter")
 
     def test_hook_asks_the_declared_capability_not_the_backend_name(self):
-        """The hook defaults the draft to a target backend that declared the capability
-        and accepts the draft; any other leaves it unset."""
+        """The hook defaults the draft to a declared backend that accepts it;
+        any other target backend leaves it unset."""
         reasons = []
 
         def declared(*, default_here=True, reject_reason=None):
@@ -271,8 +271,8 @@ class TestAiterDSparkDraftDefault(CustomTestCase):
             return aiter_dspark_draft_default_on_this_device()
 
     def test_exact_gfx950_only(self):
-        """aiter's DSpark draft default is gfx950-only: another gfx95x, gfx942 or
-        a non-HIP device must not pass the gate a "gfx95" substring test admits."""
+        """aiter's DSpark draft default is gfx950-only;
+        other gfx95x, gfx942, or non-HIP devices must fail the gate."""
         self.assertTrue(self._default_here(SimpleNamespace(gcn_arch="gfx950")))
         for hip in (
             SimpleNamespace(gcn_arch="gfx951"),
@@ -283,8 +283,8 @@ class TestAiterDSparkDraftDefault(CustomTestCase):
                 self.assertFalse(self._default_here(hip))
 
     def test_aiter_declares_the_noncausal_draft_capability(self):
-        """The resolver and the Kimi-K3 hook reach aiter's checks through its
-        registration, not by naming aiter."""
+        """The resolver and the Kimi-K3 hook reach aiter through its registration,
+        not by naming aiter."""
         from sglang.srt.utils import aiter as aiter_utils
 
         declared = attention_registry.NONCAUSAL_DRAFT_ATTENTION_BACKENDS["aiter"]
