@@ -65,8 +65,8 @@ class _RouteSortHandoff(msgspec.Struct):
 
 @contextmanager
 def scope(consumer: RouteSortConsumer) -> Iterator[None]:
-    """Ask the radix-4 routing calls in this scope for the fused sort, on the
-    batch sizes the layer's consumer takes. On exit the enclosing scope's
+    """Ask the next radix-4 routing call in this scope for the fused sort, on
+    the batch sizes the layer's consumer takes. On exit the enclosing scope's
     request is back, and a sort that no experts call consumed is dropped."""
     try:
         with get_forward().scoped(
