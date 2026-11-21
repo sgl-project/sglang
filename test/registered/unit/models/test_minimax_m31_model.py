@@ -512,7 +512,9 @@ class TestMiniMaxM31Forward(CustomTestCase):
             top_k=2,
         )
         # Not callable: a finalizing expert call would raise instead of passing.
-        experts = SimpleNamespace(forward_deferred_finalize=lambda h, topk: deferred)
+        experts = SimpleNamespace(
+            forward_deferred_finalize=lambda h, topk, pre_quant_input=None: deferred
+        )
         moe = SimpleNamespace(
             alt_stream=None,
             shared_experts=object(),

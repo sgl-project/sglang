@@ -4,7 +4,7 @@ import contextvars
 import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generator, Optional, cast
+from typing import TYPE_CHECKING, Any, Generator, NamedTuple, Optional, cast
 
 import torch
 from packaging.version import Version
@@ -1857,6 +1857,50 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
+class Nvfp4PerTokenInputPreQuant(NamedTuple):
+    """``quantize_nvfp4_per_token_input`` of the routed input, made ahead of the
+    MoE call; the producer orders it before the MoE kernels on the consuming stream."""
+
+    x_fp4: torch.Tensor
+    x_sf: torch.Tensor
+    per_token_scale: torch.Tensor
+
+
+def quantize_nvfp4_per_token_input(
+    hidden_states: torch.Tensor,
+) -> Nvfp4PerTokenInputPreQuant:
+    """Per-token NVFP4 activation quant of the TRTLLM-Gen routed input:
+    ``([T, H/2] uint8, [T, H/16] e4m3 linear scales, per-token fp32 scale)``."""
+    from flashinfer import SfLayout, nvfp4_quantize
+
+    e4m3_max = 448.0
+    if (
+        envs.FLASHINFER_NVFP4_4OVER6.get()
+        and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
+    ):
+        e4m3_max = 256.0
+
+    global_scale_inv = torch.full(
+        (1,),
+        1.0 / (e4m3_max * 6.0),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
+        hidden_states,
+        global_scale_inv,
+        sfLayout=SfLayout.layout_linear,
+        per_token_activation=True,
+        backend="cute-dsl",
+    )
+    seq_len, hidden_size = hidden_states.shape
+    return Nvfp4PerTokenInputPreQuant(
+        hs_fp4_bytes.reshape(seq_len, hidden_size // 2),
+        hs_sf_bytes.view(torch.float8_e4m3fn).reshape(seq_len, hidden_size // 16),
+        per_token_scale,
+    )
+
+
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
     input_scale_quant: torch.Tensor,
@@ -1963,34 +2007,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hs_fp4 = hidden_states
         hs_scale_linear = hidden_states_scale
     elif quant_info.use_per_token_activation:
-        from flashinfer import SfLayout, nvfp4_quantize
-
-        e4m3_max = 448.0
-        if (
-            envs.FLASHINFER_NVFP4_4OVER6.get()
-            and envs.FLASHINFER_NVFP4_4OVER6_E4M3_USE_256.get()
-        ):
-            e4m3_max = 256.0
-
-        global_scale_inv = torch.full(
-            (1,),
-            1.0 / (e4m3_max * 6.0),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
-            hidden_states,
-            global_scale_inv,
-            sfLayout=SfLayout.layout_linear,
-            per_token_activation=True,
-            backend="cute-dsl",
-        )
-
-        seq_len, hidden_size = hidden_states.shape
-        hs_fp4 = hs_fp4_bytes.reshape(seq_len, hidden_size // 2)
-        hs_scale_linear = hs_sf_bytes.view(torch.float8_e4m3fn).reshape(
-            seq_len, hidden_size // 16
-        )
+        pre_quant = dispatch_output.hidden_states_pre_quant
+        if isinstance(pre_quant, Nvfp4PerTokenInputPreQuant):
+            assert (
+                hidden_pad == 0 and pre_quant.x_fp4.shape[0] == hidden_states.shape[0]
+            )
+            hs_fp4, hs_scale_linear, per_token_scale = pre_quant
+        else:
+            hs_fp4, hs_scale_linear, per_token_scale = quantize_nvfp4_per_token_input(
+                hidden_states
+            )
     else:
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
