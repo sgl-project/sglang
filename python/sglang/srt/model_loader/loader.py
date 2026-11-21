@@ -384,6 +384,14 @@ def _validate_default_loader_extra_config(
         return
 
     allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format in (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.MISTRAL,
+        LoadFormat.FLASH_RL,
+    ):
+        # Only the buffered multithreaded safetensors iterator honors it.
+        allowed_keys.add("max_inflight_bytes")
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
@@ -393,6 +401,16 @@ def _validate_default_loader_extra_config(
                 "enable_gds in --model-loader-extra-config must be a boolean"
             )
 
+    max_inflight_bytes = extra_config.get("max_inflight_bytes")
+    if max_inflight_bytes is not None and (
+        not isinstance(max_inflight_bytes, int)
+        or isinstance(max_inflight_bytes, bool)
+        or max_inflight_bytes <= 0
+    ):
+        raise ValueError(
+            "max_inflight_bytes in --model-loader-extra-config must be a "
+            "positive integer"
+        )
     unexpected_keys = set(extra_config.keys()) - allowed_keys
     if unexpected_keys:
         raise ValueError(
@@ -733,8 +751,14 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to the multithreaded loader "
+                        "only; ignored because it is not in use."
+                    )
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
@@ -745,6 +769,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         else:
             if use_multithread:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to safetensors checkpoints "
+                        "only; ignored for .bin weights."
+                    )
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -1556,6 +1585,13 @@ class DummyModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _checkpoint_shard_rank() -> int:
+    """The shard index of this rank's weights in a sharded or remote checkpoint:
+    the TP rank, offset by the pipeline stage so stages do not collide."""
+    parallel = get_parallel()
+    return parallel.pp_rank * parallel.tp_size + parallel.tp_rank
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -1663,7 +1699,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -1716,7 +1752,7 @@ class ShardedStateLoader(BaseModelLoader):
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -3416,7 +3452,7 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.KV
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         return client.weight_iterator(rank)
 
     def _get_weights_iterator_fs(
@@ -3439,7 +3475,7 @@ class RemoteModelLoader(BaseModelLoader):
         with create_remote_connector(url) as client:
             assert get_connector_type(client) == ConnectorType.KV
             model_name = parse_model_name(url)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
