@@ -584,5 +584,7 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_skip_first_ngram_calls",
     "cuda_graph_persistence",
     "cuda_graph_persistence_config",
+    "enable_linear_bole_spec",
+    "linear_bole_workspace_mb",
 )
 # fmt: on

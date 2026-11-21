@@ -1471,6 +1471,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and mamba_pool.replayssm_cache_base is not None
                 and not mamba_pool.replayssm_is_kda
             )
+            bole_verifier = getattr(mamba_pool, "bole_verifier", None)
 
         # A strided state pool (unified memory) is read and written in place when
         # the prefill kernels address slots by its stride, else through packed
@@ -1588,6 +1589,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=self.forward_metadata.replayssm_ring_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif bole_verifier is not None:
+                # Bole: per-step low-rank factors instead of per-draft
+                # snapshots; the commit rebuilds the accepted state.
+                assert retrieve_parent_token is None, (
+                    "Bole spec-verify supports linear draft chains only"
+                )
+                core_attn_out = bole_verifier.target_verify(
+                    self.state_layer(layer.layer_id).view_layer_id,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    q=query,
+                    k=key,
+                    v=value,
+                    a=a,
+                    b=b,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
