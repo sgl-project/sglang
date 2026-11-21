@@ -3,10 +3,11 @@
 After ``sweep_mamba2_prefill`` runs, prefill batches of serving-like shapes
 (any request count, any lengths, with and without initial states and state
 tracking) must not load a single new Triton kernel binary. A load here is a
-compile that would otherwise land on live traffic (issue #51628).
+compile that would otherwise land on live traffic (issue #51628). The CPU
+checks of the swept layouts live in
+``test/registered/unit/layers/attention/mamba/test_mamba2_precompile.py``.
 """
 
-import itertools
 import random
 import sys
 
@@ -16,8 +17,6 @@ import torch
 from sglang.srt.layers.attention.mamba.mamba2_precompile import (
     Mamba2PrefillDims,
     Mamba2PrefillParams,
-    _tracked_requests,
-    prefill_layouts,
     run_mamba2_prefill,
     sweep_mamba2_prefill,
 )
@@ -28,72 +27,7 @@ register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-
 CHUNK_SIZE = 256
 
 
-def _int_class(value: int) -> str:
-    # The integer classes Triton specializes kernel arguments on.
-    if value == 1:
-        return "one"
-    return "div16" if value % 16 == 0 else "other"
-
-
-def test_layouts_cover_integer_classes():
-    token_classes, chunk_classes, request_classes = set(), set(), set()
-    for seq_lens in prefill_layouts(CHUNK_SIZE):
-        num_tokens = sum(seq_lens)
-        token_classes.add(_int_class(num_tokens))
-        chunk_classes.add(_int_class(-(-num_tokens // CHUNK_SIZE)))
-        request_classes.add(_int_class(len(seq_lens)))
-    expected = {"one", "div16", "other"}
-    assert token_classes == expected
-    assert chunk_classes == expected
-    assert request_classes == expected
-
-
-def test_layouts_cover_logical_chunk_counts():
-    # _state_passing_fwd_kernel takes the token count, the chunk count and,
-    # with initial states, the logical chunk count as separate integer
-    # arguments, so the sweep must cover combinations of their classes, not
-    # just each class on its own.
-    covered = set()
-    for seq_lens in prefill_layouts(CHUNK_SIZE):
-        num_tokens = sum(seq_lens)
-        num_chunks = -(-num_tokens // CHUNK_SIZE)
-        ends = itertools.accumulate(seq_lens[:-1])
-        num_logical = num_chunks + sum(end % CHUNK_SIZE != 0 for end in ends)
-        covered.add(
-            (_int_class(num_logical), _int_class(num_chunks), _int_class(num_tokens))
-        )
-    # (logical chunks, chunks, tokens). The first entry is a 5-request batch
-    # of 2988 tokens: 12 chunks plus 4 boundaries inside chunks.
-    required = {
-        ("div16", "other", "other"),
-        ("div16", "other", "div16"),
-        ("other", "other", "other"),
-        ("div16", "div16", "other"),
-        ("other", "div16", "div16"),
-        ("div16", "one", "div16"),
-        ("other", "one", "other"),
-        ("one", "one", "one"),
-    }
-    assert required <= covered
-
-
-def test_layouts_exercise_state_tracking():
-    tracked_counts = {
-        len(_tracked_requests(seq_lens, CHUNK_SIZE)[0])
-        for seq_lens in prefill_layouts(CHUNK_SIZE)
-    }
-    assert {1, 2} <= tracked_counts
-
-
-def test_tracked_requests_start_off_grid():
-    seq_idx, end_locs = _tracked_requests((100, 300, 50, 512), CHUNK_SIZE)
-    # Request 1 starts at 100 and covers one full chunk; request 2 is shorter
-    # than a chunk; request 3 starts at 450 and covers two chunks.
-    assert seq_idx == [1, 3]
-    assert end_locs == [100 + 256, 450 + 512]
-
-
-def _small_model(device: torch.device):
+def _small_model(*, device: torch.device):
     num_heads, head_dim, n_groups, state_size, conv_kernel = 8, 64, 2, 64, 4
     intermediate_size = num_heads * head_dim
     conv_dim = intermediate_size + 2 * n_groups * state_size
@@ -123,7 +57,7 @@ def _small_model(device: torch.device):
     return dims, params
 
 
-def _serving_like_batches(rng: random.Random, count: int):
+def _serving_like_batches(*, rng: random.Random, count: int):
     max_tokens = 16 * CHUNK_SIZE  # the default chunked prefill size
     for _ in range(count):
         num_seqs = rng.choice([1, 1, 2, 3, 5, 8, 16, 17, 31])
@@ -149,9 +83,12 @@ def test_no_kernel_loads_after_sweep():
         pytest.skip("this Triton build has no kernel load hook")
 
     device = torch.device("cuda")
-    dims, params = _small_model(device)
+    dims, params = _small_model(device=device)
     with torch.inference_mode():
-        assert sweep_mamba2_prefill(dims, params, use_triton_causal_conv=True) > 0
+        assert (
+            sweep_mamba2_prefill(dims=dims, params=params, use_triton_causal_conv=True)
+            > 0
+        )
     torch.cuda.synchronize()
 
     late_loads = []
@@ -164,12 +101,12 @@ def test_no_kernel_loads_after_sweep():
         rng = random.Random(0)
         with torch.inference_mode():
             for seq_lens, with_initial_states, with_track in _serving_like_batches(
-                rng, count=60
+                rng=rng, count=60
             ):
                 run_mamba2_prefill(
-                    dims,
-                    params,
-                    seq_lens,
+                    dims=dims,
+                    params=params,
+                    seq_lens=seq_lens,
                     with_initial_states=with_initial_states,
                     with_track=with_track,
                     use_triton_causal_conv=True,
