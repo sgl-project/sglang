@@ -1487,10 +1487,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    # A relaxed version of penalties for speculative decoding: every draft row of
-    # a round shares the penalties as of the round's start.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_spec_output_tokens()
     if batch.spec_algorithm.is_dflash_family():
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():

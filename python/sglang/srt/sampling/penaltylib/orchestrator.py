@@ -43,15 +43,14 @@ class BatchedPenalizerOrchestrator:
         return self.batch.reqs
 
     def cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: Optional[torch.Tensor] = None
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
     ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
             output_ids (torch.Tensor): The output tokens.
-            req_indices (Optional[torch.Tensor]): The batch row of each token.
-                None means one token per row, in batch order.
+            req_indices (torch.Tensor): The batch row of each token.
         """
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(
@@ -188,13 +187,11 @@ class _BatchedPenalizer(abc.ABC):
         self._is_prepared = False
 
     def cumulate_output_tokens(
-        self, output_ids: torch.Tensor, req_indices: Optional[torch.Tensor] = None
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
     ):
         if not self._is_prepared:
             return
 
-        if req_indices is None:
-            req_indices = torch.arange(len(output_ids), device=output_ids.device)
         self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:

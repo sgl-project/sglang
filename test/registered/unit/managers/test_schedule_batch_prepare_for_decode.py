@@ -51,6 +51,9 @@ class TestPrepareForDecodeMambaInit(CustomTestCase):
     def test_spec_decode_drops_extend_mamba_init_metadata(self):
         batch = ScheduleBatch(reqs=[])
         batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        batch.sampling_info = types.SimpleNamespace(
+            penalizer_orchestrator=types.SimpleNamespace(is_required=False)
+        )
         batch.mamba_cow_src_indices = torch.tensor([1])
         batch.mamba_cow_dst_indices = torch.tensor([2])
         batch.mamba_clear_indices = torch.tensor([3])
@@ -181,42 +184,28 @@ class TestCumulatePenaltyOutputTokens(CustomTestCase):
                 len(tokens),
             )
 
-    def test_spec_rounds_feed_every_committed_token(self):
-        """A verify round commits several tokens per request; the penalizers must
-        count each of them, not one token per round. Under overlap the round in
-        flight is committed after the call, so the call before each commit
-        feeds the previous rounds and the final call catches up."""
+    def test_feeds_every_committed_token_once(self):
+        """A decode step commits one token per request and a verify round
+        several; the penalizers must count each committed token exactly once.
+        Under overlap the step in flight is committed after the call, so the
+        call before each commit feeds the earlier steps and the final call
+        catches up; a call with nothing new (the first decode under overlap)
+        feeds nothing."""
         # Row 0 has its prefill token; row 1's is still in flight (overlap).
         batch = _make_penalty_batch([[7], []])
-        rounds = [
+        steps = [
             ([7, 7, 3], [4]),
-            ([7, 1, 7], [4, 4, 9]),
+            ([1], [4]),
             ([2, 7, 7], [9]),
             ([5], [9, 4, 4, 4]),
         ]
-        for committed in rounds:
-            batch.cumulate_penalty_spec_output_tokens()
+        for committed in steps:
+            batch.cumulate_penalty_output_tokens()
             for req, tokens in zip(batch.reqs, committed):
                 req.output_ids.extend(tokens)
-        batch.cumulate_penalty_spec_output_tokens()
+        batch.cumulate_penalty_output_tokens()
 
         self._assert_penalty_state(batch, [req.output_ids for req in batch.reqs])
-
-    def test_non_spec_step_feeds_one_token_per_request(self):
-        """Without spec decoding each step feeds the last output token of each
-        request (the last prompt token before the first output token)."""
-        batch = _make_penalty_batch([[], [3]])
-        fed_tokens = [[], []]
-        for step_tokens in ([5, 3], [5, 6], [8, 3]):
-            for req, fed in zip(batch.reqs, fed_tokens):
-                fed.append(
-                    req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
-                )
-            batch.cumulate_penalty_output_tokens()
-            for req, token in zip(batch.reqs, step_tokens):
-                req.output_ids.append(token)
-
-        self._assert_penalty_state(batch, fed_tokens)
 
 
 if __name__ == "__main__":
