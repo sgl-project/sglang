@@ -381,6 +381,10 @@ class PipelineConfig:
             (target_width, target_height), PIL.Image.Resampling.LANCZOS
         ), (target_width, target_height)
 
+    def output_size_condition_image(self, images):
+        """Return the condition image whose size sets an unspecified output size."""
+        return images[-1]
+
     def prepare_calculated_size(self, image):
         return self.calculate_condition_image_size(image, image.width, image.height)
 

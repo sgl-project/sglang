@@ -603,6 +603,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         return None
 
+    def output_size_condition_image(self, images):
+        # diffusers' Flux2 pipelines size the output from the first reference image.
+        return images[0]
+
     def prepare_calculated_size(self, image):
         # An image that needs no resize still sets the output size, as in diffusers.
         return super().prepare_calculated_size(image) or (image.width, image.height)
