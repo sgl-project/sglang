@@ -141,17 +141,18 @@ def request_demand(
             # scheduler-side rules keyed on the processed length (maybe_evict_swa,
             # retire_window_rows); once retirement moves into the memory layer
             # and keys on the allocated frontier, derive this from that policy.
-            # TODO(ch-wan): assumes a checkpoint every checkpoint_interval rows
-            # that the prefix-sharing cache takes, retiring the window behind it.
-            # Two stalls keep an older floor (or none), more rows than counted:
-            # (A) lazy Mamba tracking skips a checkpoint when no second tracking
-            # slot is free after eviction (`mamba_lazy_prealloc_at_boundary`);
-            # (B) with no replacement state slot free after eviction,
-            # `MambaComponent.prepare_for_caching_req` returns 0 and
-            # `checkpoint_into_tree` retires no row. (Sub-grid chunks are cut on
-            # the grid by `mamba_prefill_chunk_grid`.) Admission over this bound
-            # is an estimate: it does not guarantee an admitted request finishes
-            # when a checkpoint stalls.
+            # Assumes a checkpoint every checkpoint_interval rows that the
+            # prefix-sharing cache takes, retiring the window behind it. A
+            # checkpoint no free state slot can take is dropped rather than kept
+            # as an older floor: a decode boundary that wrote no snapshot (no
+            # second lazy slot, or a decode row of a mixed chunked-prefill step)
+            # drops it once it has run (`SchedulerBatchResultProcessor`), and a
+            # publication with no replacement slot inserts nothing and retires
+            # behind the request's frontier (`checkpoint_into_tree`).
+            # (Sub-grid chunks are cut on the grid by `mamba_prefill_chunk_grid`.)
+            # TODO: in decode, what the request's last prefill checkpoint locks
+            # stays beside its decode window; only the prefill terms below count
+            # it, and not always fully.
             retained = retained_window_tokens(window, page_size)
             in_prefix = min(retained, cached_tokens)
             # Past its latest checkpoint a chunk keeps up to an interval less a
@@ -159,6 +160,20 @@ def request_demand(
             # branch (`branch_checkpoint`) or a window-only cache's branch window.
             tail = max(checkpoint_interval - 1, last_chunk)
             beside = max(prefill_retire_lag + last_chunk + tail, retention - 1)
+            if checkpoint_interval:
+                # A publication with no replacement slot moves no tree lock, so
+                # what the last published checkpoint locks stays beside the
+                # request's retained window and a page while the next chunk is
+                # written. The lock takes whole nodes until they span the window
+                # (`SWAComponent.acquire_component_lock`): those before the last
+                # span less than the window, and each was published as a leaf of
+                # at most a retained window (`_maybe_split_leaf_for_swa_lock`), so
+                # it keeps at most two retained windows less a page. All of these
+                # are rows of the input.
+                beside = max(
+                    beside,
+                    min(last_chunk + 2 * retained - page_size, input_tokens),
+                )
             # The last chunk is still live when the first decode allocates
             # ahead, so they add up; the cached prefix's rows are held already.
             held = min(held, retained + beside + ahead - in_prefix)
