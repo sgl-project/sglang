@@ -138,6 +138,37 @@ def preprocess_image(
     return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 
+def _read_media_source(read: Callable, *args, invalid_input: str | None = None):
+    try:
+        return read(*args)
+    except requests.RequestException as exc:
+        # Requests errors can retain both the original URL and the prepared request.
+        category = next(
+            (
+                cls
+                for cls in (
+                    requests.Timeout,
+                    requests.TooManyRedirects,
+                    requests.HTTPError,
+                    requests.ConnectionError,
+                )
+                if isinstance(exc, cls)
+            ),
+            requests.exceptions.InvalidURL
+            if isinstance(exc, ValueError)
+            else requests.RequestException,
+        )
+        status = exc.response.status_code if exc.response is not None else None
+        detail = f" (HTTP {status})" if type(status) is int else ""
+        error = category(f"Media download failed: {category.__name__}{detail}.")
+    except ValueError:
+        if invalid_input is None:
+            raise
+        error = ValueError(invalid_input)
+    # Raise outside the handler so the outgoing error does not retain the HTTP error.
+    raise error from None
+
+
 # adapted from diffusers.utils import load_image
 def load_image(
     image: str | bytes | PIL.Image.Image,
@@ -158,7 +189,12 @@ def load_image(
             image = PIL.Image.open(image)
         else:
             # in-memory loading path
-            image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
+            data = _read_media_source(
+                srt_get_image_bytes,
+                image,
+                invalid_input="Invalid or disallowed image source.",
+            )
+            image = PIL.Image.open(BytesIO(data))
     elif not isinstance(image, PIL.Image.Image):
         raise ValueError(
             "Incorrect format used for the image. Should be bytes, a URL, a local path, base64/data URL, or a PIL image."
@@ -258,16 +294,19 @@ def load_video(
     """
     if max_frames is not None and max_frames <= 0:
         raise ValueError(f"max_frames must be positive, got {max_frames}.")
-    is_url = video.startswith("http://") or video.startswith("https://")
-    is_file = os.path.isfile(video)
+    pil_images = _read_media_source(_read_video_source, video, max_frames)
+    return convert_method(pil_images) if convert_method is not None else pil_images
 
-    if not (is_url or is_file):
-        raise ValueError(
-            f"Incorrect path or URL. URLs must start with `http://` or `https://`, and {video} is not a valid path."
-        )
+
+def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Image]:
+    is_url = video.startswith("http://") or video.startswith("https://")
+    if not is_url and not os.path.isfile(video):
+        raise ValueError("Expected an existing video file or an HTTP(S) URL.")
 
     if is_url:
-        parsed_url = urlparse(video)
+        parsed_url = _read_media_source(
+            urlparse, video, invalid_input="Invalid video URL."
+        )
         file_name = os.path.basename(unquote(parsed_url.path))
 
         suffix = os.path.splitext(file_name)[1] or ".mp4"
@@ -275,14 +314,8 @@ def load_video(
             video_path = os.path.join(temp_dir, f"video{suffix}")
             with open(video_path, "wb") as output:
                 download_video_to_stream(video, output)
-            pil_images = _read_video_frames(video_path, max_frames)
-    else:
-        pil_images = _read_video_frames(video, max_frames)
-
-    if convert_method is not None:
-        pil_images = convert_method(pil_images)
-
-    return pil_images
+            return _read_video_frames(video_path, max_frames)
+    return _read_video_frames(video, max_frames)
 
 
 def _read_video_frames(
