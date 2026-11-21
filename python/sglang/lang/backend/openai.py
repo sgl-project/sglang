@@ -432,6 +432,7 @@ def openai_completion_stream(
 
     for attempt in range(retries):
         try:
+            usage = None
             if is_chat:
                 if "stop" in kwargs and kwargs["stop"] is None:
                     kwargs.pop("stop")
@@ -442,6 +443,8 @@ def openai_completion_stream(
                     **kwargs,
                 )
                 for ret in generator:
+                    if ret.usage is not None:
+                        usage = ret.usage
                     if len(ret.choices) == 0:
                         continue
                     try:
@@ -457,13 +460,16 @@ def openai_completion_stream(
                     **kwargs,
                 )
                 for ret in generator:
+                    if ret.usage is not None:
+                        usage = ret.usage
                     if len(ret.choices) == 0:
                         continue
                     content = ret.choices[0].text
                     yield content or "", {}
 
-            token_usage.prompt_tokens += ret.usage.prompt_tokens
-            token_usage.completion_tokens += ret.usage.completion_tokens
+            if usage is not None:
+                token_usage.prompt_tokens += usage.prompt_tokens
+                token_usage.completion_tokens += usage.completion_tokens
             break
         except (openai.APIError, openai.APIConnectionError, openai.RateLimitError) as e:
             logger.error(f"OpenAI Error: {e}. Waiting 5 seconds...")
