@@ -7,7 +7,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -136,6 +136,39 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def _order_entries_within_experts(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size_m: int,
+    num_entries: int,
+) -> torch.Tensor:
+    num_slots = min(expert_ids.numel() * block_size_m, sorted_token_ids.numel())
+    entries = sorted_token_ids[:num_slots].to(torch.int64)
+    slots = torch.arange(num_slots, device=entries.device)
+    # An expert's blocks are contiguous, so a run of equal block ids is one expert;
+    # keying on runs instead of ids also holds when expert ids are not sorted.
+    block_runs = torch.cat(
+        [
+            expert_ids.new_zeros(1, dtype=torch.int64),
+            torch.cumsum(expert_ids[1:] != expert_ids[:-1], dim=0),
+        ]
+    )
+    # Entry ids run to num_entries, the padding sentinel; slots past the padded
+    # total keep their place after every expert.
+    key_stride = num_entries + 1
+    keys = torch.where(
+        slots < num_tokens_post_padded[0],
+        block_runs[slots // block_size_m] * key_stride + entries,
+        expert_ids.numel() * key_stride + slots,
+    )
+    ordered = sorted_token_ids.clone()
+    ordered[:num_slots] = entries[torch.argsort(keys, stable=True)].to(
+        sorted_token_ids.dtype
+    )
+    return ordered
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -251,6 +284,7 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    deterministic = get_exec().deterministic.enable_deterministic_inference
     if (
         M == 1
         and topk <= 32
@@ -273,6 +307,16 @@ def fused_marlin_moe(
             global_num_experts,
             return_inactive_prefix_count=expert_map is None,
         )
+        if deterministic:
+            # The align kernel fills each expert's blocks in atomic-counter order,
+            # and the GEMM's results depend on which entries share a block.
+            sorted_token_ids = _order_entries_within_experts(
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                block_size_m=block_size_m,
+                num_entries=topk_ids.numel(),
+            )
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (
@@ -307,10 +351,15 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
+    # Atomic adds land in no fixed order, so deterministic inference reduces without them.
     use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+        (
+            hidden_states.dtype == torch.half
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        )
+        and not is_mxfp4_marlin
+        and not deterministic
+    )
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,

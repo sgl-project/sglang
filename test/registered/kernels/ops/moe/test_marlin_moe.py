@@ -7,6 +7,7 @@ from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
@@ -515,6 +516,80 @@ class TestFusedMarlinMoe(CustomTestCase):
                     torch.testing.assert_close(
                         marlin_output, torch_output, atol=5e-2, rtol=0
                     )
+
+    def test_fused_marlin_moe_deterministic_inference_repeats_bitwise(self):
+        """Under --enable-deterministic-inference, repeated calls on one input match
+        to the bit, with and without expert parallelism, and still match the default path."""
+        n, k, e, topk = 256, 512, 16, 4
+        dtype = torch.half
+        quant_type = scalar_types.uint4b8
+        for expert_parallel, m in ((False, 256), (True, 512)):
+            with self.subTest(expert_parallel=expert_parallel):
+                torch.manual_seed(0)
+                local_e = e // 2 if expert_parallel else e
+                qweights, scales = [], []
+                for rows, cols in ((2 * n, k), (k, n)):
+                    w = (
+                        torch.randn((local_e, rows, cols), device="cuda", dtype=dtype)
+                        / 20
+                    )
+                    quantized = [
+                        marlin_quantize(
+                            w[i].transpose(1, 0),
+                            quant_type,
+                            128,
+                            False,
+                            torch.randperm(cols),
+                        )
+                        for i in range(local_e)
+                    ]
+                    qweights.append(
+                        stack_and_dev([q[1] for q in quantized]).contiguous()
+                    )
+                    scales.append(stack_and_dev([q[2] for q in quantized]))
+
+                a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+                score = torch.randn((m, e), device="cuda", dtype=dtype)
+                from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
+                topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                e_map = None
+                if expert_parallel:
+                    e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
+                    e_map[:local_e] = torch.arange(
+                        local_e, device="cuda", dtype=torch.int32
+                    )
+                    # The standard dispatcher passes local ids, -1 for non-local experts.
+                    topk_ids = e_map[topk_ids]
+                topk_ids = topk_ids.to(torch.int32)
+
+                def run():
+                    return fused_marlin_moe(
+                        a,
+                        qweights[0],
+                        qweights[1],
+                        scales[0],
+                        scales[1],
+                        score,
+                        topk_weights,
+                        topk_ids,
+                        global_num_experts=e,
+                        expert_map=e_map,
+                        num_bits=4,
+                        is_k_full=True,
+                    )
+
+                default_output = run()
+                with get_exec().deterministic.override(
+                    enable_deterministic_inference=True
+                ):
+                    outputs = [run() for _ in range(5)]
+
+                for output in outputs[1:]:
+                    self.assertTrue(torch.equal(output, outputs[0]))
+                torch.testing.assert_close(
+                    outputs[0], default_output, atol=1e-3, rtol=0
+                )
 
 
 if __name__ == "__main__":
