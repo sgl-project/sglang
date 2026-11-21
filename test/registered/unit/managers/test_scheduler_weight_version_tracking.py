@@ -12,6 +12,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -735,6 +736,51 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):
+    def test_a_failed_release_retries_only_unreleased_tags(self):
+        """A tag released before a later tag failed is not released again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.pause.side_effect = [None, RuntimeError, None]
+        manager.flush_cache = Mock()
+        request = ReleaseMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with (
+            patch("torch.distributed.all_reduce"),
+            patch("torch.distributed.barrier"),
+            patch("torch.get_device_module"),
+        ):
+            with self.assertRaises(RuntimeError):
+                manager.release_memory_occupation(request)
+            manager.release_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.pause.call_args_list],
+            ["kv_cache", "cuda_graph", "cuda_graph"],
+        )
+        self.assertEqual(manager.offload_tags, {"kv_cache", "cuda_graph"})
+
+    def test_a_failed_resume_retries_only_released_tags(self):
+        """A tag resumed before a later tag failed is not resumed again on retry."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+        manager.memory_saver_adapter.resume.side_effect = [None, RuntimeError, None]
+        manager.offload_tags.update({"kv_cache", "cuda_graph"})
+        request = ResumeMemoryOccupationReqInput(tags=["kv_cache", "cuda_graph"])
+
+        with self.assertRaises(RuntimeError):
+            manager.resume_memory_occupation(request)
+        manager.resume_memory_occupation(request)
+
+        self.assertEqual(
+            [c.args[0] for c in manager.memory_saver_adapter.resume.call_args_list],
+            ["cuda_graph", "kv_cache", "kv_cache"],
+        )
+        self.assertEqual(manager.offload_tags, set())
 
 
 class _RecordingStream:
