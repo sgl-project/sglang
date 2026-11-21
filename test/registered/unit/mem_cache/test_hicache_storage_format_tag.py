@@ -145,7 +145,13 @@ class TestStorageModelName(CustomTestCase):
             _build_unified_plan=lambda *_: None,
         )
         parallel = SimpleNamespace(
-            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_size=1, attn_dcp_rank=0
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_tp_rank=0,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
         )
         with (
             patch.object(cache_controller, "get_parallel", return_value=parallel),

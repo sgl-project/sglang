@@ -47,6 +47,9 @@ class HiCacheStorageConfig:
     unified_suffixes: Optional[List[str]] = None
     dcp_size: int = 1
     dcp_rank: int = 0
+    # Attention-local TP rank. None keeps the historical writer formula, which
+    # compares the stored tp_rank, so hand-built configs stay valid.
+    attn_tp_rank: Optional[int] = None
     logical_page_size: Optional[int] = None
     # Byte ranges in a local page, paired with unified_suffixes in the same
     # order. The key grid is layer-major, whereas page bytes are head-major.
@@ -89,9 +92,23 @@ class HiCacheStorageConfig:
         keys include the CP rank, so every CP copy retains its own writer.
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
+
+        Legacy MLA keys embed ``_cp{rank}_{size}``. When ``attn_tp_rank`` is
+        set, that writer is the attention-local TP rank (0 on every GPU when
+        attention TP size is 1) rather than the global TP rank, which equals
+        the CP rank for ``--tp-size N --attn-cp-size N``. Configs that leave
+        ``attn_tp_rank`` unset keep the global-TP comparison.
         """
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
+        if (
+            self.unified_suffixes is None
+            and self.attn_cp_size > 1
+            and self.dcp_size == 1
+            and self.attn_tp_rank is not None
+            and self.is_rank_replicated
+        ):
+            return self.attn_tp_rank == self.dcp_rank
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
 
 

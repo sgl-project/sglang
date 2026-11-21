@@ -990,6 +990,9 @@ class HiCacheController:
             unified_chunk_spans=unified_chunk_spans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
+            # Suffixes keep tp_rank above. Writer election for legacy MLA keys
+            # uses the attention-local rank so each CP rank can write its file.
+            attn_tp_rank=get_parallel().attn_tp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
         )
 
