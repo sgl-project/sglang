@@ -190,6 +190,48 @@ class TestAiterRouteSortConsumer(CustomTestCase):
         self.lookup.assert_not_called()
 
 
+class TestHandoffUnderCompile(CustomTestCase):
+    def test_handoff_reads_trace_in_a_fullgraph_compile(self):
+        """The handoff lives in a ContextVar, which fullgraph tracing cannot read,
+        so a compiled routing call must skip it and keep the unfused router."""
+
+        def routing(x):
+            route_sort.bind_select_experts(None, fused_routing_ok=True)
+            consumer, _ = route_sort._take()
+            assert consumer is None and route_sort.staged() is None
+            return x + 1
+
+        compiled = torch.compile(routing, fullgraph=True, backend="eager")
+        self.assertEqual(compiled(torch.zeros(1)).item(), 1.0)
+
+
+class TestSortTailResidency(CustomTestCase):
+    def _device_with(self, compute_units):
+        props = SimpleNamespace(multi_processor_count=compute_units)
+        return patch.object(torch.cuda, "get_device_properties", return_value=props)
+
+    def test_tail_needs_its_ctas_resident_together(self):
+        """The tail's helper CTAs wait on each other, so a device with fewer CUs
+        than helpers keeps the unfused router; the leader sort never waits."""
+        radix4 = route_sort.moe_route_radix4
+        cpu = torch.device("cpu")
+        with self._device_with(16):
+            self.assertTrue(radix4.sort_tail_fits(64, cpu))
+            self.assertTrue(radix4.sort_tail_fits(256, cpu))
+            self.assertFalse(radix4.sort_tail_fits(257, cpu))
+            self.assertFalse(radix4.sort_tail_fits(1024, cpu))
+        with self._device_with(32):
+            self.assertTrue(radix4.sort_tail_fits(1024, cpu))
+
+    def test_routing_declines_without_launching_when_the_tail_cannot_fit(self):
+        consumer = aiter_route_sort.AiterRouteSortConsumer()
+        consumer.sort_block_m = lambda m: 16
+        with self._device_with(8):
+            hit, launches = _route(consumer, 1024, [])
+        self.assertIsNone(hit)
+        self.assertEqual(launches, 0)
+
+
 class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):
     def test_sorts_at_the_block_m_aiter_names(self):
         """With presorted_moe_block_m (ROCm/aiter#8197) AITER names the block_m:

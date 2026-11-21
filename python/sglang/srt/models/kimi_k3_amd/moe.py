@@ -27,6 +27,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.moe import route_sort
+from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -161,11 +162,19 @@ class KimiK3MoEHipMixin:
         if not (_is_hip and envs.SGLANG_K3_RADIX4_TOPK.get()):
             return None
         runner = self.experts.runner
-        return None if runner is None else runner.route_sort_consumer()
+        # AITER's is the only runner core that consumes a router-written sort.
+        core = (
+            None
+            if runner is None or runner.fused_func is not None
+            else runner.runner_core
+        )
+        if not isinstance(core, AiterRunnerCore):
+            return None
+        return core.route_sort_consumer()
 
     def _route_sort_scope(self) -> ContextManager[None]:
         consumer = self._route_sort_consumer
-        if consumer is None:
+        if consumer is None or torch.compiler.is_compiling():
             return contextlib.nullcontext()
         # A sort that no experts call consumed must not outlive this layer.
         return route_sort.scope(consumer)

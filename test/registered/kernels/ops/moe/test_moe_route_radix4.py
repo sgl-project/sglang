@@ -454,9 +454,9 @@ def _payload_from_sorted(
 
 
 # 1 is the grid that skips the arrival handshake and 2..64 sort in the last CTA.
-# Past 64 the last ceil(M / 16) CTAs share the sort: 65 is the smallest such
+# Past 64 the last min(ceil(M / 16), 32) CTAs share the sort: 65 is the smallest such
 # tail (5 CTAs, a short last chunk), 300 has a short last chunk too, and 1024 is
-# the router's largest batch (64 tail CTAs).
+# the router's largest batch (32 tail CTAs of 32 tokens).
 @pytest.mark.parametrize("block_m", BLOCK_MS)
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 65, 80, 128, 300, 512, 1024])
 def test_fused_sort_matches_route_and_layout(m, block_m):

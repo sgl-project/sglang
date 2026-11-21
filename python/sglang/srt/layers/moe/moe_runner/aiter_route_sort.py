@@ -35,7 +35,7 @@ def _registrar() -> Optional[Callable[[Optional[dict]], None]]:
 
 @cache_once
 def _cfg_api() -> Optional[SimpleNamespace]:
-    """The AITER calls fused_moe resolves its kernel config with."""
+    # The AITER calls fused_moe resolves its kernel config with.
     try:
         from aiter import ActivationType, QuantType
         from aiter.fused_moe import (
@@ -117,9 +117,8 @@ _MIRRORED_ARGS = frozenset(
 
 
 def _cfg_lookup(call: dict) -> Tuple[dict, Optional[str]]:
-    """The batch-size-independent part of the get_2stage_cfgs call that
-    _fused_moe_impl makes for fused_moe(**call), or why AITER would not take a
-    presort on this call at any batch size."""
+    # The batch-size-independent part of the get_2stage_cfgs call that _fused_moe_impl
+    # makes for fused_moe(**call), or why AITER would not take a presort at any batch size.
     api = _cfg_api()
     extra = sorted(set(call) - _MIRRORED_ARGS)
     if extra:
@@ -190,7 +189,7 @@ def _cfg_lookup(call: dict) -> Tuple[dict, Optional[str]]:
 
 
 def _cfg_args(lookup: dict, m: int) -> dict:
-    """get_2stage_cfgs's keyword arguments for an M-token fused_moe call."""
+    # get_2stage_cfgs's keyword arguments for an M-token fused_moe call.
     api = _cfg_api()
     args = dict(lookup)
     quant_dtype_a = args.pop("quant_dtype_a")

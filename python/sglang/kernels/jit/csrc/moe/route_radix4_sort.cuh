@@ -18,7 +18,7 @@
 ///
 /// Two tails share that layout. Up to a few routes per thread, the last CTA to
 /// arrive sorts everything (sort_subkernel). Past that one CTA's placement
-/// grows with M, so sort_tail_stable spreads it over the last ceil(M / 16)
+/// grows with M, so sort_tail_stable spreads it over the last min(ceil(M / 16), 32)
 /// arrivals instead, each placing one token chunk. Both rank a route within
 /// its expert by the earlier tokens that picked the expert, so the order does
 /// not depend on which thread got there first.
