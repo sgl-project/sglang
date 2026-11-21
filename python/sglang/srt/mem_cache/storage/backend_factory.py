@@ -45,6 +45,22 @@ class StorageBackendFactory:
             ) from e
 
     @classmethod
+    def dynamic_backend_class(
+        cls, backend_name: str, backend_config: Dict[str, Any] | None
+    ) -> type[HiCacheStorage] | None:
+        """The class a ``dynamic`` backend would load, or None if not dynamic."""
+        if backend_name != "dynamic" or not backend_config:
+            return None
+        fields = ("backend_name", "module_path", "class_name")
+        if any(field not in backend_config for field in fields):
+            return None
+        return cls._load_backend_class(
+            backend_config["module_path"],
+            backend_config["class_name"],
+            backend_config["backend_name"],
+        )
+
+    @classmethod
     def register_backend(cls, name: str, module_path: str, class_name: str) -> None:
         """Register a storage backend with lazy loading.
 
