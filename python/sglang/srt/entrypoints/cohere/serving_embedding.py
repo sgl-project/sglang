@@ -321,8 +321,7 @@ class CohereServingEmbedding(OpenAIServingBase):
         except StarletteHTTPException as error:
             # The shared lifecycle would drop the headers and log nothing.
             return _http_error_response(error, adapted_request.rid)
-        if not isinstance(result, list):
-            result = [result]
+        # text is always a list here, so the engine returns one result per sample.
         # Serialize once here; unrequested embedding types are omitted.
         return Response(
             content=build_embed_response(request, result).model_dump_json(

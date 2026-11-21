@@ -50,23 +50,23 @@ def embedding_input_token_limit(
     return limit
 
 
-def _slice_token_metadata(
+def _select_token_metadata(
     value: Optional[Union[list[int], torch.Tensor]],
-    start: int,
-    end: int,
+    index: Union[slice, list[int]],
     length: int,
     name: str,
 ) -> Optional[Union[list[int], torch.Tensor]]:
-    """Slice a flat list or a tensor whose final axis indexes prompt tokens."""
+    """Select positions from a flat list or a tensor whose final axis indexes
+    prompt tokens, after checking that it is aligned with the prompt."""
     if value is None:
         return None
     if isinstance(value, torch.Tensor):
         if not value.shape or value.shape[-1] != length:
             raise ValueError(f"Cannot safely truncate misaligned {name}.")
-        return value[..., start:end]
+        return value[..., index]
     if len(value) != length:
         raise ValueError(f"Cannot safely truncate misaligned {name}.")
-    return value[start:end]
+    return value[index] if isinstance(index, slice) else [value[i] for i in index]
 
 
 def _truncate_multimodal_tail(
@@ -132,17 +132,15 @@ def _truncate_multimodal_tail(
     return msgspec.structs.replace(
         mm_inputs,
         input_ids=input_ids[:end],
-        padded_input_ids=_slice_token_metadata(
+        padded_input_ids=_select_token_metadata(
             mm_inputs.padded_input_ids,
-            0,
-            end,
+            slice(0, end),
             len(input_ids),
             "multimodal padded_input_ids",
         ),
-        token_type_ids=_slice_token_metadata(
+        token_type_ids=_select_token_metadata(
             mm_inputs.token_type_ids,
-            0,
-            end,
+            slice(0, end),
             len(input_ids),
             "multimodal token_type_ids",
         ),
@@ -226,26 +224,15 @@ def truncate_embedding_input(
                 f"Embedding input budget of {limit} tokens cannot fit the "
                 "tokenizer's required special tokens."
             )
-        content_positions = [
-            index for index, special in enumerate(special_tokens_mask) if not special
-        ]
-        start = 0 if truncate == "END" else len(content_positions) - content_budget
-        retained_content = set(content_positions[start : start + content_budget])
-        positions = [
-            index
-            for index, special in enumerate(special_tokens_mask)
-            if special or index in retained_content
-        ]
-        if token_type_ids is not None:
-            # Validate the original alignment before selecting noncontiguous
-            # positions (e.g. BOS + a retained text suffix + EOS).
-            _slice_token_metadata(token_type_ids, 0, length, length, "token_type_ids")
-            token_type_ids = (
-                token_type_ids[..., positions]
-                if isinstance(token_type_ids, torch.Tensor)
-                else [token_type_ids[index] for index in positions]
-            )
-        return [input_ids[index] for index in positions], token_type_ids, mm_inputs
+        content = [i for i, special in enumerate(special_tokens_mask) if not special]
+        start = 0 if truncate == "END" else len(content) - content_budget
+        dropped = set(content) - set(content[start : start + content_budget])
+        # Noncontiguous in general, e.g. BOS + a retained text suffix + EOS.
+        positions = [i for i in range(length) if i not in dropped]
+        token_type_ids = _select_token_metadata(
+            token_type_ids, positions, length, "token_type_ids"
+        )
+        return [input_ids[i] for i in positions], token_type_ids, mm_inputs
 
     start, end = (0, limit) if truncate == "END" else (length - limit, length)
     if mm_inputs is not None:
@@ -256,7 +243,7 @@ def truncate_embedding_input(
                 "Increase max_tokens or shorten the text input."
             )
         mm_inputs = _truncate_multimodal_tail(mm_inputs, input_ids, end)
-    token_type_ids = _slice_token_metadata(
-        token_type_ids, start, end, length, "token_type_ids"
+    token_type_ids = _select_token_metadata(
+        token_type_ids, slice(start, end), length, "token_type_ids"
     )
     return input_ids[start:end], token_type_ids, mm_inputs
