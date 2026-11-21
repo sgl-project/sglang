@@ -126,5 +126,26 @@ class TestLTX2STGPrefixShare(CustomTestCase):
                 torch.testing.assert_close(got, want, rtol=0, atol=2e-2)
 
 
+class TestLTX2STGQuantizedGate(CustomTestCase):
+    def test_quantized_dit_keeps_the_batched_guidance_forward(self):
+        from types import SimpleNamespace
+
+        from sglang.multimodal_gen.runtime.layers.linear import (
+            UnquantizedLinearMethod,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
+            LTX2DenoisingStage,
+        )
+
+        def dit(method):
+            model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+            model[0].quant_method = method
+            return model
+
+        check = LTX2DenoisingStage._ltx2_dit_has_quantized_linears
+        self.assertFalse(check(dit(UnquantizedLinearMethod())))
+        self.assertTrue(check(dit(SimpleNamespace(name="fp8"))))
+
+
 if __name__ == "__main__":
     unittest.main()

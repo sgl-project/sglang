@@ -32,7 +32,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     QUALITY_LEVELS,
     SamplingParams,
     SkipSoftmaxParams,
-    _json_safe,
     normalize_quality,
     quality_allows,
     resolve_skip_softmax_params,
@@ -287,7 +286,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual((params.width, params.height), (832, 480))
         self.assertIn((params.width, params.height), params.supported_resolutions)
 
-    def test_output_file_name_supports_callable_teacache_params(self):
+    def test_auto_output_file_name_is_opaque_and_stable_once_selected(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
             return [1.0, 2.0, 3.0, 4.0, 5.0]
 
@@ -300,11 +299,18 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         params._set_output_file_name()
 
-        self.assertTrue(params.output_file_name.endswith(".mp4"))
-        self.assertIn(
-            "test_sampling_params.TestSamplingParamsSubclass.test_output_file_name_supports_callable_teacache_params",
-            _json_safe(coefficients_callback),
-        )
+        first = params.output_file_name
+        self.assertRegex(first, r"^output_[0-9a-f]{32}\.mp4$")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, first)
+        params.output_file_name = None
+        params._set_output_file_name()
+        self.assertNotEqual(params.output_file_name, first)
+
+    def test_explicit_output_file_name_is_preserved(self):
+        params = SamplingParams(output_file_name="my sample.mp4")
+        params._set_output_file_name()
+        self.assertEqual(params.output_file_name, "my_sample.mp4")
 
     def test_teacache_callback_takes_precedence_over_static_coefficients(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:

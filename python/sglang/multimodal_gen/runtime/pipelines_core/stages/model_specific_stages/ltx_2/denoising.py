@@ -1450,6 +1450,26 @@ class LTX2DenoisingStage(DenoisingStage):
         return first if first > 0 else None
 
     @staticmethod
+    def _ltx2_dit_has_quantized_linears(model) -> bool:
+        """Whether any linear of the DiT runs a quantized method."""
+        cached = getattr(model, "_ltx2_has_quantized_linears", None)
+        if cached is None:
+            from sglang.multimodal_gen.runtime.layers.linear import (
+                UnquantizedLinearMethod,
+            )
+
+            cached = any(
+                (method := getattr(module, "quant_method", None)) is not None
+                and not isinstance(method, UnquantizedLinearMethod)
+                for module in model.modules()
+            )
+            try:
+                model._ltx2_has_quantized_linears = cached
+            except AttributeError:
+                pass
+        return cached
+
+    @staticmethod
     def _apply_ltx2_guidance_pass_kwargs(
         model_kwargs: dict[str, object],
         pass_spec: LTX2GuidancePassSpec,
@@ -2314,12 +2334,17 @@ class LTX2DenoisingStage(DenoisingStage):
 
                     batched_video = torch.cat(batched_video_chunks, dim=0)
                     batched_audio = torch.cat(batched_audio_chunks, dim=0)
-                elif stg_prefix_block is not None and quality_allows(
-                    batch.quality, "lossless"
+                elif (
+                    stg_prefix_block is not None
+                    and quality_allows(batch.quality, "lossless")
+                    and not self._ltx2_dit_has_quantized_linears(step.current_model)
                 ):
                     # Splitting the batched call changes its batch size, which
                     # can move GEMM/attention rounding, so "exact" keeps the
-                    # single batched forward.
+                    # single batched forward. A quantized DiT keeps it too: an
+                    # activation scale shared across the batch's rows (online
+                    # FP8 on MI300X) would give the split-off STG rows other
+                    # FP8 codes.
                     # One batched call for every pass but the perturbed one, which
                     # records the cond rows at the first STG block; then the
                     # perturbed pass runs only the blocks from there on.
