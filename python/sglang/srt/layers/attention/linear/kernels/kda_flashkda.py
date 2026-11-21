@@ -87,8 +87,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
 
-    # Tracked batches always take the Triton fallback, which forwards the
-    # fp32 snapshot arguments (see _triton_fallback).
+    # Batches that track an interior boundary take the Triton fallback, which forwards
+    # the fp32 snapshot arguments (see _triton_fallback).
     supports_track_state_snapshot: bool = True
 
     def decode(
@@ -128,10 +128,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
+        # FlashKDA cannot emit the per-chunk states (h) an interior tracked boundary needs;
+        # those batches take the Triton fallback so the snapshot is not skipped.
         if return_intermediate_states or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
@@ -153,22 +151,19 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
