@@ -53,8 +53,9 @@ class VPPActivationReceiver:
     The sender transmits full tensors on each TP lane, without TP all-gather.
     """
 
-    def __init__(self, pp_group):
+    def __init__(self, pp_group, *, tag: int = 0):
         self.pp_group = pp_group
+        self.tag = tag
         self._comm = _CommStream(pp_group)
         self._handle = None
 
@@ -65,7 +66,7 @@ class VPPActivationReceiver:
 
     def _post(self) -> None:
         with self._comm.context():
-            self._handle = self.pp_group.recv_tensor_dict_async()
+            self._handle = self.pp_group.recv_tensor_dict_async(tag=self.tag)
 
     def progress(self) -> bool:
         if self._handle is None:
@@ -73,13 +74,20 @@ class VPPActivationReceiver:
         with self._comm.context():
             return self._handle.poll_metadata_ready()
 
-    def take(self) -> VPPReceivedActivation:
+    def take(self, *, post_next: bool = True) -> VPPReceivedActivation:
+        """Consume one activation; end a finite wave with post_next=False.
+
+        The next wave calls start() again. Ending the receive chain leaves no
+        metadata waiter outstanding across an idle period or process shutdown.
+        """
         if self._handle is None:
             raise RuntimeError("VPP activation receiver is not started")
         with self._comm.context():
             tensors = self._handle.wait()
             result = VPPReceivedActivation(tensors, self._comm.record_event())
-            self._post()
+            self._handle = None
+            if post_next:
+                self._post()
         return result
 
 
@@ -92,10 +100,11 @@ class VPPSendWindow:
     it fences all outstanding readers, including sends still inside the window.
     """
 
-    def __init__(self, pp_group, max_inflight: int):
+    def __init__(self, pp_group, max_inflight: int, *, tag: int = 0):
         if type(max_inflight) is not int or max_inflight <= 0:
             raise ValueError("max_inflight must be a positive integer")
         self.pp_group = pp_group
+        self.tag = tag
         self.max_inflight = max_inflight
         self._comm = _CommStream(pp_group)
         self._pending = deque()
@@ -132,7 +141,9 @@ class VPPSendWindow:
                 if self._comm.stream is None:
                     raise ValueError("A forward event requires a device stream")
                 self._comm.stream.wait_event(forward_event)
-            items = self.pp_group.send_tensor_dict(tensors, async_send=True)
+            items = self.pp_group.send_tensor_dict(
+                tensors, async_send=True, tag=self.tag
+            )
             if not isinstance(items, list):
                 raise RuntimeError("VPP activation send requires a distributed peer")
             self._pending.append(items)

@@ -633,6 +633,7 @@ class TpModelWorker(BaseTpWorker):
         pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
         input_ids_from_graph: bool = False,
+        vpp_stage_id: Optional[int] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -685,10 +686,17 @@ class TpModelWorker(BaseTpWorker):
             else pp_proxy_tensors.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
         )
 
-        if self.pp_group.is_last_rank:
+        forward_kwargs = {} if vpp_stage_id is None else {"vpp_stage_id": vpp_stage_id}
+        is_output_stage = (
+            self.pp_group.is_last_rank
+            if vpp_stage_id is None
+            else vpp_stage_id == self.model_runner.model.vpp_layout.logical_size - 1
+        )
+        if is_output_stage:
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+                **forward_kwargs,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             if folded is not None:
@@ -746,6 +754,7 @@ class TpModelWorker(BaseTpWorker):
             # Keep the existing grammar behavior unchanged.
             if (
                 self.enable_overlap
+                and vpp_stage_id is None
                 and not self.enable_spec
                 and (
                     forward_batch.sampling_info.grammars is not None
@@ -794,6 +803,7 @@ class TpModelWorker(BaseTpWorker):
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
+                **forward_kwargs,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             routed_experts_output = merge_relayed_routed_experts(

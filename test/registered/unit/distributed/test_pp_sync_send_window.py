@@ -3,6 +3,7 @@
 import unittest
 
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.distributed.vpp_batch import VPPBatchLedger, VPPBatchState
 from sglang.srt.distributed.vpp_layout import VPPLayout
 from sglang.srt.distributed.vpp_schedule import VPPFixedSchedule, VPPTask
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -176,6 +177,56 @@ class TestVPPFixedSchedule(CustomTestCase):
             self.assertEqual(schedule.next_task(), task)
             schedule.record_dispatch(task)
             self.assertIsNone(schedule.next_task())
+
+
+class TestVPPBatchLedger(CustomTestCase):
+    def test_slot_retained_after_policy_credit_until_result_is_processed(self):
+        """Policy credit ends at dispatch; request/KV ownership ends at output."""
+        layout = VPPLayout(12, 2, virtual_stages=3)
+        ledger = VPPBatchLedger(layout, physical_rank=0, max_inflight=1)
+        schedule = VPPFixedSchedule(layout, physical_rank=0, max_inflight=1)
+        first = VPPBatchState(0, 0, ("request-a",), object())
+        ledger.admit(first)
+        schedule.enqueue(VPPTask(0, 0))
+        for stage_id in (0, 2, 4):
+            task = schedule.next_task()
+            self.assertEqual(task, VPPTask(0, stage_id))
+            if stage_id != 4:
+                with self.assertRaises(RuntimeError):
+                    ledger.complete(0)
+            ledger.record_dispatch(task)
+            schedule.record_dispatch(task)
+        schedule.enqueue(VPPTask(1, 0))
+        with self.assertRaises(RuntimeError):
+            ledger.admit(VPPBatchState(1, 0, ("request-b",), object()))
+        self.assertIs(ledger.complete(0), first)
+        ledger.admit(VPPBatchState(1, 0, ("request-b",), object()))
+        with self.assertRaises(RuntimeError):
+            ledger.get(VPPTask(0, 0))
+
+    def test_activation_checks_identity_composition_and_local_pass(self):
+        layout = VPPLayout(12, 2, virtual_stages=3)
+        ledger = VPPBatchLedger(layout, physical_rank=1, max_inflight=2)
+        state = VPPBatchState(4, 1, ("req", 3, 64, 128), object())
+        ledger.admit(state)
+        for stage_id in (1, 3, 5):
+            task = VPPTask(4, stage_id)
+            identity = (4, stage_id, 1, state.manifest)
+            for bad_identity in (
+                (3, stage_id, 1, state.manifest),
+                (4, stage_id, 0, state.manifest),
+                (4, stage_id, 1, ("req", 2, 64, 128)),
+            ):
+                with self.subTest(identity=bad_identity):
+                    with self.assertRaises(RuntimeError):
+                        ledger.check_activation(task, {"vpp_identity": bad_identity})
+            self.assertIs(
+                ledger.check_activation(task, {"vpp_identity": identity}), state
+            )
+            ledger.record_dispatch(task)
+            with self.assertRaises(RuntimeError):
+                ledger.check_activation(task, {"vpp_identity": identity})
+        ledger.complete(4)
 
 
 if __name__ == "__main__":

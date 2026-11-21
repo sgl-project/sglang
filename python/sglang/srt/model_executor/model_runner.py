@@ -1917,6 +1917,8 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        *,
+        vpp_stage_id: Optional[int] = None,
     ) -> ModelRunnerOutput:
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
@@ -1970,7 +1972,12 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(forward_batch, pp_proxy_tensors)
+            if vpp_stage_id is None:
+                output = self._forward_raw(forward_batch, pp_proxy_tensors)
+            else:
+                output = self._forward_raw(
+                    forward_batch, pp_proxy_tensors, vpp_stage_id=vpp_stage_id
+                )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output, forward_batch, pp_proxy_tensors
@@ -2101,6 +2108,8 @@ class ModelRunner:
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
+        *,
+        vpp_stage_id: Optional[int] = None,
     ) -> ModelRunnerOutput:
         prepare = getattr(self.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -2118,6 +2127,22 @@ class ModelRunner:
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,
         ):
+            if vpp_stage_id is not None:
+                from sglang.srt.model_executor.runner.vpp_stage import (
+                    execute_vpp_stage,
+                )
+
+                return ModelRunnerOutput(
+                    logits_output=execute_vpp_stage(
+                        model=self.model,
+                        attn_backend=self.attn_backend,
+                        forward_batch=forward_batch,
+                        stage_id=vpp_stage_id,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                        device_timer=self.device_timer,
+                    ),
+                    can_run_graph=False,
+                )
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

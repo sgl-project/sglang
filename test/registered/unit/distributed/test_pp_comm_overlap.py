@@ -249,6 +249,62 @@ class TestPPCommOverlap(CustomTestCase):
 
 
 class TestVPPActivationTransport(CustomTestCase):
+    def test_tagged_activation_does_not_consume_control_and_finishes_receive(self):
+        """A posted activation receive must leave untagged PP control intact."""
+        mailbox = defaultdict(deque)
+
+        def send(tensor, dst, group=None, tag=0):
+            mailbox[tag].append(tensor.clone())
+            return SimpleNamespace(wait=lambda: None)
+
+        def recv(tensor, src, group=None, tag=0):
+            return SimpleNamespace(wait=lambda: tensor.copy_(mailbox[tag].popleft()))
+
+        group = object.__new__(GroupCoordinator)
+        group.__dict__.update(
+            rank_in_group=0,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group=object(),
+            device_group=object(),
+            device=torch.device("cpu"),
+        )
+        with patch.multiple(
+            torch.distributed, is_initialized=lambda: True, isend=send, irecv=recv
+        ):
+            # Control is ahead of the activation on the same peer/group.
+            group.send_object(["abort", "req-a"], dst=1, async_send=True)
+            controls = [tensor.clone() for tensor in mailbox[0]]
+            group.send_tensor_dict(
+                {"hidden_states": torch.arange(6).reshape(2, 3)},
+                dst=1,
+                async_send=True,
+                tag=2,
+            )
+            receiver = VPPActivationReceiver(group, tag=2)
+            receiver.start()
+            result = receiver.take(post_next=False)
+            torch.testing.assert_close(
+                result.tensors["hidden_states"], torch.arange(6).reshape(2, 3)
+            )
+            self.assertEqual(len(mailbox[0]), 2)
+            for actual, expected in zip(mailbox[0], controls):
+                torch.testing.assert_close(actual, expected)
+            self.assertFalse(mailbox[2])
+            with self.assertRaisesRegex(RuntimeError, "not started"):
+                receiver.progress()
+            group.send_tensor_dict(
+                {"hidden_states": torch.tensor([8])},
+                dst=1,
+                async_send=True,
+                tag=2,
+            )
+            receiver.start()
+            self.assertEqual(
+                receiver.take(post_next=False).tensors["hidden_states"].tolist(),
+                [8],
+            )
+
     """Protect wire compatibility and cross-stream activation storage lifetime."""
 
     def test_async_metadata_progress_does_not_wait_for_payload(self):

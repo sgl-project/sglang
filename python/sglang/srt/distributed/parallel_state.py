@@ -177,8 +177,9 @@ class TensorDictRecvHandle:
 
     _MAX_METADATA_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, coordinator: "GroupCoordinator", src: int):
+    def __init__(self, coordinator: "GroupCoordinator", src: int, tag: int = 0):
         self._coordinator = coordinator
+        self._tag = tag
         # src is group-local; torch.distributed P2P requires the global rank.
         self._src_global_rank = coordinator.ranks[src]
         self._metadata_size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
@@ -196,7 +197,10 @@ class TensorDictRecvHandle:
         """Post a CPU receive for the metadata length or serialized bytes."""
         return _CPUWorkWaiter(
             torch.distributed.irecv(
-                tensor, src=self._src_global_rank, group=self._coordinator.cpu_group
+                tensor,
+                src=self._src_global_rank,
+                group=self._coordinator.cpu_group,
+                tag=self._tag,
             )
         )
 
@@ -253,7 +257,10 @@ class TensorDictRecvHandle:
                     else self._coordinator.device_group
                 )
                 payload_recv_work = torch.distributed.irecv(
-                    value, src=self._src_global_rank, group=payload_comm_group
+                    value,
+                    src=self._src_global_rank,
+                    group=payload_comm_group,
+                    **({"tag": self._tag} if value.is_cpu else {}),
                 )
                 self._payload_recv_works.append(P2PWork(payload_recv_work, value))
         self._received_tensor_dict = received_tensor_dict
@@ -1965,9 +1972,11 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        tag: int = 0,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
+        `tag` separates CPU metadata/payloads; device payloads remain untagged.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -1997,7 +2006,9 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works = self.send_object(
+            metadata_list, dst=dst, async_send=async_send, tag=tag
+        )
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -2009,15 +2020,23 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
+            work = send_func(
+                tensor,
+                self.ranks[dst],
+                group=comm_group,
+                **({"tag": tag} if tensor.is_cpu else {}),
+            )
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
-    def recv_tensor_dict_async(self, src: Optional[int] = None) -> TensorDictRecvHandle:
+    def recv_tensor_dict_async(
+        self, src: Optional[int] = None, tag: int = 0
+    ) -> TensorDictRecvHandle:
         """Receive full tensors asynchronously, without send-allgather slicing.
 
         The sender must call send_tensor_dict with all_gather_group=None.
+        Use the same CPU tag on both sides; device payloads follow FIFO order.
         """
         if not torch.distributed.is_initialized() or self.world_size == 1:
             raise RuntimeError("Async tensor-dict receive requires a distributed peer")
@@ -2025,7 +2044,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         if not 0 <= src < self.world_size or src == self.rank_in_group:
             raise ValueError(f"Invalid source rank ({src})")
-        return TensorDictRecvHandle(self, src)
+        return TensorDictRecvHandle(self, src, tag=tag)
 
     def recv_tensor_dict(
         self,

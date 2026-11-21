@@ -337,6 +337,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_vpp_mixin import SchedulerVPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -507,6 +508,7 @@ class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerPPMixin,
+    SchedulerVPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -7020,6 +7022,10 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    if getattr(scheduler.tp_worker.model_runner.model, "vpp_layout", None) is not None:
+        if disaggregation_mode != DisaggregationMode.NULL:
+            raise NotImplementedError("VPP disaggregation lifecycle is not wired yet")
+        return scheduler.event_loop_vpp()
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:
             scheduler.event_loop_pp()

@@ -4790,7 +4790,7 @@ class DeepseekV4Model(nn.Module):
         if self.vpp_layout is not None:
             raise NotImplementedError(
                 "DSV4 VPP requires explicit logical-stage execution through "
-                "forward_vpp_stage; serving scheduling is not wired yet"
+                "forward_vpp_stage"
             )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
