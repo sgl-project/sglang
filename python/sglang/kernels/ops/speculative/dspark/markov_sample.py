@@ -254,7 +254,8 @@ def _launch_partial(
 
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
-    the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
+    the rank's padded shard ``base_logits``, or adds nothing when None (``vocab_limit``
+    still masks the tail). Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
     ``has_sampled_rows=False`` argmaxes every row."""
@@ -281,10 +282,11 @@ class MarkovSampleStep:
         gather_logits,
         logits_out,
     ):
-        assert base_logits.ndim == bias.ndim == 2
-        assert bias.shape[0] == base_logits.shape[0]
-        assert bias.shape[1] <= base_logits.shape[1]
-        assert bias.stride(1) == base_logits.stride(1) == 1
+        assert base_logits.ndim == 2 and base_logits.stride(1) == 1
+        if bias is not None:
+            assert bias.ndim == 2 and bias.stride(1) == 1
+            assert bias.shape[0] == base_logits.shape[0]
+            assert bias.shape[1] <= base_logits.shape[1]
         assert temperatures.shape == (base_logits.shape[0],)
         assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
         assert offset.dtype == torch.int64 and offset.numel() == 1
@@ -304,7 +306,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Optional[torch.Tensor],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -329,7 +331,7 @@ class MarkovSampleStep:
             gather_logits,
             logits_out,
         )
-        rows, width = bias.shape
+        rows, width = (base_logits if bias is None else bias).shape
         launch = functools.partial(
             _launch_partial,
             temperatures=temperatures,
@@ -385,7 +387,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Optional[torch.Tensor],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -412,9 +414,10 @@ class MarkovSampleStep:
             gather_logits,
             logits_out,
         )
-        rows, width = bias.shape
+        rows, width = (base_logits if bias is None else bias).shape
         value = base_logits.to(torch.float32, copy=True)
-        value[:, :width] += bias.float()
+        if bias is not None:
+            value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
         if softcap is not None:
             value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()

@@ -12,6 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dflash import candidate_topk
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.speculative.bench_drafter import override_draft_sampling
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 
@@ -225,6 +226,8 @@ def propose_lilicorr_block(
         if sampling_enabled
         else torch.ones(bs, dtype=torch.bool, device=device)
     )
+    if sampling_enabled:
+        override_draft_sampling(temperatures, greedy_mask)
     selected, q_rows = head.select_with_proposal(
         uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
         temperatures=temperatures,
@@ -308,17 +311,18 @@ class LiLiCorrDraftSampler:
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+        else:
+            torch.clamp(
+                sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+                min=1e-5,
+                out=self.temperatures[:bs],
             )
-        )
+            self.greedy_mask[:bs].copy_(
+                resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
+                )
+            )
+        override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids

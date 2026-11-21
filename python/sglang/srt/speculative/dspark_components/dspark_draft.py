@@ -21,6 +21,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.speculative.bench_drafter import (
+    bench_drafter_enabled,
+    bench_drafter_temperature,
+    bench_noise_key,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -162,6 +167,11 @@ def resolve_draft_params(
         )
         torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
+    bench_temperature = bench_drafter_temperature()
+    if bench_temperature > 0.0:
+        # Only the draft step temperature: the verify reads temperatures and
+        # greedy_mask, so the target still verifies greedy rows greedily.
+        step_temperatures.masked_fill_(greedy_mask, bench_temperature)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
@@ -374,8 +384,13 @@ class DraftBlockProposer:
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
         self._sharded_accept = sharded_accept
+        noise_key = draft_noise_key(random_seed)
+        if bench_drafter_enabled():
+            # The noise dominates a draw at the benchmark temperature: DP groups get
+            # their own key so they do not draft the same tokens.
+            noise_key = bench_noise_key(noise_key)
         self._noise = DraftNoise(
-            key=draft_noise_key(random_seed),
+            key=noise_key,
             offset=torch.zeros(
                 1, dtype=torch.int64, device=self.draft_model_runner.device
             ),

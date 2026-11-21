@@ -1839,6 +1839,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sanitize NaN logits before sampling kernels and emit a throttled warning.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BENCH_DRAFTER_TEMPERATURE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft temperature of DSpark and DFLASH-family drafters (DFLASH, DFlash2 selector, LiLiCorr) under simulated acceptance (<code>SGLANG_SIMULATE_ACC_LEN</code>): greedy draft rows sample at it instead of taking the argmax, so forced acceptance commits diverse drafts rather than a greedy draft's short repeating loops or DFLASH's fixed token id (DFLASH's <code>SGLANG_SIMULATE_ACC_TOKEN_MODE</code> becomes <code>real-draft-token</code>). Unset, it is <code>1000</code> (close to uniform) whenever simulated acceptance commits drafts (<code>SGLANG_SIMULATE_ACC_LEN</code> &gt; 1); <code>0</code> keeps greedy drafts. Rows that already sample their drafts keep their own temperature (plain DFLASH's argmax head drafts every row greedily, so all of its rows sample), and the target still verifies greedy rows greedily. Overrides <code>SGLANG_DSPARK_USE_GREEDY_DRAFT</code>. LiLiCorr needs <code>SGLANG_ENABLE_LILICORR_SAMPLING=1</code>; Domino and the plain DFLASH head on NPU refuse it. A nonzero value without forced acceptance, or for another speculative algorithm, is an error. The NVIDIA megakernel's DFlash runtime does not apply it yet.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset (<code>1000</code> under simulated acceptance)</td>
+    </tr>
   </tbody>
 </table>
 

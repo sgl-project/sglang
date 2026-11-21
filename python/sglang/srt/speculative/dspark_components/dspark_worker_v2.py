@@ -29,6 +29,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
+from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -374,6 +376,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        self._apply_bench_drafter_temperature()
         markov_head = self.draft_model.markov_head
         self._sharded_accept = (
             is_hip()
@@ -647,6 +650,28 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{type(self.draft_model).__name__} folds the static verify commit, "
                 "but its FULL KV slots are not the target's unremapped slots"
             )
+
+    def _apply_bench_drafter_temperature(self) -> None:
+        """SGLANG_BENCH_DRAFTER_TEMPERATURE overrides SGLANG_DSPARK_USE_GREEDY_DRAFT.
+        Runs before anything reads ``self._greedy_draft``."""
+        temperature = bench_drafter_temperature()
+        if temperature <= 0.0:
+            return
+        overridden, self._greedy_draft = self._greedy_draft, False
+        if self._target_tp_rank != 0:
+            return
+        if overridden:
+            logger.warning(
+                "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample at the "
+                "benchmark temperature instead of taking the argmax.",
+                BENCH_DRAFTER_ENV,
+            )
+        logger.warning(
+            "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "
+            "simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
+            temperature,
+            self._simulate_acc_len,
+        )
 
     def init_attention_backends(self):
         if not self._hosts_draft:

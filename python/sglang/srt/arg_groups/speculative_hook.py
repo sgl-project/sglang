@@ -183,6 +183,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"(--speculative-algorithm {cfg.speculative_algorithm})"
         )
 
+    # SGLANG_BENCH_DRAFTER_TEMPERATURE: validated on every launch, before weights load.
+    from sglang.srt.speculative.bench_drafter import validate_server_args
+
+    validate_server_args(cfg.speculative_algorithm)
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
