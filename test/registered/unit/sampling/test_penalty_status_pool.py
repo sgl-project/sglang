@@ -33,8 +33,8 @@ def _pool():
 
 
 def _admit(pool, req):
-    pool.alloc(req)
-    pool.reset_history(req)
+    pool.alloc([req])
+    pool.reset_history([req])
 
 
 def _expected_penalties(reqs, histories):
@@ -69,7 +69,7 @@ class TestNoPenaltyPath(CustomTestCase):
             _admit(pool, req)
 
         self.assertIsNone(StepPenalties.build(reqs, pool))
-        self.assertEqual(pool.num_rows, 0)
+        self.assertEqual(pool.num_indices, 0)
         self.assertEqual(pool.counts.numel(), 0)
 
 
@@ -128,7 +128,7 @@ class TestHistory(CustomTestCase):
         for _ in range(4):
             self._step(pool, running, [r.output_ids for r in running], rng)
 
-        # a is retracted (keeps its row).
+        # a is retracted (keeps its index).
         running.remove(a)
         _admit(pool, d)
         running.append(d)
@@ -143,7 +143,7 @@ class TestHistory(CustomTestCase):
         pool.free(c)
         running.remove(c)
         self._step(pool, running, [r.output_ids for r in running], rng)
-        self.assertEqual(pool.num_rows - len(pool.free_rows), 2)
+        self.assertEqual(pool.num_indices - len(pool.free_indices), 2)
 
     def test_commit_skips_ids_outside_the_vocab(self):
         pool = _pool()
@@ -163,20 +163,20 @@ class TestHistory(CustomTestCase):
         indices = torch.tensor([reqs[0].penalty_index])
         self.assertEqual(pool.gather_lens(indices).tolist(), [1])
 
-    def test_commit_into_freed_row_is_reset_by_next_admission(self):
+    def test_commit_into_freed_index_is_reset_by_next_admission(self):
         pool = _pool()
         live = _req(3, frequency_penalty=1.0)
         a = _req(1, frequency_penalty=1.0)
         _admit(pool, live)
         _admit(pool, a)
-        row = a.penalty_index
+        index = a.penalty_index
         step = StepPenalties.build([a], pool)
 
         pool.free(a)
         step.commit(torch.tensor([7]))
         b = _req(2, frequency_penalty=1.0, output_ids=[3])
         _admit(pool, b)
-        self.assertEqual(b.penalty_index, row)
+        self.assertEqual(b.penalty_index, index)
 
         additive, _ = StepPenalties.build([b], pool).logit_penalties()
         torch.testing.assert_close(additive, _expected_penalties([b], [[3]])[0])

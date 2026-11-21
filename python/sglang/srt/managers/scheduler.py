@@ -4603,11 +4603,6 @@ class Scheduler(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).release_state_slot(req)
 
-    def admit_penalty_rows(self, batch: ScheduleBatch) -> None:
-        for req in batch.reqs:
-            self.penalty_status_pool.alloc(req)
-            self.penalty_status_pool.reset_history(req)
-
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -5001,7 +4996,8 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-        self.admit_penalty_rows(new_batch)
+        self.penalty_status_pool.alloc(new_batch.reqs)
+        self.penalty_status_pool.reset_history(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

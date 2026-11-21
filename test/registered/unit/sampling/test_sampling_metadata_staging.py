@@ -57,8 +57,8 @@ class _H2DCopies(TorchDispatchMode):
 def _step_penalties(reqs, device):
     pool = PenaltyStatusPool(VOCAB_SIZE, device)
     for req in reqs:
-        pool.alloc(req)
-        pool.reset_history(req)
+        pool.alloc([req])
+        pool.reset_history([req])
     return StepPenalties.build(reqs, pool)
 
 

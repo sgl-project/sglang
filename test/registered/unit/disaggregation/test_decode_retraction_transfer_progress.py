@@ -219,7 +219,6 @@ class _DecodeNode:
             send_abort_output=lambda abort_req, req: None,
             stream_output=lambda *a, **k: None,
         )
-        s.admit_penalty_rows = lambda batch: Scheduler.admit_penalty_rows(s, batch)
         s._set_or_validate_priority = lambda req: True
         s._reqs_finishing_inflight = lambda batch: Scheduler._reqs_finishing_inflight(
             s, batch

@@ -1033,6 +1033,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0

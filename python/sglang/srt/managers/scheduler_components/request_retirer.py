@@ -143,7 +143,7 @@ class RequestRetirer:
         a step launched before the retraction may still carry it and report it again."""
         _leave_owner_list(req)
         record_exit(req, "abort_retracted")
-        # retract kept the penalty row for the re-admission.
+        # retract kept the penalty index for the re-admission.
         self.penalty_status_pool.free(req)
         self._detach(req)
         # retract released the KV without a checkpoint.

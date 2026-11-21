@@ -570,7 +570,7 @@ class Req(ReqDllmMixin):
         self.sampling_params = sampling_params
         # Set by PenaltyStatusPool.alloc; the params do not change after admission.
         self.uses_penalty = False
-        # Row in the scheduler's PenaltyStatusPool; a retraction keeps it.
+        # Index in the scheduler's PenaltyStatusPool; a retraction keeps it.
         self.penalty_index: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.

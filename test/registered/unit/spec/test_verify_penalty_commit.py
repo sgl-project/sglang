@@ -54,8 +54,8 @@ class TestVerifyPenaltyCommit(CustomTestCase):
             _req(3, frequency_penalty=1.0),
         ]
         for req in self.reqs:
-            self.pool.alloc(req)
-            self.pool.reset_history(req)
+            self.pool.alloc([req])
+            self.pool.reset_history([req])
 
     def _counts(self):
         additive, _ = _info(self.reqs, self.pool).step_penalties.logit_penalties()

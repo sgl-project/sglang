@@ -141,7 +141,7 @@ class TestRelease(CustomTestCase):
         self.assertEqual(calls, [False])
 
 
-class TestPenaltyRowExit(CustomTestCase):
+class TestPenaltyIndexExit(CustomTestCase):
     def _penalized(self, finished_reason):
         retirer = release_only_retirer(MagicMock())
         retirer.send_abort_output = lambda abort_req, req: None
@@ -149,24 +149,24 @@ class TestPenaltyRowExit(CustomTestCase):
         req.penalty_index = None
         req.sampling_params = SamplingParams(presence_penalty=1.0)
         req.output_ids = []
-        retirer.penalty_status_pool.alloc(req)
+        retirer.penalty_status_pool.alloc([req])
         return retirer, req
 
-    def test_release_frees_the_row(self):
+    def test_release_frees_the_index(self):
         retirer, req = self._penalized(FINISH_LENGTH(length=0))
         with patch.object(request_retirer, "release_kv_cache"):
             retirer.release(req, checkpoint=False)
         self.assertIsNone(req.penalty_index)
-        self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
+        self.assertEqual(retirer.penalty_status_pool.num_indices, 0)
 
-    def test_abort_retracted_frees_the_row(self):
+    def test_abort_retracted_frees_the_index(self):
         # A retracted request holds no KV but keeps its row.
         retirer, req = self._penalized(FINISH_ABORT())
         req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         with patch.object(request_retirer, "make_abort_req"):
             retirer.abort_retracted(req, reason=FINISH_ABORT())
         self.assertIsNone(req.penalty_index)
-        self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
+        self.assertEqual(retirer.penalty_status_pool.num_indices, 0)
 
 
 class TestTakeOutWithoutRelease(CustomTestCase):
