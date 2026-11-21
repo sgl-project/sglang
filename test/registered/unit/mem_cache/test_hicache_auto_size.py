@@ -313,6 +313,31 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertEqual([name for name, _, _ in calls.mock_calls], ["free", "barrier"])
         calls.barrier.assert_called_once_with(group="cpu")
 
+    def test_explicit_size_on_a_lone_rank_still_sees_other_replicas_pools(self):
+        """A lone rank samples per pool and takes no collective, so another replica's pins stay visible."""
+        host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000}
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(rocm_budget, "is_hip", return_value=True),
+            patch.object(rocm_budget, "rocm_pinnable_share_bytes", return_value=None),
+            patch.object(
+                base, "available_host_memory_bytes", lambda **_: host_free["bytes"]
+            ),
+            patch.object(torch.distributed, "barrier") as barrier,
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
+        ):
+            self.assertIsNone(base._host_memory_budget.get())
+            self.assertEqual(base.host_memory_preflight([200]).available_bytes, 1000)
+            # Another replica pins 600 bytes after this rank's first pool was checked.
+            host_free["bytes"] -= 600
+            self.assertEqual(base.host_memory_preflight([600]), (600, 400))
+        barrier.assert_not_called()
+
     def test_explicit_size_is_a_no_op_off_rocm(self):
         """Off ROCm an explicit size keeps per-pool sampling and resolves nothing:
         no snapshot, no collective, no allocator or KV pool lookup."""
