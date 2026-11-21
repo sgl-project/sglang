@@ -2884,6 +2884,26 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(delayer.calls, [True])
         self.assertIn(req, adder.can_run_list)
 
+    def test_delay_verdict_does_not_hold_back_requests_when_pass_prefills(self):
+        """A delay verdict only saves a forward when nothing prefills this pass.
+        A continuing chunk runs regardless, so a queued request that fits must
+        join it instead of sitting out the delayer's passes."""
+        delayer = _RecordingDelayer(allow=False)
+        adder = self._create_delayer_adder(
+            available_tokens=100_000, delayer=delayer, rem_chunk_tokens=500
+        )
+        chunk = self._create_delayer_req(200, rid="chunk")
+        self.assertIsNone(adder.add_chunked_req(chunk))
+        req = self._create_delayer_req(50, rid="short")
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [chunk, req])
+        self.assertEqual(delayer.calls, [True])
+
     def _create_delayer_adder(self, *, available_tokens, delayer, **kwargs):
         self.mock_token_allocator.available_size.return_value = available_tokens
         self.mock_token_allocator.full_available_size.return_value = available_tokens

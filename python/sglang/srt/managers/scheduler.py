@@ -4552,7 +4552,16 @@ class Scheduler(
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
-        if self.prefill_delayer:
+        if self.prefill_delayer and not (
+            self.prefill_delayer.attn_dp_enabled
+            or self.waiting_queue
+            or self.chunked_req is not None
+            or self.grammar_manager.has_waiting_grammars()
+        ):
+            # Nothing can prefill on any rank (no attention DP: all ranks see the same
+            # queue), so the verdict is "none" everywhere: skip the all-gather.
+            self.prefill_delayer._curr_state = None
+        elif self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -4566,9 +4575,12 @@ class Scheduler(
             running_batch=running_batch,
         )
 
-        if self.prefill_delayer:
+        if prefill_delayer_single_pass is not None:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
-                actual_prefill_bs=ret.batch_size() if ret is not None else 0
+                # a mixed batch's decoding requests are not prefills
+                actual_prefill_bs=ret.batch_size() - len(ret.decoding_reqs or ())
+                if ret is not None
+                else 0
             )
             if observed_prefill_bs > 0:
                 self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(

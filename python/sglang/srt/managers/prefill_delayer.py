@@ -193,6 +193,9 @@ class PrefillDelayer:
                 and (time.perf_counter() - prev_state.start_time) * 1000.0
                 >= self._max_delay_ms
             ),
+            # Without attention DP every TP rank sees the same queue, so the rows agree;
+            # only an ongoing wait (timed by each rank's own clock) needs the gather.
+            local_only=prev_state is None and not self.attn_dp_enabled,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
@@ -359,6 +362,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
         queue_timeout_expired: bool = False,
+        local_only: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -372,6 +376,8 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
+        if local_only:
+            return local_info[None]
         all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,
