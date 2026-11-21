@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ class _ForkTestWorker:
     def __init__(self, preload_modules: List[str]):
         result_read_fd, result_write_fd = os.pipe()
         worker_path = os.path.join(os.path.dirname(__file__), "fork_test_worker.py")
-        cmd = ["python3", worker_path, "--result-fd", str(result_write_fd)]
+        cmd = [sys.executable, worker_path, "--result-fd", str(result_write_fd)]
         if preload_modules:
             cmd += ["--preload", *preload_modules]
         self.process = subprocess.Popen(
@@ -290,7 +291,7 @@ def run_unittest_files(
 
             full_path = os.path.join(os.getcwd(), filename)
             logger.info(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {full_path}\n.\n.\n"
+                f".\n.\nBegin ({i}/{len(files) - 1}):\n{sys.executable} {full_path}\n.\n.\n"
             )
             file_tic = time.perf_counter()
 
@@ -311,7 +312,7 @@ def run_unittest_files(
                 elapsed = time.perf_counter() - file_tic
             elif capture_output:
                 # Capture output for retry decision
-                cmd = ["python3", full_path, "-f"]
+                cmd = [sys.executable, full_path, "-f"]
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -333,7 +334,7 @@ def run_unittest_files(
                 # Bounded wait for the reader to finish.
                 reader_thread.join(timeout=60)
             else:
-                cmd = ["python3", full_path, "-f"]
+                cmd = [sys.executable, full_path, "-f"]
                 process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
 
