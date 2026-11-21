@@ -31,7 +31,14 @@ python3 -m sglang.launch_server \
 
 ## Example Configuration File
 
-Depending on the algorithm selected, the configuration parameters vary.
+The supported keys in `--dllm-algorithm-config` depend on the selected algorithm.
+Unknown keys cause an error at startup. The error also lists the supported keys.
+This check also covers keys inside Gemma4Renoise's `sampler_config`,
+`temperature_schedule`, and `stopping_config` sections.
+
+All algorithms accept `block_size`. Only Gemma4Renoise accepts
+`capture_input_preparation`, which defaults to `true`. Set it to `false` to
+exclude input preparation from the CUDA graph.
 
 LowConfidence Config:
 
@@ -64,6 +71,21 @@ max_post_edit_steps: 16
 # An empirical value of 3 is often sufficient to mitigate most repetitions.
 penalty_lambda: 0
 ```
+
+JointThreshold also accepts `vectorized_decoding`. It defaults to `true` on
+Ascend NPU and `false` on other platforms. Set it to `true` to process the batch
+together instead of each row separately.
+
+JointThresholdInDel Config:
+
+```yaml Config
+block_size: 32
+threshold: 0.5
+edit_threshold: 0.0
+max_post_edit_steps: 16
+```
+
+JointThresholdInDel does not accept `penalty_lambda` or `vectorized_decoding`.
 
 ## Example Client Code Snippet
 
