@@ -4815,6 +4815,32 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def apply_deepseek_v4_rocm_defaults() -> None:
+    """Turn on the ROCm kernel toggles DeepSeek-V4 weights are post-processed for."""
+    # Process-wide and idempotent. The DSpark draft calls this too, since an external
+    # target that replaces DeepseekV4ForCausalLM does not.
+    if not _is_hip:
+        return
+    from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
+    from sglang.srt.layers.quantization.fp8_utils import (
+        set_dense_mxscale,
+        set_force_ck_w8a8,
+    )
+
+    set_force_ck_w8a8(True)
+    set_batched_rope(True)
+    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
+    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
+    from sglang.srt.models.deepseek_common.amd.aiter_intree_tune import (
+        install_aiter_intree_tune,
+    )
+
+    install_aiter_intree_tune()
+    if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
+        set_dense_mxscale(True)
+
+
 def _v41_vision_a2a_supported() -> bool:
     backend = get_moe_a2a_backend()
     return backend.is_none() or (_is_cuda and backend.is_megamoe())
@@ -4838,28 +4864,7 @@ class DeepseekV4ForCausalLM(
         prefix: str = "",
     ) -> None:
         super().__init__()
-        # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
-        # batched/contiguous-load rope kernels (faster on gfx95; .
-        # Module-level toggles default OFF; flipped True here for DSV4
-        if _is_hip:
-            from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
-            from sglang.srt.layers.quantization.fp8_utils import (
-                set_dense_mxscale,
-                set_force_ck_w8a8,
-            )
-
-            set_force_ck_w8a8(True)
-            set_batched_rope(True)
-            # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
-            # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
-            # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
-            from sglang.srt.models.deepseek_common.amd.aiter_intree_tune import (
-                install_aiter_intree_tune,
-            )
-
-            install_aiter_intree_tune()
-            if envs.SGLANG_DSV4_DENSE_MXSCALE.get():
-                set_dense_mxscale(True)
+        apply_deepseek_v4_rocm_defaults()
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config

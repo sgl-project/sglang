@@ -54,6 +54,7 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
+    apply_deepseek_v4_rocm_defaults,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -706,6 +707,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Before the linears are built: their weight post-process reads these toggles.
+        apply_deepseek_v4_rocm_defaults()
         self.config = config
         self.quant_config = quant_config
         self.num_fused_shared_experts = get_num_fused_shared_experts()

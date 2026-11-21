@@ -136,6 +136,21 @@ class _SupportsDSparkTargetHiddenProjection(Protocol):
     ) -> bool: ...
 
 
+@runtime_checkable
+class DSparkSharedModulesProvider(Protocol):
+    """A target, e.g. one from an external model package, that hands the DSpark
+    draft its vocabulary modules instead of exposing `lm_head` /
+    `get_input_embeddings`.
+
+    Both modules must carry the raw vocab `weight`; the draft reads the weights
+    directly, so any target-only postprocessing in their `forward` is skipped.
+    """
+
+    def get_dspark_shared_modules(
+        self,
+    ) -> tuple[torch.nn.Module, torch.nn.Module]: ...
+
+
 def _configure_target_hidden_projection(
     *, target_model, draft_model, is_deepseek_v4_draft: bool
 ) -> bool:
@@ -317,16 +332,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            embed_tokens, lm_head = self._resolve_target_dspark_modules(target_model)
+            lm_head = unwrap_lora_layer(lm_head)
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
-                    "DSpark requires the target model to expose `lm_head` with `weight`."
+                    f"DSpark requires {type(target_model).__name__} to expose an "
+                    "lm_head with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=unwrap_lora_layer(
-                    self._resolve_target_embed_tokens(target_model)
-                ),
-                lm_head=lm_head,
+                embed_tokens=unwrap_lora_layer(embed_tokens), lm_head=lm_head
             )
         self._target_hidden_projection_enabled = False
 
@@ -605,6 +619,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _resolve_target_dspark_modules(self, target_model):
+        """Return the target's (embed_tokens, lm_head) for the draft to share."""
+        if isinstance(target_model, DSparkSharedModulesProvider):
+            modules = target_model.get_dspark_shared_modules()
+            if not isinstance(modules, tuple) or len(modules) != 2:
+                raise RuntimeError(
+                    f"{type(target_model).__name__}.get_dspark_shared_modules() "
+                    "must return (embed_tokens, lm_head)."
+                )
+            return modules
+        return (
+            self._resolve_target_embed_tokens(target_model),
+            getattr(target_model, "lm_head", None),
+        )
 
     @property
     def carries_confidence(self) -> bool:
