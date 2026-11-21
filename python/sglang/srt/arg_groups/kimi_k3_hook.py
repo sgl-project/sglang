@@ -3,7 +3,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.runtime_context import get_platform
 
@@ -52,6 +56,45 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             "Kimi hybrid DSPARK: defaulting "
             "--speculative-draft-attention-backend to trtllm_mha."
         )
+
+    # A target attention backend that declared NonCausalDraftAttention also runs the
+    # DSpark draft (8 Q / 2 KV heads, head dim 64, no window) where it declares itself
+    # the default (aiter: gfx950 only); elsewhere the draft keeps triton.
+    if (
+        cfg.speculative_algorithm == "DSPARK"
+        and cfg.speculative_draft_attention_backend is None
+    ):
+        from sglang.srt.layers.attention.attention_registry import (
+            NONCAUSAL_DRAFT_ATTENTION_BACKENDS,
+        )
+
+        target_backend = attention_backends_of(resolved_view(server_args))[0]
+        noncausal_draft = NONCAUSAL_DRAFT_ATTENTION_BACKENDS.get(target_backend)
+        if noncausal_draft is not None and noncausal_draft.default_on_this_device():
+            reject_reason = noncausal_draft.reject_reason(
+                draft_is_mla=False,
+                draft_has_sliding_window=False,
+                enable_unified_memory=cfg.enable_unified_memory,
+                enable_deterministic_inference=cfg.enable_deterministic_inference,
+            )
+            if reject_reason is None:
+                declare_resolution(
+                    server_args,
+                    "apply_kimi_k3_spec_backend_defaults",
+                    speculative_draft_attention_backend=target_backend,
+                )
+                logger.info(
+                    "Kimi hybrid DSPARK: defaulting "
+                    "--speculative-draft-attention-backend to %s.",
+                    target_backend,
+                )
+            else:
+                logger.info(
+                    "Kimi hybrid DSPARK: the draft keeps the triton attention "
+                    "backend because %s cannot run it: %s.",
+                    target_backend,
+                    reject_reason,
+                )
 
 
 def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:

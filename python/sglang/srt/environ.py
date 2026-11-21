@@ -677,6 +677,8 @@ class Envs:
     # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
     # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
+    # Attention (aiter, ROCm): route topk=1 non-MLA target_verify through unified_attention.
+    SGLANG_AITER_UNIFIED_VERIFY = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so

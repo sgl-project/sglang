@@ -1913,6 +1913,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_UNIFIED_VERIFY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With unified attention on, run topk=1 non-MLA target verify through AITER <code>unified_attention</code>; <code>0</code>/<code>false</code> keeps the triton extend kernel, and a DSpark draft named onto aiter then refuses to start. <code>yes</code>/<code>y</code> and <code>no</code>/<code>n</code> also parse; any other value, empty or <code>off</code> included, warns and keeps the default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_FP8_PER_TOKEN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use AITER FP8 per-token quantization.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
