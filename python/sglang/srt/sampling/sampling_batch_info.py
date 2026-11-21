@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
+import sglang.srt.sampling.penalties as penalties
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
@@ -22,7 +22,6 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.interface import (
     WatermarkRows,
@@ -113,7 +112,9 @@ def apply_acc_penalties(logits: torch.Tensor, info, rows_per_request: int = 1):
     if info.acc_additive_penalties is not None:
         by_request.add_(info.acc_additive_penalties[:, None, :])
     if info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(by_request, info.acc_scaling_penalties[:, None, :])
+        penalties.apply_scaling_penalties(
+            by_request, info.acc_scaling_penalties[:, None, :]
+        )
 
 
 @dataclasses.dataclass
@@ -155,7 +156,7 @@ class SamplingBatchInfo:
     grammar_mask: Optional[GrammarMask] = None
 
     # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+    penalizer_orchestrator: Optional[penalties.BatchedPenalizerOrchestrator] = None
     acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
@@ -339,14 +340,14 @@ class SamplingBatchInfo:
         # While we can choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+        penalizer_orchestrator = penalties.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
             penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
+                penalties.BatchedFrequencyPenalizer,
+                penalties.BatchedMinNewTokensPenalizer,
+                penalties.BatchedPresencePenalizer,
+                penalties.BatchedRepetitionPenalizer,
             },
         )
 
