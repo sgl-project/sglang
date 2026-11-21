@@ -76,11 +76,16 @@ def _covered(
     **kwargs,
 ) -> bool:
     num_heads = q.shape[2] if q.ndim == 4 else 0
+    track_ssm_h_src = kwargs.get("track_ssm_h_src")
     return (
         # spec-decode extends stay on the reference path, as in kda_gfx950_prefill
         not kwargs.get("is_spec_decode", False)
-        # the kernel writes only the final state per sequence
-        and not return_intermediate_states
+        # the kernel has no per-chunk h; aligned-only tracking (empty track_ssm_h_src)
+        # reads the final state instead, so only an interior boundary is uncovered
+        and not (
+            return_intermediate_states
+            and (track_ssm_h_src is None or track_ssm_h_src.numel() > 0)
+        )
         and kwargs.get("track_state") is None
         # breakable prefill CUDA graphs pass padded chunk tables; the walk syncs
         and kwargs.get("chunk_indices") is None
@@ -121,7 +126,7 @@ def extend(
     beta_is_raw: bool = False,
     return_intermediate_states: bool = False,
     **kwargs,
-) -> torch.Tensor | None:
+) -> torch.Tensor | tuple[torch.Tensor, None] | None:
     """``TritonKDAKernel.extend`` on AITER Gluon chunk_kda, or None when not covered.
 
     Gathers the ``cache_indices`` rows of ``ssm_states`` (bf16 or fp32) into the
@@ -176,4 +181,4 @@ def extend(
         torch.where(valid.flatten(), slots, slots.index_select(0, live)),
         torch.where(valid, written, written.index_select(0, live)),
     )
-    return out
+    return (out, None) if return_intermediate_states else out

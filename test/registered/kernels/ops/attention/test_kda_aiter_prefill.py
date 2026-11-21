@@ -205,11 +205,41 @@ class TestAiterKDAPrefill(CustomTestCase):
                 )
 
     @torch.inference_mode()
+    def test_aligned_only_tracking_returns_none_h(self):
+        """Empty track_ssm_h_src needs only the final state: run AITER and return (out, None)."""
+        inputs = _inputs((193, 137), torch.bfloat16)
+        actual_inputs, expected_inputs = _clone(inputs), _clone(inputs)
+        expected = _reference(expected_inputs)
+        result = kda_aiter_prefill.extend(
+            *_args(actual_inputs),
+            **_kwargs(
+                actual_inputs,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.empty(0, device="cuda", dtype=torch.int64),
+            ),
+        )
+        self.assertIsInstance(result, tuple)
+        out, h = result
+        self.assertIsNone(h)
+        self.assertLess(_rms_ratio(out, expected), 1e-2)
+        rows = inputs["cache_indices"].long()
+        self.assertLess(
+            _rms_ratio(
+                actual_inputs["ssm_states"][rows], expected_inputs["ssm_states"][rows]
+            ),
+            1e-2,
+        )
+
+    @torch.inference_mode()
     def test_uncovered_inputs_fall_back(self):
         inputs = _inputs((193, 137), torch.bfloat16)
         args = _args(inputs)
         for overrides in (
             {"return_intermediate_states": True},
+            {
+                "return_intermediate_states": True,
+                "track_ssm_h_src": torch.tensor([1], device="cuda"),
+            },
             {"track_state": torch.zeros(2, 12, 128, 128, device="cuda")},
             {"chunk_indices": torch.zeros(1, 2, device="cuda", dtype=torch.int32)},
             {"lower_bound": None},
