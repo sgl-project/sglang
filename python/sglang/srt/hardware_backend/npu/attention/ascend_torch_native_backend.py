@@ -74,6 +74,7 @@ class AscendTorchNativeAttnBackend:
         full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -107,6 +108,7 @@ class AscendTorchNativeAttnBackend:
         query = query.movedim(0, query.dim() - 2)
 
         start_q, start_kv = 0, 0
+        mask_offset = 0  # running offset into packed cross_attention_custom_mask
         for seq_idx in range(seq_lens.shape[0]):
             # Need optimize the performance later.
 
@@ -177,6 +179,60 @@ class AscendTorchNativeAttnBackend:
                 # scaled_dot_product_attention() expects query, key, and value to have the same dtype
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
+
+            if is_cross_attention:
+                # Cross-attention: query = new text tokens (extend_seq_len rows,
+                # unpadded), key/value = encoder (vision) tokens (encoder_len).
+                # Q and KV lengths legitimately differ, so the padded
+                # per_req_query_redundant / causal-mask self-attention path does
+                # not apply. An optional frame-level custom mask
+                # (cross_attention_custom_mask, packed [extend*encoder] per req)
+                # controls which vision tokens each text token may attend to —
+                # required for correct multi-turn, multi-image cross-attention.
+                per_req_attn_mask = None
+                if cross_attention_custom_mask is not None:
+                    kv_len = per_req_key.shape[1]  # = encoder_len
+                    q_len_r = extend_seq_len_q
+                    mask_slice = cross_attention_custom_mask[
+                        mask_offset : mask_offset + q_len_r * kv_len
+                    ].reshape(q_len_r, kv_len)
+                    # Packed mask: 1=visible, 0=masked. sdpa bool mask:
+                    # True=visible, False=masked.
+                    per_req_attn_mask = mask_slice.bool().unsqueeze(0).unsqueeze(0)
+                    mask_offset += q_len_r * kv_len
+
+                if logit_cap > 0:
+                    per_req_out = (
+                        self.scaled_dot_product_attention_with_softcapping(
+                            per_req_query.unsqueeze(0),
+                            per_req_key.unsqueeze(0),
+                            per_req_value.unsqueeze(0),
+                            enable_gqa=enable_gqa,
+                            scale=scaling,
+                            is_causal=False,
+                            logit_cap=logit_cap,
+                            logit_capping_method=logit_capping_method,
+                        )
+                        .squeeze(0)
+                        .movedim(query.dim() - 2, 0)
+                    )
+                else:
+                    per_req_out = (
+                        scaled_dot_product_attention(
+                            per_req_query.unsqueeze(0),
+                            per_req_key.unsqueeze(0),
+                            per_req_value.unsqueeze(0),
+                            enable_gqa=enable_gqa,
+                            scale=scaling,
+                            is_causal=False,
+                            attn_mask=per_req_attn_mask,
+                        )
+                        .squeeze(0)
+                        .movedim(query.dim() - 2, 0)
+                    )
+                output[start_q:end_q, :, :] = per_req_out
+                start_q, start_kv = end_q, end_kv
+                continue
 
             if logit_cap > 0:
                 per_req_out_redundant = (
