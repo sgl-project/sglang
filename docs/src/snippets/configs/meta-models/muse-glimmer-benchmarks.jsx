@@ -4,10 +4,10 @@ export const benchmarks = [
   { match: { hw: "rtx5090", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" } },
   { match: { hw: "rtx5090", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
 
-  { match: { hw: "rtx6000", variant: "default", quant: "bf16",  strategy: "standard", nodes: "single" } },
-  { match: { hw: "rtx6000", variant: "default", quant: "bf16",  strategy: "dflash",   nodes: "single" } },
-  { match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" } },
-  { match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
+  { match: { hw: "rtxpro6000", variant: "default", quant: "bf16",  strategy: "standard", nodes: "single" } },
+  { match: { hw: "rtxpro6000", variant: "default", quant: "bf16",  strategy: "dflash",   nodes: "single" } },
+  { match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" } },
+  { match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "dflash",   nodes: "single" } },
 
   { match: { hw: "h200",    variant: "default", quant: "bf16",  strategy: "standard", nodes: "single" } },
   { match: { hw: "h200",    variant: "default", quant: "bf16",  strategy: "dflash",   nodes: "single" } },

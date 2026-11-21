@@ -28,13 +28,13 @@
 export const config = {
   modelName: "MiniCPM5-2B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark"],
+  supportedHardware: ["h200", "rtxpro6000", "rtx5090", "dgx-spark"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell workstation + desktop) are not
   // datacenter parts, so the shared HARDWARE_CATALOG in _deployment.jsx does not
   // carry them. Ids/labels match the DeepSeek-V4 and Qwen3.8-27B configs.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
@@ -109,7 +109,7 @@ export const config = {
   // worker) ships in the SGLang dev image.
   dockerImages: {
     h200:    "lmsysorg/sglang:dev",
-    rtx6000: "lmsysorg/sglang:dev",
+    rtxpro6000: "lmsysorg/sglang:dev",
     rtx5090: "lmsysorg/sglang:dev",
     "dgx-spark": "lmsysorg/sglang:dev",
   },
@@ -176,7 +176,7 @@ export const config = {
       // with NO `verified: true` baseline: the boolean is what the Playground
       // reads for its own badge, so leaving it on would make the Playground
       // claim "Verified" while the Deploy panel says the round is in progress.
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "bf16", nodes: "single" },
       // Flat string, not a predicate: this cell is in-progress with or without
       // the DSPARK overlay, so there is nothing for the selection to switch on.
       verificationStatus: "in-progress",

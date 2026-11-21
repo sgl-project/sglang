@@ -1,14 +1,14 @@
 export const config = {
   modelName: "Muse Glimmer",
 
-  supportedHardware: ["b200", "h200", "rtx5090", "rtx6000", "dgx-spark", "mac"],
+  supportedHardware: ["b200", "h200", "rtx5090", "rtxpro6000", "dgx-spark", "mac"],
 
   hardware: [
     // RTX 5090 and RTX PRO 6000 are Blackwell-generation but not in the shared
     // HARDWARE_CATALOG (consumer/workstation cards, not the datacenter SKUs
     // that catalog covers), so they need a local vendor override here.
     { id: "rtx5090",   label: "RTX 5090",     vram: "32GB",  vendor: "blackwell" },
-    { id: "rtx6000",   label: "RTX PRO 6000", vram: "96GB",  vendor: "blackwell" },
+    { id: "rtxpro6000",   label: "RTX PRO 6000", vram: "96GB",  vendor: "blackwell" },
     // dgx-spark is NOT listed here -- it's already in the shared
     // HARDWARE_CATALOG under blackwell (with its multi-node docker flags),
     // so this model just inherits that entry.
@@ -105,7 +105,7 @@ export const config = {
     b200:    "lmsysorg/sglang:dev-muse-glimmer",
     h200:    "lmsysorg/sglang:dev-muse-glimmer",
     rtx5090: "lmsysorg/sglang:dev-muse-glimmer",
-    rtx6000: "lmsysorg/sglang:dev-muse-glimmer",
+    rtxpro6000: "lmsysorg/sglang:dev-muse-glimmer",
     // GB10 needs an aarch64 manifest under this tag to resolve natively
     "dgx-spark": "lmsysorg/sglang:dev-muse-glimmer",
   },
@@ -221,7 +221,7 @@ export const config = {
     },
 
     {
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -234,7 +234,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -249,7 +249,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -273,7 +273,7 @@ export const config = {
     // re-benchmarked on this SKU, but the mechanism (dynamically quantizing
     // the draft's bf16 linears to fp8 at load time) is hardware-independent.
     {
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "dflash", nodes: "single" },
       verified: true,
       env: [],
       flags: [

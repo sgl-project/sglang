@@ -15,7 +15,7 @@
 export const config = {
   modelName: "Qwen3.8-27B",
 
-  supportedHardware: ["h200", "rtx6000", "rtx5090", "dgx-spark", "gb300", "xeon"],
+  supportedHardware: ["h200", "rtxpro6000", "rtx5090", "dgx-spark", "gb300", "xeon"],
 
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs, so they are not in the shared catalog.
@@ -23,7 +23,7 @@ export const config = {
   // DGX Spark needs no entry here: it is already in the shared catalog
   // (_deployment.jsx HARDWARE_CATALOG), with its multi-node Docker flags.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
     { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
   ],
@@ -102,7 +102,7 @@ export const config = {
             // exercised; it moves the D intermediate SSM states onto a fixed
             // ring (ratio computed with D=0) and is what makes MTP fit 32GB.
             // h200 (SM90) and gb300 (SM103) keep the plain MTP recipe.
-            ...(["rtx5090", "rtx6000", "dgx-spark"].includes(sel.hw)
+            ...(["rtx5090", "rtxpro6000", "dgx-spark"].includes(sel.hw)
               ? ["--enable-linear-replayssm-spec"]
               : []),
             // Measured on the 5090 on v0.5.19: fp32 serves at 0.94,
@@ -389,7 +389,7 @@ export const config = {
 
   dockerImages: {
     h200:    "lmsysorg/sglang:latest",
-    rtx6000: "lmsysorg/sglang:latest",
+    rtxpro6000: "lmsysorg/sglang:latest",
     rtx5090: "lmsysorg/sglang:latest",
     "dgx-spark": "lmsysorg/sglang:latest",
     gb300:   "lmsysorg/sglang:latest",
@@ -585,7 +585,7 @@ export const config = {
     {
       // The page's headline recipe: NVFP4 W4A4 on the 96GB workstation card,
       // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4-bf16-head", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -606,7 +606,7 @@ export const config = {
       // so anything that fits the bf16 head fits here with room to spare.
       // The page's headline recipe: NVFP4 W4A4 on the 96GB workstation card,
       // ~16.5GB of weights, fp8 KV auto-enabled by the checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4-fp4-head", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -628,7 +628,7 @@ export const config = {
       // Re-measured against this export on v0.5.19: all 16 overlay
       // combinations (spec x tier x state dtype) serve at these pins and score
       // 94.01-95.00% on the full 1319-question GSM8K.
-      match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4-nvidia", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -646,7 +646,7 @@ export const config = {
     },
     {
       // FP8 blockwise, ~28.5GB of weights — comfortable on 96GB.
-      match: { hw: "rtx6000", variant: "default", quant: "fp8", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "fp8", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -664,7 +664,7 @@ export const config = {
     },
     {
       // BF16, the reference checkpoint.
-      match: { hw: "rtx6000", variant: "default", quant: "bf16", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "default", quant: "bf16", nodes: "single" },
       verified: true,
       env: [],
       flags: [

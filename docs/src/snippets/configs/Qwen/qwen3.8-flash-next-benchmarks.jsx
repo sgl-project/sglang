@@ -198,7 +198,7 @@ export const benchmarks = [
   // is one fifth of it (1024 in / 256 out, range ratio 1, ignore_eos).
   // AIME26 and MMMU-Pro not run.
   {
-    match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 4ccff141db",
     accuracy: { gsm8k_pct: 96.9 },
     speed: [
@@ -209,7 +209,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "rtx6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 4ccff141db",
     accuracy: { gsm8k_pct: 96.9 },
     speed: [
@@ -223,7 +223,7 @@ export const benchmarks = [
   },
   // nvidia/Qwen3.8-Flash-Next-NVFP4 on the same card and image.
   {
-    match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+    match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 4ccff141db",
     accuracy: { gsm8k_pct: 97.3 },
     speed: [
@@ -234,7 +234,7 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "rtx6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "rtxpro6000", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
     sglang_version: "dev-qwen38-next-local image @ 4ccff141db",
     accuracy: { gsm8k_pct: 97.0 },
     speed: [
