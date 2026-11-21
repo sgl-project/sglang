@@ -19,9 +19,12 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.selector import TopKSelector
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +44,10 @@ FLOOR_TOLERANCE = 2**-5
 # A tail table is a different DeepGEMM row set: its row pairing moves boundary
 # scores as well.
 MIN_TAIL_OVERLAP = 0.98
+
+
+def sgl_kernel_selector() -> TopKSelector:
+    return TopKSelector(DSATopKBackend.SGL_KERNEL)
 
 
 class Case(NamedTuple):
@@ -223,7 +230,7 @@ def reference_blocks(case: Case) -> torch.Tensor:
     return keep[:, :num_blocks]
 
 
-def publish_sparse(case: Case, row_shard=None):
+def publish_sparse(case: Case, row_shard=None, selector=None):
     """(the DeepGEMM sparse table, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         publish_prefill_table,
@@ -237,6 +244,7 @@ def publish_sparse(case: Case, row_shard=None):
         index_page_size=PAGE,
         topk_blocks=TOPK_BLOCKS,
         out_positions=own,
+        selector=selector or sgl_kernel_selector(),
         row_shard=row_shard,
     )
     return table, own
@@ -296,35 +304,43 @@ def on_every_rank(world: int, num_rows: int, run, replicated):
     return [run(shard(rank, _ReplayShares(captures))) for rank in range(world)]
 
 
-def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
+def select_sparse(
+    table, data: DeepGEMMPrefillData, k_cache: torch.Tensor, selector=None
+):
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         select_prefill_table,
     )
 
     positions = data.empty_selection(TOPK)
     select_prefill_table(
-        table=table, data=data, k_cache=k_cache, out_positions=positions
+        table=table,
+        data=data,
+        k_cache=k_cache,
+        out_positions=positions,
+        selector=selector or sgl_kernel_selector(),
     )
     return positions
 
 
-def publish_dense(case: Case):
+def publish_dense(case: Case, selector=None):
     """(the CP implementation's block ids, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         _publish_prefill_blocks,
     )
 
+    selector = selector or sgl_kernel_selector()
     own, blocks = _publish_prefill_blocks(
         data=case.data,
         kv=case.kv,
         topk=TOPK,
         topk_blocks=TOPK_BLOCKS,
         block_size=BLOCK,
+        selector=selector,
     )
-    return blocks, own
+    return selector.order_candidates(blocks), own
 
 
-def select_dense(blocks, case: Case):
+def select_dense(blocks, case: Case, selector=None):
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         _consume_prefill_blocks,
     )
@@ -335,6 +351,7 @@ def select_dense(blocks, case: Case):
         topk=TOPK,
         blocks=blocks,
         block_size=BLOCK,
+        topk_op=(selector or sgl_kernel_selector()).dense,
     )
 
 
@@ -410,10 +427,29 @@ class TestPrefillSparseIndexer(CustomTestCase):
         """The published blocks equal `select_candidate_block_ids` block for block
         (ragged lengths, an empty row, block counts above and below 2048), and the
         source's own top-k from the same tiled pass is the dense one."""
+        self.check_publish_prefill(sgl_kernel_selector())
+
+    @torch.inference_mode()
+    def test_select_prefill_matches_the_dense_implementation(self):
+        """A consumer scoring its blocks sparsely picks what the dense
+        implementation picks from the same inputs, up to bf16 rounding at the
+        selection floor, and never a position outside its blocks."""
+        self.check_select_prefill(sgl_kernel_selector())
+
+    @torch.inference_mode()
+    def test_flashinfer_publish_and_select_prefill(self):
+        """Both protocol checks under FlashInfer's top-k, with the index tie-break
+        that makes the sparse and dense passes pick alike."""
+        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"):
+            selector = TopKSelector(DSATopKBackend.FLASHINFER)
+            self.check_publish_prefill(selector)
+            self.check_select_prefill(selector)
+
+    def check_publish_prefill(self, selector):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows + ctx)
-                table, own = publish_sparse(case)
+                table, own = publish_sparse(case, selector=selector)
                 expected = reference_blocks(case)
                 nb = expected.shape[1]
                 # INT32_MAX padding lands in a spare column instead of a block
@@ -428,21 +464,17 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 differ = got ^ expected
                 self.assertTrue((~differ | (scores == floor)).all())
                 self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
-                _, own_dense = publish_dense(case)
+                _, own_dense = publish_dense(case, selector)
                 for r in range(rows):
                     self.assertEqual(picks(own, r), picks(own_dense, r), r)
 
-    @torch.inference_mode()
-    def test_select_prefill_matches_the_dense_implementation(self):
-        """A consumer scoring its blocks sparsely picks what the dense
-        implementation picks from the same inputs, up to bf16 rounding at the
-        selection floor, and never a position outside its blocks."""
+    def check_select_prefill(self, selector):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows * 3 + ctx)
-                table = publish_sparse(case)[0]
-                got = select_sparse(table, case.data, case.k_cache)
-                want = select_dense(publish_dense(case)[0], case)
+                table = publish_sparse(case, selector=selector)[0]
+                got = select_sparse(table, case.data, case.k_cache, selector)
+                want = select_dense(publish_dense(case, selector)[0], case, selector)
                 nb = -(-case.dense.shape[1] // BLOCK)
                 keep = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
                 keep.scatter_(1, table.blocks.clamp_max(nb).long(), True)
@@ -631,12 +663,19 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 with self.subTest(rows=rows, world=world):
                     case = make_case(rows, ctx, seed=rows * 5 + ctx)
                     expected = case.data.empty_selection(TOPK)
-                    dense_prefill_topk(case.data, case.kv, out=expected)
+                    selector = sgl_kernel_selector()
+                    dense_prefill_topk(
+                        case.data, case.kv, out=expected, selector=selector
+                    )
 
                     def run(shard):
                         out = case.data.empty_selection(TOPK)
                         sharded_dense_prefill_topk(
-                            case.data, case.kv, out=out, shard=shard
+                            case.data,
+                            case.kv,
+                            out=out,
+                            shard=shard,
+                            selector=selector,
                         )
                         return out
 

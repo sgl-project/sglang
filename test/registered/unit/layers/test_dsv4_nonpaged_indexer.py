@@ -2,7 +2,7 @@ import sys
 import unittest
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     iter_row_chunks,
     plan_indexer_row_chunks,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer import TopKSelector
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_budget_bytes,
@@ -222,6 +223,214 @@ class TestDSV4FlashInferTopK(CustomTestCase):
                         "out_raw_indices": out_raw_indices,
                     },
                 )
+
+
+class TestDSV41FlashInferTopK(CustomTestCase):
+    @staticmethod
+    def _fake_flashinfer():
+        def top_k(input, k, **kwargs):
+            values, indices = torch.topk(input, k, dim=-1)
+            if kwargs["sorted"]:
+                return values, indices
+            # Ascending, so a caller that needs descending order has to sort.
+            return values.flip(-1), indices.flip(-1)
+
+        def page_table_transform(input, table, lengths, k, **kwargs):
+            kwargs["out"].fill_(0)
+            if kwargs["out_raw_indices"] is not None:
+                kwargs["out_raw_indices"].fill_(0)
+            return kwargs["out"]
+
+        return SimpleNamespace(
+            top_k=MagicMock(side_effect=top_k),
+            top_k_page_table_transform=MagicMock(side_effect=page_table_transform),
+        )
+
+    def test_flashinfer_modes_reach_every_selection(self):
+        """Every V4.1 selection hands FlashInfer the deterministic and tie-break
+        modes, the graph-safe path and its page size (a zero page spanning the row
+        for plain positions), and never asks top_k to sort, which its graph-safe
+        CUB path cannot."""
+        scores = torch.randn(2, 96)
+        lens = torch.tensor([40, 96], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            compressed_seq_lens=lens,
+            page_table=torch.tensor([[3, 4], [5, 6]], dtype=torch.int32),
+            compressed_page_size=64,
+            use_topk_v2=False,
+            topk_metadata=None,
+        )
+        blocks = torch.arange(24, dtype=torch.int32).view(2, 12)
+        modes = {"deterministic": True, "tie_break": 2, "dsa_graph_safe": True}
+        flashinfer = self._fake_flashinfer()
+        with (
+            patch.dict(sys.modules, {"flashinfer": flashinfer}),
+            envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+            envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("large"),
+        ):
+            selector = TopKSelector(DSATopKBackend.FLASHINFER)
+            out = torch.empty((2, 4), dtype=torch.int32)
+            selector.dense(scores, 4)
+            values, indices = selector.dense(scores, 4, sorted=True)
+            selector.ragged(scores, lens, out=out, offsets=lens)
+            selector.raw(scores, lens, out=out, plan=None)
+            selector.paged_from_metadata(scores, metadata, out)
+            selector.sparse(
+                scores, lens, [(blocks, out), (blocks, torch.empty_like(out))]
+            )
+        self.assertTrue(torch.equal(values, values.sort(-1, True).values))
+        self.assertTrue(torch.equal(values, scores.gather(1, indices)))
+        self.assertEqual(
+            [call.kwargs["sorted"] for call in flashinfer.top_k.call_args_list],
+            [False] * flashinfer.top_k.call_count,
+        )
+        self.assertEqual(flashinfer.top_k.call_count, 2)
+        transform = flashinfer.top_k_page_table_transform
+        page_sizes = [call.kwargs["page_size"] for call in transform.call_args_list]
+        self.assertEqual(page_sizes, [128, 128, 64, 8])
+        for mock in (flashinfer.top_k, transform):
+            for call in mock.call_args_list:
+                self.assertLessEqual(modes.items(), call.kwargs.items())
+
+    def test_flashinfer_dense_blocks_publish_ascending_ids(self):
+        """Dense-block consumers lay out candidate columns in published order and
+        FlashInfer breaks ties by column, so every dense-block publish path hands
+        out ascending block ids (-1 last) under FlashInfer, and the selected order
+        otherwise."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks as mod
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            ChunkScores,
+            DecodeScores,
+            RequestScores,
+        )
+
+        unsorted = torch.tensor([[5, -1, 1, 3], [2, 0, -1, -1]], dtype=torch.int32)
+        ascending = torch.tensor([[1, 3, 5, -1], [0, 2, -1, -1]], dtype=torch.int32)
+        scores = torch.randn(2, 48)
+        lens = torch.tensor([48, 20])
+        decode = DecodeScores(
+            bs=2, lmax=48, lens=lens, slots=torch.zeros(2, 48), scores=scores
+        )
+        request = RequestScores(
+            lc=48,
+            k=4,
+            columns=torch.arange(48),
+            tok=torch.arange(2),
+            lens=lens,
+            slots=torch.arange(48),
+        )
+        chunk = ChunkScores(
+            rows=slice(0, 2), tok=torch.arange(2), lens=lens, scores=scores
+        )
+        inputs = MagicMock(positions=torch.zeros(2), rows_per_request=[2])
+        flashinfer = self._fake_flashinfer()
+        for topk_backend, expected in (
+            (DSATopKBackend.SGL_KERNEL, unsorted),
+            (DSATopKBackend.FLASHINFER, ascending),
+        ):
+            backend = mod.DenseBlocksBackend(
+                token_to_kv_pool=MagicMock(),
+                req_to_token=None,
+                candidate_topk_blocks=4,
+                candidate_block_size=8,
+                use_deep_gemm_publish=True,
+                use_deep_gemm_consume=True,
+                selector=TopKSelector(topk_backend),
+            )
+            ids = MagicMock(side_effect=lambda *args, **kwargs: unsorted.clone())
+            with (
+                patch.dict(sys.modules, {"flashinfer": flashinfer}),
+                patch.object(mod, "select_candidate_block_ids", ids),
+                patch.object(mod, "select_decode"),
+                patch.object(mod, "write_prefill"),
+                patch.object(mod, "decode_scores", return_value=decode),
+                patch.object(
+                    mod, "prefill_requests", return_value=[(request, [chunk])]
+                ),
+                patch.object(
+                    mod, "get_deep_gemm_prefill_data", return_value=MagicMock()
+                ),
+                patch.object(
+                    mod,
+                    "_publish_prefill_blocks",
+                    side_effect=lambda **kwargs: (MagicMock(), unsorted.clone()),
+                ),
+            ):
+                published = {
+                    "decode": backend.publish_decode(inputs),
+                    "deep_gemm_prefill": backend._deep_gemm_publish_prefill(inputs),
+                    "torch_prefill": backend._torch_publish_prefill(inputs),
+                }
+            for path, blocks in published.items():
+                with self.subTest(topk_backend=topk_backend, path=path):
+                    self.assertTrue(torch.equal(blocks.blocks, expected))
+
+    def test_flashinfer_block_selection_stays_on_the_main_stream(self):
+        """The candidate source overlaps its block selection with its own top-k on
+        a side stream, except under FlashInfer, whose CUB top-k shares one scratch
+        buffer per device between the two."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
+
+        for topk_backend in DSATopKBackend:
+            with self.subTest(topk_backend=topk_backend):
+                can_overlap = not topk_backend.is_flashinfer()
+                backend = object.__new__(mod.SparseTableBackend)
+                backend.token_to_kv_pool = None
+                backend.topk_blocks = 2
+                backend.alt_stream = MagicMock(name="alt")
+                backend.selector = TopKSelector(topk_backend)
+                main = MagicMock(name="main")
+                entered = []
+
+                class _Enter:
+                    def __init__(self, stream):
+                        entered.append(stream)
+
+                    def __enter__(self):
+                        return None
+
+                    def __exit__(self, *exc):
+                        return False
+
+                data = MagicMock()
+                data.paged_logits_args.return_value = (
+                    MagicMock(),
+                    MagicMock(),
+                    MagicMock(),
+                    None,
+                )
+                event = MagicMock()
+                logits = MagicMock(name="logits")
+                with (
+                    patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
+                    patch.object(
+                        mod, "deep_gemm_fp4_paged_mqa_logits", return_value=logits
+                    ),
+                    patch.object(
+                        mod,
+                        "candidate_row_lens",
+                        return_value=(MagicMock(), MagicMock()),
+                    ),
+                    patch.object(mod, "sort_candidate_blocks"),
+                    patch.object(mod, "build_sparse_indexer_schedule"),
+                    patch.object(mod.torch.cuda, "current_stream", return_value=main),
+                    patch.object(mod.torch.cuda, "stream", _Enter),
+                    patch.object(mod.torch.cuda, "Event", return_value=event),
+                    patch.object(backend.selector, "paged_from_metadata"),
+                    patch.object(backend.selector, "amax_blocks"),
+                ):
+                    backend.publish_decode(MagicMock(is_verify=True))
+                alt = backend.alt_stream
+                if can_overlap:
+                    self.assertEqual(entered, [alt])
+                    alt.wait_stream.assert_called_once_with(main)
+                    logits.record_stream.assert_called_once_with(alt)
+                    event.record.assert_called_once_with(alt)
+                    continue
+                self.assertEqual(alt.mock_calls, [])
+                self.assertNotIn(alt, entered)
+                self.assertNotIn(call(alt), logits.record_stream.call_args_list)
+                self.assertNotIn(call(alt), event.record.call_args_list)
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
@@ -987,6 +1196,7 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         indexer.req_to_token = None
         indexer.use_deep_gemm_decode = False
         indexer.use_deep_select_decode = False
+        indexer.selector = TopKSelector(DSATopKBackend.SGL_KERNEL)
 
         with (
             patch.object(mod, "decode_scores", return_value=data),
@@ -996,7 +1206,9 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
             indexer.topk_decode(inputs)
 
         page_transform.assert_not_called()
-        select_decode.assert_called_once_with(inputs, data, 2)
+        select_decode.assert_called_once_with(
+            inputs, data, 2, selector=indexer.selector
+        )
 
 
 class TestChunkedPagedDecode(CustomTestCase):
@@ -1056,18 +1268,23 @@ class TestChunkedPagedDecode(CustomTestCase):
                 (q[0].shape[0], width), dtype=torch.float32
             )
         )
-        return deep_gemm, MagicMock()
+        selector = MagicMock(can_overlap_streams=True)
+        selector.amax_blocks.side_effect = lambda _logits, lens, _nblocks, topk_blocks: (
+            torch.zeros((lens.shape[0], topk_blocks), dtype=torch.int32)
+        )
+        return deep_gemm, selector
 
-    def _assert_chunked_calls(self, deep_gemm, topk):
+    def _assert_chunked_calls(self, deep_gemm, selector):
         self.assertEqual(deep_gemm.call_count, len(self.chunks))
         for call, plan in zip(deep_gemm.call_args_list, self.plans):
             self.assertIs(call.args[5], plan)
             self.assertIsInstance(call.args[5], torch.Tensor)
+        topk = selector.paged_from_metadata
         self.assertEqual(
             [call.kwargs["rows"] for call in topk.call_args_list], self.chunks
         )
         for call, plan in zip(topk.call_args_list, self.topk_plans):
-            self.assertIs(call.kwargs["topk_metadata"], plan)
+            self.assertIs(call.kwargs["plan"], plan)
 
     def test_candidate_publisher_takes_one_schedule_per_call(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
@@ -1076,26 +1293,19 @@ class TestChunkedPagedDecode(CustomTestCase):
         backend = object.__new__(mod.SparseTableBackend)
         backend.token_to_kv_pool = None
         backend.topk_blocks = 2
-        deep_gemm, topk = self._mocks()
+        deep_gemm, selector = self._mocks()
+        backend.selector = selector
         event = MagicMock()
         stream = MagicMock()
         with (
             patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
-            patch.object(mod, "topk_transform_paged_from_metadata", topk),
             patch.object(
                 mod,
                 "candidate_row_lens",
                 side_effect=lambda lens, _topk: (
                     torch.ones_like(lens),
                     lens.clone(),
-                ),
-            ),
-            patch.object(
-                mod,
-                "amax_topk_blocks",
-                side_effect=lambda _logits, lens, _nblocks, topk_blocks: torch.zeros(
-                    (lens.shape[0], topk_blocks), dtype=torch.int32
                 ),
             ),
             patch.object(
@@ -1113,7 +1323,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         ):
             table = backend.publish_decode(inputs)
 
-        self._assert_chunked_calls(deep_gemm, topk)
+        self._assert_chunked_calls(deep_gemm, selector)
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
         self.assertEqual(table.phys_blocks.shape, table.blocks.shape)
         self.assertEqual(table.valid_lens.shape, (self.num_rows,))
@@ -1126,15 +1336,15 @@ class TestChunkedPagedDecode(CustomTestCase):
         indexer = object.__new__(mod.FullTopKIndexer)
         indexer.token_to_kv_pool = None
         indexer.use_deep_gemm_decode = True
-        deep_gemm, topk = self._mocks()
+        deep_gemm, selector = self._mocks()
+        indexer.selector = selector
         with (
             patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
-            patch.object(mod, "topk_transform_paged_from_metadata", topk),
         ):
             indexer.topk_decode(inputs)
 
-        self._assert_chunked_calls(deep_gemm, topk)
+        self._assert_chunked_calls(deep_gemm, selector)
 
 
 class TestGroupedVerifyRows(CustomTestCase):
@@ -1229,6 +1439,7 @@ class TestCandidateIndexerGating(CustomTestCase):
                     page_size=256,
                     candidate_topk_blocks=topk_blocks,
                     candidate_block_size=block_size,
+                    selector=TopKSelector(DSATopKBackend.SGL_KERNEL),
                 )
 
         flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"

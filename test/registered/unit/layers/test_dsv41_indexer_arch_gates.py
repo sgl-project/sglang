@@ -22,7 +22,9 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4 import index_logits
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4 import v41_indexer as indexer
+from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
     DenseBlocksBackend,
 )
@@ -62,6 +64,10 @@ class _FakeNonCudaArch:
 
     def is_sm_at_least(self, major, minor=0):
         return False
+
+
+def _selector(backend=DSATopKBackend.SGL_KERNEL):
+    return indexer.TopKSelector(backend)
 
 
 def _clear_gate_caches():
@@ -138,6 +144,7 @@ class TestV41IndexerArchGates(CustomTestCase):
                 req_to_token=torch.empty(0),
                 index_heads=64,
                 index_topk=512,
+                selector=_selector(),
             )
             self.assertTrue(full.use_deep_gemm_prefill)
             self.assertTrue(full.use_deep_gemm_decode)
@@ -161,6 +168,7 @@ class TestV41IndexerArchGates(CustomTestCase):
                         req_to_token=torch.empty(0),
                         index_heads=64,
                         index_topk=512,
+                        selector=_selector(),
                     )
                     prefill, _ = indexer.make_candidate_indexer(
                         token_to_kv_pool=SimpleNamespace(),
@@ -168,6 +176,7 @@ class TestV41IndexerArchGates(CustomTestCase):
                         page_size=64,
                         candidate_topk_blocks=8,
                         candidate_block_size=8,
+                        selector=_selector(),
                     )
                 self.assertEqual(full.use_deep_gemm_prefill, deep_gemm_present)
                 self.assertEqual(prefill.use_deep_gemm_publish, deep_gemm_present)
@@ -196,9 +205,48 @@ class TestV41IndexerArchGates(CustomTestCase):
                         page_size=64,
                         candidate_topk_blocks=8,
                         candidate_block_size=8,
+                        selector=_selector(),
                     )
                     self.assertIsInstance(prefill, DenseBlocksBackend)
                     self.assertIs(prefill, decode)
+
+    def test_flashinfer_skips_kernel_fused_selections(self):
+        """LiteTopK prefill and DeepSelect decode select inside their own kernels,
+        which never see the FlashInfer modes, so FlashInfer skips them and every
+        other backend keeps them."""
+        for backend in DSATopKBackend:
+            with self.subTest(backend=backend):
+                with (
+                    self._route(_FakeCudaArch((10, 0))),
+                    envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.override(True),
+                    envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.override(None),
+                    mock.patch.object(
+                        indexer, "is_fp4_indexer_supported", return_value=True
+                    ),
+                ):
+                    full = indexer.make_full_topk_indexer(
+                        token_to_kv_pool=SimpleNamespace(),
+                        req_to_token=torch.empty(0),
+                        index_heads=64,
+                        index_topk=512,
+                        selector=_selector(backend),
+                    )
+                self.assertEqual(
+                    full.use_prefill_lite_topk, not backend.is_flashinfer()
+                )
+                with mock.patch.object(
+                    full_topk, "is_deep_select_supported", return_value=True
+                ):
+                    hopper = full_topk.FullTopKIndexer(
+                        token_to_kv_pool=SimpleNamespace(),
+                        req_to_token=torch.empty(0),
+                        use_deep_gemm_prefill=False,
+                        use_deep_gemm_decode=False,
+                        selector=_selector(backend),
+                    )
+                self.assertEqual(
+                    hopper.use_deep_select_decode, not backend.is_flashinfer()
+                )
 
     def test_index_logits_dtype_stays_fp32_off_sm100(self):
         # The dtype gates stay strict: deep-gemm 0.2.6 asserts fp32 weights
