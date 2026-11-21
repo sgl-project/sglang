@@ -309,7 +309,9 @@ class SchedulerPPMixin:
         send_release_work = []
         early_send = self._pp_pd_early_send_enabled()
         if envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get():
-            # All stages or none: results hold their checkpoint frees alike.
+            # All stages or none: results hold their checkpoint frees alike. Set the
+            # variable the same on every node, or the stages that skip this gather
+            # leave the others waiting in it.
             votes = [None] * get_parallel().pp_size
             torch.distributed.all_gather_object(
                 votes, early_send, group=self.pp_group.cpu_group

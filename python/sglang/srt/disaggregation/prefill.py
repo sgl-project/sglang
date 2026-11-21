@@ -190,6 +190,9 @@ def _sender_takes_host_indices(sender) -> bool:
 def _may_send_last_chunk_early(req: Req) -> bool:
     """The part of early-send eligibility every PP stage and rank sees alike: what
     the request asks for and how its sender takes indices."""
+    # No pending_bootstrap check: held frees are applied only on the inflight
+    # Success/Failed path, which a parked request skips. That relies on optimistic
+    # prefill being off for pp_size > 1, the only setting this loop runs in.
     return (
         not req.return_logprob
         and not req.return_sampling_mask
