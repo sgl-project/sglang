@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.utils.common import copy_into_param_storage
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
@@ -80,6 +81,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         layer.logical_widths = output_partition_sizes
         layer.weight_block_size = None
         layer.orig_dtype = params_dtype
+        layer.fp8_weights_processed = False
 
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.weight_block_size is not None
@@ -153,6 +155,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             raise NotImplementedError(
                 "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
             )
+        per_tensor_or_channel = self.strategy in (
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.CHANNEL,
+        )
+        if per_tensor_or_channel and layer.fp8_weights_processed:
+            return
+        # Without the FNUZ and AITER conversions, the per-tensor and per-channel
+        # paths keep the weight and its scales in their Parameters and storage,
+        # so a weight update loads through their weight_loaders and CUDA graphs
+        # stay valid.
+        in_place = not is_fp8_fnuz() and not _use_aiter
 
         if self.strategy == QuantizationStrategy.TENSOR:
             max_w_scale, weight = requantize_with_max_scale(
@@ -169,8 +182,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            if in_place:
+                layer.weight.data = weight.t()
+                copy_into_param_storage(layer.weight_scale, max_w_scale)
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
@@ -193,11 +210,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
+            elif in_place:
+                layer.weight.data = weight.t()
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            if not in_place:
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -241,9 +261,38 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+            if in_place:
+                copy_into_param_storage(layer.input_scale, layer.input_scale.max())
+            else:
+                layer.input_scale = Parameter(
+                    layer.input_scale.max(), requires_grad=False
+                )
         else:
             layer.input_scale = None
+        if per_tensor_or_channel:
+            layer.fp8_weights_processed = in_place
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Put the weight and scales back in checkpoint form, in place.
+
+        Every shard gets the served per-tensor scales, which the next
+        processing requantizes to the same bytes.
+        """
+        if self.strategy == QuantizationStrategy.BLOCK or not (
+            layer.fp8_weights_processed
+        ):
+            return
+        num_shards = len(layer.logical_widths)
+        layer.weight.data = layer.weight.data.t()
+        if self.strategy == QuantizationStrategy.TENSOR:
+            copy_into_param_storage(
+                layer.weight_scale, layer.weight_scale.reshape(1).repeat(num_shards)
+            )
+        if layer.input_scale is not None:
+            copy_into_param_storage(
+                layer.input_scale, layer.input_scale.reshape(1).repeat(num_shards)
+            )
+        layer.fp8_weights_processed = False
 
     def apply_weights(
         self,

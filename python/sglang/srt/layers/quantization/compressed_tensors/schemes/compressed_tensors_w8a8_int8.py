@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.utils.common import copy_into_param_storage
 from sglang.srt.utils import is_cpu, is_cuda
 
 __all__ = [
@@ -79,6 +80,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
+        layer.int8_weights_processed = False
 
         # WEIGHT
         weight = ModelWeightParameter(
@@ -157,6 +159,15 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             layer.azp_adj = None
             return
 
+        if layer.int8_weights_processed:
+            return
+        # Per-channel weights with symmetric activations keep the weight and
+        # its scales in their Parameters and storage, so a weight update loads
+        # through their weight_loaders and CUDA graphs stay valid.
+        in_place = (
+            self.strategy == QuantizationStrategy.CHANNEL and self.input_symmetric
+        )
+
         # If per tensor, when we have a fused module (e.g. QKV) with per
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per channel
@@ -171,6 +182,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
         # If channelwise, scales are already lined up, so just transpose.
+        elif in_place:
+            layer.weight.data = layer.weight.data.t()
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
             weight_scale = layer.weight_scale.data
@@ -184,7 +197,9 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            if self.input_symmetric:
+            if in_place:
+                copy_into_param_storage(layer.input_scale, layer.input_scale.max())
+            elif self.input_symmetric:
                 layer.input_scale = Parameter(
                     layer.input_scale.max(), requires_grad=False
                 )
@@ -224,6 +239,16 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             layer.azp_adj = Parameter(azp_adj, requires_grad=False)
         else:
             layer.azp_adj = None
+        layer.int8_weights_processed = in_place
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Transpose the weight back to the checkpoint layout, in place."""
+        if not layer.int8_weights_processed:
+            return
+        layer.weight.data = layer.weight.data.t()
+        if layer.input_scale is not None:
+            copy_into_param_storage(layer.input_scale, layer.input_scale.reshape(1))
+        layer.int8_weights_processed = False
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
