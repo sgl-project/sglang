@@ -767,6 +767,30 @@ class _WriteBackBatchingSuite:
         ):
             cache.tree_core.demote(node)
 
+    def test_backup_larger_than_the_host_pool_keeps_host_prefixes(self):
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            host_tokens=BATCH_TOKENS,
+        )
+        host_only = batch_seqs(0)[:2]
+        for seq in host_only:
+            insert_seq(cache, allocator, seq)
+        cache.evict(EvictParams(num_tokens=2 * SEQ_TOKENS))
+        self._assert_on_host(cache, host_only)
+
+        oversized = [100_000 + t for t in range(BATCH_TOKENS + PAGE)]
+        insert_seq(cache, allocator, oversized)
+        node = match_seq(cache, oversized).last_device_node
+        written = cache._execute_and_commit_kv_backup(BackupKV(node_ids=[node]))
+
+        # No eviction can fit it, so the host prefixes must survive.
+        self.assertIsNone(written)
+        self.assertFalse(cache.is_backuped(node))
+        self.assertEqual(host_pool.available_size(), BATCH_TOKENS - 2 * SEQ_TOKENS)
+        self._assert_on_host(cache, host_only)
+        cache.sanity_check()
+
     def test_load_back_commit_rejects_indices_that_miss_the_chain(self):
         for device_tokens in (2 * SEQ_TOKENS, SEQ_TOKENS - PAGE):
             with self.subTest(device_tokens=device_tokens):
