@@ -108,6 +108,17 @@ class DeepSeekV31Detector(BaseFormatDetector):
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
 
+        # Emit text before the first tool marker once, then retain only the
+        # tool section while waiting for its name or arguments.
+        marker_positions = [
+            current_text.find(token)
+            for token in (self.bot_token, "<｜tool▁call▁begin｜>")
+            if token in current_text
+        ]
+        tool_start = min(marker_positions)
+        normal_text = current_text[:tool_start]
+        current_text = self._buffer = current_text[tool_start:]
+
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
@@ -186,17 +197,19 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
