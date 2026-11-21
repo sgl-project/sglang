@@ -198,14 +198,52 @@ def _destroy_mega_moe_localizer() -> None:
         )
 
 
-# FlashInfer SM107 MegaMoE for the W4A4 MXFP4 (mxf4xmxf4) layers
-# (SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER). The layer owns FlashInfer's
-# transformed weights; the routed-expert parameters become per-expert byte views
-# of them, so EPLB moves the kernel's own weights. No DeepGEMM buffer is used.
+# FlashInfer SM107 MegaMoE for the W4A4 MXFP4 (mxf4xmxf4) layers. The layer owns
+# FlashInfer's transformed weights; the routed-expert parameters become
+# per-expert byte views of them, so EPLB moves the kernel's own weights. No
+# DeepGEMM buffer is used.
 
 
 def _use_flashinfer_mxfp4_mega_moe(mma_type: str) -> bool:
-    return mma_type == "mxf4xmxf4" and envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER.get()
+    return mma_type == "mxf4xmxf4" and _flashinfer_mxfp4_mega_moe_selected()
+
+
+@functools.cache
+def _flashinfer_mxfp4_mega_moe_selected() -> bool:
+    """FlashInfer's MegaMoE is faster than DeepGEMM's at prefill shapes and slower
+    at decode shapes, so PD prefill servers on SM107 use it when the installed
+    FlashInfer has it. It has no non-mega fallback, so the MegaMoE capacity must
+    also cover every prefill forward on a rank."""
+    from sglang.srt.runtime_context import get_disagg, get_schedule
+
+    if (
+        _device_sm != 107
+        or get_disagg().disaggregation_mode != "prefill"
+        or _is_mega_moe_localization_enabled()
+    ):
+        return False
+    try:
+        from flashinfer.moe_ep import (  # noqa: F401
+            Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        )
+    except ImportError:
+        return False
+    schedule = get_schedule()
+    prefill_tokens = max(
+        schedule.chunked_prefill_size or 0, schedule.max_prefill_tokens or 0
+    )
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if prefill_tokens > cap:
+        logger.info(
+            "W4A4 MXFP4 MegaMoE keeps DeepGEMM: prefill forwards of up to %d tokens "
+            "per rank exceed SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=%d, "
+            "and FlashInfer's MegaMoE has no non-mega fallback",
+            prefill_tokens,
+            cap,
+        )
+        return False
+    logger.info("W4A4 MXFP4 MegaMoE layers use FlashInfer's SM107 MegaMoE")
+    return True
 
 
 def _flashinfer_mega_layer(experts):
@@ -250,33 +288,17 @@ def _expert_byte_slabs(t: torch.Tensor, num_local: int, name: str) -> torch.Tens
 
 
 def _build_flashinfer_mxfp4_mega_moe(experts) -> None:
-    if _device_sm != 107:
-        raise RuntimeError(
-            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER needs an SM107 GPU "
-            f"(FlashInfer's Rubin MegaMoE), got SM{_device_sm}"
-        )
-    if _is_mega_moe_localization_enabled():
-        raise ValueError(
-            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER does not support "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE"
-        )
-    try:
-        from flashinfer.moe_ep import (
-            BootstrapConfig,
-            FleetParams,
-            MegaConfig,
-            MoEEpMegaLayer,
-            PrequantizedMoEWeights,
-            Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
-        )
-        from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.weights import (
-            preprocess_mega_weights,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER needs a FlashInfer with "
-            "Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig"
-        ) from e
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        PrequantizedMoEWeights,
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
 
     from sglang.srt.runtime_context import get_parallel
 
@@ -313,7 +335,8 @@ def _build_flashinfer_mxfp4_mega_moe(experts) -> None:
         intermediate_size=intermediate,
         top_k=experts.top_k,
         gate_up_clamp=experts.moe_runner_config.swiglu_limit,
-        knobs=envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER_KNOBS.get(),
+        # The tuned winner in FLASHINFER_MOE_EP_KNOB_CACHE if present, else the heuristic.
+        knobs="cache",
     )
     max_tokens = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     experts._flashinfer_mega_layer = MoEEpMegaLayer(

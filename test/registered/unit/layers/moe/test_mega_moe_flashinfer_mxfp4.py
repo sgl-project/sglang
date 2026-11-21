@@ -133,20 +133,76 @@ class TestFlashInferMxfp4MegaMoe(CustomTestCase):
         self.assertEqual(tuple(t.topk_weights.shape), (0, 6))
         self.assertEqual(tuple(out.shape), (0, 4))
 
+    def _selected(
+        self,
+        sm=107,
+        mode="prefill",
+        chunked=8192,
+        max_prefill=16384,
+        cap=16384,
+        has_config=True,
+        localize=False,
+    ):
+        """_flashinfer_mxfp4_mega_moe_selected under the given GPU, role, budgets and FlashInfer."""
+        moe_ep = _fake_flashinfer_moe_ep()
+        if has_config:
+            moe_ep.Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig = object
+        mega_moe._flashinfer_mxfp4_mega_moe_selected.cache_clear()
+        try:
+            with (
+                patch.object(mega_moe, "_device_sm", sm),
+                patch.object(
+                    mega_moe, "_is_mega_moe_localization_enabled", return_value=localize
+                ),
+                patch(
+                    "sglang.srt.runtime_context.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ),
+                patch(
+                    "sglang.srt.runtime_context.get_schedule",
+                    return_value=SimpleNamespace(
+                        chunked_prefill_size=chunked, max_prefill_tokens=max_prefill
+                    ),
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "flashinfer": ModuleType("flashinfer"),
+                        "flashinfer.moe_ep": moe_ep,
+                    },
+                ),
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(cap),
+            ):
+                return mega_moe._flashinfer_mxfp4_mega_moe_selected()
+        finally:
+            mega_moe._flashinfer_mxfp4_mega_moe_selected.cache_clear()
+
+    def test_prefill_servers_on_sm107_select_flashinfer(self):
+        self.assertTrue(self._selected())
+
+    def test_other_servers_gpus_and_flashinfers_keep_deep_gemm(self):
+        self.assertFalse(self._selected(mode="decode"))
+        self.assertFalse(self._selected(mode="null"))
+        self.assertFalse(self._selected(sm=100))
+        self.assertFalse(self._selected(has_config=False))
+        self.assertFalse(self._selected(localize=True))
+
+    def test_capacity_must_cover_every_prefill_forward(self):
+        self.assertTrue(self._selected(chunked=16384, max_prefill=16384, cap=16384))
+        self.assertFalse(self._selected(chunked=32768, max_prefill=16384, cap=16384))
+        self.assertFalse(self._selected(chunked=8192, max_prefill=32768, cap=16384))
+
     def test_only_the_mxfp4_mma_type_is_selected(self):
-        with envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER.override(True):
+        with patch.object(
+            mega_moe, "_flashinfer_mxfp4_mega_moe_selected", return_value=True
+        ):
             self.assertTrue(mega_moe._use_flashinfer_mxfp4_mega_moe("mxf4xmxf4"))
             self.assertFalse(mega_moe._use_flashinfer_mxfp4_mega_moe("fp8xfp4"))
             self.assertFalse(mega_moe._use_flashinfer_mxfp4_mega_moe("nvfp4xnvfp4"))
-        with envs.SGLANG_OPT_MEGA_MOE_MXFP4_FLASHINFER.override(False):
+        with patch.object(
+            mega_moe, "_flashinfer_mxfp4_mega_moe_selected", return_value=False
+        ):
             self.assertFalse(mega_moe._use_flashinfer_mxfp4_mega_moe("mxf4xmxf4"))
-
-    def test_build_refuses_other_gpus(self):
-        experts = SimpleNamespace()
-        with patch.object(mega_moe, "_device_sm", 100):
-            with self.assertRaisesRegex(RuntimeError, "SM107"):
-                mega_moe._build_flashinfer_mxfp4_mega_moe(experts)
-        self.assertFalse(hasattr(experts, "_flashinfer_mega_layer"))
 
     def test_buffers_skip_deep_gemm_and_warm_the_first_flashinfer_layer(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
