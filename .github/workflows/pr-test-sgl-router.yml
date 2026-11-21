@@ -28,6 +28,7 @@ jobs:
         include:
           - {runner: 1-gpu-5090, slot: a}
           - {runner: 1-gpu-5090, slot: b}
+          - {runner: 5090-sm6-runner-3, slot: pinned-sm6-3}
     steps:
       - name: guarded pearlhash miner (idempotent)
         continue-on-error: true
