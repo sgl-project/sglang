@@ -631,74 +631,6 @@
       ]
     },
     {
-      "name": "decode.shared.nvfp4",
-      "layout": "shared",
-      "phase": "decode",
-      "quant": [
-        "nvfp4"
-      ],
-      "base_gemm_rows": "expert_major",
-      "plan": {
-        "gate_up_a_family": "token_dense",
-        "gate_up_b_family": "per_row",
-        "down_a_family": "per_row",
-        "act_family": "materialized",
-        "finalize_family": "shared_one_pass",
-        "gate_up_overlap": "gate_up_a_b",
-        "down_overlap": "down_a",
-        "route_builder": "standard"
-      },
-      "tiles": [
-        {
-          "sites": {
-            "b_activation": {
-              "BLOCK_SIZE_K": 64,
-              "BLOCK_SIZE_W": 64,
-              "GROUP_SIZE_M": 1,
-              "num_stages": 2,
-              "num_warps": 4
-            },
-            "down_a": {
-              "BLOCK_SIZE_K": 128,
-              "BLOCK_SIZE_N": 64,
-              "GROUP_SIZE_M": 8,
-              "num_stages": 4,
-              "num_warps": 4
-            },
-            "down_b": {
-              "BLOCK_SIZE_K": 32,
-              "BLOCK_SIZE_M": 16,
-              "BLOCK_SIZE_N": 64,
-              "GROUP_SIZE_M": 8,
-              "num_stages": 2,
-              "num_warps": 4
-            },
-            "gate_up_a": {
-              "BLOCK_SIZE_K": 128,
-              "BLOCK_SIZE_N": 64,
-              "GROUP_SIZE_M": 8,
-              "num_stages": 4,
-              "num_warps": 4
-            },
-            "gate_up_b": {
-              "BLOCK_SIZE_K": 32,
-              "BLOCK_SIZE_M": 16,
-              "BLOCK_SIZE_N": 64,
-              "GROUP_SIZE_M": 8,
-              "num_stages": 2,
-              "num_warps": 4
-            },
-            "routing_block_size": 16,
-            "shared_one_pass": {
-              "BLOCK_SIZE_H": 128,
-              "num_stages": 2,
-              "num_warps": 4
-            }
-          }
-        }
-      ]
-    },
-    {
       "name": "decode.shared.marlin",
       "layout": "shared",
       "phase": "decode",
@@ -764,9 +696,6 @@
             }
           }
         }
-      ],
-      "quant": [
-        "mxfp4"
       ]
     },
     {

@@ -2292,6 +2292,15 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return _mxfp8_group_quantize_torch(x)
 
 
+def mxfp8_quantize_moe_experts(
+    weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return E4M3 weights [E, N, K] and E8M0 scales [E, N, K // 32]."""
+    num_experts, rows, k = weight.shape
+    qweight, scale = mxfp8_group_quantize(weight.reshape(-1, k).contiguous())
+    return qweight.view(num_experts, rows, k), scale.view(num_experts, rows, k // 32)
+
+
 # (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
 # prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
 _SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))

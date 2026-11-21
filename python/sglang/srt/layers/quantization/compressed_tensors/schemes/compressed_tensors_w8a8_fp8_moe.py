@@ -21,6 +21,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    check_lora_marlin_fp8_moe_layer,
+    repack_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -76,6 +80,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
+        # lora_marlin: the LoRA MoE runner serves the experts W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().is_lora_marlin()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -92,6 +98,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        if self.use_marlin:
+            check_lora_marlin_fp8_moe_layer(
+                params_dtype, with_bias=extra_weight_attrs.get("with_bias", False)
+            )
 
         params_dtype = torch.float8_e4m3fn
 
@@ -242,6 +253,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        if self.use_marlin:
+            # No activation scales or gate/up requant in W8A16: repack before any fold.
+            if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+                repack_moe_fp8_layer_for_marlin(layer, "tensor")
+            elif self.block_quant:
+                repack_moe_fp8_layer_for_marlin(
+                    layer, "block", block_n=self.weight_block_size[0]
+                )
+            else:
+                repack_moe_fp8_layer_for_marlin(layer, "channel")
+            return
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
