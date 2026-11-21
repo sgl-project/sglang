@@ -296,6 +296,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_num_draft_entries: Optional[int] = None,
     ):
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
@@ -326,7 +327,13 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        # Layer-split prefill reports owned-only entries while
+        # a non-split decode peer registers every layer; the entry-count
+        # mismatch routes into the group-aware dst remap below, same slicing
+        # as the PP path.
+        if self.pp_size > 1 or (
+            self.is_mla_backend and len(self.kv_args.kv_data_ptrs) != len(dst_kv_ptrs)
+        ):
             if self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)

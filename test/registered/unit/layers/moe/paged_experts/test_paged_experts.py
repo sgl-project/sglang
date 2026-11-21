@@ -421,14 +421,15 @@ class TestPagedForward(CustomTestCase):
         ids = torch.full_like(d.topk_output.topk_ids, 2**31 - 1)  # not computed yet
         out = torch.empty_like(d.hidden_states)
         resident = dict(method.policy.resident)
+        callbacks = []
         capture = SimpleNamespace(
-            _end_current_segment=lambda: None,
-            cuda_graph=SimpleNamespace(_break_fns=[]),
-            _begin_new_segment=lambda: None,
+            end_current_segment=lambda: None,
+            begin_next_segment=lambda: None,
+            register_eager_call=callbacks.append,
+            retain_for_replay=lambda value: value,
         )
         device = SimpleNamespace(current_stream=lambda: SimpleNamespace(stream_id=0))
-        token = breakable_cuda_graph._current_capture_var.set(capture)
-        try:
+        with breakable_cuda_graph.use_breakable_capture_recorder(capture):
             with patch.object(
                 breakable_cuda_graph, "get_device_module", return_value=device
             ):
@@ -440,13 +441,11 @@ class TestPagedForward(CustomTestCase):
                     None,
                     out,
                 )
-        finally:
-            breakable_cuda_graph._current_capture_var.reset(token)
         self.assertEqual(method.base_method.rows, 0)
         self.assertEqual(dict(method.policy.resident), resident)
 
         ids.copy_(d.topk_output.topk_ids)
-        (replay,) = capture.cuda_graph._break_fns
+        (replay,) = callbacks
         replay()
         torch.testing.assert_close(out, _reference(full, d))
 
@@ -1599,6 +1598,7 @@ class TestSizing(CustomTestCase):
                 mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1000)
             ),
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             _calculate_mamba_ratio=lambda: 2,
             model_config=SimpleNamespace(context_len=context_length or 4096),
         )
@@ -1638,10 +1638,13 @@ class TestSizing(CustomTestCase):
             hybrid_gdn_config=None,
             hybrid_kda_config=None,
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             attn_dp_size=1,
         )
         exec_ = SimpleNamespace(
-            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+            mamba=SimpleNamespace(
+                enable_linear_replayssm_spec=False, decode_state_free_radix=False
+            )
         )
         with (
             patch.object(kvc_mod, "get_schedule", return_value=sched),
@@ -3465,6 +3468,18 @@ class TestSaveRecurrentState(CustomTestCase):
         with patch.object(replay_hooks, "_HOOKS", [lambda: False]):
             with self.assertRaisesRegex(RuntimeError, "ReplaySSM"):
                 replay_hooks.save_recurrent_state(pool, torch.tensor([1]))
+
+
+class TestPrecopyGrid(CustomTestCase):
+    def test_half_the_sms_at_most_32(self):
+        """The pre-copy's grid is half the GPU's SMs, capped at the 32 blocks measured on a 70-SM
+        RTX 5070 Ti, so a smaller GPU never gives the side copy a larger share of its SMs."""
+        from sglang.srt.layers.moe.paged_experts.precopy import copy_blocks
+
+        cases = {70: 32, 132: 32, 36: 18, 20: 10, 1: 1, 0: 1}
+        for sms, blocks in cases.items():
+            with self.subTest(sms=sms):
+                self.assertEqual(copy_blocks(sms), blocks)
 
 
 if __name__ == "__main__":

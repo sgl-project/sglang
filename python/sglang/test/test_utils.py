@@ -60,6 +60,13 @@ filter_noisy_warnings()
 
 ADMIN_API_KEY_FOR_TEST = "sk-admin-for-test"
 ADMIN_HEADERS_FOR_TEST = {"Authorization": f"Bearer {ADMIN_API_KEY_FOR_TEST}"}
+ADMIN_LAUNCH_ARGS_FOR_TEST = ("--admin-api-key", ADMIN_API_KEY_FOR_TEST)
+
+
+def admin_post(url: str, **kwargs) -> requests.Response:
+    """`requests.post` with the admin key, for a server launched with `ADMIN_LAUNCH_ARGS_FOR_TEST`."""
+    return requests.post(url, headers=ADMIN_HEADERS_FOR_TEST, **kwargs)
+
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"

@@ -29,8 +29,8 @@ def _v2p_args(v2p: Optional[torch.Tensor], dummy: torch.Tensor):
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
-        "bs",
         "max_len",
+        "bs",
     ]
 )
 def _fused_dsa_decode_metadata_kernel(
@@ -241,8 +241,8 @@ def fused_dsa_decode_metadata(
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
-        "bs",
         "max_seqlen_k",
+        "bs",
         "max_splits",
     ]
 )
@@ -503,9 +503,9 @@ def fused_dsa_target_verify_metadata(
     do_not_specialize=[
         "page_table_stride_0",
         "real_page_table_stride_0",
-        "bs",
         "total_len",
         "max_seqlen_k",
+        "bs",
     ]
 )
 def _fused_dsa_draft_extend_metadata_kernel(

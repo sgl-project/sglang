@@ -1,5 +1,6 @@
 """Fixed-shape state I/O for kernels without a masked pool-index interface."""
 
+import msgspec
 import torch
 
 
@@ -29,37 +30,49 @@ def scatter_pool_states(
     states.index_copy_(0, indices, torch.where(live_rows, updates.to(states.dtype), 0))
 
 
-def stage_pool_states(
-    states: tuple[torch.Tensor, ...], indices: torch.Tensor
-) -> tuple[tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
-    """Contiguous copies of the rows ``indices`` name, for kernels that need a
-    contiguous state pool, keeping the pool convention that row 0 is the
-    padding sink: the copies hold the sink at row 0 and request ``i`` at row
-    ``i + 1``, and a padded request (index <= 0) is addressed at the sink.
+class PoolStaging(msgspec.Struct, frozen=True):
+    """Rows for kernels that need a contiguous state pool, keeping the pool
+    convention that row 0 is the padding sink: contiguous copies hold the sink
+    at row 0 and request ``i`` at row ``i + 1``, and a padded request
+    (index <= 0) is addressed at the sink. Every layer of a forward stages the
+    same requests, so one instance serves them all."""
 
-    Returns the copies, the copies' row indices to hand the kernels, and the
-    pool rows `unstage_pool_states` writes the copies back to.
-    """
-    pool_rows = torch.where(indices > 0, indices, 0).to(torch.int64)
-    gather = torch.cat([pool_rows.new_zeros(1), pool_rows])
-    copies = tuple(state[gather].contiguous() for state in states)
-    stage_rows = torch.where(
-        indices > 0,
-        torch.arange(
-            1, indices.shape[0] + 1, device=indices.device, dtype=indices.dtype
-        ),
-        0,
-    )
-    return copies, stage_rows, pool_rows
+    # [num_requests + 1] int64: the pool row each copy row is read from.
+    gather_rows: torch.Tensor
+    # [num_requests]: the copy row of each request, to hand the kernels.
+    kernel_rows: torch.Tensor
+
+    @classmethod
+    def from_indices(cls, indices: torch.Tensor) -> "PoolStaging":
+        pool_rows = torch.where(indices > 0, indices, 0).to(torch.int64)
+        kernel_rows = torch.where(
+            indices > 0,
+            torch.arange(
+                1, indices.shape[0] + 1, device=indices.device, dtype=indices.dtype
+            ),
+            0,
+        )
+        return cls(
+            gather_rows=torch.cat([pool_rows.new_zeros(1), pool_rows]),
+            kernel_rows=kernel_rows,
+        )
+
+
+def stage_pool_states(
+    states: tuple[torch.Tensor, ...], staging: PoolStaging
+) -> tuple[torch.Tensor, ...]:
+    """Contiguous copies of the rows ``staging`` names."""
+    return tuple(state[staging.gather_rows].contiguous() for state in states)
 
 
 def unstage_pool_states(
     states: tuple[torch.Tensor, ...],
     copies: tuple[torch.Tensor, ...],
-    pool_rows: torch.Tensor,
+    staging: PoolStaging,
 ) -> None:
     """Write `stage_pool_states` copies back: request ``i``'s row goes to its
     pool row; a padded request's row, untouched by the kernels, goes back to
     the sink it was read from."""
+    pool_rows = staging.gather_rows[1:]
     for state, copy in zip(states, copies):
         state[pool_rows] = copy[1:]
