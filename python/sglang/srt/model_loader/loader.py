@@ -1060,6 +1060,11 @@ class DefaultModelLoader(BaseModelLoader):
             # For full ModelOpt quantization, use ModelOptModelLoader
             return model.eval()
 
+        if envs.SGLANG_CPU_QUANTIZATION.get():
+            return load_model_with_cpu_quantization(
+                self, model_config=model_config, device_config=device_config
+            )
+
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
@@ -3585,6 +3590,13 @@ class RemoteModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _move_module_to_device(module: nn.Module, target_device: torch.device) -> None:
+    """Move non-meta parameters and buffers of ``module`` to ``target_device`` in-place."""
+    module._apply(
+        lambda t: t if t.is_meta or t.device == target_device else t.to(target_device)
+    )
+
+
 def load_model_with_cpu_quantization(
     self,
     *,
@@ -3592,6 +3604,8 @@ def load_model_with_cpu_quantization(
     device_config: DeviceConfig,
 ) -> nn.Module:
     target_device = torch.device(device_config.device)
+    if target_device.type != "cpu":
+        target_device = torch.empty(0, device=target_device).device
     quant_config = _get_quantization_config(model_config, self.load_config)
     with set_default_torch_dtype(model_config.dtype):
         model = _initialize_model(
@@ -3600,22 +3614,33 @@ def load_model_with_cpu_quantization(
             quant_config,
         )
 
-        if not isinstance(self, DummyModelLoader):
-            model.load_weights(self._get_all_weights(model_config, model))
+        if isinstance(self, DummyModelLoader):
+            initialize_dummy_weights(model)
+            post_load_weights(model)
+        else:
+            DefaultModelLoader.load_weights_only(
+                model,
+                self._get_all_weights(model_config, model),
+                target_device,
+            )
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        for module, quant_method in _modules_with_quant_method(model):
+            # Stage each module directly onto target_device and quantize in-place
+            # so full-precision CPU tensors are freed immediately and quantized
+            # weights remain resident on target_device without bouncing back
+            # through pinned host memory.
+            if target_device.type != "cpu":
+                _move_module_to_device(module, target_device)
+            quant_method.process_weights_after_loading(module)
 
-        model.to(target_device)
+        finalize_gfx115_weight_padding(model)
 
+        if target_device.type != "cpu":
+            _move_module_to_device(model, target_device)
+            if is_cuda_alike():
+                current_platform.empty_cache()
+
+    self.counter_after_loading_weights = time.perf_counter()
     return model.eval()
 
 
