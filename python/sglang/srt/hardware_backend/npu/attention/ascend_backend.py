@@ -399,7 +399,6 @@ class AscendAttnBackend(AttentionBackend):
             and parallel.attn_tp_size > 1
             and parallel.attn_cp_size == 1
             and parallel.attn_dcp_size == 1
-            and not parallel.attn_dp_enabled
         )
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
