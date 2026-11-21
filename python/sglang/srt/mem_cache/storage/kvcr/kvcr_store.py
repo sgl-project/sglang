@@ -226,7 +226,7 @@ class KVCRStore(HiCacheStorage):
         except ImportError as e:
             raise ImportError(
                 "KVCR HiCache backend requires the kvcr>=0.2.0 package and its "
-                "NIXL Python bindings (PyPI's latest stable kvcr, 0.1.1, is older)"
+                "NIXL Python bindings (0.1.x lacks the API this backend uses)"
             ) from e
         self._budget = self._extra.get("local_dram_bytes", 8 << 30)
         self._pages_by_pool = self._extra.get("local_dram_pool_pages", {})

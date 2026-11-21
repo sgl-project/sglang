@@ -1,9 +1,8 @@
 # KVCR HiCacheStorage backend
 
 This optional backend uses KVCR's indexed-region public API and NIXL/UCX
-transport. Install KVCR 0.2.0 or later separately (PyPI's latest stable
-release, 0.1.1, is too old and is rejected at startup); selecting another
-HiCache backend does not import KVCR.
+transport. Install KVCR 0.2.0 or later separately; an older KVCR (0.1.x) is
+rejected at startup. Selecting another HiCache backend does not import KVCR.
 
 ## Ownership and data path
 
