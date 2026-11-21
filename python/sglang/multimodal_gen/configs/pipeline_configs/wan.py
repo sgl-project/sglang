@@ -358,6 +358,7 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     vae_decode_precision: str = "fp32"
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.dit_config.boundary_ratio = self.boundary_ratio
         self.dit_config.torch_compile_mode = "default"
 

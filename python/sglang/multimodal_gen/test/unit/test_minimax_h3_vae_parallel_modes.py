@@ -236,6 +236,92 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv1d replica")
+@pytest.mark.parametrize(
+    "channels, taps, dilation", [(8, 11, 5), (16, 7, 3), (64, 3, 1)]
+)
+def test_rocm_bigvgan_conv1d_replays_fp64_naive_order(channels, taps, dilation):
+    """The Triton conv1d sums x * w in FP64, input channel outer and tap inner,
+    then rounds once; an FP64 loop in that order gives the same bytes, and the
+    gated BigVGAN conv returns the eager conv's bytes either way."""
+    from torch.nn.utils.parametrizations import weight_norm
+
+    from sglang.kernels.ops.diffusion import conv1d_fp64acc
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
+        bigvgan,
+    )
+
+    torch.manual_seed(0)
+    padding = dilation * (taps - 1) // 2
+    x = torch.randn(2, channels, 4099, device="cuda")
+    conv = weight_norm(
+        nn.Conv1d(channels, channels, taps, padding=padding, dilation=dilation)
+    ).cuda()
+    w = conv.weight.detach()
+
+    xp = nn.functional.pad(x, (padding, padding)).double()
+    ref = torch.zeros(2, channels, x.shape[-1], dtype=torch.float64, device="cuda")
+    for ic in range(channels):
+        for tap in range(taps):
+            start = tap * dilation
+            window = xp[:, ic : ic + 1, start : start + x.shape[-1]]
+            ref += window * w[None, :, ic, tap, None].double()
+    out = conv1d_fp64acc(x, w, padding=padding, dilation=dilation)
+    assert torch.equal(out, ref.float())
+
+    with torch.inference_mode():
+        assert torch.equal(bigvgan._conv1d(conv, x), conv(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv replica")
+@pytest.mark.parametrize("fp64, taps_ascending", [(True, True), (False, False)])
+def test_rocm_depthwise_conv_transpose1d_replays_miopen_orders(fp64, taps_ascending):
+    """The naive solver's FP64 sum (taps ascending) and the col2im FP32 sum of
+    FP32 products (taps descending), each against a per-tap loop in that order."""
+    from sglang.kernels.ops.diffusion import conv_transpose1d_depthwise
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 4099, device="cuda")
+    w = torch.randn(16, 1, 12, device="cuda")
+    stride = 2
+    dtype = torch.float64 if fp64 else torch.float32
+    ref = torch.zeros(2, 16, 4098 * stride + 12, dtype=dtype, device="cuda")
+    for tap in range(12) if taps_ascending else reversed(range(12)):
+        ref[..., tap : tap + 4098 * stride + 1 : stride] += x.to(dtype) * w[
+            None, :, 0, tap, None
+        ].to(dtype)
+    out = conv_transpose1d_depthwise(
+        x, w, stride=stride, fp64=fp64, taps_ascending=taps_ascending
+    )
+    assert torch.equal(out, ref.float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv replica")
+@pytest.mark.parametrize("channels", [8, 64, 256])
+def test_rocm_alias_free_resampling_keeps_eager_bytes(channels):
+    """Each depthwise filter shape returns the eager conv's bytes, through the
+    replica of MIOpen's order it matched at first sight, or eager."""
+    from sglang.multimodal_gen.runtime.models.vaes import alias_free
+
+    torch.manual_seed(0)
+    x = torch.randn(2, channels, 20261, device="cuda")
+    up = alias_free.UpSample1d(2, 12).cuda()
+    down = alias_free.DownSample1d(2, 12).cuda()
+    with torch.inference_mode():
+        with mock.patch.object(
+            alias_free.current_platform, "is_rocm", return_value=False
+        ):
+            eager = (up(x), down(x))
+        alias_free._ROCM_DEPTHWISE_REPLICA.clear()
+        for _ in range(2):  # first sight, then the adopted path
+            assert torch.equal(up(x), eager[0])
+            assert torch.equal(down(x), eager[1])
+    assert len(alias_free._ROCM_DEPTHWISE_REPLICA) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_audio_snake_first_call_matches_repeated_calls():
     # a fresh process prevents earlier tests from warming a profiling JIT graph
     subprocess.run(
