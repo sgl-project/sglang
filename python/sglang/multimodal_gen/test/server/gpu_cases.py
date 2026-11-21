@@ -815,7 +815,26 @@ MINIMAX_H3_IMAGE_B200_CASES = [
     ),
 ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + MINIMAX_H3_IMAGE_B200_CASES
+ONE_GPU_B200_CASES = [
+    *ONE_GPU_MODELOPT_NVFP4_CASES,
+    *MINIMAX_H3_IMAGE_B200_CASES,
+    DiffusionTestCase(
+        "flux_2_klein_kv_ti2i",
+        DiffusionServerArgs(model_path="black-forest-labs/FLUX.2-klein-9b-kv"),
+        replace(
+            MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+            extras={
+                "quality": "lossless",
+                "num_inference_steps": 4,
+                "guidance_scale": 1.0,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        reference_quality="exact",
+    ),
+]
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
