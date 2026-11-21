@@ -142,13 +142,13 @@ def test_fused_sigmoid_mul_block_fp8_quant(
 def test_qwen35_block_fp8_output_quant_cuda_graph():
     torch.manual_seed(123)
     T, nv, hd = 8, 32, 128
-    nh, ahd = 16, 256
+    nh, attn_hd = 16, 256
     w = torch.randn(hd, device="cuda", dtype=torch.bfloat16)
     x = torch.randn(T * nv, hd, device="cuda", dtype=torch.bfloat16)
     z = torch.randn(T * nv, hd, device="cuda", dtype=torch.bfloat16)
-    attn_out = torch.randn(T, nh * ahd, device="cuda", dtype=torch.bfloat16)
-    gate_backing = torch.randn(T, nh, ahd * 2, device="cuda", dtype=torch.bfloat16)
-    gate = gate_backing[:, :, ahd:]
+    attn_out = torch.randn(T, nh * attn_hd, device="cuda", dtype=torch.bfloat16)
+    gate_backing = torch.randn(T, nh, attn_hd * 2, device="cuda", dtype=torch.bfloat16)
+    gate = gate_backing[:, :, attn_hd:]
 
     # Warmup
     _layer_norm_fwd(
