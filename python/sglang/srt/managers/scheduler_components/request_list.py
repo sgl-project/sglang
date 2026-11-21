@@ -27,6 +27,8 @@ class ListKind(enum.Enum):
     DECODING = enum.auto()
     CHUNKED = enum.auto()
     PD_BOOTSTRAP = enum.auto()
+    # Retraction recomputes waiting for their bootstrap room's release.
+    PD_ROOM_WAITERS = enum.auto()
     PREFILL_LAUNCHED = enum.auto()
     PD_SENDING = enum.auto()
     PD_PREALLOC = enum.auto()
@@ -46,6 +48,7 @@ class ListKind(enum.Enum):
 PD_KINDS = frozenset(
     {
         ListKind.PD_BOOTSTRAP,
+        ListKind.PD_ROOM_WAITERS,
         ListKind.PD_SENDING,
         ListKind.PD_PREALLOC,
         ListKind.PD_RETRACTED,

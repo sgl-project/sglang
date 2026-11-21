@@ -42,7 +42,8 @@ removes overlap between chunked prefill and KV transfer. Compare both policies
 for your workload; this option is not a general throughput improvement.
 
 This initial implementation requires Mooncake (RDMA or `mooncake_tcp`), the Python
-bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
+bootstrap registry, attention TP/CP sizes of one, and a decode pipeline size of one;
+prefill may use pipeline parallelism. Attention DP
 is allowed when each DP rank has attention TP size one. Prefill automatically
 resolves `--optimistic-prefill-attempts` from zero to one; configurations that
 disable optimistic prefill after model validation are rejected.
@@ -50,12 +51,15 @@ Chunked prefill does not yield just because decode has not admitted the request.
 Completed requests retain their KV in the existing optimistic-prefill inflight
 queue until decode supplies destination indices; readiness alone never starts
 a KV write.
-After a successful transfer, prefill clears the room's readiness and transfer
-state before notifying decode of success. Retraction recovery can then reuse
-the same bootstrap room. This notification waits for worker and scheduler
-cleanup; failure and cancellation records remain until their timeout expires.
+Prefill's transfer worker notifies decode of success as soon as the transfer
+ends, as under `early`. A retraction-recovery recompute that reuses the
+bootstrap room waits on prefill until the previous request's readiness and
+transfer state are cleared; failure and cancellation records remain until their
+timeout expires.
 Retries remain eligible for prefill after the optimistic attempt budget is
 exhausted and remain subject to the existing cancellation and timeout handling.
+With a pipeline-parallel prefill, a chunked request whose bootstrap fails
+computes its remaining chunks before prefill drops it.
 
 On prefill, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` starts after the final
 prefill result, giving decode admission its own budget. On decode,
