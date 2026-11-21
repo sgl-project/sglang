@@ -74,6 +74,12 @@ if _is_cpu and _is_cpu_amx_available:
 if _is_musa:
     from flash_attn_interface import flash_attn_varlen_func
 
+    def flash_attn_func(*args, ver: int = 3, **kwargs):
+        # flash_attn_interface ships only the fa3-style varlen entry; the
+        # ver=4 caller (VisionFlash4Attention) is gated to CUDA.
+        return flash_attn_varlen_func(*args, **kwargs)
+
+
 if _is_npu:
     import torch_npu
 if _is_xpu:
