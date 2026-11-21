@@ -354,8 +354,10 @@ class GemmaForCausalLM(nn.Module):
                     continue
                 # GemmaRMSNorm is different from Llama's in that it multiplies
                 # (1 + weight) to the output, instead of just weight.
+                # Added out of place: an online update hands the same tensor to
+                # every selected runner.
                 if "norm.weight" in name:
-                    loaded_weight += 1.0
+                    loaded_weight = loaded_weight + 1.0
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

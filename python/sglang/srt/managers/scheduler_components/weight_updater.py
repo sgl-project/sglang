@@ -65,6 +65,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     assert_empty,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    unwrap_local_serialized_tensors,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -294,14 +297,22 @@ class SchedulerWeightUpdaterManager:
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
+            runners = self._select_runners(recv_req.selector)
+            # A PP stage hosting none of the selected runners must not open the handles.
+            if runners and recv_req.load_format != "flattened_bucket":
+                named_tensors = unwrap_local_serialized_tensors(
+                    named_tensors, device=self.tp_worker.model_runner.device
+                )
             success, message = True, "Success"
-            for _, runner in self._select_runners(recv_req.selector):
+            for _, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
                 )
                 if not success:
                     break
+            # Dropped before the flush, so torch_empty_cache can return their blocks.
+            del named_tensors
             if success:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True

@@ -519,6 +519,18 @@ def _unwrap_tensor(tensor, tp_rank, device):
     return tensor.to(device)
 
 
+def unwrap_local_serialized_tensors(named_tensors, device: str):
+    if not any(isinstance(t, LocalSerializedTensor) for _, t in named_tensors):
+        return named_tensors
+    monkey_patch_torch_reductions()
+    tp_rank = get_parallel().tp_rank
+    current_device = torch.get_device_module(device).current_device()
+    return [
+        (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=current_device))
+        for name, tensor in named_tensors
+    ]
+
+
 @dataclass
 class LocalSerializedTensor:
     """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
