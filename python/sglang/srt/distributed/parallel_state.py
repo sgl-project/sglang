@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import warnings
 import weakref
 from collections import namedtuple
@@ -137,6 +138,148 @@ class P2PWork:
     def wait(self) -> None:
         if self.work is not None:
             self.work.wait()
+
+
+class _CPUWorkWaiter:
+    """Gloo receives progress through wait(), not necessarily is_completed()."""
+
+    def __init__(self, work: torch.distributed.Work):
+        self._work = work
+        self._done = threading.Event()
+        self._error = None
+        threading.Thread(target=self._wait, daemon=True).start()
+
+    def _wait(self) -> None:
+        try:
+            self._work.wait()
+        except Exception as exc:
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def wait(self, block: bool) -> bool:
+        if not block and not self._done.is_set():
+            return False
+        self._done.wait()
+        if self._error is not None:
+            raise self._error
+        return True
+
+
+class TensorDictRecvHandle:
+    """Full-tensor receive using the existing send_tensor_dict wire format.
+
+    Only CPU metadata waits run on helper threads. The caller must progress and
+    finish the handle on its communication stream: CUDA Work.wait() establishes
+    stream dependencies, rather than proving the tensors are ready on the host.
+    No TP all-gather is issued by this interface.
+    """
+
+    _MAX_METADATA_BYTES = 64 * 1024 * 1024
+
+    def __init__(self, coordinator: "GroupCoordinator", src: int):
+        self._coordinator = coordinator
+        # src is group-local; torch.distributed P2P requires the global rank.
+        self._src_global_rank = coordinator.ranks[src]
+        self._metadata_size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        self._serialized_metadata_tensor = None
+        # Allocated receive buffers do not imply payload completion.
+        self._received_tensor_dict = None
+        self._payload_recv_works = []
+        # CUDA waits establish stream dependencies, not host-visible completion.
+        self._payload_waits_issued = False
+        self._metadata_recv_waiter = self._post_metadata_recv(
+            self._metadata_size_tensor
+        )
+
+    def _post_metadata_recv(self, tensor: torch.Tensor) -> _CPUWorkWaiter:
+        """Post a CPU receive for the metadata length or serialized bytes."""
+        return _CPUWorkWaiter(
+            torch.distributed.irecv(
+                tensor, src=self._src_global_rank, group=self._coordinator.cpu_group
+            )
+        )
+
+    def _progress_metadata(self, block: bool) -> bool:
+        """Receive/decode metadata, allocate buffers and post payload receives."""
+        if self._received_tensor_dict is not None:
+            return True
+        if self._serialized_metadata_tensor is None:
+            if not self._metadata_recv_waiter.wait(block):
+                return False
+            metadata_size_bytes = int(self._metadata_size_tensor.item())
+            if not 0 < metadata_size_bytes <= self._MAX_METADATA_BYTES:
+                raise RuntimeError(
+                    f"Invalid tensor-dict metadata size: {metadata_size_bytes}"
+                )
+            self._serialized_metadata_tensor = torch.empty(
+                metadata_size_bytes, dtype=torch.uint8, device="cpu"
+            )
+            self._metadata_recv_waiter = self._post_metadata_recv(
+                self._serialized_metadata_tensor
+            )
+        if not self._metadata_recv_waiter.wait(block):
+            return False
+
+        metadata_entries = pickle.loads(
+            self._serialized_metadata_tensor.numpy().tobytes()
+        )
+        if not isinstance(metadata_entries, list):
+            raise RuntimeError("Tensor-dict metadata must be a list")
+        received_tensor_dict = {}
+        # Validate and allocate the whole message before posting any payload.
+        for entry in metadata_entries:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise RuntimeError("Invalid tensor-dict metadata entry")
+            key, value = entry
+            if key in received_tensor_dict:
+                raise RuntimeError(f"Duplicate tensor-dict metadata key: {key}")
+            received_tensor_dict[key] = (
+                torch.empty(
+                    value.size,
+                    dtype=value.dtype,
+                    device=(
+                        self._coordinator.device if value.device != "cpu" else "cpu"
+                    ),
+                )
+                if isinstance(value, TensorMetadata)
+                else value
+            )
+        for value in received_tensor_dict.values():
+            if isinstance(value, torch.Tensor) and value.numel():
+                payload_comm_group = (
+                    self._coordinator.cpu_group
+                    if value.is_cpu
+                    else self._coordinator.device_group
+                )
+                payload_recv_work = torch.distributed.irecv(
+                    value, src=self._src_global_rank, group=payload_comm_group
+                )
+                self._payload_recv_works.append(P2PWork(payload_recv_work, value))
+        self._received_tensor_dict = received_tensor_dict
+        return True
+
+    def poll_metadata_ready(self) -> bool:
+        """True means metadata is decoded and payload receives are posted.
+
+        Payload data may still be in flight; this does not wait for it.
+        """
+        return self._progress_metadata(block=False)
+
+    def wait(self) -> Dict[str, Any]:
+        """Wait for CPU payloads and order CUDA payloads on the current stream.
+
+        CUDA Work.wait() establishes stream dependencies without guaranteeing
+        host-visible GPU completion. The caller must use this handle on the same
+        communication stream and fence other consuming streams separately.
+        """
+        if not self._payload_waits_issued:
+            self._progress_metadata(block=True)
+            for item in self._payload_recv_works:
+                item.wait()
+            self._payload_recv_works.clear()
+            self._payload_waits_issued = True
+        return self._received_tensor_dict
 
 
 def _split_tensor_dict(
@@ -1870,6 +2013,19 @@ class GroupCoordinator:
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
         return p2p_works
+
+    def recv_tensor_dict_async(self, src: Optional[int] = None) -> TensorDictRecvHandle:
+        """Receive full tensors asynchronously, without send-allgather slicing.
+
+        The sender must call send_tensor_dict with all_gather_group=None.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            raise RuntimeError("Async tensor-dict receive requires a distributed peer")
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        if not 0 <= src < self.world_size or src == self.rank_in_group:
+            raise ValueError(f"Invalid source rank ({src})")
+        return TensorDictRecvHandle(self, src)
 
     def recv_tensor_dict(
         self,

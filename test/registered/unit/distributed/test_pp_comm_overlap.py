@@ -1,12 +1,18 @@
 import unittest
 from collections import defaultdict, deque
 from contextlib import nullcontext
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.vpp_activation import (
+    VPPActivationReceiver,
+    VPPReceivedActivation,
+    VPPSendWindow,
+)
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -240,6 +246,187 @@ class TestPPCommOverlap(CustomTestCase):
             proxy = schedulers[1]._pp_recv_proxy_tensors()
             torch.testing.assert_close(proxy.tensors["hidden_states"], expected_gather)
             self.assertTrue(all(not queue for queue in mailboxes.values()))
+
+
+class TestVPPActivationTransport(CustomTestCase):
+    """Protect wire compatibility and cross-stream activation storage lifetime."""
+
+    def test_async_metadata_progress_does_not_wait_for_payload(self):
+        # The actual GroupCoordinator sender and receiver share a CPU mailbox.
+        # Work completion is controlled explicitly, without timing-based sleeps.
+        mailbox = deque()
+        metadata_gate = Event()
+        payload_gate = Event()
+
+        class ReceiveWork:
+            def __init__(self, tensor, sent):
+                self.tensor = tensor
+                self.sent = sent
+
+            def wait(self):
+                if self.tensor.dtype == torch.long:
+                    if not metadata_gate.wait(timeout=5):
+                        raise RuntimeError("Metadata was never released")
+                if self.tensor.dtype == torch.float32:
+                    if not payload_gate.wait(timeout=5):
+                        raise RuntimeError("Unexpected blocking payload wait")
+                self.tensor.copy_(self.sent)
+
+        def send(tensor, dst, group=None, tag=0):
+            mailbox.append(tensor.clone())
+            return SimpleNamespace(wait=lambda: None)
+
+        def recv(tensor, src, group=None, tag=0):
+            return ReceiveWork(tensor, mailbox.popleft())
+
+        group = object.__new__(GroupCoordinator)
+        group.__dict__.update(
+            rank_in_group=0,
+            ranks=[0, 1],
+            world_size=2,
+            cpu_group=object(),
+            device_group=object(),
+            device=torch.device("cpu"),
+        )
+        expected = {
+            "batch_seq": 7,
+            "stage_id": 2,
+            "hidden_states": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+            "hc_pre": torch.empty(0),
+        }
+        with patch.multiple(
+            torch.distributed,
+            is_initialized=lambda: True,
+            isend=send,
+            irecv=recv,
+        ):
+            group.send_tensor_dict(expected, dst=1, async_send=True)
+            handle = group.recv_tensor_dict_async(src=1)
+            self.assertFalse(handle.poll_metadata_ready())
+            self.assertEqual(len(mailbox), 2)
+            metadata_gate.set()
+            self.assertTrue(handle._metadata_recv_waiter._done.wait(timeout=5))
+            handle.poll_metadata_ready()
+            self.assertTrue(handle._metadata_recv_waiter._done.wait(timeout=5))
+            self.assertTrue(handle.poll_metadata_ready())
+            self.assertFalse(payload_gate.is_set())
+            payload_gate.set()
+            actual = handle.wait()
+            self.assertEqual(actual["batch_seq"], 7)
+            self.assertEqual(actual["stage_id"], 2)
+            torch.testing.assert_close(
+                actual["hidden_states"], expected["hidden_states"]
+            )
+            self.assertEqual(actual["hc_pre"].numel(), 0)
+            self.assertIs(handle.wait(), actual)
+            self.assertFalse(mailbox)
+
+    def test_async_metadata_wait_propagates_distributed_error(self):
+        def fail():
+            raise RuntimeError("peer disconnected")
+
+        group = object.__new__(GroupCoordinator)
+        group.__dict__.update(
+            rank_in_group=0, ranks=[0, 1], world_size=2, cpu_group=object()
+        )
+        with patch.multiple(
+            torch.distributed,
+            is_initialized=lambda: True,
+            irecv=lambda *args, **kwargs: SimpleNamespace(wait=fail),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "peer disconnected"):
+                group.recv_tensor_dict_async(src=1).wait()
+
+    def _device_module(self):
+        stream = Mock()
+        module = SimpleNamespace(
+            Stream=Mock(return_value=stream),
+            stream=lambda _: nullcontext(),
+            Event=Mock(side_effect=lambda: Mock()),
+        )
+        return module, stream
+
+    def test_receiver_keeps_event_local_and_protects_forward_storage(self):
+        module, comm_stream = self._device_module()
+        tensor = Mock(spec=torch.Tensor)
+        tensor.is_cpu = False
+        tensors = {"hidden_states": tensor, "batch_seq": 0}
+        handle = Mock()
+        handle.wait.return_value = tensors
+        handle.poll_metadata_ready.return_value = False
+        group = SimpleNamespace(
+            device="cuda",
+            recv_tensor_dict_async=Mock(return_value=handle),
+        )
+        with patch.object(torch, "get_device_module", return_value=module):
+            receiver = VPPActivationReceiver(group)
+            receiver.start()
+            self.assertFalse(receiver.progress())
+            handle.wait.assert_not_called()
+            received = receiver.take()
+        self.assertIsInstance(received, VPPReceivedActivation)
+        self.assertIs(received.tensors, tensors)
+        self.assertEqual(set(tensors), {"hidden_states", "batch_seq"})
+        received.recv_event.record.assert_called_once_with(comm_stream)
+        forward_stream = Mock()
+        received.wait_on(forward_stream)
+        forward_stream.wait_event.assert_called_once_with(received.recv_event)
+        tensor.record_stream.assert_called_once_with(forward_stream)
+        self.assertEqual(group.recv_tensor_dict_async.call_count, 2)
+
+    def test_send_credit_and_graph_reuse_fence_all_unfinished_readers(self):
+        module, comm_stream = self._device_module()
+        operations = []
+        items = []
+        for index in range(3):
+            tensor = Mock(spec=torch.Tensor)
+            tensor.is_cpu = False
+            work = Mock()
+            work.wait.side_effect = lambda i=index: operations.append(("wait", i))
+            tensor.record_stream.side_effect = lambda stream, i=index: (
+                operations.append(("retain", i))
+            )
+            items.append(SimpleNamespace(wait=work.wait, payload=tensor))
+        group = SimpleNamespace(
+            device="cuda",
+            send_tensor_dict=Mock(side_effect=[[item] for item in items]),
+        )
+        forward_event = object()
+        with patch.object(torch, "get_device_module", return_value=module):
+            window = VPPSendWindow(group, max_inflight=2)
+            with self.assertRaisesRegex(ValueError, "requires a forward event"):
+                window.send({})
+            window.send({}, forward_event)
+            window.send({}, forward_event)
+            self.assertEqual(operations, [])
+            with self.assertRaisesRegex(RuntimeError, "Acquire"):
+                window.send({}, forward_event)
+            fence = window.acquire()
+            fence.record.assert_called_once_with(comm_stream)
+            self.assertEqual(operations, [("wait", 0), ("retain", 0)])
+            window.send({}, forward_event)
+            # Both remaining sends are inside the credit window, but their
+            # storage is about to be overwritten by the next graph replay.
+            fence = window.wait_for_reuse()
+            fence.record.assert_called_once_with(comm_stream)
+            self.assertEqual(
+                operations,
+                [
+                    ("wait", 0),
+                    ("retain", 0),
+                    ("wait", 1),
+                    ("retain", 1),
+                    ("wait", 2),
+                    ("retain", 2),
+                ],
+            )
+            self.assertEqual(len(window), 0)
+            self.assertIsNone(window.wait_for_reuse())
+        self.assertEqual(
+            comm_stream.wait_event.call_args_list, [call(forward_event)] * 3
+        )
+        for item in items:
+            item.payload.record_stream.assert_called_once_with(comm_stream)
 
 
 if __name__ == "__main__":
