@@ -2094,8 +2094,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 ):
                     self._staging_outstanding.pop(room, None)
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
+                    self._purge_room_state(
+                        room,
+                        terminal_status=self.request_status.get(room),
+                        purge_request_status=False,
+                        purge_deferred_ack_targets=False,
+                    )
                     if self.enable_staging and self._staging_ctx is not None:
                         self._staging_ctx.prefetched_rooms.discard(room)
                         # Snapshot first: the scheduler thread adds concurrently.
@@ -3637,6 +3641,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         self._handle_deferred_abort_ack(notification)
+        if self._staging_outstanding.get(room_to_be_aborted, 0) <= 0:
+            self._purge_room_state(
+                room_to_be_aborted,
+                terminal_status=KVPoll.Failed,
+                purge_request_status=False,
+                purge_deferred_ack_targets=False,
+            )
         return True
 
     def _handle_deferred_abort_ack(self, notification: AbortNotification) -> None:
@@ -3659,6 +3670,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                self.sweep_stale_rooms()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
@@ -3692,8 +3704,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
+                if not self.admit_bootstrap_room(room):
+                    continue
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
