@@ -55,6 +55,10 @@ class SchedulerActor:
             get_numa_node_if_available,
             numa_bind_to_node,
         )
+        from sglang.srt.utils.watchdog import exit_self_on_watchdog_timeout
+
+        # Before Scheduler(), whose watchdog already runs during its init.
+        exit_self_on_watchdog_timeout()
 
         # Declared, not copied: Ray deserializes the argument per call, so this
         # record is the actor's own and nothing else in the process holds it.
