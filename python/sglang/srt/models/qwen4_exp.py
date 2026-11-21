@@ -972,7 +972,7 @@ def _gather_ple_embedding_from_pinned_kernel(
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """PLE table read directly from host memory (pinned, or a file-backed mmap).
+    """Host PLE table (pinned or mmap), gathered directly through UVA on NPU.
 
     The table stays in its checkpoint storage dtype (fp8 with a per-tensor
     weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -1038,13 +1038,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
         )
-        # Only the file backend has anything to prefetch (rows live on storage).
-        self._file_prefetcher = make_ple_file_prefetcher(host_table)
-        # ... and only there does a prefill-sized gather read its rows on the host, on a
-        # GPU that faults each row's page through the driver (see _gathers_on_host).
+        # CUDA prefill gathers may stage file-backed rows on the host.
         table_path = getattr(host_table, "_sglang_ple_file_path", None)
         self._stages_on_host = (
-            table_path is not None
+            not _is_npu
+            and table_path is not None
             and torch.cuda.is_available()
             and device_faults_pageable_pages(torch.cuda.current_device())
         )
@@ -1052,14 +1050,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._table_fd = (
             os.open(table_path, os.O_RDONLY) if self._stages_on_host else None
         )
-        # ... and only it needs its resident set bounded: a fault maps a whole
-        # folio, so the mapping would otherwise creep towards the full table.
-        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         cpu_weight = nn.Parameter(host_table, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
+        self._npu_uva_table = None
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.ple import create_ple_uva_table
+
+            self._npu_uva_table = create_ple_uva_table(self.weight, backend=backend)
+            self._file_prefetcher = None
+            logger.info("NPU PLE lookup route: uva (backend=%s)", backend)
+        else:
+            self._file_prefetcher = make_ple_file_prefetcher(host_table)
+        self._file_rss_trimmer = make_ple_file_rss_trimmer(host_table)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
@@ -1108,8 +1113,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self._file_prefetcher.enqueue(
                     flat_ids, vocab_start=vocab_start, vocab_end=vocab_end
                 )
+            mapping = self._npu_uva_table
+            weight_ptr = (
+                mapping.get_device_pointer(input_ids.device)
+                if mapping is not None
+                else table.data_ptr()
+            )
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                table.data_ptr(),
+                weight_ptr,
                 ids,
                 output,
                 embedding_dim=self.embedding_dim,
