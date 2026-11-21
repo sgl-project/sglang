@@ -216,7 +216,6 @@ class K31VerifyHostBinding:
             float(cfg.activation_situ_linear_beta),
             int(cfg.moe_renormalize),
             int(context_length),
-            # The plugin serves its own verify request buckets (served_request_batches).
             query_width=int(query_width),
         )
 
