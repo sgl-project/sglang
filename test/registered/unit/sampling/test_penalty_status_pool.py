@@ -13,15 +13,13 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=10, suite="extra-test-cpu-intel")
 
 VOCAB_SIZE = 32
-NUM_SLOTS = 16
 DEVICE = "cpu"
 
 
-def _req(slot, rid=None, output_ids=(), **sampling_params):
+def _req(num, output_ids=(), **sampling_params):
     return SimpleNamespace(
-        rid=rid if rid is not None else f"r{slot}",
-        kv=SimpleNamespace(req_pool_idx=slot),
-        penalty_row=None,
+        rid=f"r{num}",
+        penalty_index=None,
         output_ids=list(output_ids),
         sampling_params=SamplingParams(**sampling_params),
         uses_penalty=False,
@@ -31,15 +29,12 @@ def _req(slot, rid=None, output_ids=(), **sampling_params):
 
 
 def _pool():
-    return PenaltyStatusPool(VOCAB_SIZE, NUM_SLOTS, DEVICE)
+    return PenaltyStatusPool(VOCAB_SIZE, DEVICE)
 
 
-def _slots(reqs):
-    return torch.tensor([r.kv.req_pool_idx for r in reqs])
-
-
-def _build(reqs, pool):
-    return StepPenalties.build(reqs, _slots(reqs), pool)
+def _admit(pool, req):
+    pool.alloc(req)
+    pool.reset_history(req)
 
 
 def _expected_penalties(reqs, histories):
@@ -71,9 +66,9 @@ class TestNoPenaltyPath(CustomTestCase):
         pool = _pool()
         reqs = [_req(1), _req(2, temperature=0.5, top_k=4)]
         for req in reqs:
-            pool.admit(req)
+            _admit(pool, req)
 
-        self.assertIsNone(_build(reqs, pool))
+        self.assertIsNone(StepPenalties.build(reqs, pool))
         self.assertEqual(pool.num_rows, 0)
         self.assertEqual(pool.counts.numel(), 0)
 
@@ -91,9 +86,9 @@ class TestMinNewTokens(CustomTestCase):
             _req(2, stop_token_ids=[VOCAB_SIZE + 1]),
         ]
         for req in reqs:
-            pool.admit(req)
+            _admit(pool, req)
 
-        additive, _ = _build(reqs, pool).logit_penalties()
+        additive, _ = StepPenalties.build(reqs, pool).logit_penalties()
 
         blocked = torch.isneginf(additive)
         self.assertEqual(
@@ -104,7 +99,7 @@ class TestMinNewTokens(CustomTestCase):
 
 class TestHistory(CustomTestCase):
     def _step(self, pool, reqs, histories, rng):
-        step = _build(reqs, pool)
+        step = StepPenalties.build(reqs, pool)
         torch.testing.assert_close(
             _stacked(*step.logit_penalties(), len(reqs)),
             torch.stack(_expected_penalties(reqs, histories)),
@@ -124,25 +119,23 @@ class TestHistory(CustomTestCase):
 
         running = [a, b]
         for req in running:
-            pool.admit(req)
+            _admit(pool, req)
         for _ in range(3):
             self._step(pool, running, [r.output_ids for r in running], rng)
 
-        pool.admit(c)
+        _admit(pool, c)
         running.append(c)
         for _ in range(4):
             self._step(pool, running, [r.output_ids for r in running], rng)
 
-        # a is retracted (keeps its row); d takes its slot.
+        # a is retracted (keeps its row).
         running.remove(a)
-        d.kv.req_pool_idx = a.kv.req_pool_idx
-        pool.admit(d)
+        _admit(pool, d)
         running.append(d)
         for _ in range(2):
             self._step(pool, running, [r.output_ids for r in running], rng)
 
-        a.kv.req_pool_idx = 5
-        pool.admit(a)
+        _admit(pool, a)
         running.append(a)
         for _ in range(3):
             self._step(pool, running, [r.output_ids for r in running], rng)
@@ -156,36 +149,36 @@ class TestHistory(CustomTestCase):
         pool = _pool()
         reqs = [_req(1, frequency_penalty=1.0), _req(2)]
         for req in reqs:
-            pool.admit(req)
+            _admit(pool, req)
 
-        _build(reqs, pool).commit(torch.tensor([-1, VOCAB_SIZE]))
-        _build(reqs, pool).commit(
+        StepPenalties.build(reqs, pool).commit(torch.tensor([-1, VOCAB_SIZE]))
+        StepPenalties.build(reqs, pool).commit(
             torch.tensor([[3, VOCAB_SIZE, -1], [VOCAB_SIZE + 5, 2, 2]]),
             accept_mask=torch.tensor([[True, True, False], [False, True, True]]),
         )
 
-        additive, _ = _build(reqs[:1], pool).logit_penalties()
+        additive, _ = StepPenalties.build(reqs[:1], pool).logit_penalties()
         expected, _ = _expected_penalties(reqs[:1], [[3]])
         torch.testing.assert_close(additive, expected)
-        rows = pool.rows(_slots(reqs[:1]))
-        self.assertEqual(pool.gather_lens(rows).tolist(), [1])
+        indices = torch.tensor([reqs[0].penalty_index])
+        self.assertEqual(pool.gather_lens(indices).tolist(), [1])
 
-    def test_commit_into_freed_row_is_reset_by_next_admit(self):
+    def test_commit_into_freed_row_is_reset_by_next_admission(self):
         pool = _pool()
         live = _req(3, frequency_penalty=1.0)
         a = _req(1, frequency_penalty=1.0)
-        pool.admit(live)
-        pool.admit(a)
-        row = a.penalty_row
-        step = _build([a], pool)
+        _admit(pool, live)
+        _admit(pool, a)
+        row = a.penalty_index
+        step = StepPenalties.build([a], pool)
 
         pool.free(a)
         step.commit(torch.tensor([7]))
         b = _req(2, frequency_penalty=1.0, output_ids=[3])
-        pool.admit(b)
-        self.assertEqual(b.penalty_row, row)
+        _admit(pool, b)
+        self.assertEqual(b.penalty_index, row)
 
-        additive, _ = _build([b], pool).logit_penalties()
+        additive, _ = StepPenalties.build([b], pool).logit_penalties()
         torch.testing.assert_close(additive, _expected_penalties([b], [[3]])[0])
 
     def test_step_after_the_last_free_reads_and_counts_nothing(self):
@@ -200,9 +193,9 @@ class TestHistory(CustomTestCase):
             stop_token_ids=[7],
         )
         b = _req(2, output_ids=[5], presence_penalty=1.0)
-        pool.admit(a)
-        pool.admit(b)
-        step = _build([a, b], pool)
+        _admit(pool, a)
+        _admit(pool, b)
+        step = StepPenalties.build([a, b], pool)
         step.logit_penalties()
 
         pool.free(a)
@@ -217,38 +210,20 @@ class TestHistory(CustomTestCase):
         self.assertEqual(pool.counts.shape[0], 0)
 
         c = _req(3, frequency_penalty=1.0, output_ids=[3])
-        pool.admit(c)
-        self.assertEqual(c.penalty_row, 0)
-        additive, _ = _build([c], pool).logit_penalties()
+        _admit(pool, c)
+        self.assertEqual(c.penalty_index, 0)
+        additive, _ = StepPenalties.build([c], pool).logit_penalties()
         torch.testing.assert_close(additive, _expected_penalties([c], [[3]])[0])
-
-    def test_step_reads_the_row_its_slot_holds_at_sampling(self):
-        pool = _pool()
-        live = _req(3, frequency_penalty=1.0)
-        a = _req(1, frequency_penalty=1.0, output_ids=[4])
-        b = _req(2, frequency_penalty=1.0, output_ids=[5])
-        pool.admit(live)
-        pool.admit(a)
-        pool.admit(b)
-        shared = _build([a], pool)
-
-        pool.free(a)
-        pool.free(b)
-        pool.admit(a)
-        self.assertEqual(a.penalty_row, 2)
-
-        additive, _ = shared.logit_penalties()
-        torch.testing.assert_close(additive, _expected_penalties([a], [[4]])[0])
 
     def test_readmission_resets_a_discarded_chunk_sample(self):
         pool = _pool()
         a = _req(1, presence_penalty=1.0)
-        pool.admit(a)
-        middle_chunk = _build([a], pool)
+        _admit(pool, a)
+        middle_chunk = StepPenalties.build([a], pool)
         middle_chunk.commit(torch.tensor([9]))
 
-        pool.admit(a)
-        additive, _ = _build([a], pool).logit_penalties()
+        _admit(pool, a)
+        additive, _ = StepPenalties.build([a], pool).logit_penalties()
         torch.testing.assert_close(additive, torch.zeros(1, VOCAB_SIZE))
 
 
@@ -257,23 +232,14 @@ class TestBuild(CustomTestCase):
         """Under overlap a step is built while the previous one is in flight."""
         pool = _pool()
         req = _req(1, frequency_penalty=1.0, output_ids=[2])
-        pool.admit(req)
-        previous = _build([req], pool)
-        current = _build([req], pool)
+        _admit(pool, req)
+        previous = StepPenalties.build([req], pool)
+        current = StepPenalties.build([req], pool)
         previous.commit(torch.tensor([7]))
 
         additive, _ = current.logit_penalties()
         expected, _ = _expected_penalties([req], [[2, 7]])
         torch.testing.assert_close(additive, expected)
-
-    def test_slots_past_the_requests_are_ignored(self):
-        """A decode batch's slots can run past its requests (beam member rows)."""
-        pool = _pool()
-        req = _req(1, frequency_penalty=1.0, output_ids=[3])
-        pool.admit(req)
-        step = StepPenalties.build([req], torch.tensor([1, 9, 10]), pool)
-        additive, _ = step.logit_penalties()
-        torch.testing.assert_close(additive, _expected_penalties([req], [[3]])[0])
 
 
 if __name__ == "__main__":

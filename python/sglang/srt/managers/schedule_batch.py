@@ -568,10 +568,10 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
-        # Set by PenaltyStatusPool.admit; the params do not change after admission.
+        # Set by PenaltyStatusPool.alloc; the params do not change after admission.
         self.uses_penalty = False
         # Row in the scheduler's PenaltyStatusPool; a retraction keeps it.
-        self.penalty_row: Optional[int] = None
+        self.penalty_index: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None

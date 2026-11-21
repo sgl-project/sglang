@@ -146,18 +146,17 @@ class TestPenaltyRowExit(CustomTestCase):
         retirer = release_only_retirer(MagicMock())
         retirer.send_abort_output = lambda abort_req, req: None
         req = _req(finished_reason, [])
-        req.kv.req_pool_idx = 0
-        req.penalty_row = None
+        req.penalty_index = None
         req.sampling_params = SamplingParams(presence_penalty=1.0)
         req.output_ids = []
-        retirer.penalty_status_pool.admit(req)
+        retirer.penalty_status_pool.alloc(req)
         return retirer, req
 
     def test_release_frees_the_row(self):
         retirer, req = self._penalized(FINISH_LENGTH(length=0))
         with patch.object(request_retirer, "release_kv_cache"):
             retirer.release(req, checkpoint=False)
-        self.assertIsNone(req.penalty_row)
+        self.assertIsNone(req.penalty_index)
         self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
 
     def test_abort_retracted_frees_the_row(self):
@@ -166,7 +165,7 @@ class TestPenaltyRowExit(CustomTestCase):
         req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         with patch.object(request_retirer, "make_abort_req"):
             retirer.abort_retracted(req, reason=FINISH_ABORT())
-        self.assertIsNone(req.penalty_row)
+        self.assertIsNone(req.penalty_index)
         self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
 
 

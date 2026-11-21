@@ -1,12 +1,16 @@
 """Sampling-penalty history: per-request rows of output-token counts and lengths.
 
-Host calls (`admit`, `free`, `StepPenalties.build`) only queue writes; the
-tables are written, grown, and read on the sampling stream, so a step sees the
-tokens of every step sampled before it.
+Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only
+queue writes; the tables are written, grown, and read on the sampling stream, so
+a step sees the tokens of every step sampled before it.
 
 A penalized request takes a row at its first extend admission, and every extend
 admission resets the row and replays `output_ids` into it. A retraction keeps
 the row; the request's exit (`RequestRetirer`) frees it.
+
+A step reads and commits the rows it was built with. The scheduler admits no
+request between a step's build and its sampling, so none of those rows goes to
+another request before the step samples.
 
 Freeing the last live row drops the tables at once. That is safe because they
 were allocated on the sampling stream, so their memory goes only to later
@@ -49,49 +53,41 @@ def uses_penalty(sampling_params) -> bool:
 
 
 class PenaltyStatusPool:
-    def __init__(self, vocab_size: int, num_slots: int, device):
+    def __init__(self, vocab_size: int, device):
         self.vocab_size = vocab_size
         self.device = device
         self.num_rows = 0
         self.free_rows: List[int] = []
-        self.pending_slots: Dict[int, int] = {}
         self.pending_init: Dict[int, List[int]] = {}
-        # Slot -> row. `free` leaves the entry, so a step built before the free
-        # still reads that row; the slot's next `admit` rewrites it.
-        self.slot_to_row = torch.full(
-            (num_slots,), -1, dtype=torch.int32, device=device
-        )
         self.counts = torch.zeros((0, vocab_size), dtype=torch.int32, device=device)
         self.lens = torch.zeros((0,), dtype=torch.int32, device=device)
 
-    def admit(self, req) -> None:
+    def alloc(self, req) -> None:
         req.uses_penalty = uses_penalty(req.sampling_params)
-        if not req.uses_penalty:
+        if not req.uses_penalty or req.penalty_index is not None:
             return
-        if req.penalty_row is None:
-            if self.free_rows:
-                req.penalty_row = self.free_rows.pop()
-            else:
-                req.penalty_row = self.num_rows
-                self.num_rows += 1
-        self.pending_slots[req.kv.req_pool_idx] = req.penalty_row
-        self.pending_init[req.penalty_row] = list(req.output_ids)
+        if self.free_rows:
+            req.penalty_index = self.free_rows.pop()
+        else:
+            req.penalty_index = self.num_rows
+            self.num_rows += 1
+
+    def reset_history(self, req) -> None:
+        if req.penalty_index is not None:
+            self.pending_init[req.penalty_index] = list(req.output_ids)
 
     def free(self, req) -> None:
         if self.num_rows == 0:
             return
-        row = req.penalty_row
+        row = req.penalty_index
         if row is None:
             return
-        req.penalty_row = None
+        req.penalty_index = None
         self.pending_init.pop(row, None)
         self.free_rows.append(row)
         if len(self.free_rows) == self.num_rows:
-            # No row is live: every queued table entry points at a freed row.
             self.num_rows = 0
             self.free_rows.clear()
-            self.pending_slots.clear()
-            self.pending_init.clear()
             self.counts = torch.empty(
                 (0, self.vocab_size), dtype=torch.int32, device=self.device
             )
@@ -108,14 +104,6 @@ class PenaltyStatusPool:
             lens = torch.zeros((new_capacity,), dtype=torch.int32, device=self.device)
             lens[:capacity] = self.lens
             self.counts, self.lens = counts, lens
-
-        if self.pending_slots:
-            slots = list(self.pending_slots)
-            rows = list(self.pending_slots.values())
-            self.pending_slots.clear()
-            self.slot_to_row[
-                async_h2d(slots, dtype=torch.int64, device=self.device)
-            ] = async_h2d(rows, dtype=torch.int32, device=self.device)
 
         if not self.pending_init:
             return
@@ -138,10 +126,6 @@ class PenaltyStatusPool:
                 torch.ones(len(replay_rows), dtype=torch.int32, device=self.device),
                 accumulate=True,
             )
-
-    def rows(self, slots: torch.Tensor) -> torch.Tensor:
-        self._flush()
-        return self.slot_to_row[slots]
 
     def gather_counts(self, rows: torch.Tensor) -> torch.Tensor:
         self._flush()
@@ -193,9 +177,9 @@ class PenaltyStatusPool:
 class StepPenalties:
     pool: PenaltyStatusPool
     batch_size: int
-    # [n] batch positions and slots of the n penalized requests.
+    # [n] batch positions and penalty indices of the n penalized requests.
     batch_indices: torch.Tensor
-    slots: torch.Tensor
+    indices: torch.Tensor
     # [n, 1] per penalized request, None when none of them uses that penalty.
     frequency: Optional[torch.Tensor]
     presence: Optional[torch.Tensor]
@@ -205,27 +189,19 @@ class StepPenalties:
     stop_token_ids: Optional[torch.Tensor]
 
     @classmethod
-    def build(
-        cls, reqs: Sequence, req_pool_indices: torch.Tensor, pool: PenaltyStatusPool
-    ) -> Optional[StepPenalties]:
+    def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
         batch_indices = [i for i, r in enumerate(reqs) if r.uses_penalty]
         if not batch_indices:
             return None
-        for i in batch_indices:
-            if reqs[i].penalty_row is None:
+        indices = [reqs[i].penalty_index for i in batch_indices]
+        for i, index in zip(batch_indices, indices):
+            if index is None:
                 raise RuntimeError(
                     f"request {reqs[i].rid} uses sampling penalties but holds no "
-                    "penalty row; PenaltyStatusPool.admit was not called"
+                    "penalty index; PenaltyStatusPool.alloc was not called"
                 )
 
         device = pool.device
-        batch_indices_device = async_h2d(
-            batch_indices, dtype=torch.int64, device=device
-        )
-        if len(batch_indices) == len(reqs):
-            slots = req_pool_indices[: len(reqs)]
-        else:
-            slots = req_pool_indices[batch_indices_device]
         params = [reqs[i].sampling_params for i in batch_indices]
         uses_frequency, uses_presence, uses_repetition, uses_min_new_tokens = (
             any(kind) for kind in zip(*(_penalty_kinds(p) for p in params))
@@ -248,8 +224,8 @@ class StepPenalties:
         return cls(
             pool=pool,
             batch_size=len(reqs),
-            batch_indices=batch_indices_device,
-            slots=slots,
+            batch_indices=async_h2d(batch_indices, dtype=torch.int64, device=device),
+            indices=async_h2d(indices, dtype=torch.int64, device=device),
             frequency=per_row(
                 [p.frequency_penalty for p in params], torch.float32, uses_frequency
             ),
@@ -267,8 +243,7 @@ class StepPenalties:
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """(additive, scaling) [batch_size, vocab] penalties, each None if unused."""
-        rows = self.pool.rows(self.slots)
-        counts = self.pool.gather_counts(rows)
+        counts = self.pool.gather_counts(self.indices)
         vocab_size = self.pool.vocab_size
         device = counts.device
         present = (
@@ -289,7 +264,7 @@ class StepPenalties:
             if self.presence is not None:
                 additive.addcmul_(present, self.presence, value=-1)
             if self.min_new_tokens is not None:
-                lens = self.pool.gather_lens(rows)
+                lens = self.pool.gather_lens(self.indices)
                 stop_penalties = torch.zeros(
                     (counts.shape[0], vocab_size + 1),
                     dtype=torch.float32,
@@ -330,7 +305,7 @@ class StepPenalties:
             token_ids = token_ids[self.batch_indices]
             if accept_mask is not None:
                 accept_mask = accept_mask[self.batch_indices]
-        self.pool.accumulate(self.pool.rows(self.slots), token_ids, accept_mask)
+        self.pool.accumulate(self.indices, token_ids, accept_mask)
 
 
 def _stop_token_ids(req, vocab_size: int) -> List[int]:

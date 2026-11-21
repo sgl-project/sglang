@@ -27,8 +27,7 @@ class _Batch:
 
 def _req(**sampling_params):
     return SimpleNamespace(
-        kv=SimpleNamespace(req_pool_idx=None),
-        penalty_row=None,
+        penalty_index=None,
         output_ids=[],
         sampling_params=SamplingParams(**sampling_params),
         eos_token_ids=None,
@@ -56,12 +55,11 @@ class _H2DCopies(TorchDispatchMode):
 
 
 def _step_penalties(reqs, device):
-    pool = PenaltyStatusPool(VOCAB_SIZE, len(reqs) + 1, device)
-    for slot, req in enumerate(reqs, start=1):
-        req.kv.req_pool_idx = slot
-        pool.admit(req)
-    slots = torch.arange(1, len(reqs) + 1, device=device)
-    return StepPenalties.build(reqs, slots, pool)
+    pool = PenaltyStatusPool(VOCAB_SIZE, device)
+    for req in reqs:
+        pool.alloc(req)
+        pool.reset_history(req)
+    return StepPenalties.build(reqs, pool)
 
 
 class _SamplingMetadataTestBase(CustomTestCase):

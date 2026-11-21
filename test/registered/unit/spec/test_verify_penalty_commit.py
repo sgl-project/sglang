@@ -16,18 +16,16 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 VOCAB_SIZE = 16
 
 
-def _req(slot, **sampling_params):
+def _req(num, **sampling_params):
     return SimpleNamespace(
-        rid=f"r{slot}",
-        kv=SimpleNamespace(req_pool_idx=slot),
-        penalty_row=None,
+        rid=f"r{num}",
+        penalty_index=None,
         output_ids=[],
         sampling_params=SamplingParams(**sampling_params),
     )
 
 
 def _info(reqs, pool):
-    slots = torch.tensor([r.kv.req_pool_idx for r in reqs])
     bs = len(reqs)
     info = SamplingBatchInfo(
         temperatures=torch.ones(bs, 1),
@@ -42,21 +40,22 @@ def _info(reqs, pool):
         vocab_size=VOCAB_SIZE,
         device="cpu",
     )
-    info.set_step_penalties(StepPenalties.build(reqs, slots, pool))
+    info.set_step_penalties(StepPenalties.build(reqs, pool))
     return info
 
 
 class TestVerifyPenaltyCommit(CustomTestCase):
     def setUp(self):
         super().setUp()
-        self.pool = PenaltyStatusPool(VOCAB_SIZE, 4, "cpu")
+        self.pool = PenaltyStatusPool(VOCAB_SIZE, "cpu")
         self.reqs = [
             _req(1, frequency_penalty=1.0),
             _req(2),
             _req(3, frequency_penalty=1.0),
         ]
         for req in self.reqs:
-            self.pool.admit(req)
+            self.pool.alloc(req)
+            self.pool.reset_history(req)
 
     def _counts(self):
         additive, _ = _info(self.reqs, self.pool).step_penalties.logit_penalties()

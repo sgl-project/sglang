@@ -1397,7 +1397,6 @@ class Scheduler(
     def init_penalty_status_pool(self) -> None:
         self.penalty_status_pool = PenaltyStatusPool(
             vocab_size=self.model_config.vocab_size,
-            num_slots=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
         )
 
@@ -4606,7 +4605,8 @@ class Scheduler(
 
     def admit_penalty_rows(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            self.penalty_status_pool.admit(req)
+            self.penalty_status_pool.alloc(req)
+            self.penalty_status_pool.reset_history(req)
 
     def _get_new_batch_prefill_raw(
         self,
@@ -5442,9 +5442,7 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             batch.sampling_info.set_step_penalties(
-                StepPenalties.build(
-                    batch.reqs, batch.req_pool_indices, self.penalty_status_pool
-                )
+                StepPenalties.build(batch.reqs, self.penalty_status_pool)
             )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2

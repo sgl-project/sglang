@@ -37,7 +37,7 @@ class FakeReq(SimpleNamespace):
 
 
 def idle_penalty_status_pool() -> PenaltyStatusPool:
-    return PenaltyStatusPool(vocab_size=1, num_slots=1, device="cpu")
+    return PenaltyStatusPool(vocab_size=1, device="cpu")
 
 
 def release_only_retirer(
