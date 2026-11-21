@@ -215,6 +215,43 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self.assertTrue(layer.w2_weight_scale.load_full_w2)
         self.assertTrue(layer.w2_weight_zero_point.load_full_w2)
 
+    def test_weight_actorder_shards_w2_scales_like_static(self):
+        """actorder "weight" is compressed-tensors' alias of "static" and must load like it.
+
+        compressed-tensors keeps the string as written, so a raw comparison with
+        "static" treated "weight" as dynamic: at moe_tp_size > 1 it loaded the full
+        unsharded w2 scale with no g_idx, and Marlin derived a smaller group from it.
+        """
+
+        def w2_scale_layout(actorder):
+            quant_config = CompressedTensorsConfig.from_config(
+                _make_wna16_moe_config(
+                    ["re:.*mlp.experts.*"], num_bits=4, actorder=actorder
+                )
+            )
+            with mock.patch.object(
+                compressed_tensors,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ):
+                scheme = quant_config.get_moe_scheme(
+                    torch.nn.Module(), layer_name=EXPERTS_LAYER
+                )
+            layer = torch.nn.Module()
+            layer.moe_tp_size = 4
+            scheme.create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=256,
+                intermediate_size_per_partition=256,
+                params_dtype=torch.float16,
+            )
+            scale = layer.w2_weight_scale
+            return tuple(scale.shape), scale.load_full_w2
+
+        self.assertEqual(w2_scale_layout("static"), ((2, 2, 256), False))
+        self.assertEqual(w2_scale_layout("weight"), w2_scale_layout("static"))
+
 
 if __name__ == "__main__":
     unittest.main()
