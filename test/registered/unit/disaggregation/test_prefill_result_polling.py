@@ -908,7 +908,9 @@ class TestPrefillResultPolling(CustomTestCase):
         # `_is_transfer_wait_polling_enabled`: attention CP shards keep
         # different inflight queues, so the TP-wide readiness all-reduce would
         # desynchronize. Those and the other unsupported loops warn and keep the
-        # blocking wait; so does the flag left off, silently.
+        # blocking wait; so does the flag left off, silently. Speculation is
+        # supported: the wait only polls the result's copy event and takes no
+        # input, so no second forward is pipelined behind relayed draft state.
         for mode in (
             "disabled",
             "supported",
@@ -941,7 +943,12 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.is_generation = False
                 elif mode == "dllm":
                     scheduler.dllm_config = object()
-                polling = mode in ("supported", "independent_dp", "attention_dp")
+                polling = mode in (
+                    "supported",
+                    "independent_dp",
+                    "attention_dp",
+                    "speculation",
+                )
                 logs = (
                     self.assertNoLogs
                     if polling or mode == "disabled"
