@@ -832,6 +832,9 @@ class Req(ReqDllmMixin):
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
+        # Aborted while its PD KV sender held it; not traced as a server fault.
+        self.aborted_by_caller: bool = False
+
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
         # Orchestrator KV hints, forwarded to the HiCache storage backends.
