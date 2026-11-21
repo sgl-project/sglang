@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from abc import ABC, abstractmethod
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -22,6 +23,23 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def raise_error_abort(finish_reason: dict) -> None:
+    """Raise an abort with a 4xx/5xx status as a non-streaming request gets it
+    (TokenizerManager._handle_abort_finish_reason).
+
+    A streaming handler sends its status line with the first chunk, so a stream
+    refused before it (e.g. "The request queue is full.") gets the refusal's
+    status instead of an error event under HTTP 200.
+    """
+    status = finish_reason["status_code"]
+    if not HTTPStatus.BAD_REQUEST <= status < 600:
+        return
+    message = finish_reason.get("message", "Generation aborted.")
+    if status == HTTPStatus.BAD_REQUEST:
+        raise ValueError(message)
+    raise HTTPException(status_code=int(status), detail=message)
 
 
 # Base class for specific endpoint handlers
