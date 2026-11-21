@@ -268,22 +268,33 @@ class HashTopK(nn.Module):
         routed_ids = (
             topk_ids[:, :-num_shared_topk_slots] if num_shared_topk_slots else topk_ids
         )
-        log2phy_prob = None
         if (
-            expert_location_dispatch_info is not None
+            _is_npu
+            and expert_location_dispatch_info is not None
             and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
-            if self.layer_id is None:
-                raise RuntimeError("HashTopK LP dispatch requires layer_id.")
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+            from sglang.srt.hardware_backend.npu.moe.lplb import dispatch_npu_lplb
 
-            lplb_solver = get_global_lplb_solver(self.layer_id)
-            if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(routed_ids)
+            routed_cols = dispatch_npu_lplb(
+                routed_ids, self.layer_id, num_token_non_padded
+            )
+        else:
+            log2phy_prob = None
+            if (
+                expert_location_dispatch_info is not None
+                and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
+            ):
+                if self.layer_id is None:
+                    raise RuntimeError("HashTopK LP dispatch requires layer_id.")
+                from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
-        routed_cols = topk_ids_logical_to_physical(
-            routed_ids, expert_location_dispatch_info, log2phy_prob
-        )
+                lplb_solver = get_global_lplb_solver(self.layer_id)
+                if lplb_solver is not None:
+                    log2phy_prob = lplb_solver.solve(routed_ids)
+
+            routed_cols = topk_ids_logical_to_physical(
+                routed_ids, expert_location_dispatch_info, log2phy_prob
+            )
         recorder_topk_ids = routed_cols if num_shared_topk_slots else None
         if has_per_rank_fused_shared_slots(num_shared_topk_slots):
             num_physical_routed_experts = (

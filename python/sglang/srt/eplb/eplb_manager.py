@@ -167,7 +167,8 @@ class EPLBManager:
                 update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
                 ep_dispatch_algorithm=get_exec().moe.ep_dispatch_algorithm,
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
-                    model_config=self._model_config
+                    model_config=self._model_config,
+                    update_layer_ids=chunk_layer_ids,
                 ),
             )
             if is_post_scale_rebalance:
