@@ -1181,6 +1181,31 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        from sglang.srt.disaggregation.media_metadata import (
+            media_mode,
+            request_image_metadata,
+        )
+        from sglang.srt.runtime_context import get_disagg
+
+        if media_mode() == "request" and get_disagg().disaggregation_mode == "decode":
+            ids = (
+                input_text
+                if not isinstance(input_text, str)
+                else self._processor.tokenizer.encode(input_text)
+            )
+            metadata = request_image_metadata(
+                image_data,
+                ids,
+                image_token_id=self.mm_tokens.image_token_id,
+                merge_size=self.spatial_merge_size,
+                limit=kwargs.get("max_req_input_len", 131072),
+            )
+            if metadata is not None:
+                if request_obj.video_data or request_obj.audio_data:
+                    raise ValueError(
+                        "Metadata-only decode supports image-only requests"
+                    )
+                return metadata
         if (
             not image_data
             or request_obj.video_data

@@ -3474,6 +3474,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
             return
 
+        if envs.SGLANG_PD_MEDIA_METADATA_MODE.get() == "transfer":
+            from sglang.srt.disaggregation.media_metadata import import_metadata
+
+            config = self.scheduler.model_config.hf_config
+            try:
+                import_metadata(
+                    self.metadata_buffers.get_media_metadata(idx),
+                    decode_req.req,
+                    merge_size=getattr(config.vision_config, "spatial_merge_size", 2),
+                    image_token_id=config.image_token_id,
+                )
+            except (ValueError, TypeError, AttributeError) as exc:
+                prepare_abort(
+                    decode_req.req,
+                    f"Invalid P/D media metadata: {exc}",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
+
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer

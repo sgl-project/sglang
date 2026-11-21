@@ -357,9 +357,13 @@ class CommonKVManager(BaseKVManager):
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
-        self.exchange_aux_item_lens = self.customized_info_enabled or (
-            get_disagg().disaggregation_max_top_logprobs_num
-            != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+        self.exchange_aux_item_lens = (
+            self.customized_info_enabled
+            or (
+                get_disagg().disaggregation_max_top_logprobs_num
+                != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+            )
+            or envs.SGLANG_PD_MEDIA_METADATA_MODE.get() == "transfer"
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
