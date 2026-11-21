@@ -223,6 +223,12 @@ class GraphSlot:
 
     # runtime
     buffer: Optional[torch.Tensor] = field(default=None, repr=False)
+    # (buffer, n, view): the last head view, reused while the buffer and the row
+    # count repeat (steady-state decode). One entry, so a slot whose count varies
+    # every step (eager or prefill) does not accumulate views.
+    _last_head: Optional[Tuple[torch.Tensor, int, torch.Tensor]] = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.axis not in ("bs", "tokens", "none"):
@@ -245,6 +251,21 @@ class GraphSlot:
         if self.axis == "tokens":
             return raw_num_tokens
         return self.buffer.shape[0] if self.buffer is not None else 0
+
+    def head(self, n: int) -> torch.Tensor:
+        """The buffer's leading ``n`` rows as ``fill_from`` writes them
+        (``slice_fn`` when set; the whole buffer for axis ``"none"``)."""
+        last = self._last_head
+        if last is not None and last[0] is self.buffer and last[1] == n:
+            return last[2]
+        if self.slice_fn is not None:
+            view = self.slice_fn(self.buffer, n)
+        elif self.axis == "none":
+            view = self.buffer
+        else:
+            view = self.buffer[:n]
+        self._last_head = (self.buffer, n, view)
+        return view
 
     def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
         """Return the ``[:padded_n]`` slice of the buffer consumed by callers.
@@ -493,13 +514,7 @@ class CudaGraphBufferRegistry:
                     # Non-tensor FB fields (e.g. dicts, dataclasses) are not
                     # auto-copied — caller handles via source_fn or post_fill.
                     continue
-                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-                if slot.slice_fn is not None:
-                    dst = slot.slice_fn(slot.buffer, raw_n)
-                elif slot.axis == "none":
-                    dst = slot.buffer
-                else:
-                    dst = slot.buffer[:raw_n]
+                dst = slot.head(slot._raw_n(raw_bs, raw_num_tokens))
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":
@@ -530,7 +545,12 @@ class CudaGraphBufferRegistry:
         dsts: List[torch.Tensor] = []
         srcs: List[torch.Tensor] = []
         for name, src in sources.items():
-            dst = self._slots[name].buffer[: src.shape[0]]
+            slot = self._slots[name]
+            dst = (
+                slot.head(src.shape[0])
+                if slot.slice_fn is None and slot.axis != "none"
+                else slot.buffer[: src.shape[0]]
+            )
             if not same_tensor_view(dst, src):
                 dsts.append(dst)
                 srcs.append(src)
@@ -713,6 +733,7 @@ def build_decode_registry(
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
             compute_local_num_token_non_padded,
+            compute_local_num_token_non_padded_cpu,
         )
 
         def _num_token_non_padded_post_fill(buf, fb, ctx):
@@ -731,6 +752,17 @@ def build_decode_registry(
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
             )
+            if fb.global_num_token_non_padded_cpu is not None:
+                # Every writer of the device scalar sets the host count with it,
+                # so one fill replaces the subtract, clamp and copy launches.
+                buf.fill_(
+                    compute_local_num_token_non_padded_cpu(
+                        global_num_token_non_padded=fb.global_num_token_non_padded_cpu,
+                        num_tokens_per_dp=ctx.padded_num_tokens,
+                        sharded=sharded,
+                    )
+                )
+                return
             buf.copy_(
                 compute_local_num_token_non_padded(
                     global_num_token_non_padded=fb.global_num_token_non_padded,

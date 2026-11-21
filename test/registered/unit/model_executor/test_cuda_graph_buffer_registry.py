@@ -872,9 +872,16 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             reg.fill_from(
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
-        # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
-        # local = clamp(global(100) - rank*4, 0, 4) = 4.
-        self.assertEqual(int(src.num_token_non_padded.item()), 4)
+            # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
+            # local = clamp(global(100) - rank*4, 0, 4) = 4.
+            self.assertEqual(int(src.num_token_non_padded.item()), 4)
+            # With the host count present it is the source (the device scalar
+            # is not read), localized against the padded bucket: min(3, 4) = 3.
+            fb.global_num_token_non_padded_cpu = 3
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        self.assertEqual(int(src.num_token_non_padded.item()), 3)
 
     def test_num_token_non_padded_bypass_carries_local_count(self):
         # Regression: the dense SBD draft and TBO sub-batches bypass

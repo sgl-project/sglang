@@ -97,6 +97,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
         proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+        proposer._num_token_non_padded_value = None
         proposer._dp_meta_host = None
         proposer._dp_meta_device = None
         proposer._dp_meta_copied = []
