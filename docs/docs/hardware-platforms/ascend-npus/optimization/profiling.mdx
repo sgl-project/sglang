@@ -18,6 +18,10 @@ profiling quickly.
 For more profiling scenarios (e.g., Nsight Systems, PD disaggregation, etc.),
 see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
 
+This page describes LLM serving. For image and video generation, see [Diffusion profiling](/docs/sglang-diffusion/profiling#ascend-npu-traces). Both paths use the same NPU trace handler. It chooses parsing from the current process's daemon flag: non-daemon workers use the native NPU callback, while daemon workers submit an independent background parser when capture stops, without waiting for it. This applies to both SRT profiler paths, including `SGLANG_PROFILE_V2`, and to Diffusion. Standard LLM workers use native parsing; Diffusion workers normally use background parsing. The endpoint examples below are for LLM serving.
+
+For background parsing, request completion does not imply that analysis has completed. Check each capture's `sglang_analysis.json` and `sglang_analysis.log`; parser failures are reported separately from the generation result. Native parsing does not create these SGLang background-status files.
+
 ## Ascend PyTorch Profiler
 
 SGLang has built-in PyTorch Profiler support. Through the Ascend `torch_npu`
@@ -238,9 +242,7 @@ shown in the server log as `Profiling done. Traces are saved to: <path>`.
 </Note>
 
 <Note>
-On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically
-redirect PyTorch Profiler's CUDA activity to NPU, so
-`activities: ["CPU", "GPU"]` actually captures NPU operator events.
+On Ascend NPU, SGLang's compatibility helper applies the profiler replacements through the available `torch_npu` patch API, including versions where that API has moved into an internal module. PyTorch Profiler's CUDA activity is redirected to NPU, so `activities: ["CPU", "GPU"]` captures NPU operator events.
 </Note>
 
 **`bench_serving --profile` parameters:**

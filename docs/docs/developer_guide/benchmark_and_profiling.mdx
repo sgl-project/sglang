@@ -78,6 +78,18 @@ Use `bench_serving` by default unless there are specific needs.
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
+On Ascend NPU, traces use the native `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json` layout rather than `*.trace.json.gz`. See [Ascend profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) for LLM serving, or [Diffusion profiling](/docs/sglang-diffusion/profiling#ascend-npu-traces) for image/video generation. Both parse captures automatically. A shared NPU handler selects native parsing for non-daemon workers and background parsing for daemon workers, regardless of the workload. With background parsing, generation completion does not imply that the trace is ready: check each capture's `sglang_analysis.json` and `sglang_analysis.log` for analysis results. Analysis failures are reported separately from the generation result.
+
+### NPU profiler integration
+
+`NPUTraceHandler` in `sglang.srt.observability.profile_analysis_npu` provides stateless helpers for Diffusion and both SRT profiler paths:
+
+- `apply_patches("diffusion" | "srt")` installs each entry point's existing replacements through the torch_npu compatibility helper. Diffusion replaces the profiler and schedule; SRT replaces the profiler and CPU/CUDA activity mappings. Keep these calls behind the entry point's NPU guard.
+- `get_on_trace_ready(output_dir)` creates the callback and selects native parsing from the process's daemon flag. Callers do not retain a handler instance or inspect daemon state.
+- `stop_capture(profiler, ...)` owns optional device synchronization, capture-stop error handling, and background submission using the current capture's `prof_if.prof_path`. Diffusion supplies its rank and replica CPU group to coordinate daemon capture errors. SRT keeps its existing local stop and subsequent barrier behavior.
+
+The Diffusion wrapper owns idempotency and instance cleanup. Its `stop_on_error()` method performs local cleanup without adding collectives or background analysis for NPU, logs cleanup errors, and lets the executor preserve the original inference error. Non-NPU trace export and rank selection keep their existing behavior. Background parser status never participates in capture-stop collectives.
+
 ### Profile a server with `sglang.benchmark.serving`
 
 ```bash Command
