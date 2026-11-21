@@ -173,6 +173,19 @@ class TestStreamedEncode(CustomTestCase):
                 encoder.close()
             self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
 
+    def test_staging_buffer_serves_smaller_frames(self):
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+
+        utils._close_cached_cuda_video_buffer()
+        with utils._acquire_cuda_video_buffer((4, 100)) as (array, rows):
+            address = array.ctypes.data
+            self.assertTrue(rows.is_pinned())
+        with utils._acquire_cuda_video_buffer((3, 50)) as (array, rows):
+            self.assertEqual((array.shape, tuple(rows.shape)), ((3, 50), (3, 50)))
+            self.assertEqual(array.ctypes.data, address)
+            self.assertEqual(rows.data_ptr(), address)
+        utils._close_cached_cuda_video_buffer()
+
     def test_a_failed_encode_leaves_no_file(self):
         video = self._video(64, 96)
         with tempfile.TemporaryDirectory() as tmp:

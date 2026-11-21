@@ -87,6 +87,14 @@ class _CudaMemfdVideoBuffer:
             self.close()
             raise
 
+    def view(self, shape: tuple[int, ...]) -> tuple[np.ndarray, torch.Tensor]:
+        """The first bytes as ``shape``, an array and a pinned tensor."""
+        nbytes = int(np.prod(shape, dtype=np.int64))
+        return (
+            self.array.reshape(-1)[:nbytes].reshape(shape),
+            self.tensor.view(-1)[:nbytes].view(shape),
+        )
+
     def close(self) -> None:
         if self._registered and self.array is not None:
             try:
@@ -106,13 +114,16 @@ class _CudaMemfdVideoBuffer:
 
 @contextmanager
 def _acquire_cuda_video_buffer(shape: tuple[int, ...]):
+    """A staging buffer as ``(array, pinned tensor)`` views of ``shape``. The
+    cached one serves every request it is large enough for: registering a new
+    one with CUDA costs ~20 ms on B300 at each change of frame size."""
     global _cached_cuda_video_buffer
 
     buffer = None
     stale_buffer = None
     with _cuda_video_buffer_cache_lock:
         if _cached_cuda_video_buffer is not None:
-            if _cached_cuda_video_buffer.shape == shape:
+            if _cached_cuda_video_buffer.nbytes >= np.prod(shape, dtype=np.int64):
                 buffer = _cached_cuda_video_buffer
             else:
                 stale_buffer = _cached_cuda_video_buffer
@@ -125,7 +136,7 @@ def _acquire_cuda_video_buffer(shape: tuple[int, ...]):
         buffer = _CudaMemfdVideoBuffer(shape)
 
     try:
-        yield buffer
+        yield buffer.view(shape)
     finally:
         with _cuda_video_buffer_cache_lock:
             if (
@@ -607,10 +618,9 @@ class CudaVideoEncoder:
                 torch.cuda.device(self._device),
                 _acquire_cuda_video_buffer(
                     (self._chunk_frames, self._height, self._width, 3)
-                ) as buffer,
-                memoryview(buffer.array).cast("B") as staged,
+                ) as (array, frames),
+                memoryview(array).cast("B") as staged,
             ):
-                assert buffer.tensor is not None
                 copy_stream = torch.cuda.Stream()
                 while (item := self._queue.get()) is not None:
                     chunk, ready = item
@@ -618,7 +628,7 @@ class CudaVideoEncoder:
                     count = int(chunk.shape[0])
                     copy_stream.wait_event(ready)
                     with torch.cuda.stream(copy_stream):
-                        buffer.tensor[:count].copy_(chunk, non_blocking=True)
+                        frames[:count].copy_(chunk, non_blocking=True)
                     copy_stream.synchronize()
                     # the copy is done, so the allocator may hand this block out again
                     del chunk, ready
