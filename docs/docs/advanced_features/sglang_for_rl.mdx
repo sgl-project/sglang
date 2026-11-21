@@ -347,6 +347,8 @@ for bucket in buckets:
 engine.end_weight_update()
 ```
 
+**MXFP8 MoE experts:** a server started with `--quantization mxfp8` on a high-precision checkpoint quantizes the routed experts in place at load, so an update has to deliver them already as MXFP8: the weights as `float8_e4m3fn` under their checkpoint names, and the UE8M0 block scales as `uint8` (one per 32 elements along the input dimension) under the same name with `_scale_inv` appended, e.g. `model.language_model.layers.0.mlp.experts.gate_up_proj_scale_inv` for Qwen3.5. This is half the bytes of a BF16 update. High-precision expert weights are not requantized during an update.
+
 ### Update Weights from Tensor
 
 **When to use:**
