@@ -266,15 +266,8 @@ if is_cuda():
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    fused_gdn_gating = fused_gdn_gating_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
+    from sgl_kernel_npu.operators.attention.gdn import fused_gdn_gating
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
@@ -1464,7 +1457,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
             mamba_pool = self.state_pool

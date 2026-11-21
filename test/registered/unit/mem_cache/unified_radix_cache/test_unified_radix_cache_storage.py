@@ -95,7 +95,7 @@ def _window_hit(req):
 
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=28, suite="base-b-test-1-gpu-small-amd")
 
 
 # About 0.15 s on a 2 GHz GPU, far longer than any admission step.
@@ -159,6 +159,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
                 matched_prefix_tokens,
                 pool_transfers,
                 assume_stored=False,
+                *,
+                storage_read_metadata=None,
             ):
                 self.prefetch_args = (
                     handle,
@@ -1013,6 +1015,34 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 )
             )
             self.assertEqual(self._host_avail_sizes(cache), avail0)
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_reattach_backs_up_to_the_new_backend(self):
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        seq = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        self._buffer_backup_and_wait(cache, leaf)
+
+        detached, message = cache.detach_storage_backend()
+        self.assertTrue(detached, message)
+        with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+            self._make_storage_dir()
+        ):
+            attached, message = cache.attach_storage_backend("file")
+        self.assertTrue(attached, message)
+
+        page_hashes = self._all_page_hashes(cache, leaf)
+        transfers = aux_storage_key_transfers(cache, leaf)
+        self.assertEqual(self._storage_exists_count(cache, page_hashes, transfers), 0)
+        self._buffer_backup_and_wait(cache, leaf)
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes, transfers),
+            len(page_hashes),
+        )
         cache.sanity_check()
 
     @requires_hicache

@@ -58,7 +58,16 @@ header).
 
 ## Quick start
 
-Build:
+Pull the container image (multi-arch, amd64 and arm64; see
+[Releases and versions](#releases-and-versions)):
+
+```bash
+docker pull lmsysorg/sgl-router:latest            # latest release
+docker pull lmsysorg/sgl-router:nightly           # built from main every night
+docker run --rm -p 30000:30000 lmsysorg/sgl-router:latest --help
+```
+
+Or build from source:
 
 ```bash
 cd sgl-router
@@ -101,19 +110,43 @@ every flag.
 | --- | --- |
 | `POST /v1/chat/completions`, `POST /v1/completions` | OpenAI API, served [over `/generate`](#openai-over-generate) |
 | `POST`/`PUT /generate` | SGLang [native generate](#native-generate), buffered or SSE |
+| `POST /v1/responses` | [OpenAI Responses](#openai-responses), stateless |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | [Anthropic Messages](#anthropic-messages) |
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
+| `POST`/`GET /workers`, `GET`/`PUT`/`DELETE /workers/{id}` | Asynchronous runtime Worker management and inspection |
 | `POST /flush_cache` | Fan out a cache flush to every worker, with the caller's `timeout` |
 | `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
 | `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-Endpoints for features the router does not provide yet (the Responses and
-Conversations APIs, `/v1/loads`) answer `501` with error code
-`unsupported_endpoint`.
+Endpoints for features the router does not provide yet (the stored-response
+routes under `/v1/responses/`, the Conversations API, `/v1/loads`) answer
+`501` with error code `unsupported_endpoint`.
+
+Worker mutations require `--worker-management-api-key` and a matching
+`Authorization: Bearer <key>` header; without the flag they are unavailable.
+A missing or wrong key returns `401` with `worker_management_unauthorized`.
+They return `202`. `GET /workers/{id}` exposes the operation and runtime state,
+including discovery IDs that contain `/`. `PUT` and `DELETE` require the current
+revision in `If-Match`. This revision is the Worker control record's version,
+not an HTTP entity tag; read it from the JSON response. A missing or invalid
+revision returns `400`; a non-current revision returns `409` with
+`stale_revision`. Workers created by static or Kubernetes discovery are
+read-only.
+
+Worker control state is local to one Router process. It is not persisted or
+replicated, so a Router restart loses API-created records and each Router
+replica has independent state. Follow-up `GET`, `PUT`, and `DELETE` requests
+must reach the same replica; an ordinary load-balanced Service cannot guarantee
+that without a per-replica endpoint or sticky routing.
+
+A failed create remains queryable under its assigned ID and keeps its URL
+reserved. Retry it with `PUT` using the same ID, URL, and current revision, or
+delete it before creating a new record. If discovery has restored a worker for
+that URL, retry and create requests conflict until discovery releases it.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -289,6 +322,12 @@ per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3),
 [StepFun](REFERENCE.md#stepfun)) for which chats forward `input_ids`.
 
+### OpenAI Responses
+
+`/v1/responses` is converted to a chat completion and back, so the openai
+SDK's `responses.*` and Codex work against the router. It is stateless: send
+the full conversation in `input`. See [OpenAI Responses](REFERENCE.md#openai-responses).
+
 ### Anthropic Messages
 
 `/v1/messages` is converted to a chat completion and back.
@@ -345,9 +384,13 @@ unset fields inherit the CLI flags. See
   consecutive failures; `--disable-circuit-breaker` turns this off; see
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
-  engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
-  decode rank shortly before the KV arrives; see
+  engines; for ranks that no routing key or cached prefix decides,
+  `--dp-rank-policy round_robin` cycles them and `least_tokens` picks the
+  one expected to hold the fewest KV tokens by the engine's load feed; in PD
+  mode,
+  `--decode-dp-rank-policy` sets the decode rank's policy on its own, and
+  `--decode-dispatch-limit N` picks the decode rank shortly before the KV
+  arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
@@ -358,6 +401,9 @@ unset fields inherit the CLI flags. See
   [request body size](REFERENCE.md#request-body-size).
 - **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
   see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
+- **Worker management API key**: `--worker-management-api-key` enables and
+  authenticates `POST`, `PUT`, and `DELETE` under `/workers`; it is independent
+  from the engine API key.
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
   parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
   happens to requests that differ. See
@@ -395,6 +441,37 @@ docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
   `--no-tokenizer` for load-only policies.
 - On macOS, the FIPS module links as a shared library; set
   `DYLD_LIBRARY_PATH` to its build output directory to run a native build.
+
+## Releases and versions
+
+`sgl-router` is versioned on its own semver track, independent of SGLang
+releases. Each release ships as:
+
+- a container image, `lmsysorg/sgl-router` tagged `v<version>` and `latest`
+  (the newest release);
+- a PyPI package, `pip install sgl-router`, whose wheel (linux x86_64 and
+  aarch64) puts the `sgl-router` binary on `PATH`.
+
+`lmsysorg/sgl-router:nightly` is built from main every night, and the SGLang
+images build the router from their own source. The crate itself is not
+published to crates.io.
+`sgl-router --version` prints the version a binary was built from.
+
+Releases are made manually:
+
+1. Bump `version` in `Cargo.toml` and run `cargo check` once so `Cargo.lock`
+   records it (CI builds with `--locked`): the minor version for new routing
+   behavior, flags, or protocol changes; the patch version for fixes only.
+   Open a PR with the bump and the release notes.
+2. Once the bump is on main, a maintainer tags that commit
+   `router-v<version>` and pushes the tag. That tag starts
+   `release-sgl-router.yml`, which refuses a tag that differs from the
+   `Cargo.toml` version, builds the image and the wheels for amd64 and arm64,
+   pushes `lmsysorg/sgl-router:v<version>` and `:latest`, and uploads the
+   wheels to PyPI.
+
+Do not tag a router release `v<version>`: SGLang's own PyPI and Docker release
+workflows run on every `v*` tag.
 
 ## License
 
