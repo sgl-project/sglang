@@ -722,6 +722,46 @@ class TestWorkerSamplingExtras(CustomTestCase):
         )
         self.assertEqual(out.next_token_token_ids_logprobs_idx, [[9], []])
 
+    def test_async_chained_decode_evals_lazy_logprobs(self):
+        """Chained decode must hand lazy_logprobs arrays to mx.async_eval
+        just like fresh decode and mixed extend, keeping logprob work in
+        the pipelined GPU stream instead of stalling finalize."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.hardware_backend.mlx.sampling import MlxLazyLogprobs
+
+        lazy_tokens = mx.array([42], dtype=mx.int32)
+        lazy_logprobs = MlxLazyLogprobs(
+            chosen=mx.array([-0.5], dtype=mx.float32),
+            top_val=mx.array([[-0.5, -1.2]], dtype=mx.float32),
+            top_idx=mx.array([[42, 7]], dtype=mx.int32),
+            token_ids_val=[],
+            spec=MlxLogprobSpec(top_ks=(2,), token_ids=(None,)),
+        )
+        pending = SimpleNamespace(
+            lazy_tokens=lazy_tokens,
+            req_ids=["r0"],
+            caches=[[]],
+            lazy_logprobs=lazy_logprobs,
+        )
+        worker = self._worker()
+        worker._mlx_runner = SimpleNamespace(
+            decode_batch_start_chained=lambda _prev: pending
+        )
+        captured = []
+        with patch(
+            "sglang.srt.hardware_backend.mlx.tp_worker.mx.async_eval",
+            side_effect=lambda *args: captured.extend(args),
+        ):
+            worker.async_chained_decode_mlx(pending)
+
+        self.assertEqual(len(captured), 4)
+        self.assertIs(captured[0], lazy_tokens)
+        self.assertIs(captured[1], lazy_logprobs.chosen)
+        self.assertIs(captured[2], lazy_logprobs.top_val)
+        self.assertIs(captured[3], lazy_logprobs.top_idx)
+
 
 if __name__ == "__main__":
     unittest.main()

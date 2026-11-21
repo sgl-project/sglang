@@ -600,7 +600,10 @@ class MlxTpModelWorker(TpModelWorker):
         and extend lists are always empty for a chained decode.
         """
         pending = self._mlx_runner.decode_batch_start_chained(prev_pending)
-        mx.async_eval(pending.lazy_tokens)
+        mx.async_eval(
+            pending.lazy_tokens,
+            *lazy_logprob_arrays(pending.lazy_logprobs),
+        )
         return MlxLaunch(
             lazy_tokens=pending.lazy_tokens,
             prefills=[],
