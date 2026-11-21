@@ -212,7 +212,7 @@ pub(crate) struct CallIds(std::collections::HashSet<String>);
 
 impl CallIds {
     pub(crate) fn allocate(&mut self, upstream: Option<&str>) -> String {
-        if let Some(id) = upstream.filter(|id| !id.is_empty()) {
+        if let Some(id) = upstream {
             if self.0.insert(id.to_owned()) {
                 return id.to_owned();
             }

@@ -682,6 +682,49 @@ mod tests {
     }
 
     #[test]
+    fn repeated_worker_ids_stay_distinct_on_replay() {
+        let delta = |name: Option<&str>, args: &str| {
+            let mut d = indexed(0, name, args);
+            d["tool_calls"][0]["id"] = json!("function.f:0");
+            d
+        };
+        let evs = run(&[
+            chunk(delta(Some("f"), "{}"), None),
+            chunk(delta(Some("f"), "{"), None),
+            chunk(delta(None, "}"), Some("tool_calls")),
+        ]);
+        let output = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(output[0]["call_id"], "function.f:0");
+        assert_eq!(output[1]["call_id"], "function.f:1");
+        assert_eq!(output[1]["arguments"], "{}");
+        let added: Vec<_> = evs
+            .iter()
+            .filter(|(e, _)| e == "response.output_item.added")
+            .map(|(_, e)| &e["item"]["call_id"])
+            .collect();
+        assert_eq!(added, [&output[0]["call_id"], &output[1]["call_id"]]);
+    }
+
+    #[test]
+    fn repeated_ids_with_distinct_indices_accept_interleaved_arguments() {
+        let delta = |i, name, args| {
+            let mut d = indexed(i, name, args);
+            d["tool_calls"][0]["id"] = json!("shared");
+            d
+        };
+        let evs = run(&[
+            chunk(delta(0, Some("a"), "{"), None),
+            chunk(delta(1, Some("b"), "{"), None),
+            chunk(delta(0, None, r#""a":1}"#), None),
+            chunk(delta(1, None, r#""b":2}"#), Some("tool_calls")),
+        ]);
+        let calls = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(calls[0]["arguments"], r#"{"a":1}"#);
+        assert_eq!(calls[1]["arguments"], r#"{"b":2}"#);
+        assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
+    }
+
+    #[test]
     fn streamed_tool_calls() {
         let evs = run(&[
             chunk(
@@ -871,49 +914,6 @@ mod tests {
         let mut c = call(name, args);
         c["tool_calls"][0]["index"] = json!(index);
         c
-    }
-
-    #[test]
-    fn repeated_worker_ids_stay_distinct_on_replay() {
-        let delta = |name: Option<&str>, args: &str| {
-            let mut d = indexed(0, name, args);
-            d["tool_calls"][0]["id"] = json!("function.f:0");
-            d
-        };
-        let evs = run(&[
-            chunk(delta(Some("f"), "{}"), None),
-            chunk(delta(Some("f"), "{"), None),
-            chunk(delta(None, "}"), Some("tool_calls")),
-        ]);
-        let output = &evs.last().unwrap().1["response"]["output"];
-        assert_eq!(output[0]["call_id"], "function.f:0");
-        assert_eq!(output[1]["call_id"], "function.f:1");
-        assert_eq!(output[1]["arguments"], "{}");
-        let added: Vec<_> = evs
-            .iter()
-            .filter(|(e, _)| e == "response.output_item.added")
-            .map(|(_, e)| &e["item"]["call_id"])
-            .collect();
-        assert_eq!(added, [&output[0]["call_id"], &output[1]["call_id"]]);
-    }
-
-    #[test]
-    fn repeated_ids_with_distinct_indices_accept_interleaved_arguments() {
-        let delta = |i, name, args| {
-            let mut d = indexed(i, name, args);
-            d["tool_calls"][0]["id"] = json!("shared");
-            d
-        };
-        let evs = run(&[
-            chunk(delta(0, Some("a"), "{"), None),
-            chunk(delta(1, Some("b"), "{"), None),
-            chunk(delta(0, None, r#""a":1}"#), None),
-            chunk(delta(1, None, r#""b":2}"#), Some("tool_calls")),
-        ]);
-        let calls = &evs.last().unwrap().1["response"]["output"];
-        assert_eq!(calls[0]["arguments"], r#"{"a":1}"#);
-        assert_eq!(calls[1]["arguments"], r#"{"b":2}"#);
-        assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
     }
 
     #[test]

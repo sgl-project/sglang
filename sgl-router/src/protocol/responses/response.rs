@@ -65,7 +65,10 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
         } else {
             "completed"
         };
-        let call_id = ids.allocate(tc.get("id").and_then(Value::as_str));
+        let call_id = tc
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
         let name = tc
             .pointer("/function/name")
             .and_then(Value::as_str)
@@ -76,7 +79,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .unwrap_or("");
         output.push(call_item(
             &new_id("fc"),
-            &call_id,
+            &ids.allocate(call_id),
             name,
             args,
             status,
@@ -113,6 +116,16 @@ mod tests {
         )
         .unwrap()
         .echo
+    }
+
+    #[test]
+    fn buffered_repeated_worker_ids_are_unique() {
+        let f = json!({"id":"same","function":{"name":"f","arguments":"{}"}});
+        let chat =
+            json!({"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[f,f]}}]});
+        let output = &chat_to_response(&chat, &echo())["output"];
+        assert_eq!(output[0]["call_id"], "same");
+        assert_ne!(output[0]["call_id"], output[1]["call_id"]);
     }
 
     #[test]
@@ -162,16 +175,6 @@ mod tests {
         let out = r["output"].as_array().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "reasoning");
-    }
-
-    #[test]
-    fn buffered_repeated_worker_ids_are_unique() {
-        let f = json!({"id":"same","function":{"name":"f","arguments":"{}"}});
-        let chat =
-            json!({"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[f,f]}}]});
-        let output = &chat_to_response(&chat, &echo())["output"];
-        assert_eq!(output[0]["call_id"], "same");
-        assert_ne!(output[0]["call_id"], output[1]["call_id"]);
     }
 
     #[test]
