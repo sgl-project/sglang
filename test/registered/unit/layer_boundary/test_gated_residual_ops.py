@@ -319,6 +319,24 @@ class TestGatedResidualOps(CustomTestCase):
         torch.testing.assert_close(state.normed, _normalize(residual, 1)[2:])
         torch.testing.assert_close(state.gate_partials, partials[2:])
 
+    def test_attn_tp_slice_of_a_read_without_a_normalized_residual(self):
+        """The gfx950 prefill read normalizes inside its kernels: it carries inject
+        logits as gate partials and no normalized residual."""
+        state = _state()
+        ops = state.residual_ops()
+        residual = torch.arange(4 * WIDE, dtype=torch.float32).reshape(4, WIDE)
+        logits = torch.arange(4 * HC_COUNT).reshape(4, HC_COUNT)
+        state.gate_partials = logits
+        with patch(
+            "sglang.srt.layers.layer_boundary.residual.gated.get_parallel"
+        ) as parallel:
+            parallel.return_value.attn_tp_rank = 1
+            parallel.return_value.attn_tp_size = 2
+            sliced = ops.attn_update.slice_residual_attn_tp(residual)
+        torch.testing.assert_close(sliced, residual[2:])
+        self.assertIsNone(state.normed)
+        torch.testing.assert_close(state.gate_partials, logits[2:])
+
     def test_attn_tp_gather_is_rejected(self):
         ops = _state().residual_ops()
         with self.assertRaises(NotImplementedError):

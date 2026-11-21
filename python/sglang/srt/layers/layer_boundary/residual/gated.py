@@ -32,8 +32,10 @@ class GatedResidualState:
 
     The read carries its normalized residual to write-back. Decode may also
     prepare gate partials during the read; otherwise write-back computes the
-    coefficient from that normalized residual. Both follow the residual rows
-    through any slicing and are cleared after the FFN write-back.
+    coefficient from that normalized residual. A read that normalizes inside its
+    kernels carries none; its gate partials are then the inject logits. Both
+    follow the residual rows through any slicing and are cleared after the FFN
+    write-back.
     Parameters belong to the owning layer's modules.
 
     Args:
@@ -93,7 +95,9 @@ class GatedResidualState:
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-        self.normed = self.normed.tensor_split(size)[rank]
+        # A read that normalizes inside its kernels carries no normed residual.
+        if self.normed is not None:
+            self.normed = self.normed.tensor_split(size)[rank]
         if self.gate_partials is not None:
             self.gate_partials = self.gate_partials.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]
