@@ -80,6 +80,11 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
 )
+from sglang.multimodal_gen.runtime.request_watchdog import (
+    init_execution_reporter,
+    install_stack_dump_handler,
+    watch_execution,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -179,8 +184,10 @@ class Scheduler(
                 init_progress_reporter(
                     context=self.context, endpoint=server_args.progress_endpoint
                 )
+            init_execution_reporter(self.context, server_args, self.dp_replica)
         else:
             self.receiver = None
+        install_stack_dump_handler(server_args)
         if server_args.cancel_endpoint is not None:
             # every rank takes part in each stop decision; only the driver
             # receives the cancelled request ids
@@ -1660,9 +1667,13 @@ class Scheduler(
                         )
                 continue
 
+            watched_req = get_first_generation_req(items[0][1])
             try:
-                with maybe_record_function(
-                    f"REQ {self._req_label(items)} dispatch+forward"
+                with (
+                    maybe_record_function(
+                        f"REQ {self._req_label(items)} dispatch+forward"
+                    ),
+                    watch_execution(watched_req),
                 ):
                     handler_result = self._dispatch_items(items)
             except Exception as e:
@@ -1674,7 +1685,9 @@ class Scheduler(
 
             if isinstance(handler_result, _SequentiallyReturnedOutputs):
                 try:
-                    self._return_results_sequentially(items, handler_result.outputs)
+                    # the grouped requests execute while their results return
+                    with watch_execution(watched_req):
+                        self._return_results_sequentially(items, handler_result.outputs)
                 except zmq.ZMQError as e:
                     logger.error(f"ZMQ error sending replies sequentially: {e}")
                 finally:

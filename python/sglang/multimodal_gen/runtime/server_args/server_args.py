@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.request_watchdog import parse_request_time_limits
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
@@ -569,6 +570,9 @@ class ServerArgs(DisaggServerArgsMixin):
     host: str | None = "127.0.0.1"
     port: int | None = 30000
     http_graceful_shutdown_timeout: int | None = None
+    # Request watchdog (runtime/request_watchdog.py): SECONDS or TASK=SECONDS
+    # entries; a request executing longer turns /health unhealthy. Unset: off.
+    request_time_limit: list[str] | None = None
     enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
@@ -734,6 +738,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        parse_request_time_limits(self.request_time_limit)
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
@@ -3167,6 +3172,18 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Seconds to wait for HTTP connections and tasks to finish on shutdown "
             "before cancelling them. Unset waits indefinitely; 0 cancels immediately. "
             "Does not bound GPU worker teardown or preserve asynchronous video jobs.",
+        )
+        parser.add_argument(
+            "--request-time-limit",
+            type=str,
+            nargs="+",
+            default=ServerArgs.request_time_limit,
+            help="Execution time limit per request: SECONDS for every request, or "
+            "TASK=SECONDS for one task of a model that names its request tasks "
+            "(MiniMax-H3: t2va, fl2va, ref2va); 0 or off removes a limit. A "
+            "request executing longer (queueing excluded) is logged with every "
+            "worker's Python stacks and turns /health unhealthy; restart the "
+            "server then. Unset: off. Not available with disaggregated roles.",
         )
         parser.add_argument(
             "--enable-metrics",

@@ -188,6 +188,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         return self._video_hooks().project_queued_job_fields(req)
 
+    def request_task(self) -> str | None:
+        return self.task
+
     def validate_video_final_outputs(
         self,
         output_paths: list[str],

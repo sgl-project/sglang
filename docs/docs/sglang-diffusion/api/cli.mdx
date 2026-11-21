@@ -112,6 +112,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
   Local shared-memory reply files are cleaned up when the RPC completes, fails, or is cancelled; timing out does not abort GPU work already in flight. A hard process kill cannot run this cleanup, so isolate `/dev/shm` per deployment rather than sharing it across unrelated services.
+- `--request-time-limit {SECONDS|TASK=SECONDS} ...`: mark the server unhealthy when a request executes past its limit, queue time excluded. Off by default. See [Request time limit](#request-time-limit).
 - `--sleep-on-idle`: reduce idle scheduler CPU usage by waiting for socket events. Disabled by default, matching SRT, to minimize idle-to-active wake-up latency. Applies only to monolithic serving with one rank per DP replica; TP/SP/CFG multi-rank replicas keep polling. Each wait ends when a message arrives, a pending allocator-cache release is due, or one second elapses. Active generation is unchanged; benchmark low-QPS tail latency before enabling it in latency-sensitive deployments.
 - `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
@@ -497,13 +498,33 @@ the whole server; workers and in-flight jobs are not automatically recovered.
 An allocator OOM during a multi-rank forward terminates the affected worker:
 other ranks may still be inside collectives, so continuing the next request is
 unsafe. Single-GPU replicas, including independent DP replicas, retain normal
-request-level OOM handling. The monitor does not detect arbitrary hangs, unusable
-CUDA contexts, or workers on other machines. A standalone disaggregation router
+request-level OOM handling. The monitor does not detect arbitrary hangs (see
+[Request time limit](#request-time-limit) for requests that stop making progress),
+unusable CUDA contexts, or workers on other machines. A standalone disaggregation router
 does not own remote worker processes and cannot validate their health through this
 check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
+
+### Request time limit
+
+A hung kernel or collective blocks the workers without logging anything, and the
+worker processes stay alive, so `/health` keeps returning `200`. Set
+`--request-time-limit 120` to mark the server unhealthy when a request executes
+for more than 120 seconds. Time spent queued behind other requests does not
+count, and warmup requests are not timed. A `TASK=SECONDS` entry limits one task
+of a model that names its request tasks (MiniMax-H3: `t2va`, `fl2va`, `ref2va`)
+and can follow a limit for everything else: `--request-time-limit 90 ref2va=120`.
+The limit is off by default and is not available with disaggregated roles.
+
+When a request passes its limit, the server logs the request id, task, stage and
+denoising step, asks every local worker to write the Python stacks of all its
+threads to stderr, and takes the path of a lost worker: `/health` returns `503`,
+outstanding scheduler requests fail, and new POST requests are rejected with
+`503`. The hung request is not aborted; remove the instance from routing and
+restart the whole server. `--scheduler-rpc-timeout` is a different bound: it
+fails one caller's wait, queue time included, and leaves `/health` unchanged.
 
 ### Cloud Storage
 
