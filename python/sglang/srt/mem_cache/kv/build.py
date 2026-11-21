@@ -164,6 +164,7 @@ def _build_state_storage(
             if ctx.speculative_num_draft_tokens is not None and layer_ids
             else None
         ),
+        conv_window_axis=plan.conv_window_axis,
     )
     part_scratch = {
         name.removeprefix(f"{state.name}."): tensor
