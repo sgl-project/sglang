@@ -1120,10 +1120,10 @@ async def get_request(
             yield request
     else:
         input_requests_iter = iter(input_requests)
-        for request in input_requests_iter:
+        for index, request in enumerate(input_requests_iter):
             yield request
 
-            if request_rate == float("inf"):
+            if index + 1 == len(input_requests) or request_rate == float("inf"):
                 # If the request rate is infinity, then we don't need to wait.
                 continue
 
