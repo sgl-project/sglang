@@ -254,11 +254,11 @@ def route_radix4_with_sort(
     device = scores.device
     if block_m not in SORT_BLOCK_MS:
         raise ValueError(f"block_m must be one of {SORT_BLOCK_MS}, got {block_m}")
-    # Unknown (a capture on a stream not seen eagerly) is allowed; a known short mask is not.
-    cus = _enabled_cus(device) if _tail_ctas(M) else None
-    if cus is not None and cus < _tail_ctas(M):
+    # An unknown mask (a capture on a stream not seen eagerly) fails too:
+    # the caller primes it eagerly with sort_tail_fits.
+    if not sort_tail_fits(M, device):
         raise RuntimeError(
-            f"route_radix4_with_sort: the current stream has too few CUs for the {M}-token sort tail"
+            f"route_radix4_with_sort: the current stream may have too few CUs for the {M}-token sort tail"
         )
     capacity = _sorted_capacity(M, block_m)
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)

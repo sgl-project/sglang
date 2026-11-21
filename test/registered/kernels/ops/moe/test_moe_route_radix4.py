@@ -668,6 +668,9 @@ def test_fused_sort_graph_replay():
         for m in sizes
     ]
     stream = torch.cuda.Stream()
+    # The stream's CU mask is read eagerly, as the dispatcher does before it captures.
+    with torch.cuda.stream(stream):
+        assert moe_route_radix4.sort_tail_fits(300, inputs[0][0].device)
     # The graph's arrival counters, allocated and zeroed outside the capture.
     sort_ws = _sort_ws()
 

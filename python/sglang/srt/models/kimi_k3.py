@@ -1560,11 +1560,16 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
-            # The fused route+sort launch zeroes the published latent for the
-            # experts, so route inside the block too.
-            with zero_copy_context.set_moe_output(latent):
+            if _is_hip:
+                # The fused route+sort launch zeroes the published latent for the
+                # experts, so route inside the block too.
+                with zero_copy_context.set_moe_output(latent):
+                    topk_output = self.topk(hidden_states, router_logits)
+                    expert_output = self.experts(routed_input, topk_output)
+            else:
                 topk_output = self.topk(hidden_states, router_logits)
-                expert_output = self.experts(routed_input, topk_output)
+                with zero_copy_context.set_moe_output(latent):
+                    expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
         if expert_output.data_ptr() != latent.data_ptr():
