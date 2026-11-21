@@ -133,12 +133,7 @@ class TestTensorUpdateRebuildsEachIpcTensorOnce(CustomTestCase):
             flush_cache=flush_cache is not None,
             torch_empty_cache=flush_cache is not None,
         )
-        with (
-            get_parallel().override(tp_rank=1),
-            patch(
-                "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
-            ),
-        ):
+        with get_parallel().override(tp_rank=1):
             return manager.update_weights_from_tensor(request)
 
     def test_target_and_draft_share_one_rebuild_of_each_ipc_tensor(self):
