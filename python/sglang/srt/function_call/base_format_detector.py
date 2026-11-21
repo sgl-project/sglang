@@ -451,3 +451,20 @@ class BaseFormatDetector(ABC):
         to constrain only the payload after that token.
         """
         return None
+
+    def get_answer_structural_tag(
+        self,
+        tools: List[Tool],
+        answer_json_schema: Dict[str, Any],
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+        strict_arguments: bool = False,
+        max_whitespace_cnt: Optional[int] = None,
+    ) -> Optional[StructuralTag]:
+        """Return a structural tag for automatic tool choice that admits tool
+        calls or a final answer matching ``answer_json_schema``.
+
+        ``None`` means the format cannot express both, and the caller keeps
+        the answer constraint alone.
+        """
+        return None

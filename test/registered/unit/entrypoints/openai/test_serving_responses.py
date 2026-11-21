@@ -573,6 +573,32 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertFalse(seen["parallel_tool_calls"])
         self.assertEqual(processed.tool_call_constraint[0], "json_schema")
 
+    def test_make_request_keeps_the_thinking_end_for_output_parsing(self):
+        """The output is parsed from the Responses request, not the chat
+        request that rendered the prompt and saw the grammar."""
+        serving = make_serving()
+
+        def fake_process(chat_request, is_multimodal, **_):
+            chat_request._response_parser_thinking_end = "</think>"
+            return MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(model="x", input="hi", store=False)
+
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(request._response_parser_thinking_end, "</think>")
+
     def test_harmony_forced_choices_explain_missing_routing_constraints(self):
         serving = make_serving()
         serving.use_harmony = True

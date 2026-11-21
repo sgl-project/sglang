@@ -2805,6 +2805,386 @@ class ServingChatTestCase(CustomTestCase):
             },
         )
 
+    _WORD_ANSWER_SCHEMA = {
+        "type": "object",
+        "properties": {"word": {"type": "string"}},
+        "required": ["word"],
+        "additionalProperties": False,
+    }
+
+    def _auto_tools_with_json_answer_sampling_params(
+        self, parser_name, strict, enable_thinking=False, schema=None
+    ):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = parser_name
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Read note.txt, report the word."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                        "strict": strict,
+                    },
+                }
+            ],
+            tool_choice="auto",
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": schema or self._WORD_ANSWER_SCHEMA,
+                },
+            },
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+        processed = self.chat._process_messages(request, is_multimodal=False)
+        return request.to_sampling_params(
+            stop=processed.stop,
+            model_generation_config={},
+            tool_call_constraint=processed.tool_call_constraint,
+            renderer_handles_response_format=self.chat._renders_response_format(),
+            tool_call_constraint_covers_answer=(
+                processed.tool_call_constraint_covers_answer
+            ),
+        )
+
+    def test_glm47_auto_tools_with_json_answer_keeps_tools_callable(self):
+        """tool_choice="auto" plus a JSON response_format must leave tools
+        callable and hold only the final answer to the schema; the format
+        alone made every tool call ungrammatical (#47167)."""
+        for enable_thinking in (False, True):
+            params = self._auto_tools_with_json_answer_sampling_params(
+                "glm47", strict=False, enable_thinking=enable_thinking
+            )
+
+            self.assertNotIn("json_schema", params)
+            self.assertTrue(params["ebnf_full_assistant"])
+            grammar = Grammar.from_ebnf(params["ebnf"])
+            prefix = "Plan.</think>" if enable_thinking else ""
+            for output, allowed in (
+                (
+                    "<tool_call>read_file<arg_key>path</arg_key>"
+                    "<arg_value>note.txt</arg_value></tool_call>",
+                    True,
+                ),
+                ('{"word": "banana"}', True),
+                ("The word is banana.", False),
+                ('{"other": "banana"}', False),
+                # A prose answer must not be able to end in a forced call.
+                (
+                    "The word is banana.<tool_call>read_file<arg_key>path"
+                    "</arg_key><arg_value>note.txt</arg_value></tool_call>",
+                    False,
+                ),
+            ):
+                with self.subTest(enable_thinking=enable_thinking, output=output):
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, prefix + output), allowed
+                    )
+
+    def test_kimi_k3_auto_tools_with_json_answer_keeps_tools_callable(self):
+        """The Kimi-K3 tag admits a tools section or a schema-shaped response
+        instead of being dropped or refused under a JSON format (#47167)."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat._encoding_adapter = self.chat._build_chat_encoding_adapter()
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "kimi_k3", strict=True
+        )
+
+        self.assertNotIn("json_schema", params)
+        grammar = Grammar.from_structural_tag(params["structural_tag"])
+        call = (
+            TOOLS_OPEN + '<|open|>call tool="read_file" index="1"<|sep|>'
+            '<|open|>argument key="path" type="string"<|sep|>note.txt'
+            "<|close|>argument<|sep|><|close|>call<|sep|>" + TOOLS_CLOSE
+        )
+        for output, allowed in (
+            (call, True),
+            ('{"word": "banana"}<|close|>response<|sep|>', True),
+            ("The word is banana.<|close|>response<|sep|>", False),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(_is_grammar_accept_string(grammar, output), allowed)
+
+    def test_auto_tools_with_json_answer_keeps_format_without_combined_grammar(
+        self,
+    ):
+        """A parser that cannot express calls and the answer together keeps
+        the client's JSON format rather than losing it."""
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "hermes", strict=False
+        )
+
+        self.assertEqual(
+            json.loads(params["json_schema"])["properties"],
+            {"word": {"type": "string"}},
+        )
+
+    def test_auto_tools_with_json_answer_keeps_backend_checks(self):
+        """A schema the json backend rejects or a backend that cannot compile
+        the combined grammar keeps the plain json path and its checks."""
+        nul_schema = {"type": "string", "pattern": "\x00"}
+        unique_schema = {
+            "type": "array",
+            "items": {"type": "string"},
+            "uniqueItems": True,
+        }
+        cases = [
+            # Compiling it in the frontend raised and turned a 400 into a 500.
+            ("glm47", {"schema": {"type": "string", "pattern": "(("}}, {}),
+            ("glm47", {"schema": nul_schema}, {}),
+            ("kimi_k3", {"schema": nul_schema}, {}),
+            ("glm47", {"schema": unique_schema}, {}),
+            ("kimi_k3", {"schema": unique_schema}, {}),
+            ("glm47", {}, {"grammar_backend": "outlines"}),
+            ("kimi_k3", {}, {"grammar_backend": "outlines"}),
+        ]
+        for parser_name, kwargs, config in cases:
+            with self.subTest(parser=parser_name, config=config):
+                self.tm._config_overrides.update(config)
+                params = self._auto_tools_with_json_answer_sampling_params(
+                    parser_name, strict=parser_name == "kimi_k3", **kwargs
+                )
+                self.tm._config_overrides.clear()
+
+                self.assertEqual(
+                    json.loads(params["json_schema"]),
+                    kwargs.get("schema", self._WORD_ANSWER_SCHEMA),
+                )
+                self.assertIsNone(params.get("ebnf"))
+                self.assertIsNone(params.get("structural_tag"))
+
+    def test_glm_auto_tools_with_json_answer_follows_effective_reasoning(self):
+        """GLM-5.3 thinks even with enable_thinking=false, so the answer grammar
+        must admit the thinking block the reasoning parser expects."""
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "glm47", strict=False, enable_thinking=False
+        )
+
+        grammar = Grammar.from_ebnf(params["ebnf"])
+        self.assertTrue(
+            _is_grammar_accept_string(grammar, 'Plan.</think>{"word": "banana"}')
+        )
+        self.assertFalse(_is_grammar_accept_string(grammar, '{"word": "banana"}'))
+
+    def test_auto_tools_with_json_answer_keeps_whitespace_cap(self):
+        """--constrained-json-max-whitespace-cnt bounds the answer branch as it
+        bounds a plain json_schema request."""
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat._encoding_adapter = self.chat._build_chat_encoding_adapter()
+        response_close = "<|close|>response<|sep|>"
+        cases = {
+            "glm47": (
+                (' {"word": "banana"}', True),
+                ('   {"word": "banana"}', False),
+                ('{"word":    "banana"}', False),
+            ),
+            "kimi_k3": (
+                ('{"word": "banana"}' + response_close, True),
+                ('{"word":    "banana"}' + response_close, False),
+            ),
+        }
+        for parser_name, outputs in cases.items():
+            with get_context().override_server_args(
+                constrained_json_max_whitespace_cnt=1
+            ):
+                params = self._auto_tools_with_json_answer_sampling_params(
+                    parser_name, strict=parser_name == "kimi_k3"
+                )
+
+            grammar = (
+                Grammar.from_ebnf(params["ebnf"])
+                if parser_name == "glm47"
+                else Grammar.from_structural_tag(params["structural_tag"])
+            )
+            for output, allowed in outputs:
+                with self.subTest(parser=parser_name, output=output):
+                    self.assertEqual(
+                        _is_grammar_accept_string(grammar, output), allowed
+                    )
+
+    def test_glm_auto_tools_with_json_answer_under_strict_thinking(self):
+        """Strict thinking caps a reasoning phase through the reasoner wrapper,
+        which the full-assistant grammar skips: only a request that reasons
+        under a reasoning parser falls back to the plain json path."""
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        for reasoning_parser, enable_thinking, combined in (
+            ("glm45", True, False),
+            ("glm45", False, True),
+            (None, True, True),
+        ):
+            with self.subTest(
+                reasoning_parser=reasoning_parser, enable_thinking=enable_thinking
+            ):
+                self.chat.reasoning_parser = reasoning_parser
+                with get_context().override_server_args(enable_strict_thinking=True):
+                    params = self._auto_tools_with_json_answer_sampling_params(
+                        "glm47", strict=False, enable_thinking=enable_thinking
+                    )
+
+                if combined:
+                    self.assertTrue(params["ebnf_full_assistant"])
+                    self.assertIsNone(params.get("json_schema"))
+                else:
+                    self.assertEqual(
+                        json.loads(params["json_schema"]), self._WORD_ANSWER_SCHEMA
+                    )
+                    self.assertIsNone(params.get("ebnf"))
+
+    _READ_FILE_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }
+
+    def _json_answer_fields(self):
+        return {
+            "tools": [self._READ_FILE_TOOL],
+            "tool_choice": "auto",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": self._WORD_ANSWER_SCHEMA},
+            },
+        }
+
+    def test_glm_json_answer_thinking_end_only_without_reasoning_parser(self):
+        """Only a thinking block that no reasoning parser takes out is dropped
+        from the content; without the block there is nothing to drop."""
+        self.chat.tool_call_parser = "glm47"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        for reasoning_parser, template_kwargs, thinking_end in (
+            (None, None, "</think>"),
+            (None, {"enable_thinking": False}, ""),
+            ("glm45", None, ""),
+        ):
+            with self.subTest(
+                reasoning_parser=reasoning_parser, template_kwargs=template_kwargs
+            ):
+                self.chat.reasoning_parser = reasoning_parser
+                _, request = self._convert_rendered_as(
+                    "<assistant>",
+                    chat_template_kwargs=template_kwargs,
+                    **self._json_answer_fields(),
+                )
+                self.assertEqual(request._response_parser_thinking_end, thinking_end)
+
+    def test_glm_json_answer_without_reasoning_parser_drops_thinking(self):
+        """With no reasoning parser, the thinking block the auto-tools JSON
+        grammar opens with stays out of the content, streamed or not; a
+        later quoted marker belongs to the answer."""
+        self.chat.tool_call_parser = "glm47"
+        call = (
+            "<tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>note.txt</arg_value></tool_call>"
+        )
+        cut_off = self._stopped_on_token("Plan the", 1)
+        cut_off["meta_info"]["finish_reason"] = {"type": "length", "length": 2}
+        cases = (
+            (
+                self._stopped_on_token('Plan.</think>{"word": "banana"}', 1),
+                ("", '{"word": "banana"}', []),
+            ),
+            (
+                self._stopped_on_token('Plan.</think>{"word": "a</think>b"}', 1),
+                ("", '{"word": "a</think>b"}', []),
+            ),
+            (
+                self._stopped_on_token("Plan.</think>" + call, 1),
+                ("", "", [("read_file", {"path": "note.txt"})]),
+            ),
+            (cut_off, ("", "", [])),
+        )
+        for output, expected in cases:
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    text=output["text"], stream=stream, incremental=incremental
+                ):
+                    served = self._served(
+                        output,
+                        stream,
+                        incremental=incremental,
+                        **self._json_answer_fields(),
+                    )
+                    self.assertEqual(served, expected)
+
+    def test_kimi_k3_json_answer_content_matches_streaming(self):
+        """A Kimi-K3 answer loses only its response-channel markers: unseparated
+        reasoning stays in the content, as the streamed answer keeps it."""
+        self.chat.tool_call_parser = self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        output = self._stopped_on_token(
+            "Plan.<|close|>think<|sep|><|open|>response<|sep|>"
+            '{"word": "hi"}<|close|>response<|sep|><|close|>message<|sep|>',
+            1,
+        )
+        for separate, expected in (
+            (True, ("Plan.", '{"word": "hi"}', [])),
+            (False, ("", 'Plan.<|close|>think<|sep|>{"word": "hi"}', [])),
+        ):
+            for stream in (False, True):
+                with self.subTest(separate=separate, stream=stream):
+                    served = self._served(
+                        output,
+                        stream,
+                        tools=[self._READ_FILE_TOOL],
+                        separate_reasoning=separate,
+                    )
+                    self.assertEqual(served, expected)
+
+    def test_kimi_k3_unwrapped_answer_keeps_quoted_response_opener(self):
+        """Once the kimi_k3 reasoning parser has unwrapped the answer, a JSON
+        string quoting the response opener is answer text, not a channel."""
+        self.chat.tool_call_parser = self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        answer = '{"word": "<|open|>response<|sep|>hi"}'
+        output = self._stopped_on_token(
+            "Plan.<|close|>think<|sep|><|open|>response<|sep|>"
+            + answer
+            + "<|close|>response<|sep|><|close|>message<|sep|>",
+            1,
+        )
+
+        served = self._served(output, False, tools=[self._READ_FILE_TOOL])
+
+        self.assertEqual(served, ("Plan.", answer, []))
+
+    def test_kimi_k3_answer_without_tool_call_drops_response_markers(self):
+        """With only the kimi_k3 tool parser, a JSON answer that calls no tool
+        must not carry the response-channel markers into message.content."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tool_calls, text, _ = self.chat._process_tool_calls(
+            text='{"word": "hi"}<|close|>response<|sep|><|close|>message<|sep|>',
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice="auto",
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(text, '{"word": "hi"}')
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -30,6 +31,7 @@ from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
     GlmSpecialTokenConfig,
+    generate_glm_answer_grammar,
     generate_glm_grammar,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -137,9 +139,15 @@ class FunctionCallParser:
         tool_choice=None,
         prefix: str = "",
         constrained: bool = False,
+        thinking_end: str = "",
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        # The output opens with a thinking block ending at thinking_end that no
+        # reasoning parser took out, so it is dropped instead of parsed.
+        self._thinking_end = thinking_end
+        self._in_streamed_thinking = bool(thinking_end)
+        self._thinking_tail = ""
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -175,6 +183,13 @@ class FunctionCallParser:
             or self.detector.supports_structural_tag()
             or self.detector.parses_required_natively()
         )
+
+    def strip_thinking(self, text: str) -> str:
+        """Non-streaming `text` without the thinking block it opens with; text
+        cut off inside the block has no content."""
+        if not self._thinking_end:
+            return text
+        return text.partition(self._thinking_end)[2]
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -243,6 +258,10 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        if self._in_streamed_thinking:
+            chunk_text = self._skip_streamed_thinking(chunk_text)
+            if self._in_streamed_thinking:
+                return "", []
         if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
         final_normal_text = ""
@@ -257,12 +276,25 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def _skip_streamed_thinking(self, chunk_text: str) -> str:
+        text = self._thinking_tail + chunk_text
+        end = text.find(self._thinking_end)
+        if end == -1:
+            # Keep what may be the start of a marker split across chunks.
+            self._thinking_tail = text[-(len(self._thinking_end) - 1) :]
+            return ""
+        self._in_streamed_thinking = False
+        self._thinking_tail = ""
+        return text[end + len(self._thinking_end) :]
+
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
 
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
+        # A held marker prefix is still thinking, so it is not released.
+        self._thinking_tail = ""
         if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
@@ -350,9 +382,8 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
-            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        should_constrain_auto = (
+            tool_choice == "auto" and self._constrains_auto_arguments()
         )
         structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):
@@ -442,3 +473,59 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+    def get_answer_structure_constraint(
+        self,
+        answer_json_schema: str,
+        parallel_tool_calls: bool = True,
+        thinking_mode: bool = False,
+        any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
+        allow_full_assistant_grammar: bool = True,
+    ) -> Optional[ToolCallConstraint]:
+        """
+        Returns a constraint for tool_choice="auto" that admits tool calls or a
+        final answer matching answer_json_schema, or None if the format cannot
+        express both.
+        """
+        if not self.tools:
+            return None
+        if (
+            isinstance(self.detector, Glm47MoeDetector)
+            and self.detector.parses_required_natively()
+        ):
+            if not allow_full_assistant_grammar:
+                return None
+            try:
+                grammar = generate_glm_answer_grammar(
+                    enable_thinking=thinking_mode,
+                    functions=[tool.function for tool in self.tools],
+                    special_tokens=GlmSpecialTokenConfig(),
+                    answer_json_schema=answer_json_schema,
+                    parallel_tool_calls=parallel_tool_calls,
+                    any_whitespace=any_whitespace,
+                    max_whitespace_cnt=max_whitespace_cnt,
+                )
+            except RuntimeError:
+                # An invalid schema keeps the plain json path, where the
+                # grammar backend rejects the request with a 400.
+                return None
+            return ("full_assistant_ebnf", grammar)
+        strict_arguments = self._constrains_auto_arguments()
+        structural_tag = self.detector.get_answer_structural_tag(
+            tools=self.structural_tag_tools() if strict_arguments else self.tools,
+            answer_json_schema=json.loads(answer_json_schema),
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+            strict_arguments=strict_arguments,
+            max_whitespace_cnt=max_whitespace_cnt,
+        )
+        if structural_tag is None:
+            return None
+        return ("structural_tag", structural_tag)
+
+    def _constrains_auto_arguments(self) -> bool:
+        return (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
