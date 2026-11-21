@@ -639,21 +639,21 @@ class MiniMaxM3MoE(nn.Module):
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                pre_quant = quant_done = None
+                pre_quant = None
                 if self.router_quant_overlap:
                     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                         quantize_nvfp4_per_token_input,
                     )
 
-                    pre_quant = quantize_nvfp4_per_token_input(hidden_states)
-                    quant_done = current_stream.record_event()
+                    pre_quant = quantize_nvfp4_per_token_input(hidden_states)._replace(
+                        ready=current_stream.record_event()
+                    )
                 shared_output = self._forward_shared_experts(hidden_states)
                 with torch.cuda.stream(self.alt_stream):
                     final_hidden_states = self._forward_router_experts(
                         hidden_states,
                         defer_finalize=defer_finalize,
                         pre_quant=pre_quant,
-                        pre_quant_done=quant_done,
                     )
                 current_stream.wait_stream(self.alt_stream)
             else:
@@ -685,12 +685,9 @@ class MiniMaxM3MoE(nn.Module):
         *,
         defer_finalize: bool = False,
         pre_quant: Optional[Tuple] = None,
-        pre_quant_done: Optional[torch.cuda.Event] = None,
     ):
         router_logits = self._compute_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        if pre_quant_done is not None:
-            torch.cuda.current_stream().wait_event(pre_quant_done)
         if defer_finalize:
             return self.experts.forward_deferred_finalize(
                 hidden_states, topk_output, pre_quant_input=pre_quant

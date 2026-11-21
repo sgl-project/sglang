@@ -1859,11 +1859,13 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
 
 class Nvfp4PerTokenInputPreQuant(NamedTuple):
     """``quantize_nvfp4_per_token_input`` of the routed input, made ahead of the
-    MoE call; the producer orders it before the MoE kernels on the consuming stream."""
+    MoE call. ``ready`` is recorded on the producing stream; the consumer waits on
+    it before the MoE kernels."""
 
     x_fp4: torch.Tensor
     x_sf: torch.Tensor
     per_token_scale: torch.Tensor
+    ready: Optional[torch.cuda.Event] = None
 
 
 def quantize_nvfp4_per_token_input(
@@ -2012,11 +2014,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             assert (
                 hidden_pad == 0 and pre_quant.x_fp4.shape[0] == hidden_states.shape[0]
             )
-            hs_fp4, hs_scale_linear, per_token_scale = pre_quant
+            if pre_quant.ready is not None:
+                torch.cuda.current_stream().wait_event(pre_quant.ready)
         else:
-            hs_fp4, hs_scale_linear, per_token_scale = quantize_nvfp4_per_token_input(
-                hidden_states
-            )
+            pre_quant = quantize_nvfp4_per_token_input(hidden_states)
+        hs_fp4, hs_scale_linear = pre_quant.x_fp4, pre_quant.x_sf
+        per_token_scale = pre_quant.per_token_scale
     else:
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
