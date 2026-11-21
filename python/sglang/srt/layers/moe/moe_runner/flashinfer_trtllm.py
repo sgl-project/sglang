@@ -1560,9 +1560,14 @@ def _run_cuda_mxfp4_decode_moe(
 _MXFP4_MOE_WORKSPACE = "trtllm_gen_mxfp4_moe_workspace"
 
 
-# The DP-gathered prefill batch, at the bucket the routed call tunes for.
+# Largest DP-gathered prefill forward, at the bucket the calls tune for.
 def _mxfp4_moe_workspace_tokens() -> int:
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
     prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    cg_config = get_exec().graph.cuda_graph_config
+    if cg_config is not None and cg_config.prefill.backend != Backend.DISABLED:
+        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
     return next_power_of_2(prefill_tokens * deployment_attn_dp_size())
 
 
@@ -1578,6 +1583,12 @@ def reserve_trtllm_mxfp4_moe_workspace(
     if get_disagg().disaggregation_mode == "decode":
         return
     max_num_tokens = _mxfp4_moe_workspace_tokens()
+    # Only the SiTU launches pass an activation; the rest run the Swiglu default.
+    activation_type = (
+        ActivationType.Situ
+        if layer.moe_runner_config.activation == "situ"
+        else ActivationType.Swiglu
+    )
     num_bytes = trtllm_fused_moe_workspace_size(
         max_num_tokens=max_num_tokens,
         hidden_size=hidden_size,
@@ -1586,7 +1597,7 @@ def reserve_trtllm_mxfp4_moe_workspace(
         top_k=layer.top_k,
         quant_mode="mxfp4_mxfp8" if precision == "default" else "mxfp4_bf16",
         local_num_experts=layer.num_local_experts,
-        activation_type=ActivationType.Situ.value,
+        activation_type=activation_type.value,
         gemm1_weights=layer.w13_weight,
         gemm1_weights_scale=layer.w13_weight_scale,
         gemm2_weights=layer.w2_weight,
@@ -1603,6 +1614,17 @@ def reserve_trtllm_mxfp4_moe_workspace(
         f"trtllm-gen MXFP4 MoE workspace reserved: {num_bytes / (1 << 30):.2f} GiB "
         f"for {max_num_tokens} tokens"
     )
+
+
+def _mxfp4_moe_workspace(num_tokens: int) -> Optional[torch.Tensor]:
+    workspace_buffer = get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
+    if workspace_buffer is not None and num_tokens > _mxfp4_moe_workspace_tokens():
+        print_warning_once(
+            f"trtllm-gen MXFP4 MoE forward of {num_tokens} tokens exceeds the "
+            f"{_mxfp4_moe_workspace_tokens()}-token workspace; "
+            "the overflow is allocated per call."
+        )
+    return workspace_buffer
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1761,21 +1783,6 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            # flashinfer rejects workspace_buffer with do_finalize=False.
-            workspace_buffer = (
-                None
-                if defer_finalize
-                else get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
-            )
-            if (
-                workspace_buffer is not None
-                and x_quant.shape[0] > _mxfp4_moe_workspace_tokens()
-            ):
-                print_warning_once(
-                    f"trtllm-gen MXFP4 MoE forward of {x_quant.shape[0]} tokens "
-                    f"exceeds the {_mxfp4_moe_workspace_tokens()}-token workspace; "
-                    "the overflow is allocated per call."
-                )
             result = trtllm_fp4_block_scale_routed_moe(
                 topk_ids=routing,
                 routing_bias=None,
@@ -1807,7 +1814,10 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 output=symm_output,
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-                workspace_buffer=workspace_buffer,
+                # flashinfer rejects workspace_buffer with do_finalize=False.
+                workspace_buffer=(
+                    None if defer_finalize else _mxfp4_moe_workspace(x_quant.shape[0])
+                ),
             )
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
@@ -1858,6 +1868,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+            workspace_buffer=_mxfp4_moe_workspace(x_quant.shape[0]),
         )
         return StandardCombineInput(hidden_states=symm_output)
 
@@ -1893,6 +1904,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        workspace_buffer=_mxfp4_moe_workspace(x_quant.shape[0]),
     )[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 
