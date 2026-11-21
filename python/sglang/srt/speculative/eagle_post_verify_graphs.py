@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -134,8 +135,7 @@ class EaglePostVerifyGraphs:
             or batch.has_grammar
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or info.acc_additive_penalties is not None
-            or info.acc_scaling_penalties is not None
+            or has_acc_penalties(info)
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling

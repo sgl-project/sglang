@@ -509,6 +509,8 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Leading output_ids already fed to the batch's penalizers.
+        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -1549,6 +1551,8 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
+        # The re-prefill batch starts the penalizers from zero.
+        self.penalty_cumulated_len = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
@@ -3274,24 +3278,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
-        # Under overlap batch.input_ids is just a placeholder here -- the
-        # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
-        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
-        # pin_memory (matching the prefill-path tensors) keeps the copy async;
-        # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
+        # Feed every output token since the last call: one per request in a
+        # decode step, a variable number after a speculative verify round. Under
+        # overlap, the step in flight is not in output_ids yet and is fed on the
+        # next call.
+        output_ids, req_indices = [], []
+        for i, req in enumerate(self.reqs):
+            new_tokens = req.output_ids[req.penalty_cumulated_len :]
+            output_ids.extend(new_tokens)
+            req_indices.extend([i] * len(new_tokens))
+            req.penalty_cumulated_len = len(req.output_ids)
+        if not output_ids:
+            return
+        output_ids, req_indices = torch.tensor(
+            [output_ids, req_indices],
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
         ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+            output_ids, req_indices
         )
 
     def prepare_for_decode(self):
@@ -3312,6 +3317,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
@@ -3326,9 +3334,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # tensors before allocation so alloc_for_decode covers them too.
         strip_beam_tail(self)
         append_beam_tail(self)
-
-        if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
