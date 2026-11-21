@@ -382,6 +382,8 @@ class AsyncSchedulerClient:
                 endpoints[replica], batch, timeout_ms
             )
         self.request_logger.log_finished_request(batch, output_batch)
+        if isinstance(output_batch, OutputBatch) and output_batch.fatal_error:
+            self.mark_failed(output_batch.fatal_error)
         return output_batch
 
     async def _forward_one(

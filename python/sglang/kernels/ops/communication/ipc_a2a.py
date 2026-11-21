@@ -13,5 +13,6 @@ def load_ipc_a2a_sync():
         cuda_wrappers=[
             ("spin_wait", "ipc_a2a::spin_wait"),
             ("bump_signal", "ipc_a2a::bump_signal"),
+            ("wait_peers", "ipc_a2a::wait_peers"),
         ],
     )

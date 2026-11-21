@@ -75,9 +75,12 @@ if TYPE_CHECKING:
     # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
     # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
-    # a deadlock backstop, not a per-step budget: a rank can legitimately stall
-    # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
-    # retires the transport on every rank and fails the request
+    # every in-kernel peer wait of the copy-engine transports: a deadlock
+    # backstop, not a per-step budget, as a rank can legitimately stall for
+    # seconds (layerwise offload, wan2.2 expert-tower swaps). Expiry retires the
+    # transport on every rank; on the multi-rank transport it fails the request
+    # after its denoising stage and marks the server unusable, on the two-rank
+    # transport it fails the next request
     SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 10000.0
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap

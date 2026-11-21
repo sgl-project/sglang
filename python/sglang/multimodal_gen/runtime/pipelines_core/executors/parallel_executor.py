@@ -207,6 +207,8 @@ class ParallelExecutor(PipelineExecutor):
                             batch = _relocate_batch_to_local_device(batch)
 
                     torch.distributed.barrier()
+                # every rank is back here, whichever ranks ran the stage
+                self._check_peer_waits(stage)
             raise_if_cancelled(requests)
         return batch
 

@@ -488,6 +488,9 @@ class OutputBatch:
     error: str | None = None
     # the client cancelled the request; error tells which one
     cancelled: bool = False
+    # the workers cannot serve another request after this error: the HTTP
+    # server turns unhealthy with it until the server is restarted
+    fatal_error: str | None = None
     output_file_paths: list[str] | None = None
     # encoded image per output when the request sets return_image_bytes
     output_image_bytes: list[bytes | None] | None = None
