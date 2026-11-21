@@ -2898,6 +2898,15 @@ class TestHiCacheArgs(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
                     handle_pd_disaggregation(args)
 
+    def test_host_receive_rejects_unified_memory(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_host_receive_threshold=0.5,
+            enable_unified_memory=True,
+        )
+        with self.assertRaisesRegex(ValueError, "unified memory"):
+            handle_pd_disaggregation(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),

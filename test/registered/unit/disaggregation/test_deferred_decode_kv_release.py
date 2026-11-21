@@ -13,16 +13,22 @@ import datetime
 import tempfile
 import threading
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
 
+import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
+from sglang.srt.disaggregation.base.conn import (
+    BaseKVManager,
+    KVPoll,
+    KVTransferDestination,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     AbortAck,
@@ -135,6 +141,10 @@ class _TestReceiver(CommonKVReceiver):
 
     def failure_exception(self):
         raise NotImplementedError
+
+
+class _HostCapableReceiver(_TestReceiver):
+    supports_host_destination = True
 
 
 class _TestSender(CommonKVSender):
@@ -1180,6 +1190,144 @@ class TestBackendOptIn(CustomTestCase):
         # drain ack itself before it may opt in.
         self.assertFalse(BaseKVManager.supports_deferred_decode_kv_release)
         self.assertFalse(CommonKVManager.supports_deferred_decode_kv_release)
+
+
+class TestHostDestinationDrain(CustomTestCase):
+    """A host destination's rows are reused only on proof that every peer
+    holding their addresses stopped writing -- never on an elapsed deadline."""
+
+    room = 211
+
+    def _make_receiver(self, acks, receiver_cls=_TestReceiver):
+        mgr = _make_manager()
+        mgr.local_ip = "10.0.0.1"
+        mgr.rank_port = 5000
+        receiver = receiver_cls.__new__(receiver_cls)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = self.room
+        receiver.bootstrap_infos = [
+            {"rank_ip": "10.0.0.2", "rank_port": 6000 + i} for i in range(acks or 1)
+        ]
+        receiver.init_time = 1.0
+        receiver.abort_notified = False
+        receiver._abort_generation = None
+        receiver._host_destination_acks = acks
+        receiver._connect_to_bootstrap_server = lambda info: (
+            SimpleNamespace(send_multipart=lambda frames: None),
+            threading.Lock(),
+        )
+        return receiver, mgr
+
+    def test_unpublished_host_rows_need_no_proof(self):
+        """No peer can be writing a host pool it was never sent, so a receiver
+        that never published one must not block its own release."""
+        receiver, _ = self._make_receiver(None)
+        self.assertTrue(receiver.is_abort_release_safe())
+
+    def test_release_waits_for_every_peer_ack(self):
+        """One ack out of two does not prove the second peer stopped writing."""
+        receiver, mgr = self._make_receiver(2)
+        self.assertFalse(receiver.is_abort_release_safe())
+        generation = mgr._deferred_abort_ack_tracker[self.room].generation
+        mgr.note_abort_ack(self.room, 0, generation)
+        self.assertFalse(receiver.is_abort_release_safe())
+        mgr.note_abort_ack(self.room, 1, generation)
+        self.assertTrue(receiver.is_abort_release_safe())
+
+    def test_first_query_arms_the_ack_path(self):
+        """Decode asks this question without aborting the room first, so the
+        query itself must notify the peers; otherwise no ack ever arrives."""
+        receiver, mgr = self._make_receiver(1)
+        self.assertNotIn(self.room, mgr._deferred_abort_ack_tracker)
+        receiver.is_abort_release_safe()
+        self.assertIn(self.room, mgr._deferred_abort_ack_tracker)
+        self.assertTrue(receiver.abort_notified)
+
+    def test_a_drained_room_drops_its_ack_record(self):
+        """A drained host room leaves no ack record behind and keeps answering
+        True: decode never clears the record itself, and asks until all ranks agree."""
+        receiver, mgr = self._make_receiver(1)
+        self.assertFalse(receiver.is_abort_release_safe())
+        generation = mgr._deferred_abort_ack_tracker[self.room].generation
+        mgr.note_abort_ack(self.room, 0, generation)
+
+        self.assertTrue(receiver.is_abort_release_safe())
+        self.assertNotIn(self.room, mgr._deferred_abort_ack_tracker)
+        self.assertTrue(receiver.is_abort_release_safe())
+
+    def test_drain_state_survives_the_clear_on_a_failed_transfer(self):
+        """Decode calls failure_exception() -- and so clear() -- on a failed
+        transfer before it asks whether the peer's writes drained. A clear()
+        that dropped the record would hand the host rows back while a remote
+        write was still in flight."""
+        receiver, mgr = self._make_receiver(1)
+        generation = mgr.register_deferred_abort_room(self.room)
+        receiver._abort_generation = generation
+        receiver.abort_notified = True
+
+        receiver.conclude_state = None
+        mgr.defer_decode_allocation = False
+        mgr.request_status = {self.room: KVPoll.Failed}
+        mgr.required_prefill_response_num_table = {}
+        mgr.prefill_response_tracker = {}
+        mgr.addr_to_rooms_tracker = defaultdict(set)
+        receiver.bootstrap_addr = "10.0.0.2:6000"
+        receiver._owns_bootstrap_room = True
+        receiver.clear()
+
+        self.assertFalse(receiver.is_abort_release_safe())
+        mgr.note_abort_ack(self.room, 0, generation)
+        self.assertTrue(receiver.is_abort_release_safe())
+
+    def test_publishing_a_host_destination_gates_release_on_every_peer(self):
+        """send_metadata is the only place the peer count is recorded; a publish
+        that skipped it would let the first failure hand back host rows that a
+        second prefill rank is still writing."""
+        receiver, mgr = self._make_receiver(None, _HostCapableReceiver)
+        receiver.bootstrap_infos = [
+            {"rank_ip": "10.0.0.2", "rank_port": 6000 + i, "is_dummy": False}
+            for i in range(2)
+        ]
+        receiver.required_dst_info_num = 2
+        receiver._send_bootstrap_message = MagicMock(return_value=True)
+        mgr.enable_staging = False
+        mgr.build_receiver_metadata_message = MagicMock(return_value=[b"frame"])
+
+        receiver.send_metadata(
+            np.array([1, 2], dtype=np.int32),
+            aux_index=0,
+            destination=KVTransferDestination.HOST,
+        )
+
+        self.assertEqual(
+            [
+                sent.kwargs["destination"]
+                for sent in mgr.build_receiver_metadata_message.call_args_list
+            ],
+            [KVTransferDestination.HOST] * 2,
+        )
+        self.assertFalse(receiver.is_abort_release_safe())
+        generation = mgr._deferred_abort_ack_tracker[self.room].generation
+        mgr.note_abort_ack(self.room, 0, generation)
+        self.assertFalse(receiver.is_abort_release_safe())
+        mgr.note_abort_ack(self.room, 1, generation)
+        self.assertTrue(receiver.is_abort_release_safe())
+
+    def test_publishing_a_host_destination_to_an_incapable_receiver_is_refused(self):
+        """A receiver whose peer has no host twin must not publish host
+        addresses at all: the prefill would write a pool it cannot address."""
+        receiver, mgr = self._make_receiver(None)
+        mgr.build_receiver_metadata_message = MagicMock()
+
+        with self.assertRaises(NotImplementedError):
+            receiver.send_metadata(
+                np.array([1], dtype=np.int32),
+                aux_index=0,
+                destination=KVTransferDestination.HOST,
+            )
+
+        mgr.build_receiver_metadata_message.assert_not_called()
+        self.assertIsNone(receiver._host_destination_acks)
 
 
 if __name__ == "__main__":

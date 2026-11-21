@@ -744,6 +744,7 @@ class CommonKVManager(BaseKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        destination: KVTransferDestination = KVTransferDestination.DEVICE,
     ) -> List[bytes]:
         raise NotImplementedError
 
@@ -2699,6 +2700,9 @@ class CommonKVReceiver(BaseKVReceiver):
     _prefill_wait_start: Optional[float] = None
     _owns_bootstrap_room: bool = True
     _lifecycle_lock = nullcontext()
+    # Resolved by init(); None until this receiver has read its peer's
+    # parallel info, so capability checks before then must treat it as unknown.
+    prefill_info: Optional[PrefillServerInfo] = None
 
     _ctx = zmq.Context()
     _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
@@ -2725,6 +2729,10 @@ class CommonKVReceiver(BaseKVReceiver):
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
         self._abort_generation: Optional[int] = None
+        # Prefill ranks holding this room's host addresses; None until published
+        # and again once all acked. Not reset by clear(): decode asks whether
+        # writes drained after clearing.
+        self._host_destination_acks: Optional[int] = None
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._owns_bootstrap_room = not (
             mgr.defer_decode_allocation and bootstrap_room in mgr.request_status
@@ -3082,7 +3090,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
         if destination != KVTransferDestination.DEVICE:
-            raise NotImplementedError("Host KV destinations are not supported")
+            if not self.supports_host_destination:
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support "
+                    f"{destination.value} KV destinations for this peer"
+                )
+            # Recorded before the first send: a peer whose send later fails may
+            # still have the addresses, so its ack is required to release them.
+            self._host_destination_acks = len(self.bootstrap_infos)
 
         self.chunk_staging_infos = []
         if (
@@ -3103,6 +3118,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 decode_prefix_len=decode_prefix_len,
                 is_dummy=bootstrap_info["is_dummy"],
                 device_kv_indices=device_kv_indices,
+                destination=destination,
             )
             if not self._send_bootstrap_message(
                 bootstrap_info=bootstrap_info,
@@ -3190,6 +3206,22 @@ class CommonKVReceiver(BaseKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             self.conclude_state = KVPoll.Failed
         self.ensure_abort_notified()
+
+    def is_abort_release_safe(self) -> bool:
+        if self._host_destination_acks is None:
+            return True
+        # No deadline: a timeout cannot prove a remote write stopped. Arms the
+        # ack path here, since decode asks before it aborts the room.
+        self.ensure_abort_notified(force_arm=True)
+        if not self.kv_mgr.is_abort_release_safe(
+            self.bootstrap_room, self._host_destination_acks
+        ):
+            return False
+        # Decode clears the ack record only for device rooms, and asks again
+        # until every rank agrees, so drop it here and stay drained.
+        self.kv_mgr.clear_deferred_abort_state(self.bootstrap_room)
+        self._host_destination_acks = None
+        return True
 
     def ensure_abort_notified(self, *, force_arm: bool = False) -> None:
         """Notify the prefill ranks (and arm drain-ack accounting) exactly once.
