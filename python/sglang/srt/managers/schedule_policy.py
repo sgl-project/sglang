@@ -251,6 +251,8 @@ class SchedulePolicy:
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        # Rotates the bounded re-match window over a long waiting queue.
+        self._rematch_cursor = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -591,9 +593,12 @@ class SchedulePolicy:
         # In-batch prefix caching: of the requests with almost nothing cached that
         # share a prefix, only one runs, so the shared prefix is computed once.
         candidates = []
-        for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
-            match_kv_cache(r, self.tree_cache, prefix_ids)
+        for r in self._requests_to_rematch(waiting_queue, policy):
+            # The incrementally kept fill ids avoid an O(context) copy per request.
+            r.refresh_fill_ids()
+            prefix_ids = r.full_untruncated_fill_ids
+            self._match_for_ranking(r, prefix_ids)
+            r.waiting_prefix_matched = True
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
@@ -645,6 +650,44 @@ class SchedulePolicy:
                     )
                 )
         return temporary_deprioritized
+
+    def _match_for_ranking(self, r: Req, token_ids=None) -> None:
+        # The external store lookup is a remote call plus a collective, so ranking
+        # does it once per request and reuses the hit; admission looks up afresh.
+        probe = r.external_hit_end is None
+        match_kv_cache(r, self.tree_cache, token_ids, probe_external=probe)
+        if not self.tree_cache.probes_external_store():
+            return
+        if probe:
+            r.external_hit_end = r.num_matched_prefix_tokens
+        else:
+            r.num_matched_prefix_tokens = max(
+                r.num_matched_prefix_tokens, r.external_hit_end
+            )
+
+    def _requests_to_rematch(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> List[Req]:
+        """The requests whose prefix match this pass refreshes.
+
+        Shortest-prefill-first ranks by uncached length, which moves slowly, and
+        admission re-matches every request it takes. Past
+        WAITING_QUEUE_PREFIX_MATCH_MAX requests, refresh only never-matched ones
+        plus a rotating window, so a pass costs O(window), not O(queue x context).
+        """
+        if (
+            policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            or len(waiting_queue) <= WAITING_QUEUE_PREFIX_MATCH_MAX
+        ):
+            return waiting_queue
+        fresh = [r for r in waiting_queue if not r.waiting_prefix_matched]
+        matched = [r for r in waiting_queue if r.waiting_prefix_matched]
+        if not matched:
+            return fresh
+        start = self._rematch_cursor % len(matched)
+        window = (matched[start:] + matched[:start])[:WAITING_QUEUE_PREFIX_MATCH_MAX]
+        self._rematch_cursor = start + len(window)
+        return fresh + window
 
     def poll_storage_prefetches(self, waiting_queue: Iterable[Req]) -> None:
         """Observe finished storage prefetches before ranking. Completion is
@@ -894,7 +937,7 @@ class SchedulePolicy:
             # (new or retracted: last_node is None); its count may go stale.
             for r in waiting_queue:
                 if r.last_node is None:
-                    match_kv_cache(r, self.tree_cache)
+                    self._match_for_ranking(r)
             waiting_queue.sort(key=phi)
         window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
         deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)

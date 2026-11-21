@@ -59,10 +59,14 @@ class FakeReq:
         self.cache_request_handle = None
         self.last_node = None
         self.uniboost_first_seen_step = None
+        self.external_hit_end = None
         self.finished_reason = None
         self.extra_key = None
         self.cache_salt = None
         self.priority = 0
+
+    def refresh_fill_ids(self):
+        self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
 
 class FakeTreeCache:
@@ -70,6 +74,9 @@ class FakeTreeCache:
         self.disable = disable
 
     def supports_fast_match_prefix(self):
+        return False
+
+    def probes_external_store(self):
         return False
 
     def supports_prefix_sharing(self):
@@ -222,7 +229,7 @@ class TestUniboostMatching(UniboostTestBase):
     def run_pass(self, policy, queue):
         matched = []
 
-        def fake_match(req, tree_cache, token_ids=None):
+        def fake_match(req, tree_cache, token_ids=None, **kwargs):
             matched.append(req.rid)
             req.last_node = object()
 

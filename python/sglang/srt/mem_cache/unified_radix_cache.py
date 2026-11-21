@@ -721,11 +721,10 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         # Outside the tree a window's host hit goes by its sub-pool's name.
         result = result.with_window_hits_by_sub_pool(self.window_sub_pool_of_slot)
-        # PD decode has no linker load-back path, so it only offloads.
         if (
-            self.linker is not None
-            and params.req is not None
-            and get_disagg().disaggregation_mode != "decode"
+            params.req is not None
+            and params.probe_external
+            and self.probes_external_store()
         ):
             result = self.linker.match(params.key, params.req, result)
         return result
@@ -745,6 +744,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
+
+    def probes_external_store(self) -> bool:
+        # PD decode has no linker load-back path; prefetch mode looks up on enqueue.
+        return (
+            self.linker is not None
+            and self.linker.load_mode != "prefetch"
+            and get_disagg().disaggregation_mode != "decode"
+        )
 
     def touch_prefix(self, key: RadixKey) -> None:
         # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
