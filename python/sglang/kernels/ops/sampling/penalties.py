@@ -14,11 +14,11 @@ and transforms a logit ``x`` as ``SamplingBatchInfo`` does for one row:
 otherwise, where ``round`` rounds to the logits dtype.
 
 The kernels round like the penalizers' ops that non-speculative decoding runs,
-so both give the same logits: the frequency table is advanced by FTZ fp32
-additions like the atomics of ``scatter_add_`` in ``BatchedFrequencyPenalizer``,
-and the division is Triton's ``div.full.f32``, which torch.compile emits for
-``apply_scaling_penalties``. They launch with FP contraction disabled so a logit
-bias is added after the scaled value is rounded.
+so both give the same logits: the frequency table is advanced by sequential fp32
+additions that keep subnormals, like ``index_put_(accumulate=True)`` in
+``BatchedFrequencyPenalizer``, and the division is Triton's ``div.full.f32``,
+which torch.compile emits for ``apply_scaling_penalties``. They launch with FP
+contraction disabled so a logit bias is added after the scaled value is rounded.
 """
 
 from __future__ import annotations
@@ -29,8 +29,6 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.utils import is_cuda
 
 _BLOCK_V = 2048
 
@@ -52,21 +50,6 @@ def _check_per_request(t: torch.Tensor, bs: int) -> None:
 
 
 @triton.jit
-def _add_f32(x, y, FTZ: tl.constexpr):
-    if FTZ:
-        return tl.inline_asm_elementwise(
-            asm="add.rn.ftz.f32 $0, $1, $2;",
-            constraints="=f,f,f",
-            args=[x, y],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-    else:
-        return x + y
-
-
-@triton.jit
 def _cumulate_padded_tokens_kernel(
     table_ptr,
     table_stride,
@@ -81,20 +64,26 @@ def _cumulate_padded_tokens_kernel(
     BLOCK_W: tl.constexpr,
 ):
     row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_W)
     n = tl.minimum(tl.load(lens_ptr + row), width)
-    tokens = tl.load(
-        tokens_ptr + row * tokens_stride + cols, mask=cols < n, other=-1
-    ).to(tl.int64)
-    valid = (cols < n) & (tokens >= 0) & (tokens < vocab_size)
-    coef = tl.full([BLOCK_W], tl.load(coef_ptr + row * coef_stride), tl.float32)
-    ptrs = table_ptr + row.to(tl.int64) * table_stride + tokens
+    scalar_coef = tl.load(coef_ptr + row * coef_stride)
+    table_row = table_ptr + row.to(tl.int64) * table_stride
     if ACCUMULATE:
-        # Every count of a token adds the row's same coefficient, so the order of
-        # the atomics does not change the sum.
-        tl.atomic_add(ptrs, coef, mask=valid, sem="relaxed")
+        # One token after another, with plain fp32 additions: atomics would flush
+        # a subnormal coefficient to zero, where index_put_ keeps it.
+        for j in range(0, width):
+            token = tl.load(tokens_ptr + row * tokens_stride + j).to(tl.int64)
+            hit = (j < n) & (token >= 0) & (token < vocab_size)
+            ptr = table_row + tl.where(hit, token, 0)
+            count = tl.load(ptr, mask=hit, other=0.0)
+            tl.store(ptr, count + scalar_coef, mask=hit)
     else:
-        tl.store(ptrs, coef, mask=valid)
+        cols = tl.arange(0, BLOCK_W)
+        tokens = tl.load(
+            tokens_ptr + row * tokens_stride + cols, mask=cols < n, other=-1
+        ).to(tl.int64)
+        valid = (cols < n) & (tokens >= 0) & (tokens < vocab_size)
+        coef = tl.full([BLOCK_W], scalar_coef, tl.float32)
+        tl.store(table_row + tokens, coef, mask=valid)
 
 
 def cumulate_padded_tokens(
@@ -109,7 +98,7 @@ def cumulate_padded_tokens(
 
     Each valid token adds (``accumulate``) or writes ``coefficients[b]`` at its
     column; tokens outside ``[0, V)`` are skipped. Equivalent to one
-    ``scatter_add_`` (or ``scatter_``) per column, in column order.
+    ``index_put_`` (accumulating, or not) per column, in column order.
     """
     bs, width = tokens.shape
     _check_rows(tokens, bs)
@@ -177,7 +166,6 @@ def _chain_overrides_kernel(
     HAS_PRES: tl.constexpr,
     HAS_REP: tl.constexpr,
     HAS_MIN_NEW: tl.constexpr,
-    FTZ: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     b = tl.program_id(0)
@@ -223,7 +211,7 @@ def _chain_overrides_kernel(
             counted = (j - 1 < num_drafts) & (draft >= 0) & (draft < vocab_size)
             hit = valid & (tokens == draft) & counted
             if HAS_FREQ:
-                freq = tl.where(hit, _add_f32(freq, freq_coef, FTZ), freq)
+                freq = tl.where(hit, freq + freq_coef, freq)
             seen = seen | hit
         # The same ops, in the same order, as update_penalties' accumulation.
         add = tl.zeros([BLOCK_T], dtype=tl.float32)
@@ -347,7 +335,6 @@ def chain_penalty_overrides(
         HAS_PRES=presence is not None,
         HAS_REP=repetition is not None,
         HAS_MIN_NEW=min_new_tokens is not None,
-        FTZ=is_cuda(),
         BLOCK_T=triton.next_power_of_2(num_slots),
     )
     return tokens, additive, scaling
