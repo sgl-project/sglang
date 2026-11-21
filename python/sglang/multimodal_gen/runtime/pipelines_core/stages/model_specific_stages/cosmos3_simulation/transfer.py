@@ -194,7 +194,7 @@ def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
     """First ``max_frames`` frames of the control clip as ``uint8 [3, T, H, W]``."""
     frames = load_video(path, max_frames=max_frames)
     if not frames:
-        raise ValueError(f"No frames decoded from control video {path!r}.")
+        raise ValueError("No frames decoded from control video.")
     arrays = [
         np.asarray(frame.convert("RGB"), dtype=np.uint8)
         for frame in frames[:max_frames]

@@ -194,7 +194,7 @@ def media_hw(path: str) -> tuple[int, int]:
         pass
     decoded = load_video(path, max_frames=1)
     if not decoded:
-        raise ValueError(f"No frames decoded from Cosmos3 multiview media {path!r}.")
+        raise ValueError("No frames decoded from Cosmos3 multiview media.")
     first = decoded[0]
     return int(first.height), int(first.width)
 
@@ -213,9 +213,7 @@ def load_media_uint8_cthw(
     else:
         decoded = load_video(path, max_frames=max_frames)
         if not decoded:
-            raise ValueError(
-                f"No frames decoded from Cosmos3 multiview media {path!r}."
-            )
+            raise ValueError("No frames decoded from Cosmos3 multiview media.")
         frames = [frame.convert("RGB") for frame in decoded]
     first = _pil_to_uint8_tensor(frames[0])
     if first.ndim != 3 or first.shape[0] != 3:

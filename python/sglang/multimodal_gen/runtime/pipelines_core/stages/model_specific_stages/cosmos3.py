@@ -15,7 +15,7 @@ import math
 import tempfile
 from collections import deque
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from fractions import Fraction
 from itertools import islice
 from typing import Any
@@ -244,21 +244,31 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
 @contextmanager
 def _open_video_stream(video_path: str):
     """Give PyAV a seekable stream; remote clips are fully staged under the download cap."""
-    scheme = urlparse(video_path).scheme.lower()
-    if scheme in ("http", "https"):
-        with tempfile.TemporaryFile() as stream:
-            download_video_to_stream(video_path, stream)
-            stream.seek(0)
+    with ExitStack() as files:
+        try:
+            scheme = urlparse(video_path).scheme.lower()
+            if scheme in ("http", "https"):
+                stream = files.enter_context(tempfile.TemporaryFile())
+                download_video_to_stream(video_path, stream)
+                stream.seek(0)
+            elif scheme == "data":
+                # DataHandler only reads inline bytes; it does not dispatch URLs.
+                stream = files.enter_context(
+                    DataHandler().data_open(Request(video_path))
+                )
+            elif not scheme or len(scheme) == 1:
+                stream = files.enter_context(open(video_path, "rb"))
+            else:
+                stream = None
+        except (ValueError, OSError) as exc:
+            # Both HTTP and filesystem exceptions may retain the original source.
+            category = type(exc).__name__
+        else:
+            if stream is None:
+                raise ValueError("Unsupported video path scheme")
             yield stream
-    elif scheme == "data":
-        # DataHandler decodes inline bytes only; it is not a URL dispatcher.
-        with DataHandler().data_open(Request(video_path)) as stream:
-            yield stream
-    elif scheme and len(scheme) > 1:
-        raise ValueError("Unsupported video path scheme")
-    else:
-        with open(video_path, "rb") as stream:
-            yield stream
+            return
+        raise ValueError(f"Could not open video source ({category}).")
 
 
 def _iter_video_frames_pyav(
@@ -282,7 +292,7 @@ def _iter_video_frames_pyav(
         av.open(source, options={"protocol_whitelist": "data"}) as container,
     ):
         if not container.streams.video:
-            raise ValueError(f"No video stream in {video_path!r}")
+            raise ValueError("Input media has no video stream.")
         stream = container.streams.video[0]
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
@@ -365,7 +375,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path, max_frames=max_frames)
         if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+            raise ValueError("No frames decoded from transfer video.")
         frames = frames[:max_frames]
         frames_cthw = torch.stack(
             [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
@@ -595,7 +605,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 else:
                     processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
             if not processed:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+                raise ValueError("No frames decoded from input video.")
             # Pad CUDA frames after conversion to the VAE dtype instead.
             if force_cpu:
                 if len(processed) < num_source_frames:

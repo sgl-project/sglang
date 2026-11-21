@@ -8,9 +8,11 @@ protocol-prefixed strings to ``av.open``. Public http(s) URLs keep working.
 """
 
 import asyncio
+import base64
 import http.server
 import threading
 import unittest.mock as mock
+import wave
 
 import pytest
 import requests
@@ -180,6 +182,21 @@ class TestLoadVideoDownload:
 
 
 class TestAvOpenGuard:
+    def test_audio_only_media_does_not_echo_its_source(self, tmp_path):
+        pytest.importorskip("av")
+        path = tmp_path / "synthetic-private-name.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            wav.writeframes(bytes(160))
+        data_uri = (
+            "data:audio/wav;base64," + base64.b64encode(path.read_bytes()).decode()
+        )
+        for source in (str(path), data_uri):
+            with pytest.raises(
+                ValueError, match=r"^Input media has no video stream\.$"
+            ):
+                list(_iter_video_frames_pyav(source, 1))
+
     def _fake_av(self):
         fake_av = mock.MagicMock()
         container = mock.MagicMock()
@@ -206,9 +223,25 @@ class TestAvOpenGuard:
     def test_private_http_url_is_rejected_before_av_open(self):
         fake_av = self._fake_av()
         with mock.patch.dict("sys.modules", {"av": fake_av}):
-            with pytest.raises(ValueError, match="non-public IP"):
+            with pytest.raises(ValueError, match="Could not open video source"):
                 list(_iter_video_frames_pyav(PRIVATE_URL, 1))
         fake_av.open.assert_not_called()
+
+    def test_approved_transport_failure_does_not_retain_url(self):
+        url = PUBLIC_VIDEO_URL + "?signature=synthetic-private-marker"
+        fake_av = self._fake_av()
+        with (
+            mock.patch.dict("sys.modules", {"av": fake_av}),
+            mock.patch.object(
+                vision.requests, "get", side_effect=requests.Timeout(url)
+            ),
+            pytest.raises(
+                ValueError, match=r"^Could not open video source \(Timeout\)\.$"
+            ) as exc,
+        ):
+            list(_iter_video_frames_pyav(url, 1))
+        fake_av.open.assert_not_called()
+        assert exc.value.__context__ is None and exc.value.__cause__ is None
 
     def test_local_path_still_reaches_av_open(self, tmp_path):
         fake_av = self._fake_av()
