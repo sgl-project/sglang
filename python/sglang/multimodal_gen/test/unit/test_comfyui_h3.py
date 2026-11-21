@@ -1298,6 +1298,12 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
         "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit._load_jit_kernel",
         lambda: None,
     )
+    # The CUDA backends under test are refused on an XPU host.
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.layers.quantization.configs."
+        "convrot_int8_config.current_platform",
+        SimpleNamespace(is_xpu=lambda: False),
+    )
     monkeypatch.setenv("SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", backend)
     arguments = SimpleNamespace(
         pipeline_config=SimpleNamespace(
