@@ -282,6 +282,10 @@ mod tests {
             ("params:\n  t: {pin: 1, max: 2}\n", "cannot be combined"),
             ("params:\n  t: {default: 3, max: 2}\n", "default"),
             (
+                "params:\n  t: {values: [a], on_invalid: default}\n",
+                "needs a `default`",
+            ),
+            (
                 "params:\n  t: {min: 1, normalize: [[0, -1]]}\n",
                 "never accepted",
             ),

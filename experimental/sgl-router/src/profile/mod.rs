@@ -104,6 +104,22 @@ pub struct ParamRule {
     pub ty: Option<ParamType>,
     /// `[from, to]` pairs applied to accepted values before forwarding.
     pub normalize: Vec<[Value; 2]>,
+    #[serde(skip_serializing_if = "OnInvalid::is_reject")]
+    pub on_invalid: OnInvalid,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnInvalid {
+    #[default]
+    Reject,
+    Default,
+}
+
+impl OnInvalid {
+    fn is_reject(&self) -> bool {
+        *self == OnInvalid::Reject
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -199,6 +215,9 @@ impl ParamRule {
         if self.pin.is_some() && constrained {
             bail!("params.{name}: `pin` cannot be combined with default, min, max or values");
         }
+        if self.on_invalid == OnInvalid::Default && self.default.is_none() {
+            bail!("params.{name}: `on_invalid: default` needs a `default`");
+        }
         if let (Some(lo), Some(hi)) = (self.min, self.max) {
             if lo > hi {
                 bail!("params.{name}: min {lo} > max {hi}");
@@ -225,6 +244,10 @@ impl ParamRule {
 }
 
 impl ApiProfile {
+    pub fn raw_reasoning_effort(&self) -> bool {
+        self.params.contains_key("reasoning_effort")
+    }
+
     /// The profile as YAML, without unset fields.
     pub fn to_yaml(&self) -> String {
         fn prune(v: &mut Value) -> bool {

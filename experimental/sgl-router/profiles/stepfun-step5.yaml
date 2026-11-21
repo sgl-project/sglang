@@ -13,5 +13,6 @@ params:
   presence_penalty:  { min: -2, max: 2 }
   n:                 { min: 1, max: 8, type: int }
   reasoning_format:  { values: [general, deepseek-style] }
+  reasoning_effort:  { default: max, values: [none, low, medium, high, xhigh, max], on_invalid: default }
 errors:
   bad_request_type: request_params_invalid

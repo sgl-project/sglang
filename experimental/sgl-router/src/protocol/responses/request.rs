@@ -73,7 +73,7 @@ const CONSUMED: &[&str] = &[
     "n",
 ];
 
-pub fn to_chat(req: Value) -> Result<Converted, String> {
+pub fn to_chat(req: Value, raw_effort: bool) -> Result<Converted, String> {
     let Value::Object(req) = req else {
         return Err("request body must be a JSON object".into());
     };
@@ -151,7 +151,11 @@ pub fn to_chat(req: Value) -> Result<Converted, String> {
         }
     }
     if let Some(reasoning) = req.get("reasoning").filter(|v| !v.is_null()) {
-        if let Some(effort) = convert_reasoning_effort(reasoning)? {
+        if raw_effort {
+            if let Some(effort) = reasoning.get("effort").filter(|v| !v.is_null()) {
+                chat.insert("reasoning_effort".into(), effort.clone());
+            }
+        } else if let Some(effort) = convert_reasoning_effort(reasoning)? {
             chat.insert("reasoning_effort".into(), Value::String(effort.into()));
         }
     }
@@ -730,7 +734,7 @@ mod tests {
     use super::*;
 
     fn chat(req: Value) -> Value {
-        to_chat(req).expect("converts").chat
+        to_chat(req, false).expect("converts").chat
     }
 
     #[test]
@@ -905,16 +909,19 @@ mod tests {
                 "invalid",
             ),
         ] {
-            let err = to_chat(req.clone()).expect_err(&req.to_string());
+            let err = to_chat(req.clone(), false).expect_err(&req.to_string());
             assert!(err.contains(needle), "{req}: {err}");
         }
     }
 
     #[test]
     fn echo_defaults() {
-        let e = to_chat(json!({"model": "m", "input": "x", "max_output_tokens": 16}))
-            .unwrap()
-            .echo;
+        let e = to_chat(
+            json!({"model": "m", "input": "x", "max_output_tokens": 16}),
+            false,
+        )
+        .unwrap()
+        .echo;
         assert_eq!(e.model, "m");
         assert_eq!(e.fields["max_output_tokens"], 16);
         assert_eq!(e.fields["tool_choice"], "auto");
@@ -929,22 +936,25 @@ mod tests {
 
     #[test]
     fn codex_namespace_and_custom_tools() {
-        let c = to_chat(json!({"model": "m", "tools": [
-            {"type": "function", "name": "shell", "parameters": {"type": "object"}},
-            {"type": "custom", "name": "apply_patch", "description": "Edit files.",
-             "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
-            {"type": "namespace", "name": "mcp__fs__", "description": "fs",
-             "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
-        ],
-            "input": [
-                {"type": "message", "role": "user", "content": "go"},
-                {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
-                 "input": "*** Begin Patch"},
-                {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
-                {"type": "function_call", "call_id": "c2", "name": "read",
-                 "namespace": "mcp__fs__", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "c2", "output": "data"},
-            ]}))
+        let c = to_chat(
+            json!({"model": "m", "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                {"type": "custom", "name": "apply_patch", "description": "Edit files.",
+                 "format": {"type": "grammar", "syntax": "lark", "definition": "start: patch"}},
+                {"type": "namespace", "name": "mcp__fs__", "description": "fs",
+                 "tools": [{"type": "function", "name": "read", "parameters": {"type": "object"}}]},
+            ],
+                "input": [
+                    {"type": "message", "role": "user", "content": "go"},
+                    {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
+                     "input": "*** Begin Patch"},
+                    {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+                    {"type": "function_call", "call_id": "c2", "name": "read",
+                     "namespace": "mcp__fs__", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c2", "output": "data"},
+                ]}),
+            false,
+        )
         .unwrap();
         let names: Vec<&str> = c.chat["tools"]
             .as_array()
@@ -976,5 +986,31 @@ mod tests {
             json!({"role": "tool", "tool_call_id": "c1", "content": "ok"})
         );
         assert_eq!(m[3]["tool_calls"][0]["function"]["name"], "mcp__fs__read");
+    }
+
+    #[test]
+    fn raw_effort_is_forwarded_unchanged() {
+        for e in [
+            json!("none"),
+            json!("xhigh"),
+            json!("minimal"),
+            json!("MAX"),
+            json!(""),
+            json!(5),
+        ] {
+            let req = json!({"model": "m", "input": "x", "reasoning": {"effort": e}});
+            let c = to_chat(req, true).unwrap().chat;
+            assert_eq!(c["reasoning_effort"], e);
+        }
+        for req in [
+            json!({"model": "m", "input": "x"}),
+            json!({"model": "m", "input": "x", "reasoning": {"effort": null}}),
+            json!({"model": "m", "input": "x", "reasoning": {"summary": "auto"}}),
+        ] {
+            let c = to_chat(req.clone(), true).unwrap().chat;
+            assert!(c.get("reasoning_effort").is_none(), "{req}");
+        }
+        let legacy = json!({"model": "m", "input": "x", "reasoning": {"effort": "xhigh"}});
+        assert_eq!(chat(legacy)["reasoning_effort"], "max");
     }
 }

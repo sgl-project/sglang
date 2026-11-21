@@ -31,7 +31,8 @@ pub(crate) async fn messages(
     // Body-consuming extractor: MUST stay last (see `chat_completions`).
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match parse(&body, false) {
+    let raw_effort = ctx.config.model.profile.raw_reasoning_effort();
+    let mut converted = match parse(&body, false, raw_effort) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
@@ -61,7 +62,8 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let converted = match parse(&body, true) {
+    let raw_effort = ctx.config.model.profile.raw_reasoning_effort();
+    let converted = match parse(&body, true, raw_effort) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
@@ -69,12 +71,16 @@ pub(crate) async fn count_tokens(
     if model != ctx.config.model.id {
         return adapt(ApiError::ModelNotFound(model).into_response(), None).await;
     }
+    let chat = serde_json::to_vec(&converted.chat)
+        .ok()
+        .and_then(|b| ctx.config.model.profile.apply(Bytes::from(b), &model).ok())
+        .and_then(|a| serde_json::from_slice(&a.body).ok())
+        .unwrap_or(converted.chat);
     let model_id = ModelId(model);
     let engine = crate::workers::introspect::EngineChatTemplate::from_workers(
         &ctx.registry.workers_for(&model_id),
     );
-    match crate::policies::request_tokens_for(&ctx.tokenizers, &model_id, &converted.chat, &engine)
-    {
+    match crate::policies::request_tokens_for(&ctx.tokenizers, &model_id, &chat, &engine) {
         Some(t) => axum::Json(serde_json::json!({"input_tokens": t.ids.len()})).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -85,10 +91,14 @@ pub(crate) async fn count_tokens(
     }
 }
 
-fn parse(body: &Bytes, count_only: bool) -> Result<anthropic::Converted, ApiError> {
+fn parse(
+    body: &Bytes,
+    count_only: bool,
+    raw_effort: bool,
+) -> Result<anthropic::Converted, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    anthropic::to_chat(req, count_only).map_err(ApiError::BadRequest)
+    anthropic::to_chat(req, count_only, raw_effort).map_err(ApiError::BadRequest)
 }
 
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.

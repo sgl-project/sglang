@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
 
-use super::{lax_number, number, ApiProfile, OnExceed};
+use super::{lax_number, number, ApiProfile, OnExceed, OnInvalid};
 use crate::server::error::ApiError;
 
 /// The (possibly rewritten) body and what the reply conversion must do.
@@ -20,6 +20,7 @@ pub struct Applied {
     pub body: Bytes,
     /// `reasoning_format: general`: reply with `reasoning` instead of `reasoning_content`.
     pub reasoning_general: bool,
+    pub reasoning_effort: Option<Value>,
 }
 
 impl ApiProfile {
@@ -37,6 +38,7 @@ impl ApiProfile {
             return Ok(Applied {
                 body,
                 reasoning_general: false,
+                reasoning_effort: None,
             });
         }
         let top: BTreeMap<String, &RawValue> = serde_json::from_slice(&body).map_err(|_| {
@@ -55,22 +57,47 @@ impl ApiProfile {
             }
         }
 
+        let mut nested_effort = if self.raw_reasoning_effort() {
+            take_nested_effort(&get, &mut set)
+        } else {
+            None
+        };
+        let mut reasoning_effort = None;
         for (name, rule) in &self.params {
-            match get(name) {
+            let nested = if name == EFFORT {
+                nested_effort.take()
+            } else {
+                None
+            };
+            let moved = nested.is_some();
+            let effective = match nested.or_else(|| get(name)) {
                 Some(v) => {
-                    if let Some(why) = rule.check(name, &v) {
-                        return Err(ApiError::BadRequest(why));
+                    let n = match rule.check(name, &v) {
+                        None => rule.normalized(v.clone()),
+                        Some(why) => match (rule.on_invalid, &rule.default) {
+                            (OnInvalid::Default, Some(d)) => rule.normalized(d.clone()),
+                            _ => return Err(ApiError::BadRequest(why)),
+                        },
+                    };
+                    if moved || n != v {
+                        set.insert(name.clone(), n.clone());
                     }
-                    let n = rule.normalized(v.clone());
-                    if n != v {
-                        set.insert(name.clone(), n);
-                    }
+                    Some(n)
                 }
                 None => {
-                    if let Some(d) = rule.pin.clone().or_else(|| rule.default.clone()) {
-                        set.insert(name.clone(), rule.normalized(d));
+                    let d = rule
+                        .pin
+                        .clone()
+                        .or_else(|| rule.default.clone())
+                        .map(|d| rule.normalized(d));
+                    if let Some(d) = &d {
+                        set.insert(name.clone(), d.clone());
                     }
+                    d
                 }
+            };
+            if name == EFFORT {
+                reasoning_effort = effective;
             }
         }
 
@@ -115,6 +142,7 @@ impl ApiProfile {
             return Ok(Applied {
                 body,
                 reasoning_general,
+                reasoning_effort,
             });
         }
         #[derive(Serialize)]
@@ -135,8 +163,44 @@ impl ApiProfile {
         Ok(Applied {
             body: Bytes::from(bytes),
             reasoning_general,
+            reasoning_effort,
         })
     }
+}
+
+const EFFORT: &str = "reasoning_effort";
+
+fn take_nested_effort(
+    get: &impl Fn(&str) -> Option<Value>,
+    set: &mut BTreeMap<String, Value>,
+) -> Option<Value> {
+    let mut found = Vec::new();
+    for (field, keys) in [
+        ("chat_template_kwargs", &[EFFORT][..]),
+        ("reasoning", &["effort", EFFORT][..]),
+    ] {
+        let Some(Value::Object(mut obj)) = get(field) else {
+            continue;
+        };
+        let mut hit = false;
+        for key in keys {
+            if let Some(v) = obj.remove(*key) {
+                hit = true;
+                if !v.is_null() {
+                    found.push(v);
+                }
+            }
+        }
+        if hit {
+            let rest = if obj.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(obj)
+            };
+            set.insert(field.into(), rest);
+        }
+    }
+    found.into_iter().next()
 }
 
 /// `image_url` parts across all messages; malformed shapes count as 0 (the engine rejects them).
@@ -331,5 +395,215 @@ mod tests {
         assert!(run(&p, json!({"messages": msgs(2)})).is_ok());
         let err = run(&p, json!({"messages": msgs(3)})).unwrap_err();
         assert!(err.contains("too many images: 3"), "{err}");
+    }
+
+    #[test]
+    fn on_invalid_default_replaces_rejected_values() {
+        let p = profile(
+            "params:\n  temperature: {default: 1.0, min: 0, max: 2, on_invalid: default}\n  top_k: {default: 0, min: 0, normalize: [[0, -1]], on_invalid: default}\n",
+        );
+        assert_eq!(
+            run(&p, json!({"temperature": 5})).unwrap()["temperature"],
+            1.0
+        );
+        assert_eq!(
+            run(&p, json!({"temperature": 0.5})).unwrap()["temperature"],
+            0.5
+        );
+        assert_eq!(run(&p, json!({"top_k": -3})).unwrap()["top_k"], -1);
+        let strict = profile("params:\n  reasoning_effort: {default: max, values: [low, max]}\n");
+        let err = run(&strict, json!({"reasoning_effort": "MAX"})).unwrap_err();
+        assert!(err.contains("must be one of"), "{err}");
+    }
+
+    fn stepfun_extended() -> ApiProfile {
+        let dir =
+            std::env::temp_dir().join(format!("api-profile-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("profile.yaml");
+        std::fs::write(
+            &file,
+            "name: stepfun-step5-ext\nextends: stepfun-step5\nlimits:\n  max_images: 120\noutput:\n  max_tokens: { cap: 128000, on_exceed: clamp }\n",
+        )
+        .unwrap();
+        crate::profile::resolve(Some(&file), None, None, &Default::default()).unwrap()
+    }
+
+    #[test]
+    fn stepfun_reasoning_effort_on_every_protocol() {
+        let p = stepfun_extended();
+        assert_eq!(p.limits.max_images, Some(120));
+        assert_eq!(p.output.max_tokens.as_ref().unwrap().cap, 128_000);
+        assert!(p.raw_reasoning_effort());
+        let cases = effort_cases();
+        let msgs = json!([{"role": "user", "content": "hi"}]);
+        for (effort, want) in cases {
+            let mut chat = json!({"model": "m", "messages": msgs});
+            let mut responses = json!({"model": "m", "input": "hi"});
+            let mut messages = json!({"model": "m", "max_tokens": 64, "messages": msgs});
+            if let Some(e) = &effort {
+                chat["reasoning_effort"] = e.clone();
+                responses["reasoning"] = json!({ "effort": e });
+                messages["output_config"] = json!({ "effort": e });
+            }
+            let responses = crate::protocol::responses::to_chat(responses, true)
+                .unwrap()
+                .chat;
+            let messages = crate::protocol::anthropic::to_chat(messages, false, true)
+                .unwrap()
+                .chat;
+            for (api, body) in [
+                ("chat", chat),
+                ("responses", responses),
+                ("messages", messages),
+            ] {
+                let out = run(&p, body).unwrap_or_else(|e| panic!("{api} {effort:?}: {e}"));
+                assert_eq!(out["reasoning_effort"], want, "{api} {effort:?}");
+            }
+        }
+    }
+
+    fn effort_cases() -> Vec<(Option<Value>, &'static str)> {
+        let mut cases: Vec<(Option<Value>, &str)> =
+            ["none", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(|l| (Some(json!(l)), l))
+                .collect();
+        for bad in [
+            json!("MAX"),
+            json!(""),
+            json!(null),
+            json!(5),
+            json!(0.5),
+            json!(true),
+            json!("minimal"),
+            json!(["max"]),
+        ] {
+            cases.push((Some(bad), "max"));
+        }
+        cases.push((None, "max"));
+        cases
+    }
+
+    fn effort_of(p: &ApiProfile, body: Value) -> (Value, Option<Value>) {
+        let a = p.apply(Bytes::from(body.to_string()), "m").unwrap();
+        (serde_json::from_slice(&a.body).unwrap(), a.reasoning_effort)
+    }
+
+    #[test]
+    fn stepfun_reasoning_effort_from_nested_fields() {
+        let p = stepfun_extended();
+        for (effort, want) in effort_cases() {
+            let Some(e) = effort else { continue };
+            for body in [
+                json!({"chat_template_kwargs": {"reasoning_effort": e, "thinking": true}}),
+                json!({"reasoning": {"effort": e}}),
+                json!({"reasoning": {"reasoning_effort": e, "enabled": true}}),
+            ] {
+                let (out, applied) = effort_of(&p, body.clone());
+                assert_eq!(out["reasoning_effort"], want, "{body}");
+                assert_eq!(applied, Some(json!(want)), "{body}");
+                assert!(
+                    out["chat_template_kwargs"]
+                        .get("reasoning_effort")
+                        .is_none(),
+                    "{body}: {out}"
+                );
+                assert!(out["reasoning"].get("effort").is_none(), "{body}: {out}");
+                assert!(
+                    out["reasoning"].get("reasoning_effort").is_none(),
+                    "{body}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_effort_follows_engine_precedence() {
+        let p = stepfun_extended();
+        for (body, want) in [
+            (
+                json!({"reasoning_effort": "low", "reasoning": {"effort": "high"}}),
+                "high",
+            ),
+            (
+                json!({"reasoning_effort": "low", "reasoning": {"effort": "high"},
+                       "chat_template_kwargs": {"reasoning_effort": "medium"}}),
+                "medium",
+            ),
+            (
+                json!({"reasoning": {"effort": null, "reasoning_effort": "xhigh"}}),
+                "xhigh",
+            ),
+            (
+                json!({"reasoning": {"effort": "none", "reasoning_effort": "xhigh"}}),
+                "none",
+            ),
+            (
+                json!({"reasoning_effort": "low", "reasoning": {"effort": "MAX"}}),
+                "max",
+            ),
+            (
+                json!({"reasoning_effort": "none", "chat_template_kwargs": {"reasoning_effort": null}}),
+                "none",
+            ),
+            (
+                json!({"reasoning_effort": "low", "chat_template_kwargs": {"reasoning_effort": ""}}),
+                "max",
+            ),
+        ] {
+            let (out, applied) = effort_of(&p, body.clone());
+            assert_eq!(out["reasoning_effort"], want, "{body}");
+            assert_eq!(applied, Some(json!(want)), "{body}");
+        }
+        let (out, _) = effort_of(
+            &p,
+            json!({"reasoning": {"effort": "low", "enabled": true},
+                   "chat_template_kwargs": {"reasoning_effort": null, "thinking": true}}),
+        );
+        assert_eq!(out["reasoning"], json!({"enabled": true}));
+        assert_eq!(out["chat_template_kwargs"], json!({"thinking": true}));
+        let (out, _) = effort_of(
+            &p,
+            json!({"reasoning": {"effort": "low"}, "chat_template_kwargs": {"reasoning_effort": "high"}}),
+        );
+        assert!(
+            out["reasoning"].is_null() && out["chat_template_kwargs"].is_null(),
+            "{out}"
+        );
+        let (out, _) = effort_of(
+            &p,
+            json!({"reasoning": {"summary": "auto"}, "chat_template_kwargs": {}}),
+        );
+        assert_eq!(out["reasoning"], json!({"summary": "auto"}));
+        assert_eq!(out["chat_template_kwargs"], json!({}));
+        assert_eq!(out["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn other_presets_keep_reasoning_effort_untouched() {
+        for name in crate::profile::preset_names().filter(|n| *n != "stepfun-step5") {
+            let p = crate::profile::resolve(None, Some(name), None, &Default::default()).unwrap();
+            assert!(!p.raw_reasoning_effort(), "{name}");
+            let out = run(&p, json!({"reasoning_effort": "MAX"})).unwrap();
+            assert_eq!(out["reasoning_effort"], "MAX", "{name}");
+            let body = json!({"reasoning_effort": "MAX", "reasoning": {"effort": "huge"},
+                              "chat_template_kwargs": {"reasoning_effort": "x"}});
+            let a = p.apply(Bytes::from(body.to_string()), "m").unwrap();
+            assert!(a.reasoning_effort.is_none(), "{name}");
+            let out: Value = serde_json::from_slice(&a.body).unwrap();
+            assert_eq!(out["reasoning"], body["reasoning"], "{name}");
+            assert_eq!(
+                out["chat_template_kwargs"], body["chat_template_kwargs"],
+                "{name}"
+            );
+            assert!(
+                run(&p, json!({}))
+                    .unwrap()
+                    .get("reasoning_effort")
+                    .is_none(),
+                "{name}"
+            );
+        }
     }
 }

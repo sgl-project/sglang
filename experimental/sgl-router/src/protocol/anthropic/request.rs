@@ -50,7 +50,7 @@ const CONSUMED: &[&str] = &[
 ];
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
-pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
+pub fn to_chat(req: Value, count_only: bool, raw_effort: bool) -> Result<Converted, String> {
     let Value::Object(req) = req else {
         return Err("request body must be a JSON object".into());
     };
@@ -153,18 +153,12 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         .and_then(|c| c.get("effort"))
         .filter(|v| !v.is_null())
     {
-        let mapped = match effort.as_str() {
-            Some("low") => "low",
-            Some("medium") => "medium",
-            Some("high") => "high",
-            Some("xhigh") | Some("max") => "max",
-            _ => {
-                return Err(format!(
-                    "output_config.effort: expected low, medium, high, xhigh or max, got {effort}"
-                ))
-            }
+        let effort = if raw_effort {
+            effort.clone()
+        } else {
+            legacy_effort(effort)?.into()
         };
-        chat.insert("reasoning_effort".into(), mapped.into());
+        chat.insert("reasoning_effort".into(), effort);
     }
     let format = output_config
         .and_then(|c| c.get("format"))
@@ -584,12 +578,24 @@ fn convert_tool_choice(
     Ok((choice, parallel))
 }
 
+fn legacy_effort(effort: &Value) -> Result<&'static str, String> {
+    match effort.as_str() {
+        Some("low") => Ok("low"),
+        Some("medium") => Ok("medium"),
+        Some("high") => Ok("high"),
+        Some("xhigh") | Some("max") => Ok("max"),
+        _ => Err(format!(
+            "output_config.effort: expected low, medium, high, xhigh or max, got {effort}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn chat(req: Value) -> Value {
-        to_chat(req, false).expect("converts").chat
+        to_chat(req, false, false).expect("converts").chat
     }
 
     #[test]
@@ -729,7 +735,7 @@ mod tests {
             if !t.is_null() {
                 r["thinking"] = t;
             }
-            to_chat(r, false).unwrap().echo.thinking_requested
+            to_chat(r, false, false).unwrap().echo.thinking_requested
         };
         assert!(!req(Value::Null));
         assert!(!req(json!({"type": "disabled"})));
@@ -785,13 +791,37 @@ mod tests {
                 "video",
             ),
         ] {
-            let err = to_chat(req.clone(), false).expect_err(&req.to_string());
+            let err = to_chat(req.clone(), false, false).expect_err(&req.to_string());
             assert!(err.contains(needle), "{req}: {err}");
         }
         assert!(to_chat(
             json!({"model": "m", "messages": [{"role": "user", "content": "x"}]}),
-            true
+            true,
+            false
         )
         .is_ok());
+    }
+
+    #[test]
+    fn raw_effort_is_forwarded_unchanged() {
+        let req = |e: Value| {
+            json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
+                   "output_config": {"effort": e}})
+        };
+        for e in [
+            json!("none"),
+            json!("xhigh"),
+            json!("minimal"),
+            json!("MAX"),
+            json!(""),
+            json!(5),
+        ] {
+            let c = to_chat(req(e.clone()), false, true).unwrap().chat;
+            assert_eq!(c["reasoning_effort"], e);
+        }
+        let c = to_chat(req(Value::Null), false, true).unwrap().chat;
+        assert!(c.get("reasoning_effort").is_none());
+        assert!(to_chat(req(json!("none")), false, false).is_err());
+        assert_eq!(chat(req(json!("xhigh")))["reasoning_effort"], "max");
     }
 }

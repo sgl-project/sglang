@@ -331,3 +331,152 @@ async fn thinking_blocks_on_request_hides_unrequested_thinking() {
     let shown = stream_text(Some(json!({"type": "enabled", "budget_tokens": 1024}))).await;
     assert!(shown.contains("thinking_delta"), "{shown}");
 }
+
+#[tokio::test]
+async fn reasoning_effort_falls_back_to_max_on_every_field_and_protocol() {
+    let mock = MockWorker::start(vec![]).await;
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for (effort, want) in [
+        (json!("xhigh"), "xhigh"),
+        (json!("none"), "none"),
+        (json!("MAX"), "max"),
+        (json!(""), "max"),
+        (json!(5), "max"),
+        (json!("minimal"), "max"),
+    ] {
+        for (path, body) in [
+            (
+                "/v1/chat/completions",
+                json!({"model": MODEL, "messages": user, "reasoning_effort": effort}),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model": MODEL, "messages": user, "reasoning_effort": "low",
+                       "chat_template_kwargs": {"reasoning_effort": effort}}),
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"model": MODEL, "messages": user, "reasoning": {"effort": effort}}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model": MODEL, "input": "hi", "reasoning": {"effort": effort}}),
+            ),
+            (
+                "/v1/responses",
+                json!({"model": MODEL, "input": "hi",
+                       "chat_template_kwargs": {"reasoning_effort": effort}}),
+            ),
+            (
+                "/v1/messages",
+                json!({"model": MODEL, "max_tokens": 8, "messages": user,
+                       "output_config": {"effort": effort}}),
+            ),
+            (
+                "/v1/messages",
+                json!({"model": MODEL, "max_tokens": 8, "messages": user,
+                       "chat_template_kwargs": {"reasoning_effort": effort}}),
+            ),
+        ] {
+            let (status, v) = post(ctx(&mock.url, STEP5), path, body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{path} {body}: {v}");
+            let sent = sent(&mock).unwrap();
+            assert_eq!(sent["reasoning_effort"], want, "{path} {body}");
+            assert!(
+                sent["chat_template_kwargs"]
+                    .get("reasoning_effort")
+                    .is_none(),
+                "{path} {body}: {sent}"
+            );
+            assert!(sent["reasoning"].get("effort").is_none(), "{path} {body}");
+            if path == "/v1/responses" {
+                assert_eq!(v["reasoning"]["effort"], want, "{body}: {v}");
+            }
+        }
+    }
+    let (_, v) = post(
+        ctx(&mock.url, STEP5),
+        "/v1/responses",
+        json!({"model": MODEL, "input": "hi"}),
+    )
+    .await;
+    assert_eq!(v["reasoning"]["effort"], "max");
+    assert_eq!(sent(&mock).unwrap()["reasoning_effort"], "max");
+    let (_, v) = post(
+        ctx(&mock.url, &[]),
+        "/v1/responses",
+        json!({"model": MODEL, "input": "hi", "reasoning": {"effort": "xhigh"}}),
+    )
+    .await;
+    assert_eq!(
+        v["reasoning"]["effort"], "xhigh",
+        "no rule: the request is echoed"
+    );
+    assert_eq!(sent(&mock).unwrap()["reasoning_effort"], "max");
+}
+
+#[tokio::test]
+async fn count_tokens_counts_the_profiled_request() {
+    let mock = MockWorker::start(vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/tiny_tokenizer.json",
+        dir.path().join("tokenizer.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"bos_token": "<s>", "chat_template":
+            "{{ bos_token }}{% if reasoning_effort is defined %}R={{ reasoning_effort }};{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"})
+        .to_string(),
+    )
+    .unwrap();
+    let tok = dir.path().to_str().unwrap();
+    let count = |flags: Vec<&'static str>, effort: Option<Value>| {
+        let url = mock.url.clone();
+        let tok = tok.to_owned();
+        async move {
+            let mut argv = vec![
+                "sgl-router",
+                "--model-id",
+                MODEL,
+                "--tokenizer-path",
+                tok.as_str(),
+                "--worker-urls",
+                "http://placeholder:0",
+            ];
+            argv.extend(flags);
+            let cfg = <Cli as clap::Parser>::parse_from(argv)
+                .into_config()
+                .unwrap();
+            let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+            let registry = Arc::new(WorkerRegistry::default());
+            let _ = registry.add(WorkerSpec {
+                id: WorkerId(url.clone()),
+                url,
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId(MODEL.into())],
+                bootstrap_port: None,
+                transfer_group: None,
+            });
+            let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
+            let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+            let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+            let mut body =
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hello world"}]});
+            if let Some(e) = effort {
+                body["output_config"] = json!({ "effort": e });
+            }
+            let (status, v) = post(ctx, "/v1/messages/count_tokens", body).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            v["input_tokens"].as_u64().unwrap()
+        }
+    };
+    let max = count(STEP5.to_vec(), Some(json!("max"))).await;
+    assert_eq!(count(STEP5.to_vec(), None).await, max);
+    assert_eq!(count(STEP5.to_vec(), Some(json!("MAX"))).await, max);
+    assert!(
+        count(vec![], None).await < max,
+        "no profile: no effort line"
+    );
+}

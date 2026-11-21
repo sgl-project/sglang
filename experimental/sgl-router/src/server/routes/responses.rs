@@ -32,19 +32,26 @@ pub(crate) async fn responses(
 ) -> Result<Response<Body>, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    let converted = responses::to_chat(req).map_err(ApiError::BadRequest)?;
+    let raw_effort = ctx.config.model.profile.raw_reasoning_effort();
+    let converted = responses::to_chat(req, raw_effort).map_err(ApiError::BadRequest)?;
     let chat_body = Bytes::from(
         serde_json::to_vec(&converted.chat)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
     );
-    let chat_body = ctx
+    let applied = ctx
         .config
         .model
         .profile
-        .apply(chat_body, &ctx.config.model.id)?
-        .body;
-    let resp = chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), chat_body).await?;
-    Ok(adapt(resp, converted.echo, converted.stream).await)
+        .apply(chat_body, &ctx.config.model.id)?;
+    let mut echo = converted.echo;
+    if let (Some(effort), Some(serde_json::Value::Object(r))) =
+        (applied.reasoning_effort, echo.fields.get_mut("reasoning"))
+    {
+        r.insert("effort".into(), effort);
+    }
+    let resp =
+        chat_completions_inner(ctx, headers, phase.map(|Extension(p)| p), applied.body).await?;
+    Ok(adapt(resp, echo, converted.stream).await)
 }
 
 /// Keeps status, headers and extensions (access log); replaces the body.

@@ -43,7 +43,7 @@ ships readable copies under `/usr/share/sgl-router/profiles/`.
 |---|---|
 | `openai-compatible` | Nothing enforced, nothing injected |
 | `moonshot-kimi` | Moonshot-style immutable sampling: `top_p`, `top_k`, penalties and `n` pinned; `temperature` in [0, 1] |
-| `stepfun-step5` | Ranges with defaults; `top_k: 0` means no limit; `max_tokens` clamped to 64000; 128 MiB body; at most 60 images; `reasoning_format`; `request_params_invalid` error type |
+| `stepfun-step5` | Ranges with defaults; `top_k: 0` means no limit; `max_tokens` clamped to 64000; 128 MiB body; at most 60 images; `reasoning_format`; `reasoning_effort` falls back to `max`; `request_params_invalid` error type |
 
 ### Checking what is in effect
 
@@ -108,11 +108,12 @@ and so on. Any top-level field can have a rule.
 | `values` | Accepted values |
 | `type` | `int` rejects non-integers such as `n: 1.5`; `number` is the default |
 | `normalize` | `[[from, to], …]`: rewrites an accepted value before forwarding |
+| `on_invalid` | `reject` (default): a value that fails the check returns 400. `default`: it is replaced with `default` (requires `default`) |
 
 A request value goes through these steps in order:
 
 1. **Check**: `pin`, then `values`, then `type`, then `min`/`max`. A failure
-   returns 400.
+   returns 400, or with `on_invalid: default` becomes `default`.
 2. **Normalize**: rewrite the value with `normalize`.
 3. **Inject**: if the request omitted the field, add `pin` or `default`,
    normalized the same way.
@@ -128,6 +129,27 @@ then forwarded as the engine's `-1`:
 ```yaml
 params:
   top_k: { min: 0, type: int, normalize: [[0, -1]] }
+```
+
+`reasoning_effort` also has built-in behaviour. With a rule here:
+
+- Responses' `reasoning.effort` and Messages' `output_config.effort` are
+  forwarded unchanged, so the rule decides.
+- The effort the engine would read is checked, with the engine's precedence:
+  `chat_template_kwargs.reasoning_effort`, then `reasoning.effort`, then
+  `reasoning.reasoning_effort`, then the top-level field. The result is
+  forwarded as the top-level field only; the nested keys are removed.
+- Responses echo the effective effort, and `/v1/messages/count_tokens` counts
+  the request as the profile rewrites it.
+
+Without a rule, nested fields are left alone and the protocol fields are mapped
+as before (`xhigh` becomes `max`, Responses' `minimal` becomes `low`); an
+unknown level returns 400. StepFun's rule passes the six legal levels through
+and turns everything else, including a missing field, into `max`:
+
+```yaml
+params:
+  reasoning_effort: { default: max, values: [none, low, medium, high, xhigh, max], on_invalid: default }
 ```
 
 `reasoning_format` has built-in behaviour. When a chat request sends
@@ -199,6 +221,7 @@ The router refuses to start, naming the source and the key, when the profile:
 
 - has an unknown key, or a value of the wrong type;
 - has `min > max`, or a `default` or `pin` its own rule would reject;
+- has `on_invalid: default` without a `default`;
 - combines `pin` with `default`, `min`, `max` or `values`;
 - has a `normalize` `from` value the rule never accepts;
 - has a zero `cap`, size or image limit, or an `output.max_tokens.default`

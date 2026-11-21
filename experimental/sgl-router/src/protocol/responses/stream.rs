@@ -408,7 +408,7 @@ mod tests {
     use crate::protocol::responses::to_chat;
 
     fn echo() -> EchoContext {
-        to_chat(json!({"model": "m", "input": "x", "stream": true}))
+        to_chat(json!({"model": "m", "input": "x", "stream": true}), false)
             .unwrap()
             .echo
     }
@@ -586,6 +586,7 @@ mod tests {
         let echo = to_chat(
             json!({"model": "m", "input": "x", "stream": true, "tools": [
             {"type": "custom", "name": "apply_patch"}]}),
+            false,
         )
         .unwrap()
         .echo;
