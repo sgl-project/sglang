@@ -23,6 +23,7 @@ from sglang.srt.managers.load_snapshot import (
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
+    shm_path_for,
     should_use_zmq,
     snapshot_encoder,
     zmq_reader_owner,
@@ -279,11 +280,42 @@ class TestFactoryFunctions(CustomTestCase):
         self.assertIsInstance(reader, ShmLoadSnapshotReader)
         reader.close()
         writer.close()
-        from sglang.srt.managers.load_snapshot import shm_path_for
-
         path = shm_path_for("test_shm_factory")
         if os.path.exists(path):
             os.unlink(path)
+
+    def test_macos_snapshot_factories_share_a_readable_file(self):
+        """macOS has no /dev/shm; scheduler snapshots must still reach readers."""
+        self._publish(nnodes=1, dp_size=1)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch("sys.platform", "darwin"),
+            mock.patch("tempfile.gettempdir", return_value=directory),
+            envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(False),
+        ):
+            port_args = SimpleNamespace(instance_id="macos_snapshot_factory")
+            reader = create_load_snapshot_reader(port_args, caller="TokenizerManager")
+            self.addCleanup(reader.close)
+            self.assertEqual(reader.read_all(), [])
+            writer = create_load_snapshot_writer(port_args, dp_size=1, dp_rank=0)
+            try:
+                writer.write(LoadSnapshot(dp_rank=0, num_running_reqs=3, timestamp=1.0))
+                loads = reader.read_all()
+                self.assertEqual(len(loads), 1)
+                self.assertEqual(loads[0].num_running_reqs, 3)
+                self.assertEqual(os.path.dirname(writer.path), directory)
+                self.assertEqual(os.stat(writer.path).st_mode & 0o777, 0o600)
+            finally:
+                reader.close()
+                writer.close()
+
+    def test_linux_snapshot_path_remains_compatible(self):
+        """Linux snapshot producers and consumers must retain the existing path."""
+        with mock.patch("sys.platform", "linux"):
+            self.assertEqual(
+                shm_path_for("test_shm_factory"),
+                "/dev/shm/sglang_loads_test_shm_factory_c319f4a9.shm",
+            )
 
     def test_zmq_mode_via_env(self):
         self._publish(nnodes=1, dp_size=1)
