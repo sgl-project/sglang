@@ -494,6 +494,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        disagg_rebootstrap: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -821,6 +822,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.disagg_rebootstrap = disagg_rebootstrap
         # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
         self.linker_offload_skip_prefix_len = 0
         # Override embeds give KV that the token ids alone do not determine.
@@ -1656,6 +1658,9 @@ class Req(ReqDllmMixin):
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
+            # Before the first output, decode still needs its normal tail
+            # extend. Only an emitted sequence resumes from a pending token.
+            "disagg_rebootstrap": bool(self.output_ids),
             "priority": self.priority,
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,
@@ -2147,6 +2152,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Whether this batch is a PD decode-tail extend awaiting post-forward merge
+    pd_tail_extend: bool = False
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
@@ -3278,6 +3285,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.pd_tail_extend = False
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -3529,6 +3537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
+        self.pd_tail_extend = False
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)

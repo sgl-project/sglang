@@ -590,7 +590,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
             patch(
                 "sglang.srt.disaggregation.decode.get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_retraction_backup="cpu_tensor"
+                    disaggregation_decode_retraction_backup="cpu_tensor",
+                    disaggregation_decode_tail_tokens=0,
                 ),
             ),
         ):

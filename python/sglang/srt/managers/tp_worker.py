@@ -736,6 +736,15 @@ class TpModelWorker(BaseTpWorker):
                     can_run_graph=can_run_cuda_graph,
                 )
 
+            if forward_batch.is_pd_tail_prefill:
+                # Only readiness metadata crosses the handoff in tail mode.
+                # The placeholder is not sampled or consumed by decode.
+                batch_result.next_token_ids = torch.zeros_like(
+                    forward_batch.seq_lens, dtype=torch.long
+                )
+                self._maybe_finalize_elastic_cuda_graph_scale()
+                return batch_result
+
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:

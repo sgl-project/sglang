@@ -5747,6 +5747,10 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "delete_ckpt_after_loading": ["--delete-ckpt-after-loading"],
         "return_input_ids": ["--return-input-ids"],
         "return_output_ids": ["--return-output-ids"],
+        "disaggregation_decode_tail_tokens": [
+            "--disaggregation-decode-tail-tokens",
+            "4",
+        ],
     }
 
     @staticmethod
@@ -5840,8 +5844,62 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 # The preprocessing cache off, as in the Rust pipelines.
                 "--mm-preprocess-cache-size-mb",
                 "0",
+                "--disaggregation-decode-tail-tokens",
+                "0",
             ]
         )
+
+
+class TestPdDecodeTailAdmission(CustomTestCase):
+    def test_tail_uses_final_chunk_size_and_parallel_layout(self):
+        with tempfile.TemporaryDirectory() as checkpoint:
+            Path(checkpoint, "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["LlamaForCausalLM"],
+                        "model_type": "llama",
+                        "hidden_size": 16,
+                        "intermediate_size": 32,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 2,
+                        "num_hidden_layers": 2,
+                        "vocab_size": 128,
+                        "max_position_embeddings": 32768,
+                    }
+                )
+            )
+            with (
+                override_platform(is_cuda=True, is_hip=False),
+                envs.SGLANG_RUST_SERVER.override(False),
+                patch(
+                    "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                    return_value=24 * 1024,
+                ),
+            ):
+
+                def args_for(tail, **parallel):
+                    return ServerArgs(
+                        model_path=checkpoint,
+                        device="cuda",
+                        disaggregation_mode="decode",
+                        disaggregation_transfer_backend="mooncake",
+                        disaggregation_decode_tail_tokens=tail,
+                        max_prefill_tokens=16384,
+                        chunked_prefill_size=None,
+                        **parallel,
+                    )
+
+                with self.assertRaisesRegex(ValueError, "token budget \\(4096\\)"):
+                    args_for(8192).resolve_once()
+                valid = args_for(4096)
+                valid.resolve_once()
+                self.assertEqual(resolution_result(valid, "chunked_prefill_size"), 4096)
+                # Replica width alone is insufficient: attention-DP has
+                # separate schedulers and a shared MLP synchronization path.
+                with self.assertRaisesRegex(ValueError, "attention data parallelism"):
+                    args_for(4, tp_size=2, attn_dp_size=2).resolve_once()
+                args_for(4, tp_size=2, attn_dp_size=1).resolve_once()
+                args_for(0, tp_size=2, attn_dp_size=2).resolve_once()
 
 
 class TestPrefillWeightVersionCompatibility(CustomTestCase):

@@ -56,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_flags,
     get_lora,
@@ -519,6 +520,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    is_pd_tail_prefill: bool = False
     beam: Optional[BeamForwardInputs] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
@@ -1020,6 +1022,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if id(req) not in decoding_req_ids
             )
 
+        is_pd_tail_prefill = (
+            batch.forward_mode.is_extend()
+            and get_disagg().disaggregation_mode == "prefill"
+            and get_disagg().disaggregation_decode_tail_tokens > 0
+            and bool(batch.reqs)
+        )
+        if is_pd_tail_prefill:
+            from sglang.srt.disaggregation.utils import _is_fake_transfer
+
+            is_pd_tail_prefill = all(
+                not getattr(r, "disagg_rebootstrap", False) and not _is_fake_transfer(r)
+                for r in batch.reqs
+            )
+
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
@@ -1079,6 +1095,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            is_pd_tail_prefill=is_pd_tail_prefill,
             beam=beam,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             extend_is_final_cpu=extend_is_final_cpu,
