@@ -87,6 +87,8 @@ def _cgroup_headroom(
             relative = membership.relative_to("/")
         else:
             continue
+        if ".." in relative.parts[:1]:
+            raise RuntimeError(f"Resolved cgroup memory path is outside of readable namespace: {membership}")
         if ".." in relative.parts:
             raise ValueError(f"Cannot resolve cgroup {controller} path: {membership}")
         directory = mount / relative
