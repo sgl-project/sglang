@@ -49,19 +49,37 @@ class GPUToTensor(torch.nn.Module):
             return image_tensor.contiguous()
         if isinstance(raw_image, Image.Image):
             image_tensor = transforms.ToTensor()(raw_image)
+            if image_tensor.shape[0] == 1:
+                image_tensor = image_tensor.repeat(3, 1, 1)
+            elif image_tensor.shape[0] != 3:
+                raise TypeError(
+                    f"Expected image with 1 or 3 channels, got shape {tuple(image_tensor.shape)}"
+                )
             if torch.cuda.is_available():
                 image_tensor = image_tensor.to(torch.device("cuda"))
             return image_tensor
         if raw_image.ndim == 2:
             raw_image = raw_image[:, :, None].repeat(3, -1)
+        elif raw_image.ndim != 3:
+            raise TypeError(
+                f"Expected HWC or HW numpy image array, got shape {tuple(raw_image.shape)}"
+            )
         if torch.cuda.is_available():
             device = torch.device("cuda")
         else:
             device = torch.device("cpu")
         image_tensor = torch.from_numpy(raw_image).to(device)
         image_tensor = torch.permute(image_tensor, (2, 0, 1)).contiguous()
+        if image_tensor.shape[0] == 1:
+            image_tensor = image_tensor.repeat(3, 1, 1)
+        elif image_tensor.shape[0] != 3:
+            raise TypeError(
+                f"Expected numpy image array with 1 or 3 channels, got shape {tuple(raw_image.shape)}"
+            )
         if image_tensor.dtype == torch.uint8:
             image_tensor = image_tensor.to(torch.float32).div(255)
+        elif not image_tensor.is_floating_point():
+            image_tensor = image_tensor.to(torch.float32)
         return image_tensor
 
 
@@ -249,7 +267,9 @@ class ImagePatcher:
         new_img_width, new_img_height = self.get_image_size_for_preprocess(
             img_width, img_height
         )
-        img = self.resize(img, (new_img_width, new_img_height))
+        if (new_img_width, new_img_height) != (img_width, img_height):
+            img = self.resize(img, (new_img_width, new_img_height))
+            img_width, img_height = new_img_width, new_img_height
         window_size = self.determine_window_size(
             max(new_img_height, new_img_width), min(new_img_height, new_img_width)
         )
@@ -319,10 +339,13 @@ class Step3VLProcessor:
         self.patch_feature_placeholder = self.image_token * self.num_patch_feature_size
 
         self.patcher = ImagePatcher()
+        self._image_token_id: Optional[int] = None
 
     @property
     def image_token_id(self) -> int:
-        return self.tokenizer.get_vocab()[self.image_token]
+        if self._image_token_id is None:
+            self._image_token_id = self.tokenizer.get_vocab()[self.image_token]
+        return self._image_token_id
 
     def _split_images(self, images: list[Image.Image]) -> list[ImageWithPatches]:
         result = []
