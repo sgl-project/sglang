@@ -426,7 +426,14 @@ struct SiluMulQuantContigParams {
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
 };
 
-template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    uint32_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kTransposed,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundBf16 = false>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
@@ -435,7 +442,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
   static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
-  static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto token_id = blockIdx.x;
   const auto work_id = threadIdx.x / kWorkThreads;
@@ -445,12 +451,15 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   [[maybe_unused]]
   const auto output_scale = [&] {
     const auto num_groups = params.hidden_dim / kGroupSize;
-    if constexpr (kTransposed) {
+    if constexpr (kTransposed && kScaleUE8M0) {
       // Physical layout is (G//4_pad, M_pad) int32; each int32 packs 4
       // consecutive UE8M0 exponents for the same token. Byte address:
       //   (work_id / 4) * M_pad * 4  +  token * 4  +  (work_id % 4).
       const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
       return base + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
+    } else if constexpr (kTransposed && !kScaleUE8M0) {
+      // Physical layout is (G, M_pad) fp32 transposed to (M, G) with stride (1, M_pad).
+      return params.output_scale + work_id * params.scale_row_stride_int32 + token_id;
     } else {
       return params.output_scale + token_id * num_groups + work_id;
     }
@@ -472,7 +481,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+    const auto [x, y] = silu_and_mul<kApplySwigluLimit, !kRoundBf16>(gate_vec[i], up_vec[i], params.swiglu_limit);
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -482,16 +491,18 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
   const float absmax = fmaxf(local_max, 1e-10f);
   float scale;
+  float inv_scale;
   uint32_t ue8m0_exp;
 
   if constexpr (kScaleUE8M0) {
-    const float raw_scale = absmax / math::FP8_E4M3_MAX;
+    const float raw_scale = absmax * (1.0f / math::FP8_E4M3_MAX);
     ue8m0_exp = cast_to_ue8m0(raw_scale);
     scale = __uint_as_float(ue8m0_exp << 23);
+    inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(ue8m0_exp);
   } else {
-    scale = absmax / math::FP8_E4M3_MAX;
+    scale = absmax * (1.0f / math::FP8_E4M3_MAX);
+    inv_scale = kRoundBf16 ? (math::FP8_E4M3_MAX / absmax) : (1.0f / scale);
   }
-  const auto inv_scale = 1.0f / scale;
 
   OutputVec out_vec;
 #pragma unroll
@@ -504,20 +515,28 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   PDLTriggerSecondary<kUsePDL>();
 
   out_vec.store(output, threadIdx.x);
-  if constexpr (kTransposed) {
-    *output_scale = ue8m0_exp;
-  } else {
-    *output_scale = scale;
+  if (threadIdx.x % kWorkThreads == 0) {
+    if constexpr (kTransposed && kScaleUE8M0) {
+      *output_scale = ue8m0_exp;
+    } else {
+      *output_scale = scale;
+    }
   }
 }
 
-template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    int64_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundBf16 = false>
 struct SiluAndMulContigPostQuantKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit, kRoundBf16>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, true, kSwizzle, kUsePDL, kApplySwigluLimit, kRoundBf16>;
 
   static void
   run(const tvm::ffi::TensorView input,
@@ -555,9 +574,8 @@ struct SiluAndMulContigPostQuantKernel {
           .with_dtype<fp32_t>()
           .with_device(device)
           .verify(output_scale);
-    } else {
-      RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
-      RuntimeCheck(num_groups % 4 == 0, "transposed layout requires num_groups % 4 == 0");
+    } else if constexpr (kScaleUE8M0) {
+      RuntimeCheck(num_groups % 4 == 0, "transposed ue8m0 layout requires num_groups % 4 == 0");
       auto G_ = SymbolicSize{"G // 4"};
       G_.set_value(num_groups / 4);
       auto M_pad = SymbolicSize{"M padded"};
@@ -567,9 +585,19 @@ struct SiluAndMulContigPostQuantKernel {
           .with_device(device)
           .verify(output_scale);
       scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap());
+    } else {
+      G.set_value(num_groups);
+      auto M_pad = SymbolicSize{"M padded"};
+      TensorMatcher({M, G})                   // `.transpose(-1,-2)[:M,:]` view of (G, M_pad) fp32
+          .with_strides({int64_t{1}, M_pad})  // col-major transposed
+          .with_dtype<fp32_t>()
+          .with_device(device)
+          .verify(output_scale);
+      scale_row_stride_int32 = static_cast<uint32_t>(M_pad.unwrap());
     }
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    if (num_tokens == 0) return;
 
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),

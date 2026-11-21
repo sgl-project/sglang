@@ -738,6 +738,7 @@ def _fused_moe_kernel_sequence(
             topk_ids,
         )
 
+    down_block_shape = w2_block_shape or block_shape
     use_native_fused_fp8_tail = (
         not is_batch_invariant_mode_enabled()
         and not fuse_swiglu_interleaved
@@ -756,10 +757,44 @@ def _fused_moe_kernel_sequence(
         and 128 < N // 2 < 256
         and (N // 2) % 16 == 0
     )
+    from sglang.srt.environ import envs
+
+    try:
+        deterministic = get_exec().deterministic
+        det_disabled = (
+            deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+        )
+    except ValueError:
+        det_disabled = False
+    use_native_fused_fp8_contig = (
+        not use_native_fused_fp8_tail
+        and not envs.SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION.get()
+        and not torch.compiler.is_compiling()
+        and not is_batch_invariant_mode_enabled()
+        and not det_disabled
+        and not fuse_swiglu_interleaved
+        and activation == "silu"
+        and is_gated
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and _is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and use_fp8_w8a8
+        and down_block_shape is not None
+        and len(down_block_shape) == 2
+        and down_block_shape[1] == 128
+        and a2_scale is None
+        and hooks is None
+        and not filter_expert
+        and 256 <= N // 2 <= 8192
+        and (N // 2) % 256 == 0
+        and intermediate_cache1.data_ptr() % 16 == 0
+    )
     if not fuse_swiglu_interleaved:
         intermediate_cache2 = (
             None
-            if use_native_fused_fp8_tail
+            if (use_native_fused_fp8_tail or use_native_fused_fp8_contig)
             else torch.empty(
                 (total_tokens, N // 2),
                 device=hidden_states.device,
@@ -819,6 +854,35 @@ def _fused_moe_kernel_sequence(
                 expert_step=config["BLOCK_SIZE_M"] if down_moe_use_tma else 1,
                 routed_limit=gemm1_limit,
             )
+        elif use_native_fused_fp8_contig:
+            from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+                silu_and_mul_contig_post_quant,
+            )
+
+            half_n = N // 2
+            intermediate_cache2 = torch.empty(
+                (total_tokens, half_n),
+                device=hidden_states.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            a2_scale = torch.empty(
+                (total_tokens, half_n // 128),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            if total_tokens > 0:
+                silu_and_mul_contig_post_quant(
+                    input=intermediate_cache1.view(-1, N),
+                    output=intermediate_cache2,
+                    output_scale=a2_scale,
+                    quant_group_size=128,
+                    scale_ue8m0=False,
+                    transposed=False,
+                    swiglu_limit=float(swiglu_limit)
+                    if swiglu_limit is not None
+                    else None,
+                    round_bf16=True,
+                )
         elif gemm1_limit is not None:
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit

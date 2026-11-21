@@ -1360,6 +1360,8 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
     SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)
+    # Kill switch for fusing SiLU*mul with group-128 blockwise FP8 quant in Triton MoE and Qwen2MoeMLP.
+    SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
