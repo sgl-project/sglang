@@ -66,6 +66,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
+    _restore_non_padded,
     _tail_rows,
     late_layer_num_tokens,
     late_layer_whole_extend,
@@ -716,6 +717,9 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
+    # True if the prefill CUDA graph was captured with the late layers on a tail
+    # block (decoder SWA bounded replay). Replay rebuilds the tail metadata only then.
+    prefill_graph_tail: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -748,10 +752,12 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
 
-    # allocated inside a captured segment (graph-pool storage), so a refresh must keep it
+    # allocated inside a captured segment (graph-pool storage), so a refresh must keep it.
+    # prefill_graph_tail describes the captured graph, not the live batch.
     BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = (
         "q_pad_buffer",
         "q_pad_captured",
+        "prefill_graph_tail",
     )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
@@ -907,6 +913,23 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
     _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
+    # Decoder SWA bounded replay inside the prefill CUDA graph: HIP uses the CUDA
+    # tail-block methods without change (sizing, buffers, held metadata, breaks).
+    vote_prefill_cuda_graph = DeepseekV4AttnBackend.vote_prefill_cuda_graph
+    _prefill_graph_fits_late_tail = DeepseekV4AttnBackend._prefill_graph_fits_late_tail
+    _prefill_graph_tail_capacity = DeepseekV4AttnBackend._prefill_graph_tail_capacity
+    _prefill_graph_tail_block_rows = (
+        DeepseekV4AttnBackend._prefill_graph_tail_block_rows
+    )
+    _prefill_graph_tail_buffers = DeepseekV4AttnBackend._prefill_graph_tail_buffers
+    _prefill_graph_tail_metadata = DeepseekV4AttnBackend._prefill_graph_tail_metadata
+    _bound_non_padded_to_tail = DeepseekV4AttnBackend._bound_non_padded_to_tail
+    prefill_graph_enter_late_layer_tail = (
+        DeepseekV4AttnBackend.prefill_graph_enter_late_layer_tail
+    )
+    prefill_graph_exit_late_layer_tail = (
+        DeepseekV4AttnBackend.prefill_graph_exit_late_layer_tail
+    )
     # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
@@ -992,6 +1015,13 @@ class DeepseekV4HipRadixBackend(
         # The source layer whose KV write_tail_source_kv wrote for every row; cleared in
         # exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
+        self.prefill_graph_late_layer_saved: Optional[tuple] = None
+        # State of the prefill CUDA graph tail block (bounded replay inside the
+        # graph): row capacity, persistent buffers, and metadata per block size.
+        self._bcg_tail_capacity: Optional[int] = None
+        self._bcg_tail_buffers: Optional[tuple] = None
+        self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -2184,6 +2214,7 @@ class DeepseekV4HipRadixBackend(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
         else:
@@ -2220,6 +2251,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         use_prefill_cuda_graph: bool = False,
     ) -> DSV4Metadata:
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -2238,7 +2270,7 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu.tolist(),
-            out_cache_loc=forward_batch.out_cache_loc,
+            out_cache_loc=out_cache_loc,
             num_tokens=sum(extend_seq_lens_cpu),
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -2252,7 +2284,10 @@ class DeepseekV4HipRadixBackend(
     # ---- decoder SWA bounded replay ---------------------------------------
 
     def _build_late_layer_tail_metadata(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        for_prefill_graph: bool = False,
+        max_seq_len_override: Optional[int] = None,
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
         replay: each request's last SWA_WINDOW extend tokens, or its whole extend
@@ -2279,7 +2314,11 @@ class DeepseekV4HipRadixBackend(
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         num_tokens = sum(tail_lens_cpu)
         metadata = self.init_forward_metadata_prefill(
-            max_seq_len=int(seq_lens_cpu.max().item()),
+            max_seq_len=(
+                max_seq_len_override
+                if max_seq_len_override is not None
+                else int(seq_lens_cpu.max().item())
+            ),
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
@@ -2310,16 +2349,71 @@ class DeepseekV4HipRadixBackend(
             contiguous_start=contiguous_start,
         )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-        metadata.late_layer_tail = LateLayerTail(
-            token_indices=token_indices,
-            positions=positions,
-            extend_seq_lens=tail_lens,
-            extend_seq_lens_cpu=tail_lens_cpu,
-            swa_out_cache_loc=swa_out_cache_loc,
-            contiguous_start=contiguous_start,
-        )
+        if for_prefill_graph:
+            metadata.late_layer_tail = self._prefill_graph_late_layer_tail(
+                forward_batch,
+                token_indices=token_indices,
+                tail_lens=tail_lens,
+                tail_lens_cpu=tail_lens_cpu,
+            )
+            # The refresh copies this field in place. Keep its shape fixed.
+            metadata.core_attn_metadata.swa_out_cache_loc = (
+                metadata.late_layer_tail.swa_out_cache_loc
+            )
+        else:
+            metadata.late_layer_tail = LateLayerTail(
+                token_indices=token_indices,
+                positions=positions,
+                extend_seq_lens=tail_lens,
+                extend_seq_lens_cpu=tail_lens_cpu,
+                swa_out_cache_loc=swa_out_cache_loc,
+                contiguous_start=contiguous_start,
+            )
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
+
+    def _prefill_graph_late_layer_tail(
+        self,
+        forward_batch: ForwardBatch,
+        token_indices: torch.Tensor,
+        tail_lens: torch.Tensor,
+        tail_lens_cpu: List[int],
+    ) -> LateLayerTail:
+        """The tail of a prefill CUDA graph: one block of fixed rows, real rows first.
+        The captured segments read these buffers by address to gather, scatter, rope
+        and store the KV. Each replay refills them in place. The eager breaks read
+        only the first real_rows_count rows and the exact tail metadata."""
+        real_rows = int(sum(tail_lens_cpu))
+        cap = self._prefill_graph_tail_block_rows(forward_batch)
+        assert real_rows <= cap, (real_rows, cap)
+        idx_buf, pos_buf, scatter_buf, swa_buf, loc_buf = (
+            buf[:cap]
+            for buf in self._prefill_graph_tail_buffers(
+                device=forward_batch.out_cache_loc.device,
+                pos_dtype=forward_batch.positions.dtype,
+                loc_dtype=forward_batch.out_cache_loc.dtype,
+            )
+        )
+        # As on CUDA, padding rows gather row 0 and scatter to a dummy row past
+        # the extend. They store their KV to the dummy slot 0.
+        idx_buf[:real_rows].copy_(token_indices)
+        idx_buf[real_rows:].zero_()
+        scatter_buf[:real_rows].copy_(token_indices)
+        scatter_buf[real_rows:].fill_(int(forward_batch.out_cache_loc.shape[0]))
+        pos_buf[:real_rows].copy_(forward_batch.positions[token_indices])
+        pos_buf[real_rows:].zero_()
+        loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[token_indices])
+        loc_buf[real_rows:].zero_()
+        swa_buf.copy_(self.token_to_kv_pool.translate_loc_from_full_to_swa(loc_buf))
+        return LateLayerTail(
+            token_indices=idx_buf,
+            positions=pos_buf,
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            swa_out_cache_loc=swa_buf,
+            scatter_indices=scatter_buf,
+            real_rows_count=real_rows,
+        )
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
@@ -2330,7 +2424,10 @@ class DeepseekV4HipRadixBackend(
         )
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
-        saved = (self.forward_metadata, self.candidate_masks)
+        saved = (
+            self.forward_metadata,
+            self.candidate_masks,
+        ) + self._bound_non_padded_to_tail(forward_batch, tail_metadata.late_layer_tail)
         self.forward_metadata = tail_metadata
         window = self.token_to_kv_pool.request_window
         if window is not None:
@@ -2338,7 +2435,8 @@ class DeepseekV4HipRadixBackend(
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
-        self.forward_metadata, self.candidate_masks = saved
+        self.forward_metadata, self.candidate_masks, *non_padded = saved
+        _restore_non_padded(forward_batch, non_padded)
         self.tail_source_kv_layer_id = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
@@ -2347,7 +2445,8 @@ class DeepseekV4HipRadixBackend(
             )
 
     # ---- breakable prefill CUDA graphs -----------------------------------
-    # only the fused KV store is recorded in a segment, and it reads the SWA store target by address
+    # only the fused KV store is recorded in a segment, and it reads the SWA store target by address.
+    # Under decoder SWA bounded replay, the late layers also read the tail block by address.
 
     def _prefill_metadata_for_batch(
         self,
@@ -2375,6 +2474,12 @@ class DeepseekV4HipRadixBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
+            # The breaks run only the global_num_token_non_padded_cpu rows. Attention DP
+            # pads the live batch to the graph's token bucket. The ratio-2 compressor
+            # rejects a build on the padded rows, which has more rows than the breaks.
+            out_cache_loc=forward_batch.out_cache_loc[
+                : sum(forward_batch.extend_seq_lens_cpu)
+            ],
         )
 
     @property
@@ -2432,6 +2537,16 @@ class DeepseekV4HipRadixBackend(
         # the captured store kernels bind this target's address
         self.init_forward_metadata_in_graph(forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
+        metadata.prefill_graph_tail = (
+            self.enable_decoder_swa_bounded_replay
+            and not self.is_draft_worker
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        self.tail_forward_metadata = (
+            self._prefill_graph_tail_metadata(forward_batch, max_seq_len)
+            if metadata.prefill_graph_tail
+            else None
+        )
         return metadata
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
@@ -2475,6 +2590,12 @@ class DeepseekV4HipRadixBackend(
         self._refresh_fp4_prefill_workspace(forward_batch)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(live)
         self.forward_metadata = capture_metadata
+        # the padded static batch carries the live lengths and the captured block size
+        self.tail_forward_metadata = (
+            self._prefill_graph_tail_metadata(static_forward_batch, max_seq_len)
+            if capture_metadata.prefill_graph_tail
+            else None
+        )
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
