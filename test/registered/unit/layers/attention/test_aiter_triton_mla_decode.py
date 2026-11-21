@@ -190,6 +190,14 @@ class TestResolveAiterMlaDecodeBackend(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "=triton"):
                     self._resolve("triton", **kwargs)
 
+    def test_asm_fp8q_resolves_to_asm_and_unknown_values_still_raise(self):
+        for value in ("asm_fp8q", "ASM_FP8Q"):
+            for gfx1250 in (True, False):
+                with self.subTest(value=value, gfx1250=gfx1250):
+                    self.assertEqual(self._resolve(value, gfx1250=gfx1250), "asm")
+        with self.assertRaises(ValueError):
+            self._resolve("bogus")
+
     def test_explicit_asm_and_gluon_are_honored_on_gfx1250(self):
         """Explicit values are not second-guessed, including where auto would
         pick triton and the DCP ASM decode."""
