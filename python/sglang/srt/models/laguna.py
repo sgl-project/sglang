@@ -645,6 +645,7 @@ class LagunaForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        self._checkpoint_loaded = False
 
         # Only walk this rank's local layers — out-of-range entries can be PPMissingLayer.
         self._routed_experts_weights_of_layer = LazyValue(
@@ -803,6 +804,10 @@ class LagunaForCausalLM(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
+        # Only the checkpoint load must be complete; later calls are update buckets.
+        if self._checkpoint_loaded:
+            return
+
         # If any routed-expert tensor was silently dropped (e.g. a future
         # checkpoint renaming `gate_proj`, or a ckpt-vs-mapping shape mismatch),
         # fail loud here instead of generating garbage.
@@ -820,6 +825,11 @@ class LagunaForCausalLM(nn.Module):
                 f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
                 f"num_experts={self.config.num_experts}, shards=3)."
             )
+        self._checkpoint_loaded = True
+
+    def post_load_weights(self) -> None:
+        # Loaders that skip load_weights (dummy, sharded state, remote instance) call this.
+        self._checkpoint_loaded = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
