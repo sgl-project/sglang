@@ -64,16 +64,17 @@ def _math_sdpa(query, key, value):
 def _sdpa_attention(query, key, value):
     """query/key/value: [B, S, H, D]."""
     if _FORCE_ROCM_MATH_SDPA:
-        # torch's fused SDPA corrupts this decoder on gfx950; half inputs take
-        # aiter's flash kernel (the fused class CUDA's SDPA picks, FP32
-        # accumulation), FP32 inputs the exact math replica.
+        # torch's fused SDPA corrupts this decoder on gfx950; half inputs on the
+        # GPU take aiter's flash kernel (the fused class CUDA's SDPA picks, FP32
+        # accumulation), FP32 and CPU inputs the exact math replica.
         device = query.device.type
         if torch.is_autocast_enabled(device):
             dtype = torch.get_autocast_dtype(device)
             query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
-        if _rocm_flash_attn is not None and query.dtype in (
-            torch.float16,
-            torch.bfloat16,
+        if (
+            _rocm_flash_attn is not None
+            and query.is_cuda
+            and query.dtype in (torch.float16, torch.bfloat16)
         ):
             return _rocm_flash_attn(query, key, value, dropout_p=0.0, causal=False)
         query, key, value = (t.transpose(1, 2) for t in (query, key, value))

@@ -113,19 +113,20 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
     }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gfx950_vit_attention_takes_flash_for_half_and_math_for_fp32():
-    """gfx950's fused SDPA corrupts the decoder: half inputs (autocast
-    included) go to aiter's flash kernel as [B, S, H, D], FP32 to the math
-    replica."""
+    """gfx950's fused SDPA corrupts the decoder: half inputs on the GPU
+    (autocast included) go to aiter's flash kernel as [B, S, H, D], FP32 to
+    the math replica."""
     module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
-    q, k, v = (torch.randn(1, 5, 2, 8) for _ in range(3))
+    q, k, v = (torch.randn(1, 5, 2, 8, device="cuda") for _ in range(3))
     flash = mock.Mock(side_effect=lambda q, k, v, **_: torch.full_like(q, 7.0))
     with (
         mock.patch(f"{module}._FORCE_ROCM_MATH_SDPA", True),
         mock.patch(f"{module}._rocm_flash_attn", flash),
     ):
         out_half = _sdpa_attention(q.half(), k.half(), v.half())
-        with torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             _sdpa_attention(q, k, v)
         out_fp32 = _sdpa_attention(q, k, v)
 
@@ -140,6 +141,25 @@ def test_gfx950_vit_attention_takes_flash_for_half_and_math_for_fp32():
         *(t.transpose(1, 2) for t in (q, k, v))
     ).transpose(1, 2)
     torch.testing.assert_close(out_fp32, ref)
+
+
+def test_gfx950_vit_attention_keeps_the_math_replica_on_cpu():
+    """aiter's kernel is GPU-only: a CPU decode under BF16 autocast stays on
+    the math replica."""
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+    q, k, v = (torch.randn(1, 5, 2, 8) for _ in range(3))
+    flash = mock.Mock()
+    with (
+        mock.patch(f"{module}._FORCE_ROCM_MATH_SDPA", True),
+        mock.patch(f"{module}._rocm_flash_attn", flash),
+        torch.autocast("cpu", dtype=torch.bfloat16),
+    ):
+        out = _sdpa_attention(q, k, v)
+        math = vit_attention._math_sdpa(*(t.transpose(1, 2) for t in (q, k, v)))
+
+    flash.assert_not_called()
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, math.transpose(1, 2))
 
 
 @pytest.mark.skipif(
