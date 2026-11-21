@@ -967,7 +967,13 @@ def _dp_gather_via_all_gatherv(
     get_parallel().tp_group.all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
-def _note_dp_gather_in_prefill_graph() -> None:
+def note_dp_gather_in_prefill_graph() -> None:
+    """For collectives whose per-rank row counts are fixed at capture time.
+
+    Records that the prefill graph being captured holds such a collective, so
+    every DP rank must replay one shared MAX_LEN bucket (and an idle rank runs a
+    dummy extend) instead of a per-rank SUM_LEN bucket or the eager path.
+    """
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
         dp.prefill_graph_has_dp_gather = True
@@ -995,7 +1001,7 @@ def _dp_gather(
     own (see dp_gather_partial). A caller whose CP ranks hold different rows
     passes the counts, or restores the full rows on every CP rank first.
     """
-    _note_dp_gather_in_prefill_graph()
+    note_dp_gather_in_prefill_graph()
     if get_parallel().attn_cp_size > 1:
         # Under CP the rows are placed before a sum: an all-gather takes a block
         # from every rank of the TP group, CP ranks included.
@@ -1082,7 +1088,7 @@ def dp_scatter(
     """Copy this DP group's slot of the global buffer back to the rank. With
     ``cp_shard_counts`` (as in dp_gather_partial) the rank takes back only its
     own CP shard, and the rest of ``local_tokens`` is zero."""
-    _note_dp_gather_in_prefill_graph()
+    note_dp_gather_in_prefill_graph()
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
@@ -1114,7 +1120,7 @@ def can_use_dp_reduce_scatter() -> bool:
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    _note_dp_gather_in_prefill_graph()
+    note_dp_gather_in_prefill_graph()
     parallel = get_parallel()
     if parallel.attn_cp_size > 1 and input.shape[0] % parallel.tp_size:
         # MAX_LEN padding aligns each DP slot to attention TP, not CP x TP.

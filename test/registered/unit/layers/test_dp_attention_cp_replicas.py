@@ -108,7 +108,7 @@ class TestDpGatherCpReplicas(CustomTestCase):
                         patch.object(
                             dp_attention, "get_parallel", return_value=parallel
                         ),
-                        patch.object(dp_attention, "_note_dp_gather_in_prefill_graph"),
+                        patch.object(dp_attention, "note_dp_gather_in_prefill_graph"),
                         patch.object(
                             dp_attention, "is_dp_gatherv_active", return_value=False
                         ),
@@ -168,7 +168,7 @@ class TestDpGatherCpReplicas(CustomTestCase):
                 for name, value in [
                     ("get_parallel", lambda: parallel),
                     ("world_dp_gather_enabled", lambda: False),
-                    ("_note_dp_gather_in_prefill_graph", lambda: None),
+                    ("note_dp_gather_in_prefill_graph", lambda: None),
                     ("memcpy_func", dp_attention.memcpy_cpu),
                     ("tensor_model_parallel_all_reduce", all_reduce),
                 ]:

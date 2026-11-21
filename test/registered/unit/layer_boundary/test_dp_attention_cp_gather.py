@@ -241,7 +241,7 @@ class TestDpCpGather(CustomTestCase):
                     ((comm, "get_lora"), lambda: SimpleNamespace(enable_lora=False)),
                     ((dp_attention, "get_parallel"), lambda: parallel),
                     ((dp_attention, "world_dp_gather_enabled"), lambda: False),
-                    ((dp_attention, "_note_dp_gather_in_prefill_graph"), lambda: None),
+                    ((dp_attention, "note_dp_gather_in_prefill_graph"), lambda: None),
                     ((dp_attention, "memcpy_func"), dp_attention.memcpy_cpu),
                     ((dp_attention, "tensor_model_parallel_all_reduce"), all_reduce),
                     (
