@@ -5,6 +5,9 @@ totaling ROTATE_BYTES so every call reads its inputs cold from HBM;
 on MI355X that must exceed the 256 MB Infinity Cache, not only the 4 MB per-XCD L2.
 Reports the median replay.
 
+``--layout token-major`` times the transposed view of a [tokens, heads, K] tensor that
+the MLA call site passes; ``head-major`` is the contiguous layout.
+
 Run: ``python test/manual/kernels/benchmark/gemm/bench_mla_value_bmm_mxfp4_hip.py``
 """
 
@@ -37,12 +40,16 @@ def split(x, w, w_scales):
     return fused_flatten_mxfp4_quant(bf16_output)
 
 
-def make_inputs(heads, tokens):
+def make_inputs(heads, tokens, layout):
     weight = torch.randn((heads * N, K), dtype=torch.bfloat16, device="cuda")
     w, w_scales = dynamic_mxfp4_quant(weight)
     w = w.view(heads, N, K // 2)
     w_scales = w_scales.view(heads, N, K // 32)
-    x = torch.randn((heads, tokens, K), dtype=torch.bfloat16, device="cuda")
+    if layout == "token-major":
+        x = torch.randn((tokens, heads, K), dtype=torch.bfloat16, device="cuda")
+        x = x.transpose(0, 1)
+    else:
+        x = torch.randn((heads, tokens, K), dtype=torch.bfloat16, device="cuda")
     nbytes = sum(t.numel() * t.element_size() for t in (x, w, w_scales))
     copies = math.ceil(ROTATE_BYTES / nbytes)
     return [(x.clone(), w.clone(), w_scales.clone()) for _ in range(copies)]
@@ -90,11 +97,14 @@ def main():
         "--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64]
     )
     parser.add_argument("--replays", type=int, default=50)
+    parser.add_argument(
+        "--layout", choices=("head-major", "token-major"), default="head-major"
+    )
     args = parser.parse_args()
 
     print(f"{'tokens':>8} {'split (us)':>12} {'fused (us)':>12} {'speedup':>10}")
     for tokens in args.tokens:
-        inputs = make_inputs(args.heads, tokens)
+        inputs = make_inputs(args.heads, tokens, args.layout)
         split_us, fused_us = bench_us(
             (split, batched_gemm_a16wfp4_flatten_mxfp4_quant), inputs, args.replays
         )

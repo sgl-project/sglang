@@ -48,7 +48,7 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
 
     @contextlib.contextmanager
     def _fused_kernel_only(self):
-        """Fail the call if the op took its split fallback instead of launching the fused kernel."""
+        # Fail the call if the op took its split fallback instead of launching the fused kernel.
         from sglang.kernels.ops.gemm import mla_value_bmm_mxfp4_hip
 
         with mock.patch.object(
@@ -132,6 +132,24 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
                 self._assert_matches_split_path(
                     x, *self._fused(x, w, w_scales), w=w, w_scales=w_scales
                 )
+
+    def test_rejects_uncovered_dtypes_and_shapes(self):
+        from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
+            batched_gemm_a16wfp4_flatten_mxfp4_quant,
+            can_fuse_mla_value_bmm_mxfp4_quant,
+        )
+
+        x = self._x(4)
+        w, w_scales = self.weight_fp4, self.weight_scales
+        for name, args in (
+            ("fp16 x", (x.half(), w, w_scales)),
+            ("n != 128", (x, w[:, :64], w_scales[:, :64])),
+            ("k != 512", (x[..., :256], w[..., :128], w_scales[..., :8])),
+        ):
+            with self.subTest(case=name):
+                self.assertFalse(can_fuse_mla_value_bmm_mxfp4_quant(*args))
+                with self.assertRaises(ValueError):
+                    batched_gemm_a16wfp4_flatten_mxfp4_quant(*args)
 
     def test_torch_compile_fullgraph(self):
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (

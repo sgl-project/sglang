@@ -291,7 +291,12 @@ def can_fuse_mla_value_bmm_mxfp4_quant(
 def batched_gemm_a16wfp4_flatten_mxfp4_quant(
     x: torch.Tensor, w: torch.Tensor, w_scales: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute batched A16W4 GEMM and emit flattened per-1x32 MXFP4."""
+    """Compute batched A16W4 GEMM and emit flattened per-1x32 MXFP4.
+
+    Covers ROCm gfx950 (FP4 ``dot_scaled``) with AITER: BF16 ``x`` and uint8 ``w`` and
+    ``w_scales`` at N=128, K=512; anything else raises ``ValueError``. If AITER picks a
+    split-K or non-dividing BLOCK_SIZE_N config, the op runs the split GEMM + quant pair.
+    """
     if not can_fuse_mla_value_bmm_mxfp4_quant(x=x, w=w, w_scales=w_scales):
         raise ValueError(
             "Fused MLA value BMM requires BF16 x, uint8 W/scales, compatible "

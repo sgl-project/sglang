@@ -165,10 +165,13 @@ class TestValueQuantFusionGate(CustomTestCase):
                 forward_mla_rocm, "is_kv_b_lora_active", return_value=False
             )
         )
+        stack.enter_context(
+            mock.patch.object(forward_mla_rocm, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
+        )
 
     def test_takes_the_fused_path_when_every_term_holds(self):
         self.assertTrue(
-            _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+            _CAN_FUSE_VALUE_QUANT(attn=_value_attn(), forward_mode=_forward_mode())
         )
 
     def test_active_kv_b_lora_turns_it_off(self):
@@ -177,7 +180,7 @@ class TestValueQuantFusionGate(CustomTestCase):
             forward_mla_rocm, "is_kv_b_lora_active", return_value=True
         ):
             self.assertFalse(
-                _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+                _CAN_FUSE_VALUE_QUANT(attn=_value_attn(), forward_mode=_forward_mode())
             )
 
     def test_each_term_alone_turns_it_off(self):
@@ -198,15 +201,29 @@ class TestValueQuantFusionGate(CustomTestCase):
                 )
         with self.subTest(term="forward_mode"):
             self.assertFalse(
-                _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode(False))
+                _CAN_FUSE_VALUE_QUANT(
+                    attn=_value_attn(), forward_mode=_forward_mode(False)
+                )
             )
+        # The experimental LoRA path views the value output, not an (fp4, scales) pair.
+        with self.subTest(term="_SGLANG_EXPERIMENTAL_LORA_OPTI"):
+            with mock.patch.object(
+                forward_mla_rocm, "_SGLANG_EXPERIMENTAL_LORA_OPTI", True
+            ):
+                self.assertFalse(
+                    _CAN_FUSE_VALUE_QUANT(
+                        attn=_value_attn(), forward_mode=_forward_mode()
+                    )
+                )
         # Off when the env var disables it or AITER lacks the kernel's helpers.
         with self.subTest(term="_use_fused_mla_value_mxfp4_quant"):
             with mock.patch.object(
                 forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", False
             ):
                 self.assertFalse(
-                    _CAN_FUSE_VALUE_QUANT(_value_attn(), forward_mode=_forward_mode())
+                    _CAN_FUSE_VALUE_QUANT(
+                        attn=_value_attn(), forward_mode=_forward_mode()
+                    )
                 )
 
 
