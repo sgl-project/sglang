@@ -56,10 +56,14 @@ class RankMetadata:
 
             # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
             for i, key, prefix_key in new_keys_to_process:
-                if len(self.free_pages) > 0:
+                if self.free_pages:
                     page_index = self.free_pages.pop()
+                elif self.key_to_index:
+                    _, page_index = self.key_to_index.popitem(last=False)
                 else:
-                    page_index = self.key_to_index.popitem(last=False)[1]
+                    # No free or confirmed page is available for allocation.
+                    results[i] = (False, -1)
+                    continue
 
                 results[i] = (False, page_index)
 
@@ -73,6 +77,13 @@ class RankMetadata:
         """Confirm write operations and release pages."""
         with self.lock:
             for key, page_index in written_keys_to_confirm:
+                current = self.key_to_index.get(key)
+                if current is not None and current != page_index:
+                    # Keep the published page: readers may already hold it.
+                    # This duplicate write has finished, so its page can be reused.
+                    if page_index not in self.free_pages:
+                        self.free_pages.append(page_index)
+                    continue
                 self.key_to_index[key] = page_index
                 self.key_to_index.move_to_end(key)
 
