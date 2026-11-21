@@ -267,9 +267,10 @@ class Parallel(msgspec.Struct):
         "sequence-sharded activations with no extra communication volume. "
         "Prefill only; supports Qwen3 dense, Kimi-K3 without attention DP or CP, "
         "and Muse Spark ModelOpt NVFP4 with "
-        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
-        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
-        "NVLink/NVSwitch.",
+        "TP4/EP4 or TP8/EP8, either with the FlashInfer TRT-LLM MoE runner, "
+        "NVLink/NVSwitch and FlashInfer A2A or MegaMoE, or, before SM100, with "
+        "the marlin W4A16 runner and --moe-a2a-backend none, where each rank "
+        "runs its experts on the all-gathered tokens.",
     ] = False
     layernorm_sp_min_tokens: A[
         int,

@@ -3,8 +3,8 @@
 // Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
-// Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no
-// SP/MegaMoE (SM100-only kernels).
+// Marlin W4A16 experts and BF16 at TP16 across two nodes; it has no MegaMoE
+// (SM100-only kernels), and its NVFP4 prefill SP gathers tokens for the experts.
 export const config = {
   modelName: "Muse Spark Open",
   supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon", "tpu7x"],
@@ -213,12 +213,17 @@ export const config = {
       {
         id: "prefillSp", title: "Prefill Sequence Parallel",
         showWhen: (s) => s.pdMode !== "decode",
-        stripPrefixes: ["--enable-layernorm-sp"],
+        stripPrefixes: ["--enable-layernorm-sp", "--layernorm-sp-min-tokens"],
         options: [
+          { id: "on", label: "On", flags: ["--enable-layernorm-sp"], hide: { hw: ["h200"] } },
+          // Short prefills gain nothing from SP; 1792 is the captured bucket below 2048.
+          // Option `hide` can only match, hence the list of every other GPU.
           {
-            id: "on", label: "On", flags: ["--enable-layernorm-sp"],
-            disable: { hw: ["h200"] },
-            disableReason: "Layernorm SP needs SM100 collective GEMM kernels; unavailable on H200.",
+            id: "on-h200", label: "On",
+            flags: ["--enable-layernorm-sp", "--layernorm-sp-min-tokens 1792"],
+            hide: { hw: ["b300", "gb300", "b200", "mi355x", "xeon", "tpu7x"] },
+            disable: { quant: ["bf16"] },
+            disableReason: "On H200, layernorm SP runs the NVFP4 checkpoint's Marlin experts at TP8; BF16 runs at TP16.",
           },
           { id: "off", label: "Off" },
         ],
@@ -226,13 +231,14 @@ export const config = {
       {
         id: "prefillMegaMoe", title: "Prefill MegaMoE",
         default: (s) => ["b300", "gb300", "b200"].includes(s.hw) ? "on" : "off",
-        showWhen: (s) => s.pdMode !== "decode",
+        // H200 has no MegaMoE (SM100 kernels); hiding the row keeps its no-op
+        // opt-out flag off the H200 command.
+        showWhen: (s) => s.pdMode !== "decode" && s.hw !== "h200",
         stripPrefixes: ["--enable-megamoe-for-layernorm-sp", "--no-enable-megamoe-for-layernorm-sp"],
         options: [
           {
             id: "on", label: "On", flags: ["--enable-megamoe-for-layernorm-sp"],
             disable: [
-              { when: { hw: ["h200"] }, reason: "Prefill MegaMoE needs SM100 kernels; unavailable on H200." },
               { when: { "flagSelect.prefillSp": ["off"] }, reason: "Enable Prefill Sequence Parallel first." },
             ],
           },

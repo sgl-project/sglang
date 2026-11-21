@@ -383,6 +383,7 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                             is_sm100=platform == "blackwell",
                             is_sm90=platform == "hopper",
                             is_blackwell=platform == "blackwell",
+                            device_sm=100 if platform == "blackwell" else 90,
                         ),
                         patch(
                             "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
@@ -394,7 +395,8 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                             device="cuda",
                             tp_size=4,
                             ep_size=4,
-                            enable_layernorm_sp=platform == "blackwell",
+                            # Hopper takes SP through auto resolving to marlin.
+                            enable_layernorm_sp=True,
                             speculative_algorithm="DFLASH",
                             speculative_draft_model_path=str(draft),
                         )
