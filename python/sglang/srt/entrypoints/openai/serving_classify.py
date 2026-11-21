@@ -171,7 +171,7 @@ class OpenAIServingClassify(OpenAIServingBase):
 
             if embedding is not None and len(embedding) > 0:
                 try:
-                    embedding_tensor = torch.as_tensor(embedding, dtype=torch.float32)
+                    embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
                     probs = F.softmax(embedding_tensor, dim=0).tolist()
 
                     predicted_class = int(torch.argmax(embedding_tensor).item())
