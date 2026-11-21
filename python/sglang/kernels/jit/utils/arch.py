@@ -72,6 +72,30 @@ def _jit_cuda_version() -> tuple[int, ...]:
     return get_cuda_version()
 
 
+def _reject_pre_cxx20_nvcc(version: tuple[int, ...]) -> None:
+    """Fail fast when the resolved nvcc predates C++20 support.
+
+    A host can carry a legacy system toolkit (CUDA 11.x) next to a modern
+    torch wheel; the resolution order ($CUDA_HOME, $CUDA_PATH, $PATH,
+    /usr/local/cuda) then hands the JIT build an nvcc that does not know
+    ``-std=c++20``, and the first ninja build dies with the cryptic
+    ``nvcc fatal : Value 'c++20' is not defined for option 'std'``.  Surface
+    the mismatch at flag-composition time instead, naming the resolved
+    toolkit and the way out.
+    """
+    if version < (12, 0):
+        from sglang.kernels.jit.utils.compile.toolchain import cuda_home
+
+        raise RuntimeError(
+            f"JIT kernels are built with -std=c++20, which requires nvcc from "
+            f"CUDA >= 12.0. The toolkit resolved for JIT builds is CUDA "
+            f"{version[0]}.{version[1]} ({cuda_home()}). Point CUDA_HOME or "
+            f"CUDA_PATH at a newer toolkit -- for a pip-installed torch the "
+            f"matching toolkit ships inside the environment under "
+            f"site-packages/nvidia -- or install CUDA >= 12.0 system-wide."
+        )
+
+
 def _sail_arch_suffix(major: int, minor: int) -> str:
     """SAIL devices below the SM89 capability require the arch-specific target
     variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay
@@ -153,6 +177,8 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     else:
+        if not (is_musa_runtime() or is_sail_runtime()):
+            _reject_pre_cxx20_nvcc(_jit_cuda_version())
         if arch is None:
             arch = get_compile_arch()
         return [
