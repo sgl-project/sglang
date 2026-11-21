@@ -1040,6 +1040,7 @@ def test_sort_tail_declines_on_a_cu_masked_stream():
                     True,
                     2.5,
                     sort_ws=sort_ws,
+                    block_m=16,
                 )
         assert moe_route_radix4.sort_tail_fits(256, scores.device)
     finally:
