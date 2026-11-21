@@ -200,9 +200,10 @@ echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
-    # Archive the test log into the output directory for result collection
-    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
-    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    node_log_dir="${METRICS_DATA_FILE}/node_logs/${HOSTNAME}"
+    mkdir -p "${node_log_dir}"
+    cp -a "${log_path}/." "${node_log_dir}/"
+    echo "Node log saved to ${node_log_dir}"
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"

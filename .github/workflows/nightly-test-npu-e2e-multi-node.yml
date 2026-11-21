@@ -365,6 +365,28 @@ jobs:
           echo "Run command: ${CMD}"
           eval "${CMD}"
 
+      # Fallback log collection, only when the run did not finish cleanly.
+      - name: Collect node logs
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          tc_name="${{ inputs.test_case }}"
+          tc_name="${tc_name##*/}"
+          tc_name="${tc_name%.*}"
+
+          collected=0
+          for out_dir in /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${tc_name}; do
+            [ -d "${out_dir}" ] || continue
+            for src_dir in /root/.cache/tests/logs/log/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${tc_name}/*; do
+              [ -d "${src_dir}" ] || continue
+              pod_name="$(basename "${src_dir}")"
+              mkdir -p "${out_dir}/node_logs/${pod_name}"
+              cp -a "${src_dir}/." "${out_dir}/node_logs/${pod_name}/"
+              collected=$((collected + 1))
+            done
+          done
+          echo "Collected ${collected} pod log dir(s)"
+
       - name: Upload metrics artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -374,6 +396,7 @@ jobs:
           path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
           if-no-files-found: ignore
           retention-days: 7
+          compression-level: 9
 
       - name: Post process
         if: always()
