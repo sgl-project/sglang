@@ -1035,7 +1035,10 @@ mod tests {
             .propose(&pool, &ctx)
             .unwrap();
         assert_eq!(pick.kind, ProposalKind::CacheAffinity);
-        assert_eq!(signal.media_winners, [pick.primary.url.clone()]);
+        assert_eq!(
+            signal.media_winners.as_slice(),
+            std::slice::from_ref(&pick.primary.url)
+        );
     }
 
     #[test]
