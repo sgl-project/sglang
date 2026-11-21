@@ -238,6 +238,38 @@ def _split_hicache_size(
     )
 
 
+def _split_hicache_size_with_mamba(
+    *, kv_pools: tuple[Any, ...], mamba_pools: tuple[Any, ...]
+) -> tuple[float, ...]:
+    # One share per KV pool, then one Mamba share for all of mamba_pools;
+    # the Mamba host pool packs every one of them into each slot.
+    hicache_size = get_memory().hicache_size
+    mamba_size = get_memory().hicache_mamba_size
+    if mamba_size == 0:
+        sizes = _split_hicache_size(
+            hicache_size=hicache_size, kv_pools=(*kv_pools, *mamba_pools)
+        )
+        return (*sizes[: len(kv_pools)], sum(sizes[len(kv_pools) :]))
+    kv_sizes = _split_hicache_size(
+        hicache_size=hicache_size - mamba_size, kv_pools=kv_pools
+    )
+    return (*kv_sizes, mamba_size)
+
+
+def _require_pinned_mamba_slot(host_pool: MambaPoolHost, *, host_size: float) -> None:
+    # Ratio sizing (host_size 0) never carries a pin;
+    # sizing pads each host pool by one slot, so a sub-slot pin builds a 1-slot pool.
+    if host_size <= 0 or get_memory().hicache_mamba_size == 0:
+        return
+    if host_size * 1e9 >= host_pool.size_per_token:
+        return
+    raise ValueError(
+        f"--hicache-mamba-size {host_size:g} cannot hold one Mamba state slot, "
+        f"which takes {host_pool.size_per_token / 1e9:.3f} GB across the target "
+        "and MTP draft Mamba layers."
+    )
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1161,15 +1193,17 @@ def _mamba_entry(
 ) -> PoolEntry:
     drafts = params.mtp_draft_mamba_pools
     allocator = params.token_to_kv_pool_allocator.state_slots
+    host_pool = build_mamba_host_pool(
+        mamba_pool,
+        info,
+        host_size=host_size,
+        layout=_state_host_layout(),
+        mtp_draft_device_pools=drafts,
+    )
+    _require_pinned_mamba_slot(host_pool, host_size=host_size)
     return build_pool_entry(
         name=PoolName.MAMBA,
-        host_pool=build_mamba_host_pool(
-            mamba_pool,
-            info,
-            host_size=host_size,
-            layout=_state_host_layout(),
-            mtp_draft_device_pools=drafts,
-        ),
+        host_pool=host_pool,
         device_pool=mamba_pool,
         layer_mapping=with_packed_draft_layer_mapping(
             layer_mapping,
@@ -1221,8 +1255,8 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            kv_pools=(kv_pool,), mamba_pools=(mamba_pool,)
         )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
@@ -1294,8 +1328,8 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size_with_mamba(
+            kv_pools=(full_kv_pool, swa_kv_pool), mamba_pools=(mamba_pool,)
         )
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
