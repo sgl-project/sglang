@@ -89,3 +89,18 @@ Note: for the server args, `tokenizer-path`, overriding architecture are necessa
 - sglang (oai)
 - vllm (oai)
 - lmdeploy (oai)
+
+## fast_file page I/O micro-benchmark
+
+`bench_fast_file_io.py` drives the `fast_file` L3 backend directly, the way the
+cache controller does (128-page `batch_set_v1` / `batch_get_v1` batches), on a
+page-first host pool stand-in with a real model's page geometry. Each
+(mode, read_workers, repeat) cell runs in its own process. Before the read
+phase the page cache is written back and dropped, so buffered reads come from
+the disk, not from the pages the writes left in memory. Point `--storage-dir`
+at the disk under test, not at tmpfs:
+
+```bash
+python benchmark/hicache/bench_fast_file_io.py --storage-dir /mnt/nvme/bench \
+    --preset qwen3-8b --pages 400 --read-workers 1 8 --repeat 3
+```
