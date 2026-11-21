@@ -110,7 +110,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def rollback(self, k: int):
         self.matcher.rollback(k)
-        self.accepted_tokens = self.accepted_tokens[:-k]
+        del self.accepted_tokens[-k:]
 
     def try_accept_tokens(self, tokens: List[int]) -> bool:
         if self.is_terminated():
