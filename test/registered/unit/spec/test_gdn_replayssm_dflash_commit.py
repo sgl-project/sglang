@@ -23,10 +23,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
     _validate_gdn_target_verify_layout,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +38,180 @@ _KERNELS = "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode"
 _BACKEND = "sglang.srt.layers.attention.hybrid_linear_attn_backend"
 _GDN_COMMIT = f"{_KERNELS}.commit_gdn_replayssm_after_verify"
 DRAFT_TOKENS = 8
+
+
+class TestDeferredCheckpointConsumers(CustomTestCase):
+    def backend(self):
+        backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        backend.state_pool = SimpleNamespace(
+            mamba_layer_ids=[3, 5], replayssm_deferred_state=MagicMock()
+        )
+        backend.prefill_graph_metadata = None
+        backend.forward_metadata = SimpleNamespace(
+            mamba_cache_indices=torch.tensor([7, 9, -1]),
+            query_start_loc=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            retrieve_parent_token=None,
+        )
+        return backend
+
+    def test_eager_remains_default(self):
+        from sglang.srt.arg_groups.fields.exec_ import ExecMamba
+
+        self.assertEqual(ExecMamba().linear_replayssm_spec_commit_policy, "eager")
+
+    def test_decode_and_extend_drain_before_checkpoint_read(self):
+        for mode, method in (
+            (ForwardMode.DECODE, "forward_decode"),
+            (ForwardMode.EXTEND, "forward_extend"),
+        ):
+            backend = self.backend()
+            batch = SimpleNamespace(forward_mode=mode, batch_size=2)
+            deferred = backend.state_pool.replayssm_deferred_state
+
+            def read_checkpoint(layer_id):
+                deferred.materialize.assert_called_once()
+                raise RuntimeError("checkpoint read reached")
+
+            backend.state_layer_cache = read_checkpoint
+            with self.assertRaisesRegex(RuntimeError, "checkpoint read reached"):
+                getattr(backend, method)(
+                    SimpleNamespace(layer_id=3), batch, torch.zeros(1, 4), None, None
+                )
+            args, kwargs = deferred.materialize.call_args
+            self.assertEqual(args[0].tolist(), [7, 9])
+            self.assertEqual(kwargs["reason"], "non_verify_forward")
+
+    def test_prefill_graph_drains_before_graph_checkpoint_consumer(self):
+        backend = self.backend()
+        backend.prefill_graph_metadata = SimpleNamespace(
+            cache_indices=torch.tensor([12, 14, -1])
+        )
+        deferred = backend.state_pool.replayssm_deferred_state
+
+        def consume(**kwargs):
+            deferred.materialize.assert_called_once()
+            return "graph output"
+
+        backend._forward_extend_in_graph = consume
+        result = backend.forward_extend(
+            SimpleNamespace(layer_id=3),
+            SimpleNamespace(forward_mode=ForwardMode.EXTEND, batch_size=2),
+            torch.zeros(1, 4),
+            None,
+            None,
+        )
+        self.assertEqual(result, "graph output")
+        self.assertEqual(deferred.materialize.call_args.args[0].tolist(), [12, 14])
+
+    def test_verify_and_later_layers_do_not_drain(self):
+        backend = self.backend()
+        for layer, mode in ((3, ForwardMode.TARGET_VERIFY), (5, ForwardMode.DECODE)):
+            backend._materialize_deferred_before_state_read(
+                SimpleNamespace(layer_id=layer),
+                SimpleNamespace(forward_mode=mode, batch_size=2),
+            )
+        backend.state_pool.replayssm_deferred_state.materialize.assert_not_called()
+
+    def test_non_static_pool_is_rejected(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        with (
+            patch("sglang.srt.mem_cache.kv_cache_configurator.get_exec") as config,
+            self.assertRaisesRegex(ValueError, "static MambaPool"),
+        ):
+            config.return_value.mamba.linear_replayssm_spec_commit_policy = "deferred"
+            configurator._configure_gdn_replayssm_commit(
+                SimpleNamespace(mamba_pool=SimpleNamespace())
+            )
+
+    def test_deferred_refuses_unsupported_execution_modes(self):
+        from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+
+        fields = dict(
+            linear_attn_backend="triton",
+            linear_attn_decode_backend="triton",
+            linear_attn_verify_backend="triton",
+            linear_attn_prefill_backend="triton",
+            enable_linear_replayssm=False,
+            enable_linear_replayssm_spec=True,
+            linear_replayssm_spec_commit_policy="deferred",
+            speculative_algorithm="DFLASH",
+            speculative_eagle_topk=1,
+            mamba_ssm_dtype="bfloat16",
+            disaggregation_mode="null",
+            enable_pd_role_switch=False,
+            pp_size=1,
+            enable_unified_memory=False,
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            enable_int8_mamba_checkpoint=False,
+            enable_streaming_session=False,
+            enable_session_radix_cache=False,
+        )
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.pp_spec_stable_rows_enabled",
+                return_value=False,
+            ),
+        ):
+            handle_linear_attn_backend(SimpleNamespace(**fields))
+            for key, value in (
+                ("enable_linear_replayssm_spec", False),
+                ("speculative_algorithm", "DSPARK"),
+                ("mamba_ssm_dtype", "float32"),
+                ("disaggregation_mode", "decode"),
+                ("enable_pd_role_switch", True),
+                ("pp_size", 2),
+                ("enable_unified_memory", True),
+                ("mamba_radix_cache_strategy", "no_buffer"),
+                ("enable_int8_mamba_checkpoint", True),
+                ("enable_streaming_session", True),
+                ("enable_session_radix_cache", True),
+            ):
+                with (
+                    self.subTest(field=key),
+                    self.assertRaisesRegex(ValueError, "Deferred GDN commit requires"),
+                ):
+                    handle_linear_attn_backend(
+                        SimpleNamespace(**{**fields, key: value})
+                    )
+            with (
+                envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+                self.assertRaisesRegex(ValueError, "Deferred GDN commit requires"),
+            ):
+                handle_linear_attn_backend(SimpleNamespace(**fields))
+
+    def test_deferred_refuses_non_bf16_and_strided_checkpoints(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.hybrid_gdn_config = {}
+        pool = MambaPool.__new__(MambaPool)
+        pool.replayssm_spec_write_pos = torch.zeros(2, dtype=torch.int32)
+        for temporal, error in (
+            (torch.zeros(1, 4, 1, 2, 2), "BF16 checkpoint"),
+            (
+                torch.zeros(1, 8, 1, 2, 2, dtype=torch.bfloat16)[:, ::2],
+                "contiguous checkpoints",
+            ),
+        ):
+            pool.mamba_cache = SimpleNamespace(temporal=temporal)
+            with (
+                patch("sglang.srt.mem_cache.kv_cache_configurator.get_exec") as config,
+                patch("sglang.srt.mem_cache.kv_cache_configurator.get_spec") as spec,
+                envs.SGLANG_GDN_REPLAYSSM_COMMIT_STATS.override(False),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                config.return_value.mamba.linear_replayssm_spec_commit_policy = (
+                    "deferred"
+                )
+                spec.return_value.speculative_algorithm = "DFLASH"
+                configurator._configure_gdn_replayssm_commit(
+                    SimpleNamespace(mamba_pool=pool)
+                )
 
 
 def _gdn_cache_params(num_layers=2):
@@ -142,6 +318,18 @@ class TestGDNReplaySSMRingLength(CustomTestCase):
 
 
 class TestGDNReplaySSMBackendCommit(CustomTestCase):
+    def test_deferred_route_retains_history_and_passes_capacity_margin(self):
+        pool, state = _gdn_pool(), _spec_state()
+        pool.replayssm_deferred_state = object()
+        pool.replayssm_commit_stats = torch.zeros(40, 9, dtype=torch.int64)
+        hybrid = _hybrid_backend(pool, state, torch.tensor([5, 9]))
+        with patch(_GDN_COMMIT) as commit:
+            self._commit(hybrid, torch.tensor([2, 0]), torch.tensor([17, 23]))
+        kwargs = commit.call_args.kwargs
+        self.assertIs(kwargs["fold_every_commit"], False)
+        self.assertEqual(kwargs["max_spec_len"], DRAFT_TOKENS)
+        self.assertIs(kwargs["stats"], pool.replayssm_commit_stats)
+
     def _commit(self, hybrid, last_correct, req_rows, **kwargs):
         hybrid.linear_attn_backend.ring_rows = req_rows
         hybrid.update_mamba_state_after_mtp_verify(
