@@ -53,6 +53,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import router_quant_config, unquantize_router_if_stored_so
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -82,13 +83,13 @@ class MixtralMoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.hidden_size = hidden_size
 
-        # Gate always runs at half / full precision for now.
+        # Built as the checkpoint stores it: see router_quant_config.
         self.gate = ReplicatedLinear(
             hidden_size,
             num_experts,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=router_quant_config(quant_config),
             prefix=add_prefix("gate", prefix),
         )
 
@@ -459,6 +460,14 @@ class MixtralForCausalLM(nn.Module):
                     )
                     break
                 else:
+                    # A router the checkpoint stores unquantized although the config quantizes it
+                    unquantize_router_if_stored_so(
+                        self,
+                        name,
+                        loaded_weight,
+                        params_dict,
+                        (".block_sparse_moe.gate",),
+                    )
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
