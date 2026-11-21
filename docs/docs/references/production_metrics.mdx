@@ -141,6 +141,18 @@ histogram_quantile(
 
 Mean TPOT is `rate(..._sum[5m]) / rate(..._count[5m])`. Per-request decode tokens/s is its reciprocal, so p5 TPS is `1 / p95 TPOT`; the reciprocal of mean TPOT is not mean TPS.
 
+## Rust frontend metrics
+
+The Rust frontend (`sglang-server`) exports the frontend metrics above under the same names, plus these families of its own. They carry the same labels as the request metrics (`model_name`, `engine_type`, ...), plus the one listed.
+
+| Metric | Type | Label | Meaning |
+|---|---|---|---|
+| `sglang:frontend_queue_depth` | gauge | `stage` | Requests waiting in a frontend stage queue, read at each scrape: `intake` (the request loop's inbox), `tokenizer` and `mm` (the tokenizer and multimodal worker pools), `scheduler` (the scheduler's request queue). |
+| `sglang:frontend_queue_full_total` | counter | `stage` | Generations failed as overloaded because a stage queue was full: a 503, or a 503 error item in a stream or batch. `stage` is the full queue: `tokenizer`, `mm` or `scheduler`, as in `sglang:frontend_queue_depth` (intake waits for room instead of refusing). |
+| `sglang:frontend_media_fetch_slot_wait_seconds` | histogram | | Time a media fetch waited for one of the process's concurrent fetch slots. |
+
+The gauge is summed over processes.
+
 ## Diffusion metrics
 
 SGLang Diffusion exposes request, queue, stage and LoRA metrics with
