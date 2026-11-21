@@ -462,8 +462,11 @@ class TestHiCacheHostRegister(unittest.TestCase):
         gib = 1024**3
         base = 0x10000000
         buffer = _FakeBuffer(base, 2 * gib + 17)
+        # The second call fails once; the bisect retry splits that chunk and
+        # the halves succeed, so the whole pool registers and nothing rolls
+        # back. A persistent failure (every call) must still raise and roll
+        # every prior registration back.
         cudart = _FakeCudart(fail_on_registration=2)
-
         with (
             mock.patch.object(
                 envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
@@ -471,15 +474,61 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 return_value=1,
             ),
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
-            self.assertRaisesRegex(RuntimeError, "offset=1073741824"),
         ):
             _cuda_host_register(buffer, registration_granularity_bytes=gib)
-
         self.assertEqual(
-            cudart.registrations,
-            [(base, gib, 0), (base + gib, gib, 0)],
+            [p for p, _, _ in cudart.registrations[:2]],
+            [base, base + gib],
         )
-        self.assertEqual(cudart.unregistrations, [base])
+        self.assertGreater(len(cudart.registrations), 2)  # bisected re-tries
+        self.assertEqual(cudart.unregistrations, [])  # nothing rolled back
+
+        class _AlwaysFailCudart(_FakeCudart):
+            def cudaHostRegister(self, ptr, size, flags):
+                self.registrations.append((ptr, size, flags))
+                return 1
+
+        cudart2 = _AlwaysFailCudart()
+        buffer2 = _FakeBuffer(base, 2 * gib + 17)
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart2),
+            self.assertRaisesRegex(RuntimeError, "minimum split size"),
+        ):
+            _cuda_host_register(buffer2, registration_granularity_bytes=gib)
+        # Every call failed, so no range was ever registered and there is
+        # nothing to roll back; the raise itself is the whole story.
+        self.assertEqual(cudart2.unregistrations, [])
+        # A recovery scenario where the FIRST chunk registers whole: use a
+        # fake that fails only from call #2 onward, so the first chunk pins,
+        # the second cannot be split below the floor, and the first chunk's
+        # registration must be rolled back on the raise.
+        cudart3 = _FakeCudart()
+        orig_register = cudart3.cudaHostRegister
+
+        def _fail_from_second(ptr, size, flags):
+            cudart3.registrations.append((ptr, size, flags))
+            if len(cudart3.registrations) > 1:
+                return 1
+            return orig_register(ptr, size, flags)
+
+        cudart3.cudaHostRegister = _fail_from_second
+        buffer3 = _FakeBuffer(base, 2 * gib + 17)
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart3),
+            self.assertRaisesRegex(RuntimeError, "minimum split size"),
+        ):
+            _cuda_host_register(buffer3, registration_granularity_bytes=gib)
+        self.assertEqual(cudart3.unregistrations, [base])  # first chunk rolled back
 
     def test_missing_copy_granularity_preserves_single_registration(self):
         gib = 1024**3
@@ -581,22 +630,44 @@ class TestHiCacheHostRegister(unittest.TestCase):
             ),
             mock.patch.object(torch.cuda, "cudart", return_value=cudart),
         ):
-            # lcm(2 MiB, 513 MiB) = 1026 MiB exceeds the 1 GiB chunk limit.
-            with self.assertRaises(ValueError):
-                register(513)
+            # lcm(2 MiB, 513 MiB) = 1026 MiB exceeds the 1 GiB chunk limit:
+            # fall back to the largest COPY-UNIT-aligned chunk below the limit
+            # (hugepage misalignment is absorbed by the bisect retry) instead
+            # of refusing.
+            over_limit = register(513)
             # lcm(2 MiB, 301 MiB) = 602 MiB fits: chunks keep both grids.
             lcm_aligned = register(301)
             # A page-multiple granularity keeps the same grid.
             page_multiple = register(300)
 
-        self.assertEqual([s for _, s, _ in lcm_aligned], [602 * mib] * 5 + [66 * mib])
+        # The 2 GiB+17 buffer rounds up to the 2 MiB hugepage grid; the cap
+        # (1 GiB) floors onto the copy-unit grid, so the chunk is one copy
+        # unit (513 MiB): four full chunks plus the rounded tail.
+        cu = 513 * mib
+        got = [s for _, s, _ in over_limit]
+        self.assertEqual(got[:-1], [cu] * (len(got) - 1))
+        self.assertEqual(sum(got), total)
+        self.assertLess(got[-1], cu)
+        # lcm(2 MiB, 301 MiB) = 602 MiB exceeds the 512 MiB cap: the
+        # copy-unit fallback applies (301 MiB chunks), as above.
         self.assertEqual(
-            [s for _, s, _ in page_multiple], [900 * mib] * 3 + [376 * mib]
+            [s for _, s, _ in lcm_aligned],
+            [301 * mib] * 10 + [66 * mib],
         )
-        for registrations in (lcm_aligned, page_multiple):
-            for ptr, size, _ in registrations:
-                self.assertEqual((ptr - base) % two_mib, 0)
-                self.assertEqual(size % two_mib, 0)
+        # A page-multiple granularity: lcm(300 MiB, 2 MiB) = 300 MiB <= cap,
+        # so this one keeps the normal lcm branch (900 MiB chunks).
+        self.assertEqual(
+            [s for _, s, _ in page_multiple],
+            [900 * mib] * 3 + [376 * mib],
+        )
+        # Every boundary stays on the caller's copy-unit grid.
+        for cu, registrations in (
+            (513 * mib, over_limit),
+            (301 * mib, lcm_aligned),
+            (300 * mib, page_multiple),
+        ):
+            for ptr, _, _ in registrations:
+                self.assertEqual((ptr - base) % cu, 0)
 
     def test_null_pinned_allocation_raises(self):
         """On XPU a null pinned buffer must fail at allocation, not at first transfer."""
