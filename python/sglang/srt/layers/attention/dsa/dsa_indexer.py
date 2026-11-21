@@ -235,9 +235,7 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    # PyNCCL is the faster path under capture, but it is not a precondition:
-    # a split attn-TP group is built without one (parallel_state.py), and the
-    # process-group broadcast captures and replays correctly.
+    # PyNCCL is faster under capture; the process-group broadcast also captures correctly.
     pynccl_comm = group.get_available_pynccl_comm()
     if (
         topk_indices.device.type == "cuda"
