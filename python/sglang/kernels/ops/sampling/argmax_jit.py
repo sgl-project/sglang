@@ -31,21 +31,12 @@ def _jit_argmax_module(dtype: torch.dtype) -> Module:
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
-@cache_once
-def _is_cuda_platform() -> bool:
-    from sglang.kernels.spec import PlatformInfo
-
-    return PlatformInfo.detect().is_cuda
-
-
 def can_argmax(logits: torch.Tensor) -> bool:
     """Whether `argmax` accepts ``logits``: CUDA, a supported dtype, rows of aligned vectors."""
-    if not _is_cuda_platform():
+    cuda_arch = current_arch().cuda
+    if cuda_arch is None or logits.dtype not in _SUPPORTED_DTYPES or logits.ndim != 2:
         return False
-    if logits.dtype not in _SUPPORTED_DTYPES or logits.ndim != 2:
-        return False
-    # Mirrors `kMaxVecBytes` in `argmax.cuh`
-    vec_bytes = current_arch().cuda.max_vec_bytes
+    vec_bytes = cuda_arch.max_vec_bytes
     vec_size = vec_bytes // logits.element_size()
     return (
         logits.size(1) % vec_size == 0

@@ -1118,9 +1118,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         draft_kv_ring_unsupported_reason,
     )
 
-    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-    if not switch.get():
-        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+    if not envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get():
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
@@ -1139,10 +1137,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         is_cuda=current_platform.is_cuda(),
     )
     if reason is not None:
-        if switch.is_set():
-            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-        logger.info("DFLASH draft KV ring: off, %s.", reason)
-        return
+        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
     logger.info("DFLASH draft KV ring: on.")
     declare_resolution(
         server_args,

@@ -13,6 +13,9 @@ except ImportError:
     torch_varlen_attn = None
 
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -64,10 +67,6 @@ class SDPABackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SDPAImpl"]:
         return SDPAImpl
-
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
 
 
 class SDPAImpl(AttentionImpl):
@@ -353,11 +352,12 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
             # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            # FA4's faster sub-tile kernel pays off in captured segments, but
-            # its host dispatch loses to cuDNN in eager (including BCG breaks).
+            # FA4's faster sub-tile kernel pays off inside a graph: captured
+            # segments and the eager breaks of a replay. In plain eager its host
+            # dispatch loses to cuDNN.
             # Keep exact requests on the reference route: cuDNN and FA4 differ
             # in rounding. The BCG scope includes warmup, priming FA4 for capture.
-            if not is_in_breakable_cuda_graph():
+            if not is_in_breakable_cuda_graph() and get_current_replay_token() is None:
                 context = get_forward_context_or_none()
                 if context is not None and quality_allows(context.quality, "lossless"):
                     return True
