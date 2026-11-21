@@ -125,7 +125,8 @@ def extend(
     """``TritonKDAKernel.extend`` on AITER Gluon chunk_kda, or None when not covered.
 
     Gathers the ``cache_indices`` rows of ``ssm_states`` (bf16 or fp32) into the
-    kernel's fp32 initial state and scatters the final state back in place.
+    kernel's fp32 initial state and scatters the final state back in place. Negative
+    (padding) indices leave the pool unchanged and need no reserved slot.
     """
     aiter_chunk_kda = _aiter_chunk_kda_module()
     if aiter_chunk_kda is None or not _covered(
@@ -145,8 +146,7 @@ def extend(
         **kwargs,
     ):
         return None
-    # A negative slot is padding: it starts from zeros and leaves the pool unchanged;
-    # its write-back lands on slot 0, which the mamba pool never hands out.
+    # A negative slot is padding: it starts from zeros and leaves the pool unchanged.
     valid = (cache_indices >= 0).view(-1, 1, 1, 1)
     slots = cache_indices.clamp(min=0).long()
     current = ssm_states.index_select(0, slots)
@@ -167,7 +167,13 @@ def extend(
         initial_state=initial,
         output_final_state=True,
     )
+    written = torch.where(valid, final.to(ssm_states.dtype), current)
+    # Padded rows are redirected onto a live row's slot and value (or onto their own unchanged
+    # slot 0 when none is live), so a duplicate write never clobbers a live row, even at slot 0.
+    live = valid.flatten().int().argmax()
     ssm_states.index_copy_(
-        0, slots, torch.where(valid, final.to(ssm_states.dtype), current)
+        0,
+        torch.where(valid.flatten(), slots, slots[live]),
+        torch.where(valid, written, written[live]),
     )
     return out
