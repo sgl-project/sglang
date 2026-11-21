@@ -169,15 +169,17 @@ def _tensor_ptrs_inside(start: int, end: int) -> tuple[int, float]:
     count = 0
     total = 0.0
     for obj in gc.get_objects():
-        if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
-            try:
-                ptr = obj.data_ptr()
-                nbytes = obj.numel() * obj.element_size()
-            except Exception:
+        try:
+            # isinstance raises ReferenceError on a weakref proxy whose referent died.
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
                 continue
-            if start <= ptr < end:
-                count += 1
-                total += nbytes / GIB
+            ptr = obj.data_ptr()
+            nbytes = obj.numel() * obj.element_size()
+        except Exception:
+            continue
+        if start <= ptr < end:
+            count += 1
+            total += nbytes / GIB
     return count, total
 
 
@@ -215,9 +217,10 @@ def host_memory_breakdown(modules: Mapping[str, object]) -> dict[str, dict[str, 
     seen: set[int] = set()
     table: dict[str, dict[str, float]] = {}
     for obj in gc.get_objects():
-        if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
-            continue
         try:
+            # isinstance raises ReferenceError on a weakref proxy whose referent died.
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                continue
             storage = obj.untyped_storage()
             key = storage.data_ptr()
             nbytes = storage.nbytes()

@@ -28,7 +28,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -43,8 +43,8 @@ def _decode_batch():
     sampling.logit_bias = None
     sampling.grammar_mask = None
     sampling.has_custom_logit_processor = False
-    sampling.penalizer_orchestrator = None
-    sampling.has_watermark_candidates = False
+    sampling.step_penalties = None
+    sampling.watermark = None
     batch = Mock()
     batch.forward_mode.is_decode.return_value = True
     batch.forward_mode.is_extend.return_value = False
@@ -103,9 +103,9 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling.logit_bias = torch.ones(1)
         self.assertFalse(graph_io.can_defer(batch))
         sampling.logit_bias = None
-        sampling.has_watermark_candidates = True
+        sampling.watermark = object()
         self.assertFalse(graph_io.can_defer(batch))
-        sampling.has_watermark_candidates = False
+        sampling.watermark = None
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
 
@@ -129,7 +129,7 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
 
         # watermarking samples after graph argmax; relay the actual sampled ids
         batch.sampling_info.is_all_greedy = True
-        batch.sampling_info.has_watermark_candidates = True
+        batch.sampling_info.watermark = object()
         result.next_token_ids = torch.tensor([59, 61])
         graph_io.relay_result(batch, result, indices)
         self.assertEqual(graph_io.relay[indices].tolist(), [59, 61])
@@ -221,14 +221,14 @@ class TestUocrGreedyGraph(CustomTestCase):
         logits = Mock(next_token_logits=torch.zeros(2, 5))
         replayed = _decode_batch()
         graph.before_forward(replayed, replays_graph=True, decode_graph_runner=None)
-        ids = graph.recorded_ids(logits, replayed, watermark_state=None)
+        ids = graph.recorded_ids(logits, replayed)
         self.assertEqual(ids.tolist(), [7, 8])
         self.assertEqual(ids.dtype, torch.int32)
 
         eager = _decode_batch()
         graph.before_forward(eager, replays_graph=False, decode_graph_runner=None)
-        self.assertIsNone(graph.recorded_ids(logits, eager, watermark_state=None))
-        self.assertIsNone(graph.recorded_ids(logits, replayed, watermark_state=None))
+        self.assertIsNone(graph.recorded_ids(logits, eager))
+        self.assertIsNone(graph.recorded_ids(logits, replayed))
 
 
 def _scheduler_for(architecture, training_stage):
@@ -362,6 +362,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with patch("sglang.srt.managers.utils.get_serving"):

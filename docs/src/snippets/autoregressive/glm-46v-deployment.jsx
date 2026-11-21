@@ -146,7 +146,7 @@ export const GLM46VDeployment = () => {
 
     // Add tool call parser if enabled
     if (toolcall === 'enabled') {
-      cmd += ` \\\n  --tool-call-parser glm45`;
+      cmd += ` \\\n  --tool-call-parser glm`;
     }
 
     if (hardware === 'b300') {
