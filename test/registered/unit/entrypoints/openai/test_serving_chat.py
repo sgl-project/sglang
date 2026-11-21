@@ -296,10 +296,31 @@ class TestChatTemplateCache(CustomTestCase):
         first[0].append(99)
         second = self._render()
 
-        self.assertEqual(second, ([11, 12], "decoded"))
+        self.assertEqual(second, ([11, 12], "rendered"))
         self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
         self.tokenizer_manager.tokenizer.encode.assert_called_once()
-        self.tokenizer_manager.tokenizer.decode.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def test_prompt_text_is_a_decode_only_without_the_rendered_text(self):
+        """Ids from a lossy round trip or with specials added by the encode do
+        not encode the rendered text alone, so their text is a decode."""
+        tokenizer = self.tokenizer_manager.tokenizer
+        cases = {
+            "rendered text": (False, {"add_special_tokens": False}, "rendered"),
+            "lossy round trip": (True, {}, "decoded"),
+            "encode adds specials": (False, {"add_special_tokens": True}, "decoded"),
+        }
+        for name, (lossy, encode_kwargs, prompt_text) in cases.items():
+            with self.subTest(name):
+                self.chat._chat_template_cache.clear()
+                self.chat._prompt_text_round_trip_is_lossy = lossy
+                tokenizer.apply_chat_template.return_value = (
+                    [11, 12] if lossy else "rendered"
+                )
+                self.assertEqual(
+                    self._render(encode_kwargs=encode_kwargs),
+                    ([11, 12], prompt_text),
+                )
 
     def test_cache_key_includes_template_and_encode_options(self):
         self._render()
@@ -403,6 +424,20 @@ class TestPythonChatTemplateSegments(CustomTestCase):
         )
         self.assertEqual(ids, self.tokenizer.encode(rendered))
         self.assertEqual(documents_ids, ids)
+
+    def test_prompt_text_is_the_rendered_segments(self):
+        ids, prompt_text = self.chat._render_and_encode_chat_template(
+            self.messages,
+            tools=None,
+            template_kwargs={},
+            encode_kwargs={},
+            use_cache=True,
+        )
+        rendered = self.tokenizer.apply_chat_template(
+            self.messages, add_generation_prompt=True, tokenize=False
+        )
+        self.assertEqual(prompt_text, rendered)
+        self.assertEqual(ids, self.tokenizer.encode(rendered))
 
 
 class ServingChatTestCase(CustomTestCase):
@@ -845,6 +880,47 @@ class ServingChatTestCase(CustomTestCase):
             [item.url for item in result.image_data], ["image-b", "image-a"]
         )
         self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+
+    def test_multimodal_prompt_is_the_rendered_template_text(self):
+        """The processor tokenizes the rendered text rather than a decode of
+        its ids, which need not give the text back."""
+        self.template_manager.jinja_template_content_format = "openai"
+        self.chat._prompt_text_round_trip_is_lossy = False
+        self.tm.tokenizer.apply_chat_template.return_value = "<rendered>"
+        self.tm.tokenizer.encode.return_value = [11, 12]
+        self.tm.tokenizer.decode.return_value = "<decoded>"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "image-1"}},
+                    {"type": "text", "text": "Describe"},
+                ],
+            }
+        ]
+
+        result = self.chat._apply_jinja_template(
+            ChatCompletionRequest(model="x", messages=messages),
+            None,
+            is_multimodal=True,
+        )
+
+        self.assertEqual((result.prompt, result.prompt_ids), ("<rendered>", [11, 12]))
+        self.assertEqual(result.image_data[0].url, "image-1")
+        self.tm.tokenizer.decode.assert_not_called()
+
+        # The rendered text lacks the ids of a continued final message.
+        continued = ChatCompletionRequest(
+            model="x",
+            messages=messages + [{"role": "assistant", "content": "It shows"}],
+            continue_final_message=True,
+        )
+        result = self.chat._apply_jinja_template(continued, None, is_multimodal=True)
+
+        self.assertEqual(
+            (result.prompt, result.prompt_ids), ("<decoded>", [11, 12] * 2)
+        )
+        self.tm.tokenizer.decode.assert_called_once_with([11, 12] * 2)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
