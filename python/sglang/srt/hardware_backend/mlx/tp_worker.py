@@ -273,7 +273,7 @@ class MlxTpModelWorker(TpModelWorker):
                     vocab_mask=grammar_mask.vocab_mask.to("cpu"),
                 )
                 # Release promptly; mirrors the VRAM-leak note in the CUDA
-                # ModelRunner._preprocess_logits.
+                # SamplingPipeline.
                 sinfo.grammar_mask = None
             if sinfo.logit_bias is not None:
                 combined += sinfo.logit_bias.to("cpu")
@@ -323,7 +323,9 @@ class MlxTpModelWorker(TpModelWorker):
         sinfo = batch.sampling_info
 
         def hook(logits_np):
-            from sglang.srt.layers.sampler import apply_custom_logit_processor
+            from sglang.srt.sampling.custom_logit_processor import (
+                apply_custom_logit_processor,
+            )
 
             # torch.from_numpy shares memory with logits_np, so the
             # processors' in-place edits land in the returned array.
