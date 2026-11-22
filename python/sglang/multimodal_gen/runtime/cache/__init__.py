@@ -35,7 +35,7 @@ __all__ = [
     "set_active_calibrator",
     # Spectrum (always available)
     "SpectrumMixin",
-    # cache-dit integration (lazy-loaded, requires cache-dit package)
+    # cache-dit integration (imported eagerly, requires the cache-dit package)
     "CacheDitConfig",
     "enable_cache_on_transformer",
     "enable_cache_on_dual_transformer",

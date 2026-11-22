@@ -44,27 +44,25 @@ jobs:
               - '.github/workflows/pr-test-sgl-router.yml'
               - '.github/workflows/_pr-test-sgl-router-build.yml'
               - '.github/actions/download-sgl-router/**'
-              - 'scripts/ci/utils/build_sgl_router.sh'
               - 'scripts/ci/utils/prepare_sgl_router.sh'
               - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
 
-  # pr-gate.yml reads the labels live and fails without `run-ci`, so a
-  # rerun after the label is added (`/tag-and-rerun-ci`) picks it up.
+  # pr-gate.yml reads the labels live and skips the tests without `run-ci`,
+  # so a rerun after the label is added (`/tag-and-rerun-ci`) picks it up.
   sgl-router-gate:
     name: gate
     needs: sgl-router-changes
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
 
-  # Every job below needs the gate, so it is skipped unless the gate passes.
+  # Every job below needs the gate and skips when it skips the tests.
 
   # The release binary the e2e and k8s jobs run, built once (or restored).
   sgl-router-build:
     name: build binary
     needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.opted-in != 'false'
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
       runs_on: ubuntu-22.04
@@ -72,6 +70,7 @@ jobs:
   sgl-router-test:
     name: lint + test
     needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -209,10 +208,11 @@ jobs:
   sgl-router-e2e:
     name: e2e
     needs: [sgl-router-test, sgl-router-build]
-    runs-on: 2-gpu-h100
+    runs-on: 4-gpu-h100  # the PD dp-aware test holds a dp2 prefill and a dp2 decode
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/download-rust-ext
       - uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
@@ -235,8 +235,8 @@ jobs:
             --ignore=tests/e2e/k8s_integration
 
   # Passes when every job succeeded, or when the PR touches no sgl-router path
-  # and every job after `changes` was skipped. Anything else fails, including a
-  # gate missing `run-ci`, so `/tag-and-rerun-ci` finds a run to rerun.
+  # and every job after `changes` was skipped. Skipped with the tests when the
+  # gate skips them (a draft or no `run-ci`).
   sgl-router-finish:
     name: finish
     needs:
@@ -246,7 +246,7 @@ jobs:
       - sgl-router-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
-    if: always()
+    if: always() && needs.sgl-router-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

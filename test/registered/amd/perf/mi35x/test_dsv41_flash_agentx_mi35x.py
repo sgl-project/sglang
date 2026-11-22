@@ -5,7 +5,7 @@ Runs the point AGENTX_POINT (``tp2-c1``, ``tp2-dpa-c64``, ...) of InferenceX's
 ``sglang.test.agentx_common``. InferenceX runs this row on rocm10, as the
 nightly does.
 
-Registry: nightly-perf-8-gpu-mi35x-dsv41-flash-agentx suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-dsv41-flash-agentx suite
 """
 
 import unittest
@@ -16,7 +16,9 @@ from sglang.test.ci.ci_register import register_amd_ci
 # Register for AMD CI - one AgentX point: model load, up to an hour of warmup,
 # then InferenceX's one-hour measurement window.
 register_amd_ci(
-    est_time=10800, suite="nightly-perf-8-gpu-mi35x-dsv41-flash-agentx", nightly=True
+    est_time=10800,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-dsv41-flash-agentx",
+    nightly=True,
 )
 
 
