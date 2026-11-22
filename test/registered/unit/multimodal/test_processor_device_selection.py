@@ -8,15 +8,12 @@ device has to come from what the worker was handed.
 
 import asyncio
 import unittest
-import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import torch
 from transformers import BaseImageProcessor, PreTrainedTokenizerFast
 
-from sglang.srt.environ import envs
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
@@ -73,21 +70,6 @@ def _make_wrapper(**fields):
     wrapper = TokenSpaceSGLangProcessor.__new__(TokenSpaceSGLangProcessor)
     wrapper._server_args = _make(**fields).server_args
     return wrapper
-
-
-def _gpu_placement():
-    """Patch placement so the fast image processor picks cuda:0 on any host."""
-    return patch.multiple(
-        PLACEMENT,
-        _is_cpu=False,
-        _is_xpu=False,
-        _is_npu=False,
-        platforms=SimpleNamespace(
-            current_platform=SimpleNamespace(
-                is_cuda_alike=lambda: True, device_type="cuda"
-            )
-        ),
-    )
 
 
 class TestFastImageProcessorDevice(CustomTestCase):
@@ -419,159 +401,6 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             events,
             ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
         )
-
-
-class _ImageProcessor:
-    pass
-
-
-def _image_processor_stub(gpu_error=None, *, retry=True):
-    """A base processor whose HF call raises `gpu_error()` off the CPU, if given."""
-    calls = []
-    held = []
-
-    class Held:
-        pass
-
-    class Processor:
-        image_processor = _ImageProcessor()
-        tokenizer = SimpleNamespace(bos_token=None)
-
-        def __call__(self, **kwargs):
-            calls.append(kwargs["device"])
-            if gpu_error is not None and kwargs["device"] != "cpu":
-                # Stands in for the GPU tensors the failed attempt allocated.
-                gpu_tensors = Held()
-                held.append(weakref.ref(gpu_tensors))
-                raise gpu_error()
-            return {"input_ids": [1]}
-
-    processor = _make(base_gpu_id=0)
-    processor._feature_transport = MultimodalFeatureTransport(
-        "cpu", base_gpu_id=0, skip_mm_pool=True
-    )
-    processor.precompute_hash_before_cpu_transfer = False
-    processor._processor = Processor()
-    processor._tokenizer = processor._processor.tokenizer
-    processor._tokenizer_auto_adds_specials = False
-    processor.disable_fast_image_processor = False
-    processor.retry_on_cpu_after_gpu_oom = retry
-    processor.video_preprocessing_device = None
-    processor.image_config = {}
-    processor.video_config = {}
-    processor.audio_config = {}
-    processor.FEATURE_NAMES = ["pixel_values"]
-    return processor, calls, held
-
-
-class TestRetryOnCpuAfterGpuOom(CustomTestCase):
-    def setUp(self):
-        reset_context()
-        self.addCleanup(reset_context)
-
-    def _run(self, processor, empty_cache=None):
-        with (
-            _gpu_placement(),
-            patch(f"{BASE}.BaseImageProcessor", _ImageProcessor),
-            patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
-            patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),
-            patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
-            patch(f"{BASE}.torch.cuda.empty_cache", side_effect=empty_cache),
-        ):
-            return processor.process_mm_data("test", images=["image"])
-
-    def test_gpu_oom_retries_on_cpu(self):
-        """A CUDA OOM raised outside the caching allocator (cuBLAS, a kernel
-        launch) arrives as a RuntimeError and must take the CPU retry too."""
-        for name, error in [
-            ("allocator", lambda: torch.cuda.OutOfMemoryError("CUDA out of memory")),
-            ("cuda call", lambda: RuntimeError("CUDA error: out of memory")),
-        ]:
-            with self.subTest(name):
-                processor, calls, _ = _image_processor_stub(error)
-                result = self._run(processor)
-                self.assertEqual(calls, ["cuda:0", "cpu"])
-                self.assertEqual(result, {"input_ids": [1]})
-
-    def test_other_errors_are_not_retried(self):
-        cases = [
-            ("illegal address", RuntimeError("an illegal memory access"), True),
-            ("retry disabled", torch.cuda.OutOfMemoryError("oom"), False),
-        ]
-        for name, error, retry in cases:
-            with self.subTest(name):
-                processor, calls, _ = _image_processor_stub(lambda: error, retry=retry)
-                with self.assertRaises(RuntimeError):
-                    self._run(processor)
-                self.assertEqual(calls, ["cuda:0"])
-
-    def test_failed_attempt_is_released_before_the_cpu_retry(self):
-        """Retrying inside the except block kept the failed GPU attempt's frames
-        alive, so empty_cache freed nothing and the CPU retry ran with that GPU
-        memory still held."""
-        processor, calls, held = _image_processor_stub(
-            lambda: torch.cuda.OutOfMemoryError("oom")
-        )
-        released_at_empty_cache = []
-        self._run(
-            processor,
-            empty_cache=lambda: released_at_empty_cache.append(held[0]() is None),
-        )
-        self.assertEqual(released_at_empty_cache, [True])
-        self.assertEqual(calls, ["cuda:0", "cpu"])
-
-
-class TestFreeMemoryRouting(CustomTestCase):
-    """SGLANG_MM_GPU_PREPROCESS_RESERVE_MB sends image preprocessing straight to
-    the CPU when the shared GPU lacks headroom, instead of failing there first."""
-
-    MiB = 1024 * 1024
-
-    def setUp(self):
-        reset_context()
-        self.addCleanup(reset_context)
-
-    def _run(self, *, reserve_mb, free_mib, estimate_mib=0):
-        processor, calls, _ = _image_processor_stub(retry=False)
-        processor._estimate_gpu_preprocess_bytes = lambda images, kw: (
-            estimate_mib * self.MiB
-        )
-        with (
-            envs.SGLANG_MM_GPU_PREPROCESS_RESERVE_MB.override(reserve_mb),
-            _gpu_placement(),
-            patch(f"{BASE}.BaseImageProcessor", _ImageProcessor),
-            patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
-            patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),
-            patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
-            patch(
-                f"{PLACEMENT}.torch.cuda.mem_get_info",
-                return_value=(free_mib * self.MiB, 0),
-            ) as mem_get_info,
-            patch(f"{PLACEMENT}.torch.cuda.memory_reserved", return_value=0),
-            patch(f"{PLACEMENT}.torch.cuda.memory_allocated", return_value=0),
-        ):
-            processor.process_mm_data("test", images=["image"])
-        return calls, mem_get_info
-
-    def test_disabled_reserve_never_queries_the_gpu(self):
-        calls, mem_get_info = self._run(reserve_mb=0, free_mib=1)
-        self.assertEqual(calls, ["cuda:0"])
-        mem_get_info.assert_not_called()
-
-    def test_routes_by_free_memory_against_estimate_plus_reserve(self):
-        cases = [
-            ("below the reserve", 1024, 4096, 0, ["cpu"]),
-            ("reserve met, estimate not", 4500, 4096, 512, ["cpu"]),
-            ("estimate plus reserve met", 8192, 4096, 512, ["cuda:0"]),
-        ]
-        for name, free_mib, reserve_mb, estimate_mib, expected in cases:
-            with self.subTest(name):
-                calls, _ = self._run(
-                    reserve_mb=reserve_mb,
-                    free_mib=free_mib,
-                    estimate_mib=estimate_mib,
-                )
-                self.assertEqual(calls, expected)
 
 
 if __name__ == "__main__":

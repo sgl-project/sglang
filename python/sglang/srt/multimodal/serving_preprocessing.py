@@ -1,7 +1,5 @@
 """Where serving runs media preprocessing, and how many tokens an image takes."""
 
-import logging
-import time
 from typing import List, Optional
 
 import torch
@@ -13,59 +11,6 @@ from sglang.srt.utils import is_cpu, is_npu, is_xpu
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-
-logger = logging.getLogger(__name__)
-
-# Arbitrary; bounds the CPU-routing warning under sustained memory pressure.
-_CPU_ROUTING_LOG_INTERVAL_S = 60.0
-_last_cpu_routing_log = 0.0
-
-
-def _gpu_free_bytes(device: str) -> int:
-    free, _ = torch.cuda.mem_get_info(device)
-    # Blocks this process cached but does not use are free to it as well.
-    cached_unused = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
-        device
-    )
-    return free + cached_unused
-
-
-def route_preprocessing_by_free_memory(
-    device: Optional[str], *, estimated_bytes: int, reserve_bytes: int
-) -> Optional[str]:
-    """`device`, or "cpu" when the GPU has less free memory than the estimated
-    need plus `reserve_bytes`; a reserve of 0 or less disables the check.
-
-    The tokenizer process shares its GPU with a scheduler rank whose pools fill
-    it, so an attempt without headroom fails and is redone on CPU anyway.
-    """
-    if reserve_bytes <= 0 or device is None or torch.device(device).type != "cuda":
-        return device
-    free = _gpu_free_bytes(device)
-    if free >= estimated_bytes + reserve_bytes:
-        return device
-    global _last_cpu_routing_log
-    now = time.monotonic()
-    if now - _last_cpu_routing_log >= _CPU_ROUTING_LOG_INTERVAL_S:
-        _last_cpu_routing_log = now
-        logger.warning(
-            f"Image preprocessing runs on CPU: {device} has {free >> 20} MiB free, "
-            f"below the estimated {estimated_bytes >> 20} MiB plus the "
-            f"{reserve_bytes >> 20} MiB reserve (SGLANG_MM_GPU_PREPROCESS_RESERVE_MB). "
-            f"Logged at most every {_CPU_ROUTING_LOG_INTERVAL_S:.0f}s."
-        )
-    return "cpu"
-
-
-def is_cuda_out_of_memory(exc: BaseException) -> bool:
-    """Whether `exc` is a GPU out-of-memory error.
-
-    Matches the caching allocator's OutOfMemoryError and a RuntimeError (such
-    as torch.AcceleratorError) raised by a CUDA call that ran out of memory.
-    """
-    if isinstance(exc, torch.cuda.OutOfMemoryError):
-        return True
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 
 def preprocessing_competes_with_the_scheduler(

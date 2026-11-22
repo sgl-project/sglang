@@ -1942,12 +1942,6 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
-    # Image preprocessing in the tokenizer process goes to the CPU when the GPU
-    # has less free memory than the estimated need plus this reserve; 0 disables.
-    SGLANG_MM_GPU_PREPROCESS_RESERVE_MB = EnvInt(0)
-    # Run single-worker image preprocessing on a worker thread instead of the
-    # tokenizer's event loop, so a slow request does not block other requests.
-    SGLANG_MM_PROCESSOR_THREAD_FOR_SINGLE_WORKER = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)

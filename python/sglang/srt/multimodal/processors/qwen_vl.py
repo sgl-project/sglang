@@ -52,7 +52,6 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     smart_nframes as smart_nframes,
 )
 from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart_resize
-from sglang.srt.multimodal.serving_preprocessing import is_cuda_out_of_memory
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -668,17 +667,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
         return features, image_grid_thw
 
-    def _estimate_gpu_preprocess_bytes(self, images, image_kwargs) -> int:
-        factor, min_pixels, max_pixels = self._preprocess_cost_params(
-            self._processor, image_kwargs
-        )
-        return sum(
-            _estimate_preprocess_bytes(
-                image, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
-            )
-            for image in images
-        )
-
     def _preprocess_cost_params(self, processor, image_kwargs):
         ip = processor.image_processor
         patch = getattr(ip, "patch_size", 14)
@@ -743,12 +731,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                         processor, entries, image_kwargs, processor_device
                     )
                 return self._maybe_offload_features(features), grid
-            except RuntimeError as e:
-                if not is_cuda_out_of_memory(e):
-                    raise
+            except torch.cuda.OutOfMemoryError:
                 logger.warning("Qwen-VL image preprocessing OOM; retrying on CPU")
-            # Outside the except block, once the failed attempt's tensors are freed.
-            torch.cuda.empty_cache()
             return self._run_image_processor_on_cpu(processor, entries, image_kwargs)
 
         feature_parts, grid_parts = [], []
@@ -764,14 +748,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                         if isinstance(f, torch.Tensor):
                             f = f.cpu()
                     done = True
-                except RuntimeError as e:
-                    if not is_cuda_out_of_memory(e):
-                        raise
+                except torch.cuda.OutOfMemoryError:
                     logger.warning(
                         "Qwen-VL image preprocessing OOM on a chunk; retrying on CPU"
                     )
-                if not done:
-                    torch.cuda.empty_cache()
             if not done:
                 f, g = self._run_image_processor_on_cpu(processor, chunk, image_kwargs)
             feature_parts.append(f)
@@ -815,9 +795,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             and not self.disable_fast_image_processor
         ):
             processor_device = self._fast_image_processor_device(processor)
-            processor_device = self._preprocess_device_for_images(
-                processor_device, [entry.media for entry in entries], image_kwargs
-            )
             if processor_device is not None:
                 image_kwargs["device"] = processor_device
 

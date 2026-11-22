@@ -43,11 +43,9 @@ from sglang.srt.multimodal.processors.processor_config import MultimodalProcesso
 from sglang.srt.multimodal.serving_preprocessing import (
     apply_npu_image_preprocess_patches,
     fast_image_processor_device,
-    is_cuda_out_of_memory,
     preprocessing_competes_with_the_scheduler,
     resolve_auto_mm_processor_worker_num,
     resolve_hf_image_token_counts,
-    route_preprocessing_by_free_memory,
 )
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
@@ -274,7 +272,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
             media_url_timeout=get_mm().media_url_timeout,
             allow_local_media_files=get_mm().allow_local_media_files,
-            run_single_worker_on_thread=envs.SGLANG_MM_PROCESSOR_THREAD_FOR_SINGLE_WORKER.get(),
         )
         MultimodalProcessorMixin._initialize_processor(
             self, hf_config, _processor, processor_config=processor_config
@@ -659,22 +656,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             apply_npu_image_preprocess_patches(processor)
         return device
 
-    def _estimate_gpu_preprocess_bytes(self, images: List, image_kwargs: dict) -> int:
-        """Peak GPU bytes to preprocess `images`; 0 for a model with no estimate."""
-        return 0
-
-    def _preprocess_device_for_images(
-        self, device: Optional[str], images: List, image_kwargs: dict
-    ) -> Optional[str]:
-        reserve_mb = envs.SGLANG_MM_GPU_PREPROCESS_RESERVE_MB.get()
-        if reserve_mb <= 0:
-            return device
-        return route_preprocessing_by_free_memory(
-            device,
-            estimated_bytes=self._estimate_gpu_preprocess_bytes(images, image_kwargs),
-            reserve_bytes=reserve_mb * 1024 * 1024,
-        )
-
     def process_mm_data(
         self,
         input_text,
@@ -730,10 +711,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             and not self.disable_fast_image_processor
         ):
             processor_device = self._fast_image_processor_device(processor)
-            if images:
-                processor_device = self._preprocess_device_for_images(
-                    processor_device, images, kwargs.get("images_kwargs") or {}
-                )
             if processor_device is not None:
                 kwargs["device"] = processor_device
 
@@ -749,25 +726,19 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
         try:
             return self._call_processor(processor, input_text, processor_device, kwargs)
-        except RuntimeError as e:
-            failed_device = kwargs.get("device")
-            if (
-                not self.retry_on_cpu_after_gpu_oom
-                or failed_device in (None, "cpu")
-                or not is_cuda_out_of_memory(e)
+        except torch.cuda.OutOfMemoryError:
+            if not self.retry_on_cpu_after_gpu_oom or kwargs.get("device") in (
+                None,
+                "cpu",
             ):
                 raise
-        # Retried outside the except block: its traceback keeps the failed
-        # attempt's GPU tensors alive, which empty_cache could not release.
-        logger.warning(
-            "Multimodal preprocessing of %d image(s) ran out of GPU memory on %s; "
-            "retrying on CPU",
-            len(images) if images else 0,
-            failed_device,
-        )
-        torch.cuda.empty_cache()
-        kwargs["device"] = "cpu"
-        return self._call_processor(processor, input_text, "cpu", kwargs)
+            logger.warning(
+                "Multimodal preprocessing ran out of GPU memory on %s; retrying on CPU",
+                kwargs["device"],
+            )
+            torch.cuda.empty_cache()
+            kwargs["device"] = "cpu"
+            return self._call_processor(processor, input_text, "cpu", kwargs)
 
     def _call_processor(self, processor, input_text, processor_device, kwargs) -> dict:
         with self._temporary_fast_processor_cuda_pool(processor_device):

@@ -58,19 +58,6 @@ class TestEstimate(CustomTestCase):
             qwen_vl._PREPROCESS_GPU_BUDGET_BYTES,
         )
 
-    def test_request_estimate_sums_its_images(self):
-        """The free-memory check needs the whole request's need, which grows
-        with both the image count and the image size."""
-        proc = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
-        proc._spatial_merge_size = 2
-        proc._processor = SimpleNamespace(image_processor=SimpleNamespace(size={}))
-        small, big = Image.new("RGB", (500, 500)), Image.new("RGB", (3000, 3000))
-        one_small = proc._estimate_gpu_preprocess_bytes([small], {})
-        self.assertGreater(proc._estimate_gpu_preprocess_bytes([big], {}), one_small)
-        self.assertEqual(
-            proc._estimate_gpu_preprocess_bytes([small, small], {}), 2 * one_small
-        )
-
 
 class TestOomFallbackEnabled(CustomTestCase):
     def test_qwen_vl_retries_on_cpu_after_gpu_oom(self):
@@ -78,7 +65,7 @@ class TestOomFallbackEnabled(CustomTestCase):
 
 
 class TestChunkedRun(CustomTestCase):
-    def _make(self, fail_on_gpu=False, gpu_error=None):
+    def _make(self, fail_on_gpu=False):
         proc = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         proc._spatial_merge_size = 2
         proc.mm_preprocess_cache = SimpleNamespace(enabled=True)
@@ -88,13 +75,11 @@ class TestChunkedRun(CustomTestCase):
             "contextlib"
         ).nullcontext()
         calls = []
-        if fail_on_gpu and gpu_error is None:
-            gpu_error = lambda: torch.cuda.OutOfMemoryError("oom")  # noqa: E731
 
         def fake_run(processor, entries, kwargs, device):
             calls.append((len(entries), device))
-            if gpu_error is not None and device != "cpu":
-                raise gpu_error()
+            if fail_on_gpu and device != "cpu":
+                raise torch.cuda.OutOfMemoryError("oom")
             n = len(entries)
             return torch.arange(n, dtype=torch.float32).repeat_interleave(4).view(
                 -1, 1
@@ -144,43 +129,6 @@ class TestChunkedRun(CustomTestCase):
         )
         self.assertEqual([d for _, d in calls], ["cuda:0", "cpu"])
         self.assertEqual(g.shape, (2, 3))
-
-    def test_cuda_call_oom_falls_back_to_cpu_per_chunk(self):
-        """An OOM from a CUDA call, not the allocator, is a RuntimeError; both
-        the single-call and the per-chunk path must fall back on it."""
-        per = qwen_vl._estimate_preprocess_bytes(
-            Image.new("RGB", (64, 64)),
-            factor=28,
-            min_pixels=4 * 28 * 28,
-            max_pixels=qwen_vl.MAX_PIXELS,
-        )
-        error = lambda: RuntimeError("CUDA error: out of memory")  # noqa: E731
-        for name, budget, expected in [
-            ("single call", None, ["cuda:0", "cpu"]),
-            ("per chunk", per * 2, ["cuda:0", "cpu", "cuda:0", "cpu"]),
-        ]:
-            with self.subTest(name):
-                proc, calls = self._make(gpu_error=error)
-                with patch.object(
-                    qwen_vl,
-                    "_PREPROCESS_GPU_BUDGET_BYTES",
-                    budget or qwen_vl._PREPROCESS_GPU_BUDGET_BYTES,
-                ):
-                    f, g = proc._run_image_processor_chunked(
-                        self._processor(), self._entries(4), {}, "cuda:0"
-                    )
-                self.assertEqual([d for _, d in calls], expected)
-                self.assertEqual(g.shape, (4, 3))
-
-    def test_non_oom_cuda_error_is_raised(self):
-        proc, calls = self._make(
-            gpu_error=lambda: RuntimeError("an illegal memory access")
-        )
-        with self.assertRaises(RuntimeError):
-            proc._run_image_processor_chunked(
-                self._processor(), self._entries(2), {}, "cuda:0"
-            )
-        self.assertEqual([d for _, d in calls], ["cuda:0"])
 
 
 if __name__ == "__main__":
