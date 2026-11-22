@@ -241,6 +241,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 struct.pack("Q", 16),
                 b"1",
                 b"0",
+                b"0",
             ],
             "nixl": [
                 b"NixlMsgGuard",
