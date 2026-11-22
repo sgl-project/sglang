@@ -68,9 +68,8 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     8,
     "--ep-size",
     8,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--mem-fraction-static",
     0.88,
     "--attention-backend",
@@ -101,7 +100,8 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--moe-ascend-ops-config",
     '{"prefill": "alltoallv", "decode": "low_latency"}',
     "--disable-shared-experts-fusion",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--dtype",
     "bfloat16",
     "--enable-dp-lm-head",
@@ -123,16 +123,17 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--hicache-size",
     80,
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    16,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    50,
+    # EPLB is disabled for now: the community build rejects EPLB when pp-size > 1,
+    # and the prefill side runs pp-size=4. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 16,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 50,
 ]
 
 GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
@@ -142,9 +143,8 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     2,
     "--tp-size",
     32,
-    "--dp-size",
+    "--attn-dp-size",
     8,
-    "--enable-dp-attention",
     "--dcp-size",
     4,
     "--ep-size",
@@ -194,16 +194,17 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    32,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    1000,
+    # EPLB is disabled for now, matching the prefill side: the community build
+    # rejects EPLB when pp-size > 1. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 32,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 1000,
 ]
 
 GLM_5_3_DCP_PD_SEP_MODEL_CONFIG = {
@@ -223,12 +224,12 @@ GLM_5_3_DCP_PD_SEP_MODEL_CONFIG = {
 }
 
 
-# DCP variant with EPLB
+# DCP variant (EPLB currently disabled, see the commented blocks above)
 # 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4,
-# EPLB enabled on both P and D with GLM-5.3-w8a8
+# GLM-5.3-w8a8
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP and EPLB on gpqa_diamond"""
+    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
 
     model_config = GLM_5_3_DCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
@@ -254,7 +255,7 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
     }
 
     def test_npu_glm_5_3_w8a8_1p1d_dcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP and EPLB on gpqa_diamond"""
+        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
         self.run_accuracy()
 
 
