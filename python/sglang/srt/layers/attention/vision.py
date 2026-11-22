@@ -51,6 +51,7 @@ _is_xpu = is_xpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
 
     # Resolved on first call: CUDA builds without FlashInfer must still import
     # this module.
@@ -232,6 +233,28 @@ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Ten
         device=device,
     )
     return cu_seqlens
+
+
+def _padded_batch_layout(
+    cu_seqlens: torch.Tensor, bsz: int, seq_len: int, device: torch.device
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Describe a padded batch to a varlen kernel.
+
+    Contract: q/k/v are a ``[bsz, seq_len]`` batch flattened to
+    ``bsz * seq_len`` rows; image ``b`` occupies the first ``n_b <= seq_len``
+    rows of its ``seq_len`` block, and ``cu_seqlens`` is the packed cumsum of
+    the ``n_b``. Idefics2 (MiniCPM-V/o) sends batches this way. Read as packed
+    rows, every image after a padded one attends over the wrong rows and the
+    last real rows are never written.
+
+    Returns ``(padded_cu_seqlens, seq_lens)``: each image's offset in the padded
+    rows and its real length, both int32 on the device and without a host sync.
+    Returns None for packed batches (``bsz == 1``).
+    """
+    if bsz <= 1 or cu_seqlens.numel() != bsz + 1:
+        return None
+    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device=device, dtype=torch.int32)
+    return _get_cu_seqlens_for_shape(bsz, seq_len, device=device), seq_lens
 
 
 def resolve_seqlens(
@@ -535,11 +558,13 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        padded = None
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             seq_lens = forward_metadata.seq_lens
             max_seqlen = forward_metadata.max_seqlen
-            output = torch.empty_like(q)
+            padded = _padded_batch_layout(cu_seqlens_gpu, bsz, seq_len, q.device)
+            output = None
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
@@ -553,13 +578,25 @@ class VisionTritonAttention(nn.Module):
             max_seqlen = cu_seqlens[2]
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
-            seq_lens = kwargs.get("sequence_lengths")
-            if seq_lens is None:
-                seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
-            max_seqlen = resolve_precomputed_max_seqlen(
-                cu_seqlens_gpu, kwargs.get("max_seqlen")
-            )
+            if cu_seqlens is not None:
+                padded = _padded_batch_layout(cu_seqlens_gpu, bsz, seq_len, q.device)
+            if padded is None:
+                seq_lens = kwargs.get("sequence_lengths")
+                if seq_lens is None:
+                    seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
+                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+                max_seqlen = resolve_precomputed_max_seqlen(
+                    cu_seqlens_gpu, kwargs.get("max_seqlen")
+                )
+            output = None
+
+        if padded is not None:
+            # Each image starts at its padded offset and runs for its real
+            # length; the kernel skips the padding rows, so they stay zero.
+            cu_seqlens_gpu, seq_lens = padded
+            max_seqlen = seq_len
+            output = torch.zeros_like(q)
+        elif output is None:
             # [b * s, head, head_size]
             output = torch.empty_like(q)
 
@@ -608,9 +645,11 @@ class VisionFlash3Attention(nn.Module):
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
 
+        padded = None
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
+            padded = _padded_batch_layout(cu_seqlens_gpu, bsz, seq_len, q.device)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if not isinstance(cu_seqlens, list):
                 raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
@@ -619,21 +658,61 @@ class VisionFlash3Attention(nn.Module):
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
-            max_seqlen = resolve_precomputed_max_seqlen(
-                cu_seqlens_gpu, kwargs.get("max_seqlen")
-            )
+            if cu_seqlens is not None:
+                padded = _padded_batch_layout(cu_seqlens_gpu, bsz, seq_len, q.device)
+            if padded is None:
+                max_seqlen = resolve_precomputed_max_seqlen(
+                    cu_seqlens_gpu, kwargs.get("max_seqlen")
+                )
 
         fa_kwargs = dict(
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+        )
+        if padded is not None:
+            # Padded offsets plus the real lengths in seqused_q/k: the kernel
+            # skips the padding rows and leaves `out` untouched there.
+            cu_seqlens_gpu, seq_lens = padded
+            max_seqlen = seq_len
+            if _is_cuda and not _is_fa3_supported():
+                # The FA2 fallback ignores seqused_q/k and out; the Triton
+                # kernel reads the padded layout directly.
+                if tuple(window_size) != (-1, -1) or s_aux is not None:
+                    raise NotImplementedError(
+                        "Padded vision batches with window_size or sinks need "
+                        "the FA3 kernel, which is not available on this device."
+                    )
+                output = torch.zeros_like(q)
+                context_attention_fwd(
+                    q,
+                    k,
+                    v,
+                    output,
+                    cu_seqlens_gpu,
+                    seq_lens,
+                    seq_len,
+                    is_causal=False,
+                    sm_scale=softmax_scale,
+                )
+                return output
+            fa_kwargs.update(
+                seqused_q=seq_lens, seqused_k=seq_lens, out=torch.zeros_like(q)
+            )
+        fa_kwargs.update(
             cu_seqlens_q=cu_seqlens_gpu,
             cu_seqlens_k=cu_seqlens_gpu,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            softmax_scale=softmax_scale,
-            window_size=window_size,
         )
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
         output = flash_attn_func(q, k, v, **fa_kwargs)
+
+        if padded is not None and output.data_ptr() != fa_kwargs["out"].data_ptr():
+            # A kernel without `out` allocated its own output, whose padding
+            # rows were never written.
+            pad = torch.arange(seq_len, device=q.device) >= seq_lens.unsqueeze(1)
+            output.unflatten(0, (bsz, seq_len)).masked_fill_(pad[:, :, None, None], 0)
 
         return output
 
