@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -30,8 +31,9 @@ import msgspec
 
 logger = logging.getLogger(__name__)
 
-# A healthy GPU of one model differs from the mean by a few percent under power and
-# clock limits; a factor outside this range means it was disturbed during the burn.
+# Speed factors relative to the median stage. Fitted per-GPU factors of one model
+# spanned 0.956 to 1.069 over three node pairs; these bounds allow about three times
+# that, symmetric in ratio (0.8 = 1 / 1.25), and a GPU beyond them was disturbed.
 _FACTOR_BOUNDS = (0.8, 1.25)
 
 
@@ -90,16 +92,23 @@ class PPPartitionCostModel(
                     f"of this model {sorted(kinds)}"
                 )
             _check_values(name, table.values(), minimum=0.0)
-        # Stage extras are fitted intercepts and may be negative.
+        _check_values("layer_cost", self.layer_cost.values(), minimum=math.ulp(0.0))
+        # Stage extras are fitted intercepts and may be negative; a split whose stage
+        # cost is not positive is infeasible (_Search.feasible).
         _check_values(
-            "first/last stage extras",
-            (
-                self.first_stage_cost,
-                self.last_stage_cost,
-                self.first_stage_weight_bytes,
-                self.last_stage_weight_bytes,
-            ),
+            "first/last stage costs",
+            (self.first_stage_cost, self.last_stage_cost),
             minimum=-math.inf,
+        )
+        # Even a one-layer stage cannot hold negative weight bytes.
+        least_weight = min(self.layer_weight_bytes.get(k, 0.0) for k in kinds)
+        _check_values(
+            "first/last stage weight bytes plus the least layer weight",
+            (
+                self.first_stage_weight_bytes + least_weight,
+                self.last_stage_weight_bytes + least_weight,
+            ),
+            minimum=0.0,
         )
         _check_values(
             "proxy and headroom fields",
@@ -229,6 +238,9 @@ class _Search:
     def feasible(self, s: int, start: int, n: int, kv_floor: float) -> bool:
         if any(count[start + n] == count[start] for count in self._required):
             return False
+        # A negative first/last-stage intercept fits stages of many layers only.
+        if self.cost(s, start, n) <= 0:
+            return False
         if self.headroom(s, start, n) < 0:
             return False
         return kv_floor <= 0 or self.kv_capacity(s, start, n) >= kv_floor
@@ -331,7 +343,6 @@ class _RankRow(msgspec.Struct, frozen=True):
 
     pp_rank: int
     speed: float
-    free_bytes: float
     burn_peak_bytes: int
     error: str
 
@@ -350,11 +361,12 @@ def _gather_or_raise(
 def _speed_factors(
     stage_speed: Sequence[float], scale: float
 ) -> Tuple[List[float], List[int]]:
-    """Per-stage factors around 1 (higher = slower), clamped to _FACTOR_BOUNDS; also
-    returns the stages that were clamped."""
-    mean = sum(stage_speed) / len(stage_speed)
+    """Per-stage factors around the median stage (higher = slower), clamped to
+    _FACTOR_BOUNDS; also returns the stages that were clamped. The median keeps an
+    outlier from shifting the healthy stages, which would loosen its own bound."""
+    median = statistics.median(stage_speed)
     low, high = _FACTOR_BOUNDS
-    raw = [1.0 + scale * (v / mean - 1.0) for v in stage_speed]
+    raw = [1.0 + scale * (v / median - 1.0) for v in stage_speed]
     factors = [min(max(f, low), high) for f in raw]
     clamped = [s for s, (f, g) in enumerate(zip(raw, factors)) if f != g]
     if clamped:
@@ -374,11 +386,11 @@ def resolve(
     pp_size: int,
     all_gather: Callable[[object], List[object]],
     measure: Callable[[], Tuple[float, int]],
-    free_bytes: float,
+    pre_model_load_bytes: float,
     mem_fraction_static: float,
     m: PPPartitionCostModel,
     proxy_tokens: int,
-    fixed_speed: Sequence[float] = (),
+    fixed_speed: Sequence[str] = (),
     burn_scale: float = 1.0,
 ) -> Tuple[Tuple[int, ...], dict]:
     """Collective over the world group: every rank measures (or takes its fixed
@@ -387,24 +399,25 @@ def resolve(
     still joins the gather, and then every rank raises its error."""
     try:
         if fixed_speed:
-            if len(fixed_speed) != pp_size or not all(
-                v > 0 and math.isfinite(v) for v in fixed_speed
+            factors = [float(v) for v in fixed_speed]
+            if len(factors) != pp_size or not all(
+                v > 0 and math.isfinite(v) for v in factors
             ):
                 raise ValueError(
                     f"SGLANG_PP_PARTITION_AUTO_SPEED needs {pp_size} positive "
                     f"factors, got {list(fixed_speed)}"
                 )
-            speed, peak = float(fixed_speed[pp_rank]), 0
+            speed, peak = factors[pp_rank], 0
         else:
             speed, peak = measure()
-        row = _RankRow(pp_rank, speed, free_bytes, peak, "")
+        row = _RankRow(pp_rank, speed, peak, "")
     except Exception as exc:  # The other ranks are already headed for the gather.
-        row = _RankRow(pp_rank, math.nan, free_bytes, 0, repr(exc))
+        row = _RankRow(pp_rank, math.nan, 0, repr(exc))
     rows = _gather_or_raise(all_gather, row)
     stage_speed = [max(r.speed for r in rows if r.pp_rank == s) for s in range(pp_size)]
-    # The static pools are sized from the world's least free memory before the load:
-    # static = free x mem_fraction_static, the rest is slack (kv_cache_configurator).
-    free = min(r.free_bytes for r in rows)
+    # As kv_cache_configurator sizes the pools: the world's least free memory before
+    # the load, split into static (x mem_fraction_static) and slack (the rest).
+    free = pre_model_load_bytes
     memory = StageMemory(
         static_bytes=(free * mem_fraction_static,) * pp_size,
         free_bytes=(free * (1.0 - mem_fraction_static),) * pp_size,
@@ -490,11 +503,16 @@ def _load_cost_model(
 
 
 def maybe_apply(
-    *, model_config, is_draft_worker: bool, mem_fraction_static: float
+    *,
+    model_config,
+    is_draft_worker: bool,
+    mem_fraction_static: float,
+    pre_model_load_memory: float,
 ) -> None:
     """SGLANG_ENABLE_PP_PARTITION_AUTO: choose the split before the target model's
     weights load and set SGLANG_PP_LAYER_PARTITION in this process (every rank sets
-    the same value). A collective over the world group."""
+    the same value). A collective over the world group. pre_model_load_memory is the
+    runner's world-minimum free memory before the load, in GiB."""
     import torch
 
     from sglang.srt.distributed.parallel_state import get_world_group
@@ -531,13 +549,12 @@ def maybe_apply(
         preflight_error=preflight,
         all_gather=gather,
     )
-    # The model runner has already set this rank's device.
-    device = torch.device("cuda", torch.cuda.current_device())
     burn_s = envs.SGLANG_PP_PARTITION_AUTO_BURN_S.get()
 
     def measure():
-        # Every GPU burns at the same time.
+        # Every GPU burns at the same time; the runner has already set this rank's device.
         torch.distributed.barrier(group=world.cpu_group)
+        device = torch.device("cuda", torch.cuda.current_device())
         return burn_unit_ms(burn_s, device, model_config.hidden_size)
 
     proxy_tokens = m.proxy_tokens
@@ -550,11 +567,11 @@ def maybe_apply(
         pp_size=par.pp_size,
         all_gather=gather,
         measure=measure,
-        free_bytes=torch.cuda.mem_get_info(device)[0],
+        pre_model_load_bytes=pre_model_load_memory * (1 << 30),
         mem_fraction_static=mem_fraction_static,
         m=m,
         proxy_tokens=proxy_tokens,
-        fixed_speed=[float(x) for x in envs.SGLANG_PP_PARTITION_AUTO_SPEED.get()],
+        fixed_speed=envs.SGLANG_PP_PARTITION_AUTO_SPEED.get(),
         burn_scale=envs.SGLANG_PP_PARTITION_AUTO_BURN_SCALE.get(),
     )
     # Process-wide, like a user-set split; draft workers run in a singleton PP group,

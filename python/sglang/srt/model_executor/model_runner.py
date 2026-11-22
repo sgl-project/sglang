@@ -757,6 +757,7 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             mem_fraction_static=self.mem_fraction_static,
+            pre_model_load_memory=self.pre_model_load_memory,
         )
         self.load_model()
         if self.model_config.is_layer_types_hybrid_swa:

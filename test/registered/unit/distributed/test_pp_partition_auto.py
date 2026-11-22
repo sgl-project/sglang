@@ -155,6 +155,8 @@ class TestCostModel(CustomTestCase):
             "negative layer cost": b'{"layer_cost": {"full_attention": -1.0}}',
             "proxy table length": b'{"proxy_bytes_per_token": [1.0, 2.0]}',
             "kv floor": b'{"kv_floor": 1.5}',
+            "zero layer cost": b'{"layer_cost": {"full_attention": 0.0}}',
+            "negative weight extra": b'{"first_stage_weight_bytes": -1.0}',
         }
         for name, data in bad.items():
             with (
@@ -162,13 +164,20 @@ class TestCostModel(CustomTestCase):
                 self.assertRaises((msgspec.ValidationError, ValueError)),
             ):
                 ppa.PPPartitionCostModel.from_json(data, HYBRID)
-        # Stage extras are fitted intercepts and may be negative.
-        m = ppa.PPPartitionCostModel.from_json(b'{"last_stage_cost": -3.0}', HYBRID)
-        self.assertEqual(m.last_stage_cost, -3.0)
+        # A fitted negative intercept is accepted, but no split may give a stage a
+        # non-positive cost, which the sum of squares would count as positive.
+        m = ppa.PPPartitionCostModel.from_json(b'{"last_stage_cost": -3.5}', HYBRID)
+        search = ppa._Search(HYBRID, m, 4, None, 0)
+        self.assertFalse(search.feasible(3, 45, 3, 0.0))
+        part, _ = ppa.best_partition(HYBRID, [1.0, 1.0, 1.0, 0.5], m)
+        starts = [sum(part[:s]) for s in range(4)]
+        self.assertTrue(
+            all(search.cost(s, starts[s], n) > 0 for s, n in enumerate(part))
+        )
 
 
 def _row(pp_rank, speed, error=""):
-    return ppa._RankRow(pp_rank, speed, 100e9, 0, error)
+    return ppa._RankRow(pp_rank, speed, 0, error)
 
 
 class TestResolve(CustomTestCase):
@@ -179,7 +188,7 @@ class TestResolve(CustomTestCase):
             pp_size=4,
             all_gather=lambda row: rows,
             measure=lambda: (1.0, 0),
-            free_bytes=100e9,
+            pre_model_load_bytes=100e9,
             mem_fraction_static=0.8,
             m=HYBRID_COST,
             proxy_tokens=8192,
@@ -192,9 +201,7 @@ class TestResolve(CustomTestCase):
         rows = [_row(s, 1.0) for s in range(4)] + [_row(2, 1.08)]
         rows += [_row(s, 1.0) for s in (0, 1, 3)]
         part, report = self._resolve(rows)
-        expected, _ = ppa.best_partition(
-            HYBRID, [1.0 + (v / 1.02 - 1.0) for v in (1.0, 1.0, 1.08, 1.0)], HYBRID_COST
-        )
+        expected, _ = ppa.best_partition(HYBRID, [1.0, 1.0, 1.08, 1.0], HYBRID_COST)
         self.assertEqual(part, expected)
         self.assertEqual(report["split"], list(part))
         self.assertEqual(len(report["rank_speed"]), 8)
@@ -215,16 +222,21 @@ class TestResolve(CustomTestCase):
         rows = [_row(s, 1.0) for s in (1, 2, 3)] + [_row(0, 0.0, "boom")]
         with self.assertRaisesRegex(RuntimeError, "rank 3: boom"):
             self._resolve(rows)
-        with self.assertRaisesRegex(RuntimeError, "needs 4 positive factors"):
-            self._resolve(None, all_gather=lambda row: [row], fixed_speed=[1.0, 2.0])
+        for speed in (("1.0", "2.0"), ("1.0", "x", "1.0", "1.0")):
+            with self.assertRaisesRegex(RuntimeError, "rank 0: .*"):
+                self._resolve(None, all_gather=lambda row: [row], fixed_speed=speed)
 
-    def test_an_outlier_factor_is_clamped(self):
-        # Stage 0's GPU was disturbed during the burn: 1.39 x the mean before clamping.
+    def test_an_outlier_is_clamped_against_the_healthy_stages(self):
+        """Factors are taken against the median stage, so a disturbed GPU neither
+        shifts the healthy stages nor loosens its own bound."""
         rows = [_row(0, 1.6)] + [_row(s, 1.0) for s in (1, 2, 3)]
         part, report = self._resolve(rows)
         self.assertEqual(report["clamped_stages"], [0])
-        self.assertEqual(report["factors"][0], ppa._FACTOR_BOUNDS[1])
-        self.assertGreaterEqual(part[0], 9)
+        self.assertEqual(report["factors"], [ppa._FACTOR_BOUNDS[1], 1.0, 1.0, 1.0])
+        expected, _ = ppa.best_partition(
+            HYBRID, [ppa._FACTOR_BOUNDS[1], 1.0, 1.0, 1.0], HYBRID_COST
+        )
+        self.assertEqual(part, expected)
 
 
 class TestMaybeApply(CustomTestCase):
@@ -258,8 +270,6 @@ class TestMaybeApply(CustomTestCase):
                     SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=None),
                 ),
                 ("torch.cuda.is_available", True),
-                ("torch.cuda.current_device", 0),
-                ("torch.cuda.mem_get_info", (80e9, 100e9)),
             ):
                 stack.enter_context(patch(target, return_value=value))
             stack.enter_context(
@@ -269,6 +279,7 @@ class TestMaybeApply(CustomTestCase):
                 model_config=self.CONFIG,
                 is_draft_worker=False,
                 mem_fraction_static=0.8,
+                pre_model_load_memory=80.0,
             )
             return envs.SGLANG_PP_LAYER_PARTITION.get(), get_pp_indices(8, 0, 2)
 
@@ -302,6 +313,7 @@ class TestMaybeApply(CustomTestCase):
                 model_config=self.CONFIG,
                 is_draft_worker=False,
                 mem_fraction_static=0.8,
+                pre_model_load_memory=80.0,
             )
             self.assertIsNone(envs.SGLANG_PP_LAYER_PARTITION.get())
 
