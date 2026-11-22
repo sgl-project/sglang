@@ -1,7 +1,7 @@
 """AITER gfx950 MXFP4 GEMMs for Kimi-K3 latent projections.
 
-available() bounds them to gfx950 with AITER's MXFP4 ops; pack() and run() raise
-ValueError on inputs outside their contract.
+available() bounds them to gfx950 with AITER's MXFP4 ops;
+pack() and run() raise ValueError on inputs outside their contract.
 """
 
 from __future__ import annotations

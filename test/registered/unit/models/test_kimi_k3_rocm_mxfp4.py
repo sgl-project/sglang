@@ -129,8 +129,9 @@ def _expected(moe, x, *, use_mxfp4: bool) -> torch.Tensor:
     return F.linear(routed, up) + moe.shared_experts(x)
 
 
+# Raised where a batch enters the BF16 gfx950 fused path.
 class _Gfx950Tail(Exception):
-    """Raised where a batch enters the BF16 gfx950 fused path."""
+    pass
 
 
 class TestLatentMXFP4Runtime(CustomTestCase):
@@ -334,8 +335,8 @@ class TestLatentMXFP4Runtime(CustomTestCase):
                             build_latent_mxfp4_projections(**case)
 
     def test_gemm_is_available_on_gfx950_only(self):
-        """gemm_a4w4's FP4 path is built for gfx950; other HIP targets must
-        report it unavailable so the flag raises instead of launching it."""
+        """gemm_a4w4's FP4 path is built for gfx950;
+        other HIP targets must report it unavailable so the flag raises instead of launching it."""
         for gcn_arch, expected in (
             ("gfx950", True),
             ("gfx942", False),
