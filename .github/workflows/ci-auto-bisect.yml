@@ -90,21 +90,3 @@ jobs:
           name: ci-auto-bisect-${{ github.run_number }}
           path: scripts/ci_monitor/bisect_results.json
           retention-days: 14
-
-      # Skips with a warning until the XPU_CI_TEAMS_WEBHOOK secret is configured.
-      - name: Notify Teams on XPU scheduled failure
-        if: >-
-          always() &&
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.name == 'PR Test (XPU)' &&
-          github.event.workflow_run.conclusion == 'failure'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          TEAMS_WEBHOOK: ${{ secrets.XPU_CI_TEAMS_WEBHOOK }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_NAME: ${{ github.event.workflow_run.name }}
-        run: |
-          python scripts/ci_monitor/teams_notify.py \
-            --run-id "$RUN_ID" \
-            --workflow-name "$RUN_NAME" \
-            --bisect-json scripts/ci_monitor/bisect_results.json
