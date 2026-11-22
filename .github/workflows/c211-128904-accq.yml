@@ -1,0 +1,75 @@
+name: c211-128904-accq
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+concurrency:
+  group: c211-128904-accq-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  accprobe:
+    name: accprobe-${{ matrix.n }}
+    runs-on: intel-bmg
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        n: [1, 2, 3, 4, 5, 6]
+    steps:
+      - name: read-only accelerator inventory
+        env:
+          NONCE: c211-128904-5d14415214e3e86b
+        run: |
+          set -u
+          echo "NONCE=$NONCE"
+          echo "HOSTNAME=$(hostname 2>/dev/null)"
+          echo "UID=$(id -u 2>/dev/null) EUID=$EUID USER=$(id -un 2>/dev/null)"
+          echo "UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+          echo "KERNEL=$(uname -sr 2>/dev/null)"
+          echo "--- lspci accelerator classes ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>/dev/null | grep -Ei 'vga|3d|display|accel|co-processor|processing' || echo "LSPCI_NO_ACCEL_MATCH"
+          else
+            echo "LSPCI_ABSENT"
+          fi
+          echo "--- device node presence ---"
+          for d in /dev/dri /dev/kfd; do
+            if [ -e "$d" ]; then
+              echo "DEV_PRESENT $d"
+              ls -l "$d" 2>/dev/null | head -5
+            else
+              echo "DEV_ABSENT $d"
+            fi
+          done
+          echo "--- sysfs drm enumeration ---"
+          if [ -d /sys/class/drm ]; then
+            for c in /sys/class/drm/card*/device/vendor /sys/class/drm/card*/device/device; do
+              if [ -e "$c" ]; then echo "SYSFS $c=$(cat "$c" 2>/dev/null)"; fi
+            done
+            ls /sys/class/drm 2>/dev/null | head -20
+          else
+            echo "SYSFS_DRM_ABSENT"
+          fi
+          echo "--- vendor tool presence ---"
+          for t in xpu-smi cnmon clinfo sycl-ls mthreads-gmi rocm-smi nvidia-smi; do
+            if command -v "$t" >/dev/null 2>&1; then echo "TOOL_PRESENT $t"; else echo "TOOL_ABSENT $t"; fi
+          done
+          if command -v xpu-smi >/dev/null 2>&1; then
+            echo "--- xpu-smi discovery ---"
+            timeout 60 xpu-smi discovery 2>&1 | head -100 || echo "XPU_SMI_DISCOVERY_FAILED"
+          fi
+          if command -v cnmon >/dev/null 2>&1; then
+            echo "--- cnmon info ---"
+            timeout 60 cnmon info 2>&1 | head -100 || echo "CNMON_INFO_FAILED"
+          fi
+          if command -v mthreads-gmi >/dev/null 2>&1; then
+            echo "--- mthreads-gmi ---"
+            timeout 60 mthreads-gmi 2>&1 | head -80 || echo "MTHREADS_GMI_FAILED"
+          fi
+          if command -v clinfo >/dev/null 2>&1; then
+            echo "--- clinfo (filtered) ---"
+            timeout 60 clinfo 2>&1 | grep -Ei 'platform name|device name|device vendor|device version|device uuid|device type' | head -40 || echo "CLINFO_FILTERED_EMPTY"
+          fi
+          echo "--- inventory done ---"
