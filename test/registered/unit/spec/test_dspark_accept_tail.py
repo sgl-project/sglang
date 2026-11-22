@@ -10,6 +10,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+from sglang.srt.speculative.target_verify import VerifyRoute
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -94,6 +95,7 @@ class TestAcceptTailParity(CustomTestCase):
                 greedy_draft=True,
             ),
             sampling_info=None,
+            route=VerifyRoute.derive(None, has_grammar=False),
             draft_input=None,
             layout=None
             if verify_lens is None

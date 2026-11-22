@@ -146,7 +146,15 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             out_cache_loc=None,
             has_grammar=False,
             return_logprob=False,
-            sampling_info=SimpleNamespace(step_penalties=None),
+            sampling_info=SimpleNamespace(
+                step_penalties=None,
+                logit_bias=None,
+                has_custom_logit_processor=False,
+                watermark=None,
+                need_top_k_sampling=False,
+                need_top_p_sampling=False,
+                need_min_p_sampling=False,
+            ),
         )
         tokens = torch.tensor([1])
         post = (tokens, tokens, tokens, tokens, tokens, None)

@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.watermarking.interface import VerifyWatermark
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.target_verify import VerifyRoute
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -373,6 +375,8 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    *,
+    route: VerifyRoute,
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
@@ -465,6 +469,7 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
         iteration_ids=verify_input.iteration_ids,
+        verify_route=route,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -738,12 +743,14 @@ def _sharded_sampling_applies(
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
             info,
-            # Not adjusts_logits: info may be the provider's VerifySamplingView.
+            # Not VerifyRoute: the provider path hands eagle_sample only its
+            # VerifySamplingView, so this reads the adjustments sampling applies.
             adjusts_logits=grammar_mask is not None
             or watermark
             or custom_logit_processor
             or info.step_penalties is not None
             or info.logit_bias is not None,
+            need_truncated_sampling=need_truncated_sampling(info),
             return_logprob=batch.return_logprob,
             has_local_keys=has_local_keys,
         )

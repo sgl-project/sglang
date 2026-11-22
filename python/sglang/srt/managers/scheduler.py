@@ -5600,6 +5600,7 @@ class Scheduler(
                         from sglang.srt.speculative.eagle_utils import (
                             eagle_prepare_for_verify,
                         )
+                        from sglang.srt.speculative.target_verify import VerifyRoute
 
                         # Isolation is load-bearing: eagle_prepare_for_verify
                         # mutates SB fields (forward_mode -> TARGET_VERIFY,
@@ -5613,6 +5614,10 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
+                                    route=VerifyRoute.derive(
+                                        batch.sampling_info,
+                                        has_grammar=batch.has_grammar,
+                                    ),
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(

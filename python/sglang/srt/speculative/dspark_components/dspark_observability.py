@@ -23,9 +23,7 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
     create_block_accept_estimate_recorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
-from sglang.srt.speculative.dspark_components.dspark_verify import (
-    verify_logits_adjustments_are_noop,
-)
+from sglang.srt.speculative.target_verify import VerifyRoute
 
 logger = logging.getLogger(__name__)
 
@@ -832,7 +830,7 @@ class DsparkStepObservers:
         draft_tokens: torch.Tensor,
         draft_block,
         sampling_info,
-        has_grammar: bool,
+        route: VerifyRoute,
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         bonus: torch.Tensor,
@@ -883,9 +881,7 @@ class DsparkStepObservers:
                     if sampling_info is not None
                     else None
                 ),
-                logits_adjustments_are_noop=verify_logits_adjustments_are_noop(
-                    sampling_info, has_grammar=has_grammar
-                ),
+                logits_adjustments_are_noop=not route.adjusts_logits,
                 correct_len=correct_len,
                 cap_trim_lens=cap_trim_lens,
                 bonus=bonus,

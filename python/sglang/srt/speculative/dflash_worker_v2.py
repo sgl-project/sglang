@@ -66,7 +66,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -150,7 +150,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     simulated_acc_len_generator,
 )
-from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
+from sglang.srt.speculative.target_verify import (
+    TargetVerify,
+    VerifyRoute,
+    adjust_verify_logits,
+)
 from sglang.srt.utils import (
     async_h2d,
     is_cuda,
@@ -909,17 +913,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         processors[0].defer_verify_gather = True
         return processors[0]
 
-    def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
+    def _can_skip_verify_logits(
+        self, batch: ScheduleBatch, *, sampling_info, route: VerifyRoute
+    ) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.return_logprob:
+        if batch.return_logprob or route.adjusts_logits:
             return False
         if sampling_info is None:
-            return not batch.has_grammar and self._selector_sample is None
-        if (
-            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
-            # A sampling mask is captured from the full target distribution.
-            or sampling_info.sampling_mask_batch_indices is not None
-        ):
+            return self._selector_sample is None
+        # A sampling mask is captured from the full target distribution.
+        if sampling_info.sampling_mask_batch_indices is not None:
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -3560,6 +3563,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
+        route = VerifyRoute.derive(sampling_info, has_grammar=batch.has_grammar)
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
@@ -3638,7 +3642,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
-            if self._can_skip_verify_logits(batch, sampling_info):
+            if self._can_skip_verify_logits(
+                batch, sampling_info=sampling_info, route=route
+            ):
                 target_predict = target_lp.deferred_argmax(
                     logits_output.next_token_logits
                 )

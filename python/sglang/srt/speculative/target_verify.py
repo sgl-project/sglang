@@ -8,6 +8,10 @@ import msgspec
 
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.sampling.sampling_batch_info import (
+    adjusts_logits,
+    need_truncated_sampling,
+)
 from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
 
@@ -59,6 +63,26 @@ def adjust_verify_logits(
         )
     if custom_logit_processor:
         apply_custom_logit_processor(logits, sampling_info, num_tokens_in_batch=width)
+
+
+class VerifyRoute(msgspec.Struct, frozen=True):
+    """The sampling facts that pick a target verify's fast paths, derived once per
+    verify step before the target forward launches."""
+
+    adjusts_logits: bool
+    need_truncated_sampling: bool
+
+    @classmethod
+    def derive(
+        cls, info: Optional[SamplingBatchInfo], *, has_grammar: bool
+    ) -> VerifyRoute:
+        # Without sampling info, only a grammar edits the logits.
+        if info is None:
+            return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
+        return cls(
+            adjusts_logits=adjusts_logits(info, has_grammar=has_grammar),
+            need_truncated_sampling=need_truncated_sampling(info),
+        )
 
 
 class TargetVerify(msgspec.Struct, frozen=True):

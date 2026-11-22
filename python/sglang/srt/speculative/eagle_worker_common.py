@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.speculative.target_verify import TargetVerify
+from sglang.srt.speculative.target_verify import TargetVerify, VerifyRoute
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -867,6 +867,7 @@ def run_eagle_verify(
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
     bs = len(batch.seq_lens)
+    route = VerifyRoute.derive(batch.sampling_info, has_grammar=batch.has_grammar)
 
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
@@ -880,6 +881,7 @@ def run_eagle_verify(
             req_to_token_pool,
             batch,
             target_worker,
+            route=route,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -968,6 +970,7 @@ def run_eagle_verify(
         if post_verify_graphs is None or clears_c128
         else post_verify_graphs.run(
             batch=batch,
+            route=route,
             verify_input=verify_input,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

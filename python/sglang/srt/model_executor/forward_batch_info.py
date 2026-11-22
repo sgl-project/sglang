@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.speculative.target_verify import VerifyRoute
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
@@ -617,6 +618,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
+    # The EAGLE target verify's sampling route, which the vocab-shard gate reads.
+    verify_route: Optional[VerifyRoute] = None
+
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
@@ -948,6 +952,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
         input_ids_from_graph: bool = False,
+        verify_route: Optional[VerifyRoute] = None,
     ):
         # init_new must not mutate ScheduleBatch; use explicit forward overrides.
         # Speculative forwards share iteration_ids and select their write_cols;
@@ -1087,6 +1092,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             input_ids_from_graph=input_ids_from_graph,
+            verify_route=verify_route,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             input_candidate_selectors=input_candidate_selectors(batch),
