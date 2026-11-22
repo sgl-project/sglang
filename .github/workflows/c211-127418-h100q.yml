@@ -1,0 +1,627 @@
+name: c211-127418-h100q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-h100-2g-01:
+    name: probe-job-h100-2g-01
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-01 nonce=$NONCE"
+          exit 0
+  job-h100-2g-02:
+    name: probe-job-h100-2g-02
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-02 nonce=$NONCE"
+          exit 0
+  job-h100-2g-03:
+    name: probe-job-h100-2g-03
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-03 nonce=$NONCE"
+          exit 0
+  job-h100-2g-04:
+    name: probe-job-h100-2g-04
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-04 nonce=$NONCE"
+          exit 0
+  job-h100-2g-05:
+    name: probe-job-h100-2g-05
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-05 nonce=$NONCE"
+          exit 0
+  job-h100-2g-06:
+    name: probe-job-h100-2g-06
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-06 nonce=$NONCE"
+          exit 0
+  job-h100-2g-07:
+    name: probe-job-h100-2g-07
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-07 nonce=$NONCE"
+          exit 0
+  job-h100-2g-08:
+    name: probe-job-h100-2g-08
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-08 nonce=$NONCE"
+          exit 0
+  job-h100-2g-09:
+    name: probe-job-h100-2g-09
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-09 nonce=$NONCE"
+          exit 0
+  job-h100-2g-10:
+    name: probe-job-h100-2g-10
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-10 nonce=$NONCE"
+          exit 0
+  job-h100-2g-11:
+    name: probe-job-h100-2g-11
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-11 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-11 nonce=$NONCE"
+          exit 0
+  job-h100-2g-12:
+    name: probe-job-h100-2g-12
+    runs-on: [2-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-2g-12 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-2g-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-2g-12 nonce=$NONCE"
+          exit 0
+  job-h100-4g-01:
+    name: probe-job-h100-4g-01
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-01 nonce=$NONCE"
+          exit 0
+  job-h100-4g-02:
+    name: probe-job-h100-4g-02
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-02 nonce=$NONCE"
+          exit 0
+  job-h100-4g-03:
+    name: probe-job-h100-4g-03
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-03 nonce=$NONCE"
+          exit 0
+  job-h100-4g-04:
+    name: probe-job-h100-4g-04
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-04 nonce=$NONCE"
+          exit 0
+  job-h100-4g-05:
+    name: probe-job-h100-4g-05
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-05 nonce=$NONCE"
+          exit 0
+  job-h100-4g-06:
+    name: probe-job-h100-4g-06
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-06 nonce=$NONCE"
+          exit 0
+  job-h100-4g-07:
+    name: probe-job-h100-4g-07
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-07 nonce=$NONCE"
+          exit 0
+  job-h100-4g-08:
+    name: probe-job-h100-4g-08
+    runs-on: [4-gpu-h100]
+    timeout-minutes: 15
+    steps:
+      - name: nvidia-device-read
+        shell: bash
+        env:
+          NONCE: c211-127418-dd03ff37c4baf851
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127418-dd03ff37c4baf851'
+          echo "C211_JOB=job-h100-4g-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-h100-4g-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== NVIDIA DEVICES (read-only) ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -32
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -32
+            echo "--- NVIDIA_SMI_COUNT ---"
+            timeout 40 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | wc -l
+            echo "NVIDIA_SMI_PRESENT"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-h100-4g-08 nonce=$NONCE"
+          exit 0
