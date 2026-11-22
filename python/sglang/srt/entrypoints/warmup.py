@@ -8,6 +8,7 @@ import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -166,3 +167,46 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# Prompt tokens per round: more than one prefill chunk at common chunk sizes,
+# so every round also splits a prompt across a chunk boundary.
+_CONCURRENT_PREFILL_TOKENS = 40000
+
+
+def concurrent_prefill_plan(max_running_requests) -> List[List[int]]:
+    """Prompt lengths of each concurrent round: 1, about 1/8 and all of the
+    running-request slots; lengths step by 37 so no two extends align."""
+    m = max_running_requests or 1
+    return [
+        [_CONCURRENT_PREFILL_TOKENS // n + 37 * i + 1 for i in range(n)]
+        for n in sorted({1, m // 8 or 1, m})
+    ]
+
+
+@warmup("concurrent_prefill")
+async def concurrent_prefill(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Warm up multi-sequence prefill, mixed steps and input logprobs, so their
+    first JIT compiles happen before serving."""
+    import asyncio
+
+    vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
+
+    async def one(size, **kwargs):
+        # leave room for the 8 new tokens under the server's input limit
+        size = min(size, tokenizer_manager.max_req_input_len - 8)
+        req = GenerateReqInput(
+            input_ids=np.random.randint(vocab, size=size).tolist(),
+            sampling_params={"max_new_tokens": 8, "temperature": 0},
+            **kwargs,
+        )
+        await tokenizer_manager.generate_request(req, None).__anext__()
+
+    plan = concurrent_prefill_plan(get_schedule().max_running_requests)
+    for sizes in plan:
+        await asyncio.gather(*(one(size) for size in sizes))
+    # input logprobs over an unaligned and a 16-aligned row count
+    for size in (513, 512):
+        await one(size, return_logprob=True, logprob_start_len=0)
