@@ -1106,14 +1106,15 @@ def invoke_fused_moe_kernel(
             if is_arch_support_pdl()
             else {}
         )
+        paged_expert_kwargs = {}
         if paged_expert_info is not None:
             assert not b_use_tma and bias is None and B_scale is None and not swap_ab, (
                 "--paged-experts-fused-host-copy supports only unquantized weights, "
                 "without bias, TMA or swapped operands"
             )
-        paged_expert_kwargs = paged_expert_kernel_kwargs(
-            B=B, paged_expert_info=paged_expert_info
-        )
+            paged_expert_kwargs = paged_expert_kernel_kwargs(
+                B=B, paged_expert_info=paged_expert_info
+            )
         fused_moe_kernel[grid](
             A,
             a_desc,

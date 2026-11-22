@@ -1535,17 +1535,32 @@ class TestFusedHostCopyMarlin(CustomTestCase):
     the dequantized weights, and the slots hold their experts byte for byte. Same settings as test_marlin_moe.py: inputs and weights / 10, atol 5e-2,
     rtol 0."""
 
+    FORMAT = "nvfp4"
+
     def setUp(self):
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            prepare_moe_mxfp4_layer_for_marlin,
             prepare_moe_nvfp4_layer_for_marlin,
         )
-        from sglang.test.test_marlin_utils import make_nvfp4_weight_and_ref
+        from sglang.test.test_marlin_utils import (
+            make_mxfp4_weight_and_ref,
+            make_nvfp4_weight_and_ref,
+        )
 
         torch.manual_seed(0)
         H, I, dtype = 256, 128, torch.bfloat16
 
         def experts(n, k):
+            if self.FORMAT == "mxfp4":
+                # One MXFP4 weight per expert, scaled by 1/16 through its power-of-two scales.
+                parts = [make_mxfp4_weight_and_ref(n, k, dtype) for _ in range(E)]
+                return (
+                    torch.stack([p[0] for p in parts]),
+                    torch.stack([p[1] - 4 for p in parts]),
+                    None,
+                    torch.stack([p[2] / 16 for p in parts]),
+                )
             # One NVFP4 weight per expert, scaled by 1/10 like test_marlin_moe.py's weights.
             parts = [make_nvfp4_weight_and_ref(n, k, dtype) for _ in range(E)]
             return (
@@ -1568,7 +1583,10 @@ class TestFusedHostCopyMarlin(CustomTestCase):
             intermediate_size_per_partition=I,
             params_dtype=dtype,
         )
-        prepare_moe_nvfp4_layer_for_marlin(ns, group_size=16)
+        if self.FORMAT == "mxfp4":
+            prepare_moe_mxfp4_layer_for_marlin(ns)
+        else:
+            prepare_moe_nvfp4_layer_for_marlin(ns, group_size=16)
         names = (
             "w13_weight",
             "w2_weight",
@@ -1577,7 +1595,9 @@ class TestFusedHostCopyMarlin(CustomTestCase):
             "w13_weight_scale_2",
             "w2_weight_scale_2",
         )
-        self.layer = _Layer({n: getattr(ns, n).data for n in names})
+        self.layer = _Layer(
+            {n: getattr(ns, n).data for n in names if getattr(ns, n) is not None}
+        )
         self.x = torch.randn(4, H, device="cuda", dtype=dtype) / 10
         self.workspace = lambda: marlin_make_workspace(self.x.device, 4)
 
@@ -1588,7 +1608,9 @@ class TestFusedHostCopyMarlin(CustomTestCase):
             dict(
                 host_weight_address=ptr(w),
                 host_scales_address=ptr(f"{w}_scale"),
-                host_global_scale_address=ptr(f"{w}_scale_2"),
+                host_global_scale_address=(
+                    ptr(f"{w}_scale_2") if f"{w}_scale_2" in self.layer.slots else 0
+                ),
                 expert_slot=state.expert_slot,
                 missing_expert_count=state.count,
             )
@@ -1614,8 +1636,8 @@ class TestFusedHostCopyMarlin(CustomTestCase):
             weights,
             ids,
             global_num_experts=K,
-            w1_global_scale=s["w13_weight_scale_2"],
-            w2_global_scale=s["w2_weight_scale_2"],
+            w1_global_scale=s.get("w13_weight_scale_2"),
+            w2_global_scale=s.get("w2_weight_scale_2"),
             workspace=self.workspace(),
             num_bits=4,
             is_k_full=True,
@@ -1642,6 +1664,12 @@ class TestFusedHostCopyMarlin(CustomTestCase):
 
                 torch.testing.assert_close(fused_out, ref, atol=5e-2, rtol=0)
                 self.layer.assert_slots_hold(self, fused)
+
+
+class TestFusedHostCopyMarlinMXFP4(TestFusedHostCopyMarlin):
+    """The same with MXFP4 experts: power-of-two scales per group of 32, no global scale."""
+
+    FORMAT = "mxfp4"
 
 
 if __name__ == "__main__":

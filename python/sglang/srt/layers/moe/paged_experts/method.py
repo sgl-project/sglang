@@ -370,11 +370,17 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             raise ValueError(
                 "--paged-experts-fused-host-copy needs the triton or Marlin MoE runner"
             )
+        if get_exec().graph.enable_torch_compile:
+            raise ValueError(
+                "--paged-experts-fused-host-copy does not currently support "
+                "--enable-torch-compile"
+            )
         if self.contract is TRITON:
             w13, w2 = self._fuse_host_copy_triton(layer=layer, residency=residency)
         else:
             w13, w2 = self._fuse_host_copy_marlin(layer=layer, residency=residency)
-        # An empty tensor is what can cross the runner's registered ops as one optional argument.
+        # Information of host expert locations and expert slots is stored as a Python attribute,
+        # which may be incompatible with torch.compile.
         paged_expert_info = torch.empty(0, device=residency.expert_slot.device)
         paged_expert_info.info = (w13, w2)
         self.runner.config.paged_expert_info = paged_expert_info

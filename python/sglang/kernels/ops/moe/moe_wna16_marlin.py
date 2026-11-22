@@ -47,13 +47,10 @@ def _jit_moe_wna16_marlin_module(
 
 
 def _paged_expert_kernel_args(
-    b_q_weight: torch.Tensor, b_scales: torch.Tensor, paged_expert_info: Optional[dict]
+    b_q_weight: torch.Tensor, b_scales: torch.Tensor, paged_expert_info: dict
 ) -> tuple:
     """The fused-host-copy kernel's extra arguments: the host tables as offsets from the slot
-    tables in 16-byte units, then addresses and the first host id (the number of slots). None
-    without ``paged_expert_info``."""
-    if paged_expert_info is None:
-        return ()
+    tables in 16-byte units, then addresses and the first host id (the number of slots)."""
     return (
         (paged_expert_info["host_weight_address"] - b_q_weight.data_ptr()) // 16,
         (paged_expert_info["host_scales_address"] - b_scales.data_ptr()) // 16,
@@ -282,10 +279,14 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
-        *_paged_expert_kernel_args(
-            b_q_weight=b_q_weight,
-            b_scales=b_scales,
-            paged_expert_info=paged_expert_info,
+        *(
+            _paged_expert_kernel_args(
+                b_q_weight=b_q_weight,
+                b_scales=b_scales,
+                paged_expert_info=paged_expert_info,
+            )
+            if paged_expert_info is not None
+            else ()
         ),
     )
 

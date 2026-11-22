@@ -27,6 +27,9 @@ if _is_cuda:
 # Where the CUDA kernel's own small-batch single-block path stops: its
 # per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
+# The default CUDA kernel scans its buckets with one block of 1024 threads; the JIT
+# kernel handles up to 8192 buckets.
+_CUDA_DEFAULT_MAX_BUCKETS = 1024
 
 
 def moe_align_block_size(
@@ -162,7 +165,15 @@ def moe_align_block_size(
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = return_inactive_prefix_count or pad_expert_ids
+    use_jit_align = (
+        return_inactive_prefix_count
+        or pad_expert_ids
+        or (
+            _is_cuda
+            and not ignore_invalid_expert
+            and num_experts + 1 > _CUDA_DEFAULT_MAX_BUCKETS
+        )
+    )
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 

@@ -11,22 +11,16 @@ expert e being paged in: the kernel reads it from the host copy and writes it in
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
 
-def paged_expert_kernel_kwargs(
-    B: torch.Tensor, paged_expert_info: Optional[dict]
-) -> dict:
-    """``fused_moe_kernel``'s arguments for paging experts into the slot table ``B``, none
-    without ``paged_expert_info``: ``host_table`` (every expert in pinned host memory, in B's
+def paged_expert_kernel_kwargs(B: torch.Tensor, paged_expert_info: dict) -> dict:
+    """``fused_moe_kernel``'s arguments for paging experts into the slot table ``B``, from
+    ``paged_expert_info``: ``host_table`` (every expert in pinned host memory, in B's
     layout), ``expert_slot`` (the layer's expert -> slot table) and ``missing_expert_count``
     (the number of experts its current step pages in)."""
-    if paged_expert_info is None:
-        return {}
     host_table = paged_expert_info["host_table"]
     assert host_table.shape[1:] == B.shape[1:], (
         "--paged-experts-fused-host-copy: the shape of one expert in the host table, "
