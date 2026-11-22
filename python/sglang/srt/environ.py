@@ -784,6 +784,20 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP layer split: layers per stage, comma-separated (distributed.utils.get_pp_indices).
+    SGLANG_PP_LAYER_PARTITION = EnvStr(None)
+    # PP: choose the layer split at boot from each GPU's measured speed and replace
+    # SGLANG_PP_LAYER_PARTITION with it (distributed/pp_partition_auto.py). Speeds come
+    # from a concurrent burn of BURN_S seconds on every GPU, or from SPEED (one factor
+    # per stage, for tests and fixed rigs); BURN_SCALE stretches the burn's spread.
+    SGLANG_ENABLE_PP_PARTITION_AUTO = EnvBool(False)
+    SGLANG_PP_PARTITION_AUTO_SPEED = EnvTuple(())
+    SGLANG_PP_PARTITION_AUTO_BURN_S = EnvFloat(10.0)
+    SGLANG_PP_PARTITION_AUTO_BURN_SCALE = EnvFloat(1.0)
+    # JSON PPPartitionCostModel: per-layer-kind costs and memory (empty: uniform cost).
+    SGLANG_PP_PARTITION_AUTO_COST_MODEL = EnvStr("")
+    # With a KV model: fraction of the reference split's KV token capacity to keep.
+    SGLANG_PP_PARTITION_AUTO_KV_FLOOR = EnvFloat(1.0)
     # PP rank 0 posts its output recv only after its own forward. Enable it if PP
     # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
     SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
