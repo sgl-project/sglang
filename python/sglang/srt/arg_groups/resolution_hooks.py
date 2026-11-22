@@ -38,6 +38,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_missing_default_values",
         "handle_expert_pack",
         "handle_pd_disaggregation",
+        "validate_pd_decode_tail_admission",
         "validate_prefill_only_disable_kv_cache_args",
         "handle_decode_context_parallelism",
         "handle_cuda_graph_persistence",

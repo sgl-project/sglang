@@ -131,6 +131,15 @@ class Disagg(msgspec.Struct):
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
+    disaggregation_decode_tail_tokens: A[
+        int,
+        "Opt-in decode-side tail computation for PD disaggregation. The prefill "
+        "worker transfers KV for [0, max(0, N - W)) and skips LM-head computation "
+        "and sampling; decode extends the remaining prompt and samples the "
+        "first token. Set the same W on both roles. Initially supports dense "
+        "full attention, without speculative decoding or logprob returns. "
+        "0 keeps the current prefill-samples-the-first-token behavior.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

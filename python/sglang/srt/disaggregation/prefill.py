@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.utils import (
     record_network_transfer,
     setup_state_kv_args,
     state_indices_per_entry,
+    tail_transfer_input_len,
 )
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
@@ -552,8 +553,16 @@ class PrefillBootstrapQueue:
         return True
 
     def _num_pages_to_send(self, req: Req, decode_prefix_len: int) -> int:
+        # Register exactly the range _send_kv_chunk sends: in decode-tail mode
+        # the transfer stops at N - W, and the sender's completion signal is
+        # derived from this registered length.
+        n = len(req.origin_input_ids)
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        transfer_input_len = tail_transfer_input_len(
+            n, tail, is_rebootstrap=req.disagg_rebootstrap
+        )
         return kv_to_page_num(
-            len(req.origin_input_ids) - decode_prefix_len,
+            max(0, transfer_input_len - decode_prefix_len),
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
@@ -684,11 +693,27 @@ class SchedulerDisaggregationPrefillMixin:
         if prefetch is None:
             return
         lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        tail = get_disagg().disaggregation_decode_tail_tokens
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                if lazy and req.extend_end is not None:
-                    prefetch(room, upto_tokens=req.extend_end)
+                upto_tokens = None
+                if tail:
+                    # Reserve only the KV range this request will actually
+                    # send. In tail mode N<=W is a metadata-only handoff; a
+                    # full-size reservation there has no matching transfer and
+                    # would pin a staging slot until the request times out.
+                    upto_tokens = tail_transfer_input_len(
+                        len(req.origin_input_ids),
+                        tail,
+                        is_rebootstrap=req.disagg_rebootstrap,
+                    )
+                    if lazy and req.extend_end is not None:
+                        upto_tokens = min(upto_tokens, req.extend_end)
+                elif lazy and req.extend_end is not None:
+                    upto_tokens = req.extend_end
+                if upto_tokens is not None:
+                    prefetch(room, upto_tokens=upto_tokens)
                 else:
                     prefetch(room)
 
@@ -1263,7 +1288,10 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                if (
+                    req.grammar is not None
+                    and not get_disagg().disaggregation_decode_tail_tokens
+                ):
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
@@ -1757,6 +1785,16 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx: Optional[int] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        if tail:
+            end_idx = min(
+                req.extend_end if end_idx is None else end_idx,
+                tail_transfer_input_len(
+                    len(req.origin_input_ids),
+                    tail,
+                    is_rebootstrap=req.disagg_rebootstrap,
+                ),
+            )
         if last_chunk and computer is not None:
             if is_health_check_req(req):
                 digest = signature = 0
@@ -1789,12 +1827,29 @@ class SchedulerDisaggregationPrefillMixin:
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
-        end_idx = (
-            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
+        # Tail mode: the decode worker computes the last W prompt tokens from
+        # a real extend, so only [0, N - W) transfers. The common sender also
+        # supports an empty final chunk carrying only the metadata.
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        if tail:
+            transfer_input_len = tail_transfer_input_len(
+                transfer_input_len, tail, is_rebootstrap=req.disagg_rebootstrap
+            )
+        end_idx = min(
+            req.extend_end if end_idx is None else end_idx, transfer_input_len
         )
 
         if not last_chunk:
-            end_idx = clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx)
+            # The common sender recognizes the final chunk by its cumulative
+            # page count. Keep the last prefix page until the final forward has
+            # published metadata, even when an early cache hit covers it.
+            send_limit = transfer_input_len
+            if tail and send_limit > 0:
+                send_limit = (send_limit - 1) // page_size * page_size
+            end_idx = min(
+                clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx),
+                send_limit,
+            )
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:

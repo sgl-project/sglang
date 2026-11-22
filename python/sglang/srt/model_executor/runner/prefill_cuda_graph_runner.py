@@ -2180,6 +2180,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.return_logprob if self._is_breakable_backend else False
             ),
             is_prefill_only=forward_batch.is_prefill_only,
+            is_pd_tail_prefill=forward_batch.is_pd_tail_prefill,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,

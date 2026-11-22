@@ -350,6 +350,8 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
+    # Internal recompute request: restore all KV and retain decode's pending token.
+    disagg_rebootstrap: bool = False
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
@@ -1162,6 +1164,7 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            disagg_rebootstrap=self.disagg_rebootstrap,
             bootstrap_pair_key=(
                 self.bootstrap_pair_key[i]
                 if self.bootstrap_pair_key is not None
@@ -1324,6 +1327,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
     # See GenerateReqInput.token_ids_logprob_rows.
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+
+    # Append-only IPC field; older senders retain the normal transfer path.
+    disagg_rebootstrap: bool = False
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

@@ -401,6 +401,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    is_pd_tail_prefill: bool = False
     beam_trie_levels: Optional[torch.Tensor] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
@@ -468,6 +469,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            is_pd_tail_prefill=forward_batch.is_pd_tail_prefill,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             beam_trie_levels=(
                 None if forward_batch.beam is None else forward_batch.beam.trie_levels
@@ -707,7 +709,7 @@ class LogitsProcessor(nn.Module):
         # Autotune dummy run discards this output. `is False` not `not`: None
         # means no autotune pass, which must not skip. Placed before the MIS /
         # DLLM / common dispatch so all three LM-head paths are skipped.
-        if _autotune_run_lm_head is False:
+        if _autotune_run_lm_head is False or logits_metadata.is_pd_tail_prefill:
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Under LayerNorm SP the decoder loop leaves these sequence-sharded; undo

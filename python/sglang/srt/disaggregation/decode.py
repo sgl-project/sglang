@@ -29,16 +29,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import numpy as np
@@ -92,6 +83,7 @@ from sglang.srt.disaggregation.utils import (
     record_network_transfer,
     setup_state_kv_args,
     state_indices_per_entry,
+    tail_transfer_input_len,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
@@ -108,10 +100,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
-from sglang.srt.managers.utils import (
-    GenerationBatchResult,
-    is_war_barrier_enabled,
-)
+from sglang.srt.managers.utils import GenerationBatchResult, is_war_barrier_enabled
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -168,6 +157,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
@@ -200,6 +190,32 @@ class _HostStagedAdmissionStats:
     max_window_req_tokens: Optional[Dict[str, int]] = None
     num_device_transfer_reqs: Optional[int] = None
     retracted_tokens: Optional[Tuple[int, Dict[str, int]]] = None
+
+
+def _is_tail_transfer(req: Req) -> bool:
+    """Whether this transfer belongs to the decode-tail mode (RFC #50547).
+
+    Tail reqs run a real extend over the last W prompt tokens and sample
+    their own first token, so the prefill handoff token and its logprobs
+    are dropped at commit. Module-level: the transfer queue, the prebuilt
+    admission and the tail-extend admission all gate on it.
+    """
+    return (
+        get_disagg().disaggregation_decode_tail_tokens > 0
+        and not _is_fake_transfer(req)
+        and not req.output_ids
+    )
+
+
+def _truncate_to_tail_boundary(req: Req) -> None:
+    """Commit only the KV range the prefill actually transferred."""
+    req.kv.truncate_committed(
+        tail_transfer_input_len(
+            len(req.origin_input_ids),
+            get_disagg().disaggregation_decode_tail_tokens,
+            is_rebootstrap=getattr(req, "disagg_rebootstrap", False),
+        )
+    )
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -1418,6 +1434,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            # _pre_alloc marks the whole row committed and sets extend_end to
+            # the full prompt. A tail request whose first sample was lost to a
+            # retraction must not re-enter the prebuilt path with that full
+            # committed length; restore the transferred boundary here.
+            if _is_tail_transfer(req):
+                _truncate_to_tail_boundary(req)
 
         move(resumed_reqs, dst)
 
@@ -3479,9 +3501,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Case 3: Success - commit the transfer
         # A rebootstrap resumes from its last output id, already committed; the
         # prefill's sampled token is dropped.
-        resumes_output = decode_req.is_rebootstrap
+        resumes_output = decode_req.is_rebootstrap and bool(decode_req.req.output_ids)
         if resumes_output:
             assert len(decode_req.req.output_ids) > 0, decode_req.req.rid
+        elif _is_tail_transfer(decode_req.req):
+            # Tail mode: the decode worker recomputes the last W prompt
+            # tokens from a real extend and samples the first token itself,
+            # so the prefill's handoff token is dropped here (grammar,
+            # penalties and logprobs apply on decode's own sample).
+            _truncate_to_tail_boundary(decode_req.req)
         else:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(
@@ -4208,6 +4236,48 @@ class SchedulerDisaggregationDecodeMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
+        # A tail-extend batch ran last iteration: merge its requests into the
+        # running decode batch (the standard prefill->decode transition).
+        last = self.last_batch
+        if last is not None and getattr(last, "pd_tail_extend", False):
+            last.pd_tail_extend = False
+            last_bs = last.batch_size()
+            last.filter_batch()
+            if last.batch_size() < last_bs:
+                running_batch.batch_is_full = False
+            if last is not running_batch and not last.is_empty():
+                move(
+                    [req for req in last.reqs if req not in self.running_reqs],
+                    self.running_reqs,
+                )
+                if running_batch.is_empty():
+                    running_batch = last
+                else:
+                    running_batch.merge_batch(last)
+
+        # Poll on the shared path so sustained tail batches cannot stall
+        # requests waiting to enter the decode preallocation queue.
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+
+        # Overlap merges a tail extend before its result finishes its requests,
+        # and back-to-back tail batches bypass update_running_batch. Filter
+        # finished requests from running_batch before checking tail capacity.
+        if not running_batch.is_empty():
+            running_bs = running_batch.batch_size()
+            running_batch.filter_batch()
+            if running_batch.batch_size() < running_bs:
+                running_batch.batch_is_full = False
+
+        # Decode-tail reqs run a real extend first: they become ordinary
+        # decode reqs through the standard result processor on this batch.
+        tail_extend_batch = self._get_new_tail_extend_batch(running_batch)
+        if tail_extend_batch is not None:
+            return NextBatchPlan(
+                batch_to_run=tail_extend_batch, running_batch=running_batch
+            )
+
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
@@ -4289,6 +4359,12 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
     def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
+        keep_indices = self._kv_checksum_keep_indices(batch.reqs)
+        if keep_indices is not None:
+            batch.filter_batch(keep_indices=keep_indices)
+
+    def _kv_checksum_keep_indices(self, reqs: List[Req]) -> Optional[List[int]]:
+        """Retire checksum failures; return survivors only if any rank dropped a request."""
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if computer is None:
             return
@@ -4296,9 +4372,9 @@ class SchedulerDisaggregationDecodeMixin:
         prealloc_queue = self.disagg_decode_prealloc_queue
         kv_manager = prealloc_queue.kv_manager
         mismatch_prob = envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get()
-        mismatched = [0] * len(batch.reqs)
+        mismatched = [0] * len(reqs)
         messages: Dict[int, str] = {}
-        for i, req in enumerate(batch.reqs):
+        for i, req in enumerate(reqs):
             expected = req.expected_kv_checksum
             if (
                 expected == 0
@@ -4310,7 +4386,13 @@ class SchedulerDisaggregationDecodeMixin:
             # written its own tokens into the last page, so the handoff digest
             # no longer describes it.
             req.expected_kv_checksum = 0
-            seq_len = len(req.origin_input_ids)
+            # Tail mode transfers [0, N - W): the digest covers the committed
+            # range, not the full prompt the request will eventually hold.
+            seq_len = (
+                req.kv.kv_committed_len
+                if _is_tail_transfer(req)
+                else pre_alloc_fill_len(req)
+            )
             # The tree cache owns [0, cache_protected_len): the prefix this
             # decode promised at bootstrap, so prefill sent and digested only
             # what follows it.
@@ -4343,7 +4425,7 @@ class SchedulerDisaggregationDecodeMixin:
         )
         if not any(mismatched):
             return
-        for i, req in enumerate(batch.reqs):
+        for i, req in enumerate(reqs):
             if mismatched[i]:
                 msg = messages.get(
                     i,
@@ -4352,9 +4434,7 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 logger.error(msg)
                 self._handle_kv_checksum_mismatch(req, msg)
-        batch.filter_batch(
-            keep_indices=[i for i, bad in enumerate(mismatched) if not bad]
-        )
+        return [i for i, bad in enumerate(mismatched) if not bad]
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
@@ -4377,15 +4457,89 @@ class SchedulerDisaggregationDecodeMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
+    def _get_new_tail_extend_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Admit transferred requests that run a real extend over the last W
+        prompt tokens (decode-tail mode, RFC #50547).
+
+        The transferred KV covers [0, N - W) and lives in the request's
+        preallocated rows; the tail W tokens run through the ordinary extend
+        forward so sampling, grammar and penalties use decode's own state.
+        """
+        if get_disagg().disaggregation_decode_tail_tokens <= 0:
+            return None
+        if len(self.waiting_queue) == 0:
+            return None
+
+        curr_batch_size = running_batch.batch_size()
+        batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        num_not_used_batch = batch_size - curr_batch_size
+        # The tail forward is W tokens per request; keep the batch inside the
+        # chunked-prefill budget the same way a local prefill would be.
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        schedule = get_schedule()
+        token_budget = schedule.max_prefill_tokens
+        if (
+            schedule.chunked_prefill_size is not None
+            and schedule.chunked_prefill_size > 0
+        ):
+            token_budget = min(token_budget, schedule.chunked_prefill_size)
+        max_admit = min(num_not_used_batch, token_budget // tail)
+        if max_admit <= 0:
+            return None
+
+        if self.enable_priority_scheduling:
+            self.waiting_queue.reorder(
+                self.policy.calc_priority(self.waiting_queue, running_batch)
+            )
+
+        # A retraction restored into the host pool leaves a completion event
+        # on the row. Finalize it before admission, or this request would be
+        # skipped here and skipped by the prebuilt path for being a tail req.
+        restores_ready = self._host_restores_ready()
+        can_run_list: List[Req] = []
+        for req in self.waiting_queue:
+            if not _is_tail_transfer(req):
+                continue
+            restoring = req.kv.restore_done_event is not None
+            if restoring and id(req) not in restores_ready:
+                continue
+            if len(can_run_list) >= max_admit:
+                continue
+            if restoring:
+                finish_restore_kv_cache(req, self.tree_cache)
+            can_run_list.append(req)
+
+        if len(can_run_list) == 0:
+            return None
+        move(can_run_list, self.running_reqs)
+        set_time_batch(can_run_list, "set_forward_entry_time")
+
+        # Verify before initializing the batch, so its request-derived flags
+        # (including grammar) describe only requests with intact KV.
+        keep_indices = self._kv_checksum_keep_indices(can_run_list)
+        if keep_indices is not None:
+            can_run_list = [can_run_list[i] for i in keep_indices]
+        if not can_run_list:
+            return None
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_tail_extend()
+        return new_batch
+
     def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
-
         if len(self.waiting_queue) == 0:
             return None
 
@@ -4410,6 +4564,10 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
 
         for req in self.waiting_queue:
+            if _is_tail_transfer(req):
+                # Tail reqs run a real extend over the last W prompt tokens;
+                # _get_new_tail_extend_batch admits them instead.
+                continue
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
             if len(can_run_list) < num_not_used_batch and (

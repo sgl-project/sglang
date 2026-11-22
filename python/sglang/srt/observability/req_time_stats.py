@@ -963,7 +963,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.enable_metrics or self.trace_ctx.tracing_enable:
             if last_time == 0.0:
                 if self.disagg_mode == DisaggregationMode.DECODE:
-                    last_time = self.decode_prebuilt_finish_time
+                    # Decode-tail runs a real prefill on this worker. Use the
+                    # most recent local boundary, including after rebootstrap.
+                    last_time = max(
+                        self.decode_prebuilt_finish_time,
+                        self.last_prefill_finished_time,
+                    )
                 else:
                     if (
                         self.last_decode_scheduled_time

@@ -95,6 +95,70 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
+    if cfg.disaggregation_decode_tail_tokens:
+        tail = cfg.disaggregation_decode_tail_tokens
+        if tail < 0:
+            raise ValueError("--disaggregation-decode-tail-tokens must be >= 0")
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--disaggregation-decode-tail-tokens requires "
+                "--disaggregation-mode prefill or decode"
+            )
+        unsupported = []
+        if cfg.disaggregation_transfer_backend != "mooncake":
+            unsupported.append("transfer backends other than Mooncake")
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = model_config_of(server_args)
+        layer_types = getattr(model_config.hf_text_config, "layer_types", None)
+        if (
+            model_config.attention_arch != AttentionArch.MHA
+            or model_config.is_hybrid_swa
+            or mambaish_config(model_config) is not None
+            or (layer_types and any(layer != "full_attention" for layer in layer_types))
+        ):
+            unsupported.append(
+                "attention or recurrent state beyond dense full attention"
+            )
+        if resolved_view(server_args).speculative_algorithm is not None:
+            unsupported.append(
+                "speculative decoding "
+                f"(--speculative-algorithm {resolved_view(server_args).speculative_algorithm}); the "
+                "draft extend over the tail is a later phase"
+            )
+        if cfg.pp_size != 1:
+            unsupported.append("pipeline parallelism")
+        if cfg.ep_size != 1:
+            unsupported.append("expert parallelism")
+        if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+            unsupported.append("context parallelism")
+        if cfg.enable_two_batch_overlap:
+            unsupported.append("two-batch overlap")
+        if cfg.enable_mixed_chunk:
+            unsupported.append("mixed chunked prefill")
+        if cfg.enable_lora:
+            unsupported.append("LoRA")
+        if cfg.enable_hisparse:
+            unsupported.append("HiSparse")
+        if cfg.enable_pd_role_switch:
+            unsupported.append("dynamic PD role switching")
+        if cfg.disaggregation_decode_enable_radix_cache:
+            unsupported.append("decode radix caching")
+        if cfg.disaggregation_decode_host_receive_threshold < 1:
+            unsupported.append("host KV receive")
+        if getattr(cfg, "dsv41_encoder_only_prefill", False):
+            # #40874's field: only checked when that branch's arg exists.
+            unsupported.append(
+                "--dsv41-encoder-only-prefill (the model-specific form of the "
+                "same mode; use one)"
+            )
+        if unsupported:
+            raise ValueError(
+                "--disaggregation-decode-tail-tokens does not support: "
+                + ", ".join(unsupported)
+            )
+
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:
@@ -204,6 +268,28 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+
+def validate_pd_decode_tail_admission(server_args: ServerArgs) -> None:
+    """Validate final parallel layout and hardware/model-resolved tail budget."""
+    cfg = resolving_view(server_args)
+    tail = cfg.disaggregation_decode_tail_tokens
+    if not tail:
+        return
+    # A real tail extend is admitted before the ordinary decode MLP sync.
+    if cfg.dp_size != 1 or attn_dp_enabled_of(cfg):
+        raise ValueError(
+            "--disaggregation-decode-tail-tokens does not support replica or "
+            "attention data parallelism"
+        )
+    budget = cfg.max_prefill_tokens
+    if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
+        budget = min(budget, cfg.chunked_prefill_size)
+    if tail > budget:
+        raise ValueError(
+            "--disaggregation-decode-tail-tokens must fit the resolved prefill "
+            f"token budget ({budget})"
+        )
 
 
 def _validate_prefill_complete(server_args: ServerArgs) -> None:
