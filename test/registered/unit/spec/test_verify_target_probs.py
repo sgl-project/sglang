@@ -297,19 +297,21 @@ def test_eagle_dense_verify_applies_min_p():
 def test_dspark_accept_min_p_does_not_depend_on_the_batch():
     """A min-p request verifies against the same filtered distribution alone and
     batched with a top-k request (DSpark's accept, also DFlash's selector draft)."""
+    # The accept picks its kernels by platform, not by tensor device.
+    device = _DEVICES[-1]
     width, vocab = 3, 16
     # Unit-scale logits, so min-p keeps several tokens per row.
-    logits = _random_logits("cpu", 2 * width, vocab, seed=41) / 4
+    logits = _random_logits(device, 2 * width, vocab, seed=41) / 4
 
     class _Stop(Exception):
         pass
 
     def verify_target_probs(bs):
         info = SimpleNamespace(
-            temperatures=torch.ones((bs, 1)),
-            top_ks=torch.tensor([TOP_K_ALL, 4][:bs], dtype=torch.int32),
-            top_ps=torch.ones(bs),
-            min_ps=torch.tensor([0.2, 0.0][:bs]),
+            temperatures=torch.ones((bs, 1), device=device),
+            top_ks=torch.tensor([TOP_K_ALL, 4][:bs], dtype=torch.int32, device=device),
+            top_ps=torch.ones(bs, device=device),
+            min_ps=torch.tensor([0.2, 0.0][:bs], device=device),
             need_top_k_sampling=bs == 2,
             need_top_p_sampling=False,
             need_min_p_sampling=True,
@@ -326,9 +328,9 @@ def test_dspark_accept_min_p_does_not_depend_on_the_batch():
             pytest.raises(_Stop),
         ):
             dspark_accept.accept_sampling(
-                candidates=torch.zeros((bs, width), dtype=torch.int64),
+                candidates=torch.zeros((bs, width), dtype=torch.int64, device=device),
                 target_logits=logits[: bs * width],
-                draft_probs=torch.zeros((bs, width - 1, vocab)),
+                draft_probs=torch.zeros((bs, width - 1, vocab), device=device),
                 sampling_info=info,
                 draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
                 gamma=width - 1,
@@ -338,7 +340,7 @@ def test_dspark_accept_min_p_does_not_depend_on_the_batch():
 
     alone, batched = verify_target_probs(1), verify_target_probs(2)
     want = _sampler_min_p(
-        torch.softmax(logits[:width], dim=-1), torch.full((width,), 0.2)
+        torch.softmax(logits[:width], dim=-1), torch.full((width,), 0.2, device=device)
     )
     for got in (alone, batched):
         assert torch.equal(got > 0, want > 0)
