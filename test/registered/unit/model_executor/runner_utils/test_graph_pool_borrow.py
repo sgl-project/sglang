@@ -193,8 +193,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             draft_probs=None,
         )
         sampling_info = SimpleNamespace(
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
