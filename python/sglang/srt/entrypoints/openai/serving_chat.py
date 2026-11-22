@@ -3743,6 +3743,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                     constrained=constrained,
+                    response_unwrapped=self.reasoning_parser == "kimi_k3"
+                    and request.separate_reasoning,
                 )
 
         parser = parser_dict[index]

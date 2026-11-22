@@ -2341,6 +2341,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_tool_grammar,
                     request._response_parser_grammar_start,
                 ),
+                response_unwrapped=self.reasoning_parser == "kimi_k3",
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:

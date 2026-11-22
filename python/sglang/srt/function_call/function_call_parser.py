@@ -137,6 +137,7 @@ class FunctionCallParser:
         tool_choice=None,
         prefix: str = "",
         constrained: bool = False,
+        response_unwrapped: bool = False,
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
@@ -164,6 +165,8 @@ class FunctionCallParser:
             detector.use_full_assistant_constraint = not any(
                 tool.function.strict for tool in tools
             )
+        if isinstance(detector, KimiK3Detector) and response_unwrapped:
+            detector.use_unwrapped_response()
         if isinstance(tool_choice, dict):
             tool_choice = ToolChoice(function={"name": tool_choice["name"]})
         self._required_tool_parser = detector.get_required_tool_parser(tool_choice)

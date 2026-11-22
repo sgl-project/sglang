@@ -2012,6 +2012,31 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
+    def test_kimi_k3_answer_keeps_quoted_markers_with_both_parsers(self):
+        """With the kimi_k3 reasoning and tool parsers, markers quoted in the
+        answer survive the reasoning parser and are not stripped again by the
+        tool parser, streamed or not."""
+        self.chat.tool_call_parser = self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        tool = {"type": "function", "function": {"name": "read_file"}}
+        opener, closer = "<|open|>response<|sep|>", "<|close|>response<|sep|>"
+        for answer in (f"quote {opener} opener", f'{{"w": "a{closer}b"}}'):
+            raw = (
+                f"Plan.<|close|>think<|sep|>{opener}{answer}{closer}"
+                "<|close|>message<|sep|>"
+            )
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    answer=answer, stream=stream, incremental=incremental
+                ):
+                    served = self._served(
+                        self._stopped_on_token(raw, 1),
+                        stream,
+                        incremental=incremental,
+                        tools=[tool],
+                    )
+                    self.assertEqual(served, ("Plan.", answer, []))
+
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")
         ret = [
