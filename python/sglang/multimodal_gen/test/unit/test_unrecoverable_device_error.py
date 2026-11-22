@@ -91,7 +91,9 @@ def test_device_error_exits_the_worker(worker, message, propagate):
 def _run_grouped_requests(worker, monkeypatch, error, replica_size):
     """Two grouped requests; the first one's DiT/VAE forward raises ``error``."""
     monkeypatch.setattr(
-        type(gpu_worker_module.current_platform), "is_cpu", lambda self: True
+        gpu_worker_module,
+        "current_platform",
+        SimpleNamespace(is_cpu=lambda: True, is_mps=lambda: False),
     )
     replica = lambda: SimpleNamespace(world_size=replica_size)
     monkeypatch.setattr(gpu_worker_module, "get_replica_group", replica)
