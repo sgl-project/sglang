@@ -480,3 +480,37 @@ async fn count_tokens_counts_the_profiled_request() {
         "no profile: no effort line"
     );
 }
+
+/// Buffered `/v1/responses`: `length` → incomplete, `stop` → completed, and
+/// `completion_tokens_details.reasoning_tokens` → `output_tokens_details`.
+#[tokio::test]
+async fn buffered_responses_finish_and_reasoning_tokens() {
+    let chat = |finish: &str| {
+        json!({"id": "c", "object": "chat.completion", "created": 1, "model": MODEL,
+               "choices": [{"index": 0, "finish_reason": finish,
+                            "message": {"role": "assistant", "content": "partial",
+                                        "reasoning_content": "think"}}],
+               "usage": {"prompt_tokens": 7, "completion_tokens": 50, "total_tokens": 57,
+                         "reasoning_tokens": 0, "completion_tokens_details": {"reasoning_tokens": 40}}})
+    };
+    let req = json!({"model": MODEL, "input": "hi", "max_output_tokens": 50});
+
+    let mock = MockWorker::start_returning_error(StatusCode::OK, chat("length")).await;
+    let (status, r) = post(ctx(&mock.url, STEP5), "/v1/responses", req.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r["status"], "incomplete");
+    assert_eq!(
+        r["incomplete_details"],
+        json!({"reason": "max_output_tokens"})
+    );
+    assert_eq!(r["completed_at"], Value::Null);
+    assert_eq!(r["output"][1]["status"], "incomplete");
+    assert_eq!(r["usage"]["output_tokens_details"]["reasoning_tokens"], 40);
+
+    let mock = MockWorker::start_returning_error(StatusCode::OK, chat("stop")).await;
+    let (status, r) = post(ctx(&mock.url, STEP5), "/v1/responses", req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(r["status"], "completed");
+    assert_eq!(r["incomplete_details"], Value::Null);
+    assert_eq!(r["usage"]["output_tokens_details"]["reasoning_tokens"], 40);
+}

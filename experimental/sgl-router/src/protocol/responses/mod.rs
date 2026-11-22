@@ -29,15 +29,10 @@ pub(crate) fn usage_from_chat(usage: Option<&Value>) -> Value {
     let input = int(u.and_then(|u| u.get("prompt_tokens")));
     let output = int(u.and_then(|u| u.get("completion_tokens")));
     let cached = int(u.and_then(|u| u.pointer("/prompt_tokens_details/cached_tokens")));
-    // sglang reports `reasoning_tokens` at the top level; OpenAI nests it.
-    let reasoning = u
-        .and_then(|u| {
-            u.get("reasoning_tokens")
-                .filter(|v| !v.is_null())
-                .or_else(|| u.pointer("/completion_tokens_details/reasoning_tokens"))
-        })
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    // sglang reports `reasoning_tokens` at the top level (always, default 0);
+    // OpenAI nests it under `completion_tokens_details`. Take whichever is set.
+    let reasoning = int(u.and_then(|u| u.pointer("/completion_tokens_details/reasoning_tokens")))
+        .max(int(u.and_then(|u| u.get("reasoning_tokens"))));
     json!({
         "input_tokens": input,
         // Required by the OpenAI SDK; the engine does not report it.
@@ -222,6 +217,12 @@ mod tests {
         assert_eq!(u["input_tokens_details"]["cached_tokens"], 0);
         assert_eq!(u["output_tokens_details"]["reasoning_tokens"], 0);
         assert_eq!(u["total_tokens"], 3);
+        // OpenAI-style nested count is not masked by sglang's default top-level 0.
+        let u = usage_from_chat(Some(&json!({
+            "prompt_tokens": 2, "completion_tokens": 9, "reasoning_tokens": 0,
+            "completion_tokens_details": {"reasoning_tokens": 6},
+        })));
+        assert_eq!(u["output_tokens_details"]["reasoning_tokens"], 6);
     }
 
     #[test]
