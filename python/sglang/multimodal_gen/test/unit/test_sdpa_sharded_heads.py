@@ -106,8 +106,8 @@ class TestSDPAShardedHeads(CustomTestCase):
 
     def test_padding_only_when_the_shard_alone_would_split(self):
         query = torch.empty(1, 6, 1025, 128, device="cuda", dtype=torch.bfloat16)
-        padded = _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)
-        if padded == 1025:
+        exact_len = _impl(heads=6, global_num_heads=24)._unsplit_query_len(query, 1025)
+        if exact_len == 1025:
             self.skipTest("too few SMs for these shapes to split")
         # Unknown, unsharded, FP32, dropout and cuDNN keep the input length.
         cases = {
@@ -140,6 +140,17 @@ class TestSDPAShardedHeads(CustomTestCase):
                 impl = _impl(heads=6, global_num_heads=24)
                 padded = impl._unsplit_query_len(query, 1025) > 1025
                 self.assertEqual(padded, expect_padding)
+        with self.subTest("one impl caches the shape, not the request or dtype"):
+            impl = _impl(heads=6, global_num_heads=24)
+            for quality, expected in (
+                ("lossless", 1025),
+                ("exact", exact_len),
+                ("lossless", 1025),
+            ):
+                with _request(quality):
+                    self.assertEqual(impl._unsplit_query_len(query, 1025), expected)
+            with _request("exact"):
+                self.assertEqual(impl._unsplit_query_len(query.float(), 1025), 1025)
         with (
             self.subTest("no forward context"),
             patch.object(forward_context, "_forward_context", None),

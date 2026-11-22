@@ -14,7 +14,10 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
-from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    QUALITY_LEVELS,
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -53,6 +56,12 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 _FLASH_QUERY_BLOCK = 128
 _FLASH_UNSPLIT_KEY_LEN = 128
 _FLASH_SPLIT_OCCUPANCY = 0.8
+# Arbitrary bound; one entry per distinct attention shape an impl has seen.
+_MAX_SPLIT_PADDING_PLANS = 256
+# Tiers that rule out "lossless" fast paths, i.e. the requests that pad.
+_EXACT_QUALITY_LEVELS = frozenset(
+    level for level in QUALITY_LEVELS if not quality_allows(level, "lossless")
+)
 
 
 @functools.cache
@@ -73,7 +82,7 @@ def _request_quality_is_exact() -> bool:
         if batch is not None and batch.sampling_params is not None
         else context.quality
     )
-    return not quality_allows(quality, "lossless")
+    return quality in _EXACT_QUALITY_LEVELS
 
 
 def torch_default_sdpa_backends():
@@ -134,6 +143,8 @@ class SDPAImpl(AttentionImpl):
             and not self.dropout
             and torch.version.hip is None
         )
+        # (query shape, key length, dtype, device) -> _split_padding_len.
+        self._split_padding_plans: dict[tuple, int] = {}
 
     def _unsplit_query_len(self, query: torch.Tensor, key_len: int) -> int:
         """Query length that keeps sharded heads on the full layer's kernel.
@@ -145,25 +156,50 @@ class SDPAImpl(AttentionImpl):
         Applies to "exact" quality requests only.
         ``query`` is [B, H, S, D]; ``key_len`` is the key sequence length.
         """
-        batch, heads, query_len, head_dim = query.shape
+        query_shape = query.shape
+        if not self._may_pad_split_queries:
+            return query_shape[2]
+        return self._padded_query_len(query, query_shape, key_len) or query_shape[2]
+
+    def _padded_query_len(
+        self, query: torch.Tensor, query_shape: torch.Size, key_len: int
+    ) -> int:
+        """Padded length for this call, or 0 when it runs unpadded."""
+        if torch.compiler.is_compiling():
+            padded_len = self._split_padding_len(query, query_shape, key_len)
+        else:
+            plan_key = (query_shape, key_len, query.dtype, query.device)
+            padded_len = self._split_padding_plans.get(plan_key)
+            if padded_len is None:
+                padded_len = self._split_padding_len(query, query_shape, key_len)
+                if len(self._split_padding_plans) >= _MAX_SPLIT_PADDING_PLANS:
+                    self._split_padding_plans.clear()
+                self._split_padding_plans[plan_key] = padded_len
+        # The request lookup comes last: only calls that would pad pay for it.
+        if padded_len and _request_quality_is_exact():
+            return padded_len
+        return 0
+
+    def _split_padding_len(
+        self, query: torch.Tensor, query_shape: torch.Size, key_len: int
+    ) -> int:
+        """Length that moves the shard off the split kernel, or 0 if it need not move."""
+        batch, heads, query_len, head_dim = query_shape
         if (
-            not self._may_pad_split_queries
-            or heads >= self.global_num_heads
+            heads >= self.global_num_heads
             or not query.is_cuda
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
             or key_len <= _FLASH_UNSPLIT_KEY_LEN
         ):
-            return query_len
+            return 0
         threshold = _FLASH_SPLIT_OCCUPANCY * _multi_processor_count(query.device.index)
         blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)
-        # The request lookup comes last: only calls that would pad pay for it.
         if (
             batch * heads * blocks >= threshold
             or batch * self.global_num_heads * blocks < threshold
-            or not _request_quality_is_exact()
         ):
-            return query_len
+            return 0
         return math.ceil(threshold / (batch * heads)) * _FLASH_QUERY_BLOCK
 
     def _sdpa_context(self, query: torch.Tensor):
@@ -182,13 +218,14 @@ class SDPAImpl(AttentionImpl):
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        query_shape, key_shape = query.shape, key.shape
         attn_mask = None
         is_causal = self.causal
-        if self.causal and query.shape[-2] != key.shape[-2]:
+        if self.causal and query_shape[-2] != key_shape[-2]:
             is_causal = False
-            if query.shape[-2] > 1:
-                query_length = query.shape[-2]
-                key_length = key.shape[-2]
+            if query_shape[-2] > 1:
+                query_length = query_shape[-2]
+                key_length = key_shape[-2]
                 attn_mask = torch.ones(
                     query_length,
                     key_length,
@@ -202,22 +239,22 @@ class SDPAImpl(AttentionImpl):
             "is_causal": is_causal,
             "scale": self.softmax_scale,
         }
-        if query.shape[1] != key.shape[1]:
+        if query_shape[1] != key_shape[1]:
             attn_kwargs["enable_gqa"] = True
-        batch, heads, query_len, head_dim = query.shape
-        padded_len = query_len
-        if attn_mask is None and not is_causal:
-            padded_len = self._unsplit_query_len(query, key.shape[-2])
-        if padded_len > query_len:
+        padded_len = 0
+        if self._may_pad_split_queries and attn_mask is None and not is_causal:
+            padded_len = self._padded_query_len(query, query_shape, key_shape[2])
+        if padded_len:
             # Pad in the caller's [B, S, H, D] layout: flash allocates its output
             # with the query's strides, and callers view the result as [B, S, H * D].
+            batch, heads, query_len, head_dim = query_shape
             padding = query.new_zeros(batch, padded_len - query_len, heads, head_dim)
             query = torch.cat([query.transpose(1, 2), padding], dim=1).transpose(1, 2)
         with self._sdpa_context(query):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs
             )
-        if padded_len > query_len:
+        if padded_len:
             return output[:, :, :query_len].transpose(1, 2).contiguous()
         return output.transpose(1, 2)
 
