@@ -247,38 +247,44 @@ async def run_async_client_warmup(
     *,
     rewarm: bool = False,
     step_limit: int | None = None,
+    check_backend: Callable[[], None] | None = None,
 ) -> None:
     """Warm every replica with the full request list.
 
     `forward(req, replica=i)` must deliver to replica i: each replica compiles
     and allocates on its own GPUs, and each counts the same `warmup_total`.
     """
-    warmup_input_path = None
-    if should_include_warmup_image(server_args, server_based_warmup=True):
-        warmup_input_path = prepare_warmup_image_path(server_args)
-    warmup_audio_path = None
-    if should_include_warmup_audio(server_args):
-        warmup_audio_path = prepare_warmup_audio_path(server_args)
+    try:
+        warmup_input_path = None
+        if should_include_warmup_image(server_args, server_based_warmup=True):
+            warmup_input_path = prepare_warmup_image_path(server_args)
+        warmup_audio_path = None
+        if should_include_warmup_audio(server_args):
+            warmup_audio_path = prepare_warmup_audio_path(server_args)
 
-    warmup_reqs = build_client_warmup_reqs(
-        server_args,
-        warmup_input_path=warmup_input_path,
-        warmup_audio_path=warmup_audio_path,
-        rewarm=rewarm,
-        step_limit=step_limit,
-    )
-    # let every replica finish before judging, so a failed one does not
-    # leave its siblings warming in the background of live traffic
-    results = await asyncio.gather(
-        *(
-            _warm_replica(server_args, forward, replica, warmup_reqs)
-            for replica in range(len(server_args.scheduler_endpoints))
-        ),
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, BaseException):
-            raise result
+        warmup_reqs = build_client_warmup_reqs(
+            server_args,
+            warmup_input_path=warmup_input_path,
+            warmup_audio_path=warmup_audio_path,
+            rewarm=rewarm,
+            step_limit=step_limit,
+        )
+        # let every replica finish before judging, so a failed one does not
+        # leave its siblings warming in the background of live traffic
+        results = await asyncio.gather(
+            *(
+                _warm_replica(server_args, forward, replica, warmup_reqs)
+                for replica in range(len(server_args.scheduler_endpoints))
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+    except Exception:
+        if check_backend is not None:
+            check_backend()
+        raise
 
 
 def _warm_replica_sync(
