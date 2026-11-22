@@ -57,7 +57,18 @@ def _forward_error_ends_the_replica(error: Exception) -> bool:
     """
     if isinstance(error, torch.OutOfMemoryError):
         return get_replica_group().world_size > 1
-    return is_unrecoverable_device_error(error)
+    # Only RuntimeError messages are matched: a request error may quote the
+    # caller's text (e.g. a Cosmos3 domain name) that contains a marker.
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, torch.AcceleratorError) or (
+            isinstance(error, RuntimeError)
+            and is_unrecoverable_device_error(str(error))
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 class PipelineExecutor(ABC):

@@ -103,6 +103,8 @@ def _run_grouped_requests(worker, monkeypatch, error, replica_size):
 
     def execute(stages, batch, server_args):
         if batch.request_id == "first":
+            if callable(error):
+                raise error()
             raise error
         return OutputBatch()
 
@@ -153,6 +155,32 @@ def test_grouped_request_oom_on_a_single_rank_fails_only_that_request(
 
     assert "allocator OOM" in outputs[0].error
     assert outputs[1].error is None
+
+
+def test_grouped_request_quoting_a_domain_name_fails_only_that_request(
+    worker, monkeypatch
+):
+    worker, _ = worker
+
+    outputs = _run_grouped_requests(
+        worker, monkeypatch, ValueError("domain cuda error: x"), 1
+    )
+
+    assert "domain cuda error: x" in outputs[0].error
+    assert outputs[1].error is None
+
+
+def test_grouped_request_wrapped_device_error_exits_the_worker(worker, monkeypatch):
+    worker, _ = worker
+
+    def wrapped():
+        try:
+            raise RuntimeError(_DRIVER_ERROR)
+        except RuntimeError as cause:
+            raise ValueError("unknown domain") from cause
+
+    with pytest.raises(SystemExit, match="restart the server"):
+        _run_grouped_requests(worker, monkeypatch, wrapped, 1)
 
 
 class _Exited(Exception):
