@@ -327,6 +327,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.profiler_manager = MagicMock()
         s.forward_sleep_time = None
         s.enable_overlap = True
+        s.penalty_status_pool = None  # no request uses a penalty
         s.future_map = Mock()
         s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
         # Each launch's rows, and whether each has an earlier step unprocessed.
@@ -397,7 +398,12 @@ class TestRunningReqsHooks(CustomTestCase):
         move([waiting], s.waiting_queue)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
+        s.policy = Mock(
+            _bounded_active=False,
+            calc_priority=lambda waiting, *args, **kwargs: list(waiting),
+            admission_candidates=lambda waiting: iter(waiting),
+            prefill_token_budget=lambda **kwargs: None,
+        )
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -469,7 +475,9 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         s.enable_hierarchical_cache = False
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.chunked_prefill_size = None
         s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        s.dllm_config = None
         Scheduler.init_schedule_policy(s)
         return s.enable_priority_preemption
 

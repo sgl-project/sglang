@@ -396,6 +396,7 @@ pub struct TreeCoreInitParamsBinding {
     pub slru_protected_threshold: i64,
     pub tlru_tail_budget: usize,
     pub tlru_float_config: Option<TlruFloatConfigBinding>,
+    pub state_cost: Option<(f64, f64)>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -419,6 +420,7 @@ impl TreeCoreInitParamsBinding {
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
             tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
+            state_cost: self.state_cost,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -441,7 +443,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, state_cost = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -460,12 +462,14 @@ impl TreeCoreInitParamsBinding {
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
         joint_lru: bool,
+        state_cost: Option<(f64, f64)>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
             tlru_tail_budget,
             tlru_float_config,
+            state_cost,
             page_size,
             is_write_back,
             enable_hicache,
@@ -1809,6 +1813,16 @@ macro_rules! tree_core_methods {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().node_backuped(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                py.detach(|| self.core().needs_incremental_component_backup(node_id))
                     .map_err(node_access_error)
             }
 
@@ -3240,6 +3254,15 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            /// Whether an auxiliary component has device data missing from host.
+            fn needs_incremental_component_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.needs_incremental_component_backup(py, node_id))
             }
 
             /// Whether the node is a (default or named) root.

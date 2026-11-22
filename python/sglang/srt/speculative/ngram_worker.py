@@ -25,7 +25,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_utils import (
+    commit_accept_tokens_to_penalties,
+    eagle_sample,
+)
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
@@ -49,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+# Tail of each request's context inserted into the trie once its prefill ends.
+NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
 
 def _derive_tree_links(
@@ -155,6 +160,8 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
+        # Drain queued inserts first, or they land after the reset.
+        self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
 
@@ -403,15 +410,28 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=self.draft_token_num,
         )
 
+    def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
+        """Seed the trie with each request's context once its prefill finishes."""
+        batch_tokens = []
+        for req in batch.reqs:
+            # A middle chunk would re-insert the same tail on every chunk.
+            if req is batch.chunked_req:
+                continue
+            # Unpadded: multimodal pad values are cache identities, not tokens.
+            tail = list(req.output_ids[-NGRAM_EXTEND_PROMPT_WINDOW:])
+            need = NGRAM_EXTEND_PROMPT_WINDOW - len(tail)
+            if need > 0:
+                tail = list(req.origin_input_ids_unpadded[-need:]) + tail
+            if tail:
+                batch_tokens.append(tail)
+        if batch_tokens:
+            self.ngram_corpus.batch_put(batch_tokens)
+
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        # Prompt context is inserted at extend by _insert_extend_prompt_tails.
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -477,6 +497,14 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
+            # NGRAM watermark contexts use the full-mask layout.
+            watermark = (
+                self.model_runner.watermark.bind_verify(
+                    batch.sampling_info.watermark, full_mask=True
+                )
+                if self.model_runner.watermark is not None
+                else None
+            )
             if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
                 post_verify_output = self._speculative_runtime_hooks.post_verify(
                     make_post_verify_io(
@@ -487,8 +515,7 @@ class NGRAMWorker(BaseSpecWorker):
                         device=batch.device,
                         logits_output=logits_output,
                         grammar_mask=grammar_mask,
-                        watermark=self.model_runner.watermark_state,
-                        # NGRAM watermark contexts use the full-mask layout.
+                        watermark=watermark,
                         watermark_full_mask=True,
                         return_logprob=batch.return_logprob,
                         is_idle=batch.forward_mode.is_idle(),
@@ -507,8 +534,11 @@ class NGRAMWorker(BaseSpecWorker):
                     batch,
                     logits_output,
                     grammar_mask,
-                    watermark_state=self.model_runner.watermark_state,
+                    watermark=watermark,
                 )
+            commit_accept_tokens_to_penalties(
+                batch.sampling_info, predict, accept_index
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -518,11 +548,9 @@ class NGRAMWorker(BaseSpecWorker):
                 self.draft_token_num,
             )
             accept_tokens = predict[accept_index]
-            if (
-                self.model_runner.watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-            ):
-                self.model_runner.watermark_state.append_speculative(
+            if watermark is not None:
+                self.model_runner.watermark.append_accept_tokens(
+                    batch.sampling_info.watermark,
                     batch.req_pool_indices,
                     accept_tokens,
                     accept_lens,
@@ -566,6 +594,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            if batch.forward_mode.is_extend():
+                self._insert_extend_prompt_tails(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

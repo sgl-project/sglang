@@ -20,7 +20,10 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
+from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Tuple
+
+import msgspec
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -179,6 +182,11 @@ class PrefillBudget:
     def state_slots_exhausted(self) -> bool:
         return False
 
+    def admits_more(self) -> bool:
+        """Whether the pass may admit another request: capacity remains
+        (`has_capacity`) and a state slot is left (`state_slots_exhausted`)."""
+        return self.has_capacity() and not self.state_slots_exhausted()
+
     def state_slots_fit(self, state_slots: int) -> bool:
         return True
 
@@ -286,11 +294,13 @@ class PrefillBudget:
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         """Charge one admitted chunk or request. ``unfinished_input_len`` and
         ``deferred_max_new_tokens`` describe the rest of a request this chunk
-        does not finish; a budget that commits whole requests charges them,
-        at the chunk limit admission chose (``admitted_chunk_limit``)."""
+        does not finish; a budget that commits whole requests always charges
+        them, at the chunk limit admission chose (``admitted_chunk_limit``),
+        and this one charges them only with ``commit_unfinished``."""
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         immediate = (
             extend_input_len
@@ -300,6 +310,11 @@ class PrefillBudget:
         )
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
+        if commit_unfinished:
+            # Later passes allocate the rest, so only the total carries it.
+            self.total_offset += (
+                self.ceil_paged_tokens(unfinished_input_len) + deferred_max_new_tokens
+            )
 
 
 class SWAPrefillBudget(PrefillBudget):
@@ -514,14 +529,20 @@ class SWAPrefillBudget(PrefillBudget):
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         # Charges only this chunk, already cut to the admitted limit; the
         # static estimate keeps ``chunk_limit`` (see `can_allocate_prefill`).
+        # A committed rest goes whole to the FULL pool; a window pool, and the
+        # total of a pure-SWA pool, take one more chunk's peak (`swa_tokens`).
         super().reserve(
             extend_input_len,
             max_new_tokens,
             extra_tokens=extra_tokens,
             state_slots=state_slots,
+            unfinished_input_len=unfinished_input_len,
+            deferred_max_new_tokens=deferred_max_new_tokens,
+            commit_unfinished=commit_unfinished and not self.all_swa,
         )
         # A continuation already owns its ring slot.
         if not (self.req_ring and is_chunked_continuation):
@@ -530,6 +551,15 @@ class SWAPrefillBudget(PrefillBudget):
                 max_new_tokens,
                 chunk_limit=chunk_limit,
             )
+        if commit_unfinished and not self.req_ring:
+            window_rest = self.swa_tokens(
+                self.ceil_paged_tokens(unfinished_input_len),
+                deferred_max_new_tokens,
+                chunk_limit=chunk_limit,
+            )
+            self.swa_offset += window_rest
+            if self.all_swa:
+                self.total_offset += window_rest
 
 
 class ChainPrefillBudget(PrefillBudget):
@@ -546,6 +576,10 @@ class ChainPrefillBudget(PrefillBudget):
     requires_final_shape_check = True
     admits_whole_requests = True
     prices_by_demand = True
+    # While one decision asks several questions of memory that does not change
+    # between them (`_one_memory_state`), and the evictable credit it read.
+    _one_state = False
+    _held_evictable: Optional[Dict[str, int]] = None
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
@@ -574,6 +608,10 @@ class ChainPrefillBudget(PrefillBudget):
         # The rows this pass's forward writes, without the commitments and
         # decode that come later (`current_offset` is the token sub-pool's).
         self.window_current_offsets = dict(self.window_offsets)
+        # Request demands built in this pass, by `request_demand`'s arguments.
+        self._demands: Dict[tuple, KVDemand] = {}
+        # The allocator's answers in this pass, by question and memory state.
+        self._answers: Dict[tuple, bool] = {}
 
     def _available_and_evictable(self):
         # Sub-pools share bytes, so no token count says whether a demand fits;
@@ -597,24 +635,48 @@ class ChainPrefillBudget(PrefillBudget):
         cached_tokens=0,
     ) -> KVDemand:
         """What one request still needs over this pool's windows, built for
-        ``purpose`` as every site builds it (`demand.demand_inputs`)."""
-        return demand_inputs(
+        ``purpose`` as every site builds it (`demand.demand_inputs`).
+
+        A pass asks one request's demand at several checks (admission, its
+        shape check, the chunk-limit searches of a request that waits); each
+        distinct demand is built once per budget, which lives for one pass.
+        A demand depends only on these arguments and the pool parameters fixed
+        at construction, and its window map is read-only, so it is shared."""
+        key = (
             purpose,
             extend_input_len,
             max_new_tokens,
-            windows=dict(self.windows),
-            page_size=self.page_size,
-            chunk_limit=chunk_limit,
-            prefill_retire_lag=self.retirement.prefill_retire_lag,
-            decode_retire_lag=self.retirement.decode_retire_lag,
-            eviction_interval=self.retirement.eviction_interval,
-            checkpoint_interval=self.checkpoint_interval,
-            state_slots=state_slots,
-            request_rows=request_rows if self.has_request_rows else 0,
-            cached_tokens=cached_tokens,
-            host_hit_lengths=host_hit_lengths,
-            extra_tokens=extra_tokens,
-        ).demand()
+            chunk_limit,
+            tuple(sorted(host_hit_lengths.items())) if host_hit_lengths else (),
+            state_slots,
+            request_rows if self.has_request_rows else 0,
+            extra_tokens,
+            cached_tokens,
+        )
+        demand = self._demands.get(key)
+        if demand is None:
+            demand = demand_inputs(
+                purpose,
+                extend_input_len,
+                max_new_tokens,
+                windows=dict(self.windows),
+                page_size=self.page_size,
+                chunk_limit=chunk_limit,
+                prefill_retire_lag=self.retirement.prefill_retire_lag,
+                decode_retire_lag=self.retirement.decode_retire_lag,
+                eviction_interval=self.retirement.eviction_interval,
+                checkpoint_interval=self.checkpoint_interval,
+                state_slots=state_slots,
+                request_rows=request_rows if self.has_request_rows else 0,
+                cached_tokens=cached_tokens,
+                host_hit_lengths=host_hit_lengths,
+                extra_tokens=extra_tokens,
+            ).demand()
+            demand = msgspec.structs.replace(
+                demand, window_tokens=MappingProxyType(demand.window_tokens)
+            )
+            self._demands[key] = demand
+        return demand
 
     def window_tokens(
         self,
@@ -721,10 +783,46 @@ class ChainPrefillBudget(PrefillBudget):
             request_rows + rows_pending,
         )
 
-        evictable = None
-        if not empty_pool:
-            evictable = evictable_by_sub_pool(self.tree_cache, self.allocator)
-        return self.allocator.admits(demand, evictable=evictable, empty_pool=empty_pool)
+        evictable = None if empty_pool else self._evictable()
+        # The allocator's answer depends only on the question and its pricing
+        # key (`ChainAllocator.pricing_key`), so it is priced once per memory state.
+        key = (
+            demand.full_tokens,
+            tuple(demand.window_tokens.values()),
+            demand.state_slots,
+            demand.request_rows,
+            # None for the empty pool.
+            None if evictable is None else tuple(evictable.items()),
+            self.allocator.pricing_key(),
+        )
+        fits = self._answers.get(key)
+        if fits is None:
+            fits = self.allocator.admits(
+                demand, evictable=evictable, empty_pool=empty_pool
+            )
+            self._answers[key] = fits
+        return fits
+
+    def _evictable(self) -> Dict[str, int]:
+        if not self._one_state:
+            return evictable_by_sub_pool(self.tree_cache, self.allocator)
+        if self._held_evictable is None:
+            self._held_evictable = evictable_by_sub_pool(
+                self.tree_cache, self.allocator
+            )
+        return self._held_evictable
+
+    def _one_memory_state(self, decide, *args, **kwargs):
+        """``decide(*args, **kwargs)``, whose questions all see one memory
+        state: the evictable credit is read once for them."""
+        if self._one_state:
+            return decide(*args, **kwargs)
+        self._one_state = True
+        try:
+            return decide(*args, **kwargs)
+        finally:
+            self._one_state = False
+            self._held_evictable = None
 
     def _admits(self, demand: KVDemand, **kwargs) -> bool:
         return self._fits(
@@ -824,7 +922,13 @@ class ChainPrefillBudget(PrefillBudget):
     def state_slots_exhausted(self) -> bool:
         return not self.state_slots_fit(1)
 
-    def check_prefill(
+    def admits_more(self) -> bool:
+        return self._one_memory_state(super().admits_more)
+
+    def check_prefill(self, **request) -> tuple[bool, int | None]:
+        return self._one_memory_state(self._check_prefill, **request)
+
+    def _check_prefill(
         self,
         *,
         extend_input_len: int,
@@ -998,7 +1102,10 @@ class ChainPrefillBudget(PrefillBudget):
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         return chunk_limit if chunk_limit > 0 else None
 
-    def fit_chunk(
+    def fit_chunk(self, req, **chunk) -> int | None:
+        return self._one_memory_state(self._fit_chunk, req, **chunk)
+
+    def _fit_chunk(
         self,
         req,
         *,
@@ -1079,9 +1186,11 @@ class ChainPrefillBudget(PrefillBudget):
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         """Charge an admitted chunk now and commit its whole request (the rest of
-        the prompt and its decode stay pending), priced as admission priced it."""
+        the prompt and its decode stay pending), priced as admission priced it;
+        ``commit_unfinished`` changes nothing here."""
         if admitted_chunk_limit is not None:
             chunk_limit = admitted_chunk_limit
         extend_input_len = self.ceil_paged_tokens(extend_input_len)

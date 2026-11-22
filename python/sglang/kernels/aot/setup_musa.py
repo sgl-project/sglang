@@ -35,11 +35,10 @@ arch = platform.machine().lower()
 class _RepoInfo:
     """Configuration for a third-party git repository."""
 
-    def __init__(self, name, git_repository, git_tag, git_shallow=False):
+    def __init__(self, name, git_repository, git_tag):
         self.name = name
         self.git_repository = git_repository
         self.git_tag = git_tag
-        self.git_shallow = git_shallow
         self.source_dir = third_party / name
 
 
@@ -47,14 +46,12 @@ _FLASHINFER_REPO = _RepoInfo(
     name="flashinfer",
     git_repository="https://github.com/flashinfer-ai/flashinfer.git",
     git_tag="bc29697ba20b7e6bdb728ded98f04788e16ee021",
-    git_shallow=False,
 )
 
 _MUTLASS_REPO = _RepoInfo(
     name="mutlass",
     git_repository="https://github.com/MooreThreads/mutlass.git",
     git_tag="3abd6a728aacd190df0d922514aca8a8bc3c46b7",
-    git_shallow=False,
 )
 
 
@@ -183,23 +180,82 @@ ext_modules = [
 ]
 
 
+def _remote_urls(repo_url):
+    """Remote URLs to try for a repository, in order.
+
+    The build nodes reach github.com slowly, so a mirror prefix taken from
+    SGLANG_MUSA_GIT_PROXY is tried first and the direct URL is the fallback.
+    `SGLANG_MUSA_GIT_PROXY=direct` disables the prefix.
+    """
+    prefix = os.environ.get("SGLANG_MUSA_GIT_PROXY", "").strip()
+    if not prefix or prefix.lower() == "direct":
+        return [repo_url]
+    return [prefix + repo_url, repo_url]
+
+
 class _CustomBuildExt(BuildExtension):
     """Custom build extension that clones third-party repositories before building."""
 
     @staticmethod
-    def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
-        """Clone a git repository and checkout a specific tag/commit."""
-        repo_path.parent.mkdir(parents=True, exist_ok=True)
-        if not repo_path.exists():
-            clone_cmd = ["git", "clone"]
-            if git_shallow:
-                clone_cmd += ["--depth", "1"]
-            clone_cmd += [repo_url, str(repo_path)]
-            subprocess.check_call(clone_cmd)
-            subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
-        else:
-            subprocess.check_call(["git", "fetch", "--all"], cwd=repo_path)
-            subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
+    def _clone_and_checkout(repo_path, repo_url, git_tag):
+        """Fetch the pinned commit of a repository and check it out.
+
+        Only that commit is fetched: a full clone of these repositories stalls on
+        CI links, and the build needs nothing but the pin. Re-running on an
+        existing checkout re-fetches the pin instead of cloning again.
+        """
+        last_error = None
+        for url in _remote_urls(repo_url):
+            try:
+                if (repo_path / ".git").exists():
+                    subprocess.check_call(
+                        [
+                            "git",
+                            "-C",
+                            str(repo_path),
+                            "remote",
+                            "set-url",
+                            "origin",
+                            url,
+                        ]
+                    )
+                else:
+                    repo_path.mkdir(parents=True, exist_ok=True)
+                    subprocess.check_call(["git", "init", "-q", str(repo_path)])
+                    subprocess.check_call(
+                        ["git", "-C", str(repo_path), "remote", "add", "origin", url]
+                    )
+                subprocess.check_call(
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "fetch",
+                        "-q",
+                        "--depth",
+                        "1",
+                        "origin",
+                        git_tag,
+                    ]
+                )
+                subprocess.check_call(
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "checkout",
+                        "-q",
+                        "--force",
+                        "FETCH_HEAD",
+                    ]
+                )
+                return
+            except subprocess.CalledProcessError as error:
+                last_error = error
+                print(
+                    f"[sgl-kernel] fetching from {url} failed, trying the next remote"
+                )
+        raise last_error
 
     def run(self):
         if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":
@@ -212,13 +268,11 @@ class _CustomBuildExt(BuildExtension):
                 _MUTLASS_REPO.source_dir,
                 _MUTLASS_REPO.git_repository,
                 _MUTLASS_REPO.git_tag,
-                _MUTLASS_REPO.git_shallow,
             )
             self._clone_and_checkout(
                 _FLASHINFER_REPO.source_dir,
                 _FLASHINFER_REPO.git_repository,
                 _FLASHINFER_REPO.git_tag,
-                _FLASHINFER_REPO.git_shallow,
             )
             print("Third-party repositories ready.")
 

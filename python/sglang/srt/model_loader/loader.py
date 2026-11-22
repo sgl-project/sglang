@@ -204,29 +204,6 @@ def _get_quantization_config(
             }
         )
 
-    if _is_npu:
-        packed_modules_mapping.update(
-            {
-                "visual": {
-                    "qkv_proj": ["qkv"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                },
-                "vision_model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "proj": ["out_proj"],
-                },
-                "model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                    "fused_qkv_a_proj_with_mqa": [
-                        "q_a_proj",
-                        "kv_a_proj_with_mqa",
-                    ],
-                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
-                },
-            }
-        )
-
     if model_config.quantization is not None:
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping, remap_prefix
@@ -407,6 +384,14 @@ def _validate_default_loader_extra_config(
         return
 
     allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format in (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.MISTRAL,
+        LoadFormat.FLASH_RL,
+    ):
+        # Only the buffered multithreaded safetensors iterator honors it.
+        allowed_keys.add("max_inflight_bytes")
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
@@ -416,6 +401,16 @@ def _validate_default_loader_extra_config(
                 "enable_gds in --model-loader-extra-config must be a boolean"
             )
 
+    max_inflight_bytes = extra_config.get("max_inflight_bytes")
+    if max_inflight_bytes is not None and (
+        not isinstance(max_inflight_bytes, int)
+        or isinstance(max_inflight_bytes, bool)
+        or max_inflight_bytes <= 0
+    ):
+        raise ValueError(
+            "max_inflight_bytes in --model-loader-extra-config must be a "
+            "positive integer"
+        )
     unexpected_keys = set(extra_config.keys()) - allowed_keys
     if unexpected_keys:
         raise ValueError(
@@ -458,6 +453,8 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -469,6 +466,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                safetensors_index_file=getattr(
+                    model, "safetensors_index_file", SAFE_WEIGHTS_INDEX_NAME
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -522,6 +522,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: Optional[str],
         fall_back_to_pt: bool,
         allow_patterns_overrides: Optional[list[str]] = None,
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
@@ -533,7 +534,7 @@ class DefaultModelLoader(BaseModelLoader):
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = SAFE_WEIGHTS_INDEX_NAME
+        index_file = safetensors_index_file
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
@@ -547,7 +548,8 @@ class DefaultModelLoader(BaseModelLoader):
         elif load_format == LoadFormat.MISTRAL:
             use_safetensors = True
             allow_patterns = ["consolidated*.safetensors"]
-            index_file = "consolidated.safetensors.index.json"
+            if index_file is not None:
+                index_file = "consolidated.safetensors.index.json"
         elif load_format == LoadFormat.PT:
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
@@ -591,7 +593,7 @@ class DefaultModelLoader(BaseModelLoader):
                     use_safetensors = True
                 break
 
-        if use_safetensors:
+        if use_safetensors and index_file is not None:
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
             # safetensors file. Using both breaks.
@@ -657,6 +659,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.safetensors_index_file,
             )
             if use_safetensors and source.model_config is not None:
                 hf_weights_files = maybe_add_mtp_safetensors(
@@ -748,8 +751,14 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to the multithreaded loader "
+                        "only; ignored because it is not in use."
+                    )
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
@@ -760,6 +769,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         else:
             if use_multithread:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to safetensors checkpoints "
+                        "only; ignored for .bin weights."
+                    )
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -835,6 +849,7 @@ class DefaultModelLoader(BaseModelLoader):
                 source.revision,
                 source.fall_back_to_pt,
                 source.allow_patterns_overrides,
+                source.safetensors_index_file,
             )
             if use_safetensors and source.model_config is not None:
                 weight_files = maybe_add_mtp_safetensors(
@@ -1247,13 +1262,18 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         revision: Optional[str],
         fall_back_to_pt: bool,
         allow_patterns_overrides: Optional[list[str]] = None,
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
     ):
         """Standard weight preparation using base model path."""
         logger.info(f"[QuantizedRL] Loading from base model: {model_name_or_path}")
         temp_config = LoadConfig(load_format=LoadFormat.AUTO)
         temp_loader = DefaultModelLoader(temp_config)
         return temp_loader._prepare_weights(
-            model_name_or_path, revision, fall_back_to_pt, allow_patterns_overrides
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+            safetensors_index_file,
         )
 
     @staticmethod
@@ -1565,6 +1585,13 @@ class DummyModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _checkpoint_shard_rank() -> int:
+    """The shard index of this rank's weights in a sharded or remote checkpoint:
+    the TP rank, offset by the pipeline stage so stages do not collide."""
+    parallel = get_parallel()
+    return parallel.pp_rank * parallel.tp_size + parallel.tp_rank
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -1672,7 +1699,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -1725,7 +1752,7 @@ class ShardedStateLoader(BaseModelLoader):
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -3425,7 +3452,7 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.KV
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         return client.weight_iterator(rank)
 
     def _get_weights_iterator_fs(
@@ -3448,7 +3475,7 @@ class RemoteModelLoader(BaseModelLoader):
         with create_remote_connector(url) as client:
             assert get_connector_type(client) == ConnectorType.KV
             model_name = parse_model_name(url)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
@@ -3980,37 +4007,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
     ObjectStorageModel.download_and_get_path() before instantiation.
     """
 
-    @dataclasses.dataclass
-    class Source:
-        """A source for weights."""
-
-        model_or_path: str
-        """The model ID or path."""
-
-        revision: Optional[str]
-        """The optional model revision."""
-
-        prefix: str = ""
-        """A prefix to prepend to all weights."""
-
-        fall_back_to_pt: bool = True
-        """Whether .pt weights can be used."""
-
-        model_config: Optional[ModelConfig] = None
-        """The model configuration (for checking architecture, etc)."""
-
-        @classmethod
-        def init_new(cls, model_config: ModelConfig, model):
-            model_weights = model_config.model_path
-            if hasattr(model_config, "model_weights"):
-                model_weights = model_config.model_weights
-            return cls(
-                model_weights,
-                model_config.revision,
-                prefix="",
-                fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
-                model_config=model_config,
-            )
+    Source = DefaultModelLoader.Source
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -4037,11 +4034,13 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 self._is_distributed = extra_config.get("distributed")
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str]
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        allow_patterns_overrides: Optional[list[str]] = None,
+        safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
     ) -> Tuple[str, List[str]]:
-        """Prepare weights for the model.
-
-        If the model is not local, it will be downloaded."""
+        """Resolve weight files, preserving object-storage URIs for streaming."""
         from sglang.srt.utils.runai_utils import (
             ObjectStorageModel,
             is_runai_obj_uri,
@@ -4052,8 +4051,18 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         if self._is_distributed is None:
             self._is_distributed = is_object_storage_path
         is_local = os.path.isdir(model_name_or_path)
-        safetensors_pattern = "*.safetensors"
-        index_file = SAFE_WEIGHTS_INDEX_NAME
+        allow_patterns = (
+            allow_patterns_overrides
+            if allow_patterns_overrides is not None
+            else ["*.safetensors"]
+        )
+        for pattern in allow_patterns:
+            if glob.has_magic(os.path.dirname(pattern)):
+                raise ValueError(
+                    "RunAI streamer loading does not support directory wildcards "
+                    f"in weight pattern: {pattern!r}"
+                )
+        index_file = safetensors_index_file
 
         hf_folder = (
             model_name_or_path
@@ -4061,7 +4070,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             else download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
-                [safetensors_pattern],
+                allow_patterns,
                 revision,
                 ignore_patterns=self.load_config.ignore_patterns,
             )
@@ -4074,27 +4083,41 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             checksums_source = get_model().model_checksum or model_name_or_path
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
-        hf_weights_files = list_safetensors(path=hf_folder)
+        hf_weights_files = []
+        for pattern in allow_patterns:
+            subfolder = os.path.dirname(pattern)
+            search_path = os.path.join(hf_folder, subfolder) if subfolder else hf_folder
+            hf_weights_files = [
+                path
+                for path in list_safetensors(path=search_path)
+                if fnmatch.fnmatch(os.path.basename(path), os.path.basename(pattern))
+            ]
+            if hf_weights_files:
+                break
 
         # For models like Mistral-7B-Instruct-v0.3
         # there are both sharded safetensors files and a consolidated
         # safetensors file. Using both breaks.
         # Here, we download the `model.safetensors.index.json` and filter
         # any files not found in the index.
-        if not is_local and not is_object_storage_path:
-            download_safetensors_index_file_from_hf(
-                model_name_or_path,
+        if index_file is not None:
+            if not is_local and not is_object_storage_path:
+                download_safetensors_index_file_from_hf(
+                    model_name_or_path,
+                    index_file,
+                    self.load_config.download_dir,
+                    revision,
+                )
+            if is_object_storage_path:
+                index_file = os.path.abspath(
+                    os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
+                )
+            hf_weights_files = filter_duplicate_safetensors_files(
+                hf_weights_files,
+                hf_folder,
                 index_file,
-                self.load_config.download_dir,
-                revision,
+                allow_patterns=allow_patterns_overrides,
             )
-        if is_object_storage_path:
-            index_file = os.path.abspath(
-                os.path.join(ObjectStorageModel.get_path(hf_folder), index_file)
-            )
-        hf_weights_files = filter_duplicate_safetensors_files(
-            hf_weights_files, hf_folder, index_file
-        )
 
         if len(hf_weights_files) == 0:
             raise RuntimeError(
@@ -4112,7 +4135,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         )
 
         hf_folder, hf_weights_files = self._prepare_weights(
-            source.model_or_path, source.revision
+            source.model_or_path,
+            source.revision,
+            source.allow_patterns_overrides,
+            source.safetensors_index_file,
         )
 
         if source.model_config is not None:
@@ -4124,7 +4150,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
 
         weights_iterator = runai_safetensors_weights_iterator(
-            hf_weights_files, self._is_distributed, self.target_device_str
+            hf_weights_files,
+            self._is_distributed,
+            self.target_device_str,
+            load_group=self.load_config.load_group,
         )
 
         if self.load_config.draft_model_idx is not None:
@@ -4159,14 +4188,21 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
-        primary_weights = RunaiModelStreamerLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
-
-        secondary_weights = cast(
-            Iterable[RunaiModelStreamerLoader.Source],
-            getattr(model, "secondary_weights", ()),
+        sources = [self.Source.init_new(model_config, model)]
+        sources.extend(
+            cast(
+                Iterable[RunaiModelStreamerLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            )
         )
-        for source in secondary_weights:
+        for source in sources:
+            if (
+                hasattr(model_config, "model_weights")
+                and source.model_or_path == model_config.model_path
+            ):
+                source = dataclasses.replace(
+                    source, model_or_path=model_config.model_weights
+                )
             yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -4322,13 +4358,14 @@ def get_model_loader(
         return RunaiModelStreamerLoader(load_config)
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        return IpcModelLoader(
+        return WeightCacheModelLoader(
             load_config=load_config,
             socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
+            weight_cache_transport=load_config.weight_cache_transport,
         )
 
     return DefaultModelLoader(load_config)
