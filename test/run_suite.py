@@ -89,10 +89,8 @@ PER_COMMIT_SUITES = {
         # bridge files while sharing this discovery and dispatch entry point.
         "base-b-diffusion-test-1-gpu-large",
         "base-b-diffusion-test-1-gpu-small",
-        "base-b-diffusion-test-1-gpu-b200",
+        "base-b-diffusion-test-4-gpu-b200",
         "base-b-diffusion-test-2-gpu-large",
-        "base-b-diffusion-bcg-test-1-gpu-large",
-        "base-b-diffusion-component-test-2-gpu-large",
         "base-b-diffusion-unit-test-1-gpu-large",
         "base-b-diffusion-unit-test-1-gpu-b300",
         "base-c-test-4-gpu-h100",
