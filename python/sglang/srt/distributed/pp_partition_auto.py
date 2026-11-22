@@ -298,9 +298,13 @@ def best_partition(
     value, part = search.best(speed, kv_floor)
     if not part:
         raise RuntimeError(
-            f"no PP split of {len(kinds)} layers over {len(speed)} stages keeps every "
-            f"layer kind, {kv_floor:.0f} KV tokens and the activation headroom on "
-            "every stage"
+            f"no PP split of {len(kinds)} layers over {len(speed)} stages keeps "
+            + ", ".join(
+                ["every layer kind", "a positive cost"]
+                + ([f"{kv_floor:.0f} KV tokens"] if kv_floor > 0 else [])
+                + (["the activation headroom"] if search.headroom_on else [])
+            )
+            + " on every stage"
         )
     _, part = search.best(speed, kv_floor, cap=value)
     return part, value
@@ -363,7 +367,9 @@ def _speed_factors(
 ) -> Tuple[List[float], List[int]]:
     """Per-stage factors around the median stage (higher = slower), clamped to
     _FACTOR_BOUNDS; also returns the stages that were clamped. The median keeps an
-    outlier from shifting the healthy stages, which would loosen its own bound."""
+    outlier from shifting the healthy stages, which would loosen its own bound. With
+    two stages the median is their mean, so an outlier cannot be told apart there and
+    the clamp bounds the pair's ratio at 1.25 / 0.8."""
     median = statistics.median(stage_speed)
     low, high = _FACTOR_BOUNDS
     raw = [1.0 + scale * (v / median - 1.0) for v in stage_speed]

@@ -222,8 +222,11 @@ class TestResolve(CustomTestCase):
         rows = [_row(s, 1.0) for s in (1, 2, 3)] + [_row(0, 0.0, "boom")]
         with self.assertRaisesRegex(RuntimeError, "rank 3: boom"):
             self._resolve(rows)
-        for speed in (("1.0", "2.0"), ("1.0", "x", "1.0", "1.0")):
-            with self.assertRaisesRegex(RuntimeError, "rank 0: .*"):
+        for speed, message in (
+            (("1.0", "2.0"), "needs 4 positive factors"),
+            (("1.0", "x", "1.0", "1.0"), "could not convert string to float"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, f"rank 0: .*{message}"):
                 self._resolve(None, all_gather=lambda row: [row], fixed_speed=speed)
 
     def test_an_outlier_is_clamped_against_the_healthy_stages(self):
