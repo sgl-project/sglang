@@ -5,10 +5,11 @@
 
 A `SamplingObserver` sees the logits between the penalty and the grammar mask.
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
-builds at each launch from the step's requests. logit_bias and the custom logit
-processor are plugins: stateless `(logits, sampling_info, *, rows_per_request)`
-functions, which speculative verify calls with several rows per request.
-Penalty, grammar, and watermark are adapters over their existing code.
+builds at each launch from the step's requests. The grammar mask, logit_bias,
+and the custom logit processor are plugins: stateless `(logits, sampling_info)`
+functions; speculative verify calls the last two with several rows per request
+(`rows_per_request`) and builds its own grammar mask. Penalty and watermark are
+adapters over their existing code.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import msgspec
 import torch
 
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
+from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.penalties import apply_scaling_penalties
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -139,9 +141,6 @@ def _adjust_before_watermark(
     observer: Optional[SamplingObserver],
 ) -> Any:
     """Penalty, grammar mask, then logit_bias; returns the observer's state."""
-    # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
-    #       was executed after we processed last batch's results.
-    sampling_info.update_regex_vocab_mask()
     if sampling_info.step_penalties is not None:
         additive, scaling = sampling_info.step_penalties.logit_penalties()
         if additive is not None:
@@ -151,16 +150,8 @@ def _adjust_before_watermark(
     observer_state = (
         observer.before_grammar(logits, sampling_info) if observer is not None else None
     )
-    if sampling_info.grammar_mask is not None:
-        sampling_info.grammar_mask.apply(logits)
+    apply_grammar_mask(logits, sampling_info)
     apply_logit_bias(logits, sampling_info)
-
-    # Release the vocab_mask GPU tensor immediately after it has been applied
-    # to the logits. In overlap scheduling, the sampling_info (and its
-    # grammar_mask) can be kept alive by the delay_sample_func closure and
-    # batch_record_buf until the next iteration, causing a steady VRAM leak
-    # when structured output (grammar) is used.
-    sampling_info.grammar_mask = None
     return observer_state
 
 
