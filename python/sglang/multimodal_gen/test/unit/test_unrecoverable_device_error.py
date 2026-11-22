@@ -144,16 +144,21 @@ def test_grouped_request_fatal_error_exits_the_worker(
         _run_grouped_requests(worker, monkeypatch, error, replica_size)
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        torch.OutOfMemoryError("allocator OOM"),
+        torch.AcceleratorError("CUDA error: out of memory"),
+    ],
+)
 def test_grouped_request_oom_on_a_single_rank_fails_only_that_request(
-    worker, monkeypatch
+    worker, monkeypatch, error
 ):
     worker, _ = worker
 
-    outputs = _run_grouped_requests(
-        worker, monkeypatch, torch.OutOfMemoryError("allocator OOM"), 1
-    )
+    outputs = _run_grouped_requests(worker, monkeypatch, error, 1)
 
-    assert "allocator OOM" in outputs[0].error
+    assert str(error) in outputs[0].error
     assert outputs[1].error is None
 
 

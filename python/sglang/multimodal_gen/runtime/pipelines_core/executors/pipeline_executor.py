@@ -62,9 +62,13 @@ def _forward_error_ends_the_replica(error: Exception) -> bool:
     seen = set()
     while error is not None and id(error) not in seen:
         seen.add(id(error))
-        if isinstance(error, torch.AcceleratorError) or (
-            isinstance(error, RuntimeError)
-            and is_unrecoverable_device_error(str(error))
+        message = str(error)
+        if "out of memory" not in message.lower() and (
+            isinstance(error, torch.AcceleratorError)
+            or (
+                isinstance(error, RuntimeError)
+                and is_unrecoverable_device_error(message)
+            )
         ):
             return True
         error = error.__cause__ or error.__context__
