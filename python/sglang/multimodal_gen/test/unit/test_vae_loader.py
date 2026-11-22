@@ -1,5 +1,6 @@
 import pathlib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -48,6 +49,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import AutoencoderDC
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+    RotaryEmbeddingND,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
@@ -289,6 +293,11 @@ class TestDirectGPUVAEState(unittest.TestCase):
     def test_assigns_one_complete_state_without_a_cpu_state_dict(self):
         expected_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
         expected_scale = torch.tensor([3.0])
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        streamed = {
+            "proj.weight": expected_weight.to(device),
+            "scale": expected_scale.to(device),
+        }
         with TemporaryDirectory() as root:
             checkpoint = pathlib.Path(root) / "model.safetensors"
             safetensors_save_file(
@@ -296,16 +305,21 @@ class TestDirectGPUVAEState(unittest.TestCase):
             )
             with torch.device("meta"):
                 vae = self._StandardVAE()
-            _assign_direct_gpu_vae_state(
-                vae,
-                [str(checkpoint)],
-                component_name="vae",
-                device=torch.device("cpu"),
-                vae_config=QwenImagePipelineConfig().vae_config,
-            )
+            with patch.object(
+                vae_loader,
+                "safetensors_weights_iterator",
+                return_value=streamed.items(),
+            ):
+                _assign_direct_gpu_vae_state(
+                    vae,
+                    [str(checkpoint)],
+                    component_name="vae",
+                    device=device,
+                    vae_config=QwenImagePipelineConfig().vae_config,
+                )
 
-        self.assertTrue(torch.equal(vae.proj.weight, expected_weight))
-        self.assertTrue(torch.equal(vae.scale, expected_scale))
+        self.assertEqual(vae.proj.weight.data_ptr(), streamed["proj.weight"].data_ptr())
+        self.assertEqual(vae.scale.data_ptr(), streamed["scale"].data_ptr())
         self.assertFalse(any(tensor.is_meta for tensor in vae.state_dict().values()))
 
     def test_direct_load_adopts_folded_weight_norm_and_checkpoint_metadata(self):
@@ -370,6 +384,12 @@ class TestDirectGPUVAEState(unittest.TestCase):
         self.assertNotIn("runtime_cache", slots)
 
     def test_loader_streams_native_vae_without_the_legacy_cpu_state_dict(self):
+        class _RotaryVAE(self._StandardVAE):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.rope = RotaryEmbeddingND(dim=48)
+                self.weight_device_at_init = self.proj.weight.device.type
+
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())
         server_args.component_weights_paths = {}
@@ -377,51 +397,6 @@ class TestDirectGPUVAEState(unittest.TestCase):
         expected_weight = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
         expected_scale = torch.tensor([3.0], dtype=torch.bfloat16)
 
-        with (
-            TemporaryDirectory() as root,
-            patch.object(
-                vae_loader,
-                "get_diffusers_component_config",
-                return_value={"_class_name": "TestVAE"},
-            ),
-            patch.object(
-                vae_loader.ModelRegistry,
-                "resolve_model_cls",
-                return_value=(self._StandardVAE, None),
-            ),
-            patch.object(
-                vae_loader,
-                "_list_safetensors_files",
-                return_value=[str(pathlib.Path(root) / "model.safetensors")],
-            ),
-            patch.object(loader, "target_device", return_value=torch.device("cpu")),
-            patch.object(
-                vae_loader.current_platform,
-                "optimize_vae",
-                side_effect=lambda vae: vae,
-            ),
-            patch("safetensors.torch.load_file") as legacy_load,
-        ):
-            safetensors_save_file(
-                {"proj.weight": expected_weight, "scale": expected_scale},
-                pathlib.Path(root) / "model.safetensors",
-            )
-            loaded = loader.load_customized(root, server_args, "vae")
-
-        legacy_load.assert_not_called()
-        self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
-        self.assertTrue(torch.equal(loaded.scale, expected_scale))
-
-    def test_direct_load_keeps_non_persistent_buffers(self):
-        class _RotaryVAE(self._StandardVAE):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.register_buffer("inv_freq", torch.arange(3.0), persistent=False)
-
-        loader = vae_loader.VAELoader()
-        server_args = _FakeServerArgs(QwenImagePipelineConfig())
-        server_args.component_weights_paths = {}
-        server_args.component_direct_gpu_weight_loading = {"vae": True}
         with (
             TemporaryDirectory() as root,
             patch.object(
@@ -445,18 +420,52 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 "optimize_vae",
                 side_effect=lambda vae: vae,
             ),
+            patch("safetensors.torch.load_file") as legacy_load,
         ):
             safetensors_save_file(
-                {
-                    "proj.weight": torch.ones(2, 2, dtype=torch.bfloat16),
-                    "scale": torch.ones(1, dtype=torch.bfloat16),
-                },
+                {"proj.weight": expected_weight, "scale": expected_scale},
                 pathlib.Path(root) / "model.safetensors",
             )
             loaded = loader.load_customized(root, server_args, "vae")
 
-        self.assertFalse(loaded.inv_freq.is_meta)
-        self.assertTrue(torch.equal(loaded.inv_freq.float(), torch.arange(3.0)))
+        legacy_load.assert_not_called()
+        self.assertEqual(loaded.weight_device_at_init, "meta")
+        self.assertTrue(
+            torch.equal(loaded.rope.inv_freq, RotaryEmbeddingND(48).inv_freq)
+        )
+        self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
+        self.assertTrue(torch.equal(loaded.scale, expected_scale))
+
+    def test_meta_parameter_registration_keeps_aliases_and_is_scoped(self):
+        with vae_loader._init_vae_with_meta_parameters(), ThreadPoolExecutor(1) as pool:
+            self.assertFalse(pool.submit(nn.Linear, 2, 2).result().weight.is_meta)
+            vae = nn.Module()
+            weight = nn.Parameter(torch.ones(2), requires_grad=False)
+            vae.left = vae.right = weight
+            self.assertTrue(vae.left.is_meta)
+            self.assertFalse(vae.left.requires_grad)
+            with self.assertRaisesRegex(ComponentCheckpointUnsupportedError, "tied"):
+                _direct_gpu_vae_state_slots(vae, "vae")
+        self.assertFalse(nn.Linear(2, 2).weight.is_meta)
+
+    def test_runtime_buffer_inheriting_weight_device_replays_cpu_constructor(self):
+        class _VAE(self._StandardVAE):
+            def __init__(self, config):
+                super().__init__()
+                self.register_buffer(
+                    "table", torch.rand_like(self.proj.weight), persistent=False
+                )
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(123)
+            reference = vae_loader.initialize_model(
+                _VAE, {"config": None}, torch.float32
+            )
+            expected_next = torch.rand(1)
+            torch.manual_seed(123)
+            vae = vae_loader._initialize_direct_vae(_VAE, None, torch.float32)
+            self.assertTrue(torch.equal(torch.rand(1), expected_next))
+        self.assertTrue(torch.equal(vae.table, reference.table))
 
     def test_native_vae_ignores_diffusers_auto_map_for_weight_override(self):
         loader = vae_loader.VAELoader()

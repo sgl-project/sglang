@@ -62,7 +62,7 @@ def initialize_model(
     model_cls: type[nn.Module],
     init_params: dict[str, Any],
     dtype: torch.dtype,
-    device: torch.device | None = None,
+    device: torch.device | contextlib.AbstractContextManager | None = None,
 ) -> nn.Module:
     """Construct a checkpoint-backed module without initializing replaceable weights."""
     with (
