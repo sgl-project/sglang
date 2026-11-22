@@ -312,7 +312,9 @@ class SpectrumForecaster(nn.Module):
 @dataclass
 class SpectrumContext:
     current_step: int
+    num_inference_steps: int
     total_forward_steps: int
+    do_cfg: bool
     is_cfg_negative: bool
     spectrum_params: SpectrumParams
     debug: bool
@@ -479,7 +481,9 @@ class SpectrumMixin:
         return SpectrumContext(
             force_real=forward_context.force_spectrum_real,
             current_step=forward_context.current_timestep,
+            num_inference_steps=num_inference_steps,
             total_forward_steps=total_forward_steps,
+            do_cfg=do_cfg,
             is_cfg_negative=is_cfg_negative,
             spectrum_params=spectrum_params,
             debug=bool(getattr(forward_batch, "debug", False)),
