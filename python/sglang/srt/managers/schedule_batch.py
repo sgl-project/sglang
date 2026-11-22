@@ -1176,6 +1176,7 @@ class Req(ReqDllmMixin):
         cow_mamba: Optional[bool] = None,
         *,
         defer_cow_slot: bool = False,
+        probe: bool = False,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1221,6 +1222,7 @@ class Req(ReqDllmMixin):
                 cow_mamba=cow_mamba,
                 defer_cow_slot=defer_cow_slot,
                 max_prefix_len=key_limit,
+                probe=probe,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:

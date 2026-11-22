@@ -2230,7 +2230,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
                         )
                         for name in names
                     )
-                    expected.append(mock.call.linker.match(params.key, req, finalized))
+                    expected.append(
+                        mock.call.linker.match(params.key, req, finalized, probe=False)
+                    )
                     self.assertEqual(order.mock_calls, expected)
                     received = order.complete.call_args.args
                     self.assertIs(received[0], params)

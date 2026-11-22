@@ -2781,8 +2781,16 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.linker_lookup_tokens = Counter(
             name="sglang:linker_lookup_tokens_total",
             documentation="Device-uncached prefix tokens probed in the external "
-            "store, per lookup. A waiting request is probed again on each "
-            "scheduling pass that matches it.",
+            "store, per lookup. A scheduling pass that only orders the waiting "
+            "queue reuses a request's last lookup while its prefix and device hit "
+            "are unchanged; see sglang:linker_probe_reuses_total.",
+            labelnames=labels.keys(),
+        )
+        self.linker_probe_reuses = Counter(
+            name="sglang:linker_probe_reuses_total",
+            documentation="Matches that only order the waiting queue and were "
+            "answered from the request's last external store lookup instead of a "
+            "new one.",
             labelnames=labels.keys(),
         )
         self.linker_hit_tokens = Counter(
@@ -2866,6 +2874,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.linker_lookup_tokens.labels(**self.labels).inc(lookup_tokens)
         if hit_tokens > 0:
             self.linker_hit_tokens.labels(**self.labels).inc(hit_tokens)
+
+    def increment_linker_probe_reuses(self) -> None:
+        self.linker_probe_reuses.labels(**self.labels).inc()
 
     def increment_linker_load_tokens(self, num_tokens: int, mode: str) -> None:
         self.linker_load_tokens.labels(**self.labels, mode=mode).inc(num_tokens)
