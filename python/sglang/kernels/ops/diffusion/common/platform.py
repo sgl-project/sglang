@@ -25,21 +25,7 @@ from __future__ import annotations
 
 from typing import Callable, TypeVar
 
-import torch
-
-from sglang.kernels.arch import current_arch
-
 F = TypeVar("F", bound=Callable)
-
-
-def is_cuda_sm_at_least(
-    min_sm: tuple[int, int], device: torch.device | int | None = None
-) -> bool:
-    """True on NVIDIA CUDA when the GPU's compute capability is >= ``min_sm``.
-
-    ``device`` is ignored: all GPUs of a node are assumed to be the same model.
-    """
-    return current_arch().is_sm_at_least(*min_sm)
 
 
 def platform_key() -> str:

@@ -88,7 +88,7 @@ def test_dflash_draft_backend_uses_generic_attention_policy(explicit_backend, ex
             return_value=False,
         ),
         patch(
-            "sglang.srt.utils.hf_transformers.get_config",
+            "sglang.srt.hf_transformers.get_config",
             return_value=draft_config,
         ),
     ):

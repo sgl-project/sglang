@@ -170,6 +170,10 @@ class _EagleDraftWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.draft_attn_backend = draft_attn_backend
         self.topk = settings.topk
         self.speculative_num_steps = settings.speculative_num_steps
@@ -178,9 +182,13 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
+        self.draft_probs_need_vocab_scatter = False
         self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
+        self._build_verify_draft_probs = MethodType(
+            EagleDraftWorker._build_verify_draft_probs, self
+        )
         # draft_forward's topk=1 fast path reads these prealloc buffers (built
         # in EagleDraftWorker.__init__, which the harness skips), so build them
         # here. _rebuild_topk1_chain_buffers asserts num_draft_tokens ==
@@ -214,6 +222,10 @@ class _FrozenKVMTPWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.draft_attn_backend = draft_attn_backend
         self.topk = settings.topk
         self.speculative_num_steps = settings.speculative_num_steps

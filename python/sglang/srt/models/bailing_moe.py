@@ -72,6 +72,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,14 +85,10 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    is_non_idle_and_non_empty,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_non_idle_and_non_empty,
-    make_pp_layers,
-)
+from sglang.srt.utils import is_cuda
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -339,7 +337,10 @@ class BailingMoESparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
-                if get_moe_a2a_backend().is_deepep()
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
+                )
                 else "tp",
             )
         # dispatcher
@@ -362,7 +363,10 @@ class BailingMoESparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
+        ):
             return self.forward_normal(hidden_states, forward_batch)
         else:
             return self.forward_deepep(hidden_states, forward_batch)

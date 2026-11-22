@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -23,7 +24,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -36,25 +36,6 @@ def _resolve_tuple2(x: _Tuple2) -> tuple[int, int]:
         )
         return cast(tuple[int, int], tuple(x))
     return (x, x)
-
-
-def calculate_mel_frames_dasheng(
-    audio_length_samples: int,
-    n_fft: int = 512,
-    hop_size: int = 160,
-    dasheng_subsampling: int = 4,
-    center=True,
-    model_subsampling: int = 5,
-) -> int:
-    """Calculate the number of Mel-spectrogram frames."""
-    if center:
-        audio_length_samples = audio_length_samples + n_fft
-
-    return (
-        int(1 + ((audio_length_samples - n_fft) / hop_size))
-        // dasheng_subsampling
-        // model_subsampling
-    )
 
 
 class AudioPatchEmbed(nn.Module):

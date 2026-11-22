@@ -9,10 +9,28 @@ use http::StatusCode;
 
 use super::CoreError;
 use super::fanout::{ControlTarget, RankId, RankReply, RequestBuilder};
-use crate::message::config::DeploymentInfo;
+use crate::message::config::{ApiKeys, DeploymentInfo};
 
 /// The route a listener serves forwarded control requests on.
 pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
+
+/// The header a relayed control request presents its target listener's
+/// `peer_token` in: the route serves only requests that carry it, which only
+/// this launch's own listeners know.
+pub(crate) const PEER_TOKEN_HEADER: &str = "x-sglang-peer-token";
+
+/// The token this listener's relay route requires: its own entry's in the
+/// listener table. `None`, and every relayed request refused, for a listener
+/// the table does not list, which no peer relays to.
+pub(crate) fn own_peer_token(deployment_info: &DeploymentInfo) -> Option<&str> {
+    let own = deployment_info.dp_rank.unwrap_or(0);
+    deployment_info
+        .rust_server_endpoints
+        .iter()
+        .find(|endpoint| endpoint.dp_rank == own)?
+        .peer_token
+        .as_deref()
+}
 
 /// Peers only need a connection to come up; the scheduler-side wait (a
 /// flush's own `timeout_s`, a weight check) has no bound on the local path
@@ -23,30 +41,47 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct Peer {
     ranks: [RankId; 1],
     url: String,
+    /// The listener's [`PEER_TOKEN_HEADER`] value.
+    token: Option<http::HeaderValue>,
     client: reqwest::Client,
 }
 
 impl Peer {
-    pub(crate) fn new(client: reqwest::Client, dp_rank: RankId, base_url: &str) -> Self {
-        Self {
+    pub(crate) fn new(
+        client: reqwest::Client,
+        dp_rank: RankId,
+        base_url: &str,
+        token: Option<&str>,
+    ) -> Result<Self, String> {
+        let token = token
+            .map(|token| {
+                let mut value = http::HeaderValue::from_str(token).map_err(|_| {
+                    format!("control peer client: dp rank {dp_rank}'s peer token is not a valid header value")
+                })?;
+                value.set_sensitive(true);
+                Ok::<_, String>(value)
+            })
+            .transpose()?;
+        Ok(Self {
             ranks: [dp_rank],
             url: format!("{}{FORWARD_PEER_PATH}", base_url.trim_end_matches('/')),
+            token,
             client,
-        }
+        })
     }
 
     async fn forward(&self, build: &RequestBuilder<'_>) -> Result<Bytes, CoreError> {
         let header = build()
             .encode()
             .map_err(|error| CoreError::Internal(error.to_string()))?;
-        let response = self
+        let mut post = self
             .client
             .post(&self.url)
-            .header(http::header::CONTENT_TYPE, "application/msgpack")
-            .body(header)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .header(http::header::CONTENT_TYPE, "application/msgpack");
+        if let Some(token) = &self.token {
+            post = post.header(PEER_TOKEN_HEADER, token.clone());
+        }
+        let response = post.body(header).send().await.map_err(transport_error)?;
         let status = response.status();
         let body = response.bytes().await.map_err(transport_error)?;
         if status.is_success() {
@@ -89,10 +124,13 @@ impl ControlTarget for Peer {
     }
 }
 
-/// The target endpoints for every DP rank other than `own`.
+/// The target endpoints for every DP rank other than `own`. Peers check the
+/// relay against the same keys as clients, at the admin-optional level, so it
+/// presents the admin key when one is configured, else the API key.
 pub(crate) fn peer_endpoints(
     deployment_info: &DeploymentInfo,
     own: RankId,
+    keys: &ApiKeys,
 ) -> Result<Vec<Arc<dyn ControlTarget>>, String> {
     let endpoints: Vec<_> = deployment_info
         .rust_server_endpoints
@@ -102,20 +140,33 @@ pub(crate) fn peer_endpoints(
     if endpoints.is_empty() {
         return Ok(Vec::new());
     }
+    let mut headers = http::HeaderMap::new();
+    if let Some(key) = keys.admin_api_key.as_deref().or(keys.api_key.as_deref()) {
+        let mut value = http::HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| "control peer client: the API key is not a valid header value")?;
+        value.set_sensitive(true);
+        headers.insert(http::header::AUTHORIZATION, value);
+    }
     let client = reqwest::Client::builder()
+        // Peers are this engine's own listeners: never relay through the
+        // HTTP proxy the process may inherit.
+        .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
+        .default_headers(headers)
         .build()
         .map_err(|error| format!("control peer client: {error}"))?;
-    Ok(endpoints
+    endpoints
         .into_iter()
         .map(|endpoint| {
-            Arc::new(Peer::new(
+            Peer::new(
                 client.clone(),
                 endpoint.dp_rank,
                 &endpoint.endpoint,
-            )) as Arc<dyn ControlTarget>
+                endpoint.peer_token.as_deref(),
+            )
+            .map(|peer| Arc::new(peer) as Arc<dyn ControlTarget>)
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_the_encoded_message_and_returns_the_reply_body() {
         let (url, seen) = peer_listener((StatusCode::OK, Bytes::from_static(b"reply-bytes"))).await;
-        let peer = Peer::new(reqwest::Client::new(), 3, &url);
+        let peer = Peer::new(reqwest::Client::new(), 3, &url, None).unwrap();
         let replies = peer.control(&build).await;
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].rank, 3);
@@ -189,7 +240,7 @@ mod tests {
             (StatusCode::INTERNAL_SERVER_ERROR, CoreErrorKind::Internal),
         ] {
             let (url, _) = peer_listener((status, Bytes::from_static(b"why"))).await;
-            let peer = Peer::new(reqwest::Client::new(), 1, &url);
+            let peer = Peer::new(reqwest::Client::new(), 1, &url, None).unwrap();
             let error = peer.control(&build).await.remove(0).outcome.unwrap_err();
             assert_eq!(error.kind(), expected, "{status}");
             if status == StatusCode::BAD_REQUEST {
@@ -201,7 +252,7 @@ mod tests {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let unreachable = format!("http://{}", probe.local_addr().unwrap());
         drop(probe);
-        let peer = Peer::new(reqwest::Client::new(), 1, &unreachable);
+        let peer = Peer::new(reqwest::Client::new(), 1, &unreachable, None).unwrap();
         let error = peer.control(&build).await.remove(0).outcome.unwrap_err();
         assert!(matches!(error, CoreError::Unavailable), "{error}");
     }
@@ -222,24 +273,27 @@ mod tests {
                 RustServerEndpoint {
                     dp_rank: 2,
                     endpoint: url_b,
+                    peer_token: None,
                 },
                 RustServerEndpoint {
                     dp_rank: 1,
                     endpoint: "http://127.0.0.1:1".into(),
+                    peer_token: None,
                 },
                 RustServerEndpoint {
                     dp_rank: 0,
                     endpoint: url_a,
+                    peer_token: None,
                 },
             ],
             ..Default::default()
         };
         assert!(
-            peer_endpoints(&DeploymentInfo::default(), 0)
+            peer_endpoints(&DeploymentInfo::default(), 0, &ApiKeys::default())
                 .unwrap()
                 .is_empty()
         );
-        let peers = peer_endpoints(&info, 1).unwrap();
+        let peers = peer_endpoints(&info, 1, &ApiKeys::default()).unwrap();
         assert_eq!(peers.len(), 2);
         let replies = fan_out(1, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
         let messages: Vec<String> = replies
@@ -249,5 +303,69 @@ mod tests {
             .map(|status| status.message)
             .collect();
         assert_eq!(messages, ["from 0", "local", "from 2"]);
+    }
+
+    /// Peers are this engine's own listeners, so the relay must not go
+    /// through an HTTP proxy the process inherits: CI and some hosts set
+    /// `http_proxy`, and a proxy that refuses or cannot reach the peer turns
+    /// every DP control fan-out (`/server_info`, `/flush_cache`, ...) into its
+    /// error. reqwest reads the proxy variables when a client is built and they
+    /// are process-wide, so the check runs alone in a child test process.
+    #[test]
+    fn control_peers_bypass_an_inherited_http_proxy() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api_server::core::peer::tests::proxied_peer_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(PROXY_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{log}");
+        assert!(
+            log.contains("1 passed"),
+            "the child test did not run: {log}"
+        );
+    }
+
+    const PROXY_CHILD_ENV: &str = "SGLANG_TEST_PEER_PROXY_CHILD";
+
+    #[tokio::test]
+    #[ignore = "run by control_peers_bypass_an_inherited_http_proxy in its own process"]
+    async fn proxied_peer_child() {
+        if std::env::var_os(PROXY_CHILD_ENV).is_none() {
+            return;
+        }
+        // A proxy that refuses everything, as a forward proxy refuses a
+        // destination outside its allowlist.
+        let proxy = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy_listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(proxy_listener, proxy).into_future());
+        // SAFETY: this test runs alone in its own process.
+        unsafe {
+            for name in ["no_proxy", "NO_PROXY"] {
+                std::env::remove_var(name);
+            }
+            for name in ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"] {
+                std::env::set_var(name, &proxy_url);
+            }
+        }
+        let (url, seen) = peer_listener((StatusCode::OK, Bytes::from_static(b"reply"))).await;
+        let info = DeploymentInfo {
+            rust_server_endpoints: vec![RustServerEndpoint {
+                dp_rank: 1,
+                endpoint: url,
+                peer_token: None,
+            }],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0, &ApiKeys::default()).unwrap();
+        let reply = peers[0].control(&build).await.remove(0).outcome;
+        assert_eq!(reply.unwrap(), "reply");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }

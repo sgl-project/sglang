@@ -32,6 +32,8 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -146,7 +148,6 @@ class Scheduler(
         local_rank: int | None = None,
     ):
         self.server_args = server_args
-        self.port_args = port_args
 
         # local_rank is the physical GPU index for torch.cuda.set_device.
         # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
@@ -206,6 +207,8 @@ class Scheduler(
             SetLoraReq: self._handle_set_lora,
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            StartProfileReq: self._handle_start_profile,
+            StopProfileReq: self._handle_stop_profile,
             Req: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
@@ -307,6 +310,20 @@ class Scheduler(
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+
+    def _handle_start_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.start_profile(
+            output_dir=req.output_dir,
+            profile_id=req.profile_id,
+            activities=req.activities,
+            with_stack=req.with_stack,
+            record_shapes=req.record_shapes,
+        )
+
+    def _handle_stop_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.stop_profile(export_trace=req.export_trace)
 
     def _handle_release_realtime_session(self, reqs: List[Any]) -> OutputBatch:
         req = reqs[0]
@@ -1449,7 +1466,7 @@ class Scheduler(
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using
-        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        broadcast_pyobj. ``comfyui_mode`` multi-rank instead keeps CUDA
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:

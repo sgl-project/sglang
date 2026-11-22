@@ -27,9 +27,10 @@ construction -- a message that names neither the rail nor the mode. The eager
 path built it, so only cuda-graph runs failed.
 
 A bare `None` here is the defect: every mode this function serves can carry
-window layers, so each must pass the buffer, guarded on the model actually
-having a window. This is an AST check over the real function body, so a new
-mode branch that forgets the rail fails here rather than on a GPU.
+window layers, so each must pass its window rails (`windows`, one per window
+sub-pool, over the cuda-graph buffers). This is an AST check over the real
+function body, so a new mode branch that forgets the rails fails here rather
+than on a GPU.
 
     python -m pytest test/registered/unit/layers/attention/test_cuda_graph_window_rail_completeness.py -v
 """
@@ -50,7 +51,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _BUILDER = "_build_cuda_graph_forward_metadata"
-_RAIL = "window_kv_indices"
+_RAIL = "windows"
 
 
 def _builder_body():
@@ -97,7 +98,7 @@ class TestCudaGraphWindowRailCompleteness(CustomTestCase):
             [],
             f"{_BUILDER}: {_RAIL} is a bare None at line(s) {offenders}; a window "
             "layer in that mode reaches the Triton kernel with a null index "
-            "tensor. Pass the cuda-graph buffer, guarded on the sliding-window flag.",
+            "tensor. Pass the window rails over the cuda-graph buffers.",
         )
 
 

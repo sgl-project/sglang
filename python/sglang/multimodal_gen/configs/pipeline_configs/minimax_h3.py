@@ -39,6 +39,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
+    # How fl2va keyframes reach the target canvas: "stretch" resizes the first
+    # keyframe directly (followers cover-crop); "source_crop" center-crops
+    # every keyframe to the canvas aspect at source resolution, then resizes.
+    keyframe_fit: str = "stretch"
+    # Cut the decoded soundtrack to the video's duration. The audio latents
+    # cover whole hops, so the raw waveform runs a few hundred samples long.
+    trim_audio_to_video: bool = False
     native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
@@ -171,7 +178,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
-            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -196,7 +202,6 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
-            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -256,13 +261,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if (
-            int(server_args.ring_degree or 1) > 1
-            and selected_backend is not AttentionBackendEnum.FA
+        if int(server_args.ring_degree or 1) > 1 and selected_backend not in (
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.AITER,
         ):
             raise ValueError(
-                "MiniMax-H3 ring parallelism requires the FlashAttention "
-                "backend for the transformer"
+                "MiniMax-H3 ring parallelism requires the FlashAttention or "
+                "aiter backend for the transformer"
             )
         if selected_backend is None:
             return
@@ -340,6 +345,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
+def vsa_h3_device_supported() -> bool:
+    """Whether this GPU runs the VSA-H3 kernels FastH3 was distilled with."""
+    if not current_platform.is_cuda():
+        return False
+    from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and (capability.major, capability.minor) in VSA_H3_CAPABILITIES
+    )
+
+
+def vsa_h3_execution_supported(
+    *, enable_torch_compile, enable_breakable_cuda_graph, ring_degree
+) -> bool:
+    """VSA-H3 does not serve torch.compile, the breakable CUDA graph or ring."""
+    return not (
+        enable_torch_compile or enable_breakable_cuda_graph or int(ring_degree or 1) > 1
+    )
+
+
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
@@ -374,20 +401,12 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         # trained compression gate and runs slower.
         if self.resolve_transformer_attention_backend(server_args) is not None:
             return
-        if not current_platform.is_cuda():
+        if not vsa_h3_device_supported():
             return
-        from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
-
-        capability = current_platform.get_device_capability()
-        if (
-            capability is None
-            or (capability.major, capability.minor) not in VSA_H3_CAPABILITIES
-        ):
-            return
-        if (
-            server_args.enable_torch_compile
-            or server_args.enable_breakable_cuda_graph
-            or int(server_args.ring_degree or 1) > 1
+        if not vsa_h3_execution_supported(
+            enable_torch_compile=server_args.enable_torch_compile,
+            enable_breakable_cuda_graph=server_args.enable_breakable_cuda_graph,
+            ring_degree=server_args.ring_degree,
         ):
             logger.info(
                 "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
@@ -433,6 +452,11 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
     """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
 
+    # Pika's reference pipeline center-crops keyframes before resizing.
+    keyframe_fit: str = "source_crop"
+    # Pika's reference audio decode step trims to the video's duration.
+    trim_audio_to_video: bool = True
+
     def validate_server_args(self, server_args) -> None:
         # A BF16 merge rounds away about a third of the adapters' update (by
         # norm, under auto's 50% cutoff), so keep them unmerged like the
@@ -476,6 +500,8 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "minimaxh3image"
+                not in model_id.lower().replace("-", "").replace("_", "")
                 and "vdn" not in model_id.lower()
             )
         ],

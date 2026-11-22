@@ -248,7 +248,10 @@ python3 scripts/analyze_llm_torch_profile.py \
   --profile-workload both
 ```
 
-The script sends `POST /start_profile` to the SGLang server directly.
+The script sends `POST /start_profile` to the SGLang server directly. SGLang's
+profiler endpoints require the server's admin key: launch the server with
+`SGLANG_ADMIN_API_KEY` set (or pass `--admin-api-key`), export the same
+`SGLANG_ADMIN_API_KEY` here, and the script sends it as a bearer token.
 Keep `--output-dir` under `/data/...` so later analysis and docs can see the trace.
 The script writes `server_args.json`, warms up with the same workload shape,
 sends the active probe requests after profiling is armed, captures separate

@@ -13,11 +13,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.models.beam import BeamModel
 from sglang.srt.models.laguna import LagunaModel
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -130,6 +132,70 @@ class TestLagunaPerLayerAttentionDims(CustomTestCase):
                     model.get_hidden_dim("o_proj", layer_idx),
                     (head_dim * heads, hidden),
                 )
+
+
+class TestBeamLoraConstruction(CustomTestCase):
+    def test_lora_keeps_wrappable_projections_and_expert_dispatch(self):
+        """Packed projections hide adapter targets; deferred sums bypass LoRA.
+
+        Tiny serving fixtures never enter the hidden-size-5120 fusion path.
+        """
+        config = BeamConfig(
+            vocab_size=128,
+            hidden_size=5120,
+            num_hidden_layers=1,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            layer_types=["full_attention"],
+            mlp_layer_types=["sparse"],
+        )
+        pp_group = SimpleNamespace(
+            is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+        )
+        # CUDA metadata suffices for eligibility; no GPU storage or collective.
+        hidden = SimpleNamespace(
+            is_cuda=True,
+            dtype=torch.bfloat16,
+            shape=(4, 5120),
+            device=torch.device("cuda"),
+            is_contiguous=lambda: True,
+            data_ptr=lambda: 16,
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(enable_lora=enabled),
+                get_context().override_server_args(
+                    enable_lora=enabled, disable_custom_all_reduce=False
+                ),
+                get_parallel().override(
+                    tp_size=2,
+                    tp_rank=0,
+                    attn_tp_size=2,
+                    attn_tp_rank=0,
+                    attn_cp_size=1,
+                    attn_dp_size=1,
+                    moe_tp_size=2,
+                    moe_ep_size=1,
+                    pp_group=pp_group,
+                ),
+                patch("torch.cuda.is_available", return_value=False),
+                patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+                patch(
+                    "sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()
+                ),
+                torch.device("meta"),
+            ):
+                model = BeamModel(config)
+                projections = set(dict(model.layers[0].self_attn.named_children()))
+                self.assertEqual(
+                    projections & {"qkv_gate_proj", "qkv_proj", "gate_proj"},
+                    {"qkv_proj", "gate_proj"} if enabled else {"qkv_gate_proj"},
+                )
+                attention_limit, expert_limit = model._all_reduce_limits(hidden)
+                self.assertGreater(attention_limit, 0)
+                self.assertEqual(expert_limit > 0, not enabled)
+                self.assertTrue(model._can_replace_mlp_all_reduce())
 
 
 if __name__ == "__main__":
