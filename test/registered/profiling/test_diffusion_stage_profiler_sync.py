@@ -28,25 +28,38 @@ def test_stage_entry_sync_excludes_previous_stage_tail(monkeypatch):
     # warm the consumer kernels before measuring stage synchronization
     torch.ones(8, device="cuda").sum().cpu()
 
-    # Calibrate ~0.5 s of queued GPU work.
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
+    # Calibrate ~0.5 s of queued GPU work. Warm up first and time a long
+    # window: a ~4 ms window was dominated by launch/sync overhead and clock
+    # ramp-up, so it underestimated the cycle rate and queued far less work.
     torch.cuda._sleep(10_000_000)
     torch.cuda.synchronize()
-    cycles = int(10_000_000 / max(time.perf_counter() - t0, 1e-9) * 0.5)
+    calib_cycles = 200_000_000
+    t0 = time.perf_counter()
+    torch.cuda._sleep(calib_cycles)
+    torch.cuda.synchronize()
+    cycles = int(calib_cycles / max(time.perf_counter() - t0, 1e-9) * 0.5)
 
-    # Producer stage queues work without awaiting it (a denoise tail).
+    # Producer stage queues work without awaiting it (a denoise tail). Time the
+    # kernel itself with events so the checks don't depend on the calibration.
+    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     with StageProfiler("producer", logger, metrics, perf_dump_path_provided=True):
+        start.record()
         torch.cuda._sleep(cycles)
+        end.record()
     # Consumer stage's first blocking op used to absorb the producer's tail.
     with StageProfiler("consumer", logger, metrics, perf_dump_path_provided=True):
         torch.ones(8, device="cuda").sum().cpu()
 
+    kernel_ms = start.elapsed_time(end)
     producer_ms, consumer_ms = metrics.stages["producer"], metrics.stages["consumer"]
-    assert producer_ms > 250, (
-        f"queued work not attributed to producer: {metrics.stages}"
+    timings = f"{metrics.stages}, producer kernel {kernel_ms:.1f} ms"
+    assert kernel_ms > 50, f"too little queued work to measure: {timings}"
+    assert producer_ms > 0.8 * kernel_ms, (
+        f"queued work not attributed to producer: {timings}"
     )
-    assert consumer_ms < 100, f"producer tail leaked into consumer: {metrics.stages}"
+    assert consumer_ms < 0.2 * kernel_ms, (
+        f"producer tail leaked into consumer: {timings}"
+    )
 
 
 if __name__ == "__main__":

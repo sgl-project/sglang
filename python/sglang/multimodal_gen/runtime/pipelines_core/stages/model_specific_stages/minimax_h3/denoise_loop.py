@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -139,13 +139,14 @@ def _minimax_h3_renoise_target_rows_(
     ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
     The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
     """
-    state.add_(velocity, alpha=sigma)
+    # Keep the release's separate FP32 multiply/add rounding.
+    state.copy_(state + sigma * velocity)
     if sigma_next == 0.0:
         return
     noise = torch.randn(
         state.shape, generator=generator, device=state.device, dtype=torch.float32
     )
-    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
+    state.mul_(1.0 - sigma_next).add_(sigma_next * noise)
 
 
 def _build_local_embedding_layout(
@@ -188,6 +189,13 @@ def _build_local_embedding_layout(
     }
 
 
+class _StepTimesteps(NamedTuple):
+    unique: torch.Tensor
+    inverse_indices: torch.Tensor
+    block_combined_indices: torch.Tensor
+    fp32_bits: tuple[int, ...]
+
+
 class MiniMaxH3DenoiseBranch:
     """Static per-branch state: packed layout + fixed forward kwargs.
 
@@ -201,7 +209,7 @@ class MiniMaxH3DenoiseBranch:
     def __init__(
         self,
         *,
-        packed: dict[str, torch.Tensor],
+        packed: dict[str, Any],
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
@@ -328,6 +336,12 @@ class MiniMaxH3DenoiseBranch:
                 "cu_seqlens_q": cu.to(device),
                 "cu_seqlens_q_host": tuple(int(value) for value in cu.tolist()),
                 "max_seqlen_q": int(cu[1]),
+                # Host metadata describes the global sequence reconstructed
+                # by Ulysses, not this rank's token shard. Keep text length
+                # for layout provenance; MindIE's video_spans mode uses
+                # txt_len=0 and treats everything outside spans as dense.
+                "txt_len": text_len,
+                "video_spans": packed.get("video_spans"),
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
@@ -347,7 +361,7 @@ class MiniMaxH3DenoiseBranch:
         *,
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
-        step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        step_timesteps: _StepTimesteps,
         adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
@@ -370,14 +384,14 @@ class MiniMaxH3DenoiseBranch:
             audio_x[0].index_copy_(
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
-        unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
         kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
-            "unique_timesteps": unique_timesteps,
-            "inverse_indices": inverse_indices,
-            "block_combined_indices": block_combined_indices,
+            "unique_timesteps": step_timesteps.unique,
+            "adaln_timestep_bits": step_timesteps.fp32_bits,
+            "inverse_indices": step_timesteps.inverse_indices,
+            "block_combined_indices": step_timesteps.block_combined_indices,
         }
         if adaln_slot is not None:
             # Device scalar, never a Python int: an int would key one breakable
@@ -394,7 +408,7 @@ class MiniMaxH3DenoiseBranch:
         audio_ref_cond_timestep: float,
         inverse_indices_by_pattern: dict[tuple[int, ...], torch.Tensor],
         block_combined_by_pattern: dict[tuple[int, ...], torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _StepTimesteps:
         """Build step-local timestep and AdaLN index tensors.
 
         Packed-sequence timestep semantics: non-media rows (text and padding)
@@ -421,7 +435,7 @@ class MiniMaxH3DenoiseBranch:
                 fill_groups.append((seq_idx, len(candidates)))
                 candidates.append(float(value))
         unique_cpu, slot_to_unique = torch.unique(
-            torch.tensor(candidates, dtype=torch.float32),
+            torch.tensor(candidates, dtype=torch.float32, device="cpu"),
             sorted=True,
             return_inverse=True,
         )
@@ -444,7 +458,12 @@ class MiniMaxH3DenoiseBranch:
                 alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
             )
             block_combined_by_pattern[pattern] = block_combined
-        return unique_cpu.to(device), inverse_indices, block_combined
+        return _StepTimesteps(
+            unique_cpu.to(device),
+            inverse_indices,
+            block_combined,
+            tuple(unique_cpu.view(torch.int32).tolist()),
+        )
 
     def prepare_timestep_plan(
         self,
@@ -456,7 +475,7 @@ class MiniMaxH3DenoiseBranch:
         # True: condition rows keep ``imgvid_cond_noise_aug`` on every step
         # instead of ``max(t, imgvid_cond_noise_aug)``.
         pin_imgvid_cond: bool = False,
-    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> list[_StepTimesteps]:
         """Stage every step's packed timestep state before denoising."""
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("video/audio timestep plans must have equal length")
@@ -622,7 +641,7 @@ def minimax_h3_denoise_loop(
                     None if adaln_plan_slots is None else adaln_plan_slots[step]
                 ),
             )
-            if attn_metadata is not None:
+            if attn_metadata is not None and hasattr(attn_metadata, "current_timestep"):
                 attn_metadata.current_timestep = step
             if model_forward is None and attn_metadata is not None:
                 forward_cm: AbstractContextManager = set_forward_context(

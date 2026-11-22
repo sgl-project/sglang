@@ -23,6 +23,10 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -44,8 +48,7 @@ def _make_mock_req(
     origin_len: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
-    req = MagicMock()
-    req.rid = rid
+    req = MagicMock(rid=rid, owner_list=None)
     req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.cache_salt = None
     req.origin_input_ids = list(range(origin_len))
@@ -118,6 +121,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
     manager.offload_inflight = WeakKeyDict()
+    manager.offloading_reqs = IndexedReqList(ListKind.PD_OFFLOADING)
     manager.request_retirer = release_only_retirer(tree_cache)
 
     return manager, freed_indices
@@ -181,6 +185,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertTrue(manager.offload_kv_cache(old_req))
         old_req.finished.return_value = True
+        manager.finalize_release_on_finish(old_req)
 
         # A completed request leaves the API before its asynchronous D2H copy
         # necessarily finishes, so a caller can reuse the same rid here.
@@ -224,12 +229,14 @@ class TestReleaseFinishedReq(unittest.TestCase):
             HiCacheAck(None, _FinishedEvent(), [8])
         ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager.finalize_release_on_finish(req)
 
         manager._check_offload_progress(1)
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
         self.assertEqual(manager.offload_inflight[req], 1)
+        self.assertIn(req, manager.offloading_reqs)
 
     def test_finished_request_releases_all_committed_slots_after_last_offload_ack(
         self,
@@ -257,9 +264,11 @@ class TestReleaseFinishedReq(unittest.TestCase):
             HiCacheAck(None, _FinishedEvent(), [9])
         ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager.finalize_release_on_finish(req)
 
         manager._check_offload_progress(1)
 
+        self.assertNotIn(req, manager.offloading_reqs)
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
@@ -327,8 +336,6 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 self.assertEqual(len(freed), 1)
                 self.assertTrue(torch.equal(freed[0], torch.arange(20)))
                 self.assertIsNone(req.kv.req_pool_idx)
-                manager.finalize_release_on_finish(req)
-                self.assertEqual(len(freed), 1)
 
 
 if __name__ == "__main__":

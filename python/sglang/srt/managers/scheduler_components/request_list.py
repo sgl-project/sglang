@@ -34,6 +34,7 @@ class ListKind(enum.Enum):
     PD_HELD = enum.auto()
     PD_RECEIVING = enum.auto()
     PD_RELEASING = enum.auto()
+    PD_OFFLOADING = enum.auto()
     HISPARSE_STAGING = enum.auto()
     GRAMMAR = enum.auto()
     DLLM = enum.auto()
@@ -51,6 +52,7 @@ PD_KINDS = frozenset(
         ListKind.PD_HELD,
         ListKind.PD_RECEIVING,
         ListKind.PD_RELEASING,
+        ListKind.PD_OFFLOADING,
     }
 )
 
@@ -59,15 +61,15 @@ def assert_empty(lists: Mapping[ListKind, ReqList], kinds: Iterable[ListKind]) -
     """A teardown runs behind an idle gate that leaves these lists empty; a
     request still in one would be dropped and never answered."""
     nonempty = sorted(kind.name for kind in kinds if lists.get(kind))
-    assert not nonempty, f"Requests still in {nonempty} at teardown"
+    if nonempty:
+        raise RuntimeError(f"Requests still in {nonempty} at teardown")
 
 
 class ReqList(ABC):
     """A list of live requests. Every live request is in at most one list,
     which its `owner_list` names: joining a second list raises. Requests come
     in and move between lists through `move`, and an ended request leaves
-    through the retirer; the underscored edits are for those two and the
-    places `test_request_list` lists."""
+    through the retirer; the underscored edits are for those two only."""
 
     kind: ListKind
 
@@ -86,10 +88,6 @@ class ReqList(ABC):
 
     def abort(self, recv_req: AbortReq) -> None:
         """Abort the requests `recv_req` names."""
-
-    @abstractmethod
-    def _drop_all(self) -> None:
-        """Drop every request without ending it."""
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
@@ -128,14 +126,6 @@ class KeyedReqList(ReqList):
                 del self._reqs[req]
                 req.owner_list = None
 
-    def _leave_finished(self) -> None:
-        self._leave([req for req in self._reqs if req.finished()])
-
-    def _drop_all(self) -> None:
-        for req in self._reqs:
-            req.owner_list = None
-        self._reqs.clear()
-
     def __iter__(self) -> Iterator[Req]:
         return iter(self._reqs)
 
@@ -157,15 +147,20 @@ class IndexedReqList(ReqList):
         *,
         abort: Optional[Callable[[AbortReq], None]] = None,
         req_of: Callable[[Any], Req] = lambda x: x,
+        on_leave: Optional[Callable[[List[Req]], None]] = None,
     ) -> None:
         self.kind = kind
         self._abort = abort
         self._req_of = req_of
+        self._on_leave = on_leave
         # May still hold items whose request left: a leave only clears the
         # owner; the next iteration, index, join or reorder drops them in one
         # pass.
         self._items: List[Any] = []
         self._num_left = 0
+
+    def set_on_leave(self, callback: Optional[Callable[[List[Req]], None]]) -> None:
+        self._on_leave = callback
 
     def _compact(self) -> None:
         if self._num_left:
@@ -197,18 +192,13 @@ class IndexedReqList(ReqList):
 
     def _leave(self, reqs: Iterable[Req]) -> None:
         """Drop the items of the given requests; ones not in are ignored."""
+        if self._on_leave is not None:
+            reqs = list(reqs)
+            self._on_leave([req for req in reqs if req.owner_list is self])
         for req in reqs:
             if req.owner_list is self:
                 req.owner_list = None
                 self._num_left += 1
-
-    def _drop_all(self) -> None:
-        for item in self._items:
-            req = self._req_of(item)
-            if req.owner_list is self:
-                req.owner_list = None
-        self._items = []
-        self._num_left = 0
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:

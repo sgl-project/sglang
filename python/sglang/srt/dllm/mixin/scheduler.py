@@ -59,6 +59,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
+        self._ack_waiting_health_checks()
         self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
@@ -188,7 +189,12 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
+            req.finish_outside_step(
+                FINISH_LENGTH(
+                    length=len(req.output_ids),
+                    ignored_stop_position=req.ignored_stop_token_len,
+                )
+            )
 
         if req.finished():
             self.request_retirer.release(
@@ -359,6 +365,7 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
         )
         new_batch.prepare_for_extend()
+        self.sampler_params_pool.write(new_batch.reqs)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
@@ -474,14 +481,6 @@ class DllmManager:
             return True
         return len(self.waiting_queue) == 0
 
-    def filter_finished_reqs(self) -> None:
-        self.take(lambda req: req.finished())
-
-    def take(self, pred: Callable[[Req], bool]) -> List[Req]:
-        taken = [req for req in self.waiting_queue if pred(req)]
-        self.waiting_queue._leave(taken)
-        return taken
-
     def _abort(self, recv_req: AbortReq) -> None:
-        for req in self.take(lambda req: recv_req.matches(req.rid)):
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
             self._abort_one(req)

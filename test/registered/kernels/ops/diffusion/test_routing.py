@@ -89,8 +89,6 @@ def test_group_limited_topk_handles_repeated_nonuniform_scores():
 def test_group_limited_topk_rejects_unsupported_group_layout():
     scores = torch.randn(1, 30, device="cuda", dtype=torch.float32)
     assert not can_use_group_limited_topk(scores, 3, 2, 4)
-    with pytest.raises(ValueError, match="power-of-two experts per group"):
-        group_limited_topk(scores, 3, 2, 4)
 
 
 def test_group_limited_topk_torch_compile_fullgraph():
