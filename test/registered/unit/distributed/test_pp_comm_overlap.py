@@ -8,9 +8,17 @@ from unittest.mock import Mock, call, patch
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator, _split_tensor_dict
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
 from sglang.srt.managers import utils as managers_utils
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -183,6 +191,80 @@ class TestPPCommOverlap(CustomTestCase):
         sent, ops = self._send_last_stage_output(message)
         self.assertEqual(ops, ["send"])
         self.assertIs(sent["next_token_token_ids_logprobs_idx"], token_ids)
+
+    def test_first_stage_processes_logprob_rows_received_as_lists(self):
+        """The first stage builds its LogitsProcessorOutput from the received
+        message, whose logprob rows are lists; prefill and decode result
+        processing must take them as they take host tensor rows."""
+        top_val = [torch.tensor([-0.5, -1.5]), torch.tensor([-0.25, -2.0])]
+        top_idx = [torch.tensor([7, 3]), torch.tensor([1, 9])]
+        ids_val = [torch.tensor([-3.0, -4.0]), torch.tensor([-5.0, -6.0])]
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_logprobs=torch.tensor([-0.5, -0.25]),
+                next_token_top_logprobs_val=top_val,
+                next_token_top_logprobs_idx=top_idx,
+                next_token_token_ids_logprobs_val=ids_val,
+                next_token_token_ids_logprobs_idx=[[5, 6], [5, 6]],
+            )
+        )
+        message = managers_utils.get_logprob_dict_from_result(result)
+        pp_mod.pp_output_rows_to_lists(
+            message, SimpleNamespace(synchronize=lambda: None)
+        )
+        received = pickle.loads(pickle.dumps(message))
+        processor = object.__new__(SchedulerBatchResultProcessor)
+        object.__setattr__(
+            processor, "logprob_result_processor", SchedulerLogprobResultProcessor
+        )
+        batch = SimpleNamespace(
+            return_logprob=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        )
+
+        prefill_output, _, _ = managers_utils.get_logprob_from_pp_outputs(
+            pp_mod.PPProxyTensors(dict(received))
+        )
+        processor.move_logprobs_to_cpu(batch=batch, logits_output=prefill_output)
+        self.assertEqual(prefill_output.next_token_top_logprobs_idx, [[7, 3], [1, 9]])
+        self.assertEqual(
+            prefill_output.next_token_token_ids_logprobs_val,
+            [[-3.0, -4.0], [-5.0, -6.0]],
+        )
+
+        decode_output, _, _ = managers_utils.get_logprob_from_pp_outputs(
+            pp_mod.PPProxyTensors(dict(received))
+        )
+        next_token_ids, next_token_logprobs = processor._normalize_decode_outputs(
+            batch=batch,
+            result=result,
+            still_in_batch_rows=[True, True],
+            logits_output=decode_output,
+            next_token_ids=torch.tensor([7, 1]),
+        )
+        logprob = SimpleNamespace(
+            top_logprobs_num=2,
+            token_ids_logprob=[5, 6],
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+            output_token_ids_logprobs_val=[],
+            output_token_ids_logprobs_idx=[],
+        )
+        processor._apply_decode_logprobs(
+            req=SimpleNamespace(logprob=logprob),
+            i=1,
+            batch=batch,
+            next_token_id=next_token_ids[1],
+            next_token_logprobs=next_token_logprobs,
+            logits_output=decode_output,
+        )
+        self.assertEqual(logprob.output_token_logprobs_val, [-0.25])
+        self.assertEqual(logprob.output_top_logprobs_val, [[-0.25, -2.0]])
+        self.assertEqual(logprob.output_top_logprobs_idx, [[1, 9]])
+        self.assertEqual(logprob.output_token_ids_logprobs_val, [[-5.0, -6.0]])
 
     def test_npu_pp2_outputs_match_across_paired_and_one_sided_transfers(self):
         """Output receives during graph replay must avoid model collectives,
