@@ -694,7 +694,6 @@ class Qwen3VLModel(QwenVLModelBase):
         use_tensor_parallel: bool = False,
         prefix: str = "",
         vision_replicated: bool = False,
-        vision_transformers_numerics: bool = False,
     ):
         super().__init__()
         vision_quant_config = (
@@ -707,7 +706,6 @@ class Qwen3VLModel(QwenVLModelBase):
             quant_config=vision_quant_config,
             prefix=add_prefix("visual", prefix),
             replicated=vision_replicated,
-            transformers_numerics=vision_transformers_numerics,
         )
         self.language_model = Qwen3VLTextModel(
             config.text_config,

@@ -59,15 +59,8 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         ModelTaskType.T2I,
         ModelTaskType.I2I,
     )
-    # the image release's reference is this native path, not the Diffusers /
-    # Transformers pipeline the video releases follow, so its vision tower
-    # keeps the TP-folded layout and its own rounding
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
-        default_factory=lambda: (
-            MiniMaxH3Qwen3VLConfig(
-                vision_replicated=False, vision_transformers_numerics=False
-            ),
-        )
+        default_factory=lambda: (MiniMaxH3Qwen3VLConfig(vision_replicated=False),)
     )
     # The image decoder runs with BF16 weights under BF16 autocast.
     vae_decode_precision: str = "bf16"
