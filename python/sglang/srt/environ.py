@@ -1862,6 +1862,10 @@ class Envs:
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
+    # DFLASH prompt lookup (speculative/dflash_prompt_lookup.py): a request whose
+    # last tokens repeat earlier ones of its own gets the tokens that followed them
+    # as its draft block. Startup fails where unsupported; PD prefill ignores it.
+    SGLANG_ENABLE_DFLASH_PROMPT_LOOKUP = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.

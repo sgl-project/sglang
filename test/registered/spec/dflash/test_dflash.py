@@ -1,7 +1,9 @@
+import random
 import unittest
 from contextlib import ExitStack
 
 import openai
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -21,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=894, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1118, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=420, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
@@ -190,6 +192,58 @@ class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
     # Measured over 4x200 examples per arm: score 0.7525 (sd 0.021) and accept
     # length 2.80, borrowing on or off. Corruption collapses accept length
     # toward 1.0; the accuracy floor is loose to absorb other hardware.
+    gsm8k_accuracy_thres = 0.60
+    gsm8k_accept_length_thres = 2.0
+
+
+@unittest.skipIf(is_hip(), "prompt lookup is CUDA-only")
+class TestDFlashServerPromptLookup(TestDFlashServerOverlap):
+    """Prompt lookup through the stock kits, whose grammar and logprob requests
+    keep the drafter's blocks, and through a request that copies its prompt."""
+
+    extra_env_overrides = ((envs.SGLANG_ENABLE_DFLASH_PROMPT_LOOKUP, True),)
+    copy_temperature = 0.0
+
+    def _generate_copy(self, *, return_logprob):
+        # Random tokens, which the model can only continue by copying its prompt.
+        rng = random.Random(0)
+        span = [rng.randrange(1000, 30000) for _ in range(256)]
+        output = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": span + span[:32],
+                "sampling_params": {
+                    "temperature": self.copy_temperature,
+                    "max_new_tokens": 128,
+                },
+                "return_logprob": return_logprob,
+            },
+        ).json()
+        meta = output["meta_info"]
+        return output["output_ids"], meta["completion_tokens"] / meta["spec_verify_ct"]
+
+    def test_copying_request_takes_looked_up_blocks(self):
+        """A request that copies its own prompt commits more tokens per verify step
+        than the same request with logprobs, which keeps the drafter's blocks; with
+        greedy decoding both commit the same tokens."""
+        looked_up, looked_up_accept = self._generate_copy(return_logprob=False)
+        drafted, drafted_accept = self._generate_copy(return_logprob=True)
+        print(f"copy accept length: {looked_up_accept=:.2f}, {drafted_accept=:.2f}")
+        if self.copy_temperature == 0:
+            self.assertEqual(looked_up, drafted)
+        self.assertGreater(looked_up_accept, drafted_accept)
+        assert self.process.poll() is None
+
+
+@unittest.skipIf(is_hip(), "prompt lookup is CUDA-only")
+class TestDFlashServerPromptLookupSampled(TestDFlashServerPromptLookup):
+    """Sampled requests, so looked-up blocks reach the drafter-only sampling
+    accept (the test drafter has no selector) as point masses."""
+
+    copy_temperature = 0.6
+    gsm8k_temperature = 0.6
+    gsm8k_top_p = 0.95
+    # The sampled GSM8K floors of TestDFlashServerGraphPoolBorrow.
     gsm8k_accuracy_thres = 0.60
     gsm8k_accept_length_thres = 2.0
 
