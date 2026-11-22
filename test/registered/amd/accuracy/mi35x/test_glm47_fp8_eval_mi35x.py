@@ -2,7 +2,7 @@
 
 Tests GLM-4.7-FP8 accuracy using GSM8K benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-glm47-fp8 suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm47-fp8 suite
 """
 
 import unittest
@@ -15,7 +15,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Register for AMD CI - MI35x GLM-4.7-FP8 accuracy test (~30 min)
 register_amd_ci(
     est_time=1800,
-    suite="nightly-amd-8-gpu-mi35x-glm47-fp8",
+    suite="nightly-test-8-gpu-amd-mi35x-glm47-fp8",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )

@@ -169,22 +169,68 @@ jobs:
       - name: Install protoc and Rust toolchain
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
+      # Third-party crates move only with the lock files, so main's target dir leaves a
+      # PR the sglang crates. Hosted runners only: the target dir holds absolute paths.
+      - name: Compute the cargo target cache key
+        id: target-key
+        if: runner.environment == 'github-hosted'
+        env:
+          # ci is the build step's SETUPTOOLS_RUST_CARGO_PROFILE. No torch pin:
+          # torch-sys, the one crate built against torch, is cleaned every run.
+          PREFIX: rust-target-${{ runner.arch }}-py${{ matrix.python-version }}-ci-${{ hashFiles('rust/rust-toolchain.toml') }}-
+          LOCKS: ${{ hashFiles('rust/Cargo.lock', 'rust/sglang-radix-tree/Cargo.lock') }}
+        run: |
+          {
+              echo "dir=${RUNNER_TEMP}/sglang-cargo-target"
+              echo "key=${PREFIX}${LOCKS}"
+              # Only main saves, so PRs add no multi-GB entries; a PR falls back to
+              # main's entry for an older lock, while main starts clean on a miss.
+              if [ "${GITHUB_REF}" = refs/heads/main ]; then
+                  echo "save=true"
+              else
+                  echo "restore-prefix=${PREFIX}"
+              fi
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Ensure zstd so the target cache matches main's entry
+        if: steps.target-key.outcome == 'success'
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      - name: Restore cargo target dir
+        id: target-cache
+        if: steps.target-key.outcome == 'success'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.target-key.outputs.dir }}
+          key: ${{ steps.target-key.outputs.key }}
+          restore-keys: ${{ steps.target-key.outputs.restore-prefix }}
+
       - name: Build extension modules
+        env:
+          # Empty when the target cache steps were skipped.
+          CACHED_TARGET_DIR: ${{ steps.target-key.outputs.dir }}
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # A hosted runner is fresh per job, so there is no shared tree to reuse or
-          # to guard against a concurrent dropper.
-          export CARGO_TARGET_DIR="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
+          if [ -n "${CACHED_TARGET_DIR}" ]; then
+              export CARGO_TARGET_DIR="${CACHED_TARGET_DIR}"
+              # Fixed too: pyo3 rebuilds when the interpreter's path changes.
+              venv="${RUNNER_TEMP}/sglang-ci-rust-ext"
+          else
+              # Per-job paths: a self-hosted runs_on is persistent and shared, so a
+              # fixed one both inherits the previous job's venv and races a concurrent build.
+              export CARGO_TARGET_DIR="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
+              venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          fi
           mkdir -p "${CARGO_TARGET_DIR}"
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
-          # Per-job path: a self-hosted runs_on is persistent and shared, so a fixed
-          # one both inherits the previous job's venv and races a concurrent build.
-          venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv}" "${CARGO_TARGET_DIR}" || true' EXIT
+          # The cached target dir stays for the save below.
+          scratch_dirs=("${venv}")
+          [ -n "${CACHED_TARGET_DIR}" ] || scratch_dirs+=("${CARGO_TARGET_DIR}")
+          trap 'rm -rf "${scratch_dirs[@]}" || true' EXIT
           # build_rust needs the build backend and torch, not sglang's ~294 other runtime deps.
           uv venv "${venv}" --python "${{ steps.py.outputs.python-path }}" --seed
           # shellcheck disable=SC1091
@@ -287,6 +333,14 @@ jobs:
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
           if-no-files-found: error
           retention-days: 1
+
+      # An exact hit means the entry is already there.
+      - name: Save cargo target dir
+        if: steps.target-key.outputs.save == 'true' && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.target-key.outputs.dir }}
+          key: ${{ steps.target-key.outputs.key }}
 
   # The interpreters compile independently, but the suffix-set check and the cache
   # entry both cover the whole set, so they join in one job that sees all of it.

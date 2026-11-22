@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
@@ -120,7 +120,6 @@ class TestCustomLogitProcessorRows(CustomTestCase):
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=4,
-            penalizer_orchestrator=MagicMock(is_required=False),
             has_custom_logit_processor=True,
             custom_params=[{"row": i} for i in range(batch_size)],
             custom_logit_processor={
@@ -138,7 +137,7 @@ class TestCustomLogitProcessorRows(CustomTestCase):
         info = self._info(3, [0, 2])
         info.filter_batch([0, 2], torch.tensor([0, 2]))
         # Merge a 2-row batch whose only opted-in row is old index 1.
-        info.merge_batch(self._info(2, [1]))
+        info.merge_batch(self._info(2, [1]), self_len=2, other_len=2)
 
         entry = info.custom_logit_processor[self.KEY]
         self.assertEqual(entry.rows, entry.indices.tolist())
