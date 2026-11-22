@@ -128,7 +128,7 @@ class TestAbsorbBmmConfig(CustomTestCase):
 
 
 def _value_attn(**overrides):
-    """An attention module the value-quant gate accepts, before the caller breaks one."""
+    # An attention module the value-quant gate accepts, before the caller breaks one.
     attn = SimpleNamespace(
         current_attention_backend="aiter",
         use_dsa=False,
