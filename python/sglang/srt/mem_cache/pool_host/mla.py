@@ -37,6 +37,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    alloc_padded_pages,
+    get_storage_page_align,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -134,6 +136,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.dtype = buffer_info.dtype
         self.layout = layout
         self.page_unified_layout = page_unified_layout
+        self.storage_page_align = get_storage_page_align(layout, allocator_type)
         self.kv_lora_rank = buffer_info.kv_lora_rank
         self.qk_rope_head_dim = buffer_info.qk_rope_head_dim
         # Existing builders explicitly resolve packed row width before construction.
@@ -352,7 +355,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    @property
+    def page_bytes(self) -> int:
+        return self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+
+    @property
+    def page_stride_bytes(self) -> int:
+        align = self.storage_page_align
+        return -(-self.page_bytes // align) * align
+
     def get_mapping_lengths(self) -> list[int]:
+        if self.page_stride_bytes != self.page_bytes:
+            return [self.page_num * self.page_stride_bytes]
         if self.layout != "page_first_kv_split" or self._native_buffers is None:
             return super().get_mapping_lengths()
         native = self._native_buffers
@@ -467,8 +481,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
+        page_bytes = self.page_bytes
 
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
+        if self.page_stride_bytes != page_bytes:
+            logger.info(
+                "HiCache %s host pool: page stride %d bytes for %d-byte pages "
+                "(%.2f GB of padding) for the storage backend.",
+                self.pool_label,
+                self.page_stride_bytes,
+                page_bytes,
+                self.page_num * (self.page_stride_bytes - page_bytes) / 1e9,
+            )
+            return alloc_padded_pages(
+                alloc_func,
+                dims[1:],
+                self.page_num,
+                self.page_stride_bytes,
+                self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -737,7 +771,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
-        if io_backend not in ("kernel", "direct"):
+        if io_backend not in ("kernel", "direct", "kernel_ascend"):
             raise ValueError(
                 f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
             )
@@ -745,7 +779,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Draft transfer IDs follow all target device layers, while host rows
         # follow only this rank's target layers.
         host_layer_id = self._host_layer_by_controller[layer_id]
-        device_buffer = self.device_kv_buffers[self._buffer_index_by_layer[layer_id]]
+        if io_backend != "kernel_ascend":
+            device_buffer = self.device_kv_buffers[
+                self._buffer_index_by_layer[layer_id]
+            ]
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -800,6 +837,47 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     "Layer-sharded direct HiCache backup only supports "
                     f"layer_first layout, got {self.layout}"
                 )
+        elif io_backend == "kernel_ascend":
+            # Layer-sharded NPU D2H: the whole owned-layer range is transferred
+            # in one call per pool, so only the first owned layer triggers the
+            # transfer and later iterations return early.  Pools (target and
+            # compatible MTP drafts) mirror the non-sharded kernel_ascend
+            # backup via the same all-layer kv-split kernel.
+            if is_draft or layer_id != 0:
+                return
+            if self.layout == "page_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split_lf_pf
+            elif self.layout == "layer_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            indexer_backup = self._npu_indexer_backup
+            for native, host_k, host_v, is_target in self._npu_pool_bindings:
+                copy_indexer_with_kv = is_target and indexer_backup is None
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=native.k,
+                    host_k=host_k,
+                    device_v=native.v,
+                    host_v=host_v,
+                    device_index_k=native.index_k,
+                    host_index_k=self.index_k_buffer if copy_indexer_with_kv else None,
+                    device_index_k_scale=native.index_scales,
+                    host_index_k_scale=(
+                        self.index_k_scale_buffer if copy_indexer_with_kv else None
+                    ),
+                    page_size=self.page_size,
+                    impl="auto",
+                )
+                if is_target and indexer_backup is not None:
+                    ratio = self.page_size // indexer_backup["page_size"]
+                    transfer(
+                        device_indices=device_indices[::ratio] // ratio,
+                        host_indices=host_indices[::ratio] // ratio,
+                        **indexer_backup,
+                        impl="auto",
+                    )
 
     def _init_npu_transfer_bindings(self):
         self._npu_layer_bindings = {}
@@ -1329,7 +1407,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout == "page_first_direct":
+            ptr_list = [
+                kv_buffer_data_ptr + index // self.page_size * self.page_stride_bytes
+                for index in page_starts
+            ]
+            element_size_list = [self.page_bytes] * len(ptr_list)
+        elif self.layout == "page_first":
             for index in page_starts:
                 k_ptr = (
                     kv_buffer_data_ptr
@@ -1352,17 +1436,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         When O_DIRECT is used with any file-based NIXL backend, every data pointer
         passed to the kernel must be page-aligned.  In zero-copy mode the
-        pointer for KV page ``p`` is:
-
-            base_ptr + p * page_size * layer_num * kv_cache_dim * itemsize
-
-        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
-        stride must itself be a multiple of the OS page size.
+        pointer for KV page ``p`` is ``base_ptr + p * page_stride_bytes``, so
+        both must be multiples of the OS page size.
         """
         if self.layout not in ("page_first", "page_first_direct"):
             return False
-        stride = (
-            self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
-        )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
-        return base_aligned and stride % page_size_bytes == 0
+        return base_aligned and self.page_stride_bytes % page_size_bytes == 0
