@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.device import async_h2d
+from sglang.srt.utils.device import async_h2d, async_h2d_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -59,21 +59,21 @@ class SamplerParams(NamedTuple):
 
 
 class SamplerParamsPool:
+    # Rows of `table`, floats as fp32 bits: one int32 gather reads all four, top_k exact.
+    TEMPERATURE, TOP_P, TOP_K, MIN_P = range(4)
+
     def __init__(self, num_rows: int, device):
-        self.device = device
-        self.temperatures = torch.ones(num_rows, dtype=torch.float32, device=device)
-        self.top_ps = torch.ones(num_rows, dtype=torch.float32, device=device)
-        self.top_ks = torch.full(
-            (num_rows,), TOP_K_ALL, dtype=torch.int32, device=device
-        )
-        self.min_ps = torch.zeros(num_rows, dtype=torch.float32, device=device)
+        self.table = torch.empty((4, num_rows), dtype=torch.int32, device=device)
+        floats = self.table.view(torch.float32)
+        floats[self.TEMPERATURE] = 1.0
+        floats[self.TOP_P] = 1.0
+        self.table[self.TOP_K] = TOP_K_ALL
+        floats[self.MIN_P] = 0.0
         self.top_ks_host = np.full(num_rows, TOP_K_ALL, dtype=np.int64)
         self.uses_top_p_host = np.zeros(num_rows, dtype=bool)
         self.uses_min_p_host = np.zeros(num_rows, dtype=bool)
 
     def write(self, reqs: Sequence[Req]) -> None:
-        if not reqs:
-            return
         slots = [r.kv.req_pool_idx for r in reqs]
         params = [r.sampling_params for r in reqs]
         top_ks = [p.top_k for p in params]
@@ -81,38 +81,36 @@ class SamplerParamsPool:
         self.uses_top_p_host[slots] = [p.top_p != 1.0 for p in params]
         self.uses_min_p_host[slots] = [p.min_p > 0 for p in params]
 
-        rows = async_h2d(slots, dtype=torch.int64, device=self.device)
-        floats = async_h2d(
-            [
-                [p.temperature for p in params],
-                [p.top_p for p in params],
-                [p.min_p for p in params],
-            ],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.temperatures[rows] = floats[0]
-        self.top_ps[rows] = floats[1]
-        self.min_ps[rows] = floats[2]
-        self.top_ks[rows] = async_h2d(top_ks, dtype=torch.int32, device=self.device)
+        host_values = np.empty((4, len(reqs)), dtype=np.int32)
+        host_floats = host_values.view(np.float32)
+        host_floats[self.TEMPERATURE] = [p.temperature for p in params]
+        host_floats[self.TOP_P] = [p.top_p for p in params]
+        host_values[self.TOP_K] = top_ks
+        host_floats[self.MIN_P] = [p.min_p for p in params]
+        rows = async_h2d(slots, dtype=torch.int64, device=self.table.device)
+        values = async_h2d_tensor(torch.from_numpy(host_values), self.table.device)
+        self.table.index_copy_(1, rows, values)
 
     def gather(
         self, req_pool_indices: torch.Tensor, req_pool_indices_cpu: torch.Tensor
     ) -> SamplerParams:
         slots = req_pool_indices_cpu.numpy()
         if slots.size == 0:
-            return SamplerParams.empty(self.device)
+            return SamplerParams.empty(self.table.device)
         top_ks = self.top_ks_host[slots]
         lo, hi = int(top_ks.min()), int(top_ks.max())
+        # Each row of the [4, bs] result is a contiguous [bs] tensor.
+        values = self.table.index_select(1, req_pool_indices)
+        floats = values.view(torch.float32)
         return SamplerParams(
-            temperatures=self.temperatures[req_pool_indices].view(-1, 1),
-            top_ps=self.top_ps[req_pool_indices],
-            top_ks=self.top_ks[req_pool_indices],
-            min_ps=self.min_ps[req_pool_indices],
+            temperatures=floats[self.TEMPERATURE].view(-1, 1),
+            top_ps=floats[self.TOP_P],
+            top_ks=values[self.TOP_K],
+            min_ps=floats[self.MIN_P],
             is_all_greedy=hi <= 1,
             is_any_greedy=lo <= 1,
             need_top_p_sampling=bool(self.uses_top_p_host[slots].any()),
-            need_top_k_sampling=bool((top_ks != TOP_K_ALL).any()),
+            need_top_k_sampling=(lo, hi) != (TOP_K_ALL, TOP_K_ALL),
             need_min_p_sampling=bool(self.uses_min_p_host[slots].any()),
             npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
             max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,

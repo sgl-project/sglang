@@ -33,15 +33,9 @@ def _tables_step(additive, scaling=None):
     return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
 
 
-def _make_info(batch_size=2, **overrides):
+def _make_info(**overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
-    defaults = dict(
-        temperatures=torch.ones(batch_size, 1),
-        vocab_size=VOCAB_SIZE,
-        device=DEVICE,
-    )
-    defaults.update(overrides)
-    return SamplingBatchInfo(**defaults)
+    return SamplingBatchInfo(vocab_size=VOCAB_SIZE, device=DEVICE, **overrides)
 
 
 def _serial_batched_fill(entries, vocab_mask):
@@ -95,7 +89,6 @@ class TestMergeBiasTensor(CustomTestCase):
 class TestSamplingMaskBatchIndices(CustomTestCase):
     def test_filter_and_merge_preserve_support_logprob_modes(self):
         info = _make_info(
-            batch_size=3,
             return_sampling_masks=[True, True, False],
             return_sampling_support_logprobs=[False, True, False],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
@@ -105,7 +98,6 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
 
         other = _make_info(
-            batch_size=2,
             return_sampling_masks=[True, True],
             return_sampling_support_logprobs=[False, True],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
@@ -121,14 +113,12 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
     def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
         info = _make_info(
-            batch_size=2,
             return_sampling_masks=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
         info.filter_batch([0], torch.tensor([0]))
         self.assertIsNone(info.sampling_mask_batch_indices)
         other = _make_info(
-            batch_size=1,
             return_sampling_masks=[True],
             sampling_mask_batch_indices=torch.tensor([0]),
         )
@@ -138,7 +128,6 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
     def test_filter_rebuilds_row_indices(self):
         info = _make_info(
-            batch_size=4,
             return_sampling_masks=[False, True, False, True],
             sampling_mask_batch_indices=torch.tensor([1, 3]),
         )
@@ -150,12 +139,10 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
 
     def test_merge_offsets_rhs_row_indices(self):
         lhs = _make_info(
-            batch_size=2,
             return_sampling_masks=[False, True],
             sampling_mask_batch_indices=torch.tensor([1]),
         )
         rhs = _make_info(
-            batch_size=3,
             return_sampling_masks=[True, False, True],
             sampling_mask_batch_indices=torch.tensor([0, 2]),
         )
@@ -181,7 +168,6 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
                 for size, rows in ((2, left_rows), (3, right_rows)):
                     infos.append(
                         _make_info(
-                            batch_size=size,
                             has_custom_logit_processor=bool(rows),
                             custom_logit_processor={
                                 key: ProcessorEntry(
@@ -217,7 +203,7 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 class TestApplyLogitsBias(CustomTestCase):
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.step_penalties = _tables_step(torch.tensor([[-1.0] * VOCAB_SIZE]))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
@@ -225,7 +211,7 @@ class TestApplyLogitsBias(CustomTestCase):
 
     def test_applies_logit_bias(self):
         """Test that per-token logit_bias is added to logits."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         bias = torch.zeros(1, VOCAB_SIZE)
         bias[0, 5] = 10.0
         info.logit_bias = bias
@@ -236,7 +222,7 @@ class TestApplyLogitsBias(CustomTestCase):
 
     def test_applies_vocab_mask(self):
         """Test that a grammar_mask gets applied to the logits."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         grammar = MagicMock()
         info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -245,7 +231,7 @@ class TestApplyLogitsBias(CustomTestCase):
 
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.logit_bias = None
         info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -265,7 +251,7 @@ class TestApplyLogitsBias(CustomTestCase):
         grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: logits.fill_(
             -4.0
         )
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
@@ -289,7 +275,7 @@ class TestApplyLogitsBias(CustomTestCase):
             grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: (
                 logits.add_(vocab_mask)
             )
-            info = _make_info(batch_size=1)
+            info = _make_info()
             info.step_penalties = _tables_step(
                 torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
                 torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
@@ -319,14 +305,14 @@ class TestApplyLogitsBias(CustomTestCase):
 class TestUpdateRegexVocabMask(CustomTestCase):
     def test_no_grammars_clears_mask(self):
         """Test that None grammars clears the grammar_mask."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.grammars = None
         info.update_regex_vocab_mask()
         self.assertIsNone(info.grammar_mask)
 
     def test_empty_grammars_clears_mask(self):
         """Test that empty grammars list clears the grammar_mask."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.grammars = []
         info.update_regex_vocab_mask()
         self.assertIsNone(info.grammar_mask)
@@ -339,7 +325,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         grammar.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         grammar.allocate_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         grammar.move_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.grammars = [grammar]
         info.update_regex_vocab_mask()
         grammar.allocate_vocab_mask.assert_called_once()
@@ -364,7 +350,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         terminated.finished = False
         terminated.is_terminated.return_value = True
 
-        info = _make_info(batch_size=3)
+        info = _make_info()
         info.grammars = [active, finished, terminated]
         info.update_regex_vocab_mask()
 
@@ -385,7 +371,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         other.finished = False
         other.is_terminated.return_value = False
 
-        info = _make_info(batch_size=2)
+        info = _make_info()
         info.grammars = [active, other]
         info.update_regex_vocab_mask()
 
@@ -401,7 +387,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
 class TestFilterBatch(CustomTestCase):
     def test_filter_keeps_correct_indices(self):
         """Test that filter retains rows at indices 0 and 2, dropping index 1."""
-        info = _make_info(batch_size=3)
+        info = _make_info()
         info.logit_bias = torch.arange(3.0).view(3, 1).expand(3, VOCAB_SIZE)
         keep = torch.tensor([0, 2])
         info.filter_batch([0, 2], keep)
@@ -409,7 +395,7 @@ class TestFilterBatch(CustomTestCase):
 
     def test_filter_with_custom_logit_processor(self):
         proc = MagicMock()
-        info = _make_info(batch_size=3)
+        info = _make_info()
         info.has_custom_logit_processor = True
         info.custom_logit_processor = {
             42: ProcessorEntry(
@@ -429,7 +415,6 @@ class TestFilterBatch(CustomTestCase):
             with self.subTest(keep=keep):
                 original_indices = torch.tensor([0, 1])
                 info = _make_info(
-                    batch_size=3,
                     has_custom_logit_processor=True,
                     custom_logit_processor={
                         42: ProcessorEntry(
@@ -461,7 +446,6 @@ class TestFilterBatch(CustomTestCase):
             return logits
 
         info = _make_info(
-            batch_size=3,
             has_custom_logit_processor=True,
             custom_logit_processor={
                 42: ProcessorEntry(
@@ -473,7 +457,6 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([2, 1, 0], torch.tensor([2, 1, 0]))
         info.merge_batch(
             _make_info(
-                batch_size=1,
                 has_custom_logit_processor=True,
                 custom_logit_processor={
                     42: ProcessorEntry(
@@ -498,7 +481,7 @@ class TestFilterBatch(CustomTestCase):
     def test_filter_removes_all_custom_processors(self):
         """Test cleanup when filter removes all requests using a processor."""
         proc = MagicMock()
-        info = _make_info(batch_size=3)
+        info = _make_info()
         info.has_custom_logit_processor = True
         info.custom_logit_processor = {
             42: ProcessorEntry(processor=proc, rows=[1], indices=torch.tensor([1]))
@@ -512,9 +495,8 @@ class TestFilterBatch(CustomTestCase):
     def test_seeds_follow_rows_through_merge_and_filter(self):
         """A merged-in unseeded side gets filler seeds; once the last seeded row
         leaves, the batch returns to the unseeded samplers."""
-        info = _make_info(batch_size=1)
+        info = _make_info()
         seeded = _make_info(
-            batch_size=1,
             sampling_seed=torch.tensor([123], dtype=torch.int64),
             rows_with_seed=[True],
         )
@@ -528,7 +510,7 @@ class TestFilterBatch(CustomTestCase):
 
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
-        info = _make_info(batch_size=3)
+        info = _make_info()
         info.sampling_seed = None
         keep = torch.tensor([1])
         info.filter_batch([1], keep)
@@ -539,9 +521,9 @@ class TestFilterBatch(CustomTestCase):
 class TestMergeBatch(CustomTestCase):
     def test_merge_with_logit_bias(self):
         """Test that merge pads missing logit_bias with zeros before concatenation."""
-        info1 = _make_info(batch_size=1)
+        info1 = _make_info()
         info1.logit_bias = torch.ones(1, VOCAB_SIZE)
-        info2 = _make_info(batch_size=1)
+        info2 = _make_info()
         info2.logit_bias = None
         info1.merge_batch(info2, self_len=1, other_len=1)
         self.assertEqual(info1.logit_bias.shape, (2, VOCAB_SIZE))
@@ -549,13 +531,13 @@ class TestMergeBatch(CustomTestCase):
     def test_merge_with_custom_logit_processor(self):
         """Test that merge combines processors when only one side has them."""
         proc = MagicMock()
-        info1 = _make_info(batch_size=1)
+        info1 = _make_info()
         info1.has_custom_logit_processor = True
         info1.custom_logit_processor = {
             1: ProcessorEntry(processor=proc, rows=[0], indices=torch.tensor([0]))
         }
         info1.custom_params = [{"a": 1}]
-        info2 = _make_info(batch_size=1)
+        info2 = _make_info()
         info2.has_custom_logit_processor = False
         info2.custom_logit_processor = None
         info2.custom_params = None
@@ -565,18 +547,18 @@ class TestMergeBatch(CustomTestCase):
 
     def test_merge_with_none_sampling_seed(self):
         """Test that merge preserves None when both sampling_seeds are None."""
-        info1 = _make_info(batch_size=1)
+        info1 = _make_info()
         info1.sampling_seed = None
-        info2 = _make_info(batch_size=1)
+        info2 = _make_info()
         info2.sampling_seed = None
         info1.merge_batch(info2, self_len=1, other_len=1)
         self.assertIsNone(info1.sampling_seed)
 
     def test_merge_with_both_sampling_seeds(self):
         """Test that merge concatenates both sampling_seed tensors."""
-        info1 = _make_info(batch_size=2)
+        info1 = _make_info()
         info1.sampling_seed = torch.tensor([10, 20], dtype=torch.int64)
-        info2 = _make_info(batch_size=1)
+        info2 = _make_info()
         info2.sampling_seed = torch.tensor([30], dtype=torch.int64)
         info1.merge_batch(info2, self_len=2, other_len=1)
         self.assertEqual(info1.sampling_seed.shape[0], 3)
@@ -591,7 +573,7 @@ class TestCopyForForward(CustomTestCase):
         """Both copy implementations preserve every field, including fields
         declared with init=False, and leave the step's tables to sampling."""
         for fast_path in (False, True):
-            info = _make_info(batch_size=1)
+            info = _make_info()
             step = MagicMock()
             info.step_penalties = step
             with (
@@ -634,10 +616,7 @@ class TestFromScheduleBatch(CustomTestCase):
 
     def _make_req(
         self,
-        temp=1.0,
-        top_p=1.0,
         top_k=-1,
-        min_p=0.0,
         freq=0.0,
         presence=0.0,
         min_tokens=0,
@@ -647,10 +626,7 @@ class TestFromScheduleBatch(CustomTestCase):
         eos_id=2,
     ):
         req = MagicMock()
-        req.sampling_params.temperature = temp
-        req.sampling_params.top_p = top_p
         req.sampling_params.top_k = top_k
-        req.sampling_params.min_p = min_p
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
