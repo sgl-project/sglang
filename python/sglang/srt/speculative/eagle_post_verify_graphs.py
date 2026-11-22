@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -131,14 +132,12 @@ class EaglePostVerifyGraphs:
             not can_run_cuda_graph
             or batch.forward_mode.is_idle()
             or verify_input.topk != 1
-            or batch.has_grammar
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or info.step_penalties is not None
-            or info.logit_bias is not None
+            or adjusts_logits(info, has_grammar=batch.has_grammar)
+            # the replayed sampling view carries no seeds and no min-p
             or info.sampling_seed is not None
             or info.need_min_p_sampling
-            or info.watermark is not None
             # compute_spec_logprobs reads the gathered logits off logits_output
             or (
                 batch.return_logprob
@@ -265,8 +264,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
     # capture round's values.
     assert slot.is_all_greedy or "temperatures" in staged
     sampling_info = SimpleNamespace(
-        acc_additive_penalties=None,
-        acc_scaling_penalties=None,
+        step_penalties=None,
         logit_bias=None,
         sampling_seed=None,
         watermark=None,

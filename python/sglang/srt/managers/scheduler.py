@@ -342,6 +342,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
     make_abort_req,
@@ -398,7 +399,9 @@ from sglang.srt.rust_server.server import (
     drain_notify_name,
 )
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -703,6 +706,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
+        self.init_sampler_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1061,6 +1065,10 @@ class Scheduler(
                     )
                 ]
 
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1398,6 +1406,12 @@ class Scheduler(
     def init_penalty_status_pool(self) -> None:
         self.penalty_status_pool = PenaltyStatusPool(
             vocab_size=self.model_config.vocab_size,
+            device=self.req_to_token_pool.device,
+        )
+
+    def init_sampler_params_pool(self) -> None:
+        self.sampler_params_pool = SamplerParamsPool(
+            num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
         )
 
@@ -3707,6 +3721,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4222,6 +4237,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             self._add_request_to_queue(req)
@@ -5022,6 +5038,7 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
 
@@ -5361,8 +5378,8 @@ class Scheduler(
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
            only need sampling_info restored - V1 carries spec_info forward as
            next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy that carries this
-           step's logit penalties, built on the forward stream.
+        2. Substitute sampling_info with a forward-only copy, so the forward's
+           edits to it do not reach the scheduler's.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
@@ -5463,9 +5480,21 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            # A beam tail's member rows follow the requests' rows; they take no params.
+            num_reqs = len(batch.reqs)
+            batch.sampling_info.set_sampler_params(
+                self.sampler_params_pool.gather(
+                    batch.req_pool_indices[:num_reqs],
+                    batch.req_pool_indices_cpu[:num_reqs],
+                )
+            )
             batch.sampling_info.step_penalties = StepPenalties.build(
                 batch.reqs, self.penalty_status_pool
             )
+            batch.sampling_info.watermark = build_watermark_rows(
+                batch.reqs, batch.device
+            )
+            batch.sampling_info.set_plugin_state(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
