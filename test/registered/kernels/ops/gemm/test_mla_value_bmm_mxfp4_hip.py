@@ -114,8 +114,8 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
             can_fuse_mla_value_bmm_mxfp4_quant,
         )
 
-        # The weight loader stores w_vc / w_scale_v transposed and the call site
-        # transposes them back; x is a head-major view of attn_output (tokens, heads, K).
+        # The weight loader stores w_vc / w_scale_v transposed and the caller flips them back;
+        # x is a head-major view of attn_output (tokens, heads, K).
         w_vc = self.weight_fp4.contiguous().transpose(1, 2)
         w_scale_v = self.weight_scales.contiguous().transpose(1, 2)
         w, w_scales = w_vc.transpose(-2, -1), w_scale_v.transpose(-2, -1)
@@ -141,15 +141,18 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
 
         x = self._x(4)
         w, w_scales = self.weight_fp4, self.weight_scales
-        for name, args in (
-            ("fp16 x", (x.half(), w, w_scales)),
-            ("n != 128", (x, w[:, :64], w_scales[:, :64])),
-            ("k != 512", (x[..., :256], w[..., :128], w_scales[..., :8])),
+        for name, case in (
+            ("fp16 x", dict(x=x.half(), w=w, w_scales=w_scales)),
+            ("n != 128", dict(x=x, w=w[:, :64], w_scales=w_scales[:, :64])),
+            (
+                "k != 512",
+                dict(x=x[..., :256], w=w[..., :128], w_scales=w_scales[..., :8]),
+            ),
         ):
             with self.subTest(case=name):
-                self.assertFalse(can_fuse_mla_value_bmm_mxfp4_quant(*args))
+                self.assertFalse(can_fuse_mla_value_bmm_mxfp4_quant(**case))
                 with self.assertRaises(ValueError):
-                    batched_gemm_a16wfp4_flatten_mxfp4_quant(*args)
+                    batched_gemm_a16wfp4_flatten_mxfp4_quant(**case)
 
     def test_torch_compile_fullgraph(self):
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (

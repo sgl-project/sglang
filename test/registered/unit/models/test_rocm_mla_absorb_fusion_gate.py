@@ -196,7 +196,8 @@ class TestValueQuantFusionGate(CustomTestCase):
             with self.subTest(term=name):
                 self.assertFalse(
                     _CAN_FUSE_VALUE_QUANT(
-                        _value_attn(**{name: broken}), forward_mode=_forward_mode()
+                        attn=_value_attn(**{name: broken}),
+                        forward_mode=_forward_mode(),
                     )
                 )
         with self.subTest(term="forward_mode"):

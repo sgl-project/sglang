@@ -281,8 +281,8 @@ def can_fuse_mla_value_bmm_mxfp4_quant(
         and w.shape[1] == w_scales.shape[1]
         and w.shape[2] * 2 == x.shape[2]
         and w_scales.shape[2] * _MXFP4_QUANT_BLOCK_SIZE == x.shape[2]
-        # The pinned Kimi shape has a non-split AITER config; checking the shape keeps
-        # graph tracing free of the config lookup, which the custom op redoes at launch.
+        # The pinned Kimi shape has a non-split AITER config;
+        # checking it here keeps the config lookup out of graph tracing.
         and w.shape[1] == 128
         and x.shape[2] == 512
     )
