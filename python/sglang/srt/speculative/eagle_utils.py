@@ -722,7 +722,7 @@ def _sharded_sampling_applies(
     batch: ScheduleBatch,
     grammar_mask: Optional[GrammarMask],
     watermark: bool,
-    custom_logit_processor: bool,
+    has_custom_logit_processor: bool,
     has_local_keys: bool = False,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
@@ -741,7 +741,7 @@ def _sharded_sampling_applies(
             # Not adjusts_logits: info may be the provider's VerifySamplingView.
             adjusts_logits=grammar_mask is not None
             or watermark
-            or custom_logit_processor
+            or has_custom_logit_processor
             or info.step_penalties is not None
             or info.logit_bias is not None,
             return_logprob=batch.return_logprob,
@@ -763,19 +763,16 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
-    custom_logit_processor: bool = False,
+    has_custom_logit_processor: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information): adjust the verify logits, then
-    run the tree accept core. custom_logit_processor: run the batch's custom
-    logit processors, so its sampling info must be a SamplingBatchInfo.
-    simulated_acc_len: the injected acceptance length already drawn on the host,
-    as a device int64 [1], so a CUDA graph can replay the injection.
-    simulated_acc_len_rng: the generator to draw it from here otherwise (the
-    global CPU RNG when None). sparse_bonus_argmax: an injected acceptance's
-    bonus is the target argmax on the compact top-k branch too, as on the dense
-    one.
+    (which contains spec decoding information). simulated_acc_len: the injected
+    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
+    graph can replay the injection. simulated_acc_len_rng: the generator to draw
+    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
+    injected acceptance's bonus is the target argmax on the compact top-k branch
+    too, as on the dense one.
     """
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.speculative.target_verify import adjust_verify_logits
@@ -800,7 +797,7 @@ def eagle_sample(
         batch=batch,
         grammar_mask=grammar_mask,
         watermark=watermark is not None,
-        custom_logit_processor=custom_logit_processor,
+        has_custom_logit_processor=has_custom_logit_processor,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -819,7 +816,7 @@ def eagle_sample(
         draft_tokens=candidates,
         next_child=verify_input.retrieve_next_token,
         next_sibling=verify_input.retrieve_next_sibling,
-        custom_logit_processor=custom_logit_processor,
+        has_custom_logit_processor=has_custom_logit_processor,
     )
     if watermark is not None:
         next_token_logits, sampling_info = watermark.apply(
@@ -867,9 +864,7 @@ def _tree_accept(
     sparse_bonus_argmax: bool,
     local_keys: Optional[LocalKeysFn],
 ):
-    """The accept half of ``eagle_sample``: sample the target tokens from the
-    adjusted logits and walk the draft tree. A gather it still needs is published
-    to ``logits_output``."""
+    """A gather it still needs is published to ``logits_output``."""
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )

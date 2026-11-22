@@ -269,11 +269,11 @@ def accept_draft_tree(
     under the NV mega runtime, eagle_sample otherwise."""
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    custom_logit_processor = batch.sampling_info.has_custom_logit_processor
+    has_custom_logit_processor = batch.sampling_info.has_custom_logit_processor
     # The provider's sampling view carries no custom logit processors.
     if (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-        and not custom_logit_processor
+        and not has_custom_logit_processor
     ):
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
@@ -315,7 +315,7 @@ def accept_draft_tree(
         watermark=verify.watermark,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
-        custom_logit_processor=custom_logit_processor,
+        has_custom_logit_processor=has_custom_logit_processor,
     )
     return VerifyAccept(
         tokens=predict, accept_lens=accept_lens, accept_index=accept_index

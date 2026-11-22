@@ -3662,7 +3662,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 grammar_mask=verify.grammar_mask,
                 draft_tokens=draft_tokens,
-                custom_logit_processor=sampling_info.has_custom_logit_processor,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
 
         candidates = draft_tokens
