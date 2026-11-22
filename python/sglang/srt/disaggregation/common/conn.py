@@ -2824,7 +2824,8 @@ class CommonKVReceiver(BaseKVReceiver):
             and self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed
         ):
             # Success is cached before the request commits; the manager failed
-            # the room since (a metadata item it dropped).
+            # the room since (a metadata item it dropped). The metadata gate
+            # polls again for this.
             self.conclude_state = KVPoll.Failed
         if self.conclude_state is not None:
             return self.conclude_state
