@@ -732,6 +732,7 @@ _EXPORTS: dict[str, str] = {
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
+    "gated_residual_fp32": "norm.gated_residual_fp32_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",
     "triton_group_norm_silu": "norm.group_norm_silu_triton",

@@ -4,6 +4,7 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
 
+import functools
 from typing import Optional, Tuple, Union
 
 import torch
@@ -17,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
     fused_scale_residual_norm_scale_shift_triton,
+    gated_residual_fp32,
     triton_one_pass_rms_norm,
 )
 from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
@@ -551,6 +553,19 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
     def forward_cuda(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.forward_native(inputs)
 
+    def forward_hip(self, inputs: torch.Tensor) -> torch.Tensor:
+        # aten's kernel accumulates a half-precision input in fp32 and rounds
+        # once on the store: forward_native's bits without its two cast passes
+        if (
+            inputs.dtype in (torch.bfloat16, torch.float16)
+            and self.weight is None
+            and self.bias is None
+        ):
+            # autocast would promote the input back to fp32
+            with torch.autocast(device_type=inputs.device.type, enabled=False):
+                return F.layer_norm(inputs, self.normalized_shape, None, None, self.eps)
+        return self.forward_native(inputs)
+
     def forward_npu(self, inputs: torch.Tensor) -> torch.Tensor:
         origin_dtype = inputs.dtype
         device = inputs.device
@@ -587,6 +602,13 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
 ################################################################################
 # Fused norm kernel
 ################################################################################
+@functools.lru_cache(maxsize=None)
+def null_modulation(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """The shared all-zero [1] scale/shift of ``device``; read-only. An op knows
+    it is zero by identity, where any other tensor needs a readback."""
+    return torch.zeros((1,), device=device, dtype=dtype)
+
+
 def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return tensor.contiguous() if tensor is not None else None
 
@@ -718,7 +740,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
             WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
             and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
         ):
-            return self.forward_native(residual, x, gate, shift, scale)
+            return self._forward_hip_bitexact(residual, x, gate, shift, scale)
 
         try:
             from sglang.kernels.ops.diffusion import (
@@ -742,6 +764,29 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.norm_type,
             self.eps,
         )
+
+    def _forward_hip_bitexact(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """forward_native's bits, already rounded to ``x.dtype``, for the gated
+        residual with null modulation; forward_native for anything else"""
+        if (
+            self.norm_type == "layer"
+            and isinstance(gate, torch.Tensor)
+            and scale.numel() == 1
+            and scale is null_modulation(scale.device, scale.dtype)
+            and shift is scale
+        ):
+            fused = gated_residual_fp32(residual=residual, x=x, gate=gate)
+            if fused is not None:
+                residual_fp32, residual_output = fused
+                return self.norm(residual_fp32).to(x.dtype), residual_output
+        return self.forward_native(residual, x, gate, shift, scale)
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
