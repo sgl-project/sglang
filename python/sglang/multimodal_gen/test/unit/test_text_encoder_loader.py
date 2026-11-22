@@ -13,7 +13,10 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
     ComfyInt8EmbeddingMethod,
 )
@@ -246,6 +249,21 @@ def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_siz
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert embedding.weight.dtype == torch.int8
         assert torch.count_nonzero(embedding.weight[count:]) == 0
+
+
+def test_embedding_rejects_a_quant_method_without_an_embedding_op():
+    """A quant config that hands an embedding layer a linear-only method must be
+    rejected when the layer is built, not at the first token lookup."""
+    config = SimpleNamespace(
+        get_quant_method=lambda layer, prefix: UnquantizedLinearMethod()
+    )
+    with pytest.raises(NotImplementedError, match="must implement the 'embedding'"):
+        VocabParallelEmbedding(
+            8,
+            4,
+            quant_config=config,
+            tp_group=SimpleNamespace(world_size=1, rank_in_group=0),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
