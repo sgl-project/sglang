@@ -145,7 +145,6 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             repack_nvfp4_experts,
             scales_supported,
         )
-        from sglang.srt.layers.muse_spark.muse_spark_sp_experts import max_tokens
         from sglang.srt.runtime_context import get_parallel
 
         w13_scale, w2_scale = (
@@ -187,7 +186,8 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 name, torch.nn.Parameter(value, requires_grad=False)
             )
         torch.cuda.empty_cache()
-        init_runtime(w13.device, max_tokens())
+        # the big (SP) workspace keeps its default size until the SP port sizes it
+        init_runtime(w13.device, 0)
         return True
 
     def process_weights_after_loading(self, layer):
