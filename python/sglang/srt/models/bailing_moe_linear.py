@@ -963,6 +963,12 @@ class BailingMoELinearForCausalLM(nn.Module):
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             )
+            # The tied head keeps the embedding's dtype; the untied head is FP32.
+            self.logits_input_dtype = (
+                self.lm_head.weight.dtype
+                if config.tie_word_embeddings
+                else torch.float32
+            )
             self.logits_processor = LogitsProcessor(config)
         else:
             self.lm_head = PPMissingLayer()
@@ -1256,14 +1262,9 @@ class BailingMoELinearForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
-            logits_input_dtype = (
-                self.lm_head.weight.dtype
-                if self.config.tie_word_embeddings
-                else torch.float32
-            )
             return self.logits_processor(
                 input_ids,
-                hidden_states.to(logits_input_dtype),
+                hidden_states.to(self.logits_input_dtype),
                 self.lm_head,
                 forward_batch,
             )

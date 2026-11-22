@@ -76,7 +76,7 @@ class _ContextTestCase(CustomTestCase):
 
 class TestExaone4GetWeightsByName(_ContextTestCase):
     def test_tp_replicated_kv_heads_return_the_local_rows(self):
-        with parallel_scope(tp_size=4, attn_tp_size=4):
+        with parallel_scope(tp_size=4, attn_tp_size=4, moe_tp_size=4):
             model = _exaone4()
             qkv = model.model.layers[0].self_attn.qkv_proj.weight.data
             q, k, v = qkv.split(HEAD_DIM, dim=0)

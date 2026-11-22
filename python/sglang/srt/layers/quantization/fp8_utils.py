@@ -363,7 +363,7 @@ if _use_aiter:
     )
 
 _use_aiter_mxfp8_gfx1250 = False
-if get_bool_env_var("SGLANG_USE_AITER") and _is_hip and _is_gfx1250_supported:
+if envs.SGLANG_USE_AITER.get() and _is_hip and _is_gfx1250_supported:
     try:
         from aiter import dtypes as aiter_dtypes
         from aiter.ops.gemm_op_a8w8 import (

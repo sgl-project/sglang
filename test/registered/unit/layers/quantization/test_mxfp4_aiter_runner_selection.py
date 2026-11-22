@@ -138,7 +138,7 @@ class TestAiterOnlyMoEMethodsRejectOtherRunners(CustomTestCase):
             # __init__ requires ROCm; create_moe_runner reads no instance state.
             "quark_int4fp8": QuarkInt4Fp8MoEMethod.__new__(QuarkInt4Fp8MoEMethod),
         }
-        selections = (("triton", "none"), ("auto", "flashinfer"))
+        selections = (("triton", "none"), ("auto", "flashinfer_nvlink_one_sided"))
         for name, method in methods.items():
             for runner_backend, a2a_backend in selections:
                 with (

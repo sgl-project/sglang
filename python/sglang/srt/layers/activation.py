@@ -63,9 +63,14 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 # kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
 # sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
 # tp8, 1368 % 16 != 0).
+_jit_act_max_vec_bytes: Optional[int] = None
+
+
 def _jit_act_supported(out: torch.Tensor) -> bool:
-    vec_bytes = current_arch().cuda.max_vec_bytes
-    return out.shape[-1] % (vec_bytes // out.dtype.itemsize) == 0
+    global _jit_act_max_vec_bytes
+    if _jit_act_max_vec_bytes is None:
+        _jit_act_max_vec_bytes = current_arch().cuda.max_vec_bytes
+    return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
 
 
 if _is_cuda:

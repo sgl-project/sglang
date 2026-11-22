@@ -457,6 +457,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
+        # Fixed once the runner is bound; forward reads the flag, not the config.
+        self.routed_scaling_fused_in_topk = is_routed_scaling_factor_fused_in_topk(
+            self.topk.topk_config
+        )
 
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
@@ -585,7 +589,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
             if (
                 not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            ) and not is_routed_scaling_factor_fused_in_topk(self.topk.topk_config):
+            ) and not self.routed_scaling_fused_in_topk:
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -606,9 +610,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not is_routed_scaling_factor_fused_in_topk(
-            self.topk.topk_config
-        ):
+        if not _is_cuda and not self.routed_scaling_fused_in_topk:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
@@ -655,7 +657,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if enable_npu_dual_stream:
             wait_share_stream()
 
-        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
+        fused_in_topk = self.routed_scaling_fused_in_topk
         if shared_output is not None:
             x = shared_output
             if fused_in_topk:
