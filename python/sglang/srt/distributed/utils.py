@@ -8,7 +8,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import logging
-import os
 import pickle
 import time
 from collections import deque
@@ -24,6 +23,7 @@ except ImportError:  # older torch builds only have the *_tensor names
     from torch.distributed import all_gather_into_tensor as _all_gather_single
     from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
 
 all_gather_single = _all_gather_single
@@ -114,8 +114,7 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
     """
-    # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    partition_list_str = envs.SGLANG_PP_LAYER_PARTITION.get()
     if pp_size == 1:
         # A singleton draft PP group owns every layer and must ignore the target's
         # process-global pipeline partition list.

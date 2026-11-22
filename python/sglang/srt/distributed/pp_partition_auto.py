@@ -3,16 +3,19 @@
 GPUs of one model run at slightly different speeds (power and clock limits), and a
 pipeline runs at the pace of its slowest (stage, GPU) pair. Before the weights load,
 every rank measures its GPU with a short concurrent burn (or takes a fixed factor
-from SGLANG_PP_PARTITION_AUTO_SPEED), the ranks all-gather the results, and each
-runs the same deterministic search: the contiguous split that minimizes the slowest
-stage's cost x speed factor, then the sum of squares of the stage costs. Rank 0's
-split is broadcast and every rank asserts it computed the same one, then it replaces
-SGLANG_PP_LAYER_PARTITION, which the model reads when it builds its layer range.
+from SGLANG_PP_PARTITION_AUTO_SPEED) and the ranks all-gather the results. Each rank
+then runs the same deterministic search on the same inputs: the contiguous split that
+minimizes the slowest stage's cost x speed factor, then the sum of squares of the
+stage costs. The split replaces the default one through SGLANG_PP_LAYER_PARTITION,
+which the model reads when it builds its layer range. Burn noise can change the split
+between boots on the same hardware; all ranks of one boot always agree.
 
 Layer costs are uniform unless a cost model (SGLANG_PP_PARTITION_AUTO_COST_MODEL)
-gives a cost per layer kind. Every stage keeps every layer kind of a hybrid model.
-The cost model can also bound each stage's KV token capacity and its activation
-headroom outside the static memory pools.
+gives a cost per layer kind. Kinds are attention types, so layers of one kind that
+differ otherwise (e.g. the leading dense layers of an MoE model) share one cost.
+Every stage keeps every layer kind of a hybrid model. The cost model can also bound
+each stage's KV token capacity and its activation headroom outside the static
+memory pools.
 """
 
 from __future__ import annotations
@@ -27,8 +30,14 @@ import msgspec
 
 logger = logging.getLogger(__name__)
 
+# A healthy GPU of one model differs from the mean by a few percent under power and
+# clock limits; a factor outside this range means it was disturbed during the burn.
+_FACTOR_BOUNDS = (0.8, 1.25)
 
-class PPPartitionCostModel(msgspec.Struct, frozen=True, kw_only=True):
+
+class PPPartitionCostModel(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
     """Per-layer-kind forward cost and memory of a model, read from JSON."""
 
     # Forward cost per layer of each kind, in any unit (kinds not listed cost 1),
@@ -43,6 +52,9 @@ class PPPartitionCostModel(msgspec.Struct, frozen=True, kw_only=True):
     kv_bytes_per_token: Dict[str, float] = {}
     first_stage_weight_bytes: float = 0.0
     last_stage_weight_bytes: float = 0.0
+    # The split keeps this fraction of the default split's KV token capacity, the
+    # minimum over stages.
+    kv_floor: float = 1.0
     # Activation headroom bound, on when proxy_bytes_per_token is set: entry e is the
     # bytes per token of the activations a stage ending at layer e sends (e = 0 ..
     # num_layers). Outside the static pools, a stage holds proxy_buffers_in received
@@ -57,24 +69,84 @@ class PPPartitionCostModel(msgspec.Struct, frozen=True, kw_only=True):
     activation_headroom_fraction: float = 0.0
 
     @classmethod
-    def from_json(cls, path: str) -> PPPartitionCostModel:
-        with open(path, "rb") as f:
-            return msgspec.json.decode(f.read(), type=cls)
+    def from_json(cls, data: bytes, kinds: Sequence[str]) -> PPPartitionCostModel:
+        """Decode and validate a JSON cost model for a model with these layer kinds."""
+        m = msgspec.json.decode(data, type=cls)
+        m._validate(set(kinds), len(kinds))
+        return m
+
+    def _validate(self, kinds: set, num_layers: int) -> None:
+        tables = {
+            "layer_cost": self.layer_cost,
+            "layer_weight_bytes": self.layer_weight_bytes,
+            "layer_state_bytes": self.layer_state_bytes,
+            "kv_bytes_per_token": self.kv_bytes_per_token,
+        }
+        for name, table in tables.items():
+            unknown = sorted(set(table) - kinds)
+            if unknown:
+                raise ValueError(
+                    f"cost model {name} has keys {unknown} that are not layer kinds "
+                    f"of this model {sorted(kinds)}"
+                )
+            _check_values(name, table.values(), minimum=0.0)
+        # Stage extras are fitted intercepts and may be negative.
+        _check_values(
+            "first/last stage extras",
+            (
+                self.first_stage_cost,
+                self.last_stage_cost,
+                self.first_stage_weight_bytes,
+                self.last_stage_weight_bytes,
+            ),
+            minimum=-math.inf,
+        )
+        _check_values(
+            "proxy and headroom fields",
+            (
+                *self.proxy_bytes_per_token,
+                self.proxy_tokens,
+                self.proxy_buffers_in,
+                self.proxy_buffers_out,
+                self.activation_headroom_bytes,
+            ),
+            minimum=0.0,
+        )
+        if self.proxy_bytes_per_token and len(self.proxy_bytes_per_token) != (
+            num_layers + 1
+        ):
+            raise ValueError(
+                f"cost model proxy_bytes_per_token has {len(self.proxy_bytes_per_token)} "
+                f"entries; it needs one per end layer 0..{num_layers}"
+            )
+        if not 0.0 <= self.activation_headroom_fraction < 1.0:
+            raise ValueError(
+                "cost model activation_headroom_fraction must be in [0, 1)"
+            )
+        if not 0.0 < self.kv_floor <= 1.0:
+            raise ValueError("cost model kv_floor must be in (0, 1]")
+
+
+def _check_values(name: str, values, minimum: float) -> None:
+    for value in values:
+        if math.isnan(value) or math.isinf(value) or value < minimum:
+            raise ValueError(f"cost model {name} has an invalid value {value!r}")
 
 
 class StageMemory(msgspec.Struct, frozen=True):
     """Bytes per stage: static_bytes holds the static pools (weights, state, KV),
-    free_bytes the rest, which activations use."""
+    free_bytes the slack left outside them, which activations use."""
 
     static_bytes: Tuple[float, ...]
     free_bytes: Tuple[float, ...]
 
 
-def even_partition(num_layers: int, pp_size: int) -> Tuple[int, ...]:
-    """get_pp_indices' default split: the last `num_layers % pp_size` stages take one
-    layer more."""
-    base, extra = divmod(num_layers, pp_size)
-    return tuple(base + (s >= pp_size - extra) for s in range(pp_size))
+def default_partition(num_layers: int, pp_size: int) -> Tuple[int, ...]:
+    """The split get_pp_indices makes without SGLANG_PP_LAYER_PARTITION."""
+    from sglang.srt.distributed.utils import get_pp_indices
+
+    bounds = [get_pp_indices(num_layers, s, pp_size) for s in range(pp_size)]
+    return tuple(end - start for start, end in bounds)
 
 
 def _prefix(values: Sequence[float]) -> List[float]:
@@ -113,9 +185,6 @@ class _Search:
         self._required = [_prefix([k == kind for k in kinds]) for kind in required]
         self.headroom_on = memory is not None and bool(m.proxy_bytes_per_token)
         if self.headroom_on:
-            assert len(m.proxy_bytes_per_token) == len(kinds) + 1, (
-                "proxy_bytes_per_token needs one entry per end layer 0..num_layers"
-            )
             self.reserved = m.activation_headroom_bytes + (
                 m.activation_headroom_fraction * min(memory.free_bytes)
             )
@@ -225,12 +294,14 @@ def best_partition(
     return part, value
 
 
-def burn_unit_ms(seconds: float, device, hidden_size: int) -> float:
+def burn_unit_ms(seconds: float, device, hidden_size: int) -> Tuple[float, int]:
     """Mean time of one burn unit (4 bf16 GEMMs at a prefill shape, then a 1 GiB
-    copy) over the second half of a `seconds` burn. Callers start it on every GPU at
-    once, so each runs at its loaded clock."""
+    copy) over the second half of a `seconds` burn, and the burn's peak device bytes.
+    Callers start it on every GPU at once, so each runs at its loaded clock."""
     import torch
 
+    base = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
     a = torch.randn(16384, hidden_size, device=device, dtype=torch.bfloat16)
     b = torch.randn(hidden_size, 4096, device=device, dtype=torch.bfloat16)
     c = torch.empty(16384, 4096, device=device, dtype=torch.bfloat16)
@@ -249,9 +320,51 @@ def burn_unit_ms(seconds: float, device, hidden_size: int) -> float:
         end.synchronize()
         times.append((wall, start.elapsed_time(end)))
     half = [ms for w, ms in times if w >= t0 + seconds / 2] or [ms for _, ms in times]
+    peak = torch.cuda.max_memory_allocated(device) - base
     del a, b, c, x, y
     torch.cuda.empty_cache()
-    return sum(half) / len(half)
+    return sum(half) / len(half), peak
+
+
+class _RankRow(msgspec.Struct, frozen=True):
+    """What every rank contributes to the gather."""
+
+    pp_rank: int
+    speed: float
+    free_bytes: float
+    burn_peak_bytes: int
+    error: str
+
+
+def _gather_or_raise(
+    all_gather: Callable[[object], List[object]], row: _RankRow
+) -> List[_RankRow]:
+    """All-gather one row per rank; if any rank failed, raise the same error on all."""
+    rows = all_gather(row)
+    errors = [f"rank {i}: {r.error}" for i, r in enumerate(rows) if r.error]
+    if errors:
+        raise RuntimeError("PP partition auto failed: " + "; ".join(errors))
+    return rows
+
+
+def _speed_factors(
+    stage_speed: Sequence[float], scale: float
+) -> Tuple[List[float], List[int]]:
+    """Per-stage factors around 1 (higher = slower), clamped to _FACTOR_BOUNDS; also
+    returns the stages that were clamped."""
+    mean = sum(stage_speed) / len(stage_speed)
+    low, high = _FACTOR_BOUNDS
+    raw = [1.0 + scale * (v / mean - 1.0) for v in stage_speed]
+    factors = [min(max(f, low), high) for f in raw]
+    clamped = [s for s, (f, g) in enumerate(zip(raw, factors)) if f != g]
+    if clamped:
+        logger.warning(
+            "PP partition auto: speed factors %s outside %s clamped on stages %s",
+            [round(f, 4) for f in raw],
+            _FACTOR_BOUNDS,
+            clamped,
+        )
+    return factors, clamped
 
 
 def resolve(
@@ -260,47 +373,61 @@ def resolve(
     pp_rank: int,
     pp_size: int,
     all_gather: Callable[[object], List[object]],
-    broadcast_from_0: Callable[[object], object],
-    measure: Callable[[], float],
-    total_bytes: float,
+    measure: Callable[[], Tuple[float, int]],
+    free_bytes: float,
     mem_fraction_static: float,
     m: PPPartitionCostModel,
-    reference: Tuple[int, ...],
     proxy_tokens: int,
     fixed_speed: Sequence[float] = (),
-    kv_floor: float = 1.0,
     burn_scale: float = 1.0,
 ) -> Tuple[Tuple[int, ...], dict]:
-    """Collective over the world group: gather (pp_rank, speed, GPU memory) from every
-    rank, take each stage's slowest rank and smallest GPU, search, broadcast rank 0's
-    split and assert every rank found the same. Returns the split and a report."""
-    speed = float(fixed_speed[pp_rank]) if fixed_speed else measure()
-    rows = all_gather((pp_rank, speed, total_bytes))
-    stage_speed = [max(v for r, v, _ in rows if r == s) for s in range(pp_size)]
-    totals = [min(b for r, _, b in rows if r == s) for s in range(pp_size)]
+    """Collective over the world group: every rank measures (or takes its fixed
+    factor), the ranks gather speed and free memory, and each runs the same search on
+    the same rows, so all ranks choose the same split. A rank whose measurement fails
+    still joins the gather, and then every rank raises its error."""
+    try:
+        if fixed_speed:
+            if len(fixed_speed) != pp_size or not all(
+                v > 0 and math.isfinite(v) for v in fixed_speed
+            ):
+                raise ValueError(
+                    f"SGLANG_PP_PARTITION_AUTO_SPEED needs {pp_size} positive "
+                    f"factors, got {list(fixed_speed)}"
+                )
+            speed, peak = float(fixed_speed[pp_rank]), 0
+        else:
+            speed, peak = measure()
+        row = _RankRow(pp_rank, speed, free_bytes, peak, "")
+    except Exception as exc:  # The other ranks are already headed for the gather.
+        row = _RankRow(pp_rank, math.nan, free_bytes, 0, repr(exc))
+    rows = _gather_or_raise(all_gather, row)
+    stage_speed = [max(r.speed for r in rows if r.pp_rank == s) for s in range(pp_size)]
+    # The static pools are sized from the world's least free memory before the load:
+    # static = free x mem_fraction_static, the rest is slack (kv_cache_configurator).
+    free = min(r.free_bytes for r in rows)
     memory = StageMemory(
-        static_bytes=tuple(t * mem_fraction_static for t in totals),
-        free_bytes=tuple(t * (1.0 - mem_fraction_static) for t in totals),
+        static_bytes=(free * mem_fraction_static,) * pp_size,
+        free_bytes=(free * (1.0 - mem_fraction_static),) * pp_size,
     )
-    mean = sum(stage_speed) / pp_size
     # burn_scale stretches the burn's speed spread around 1 (fixed factors are used as is).
-    scale = 1.0 if fixed_speed else burn_scale
-    factors = [1.0 + scale * (v / mean - 1.0) for v in stage_speed]
+    factors, clamped = _speed_factors(stage_speed, 1.0 if fixed_speed else burn_scale)
     search = _Search(kinds, m, pp_size, memory, proxy_tokens)
+    reference = default_partition(len(kinds), pp_size)
     floor = 0.0
     if m.kv_bytes_per_token:
-        # KV token capacity is the stage minimum; keep kv_floor x the reference's.
-        floor = kv_floor * search.min_kv_capacity(reference)
+        floor = m.kv_floor * search.min_kv_capacity(reference)
     part, value = best_partition(kinds, factors, m, memory, floor, proxy_tokens)
-    chosen = tuple(broadcast_from_0(part))
-    assert chosen == part, f"PP split {part} differs from rank 0's {chosen}"
     starts = [sum(part[:s]) for s in range(pp_size)]
     ref_value = max(
         search.cost(s, sum(reference[:s]), reference[s]) * factors[s]
         for s in range(pp_size)
     )
     report = {
+        "rank_speed": [round(r.speed, 3) for r in rows],
+        "burn_peak_mib": max(r.burn_peak_bytes for r in rows) >> 20,
+        "free_gib_min": round(free / (1 << 30), 1),
         "factors": [round(x, 4) for x in factors],
+        "clamped_stages": clamped,
         "source": "fixed" if fixed_speed else f"burn x{burn_scale:g}",
         "reference": list(reference),
         "reference_max_cost": round(ref_value, 3),
@@ -339,6 +466,29 @@ def layer_kinds(model_config) -> List[str]:
     return ["layer"] * num_layers
 
 
+def _load_cost_model(
+    *, path: str, kinds: Sequence[str], is_rank0: bool, preflight_error: str, all_gather
+) -> PPPartitionCostModel:
+    """Rank 0 reads the JSON; every rank gathers it with every rank's preflight
+    error, so a failure on one rank fails all of them instead of leaving them
+    waiting in a later collective."""
+    data, error = None, preflight_error
+    if is_rank0 and path and not error:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            error = repr(exc)
+    rows = all_gather((data, error))
+    errors = [f"rank {i}: {e}" for i, (_, e) in enumerate(rows) if e]
+    if errors:
+        raise RuntimeError("PP partition auto failed: " + "; ".join(errors))
+    data = rows[0][0]
+    return (
+        PPPartitionCostModel.from_json(data, kinds) if data else PPPartitionCostModel()
+    )
+
+
 def maybe_apply(
     *, model_config, is_draft_worker: bool, mem_fraction_static: float
 ) -> None:
@@ -358,54 +508,57 @@ def maybe_apply(
         or not envs.SGLANG_ENABLE_PP_PARTITION_AUTO.get()
     ):
         return
-    kinds = layer_kinds(model_config)
-    path = envs.SGLANG_PP_PARTITION_AUTO_COST_MODEL.get()
-    m = PPPartitionCostModel.from_json(path) if path else PPPartitionCostModel()
-    env_part = envs.SGLANG_PP_LAYER_PARTITION.get()
-    reference = (
-        tuple(int(x) for x in env_part.split(","))
-        if env_part
-        else even_partition(len(kinds), par.pp_size)
-    )
     world = get_world_group()
-    device = torch.device("cuda", torch.cuda.current_device())
-    total = torch.cuda.get_device_properties(device).total_memory
-    burn_s = envs.SGLANG_PP_PARTITION_AUTO_BURN_S.get()
 
     def gather(obj):
         out = [None] * world.world_size
         torch.distributed.all_gather_object(out, obj, group=world.cpu_group)
         return out
 
-    def bcast(obj):
-        box = [obj]
-        torch.distributed.broadcast_object_list(
-            box, src=world.ranks[0], group=world.cpu_group
+    preflight = ""
+    if envs.SGLANG_PP_LAYER_PARTITION.get() is not None:
+        preflight = (
+            "SGLANG_PP_LAYER_PARTITION and SGLANG_ENABLE_PP_PARTITION_AUTO are "
+            "mutually exclusive; unset one"
         )
-        return box[0]
+    elif not torch.cuda.is_available():
+        preflight = "SGLANG_ENABLE_PP_PARTITION_AUTO needs CUDA GPUs"
+    kinds = layer_kinds(model_config)
+    m = _load_cost_model(
+        path=envs.SGLANG_PP_PARTITION_AUTO_COST_MODEL.get(),
+        kinds=kinds,
+        is_rank0=world.rank_in_group == 0,
+        preflight_error=preflight,
+        all_gather=gather,
+    )
+    # The model runner has already set this rank's device.
+    device = torch.device("cuda", torch.cuda.current_device())
+    burn_s = envs.SGLANG_PP_PARTITION_AUTO_BURN_S.get()
 
     def measure():
         # Every GPU burns at the same time.
         torch.distributed.barrier(group=world.cpu_group)
         return burn_unit_ms(burn_s, device, model_config.hidden_size)
 
+    proxy_tokens = m.proxy_tokens
+    if m.proxy_bytes_per_token and not proxy_tokens:
+        proxy_tokens = get_schedule().chunked_prefill_size
     t0 = time.time()
     part, report = resolve(
         kinds=kinds,
         pp_rank=par.pp_rank,
         pp_size=par.pp_size,
         all_gather=gather,
-        broadcast_from_0=bcast,
         measure=measure,
-        total_bytes=total,
+        free_bytes=torch.cuda.mem_get_info(device)[0],
         mem_fraction_static=mem_fraction_static,
         m=m,
-        reference=reference,
-        proxy_tokens=m.proxy_tokens or get_schedule().chunked_prefill_size,
+        proxy_tokens=proxy_tokens,
         fixed_speed=[float(x) for x in envs.SGLANG_PP_PARTITION_AUTO_SPEED.get()],
-        kv_floor=envs.SGLANG_PP_PARTITION_AUTO_KV_FLOOR.get(),
         burn_scale=envs.SGLANG_PP_PARTITION_AUTO_BURN_SCALE.get(),
     )
+    # Process-wide, like a user-set split; draft workers run in a singleton PP group,
+    # which get_pp_indices exempts from it.
     envs.SGLANG_PP_LAYER_PARTITION.set(",".join(map(str, part)))
     report["seconds"] = round(time.time() - t0, 1)
     if world.rank_in_group == 0:
