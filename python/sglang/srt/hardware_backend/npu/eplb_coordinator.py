@@ -42,9 +42,11 @@ class Runtime(Protocol):
 
     def record_source_ready(self) -> None: ...
 
-    def stage(self, layer: int) -> WeightWriteback: ...
+    def stage(self, layer: int, slot: int = 0) -> WeightWriteback: ...
 
-    def install(self, layer: int, writeback: WeightWriteback) -> None: ...
+    def install(
+        self, layer: int, writeback: WeightWriteback, slot: int = 0
+    ) -> None: ...
 
     def synchronize(self) -> None: ...
 
@@ -56,14 +58,22 @@ _FAILED_OWNERS: list[Any] = []
 
 
 class AsyncEplbCoordinator:
-    """Run one plan or layer transfer at a time so staging can be reused.
+    """Run one plan or chunk of layer transfers at a time.
 
     A failed plan can be disabled once every worker has drained. An uncertain
     transfer or partial install is fatal because other ranks may own live work.
     """
 
-    def __init__(self, control: Control, runtime: Runtime, timeout: float = 60):
+    def __init__(
+        self,
+        control: Control,
+        runtime: Runtime,
+        timeout: float = 60,
+        *,
+        layers_per_chunk: int = 1,
+    ):
         self.control, self.runtime, self.timeout = control, runtime, timeout
+        self.layers_per_chunk = layers_per_chunk
         self.phase = Phase.IDLE
         self.epoch = 0
         self._layers: tuple[int, ...] = ()
@@ -142,11 +152,11 @@ class AsyncEplbCoordinator:
             self._layers = self._future.result()
         else:
             try:
-                writeback = self._future.result()
-                self.runtime.install(layer, writeback)
+                for slot, (layer, writeback) in enumerate(self._future.result()):
+                    self.runtime.install(layer, writeback, slot)
+                    self.layers_installed += 1
             except Exception as error:
                 self._fatal("EPLB install failed; layout integrity unknown", error)
-            self.layers_installed += 1
         self._future = None
 
         if self.layers_installed == len(self._layers):
@@ -157,12 +167,20 @@ class AsyncEplbCoordinator:
         self._deadline = time.monotonic() + self.timeout
         try:
             self.runtime.record_source_ready()
-            next_layer = self._layers[self.layers_installed]
-            self._future = self._executor.submit(self.runtime.stage, next_layer)
+            next_layers = self._layers[
+                self.layers_installed : self.layers_installed + self.layers_per_chunk
+            ]
+            self._future = self._executor.submit(self._stage_chunk, next_layers)
         except Exception as error:
             self._error = error
             self._future = None
         return False
+
+    def _stage_chunk(self, layers: tuple[int, ...]):
+        return tuple(
+            (layer, self.runtime.stage(layer, slot))
+            for slot, layer in enumerate(layers)
+        )
 
     def cancel(self) -> None:
         """Collective: no rank may restart or free storage until all are drained."""

@@ -418,9 +418,12 @@ def validate_async_eplb_args(cfg) -> None:
         raise ValueError(
             "Async NPU EPLB requires fixed PP=1 resident weights and single-batch execution"
         )
-    if cfg.eplb_rebalance_layers_per_chunk not in (None, 1):
+    chunk_size = cfg.eplb_rebalance_layers_per_chunk
+    if chunk_size not in (None, 1) and (
+        chunk_size != 2 or cfg.disaggregation_mode != "prefill"
+    ):
         raise ValueError(
-            "Async NPU EPLB commits one layer per boundary; use chunk size 1"
+            "Async NPU EPLB supports a chunk size of 1, or 2 on a disaggregated prefill worker"
         )
     window = cfg.expert_distribution_recorder_buffer_size
     interval = cfg.eplb_rebalance_num_iterations
