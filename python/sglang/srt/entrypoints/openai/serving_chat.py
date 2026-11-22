@@ -2101,9 +2101,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                processed_msg["content"] = normalize_tool_content(
-                    processed_msg["role"], processed_msg.get("content")
-                )
+                if not self.is_gigachat4:
+                    processed_msg["content"] = normalize_tool_content(
+                        processed_msg["role"], processed_msg.get("content")
+                    )
 
                 openai_compatible_messages.append(processed_msg)
 
