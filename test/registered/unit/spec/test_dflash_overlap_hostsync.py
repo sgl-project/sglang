@@ -56,16 +56,20 @@ class TestCompactSeqLensHostBound(CustomTestCase):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
         seq = torch.arange(16385)
+        block_size = 16
         for page in (1, 64):
             worker = SimpleNamespace(
-                draft_window_size=2048, page_size=page, _draft_compact_page_size=page
+                draft_window_size=2048,
+                page_size=page,
+                _draft_compact_page_size=page,
+                block_size=block_size,
             )
             bound = torch.empty(seq.numel(), dtype=torch.int32)
             DFlashWorkerV2._fill_compact_seq_lens_cpu_bound(
                 worker, batch_seq_lens_cpu=None, nxt_kv_lens_cpu=None, out=bound
             )
             exact = _compact_lens_exact(seq, 2048, page)
-            self.assertTrue(bool((bound >= exact).all()))
+            self.assertTrue(bool((bound >= exact + block_size).all()))
 
     def test_sawtooth_counterexample(self):
         # exact(4160) = 4096 < exact(4100) = 4100 at window=4096 page=64:
