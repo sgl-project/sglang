@@ -45,6 +45,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
