@@ -355,6 +355,33 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
+def dflash_draft_kv_fits_swa(
+    *, draft_hf_config: Any, target_window: Optional[int]
+) -> bool:
+    """Every draft layer slides within the target's SWA window."""
+    from sglang.srt.runtime_context import get_disagg
+
+    # PD transfer registers only a pool's full sub-pool
+    if (
+        target_window is None
+        or get_spec().speculative_draft_window_size is not None
+        or get_disagg().disaggregation_mode != "null"
+    ):
+        return False
+    layer_types, window = (
+        get_dflash_layer_types(draft_hf_config),
+        get_dflash_attention_sliding_window_size(draft_hf_config),
+    )
+    return (
+        bool(layer_types)
+        and all(t == "sliding_attention" for t in layer_types)
+        and window is not None
+        and 0 <= window <= target_window
+        # The draft then lives in an MHA SWA sub-pool, which an MLA draft cannot use.
+        and not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+    )
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)

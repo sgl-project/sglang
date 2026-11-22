@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     layer_window_locs,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -803,6 +804,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
+
+    @property
+    def draft_window_reaches(self) -> dict[str, int]:
+        # A window-geometry draft pool reads its window back from the block's first query row.
+        if not self._hosts_draft:
+            return {}
+        runner = self.draft_model_runner
+        pool = runner.token_to_kv_pool
+        if not isinstance(pool, SWAKVPool):
+            return {}
+        router = pool.layer_router
+        if not router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+            return {}
+        return {
+            router.storage_name(IdSpaceKind.SLIDING_WINDOW): (
+                get_dflash_attention_sliding_window_size(runner.model_config.hf_config)
+                + int(self.block_size)
+            )
+        }
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
