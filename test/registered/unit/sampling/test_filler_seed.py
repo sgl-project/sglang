@@ -112,10 +112,8 @@ class TestFillerSeed(CustomTestCase):
         copies = pickle.loads(pickle.dumps(received[:4]))
         live = Session(capacity_of_str_len=0, session_id="live", streaming=True)
         reqs = [_build_req(r, {"live": live}) for r in copies]
-        info = SamplingBatchInfo.from_schedule_batch(
-            SimpleNamespace(reqs=reqs, device="cpu"), VOCAB
-        )
-        self.assertEqual(info.rows_with_seed, [True, False, False, False])
+        info = SamplingBatchInfo(vocab_size=VOCAB, device="cpu")
+        info.set_seeds_and_mask_rows(reqs)
         self.assertEqual(info.sampling_seed.tolist(), [123] + fillers[1:4])
 
 
