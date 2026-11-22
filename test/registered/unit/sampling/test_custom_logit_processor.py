@@ -137,7 +137,7 @@ class TestCustomLogitProcessorRows(CustomTestCase):
         info = self._info(3, [0, 2])
         info.filter_batch([0, 2], torch.tensor([0, 2]))
         # Merge a 2-row batch whose only opted-in row is old index 1.
-        info.merge_batch(self._info(2, [1]))
+        info.merge_batch(self._info(2, [1]), self_len=2, other_len=2)
 
         entry = info.custom_logit_processor[self.KEY]
         self.assertEqual(entry.rows, entry.indices.tolist())
