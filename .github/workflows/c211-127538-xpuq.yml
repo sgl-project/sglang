@@ -1,0 +1,871 @@
+name: c211-127538-xpuq
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  intel-bmg-01:
+    name: intel-bmg-01
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-01 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-01 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-02:
+    name: intel-bmg-02
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-02 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-02 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-03:
+    name: intel-bmg-03
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-03 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-03 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-04:
+    name: intel-bmg-04
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-04 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-04 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-05:
+    name: intel-bmg-05
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-05 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-05 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-06:
+    name: intel-bmg-06
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-06 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-06 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-07:
+    name: intel-bmg-07
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-07 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-07 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-08:
+    name: intel-bmg-08
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-08 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-08 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-09:
+    name: intel-bmg-09
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-09 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-09 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-10:
+    name: intel-bmg-10
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-10 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-10 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-11:
+    name: intel-bmg-11
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-11 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-11 nonce=$NONCE"
+          exit 0
+
+  intel-bmg-12:
+    name: intel-bmg-12
+    runs-on: intel-bmg
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=intel-bmg-12 NONCE=$NONCE"
+          echo "C211_MARKER job=intel-bmg-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=intel-bmg-12 nonce=$NONCE"
+          exit 0
+
+  bmg-multigen-01:
+    name: bmg-multigen-01
+    runs-on: bmg-multigen-models
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=bmg-multigen-01 NONCE=$NONCE"
+          echo "C211_MARKER job=bmg-multigen-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=bmg-multigen-01 nonce=$NONCE"
+          exit 0
+
+  bmg-multigen-02:
+    name: bmg-multigen-02
+    runs-on: bmg-multigen-models
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=bmg-multigen-02 NONCE=$NONCE"
+          echo "C211_MARKER job=bmg-multigen-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=bmg-multigen-02 nonce=$NONCE"
+          exit 0
+
+  bmg-multigen-03:
+    name: bmg-multigen-03
+    runs-on: bmg-multigen-models
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=bmg-multigen-03 NONCE=$NONCE"
+          echo "C211_MARKER job=bmg-multigen-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=bmg-multigen-03 nonce=$NONCE"
+          exit 0
+
+  bmg-multigen-04:
+    name: bmg-multigen-04
+    runs-on: bmg-multigen-models
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=bmg-multigen-04 NONCE=$NONCE"
+          echo "C211_MARKER job=bmg-multigen-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- XPU-SMI DISCOVERY ---"
+          if command -v xpu-smi >/dev/null 2>&1; then
+            xpu-smi discovery 2>&1 | head -300 || echo XPU_SMI_DISCOVERY_FAILED
+            echo "--- XPU-SMI DISCOVERY JSON (--json) ---"
+            xpu-smi discovery --json 2>&1 | head -500 || echo XPU_SMI_JSON_UNSUPPORTED
+            echo "--- XPU-SMI DISCOVERY JSON (-j) ---"
+            xpu-smi discovery -j 2>&1 | head -500 || echo XPU_SMI_DASH_J_UNSUPPORTED
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Intel|Moore' | head -40 || echo LSPCI_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=bmg-multigen-04 nonce=$NONCE"
+          exit 0
+
+  musa-s5000-1-01:
+    name: musa-s5000-1-01
+    runs-on: s5000-1-gpu-runner
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=musa-s5000-1-01 NONCE=$NONCE"
+          echo "C211_MARKER job=musa-s5000-1-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- MTHREADS-GMI -L ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then
+            mthreads-gmi -L 2>&1 | head -80 || echo MTHREADS_GMI_L_FAILED
+            echo "--- MTHREADS-GMI -q ---"
+            mthreads-gmi -q 2>&1 | head -400 || echo MTHREADS_GMI_Q_FAILED
+            echo "--- MTHREADS-GMI (plain fallback) ---"
+            mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED
+          else
+            echo MTHREADS_GMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Moore|1ed5' | head -40 || echo LPCIE_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=musa-s5000-1-01 nonce=$NONCE"
+          exit 0
+
+  musa-s5000-2-01:
+    name: musa-s5000-2-01
+    runs-on: s5000-2-gpu-runner
+    timeout-minutes: 15
+    steps:
+      - name: read-only-device-identity
+        shell: bash
+        env:
+          NONCE: c211-127538-13f55533aa5d628b
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127538-13f55533aa5d628b'
+          echo "C211_JOB=musa-s5000-2-01 NONCE=$NONCE"
+          echo "C211_MARKER job=musa-s5000-2-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- DRM SYSFS (read-only) ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            echo "DRM_PATH=$d"
+            echo "DRM_VENDOR=$(cat $d/vendor 2>/dev/null)"
+            echo "DRM_DEVICE=$(cat $d/device 2>/dev/null)"
+            echo "DRM_SUBSYS_DEVICE=$(cat $d/subsystem_device 2>/dev/null)"
+            grep -E '^(PCI_SLOT_NAME|PCI_ID|PCI_SUBSYS_ID|DRIVER)=' "$d/uevent" 2>/dev/null || true
+          done
+          ls -l /dev/dri 2>&1 || true
+          echo "--- MTHREADS-GMI -L ---"
+          if command -v mthreads-gmi >/dev/null 2>&1; then
+            mthreads-gmi -L 2>&1 | head -80 || echo MTHREADS_GMI_L_FAILED
+            echo "--- MTHREADS-GMI -q ---"
+            mthreads-gmi -q 2>&1 | head -400 || echo MTHREADS_GMI_Q_FAILED
+            echo "--- MTHREADS-GMI (plain fallback) ---"
+            mthreads-gmi 2>&1 | head -200 || echo MTHREADS_GMI_FAILED
+          else
+            echo MTHREADS_GMI_ABSENT
+          fi
+          echo "--- LSPCI FALLBACK ---"
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>&1 | grep -iE 'VGA|Display|3D|Moore|1ed5' | head -40 || echo LPCIE_NO_MATCH
+          else
+            echo LSPCI_ABSENT
+          fi
+          echo "C211_PROBE_END job=musa-s5000-2-01 nonce=$NONCE"
+          exit 0
+
