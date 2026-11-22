@@ -119,7 +119,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
             return_sampling_support_logprobs=[False, True],
             sampling_mask_batch_indices=torch.tensor([0, 1]),
         )
-        info.merge_batch(other)
+        info.merge_batch(other, reqs=[], other_reqs=[])
         self.assertEqual(
             info.return_sampling_support_logprobs,
             [True, False, False, True],
@@ -141,7 +141,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
             return_sampling_masks=[True],
             sampling_mask_batch_indices=torch.tensor([0]),
         )
-        info.merge_batch(other)
+        info.merge_batch(other, reqs=[], other_reqs=[])
         self.assertEqual(info.return_sampling_masks, [False, True])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
 
@@ -169,7 +169,7 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
             sampling_mask_batch_indices=torch.tensor([0, 2]),
         )
 
-        lhs.merge_batch(rhs)
+        lhs.merge_batch(rhs, reqs=[], other_reqs=[])
 
         self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
@@ -210,7 +210,7 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
                     for key, entry in (left.custom_logit_processor or {}).items()
                 }
 
-                left.merge_batch(right)
+                left.merge_batch(right, reqs=[], other_reqs=[])
 
                 self.assertEqual(set(left.custom_logit_processor or {}), set(expected))
                 for key, expected_rows in expected.items():
@@ -509,7 +509,9 @@ class TestFilterBatch(CustomTestCase):
                     )
                 },
                 custom_params=[{"value": 30}],
-            )
+            ),
+            reqs=[],
+            other_reqs=[],
         )
         entry = info.custom_logit_processor[42]
         self.assertEqual(entry.rows, [0, 2, 3])
@@ -536,16 +538,20 @@ class TestFilterBatch(CustomTestCase):
         self.assertIsNone(info.custom_logit_processor)
 
     def test_seeds_follow_rows_through_merge_and_filter(self):
-        """A merged-in unseeded side gets filler seeds; once the last seeded row
-        leaves, the batch returns to the unseeded samplers."""
+        """A merged-in unseeded side takes its requests' filler seeds; once the last
+        seeded row leaves, the batch returns to the unseeded samplers."""
         info = _make_info(batch_size=1)
         seeded = _make_info(
             batch_size=1,
             sampling_seed=torch.tensor([123], dtype=torch.int64),
             rows_with_seed=[True],
         )
-        info.merge_batch(seeded)
-        self.assertEqual(info.sampling_seed[1].item(), 123)
+        info.merge_batch(
+            seeded,
+            reqs=[SimpleNamespace(filler_seed=456)],
+            other_reqs=[SimpleNamespace(filler_seed=789)],
+        )
+        self.assertEqual(info.sampling_seed.tolist(), [456, 123])
         self.assertEqual(info.rows_with_seed, [False, True])
 
         info.filter_batch([0], torch.tensor([0]))
@@ -569,7 +575,7 @@ class TestMergeBatch(CustomTestCase):
         info1.temperatures = torch.tensor([[1.0], [2.0]])
         info2 = _make_info(batch_size=1)
         info2.temperatures = torch.tensor([[3.0]])
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertEqual(len(info1), 3)
         self.assertAlmostEqual(info1.temperatures[2, 0].item(), 3.0)
 
@@ -589,7 +595,7 @@ class TestMergeBatch(CustomTestCase):
             need_min_p_sampling=True,
             npu_top_k_top_p_eligible=False,
         )
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertFalse(info1.is_all_greedy)  # AND semantics
         self.assertTrue(info1.need_top_p_sampling)  # OR semantics
         self.assertTrue(info1.need_top_k_sampling)  # OR semantics
@@ -601,7 +607,7 @@ class TestMergeBatch(CustomTestCase):
         for (lhs, rhs), expected in cases:
             with self.subTest(lhs=lhs, rhs=rhs):
                 info1 = _make_info(max_top_k=lhs)
-                info1.merge_batch(_make_info(max_top_k=rhs))
+                info1.merge_batch(_make_info(max_top_k=rhs), reqs=[], other_reqs=[])
                 self.assertEqual(info1.max_top_k, expected)
 
     def test_merge_with_logit_bias(self):
@@ -610,7 +616,7 @@ class TestMergeBatch(CustomTestCase):
         info1.logit_bias = torch.ones(1, VOCAB_SIZE)
         info2 = _make_info(batch_size=1)
         info2.logit_bias = None
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertEqual(info1.logit_bias.shape, (2, VOCAB_SIZE))
 
     def test_merge_with_custom_logit_processor(self):
@@ -626,7 +632,7 @@ class TestMergeBatch(CustomTestCase):
         info2.has_custom_logit_processor = False
         info2.custom_logit_processor = None
         info2.custom_params = None
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertTrue(info1.has_custom_logit_processor)
         self.assertEqual(len(info1.custom_params), 2)
 
@@ -636,7 +642,7 @@ class TestMergeBatch(CustomTestCase):
         info1.sampling_seed = None
         info2 = _make_info(batch_size=1)
         info2.sampling_seed = None
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertIsNone(info1.sampling_seed)
 
     def test_merge_with_both_sampling_seeds(self):
@@ -645,7 +651,7 @@ class TestMergeBatch(CustomTestCase):
         info1.sampling_seed = torch.tensor([10, 20], dtype=torch.int64)
         info2 = _make_info(batch_size=1)
         info2.sampling_seed = torch.tensor([30], dtype=torch.int64)
-        info1.merge_batch(info2)
+        info1.merge_batch(info2, reqs=[], other_reqs=[])
         self.assertEqual(info1.sampling_seed.shape[0], 3)
         self.assertEqual(info1.sampling_seed[0].item(), 10)
         self.assertEqual(info1.sampling_seed[1].item(), 20)
@@ -710,6 +716,7 @@ class TestFromScheduleBatch(CustomTestCase):
         min_tokens=0,
         logit_bias=None,
         seed=None,
+        filler_seed=0,
         stop_ids=None,
         eos_id=2,
     ):
@@ -723,6 +730,7 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.min_new_tokens = min_tokens
         req.sampling_params.logit_bias = logit_bias
         req.sampling_params.sampling_seed = seed
+        req.filler_seed = filler_seed
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
@@ -781,14 +789,16 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
 
     def test_seed_without_deterministic_inference(self):
-        """A non-greedy request's seed applies and the other rows get seeds too; a
-        greedy seed, or speculative decoding, leaves the batch unseeded."""
+        """A non-greedy request's seed applies and the other rows take their filler
+        seeds; a greedy seed, or speculative decoding, leaves the batch unseeded."""
         batch = MagicMock()
         batch.device = DEVICE
-        batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
+        batch.reqs = [
+            self._make_req(seed=123, top_k=50),
+            self._make_req(seed=None, filler_seed=456),
+        ]
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertEqual(info.sampling_seed.shape[0], 2)
-        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.sampling_seed.tolist(), [123, 456])
         self.assertEqual(info.rows_with_seed, [True, False])
 
         batch.reqs = [self._make_req(seed=123, top_k=1)]
@@ -931,7 +941,7 @@ class TestFromScheduleBatch(CustomTestCase):
         right_batch.device = DEVICE
         right = SamplingBatchInfo.from_schedule_batch(right_batch, VOCAB_SIZE)
 
-        left.merge_batch(right)
+        left.merge_batch(right, reqs=[], other_reqs=[])
 
         entry = left.custom_logit_processor[hash(processor_str)]
         self.assertEqual(entry.rows, [2])

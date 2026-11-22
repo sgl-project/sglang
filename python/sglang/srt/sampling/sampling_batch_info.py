@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import operator
-import random
 from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -72,19 +71,8 @@ def _rows_with_seed(
     return rows
 
 
-# TP ranks sample independently, so their filler seeds must match. Every rank builds
-# the same batches, but other code (e.g. tracing) may draw from the global `random`
-# on one rank and not another, which would put the ranks' sequences out of step.
-_FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
-
-
-def _filler_seed() -> int:
-    # The seeded samplers hash each seed as uint64; any int64 works.
-    return _FILLER_SEED_RNG.getrandbits(63)
-
-
-def _filler_seeds(n: int, device: str) -> torch.Tensor:
-    return torch.tensor([_filler_seed() for _ in range(n)], dtype=torch.int64).to(
+def _filler_seeds(reqs: List[Req], device: str) -> torch.Tensor:
+    return torch.tensor([r.filler_seed for r in reqs], dtype=torch.int64).to(
         device, non_blocking=True
     )
 
@@ -212,7 +200,7 @@ class SamplingBatchInfo:
                 seed = r.sampling_params.sampling_seed
                 if seed is None:
                     # A deterministic run defaults to 42; otherwise the row stays random.
-                    seed = 42 if enable_deterministic else _filler_seed()
+                    seed = 42 if enable_deterministic else r.filler_seed
                 seeds.append(seed)
             sampling_seed = torch.tensor(seeds, dtype=torch.int64, pin_memory=_pin).to(
                 device, non_blocking=True
@@ -518,7 +506,10 @@ class SamplingBatchInfo:
             self.custom_params = None
             self.has_custom_logit_processor = False
 
-    def merge_batch(self, other: SamplingBatchInfo):
+    def merge_batch(
+        self, other: SamplingBatchInfo, *, reqs: List[Req], other_reqs: List[Req]
+    ):
+        """reqs and other_reqs are the requests behind self's and other's rows."""
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors
@@ -578,11 +569,11 @@ class SamplingBatchInfo:
             self.rows_with_seed = (self.rows_with_seed or [False] * self_len) + (
                 other.rows_with_seed or [False] * other_len
             )
-            # Rows of an unseeded side sample with random seeds, as in from_schedule_batch.
+            # Rows of an unseeded side use their filler seeds, as in from_schedule_batch.
             if self.sampling_seed is None:
-                self.sampling_seed = _filler_seeds(self_len, self.device)
+                self.sampling_seed = _filler_seeds(reqs, self.device)
             if other.sampling_seed is None:
-                other.sampling_seed = _filler_seeds(other_len, self.device)
+                other.sampling_seed = _filler_seeds(other_reqs, self.device)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
