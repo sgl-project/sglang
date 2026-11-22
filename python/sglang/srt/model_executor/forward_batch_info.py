@@ -1853,6 +1853,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
+            and not prefill_graph_tolerates_sum_len()
+        ):
+            from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+                PrefillCudaGraphRunner,
+            )
+
+            prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
+            if isinstance(
+                prefill_runner, PrefillCudaGraphRunner
+            ) and not prefill_runner.can_replay_dp_tokens(
+                self.original_global_num_tokens_cpu or self.global_num_tokens_cpu
+            ):
+                self.can_run_dp_prefill_cuda_graph = False
+        if (
+            self.can_run_dp_prefill_cuda_graph
+            and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
             and max_len_with_idle_allowed
