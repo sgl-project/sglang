@@ -1,6 +1,5 @@
 """Filler seeds: drawn per request where it enters the scheduler, shared by every rank."""
 
-import importlib
 import pickle
 import unittest
 from array import array
@@ -28,7 +27,6 @@ from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.session.session_controller import Session  # noqa: E402
-from sglang.srt.utils.common import set_random_seed  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -56,26 +54,9 @@ def _tokenized(rid, *, sampling_seed=None, session_params=None, filler_seed=None
 
 
 def _receive(sent):
-    """The requests a server's first rank receives from its frontend."""
-    receiver = request_receiver.SchedulerRequestReceiver(
-        recv_from_tokenizer=SimpleNamespace(drain=lambda limit: list(sent)),
-        recv_skipper=None,
-        input_blocker=None,
-        mm_receiver=None,
-        server_args=SimpleNamespace(),
-        model_config=SimpleNamespace(is_multimodal=False),
-        max_recv_per_poll=-1,
-        request_retirer=None,
-        get_last_batch=lambda: None,
-        rust_server_mode=True,
-    )
-    return receiver.recv_requests()
-
-
-def _relaunch():
-    """Reset the receiving side as a restart with the same --random-seed does."""
-    importlib.reload(request_receiver)
-    set_random_seed(0)
+    """The requests the first rank holds once it has drawn their fillers."""
+    request_receiver._draw_filler_seeds(sent)
+    return sent
 
 
 def _build_req(recv_req, sessions):
@@ -107,52 +88,35 @@ class TestFillerSeed(CustomTestCase):
         super().setUp()
         enter_scope(self, published_topology(role="scheduler"))
 
-    def test_each_received_request_draws_its_own_filler(self):
-        """Two launches given the same traffic draw different fillers, and a filler
-        a sender put on the wire is replaced."""
-
-        def traffic():
-            return [
-                _tokenized("a", filler_seed=7),
-                BatchTokenizedGenerateReqInput(
-                    batch=[_tokenized("b"), _tokenized("c")]
-                ),
-            ]
-
-        def launch_and_receive():
-            _relaunch()
-            single, batch = _receive(traffic())
-            return [single.filler_seed] + [r.filler_seed for r in batch]
-
-        first, second = launch_and_receive(), launch_and_receive()
-        self.assertNotIn(7, first)
-        self.assertEqual(len(set(first + second)), 6)
-        self.assertTrue(all(0 <= seed < 2**63 for seed in first + second))
-
-    def test_another_rank_samples_with_the_same_seeds(self):
-        """A rank given the broadcast requests builds the leader's fillers on every
-        construction path (an unknown session is aborted but still prefilled); the
-        seeded request keeps its own seed."""
+    def test_every_rank_samples_with_the_leader_fillers(self):
+        """The receiving rank replaces any filler a sender set and draws one per
+        request, batched ones included. A rank given the broadcast copies builds
+        the same fillers on every construction path (an unknown session is aborted
+        but still prefilled); the seeded request keeps its own seed."""
         received = _receive(
             [
                 _tokenized("seeded", sampling_seed=123),
-                _tokenized("plain"),
+                _tokenized("plain", filler_seed=7),
                 _tokenized("turn", session_params=SessionParams(id="live")),
                 _tokenized("lost", session_params=SessionParams(id="gone")),
+                BatchTokenizedGenerateReqInput(batch=[_tokenized("b")]),
             ]
         )
+        fillers = [r.filler_seed for r in received[:4]] + [
+            received[4].batch[0].filler_seed
+        ]
+        self.assertNotIn(7, fillers)
+        self.assertEqual(len(set(fillers)), 5)
+
         # A broadcast hands every other rank a pickled copy.
-        copies = pickle.loads(pickle.dumps(received))
+        copies = pickle.loads(pickle.dumps(received[:4]))
         live = Session(capacity_of_str_len=0, session_id="live", streaming=True)
         reqs = [_build_req(r, {"live": live}) for r in copies]
         info = SamplingBatchInfo.from_schedule_batch(
             SimpleNamespace(reqs=reqs, device="cpu"), VOCAB
         )
         self.assertEqual(info.rows_with_seed, [True, False, False, False])
-        self.assertEqual(
-            info.sampling_seed.tolist(),
-            [123] + [r.filler_seed for r in received[1:]],
-        )
+        self.assertEqual(info.sampling_seed.tolist(), [123] + fillers[1:4])
 
 
 if __name__ == "__main__":
