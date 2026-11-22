@@ -332,6 +332,12 @@ class AiterRunnerCore(MoeRunnerCore):
         if activation is None:
             activation = _aiter_activation(self.config)
 
+        from sglang.srt.runtime_context import get_forward
+
+        out_buf = get_forward().aiter_moe_output
+        if out_buf is not None:
+            extra["output"] = out_buf
+
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,

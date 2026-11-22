@@ -709,6 +709,8 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
+        # [M, hidden] destination aiter's fused_moe writes directly (opt-in).
+        "aiter_moe_output": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,
