@@ -69,6 +69,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.muse_spark.fused import glue
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
@@ -369,6 +370,7 @@ class MuseSpark1xAttention(nn.Module):
             if self.use_qk_norm
             else None
         )
+        glue.prepare_attention(self)
 
     def _fused_kv_store(
         self, forward_batch: ForwardBatch
@@ -413,6 +415,11 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        attn_out = glue.run_attention(self, qkv, positions, forward_batch)
+        if attn_out is not None:
+            return self.o_proj(
+                attn_out, output_tensor=glue.ar_out(attn_out.shape[0], self.hidden_size)
+            )[0]
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
             q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
