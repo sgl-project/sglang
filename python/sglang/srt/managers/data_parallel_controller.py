@@ -992,9 +992,7 @@ def run_data_parallel_controller_process(
             init_info["kv_hint_sources"] = sorted(
                 controller.local_kv_hint_sources, key=lambda source: source["dp_rank"]
             )
-        # Without gRPC, schedulers report raw event sources only for a storage
-        # backend that publishes its own residency.
-        if get_serving().grpc_port is not None or controller.local_kv_event_sources:
+        if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )

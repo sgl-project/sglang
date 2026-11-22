@@ -485,9 +485,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
-    # Whether an attached storage backend publishes its own residency as KV
-    # events (HiCacheStorage.publishes_kv_events) through this cache.
-    storage_kv_events_enabled: bool = False
     buffer_pipeline: Optional[BufferModePipeline] = None
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.

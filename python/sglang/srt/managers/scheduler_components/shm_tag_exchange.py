@@ -262,10 +262,7 @@ _EXCHANGES: Dict[tuple, object] = {}
 
 
 def get_shm_exchange(
-    group: Optional[dist.ProcessGroup],
-    kind: str,
-    multihost: bool = False,
-    width: int = 8,
+    group: Optional[dist.ProcessGroup], kind: str, multihost: bool = False
 ):
     """Collective on first call per (group, kind): every rank of the group must call it
     at the same point. Returns None (stock path) when disabled, under --sleep-on-idle,
@@ -286,7 +283,7 @@ def get_shm_exchange(
 
             same = in_the_same_node_as(group, source_rank=0)
             if all(same):
-                _EXCHANGES[key] = ShmTagExchange(group, kind, width)
+                _EXCHANGES[key] = ShmTagExchange(group, kind)
                 logger.info(
                     "Shared-memory exchange '%s' enabled for a %d-rank group",
                     kind,
@@ -299,7 +296,7 @@ def get_shm_exchange(
             ):
                 # Only when this group is the whole default group, so the subgroup
                 # creation inside is collective over exactly these ranks.
-                _EXCHANGES[key] = HierTagExchange(group, kind, width)
+                _EXCHANGES[key] = HierTagExchange(group, kind)
                 logger.info(
                     "Hierarchical shared-memory exchange '%s' enabled for a %d-rank group on %d hosts",
                     kind,

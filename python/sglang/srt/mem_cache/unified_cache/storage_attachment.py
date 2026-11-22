@@ -32,12 +32,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-def _publishes_kv_events(controller) -> bool:
-    backend = controller.storage_backend
-    return backend is not None and backend.publishes_kv_events
-
-
 # Kept in sync with the server-args choices; validated here so an admin request
 # carrying a bad policy is rejected before it can touch the controller.
 _PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
@@ -196,32 +190,6 @@ class StorageAttachment:
             )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
-        if _publishes_kv_events(controller):
-            # The KV event topic and the router sources are fixed when the
-            # scheduler starts, so such a backend only works from launch. Its
-            # class decides only once built, hence attach-then-detach. If the
-            # rollback fails it stays attached but never publishes: the cache
-            # enables publishing only for a launch-time backend.
-            (
-                cache.prefetch_stop_policy,
-                controller.write_policy,
-                cache.write_through_threshold,
-                cache.is_write_back,
-            ) = original_policies
-            rejected = (
-                f"Storage backend '{storage_backend}' publishes KV events and "
-                "must be configured when launching the worker"
-            )
-            try:
-                controller.detach_storage_backend()
-            except Exception as e:
-                logger.exception("Failed to detach a rejected storage backend.")
-                return False, (
-                    f"{rejected}; detaching it failed ({e}), so it is still "
-                    "attached. Retry the detach."
-                )
-            return False, f"{rejected}."
-
         self.apply_runtime_config(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
@@ -237,11 +205,8 @@ class StorageAttachment:
         cache.storage_existence_cache.clear()
         return True, "Attached HiCache storage backend successfully."
 
-    def detach(self, *, shutdown: bool = False) -> tuple[bool, str]:
+    def detach(self) -> tuple[bool, str]:
         """Disable the storage backend at runtime.
-
-        A backend that publishes KV events is detached only at ``shutdown``:
-        its residency stream lives as long as the worker.
 
         The caller must ensure there are no running or queued requests. Ordering
         matters and is the reason this is not just ``controller.detach()``:
@@ -259,11 +224,6 @@ class StorageAttachment:
         controller = cache.cache_controller
         if controller is None:
             return False, "HiCache storage backend is not initialized."
-        if not shutdown and cache.storage_kv_events_enabled:
-            return False, (
-                "The storage backend publishes KV events for the worker's "
-                "lifetime; restart the worker to change or detach it."
-            )
 
         try:
             cache.drain_storage_control_queues_local()
@@ -296,7 +256,7 @@ class StorageAttachment:
         """
         try:
             if self._cache.enable_storage:
-                self.detach(shutdown=True)
+                self.detach()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 

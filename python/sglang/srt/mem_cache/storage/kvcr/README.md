@@ -73,7 +73,7 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
   least 30 s. Setting only one derives the other, and the startup log prints
   both. Lower abandonment shortens a dead peer's stall; raise both for links
   slower than that rate.
-- `enable_remote_hint` and `publish_inventory` (`false`): see below.
+- `enable_remote_hint` (`false`): see below.
 - `share_replicated_kv` (`false`): one copy of rank-replicated KV per replica;
   see below.
 - `extra_backend_tag` (unset): hashed into the storage namespace. The namespace
@@ -105,11 +105,7 @@ the request's own event IDs are fetched. A query is advisory; terminal delivery
 decides which pages are usable.
 
 With an explicit `control_advertise_host`, remote hints also report the
-worker's control endpoint to a router (see below). Without
-`publish_inventory`, Dynamo's router then treats the worker's GPU and HiCache
-host pages as fetchable too, but a peer's KVCR serves only its own DRAM, so
-many of those hints miss and the target recomputes. Use `publish_inventory`
-with Dynamo's `kvcr` worker-selection policy.
+worker's control endpoint to a router (see Router discovery).
 
 For models with trailing/checkpoint pools (SWA, Mamba, DeepSeek V4 states),
 peer reuse is effectively disabled in this version. A hinted page does not
@@ -147,98 +143,23 @@ well within it. With KVCR 0.2.0, a writer whose progress stalls past
 its replica then misses in L3 for the shared pools. Include `sm` in `UCX_TLS`
 so same-host pulls use shared memory.
 
-## Inventory publication (Dynamo KV state agent)
+## Router discovery
 
-With `"publish_inventory": true`, each rank reports what its KVCR DRAM
-actually holds as KV events, so a KV-aware router (Dynamo's KV state agent)
-can tell KVCR residency apart from SGLang's own GPU and HiCache host pages and
-send `kv.fetch` hints that name a peer which really holds the prefix. It
-requires remote hints and an explicit, peer-reachable, non-loopback
-`control_advertise_host`; startup fails otherwise:
+With remote hints on and an explicit `control_advertise_host`, the engine
+reports one `kv_hint_sources` entry per DP replica in `scheduler_infos`, from
+its first shard: `dp_rank`, `source_control_endpoint` (`tcp://host:port`) and
+`capabilities` `["router_hint"]`. A router such as Dynamo's reads it to name
+this worker in `kv.fetch` hints; peers reach the other shards by rank offset
+from that endpoint.
 
-```json
-{
-  "enable_remote_hint": true,
-  "publish_inventory": true,
-  "control_advertise_host": "<reachable-worker-host>",
-  "control_port": 32100
-}
-```
+This version does not report what KVCR's DRAM holds, so such a router treats
+the worker's GPU and HiCache host pages as fetchable too. A peer's KVCR serves
+only its own DRAM, so many of those hints miss and the target recomputes.
+Publishing KVCR residency to the router is left to a follow-up.
 
-KV events must be on, with a ZMQ publisher in Dynamo format, e.g.
-`--kv-events-config '{"publisher": "zmq", "endpoint": "tcp://*:5557",
-"topic": "kv-events", "format": "dynamo"}'`. A wildcard bind is advertised on
-`control_advertise_host`; the raw-event endpoint must be reachable from the
-state agent's host as well. Startup fails for another format, a null or
-connect-mode publisher, an IPC endpoint or a loopback bind.
-
-The KVCR-owned events go out on the worker's ordinary KV event stream: the
-`/owner/<id>` topic suffix only separates engine incarnations, so any
-subscriber to the configured topic (or to all topics) receives them. Only
-Dynamo's state agent reads their `ownership` today; sgl-router and
-sgl-kv-indexer ignore it and would file KVCR DRAM pages as the worker's own
-HiCache host pages. Do not combine `publish_inventory` with sgl-router KV
-event routing.
-
-What SGLang reports at startup (`scheduler_infos` of the engine):
-
-- `kv_hint_sources`: one source per DP replica, from its first shard:
-  `dp_rank`, `source_control_endpoint` (`tcp://host:port`), `capabilities`
-  `["router_hint"]` whenever remote hints are on with an explicit
-  `control_advertise_host`, plus `"kvcr_inventory"` and a `cache_owner_id`
-  when publishing. The owner ID is Dynamo's `CacheOwnerId`,
-  `<ns[:32]>:<ns[32:]>/0000000000000000/<uuid>`: the indexer domain is the
-  64-hex storage namespace, the cluster field is fixed, and the incarnation is
-  a per-process UUID, since KVCR's DRAM does not survive the process.
-- `kv_event_sources`: per DP replica, the publisher's endpoint, `topic`
-  (the configured topic plus `/owner/<sha256 of the owner>`), `block_size`
-  and `format`.
-
-Events are single-page `BlockStored`/`BlockRemoved` with `ownership: "kvcr"`
-and medium `CPU_PINNED`, published from KVCR's native residency (not from an
-acknowledged write). A page is stored once every attention TP x CP shard holds
-it (the writer alone with `share_replicated_kv`) in every pool that must hold
-all pages (trailing SWA/Mamba/state pools are not advertised), and removed as
-soon as any shard drops it. `/flush_cache` leaves KVCR DRAM and these events in
-place: its `AllBlocksCleared` carries no ownership, and Dynamo clears only the
-worker's own residency for it. Event identities
-come from the HiCache tree backups and prefetches that move a page; a page
-resident only through a decode-side offload backup is not advertised.
-
-End to end with Dynamo: start `python -m dynamo.kv_state_agent` in the
-workers' namespace, then the frontend with the `kvcr` worker-selection policy,
-which is what sends `kv.fetch` hints (with only `--router-mode kv`, the default
-policy sends none):
-
-```yaml
-# worker-selection.yaml; add prefill/decode roles for disaggregated serving.
-worker_selection:
-  aggregated:
-    type: kvcr
-    parameters:
-      shared_cache_multiplier: 0.5  # > 0 credits prefixes fetchable from a peer
-```
-
-```bash
-python -m dynamo.frontend --router-mode kv --router-policy-config worker-selection.yaml
-```
-
-Keep the frontend's event-driven local indexer (no predict-on-route), which
-fetch-source discovery requires. Then start `python -m dynamo.sglang` workers
-with HiCache, this backend and the options above, KV events on. Each worker
-attaches its owners to the state agent from this startup metadata. The router
-then routes on, and hints from, actual KVCR residency, and a worker fetches
-hinted pages from that peer's KVCR DRAM. See Dynamo's SGLang README
-("KVCR-owned inventory") and router docs ("KV Fetch Hints").
-
-Limits of this version: with remote hints or inventory, each worker runs on one
-node (`--nnodes 1`; peers may be on other hosts); PP=1, no DCP, one tokenizer
-worker, and not replica DP combined with attention DP; the backend must be
-configured at launch (no runtime attach or detach). Inventory is process-local
-and starts empty: each page is announced once, so pages stored before the
-worker attaches to the state agent stay unknown to the router, and a dropped
-event (a ZMQ sequence gap) stops the inventory until the worker restarts. Warm
-KVCR only after the worker is attached.
+Limits of this version: with remote hints, each worker runs on one node
+(`--nnodes 1`; peers may be on other hosts); PP=1, no DCP, and not replica DP
+combined with attention DP.
 
 ## Failure handling
 
@@ -274,7 +195,7 @@ python test/registered/unit/mem_cache/test_kvcr_endpoints.py -v
 Most of these CPU tests replace the native transport with a byte-copying fake
 and always run. `TestRealKVCR` runs only on Linux with KVCR and its NIXL
 bindings installed, and is skipped otherwise: it starts real KVCR on host
-memory and checks a backup, query, local restore and inventory round trip, and
-a shared replicated rank restoring from its writer.
+memory and checks a backup, query and local restore round trip, and a shared
+replicated rank restoring from its writer.
 None of these tests cover peer reads across hosts, model accuracy or inference
 performance.

@@ -34,7 +34,6 @@ from sglang.srt.mem_cache.storage.kvcr.endpoints import (
     control_address,
     rank_endpoint,
     rank_offset,
-    require_routable_host,
 )
 from sglang.srt.mem_cache.storage.kvcr.hints import (
     fetch_hint,
@@ -50,7 +49,6 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
-from sglang.srt.mem_cache.storage.kvcr.inventory import KVCRInventory
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -114,7 +112,6 @@ _EXTRA_CONFIG_KEYS = frozenset(
         "local_dram_pool_pages",
         "nixl_listen_port",
         "operation_timeout_ms",
-        "publish_inventory",
         "share_replicated_kv",
         "startup_timeout_seconds",
     }
@@ -234,9 +231,7 @@ class KVCRStore(HiCacheStorage):
         self._remote_hint = _bool_option(self._extra, "enable_remote_hint")
         if self._remote_hint and get_parallel().nnodes > 1:
             # Peers reach shard k at shard 0's advertised host, port + k.
-            raise ValueError(
-                "KVCR enable_remote_hint (and publish_inventory) requires --nnodes 1"
-            )
+            raise ValueError("KVCR enable_remote_hint requires --nnodes 1")
         self._shared = self._share_replicated(storage_config)
         # The controller elects the writer from the config it holds; with CP=1
         # (required to share) KVCR's own config does not renumber it.
@@ -326,25 +321,6 @@ class KVCRStore(HiCacheStorage):
             if self._needs_control()
             else _IDLE_POLL_MAX_SECONDS_WITHOUT_PEERS
         )
-        # Publish this shard's DRAM residency as KV events (ownership "kvcr")
-        # for an external KV state agent, e.g. Dynamo's.
-        self.publishes_kv_events = _bool_option(self._extra, "publish_inventory")
-        if self.publishes_kv_events:
-            if not self._remote_hint or "control_advertise_host" not in self._extra:
-                raise ValueError(
-                    "KVCR publish_inventory requires enable_remote_hint and an "
-                    "explicit control_advertise_host"
-                )
-            # The state agent subscribes to the events on this host.
-            require_routable_host(self._control[0])
-        self._inventory = KVCRInventory() if self.publishes_kv_events else None
-        # Each attention TP x CP rank stores its own shard (no PP, no DCP), and a
-        # page is advertised once every shard holds it. Shared replicated pools
-        # live on the first shard alone; the others are its replicas.
-        self.kv_event_shard = self._offset
-        self.kv_event_shard_count = (
-            1 if self._shared else self.config.tp_size * self.config.attn_cp_size
-        )
         # External hints name the source replica's first shard; a rank reads
         # its shared pools from that replica's first shard too.
         self._source_offset = 0 if self._shared else self._offset
@@ -355,8 +331,6 @@ class KVCRStore(HiCacheStorage):
         # The control listener and the NIXL port, held from the attach until
         # KVCR binds them at start (_reserve_ports).
         self._listener = self._nixl_hold = None
-        # Set once advertised; fixed for this backend's (and engine's) lifetime.
-        self._cache_owner_id = None
         self.register_mem_pool_host(mem_pool_host)
 
     def _share_replicated(self, storage_config) -> bool:
@@ -422,34 +396,11 @@ class KVCRStore(HiCacheStorage):
         ):
             return None
         host, port = self._control
-        source = {
+        return {
             "dp_rank": int(self.config.dp_rank),
             "capabilities": ["router_hint"],
             "source_control_endpoint": f"tcp://{host}:{port}",
         }
-        if self.publishes_kv_events:
-            source["capabilities"].append("kvcr_inventory")
-            source["cache_owner_id"] = self._owner_id()
-        return source
-
-    def _owner_id(self) -> str:
-        """Dynamo CacheOwnerId: <ns[:32]>:<ns[32:]>/<16 zeros>/<incarnation>.
-
-        The indexer domain is the 64-hex storage namespace, so engines that
-        can serve each other's pages share it; the cluster field is fixed.
-        KVCR's DRAM is process-local: the incarnation is this process's agent
-        UUID, so a new engine never inherits retained residency.
-        """
-        with self._lock:
-            if self._cache_owner_id is None:
-                if not self._layouts:
-                    raise ValueError("KVCR has no registered physical host pools")
-                namespace = self._namespaces()[1]
-                self._cache_owner_id = (
-                    f"{namespace[:32]}:{namespace[32:]}/{'0' * 16}/"
-                    f"{self._agent_name.rsplit('-', 1)[-1]}"
-                )
-            return self._cache_owner_id
 
     def register_mem_pool_host(self, mem_pool_host):
         self.mem_pool_host = mem_pool_host
@@ -470,19 +421,9 @@ class KVCRStore(HiCacheStorage):
                 raise ValueError(
                     "KVCR host pools must be registered before the first IO"
                 )
-            if self._cache_owner_id is not None:
-                # The advertised owner names the namespace of these pools.
-                raise ValueError("KVCR host pools must be registered before discovery")
             layout = describe_pool(name, host_pool)
             if name in _MHA_DRAFT_POOLS and isinstance(host_pool, MHATokenToKVPoolHost):
                 # Its heads are this rank's (should_backup writes it everywhere).
-                if self._shared and self.publishes_kv_events:
-                    # Only the writer's residency is published, which says
-                    # nothing of the other ranks' own draft pages.
-                    raise ValueError(
-                        "KVCR share_replicated_kv with publish_inventory does "
-                        f"not support an MHA {name} pool yet"
-                    )
                 self._rank_local_pools.add(name)
             if self._pools_attached:
                 # A late sidecar shrinks every pool's share: fail its
@@ -626,12 +567,6 @@ class KVCRStore(HiCacheStorage):
         self._warn_unmatched_pool_pages()
         operation_timeout_ms, abandon_timeout_ms = self._timeouts()
         self._namespace, self._shared_namespace = self._namespaces()
-        if self._inventory is not None:
-            # Only the writer's pages are advertised (kv_event_shard_count).
-            self._inventory.configure(
-                self._shared_namespace,
-                [name for name in self._layouts if name not in _TRAILING_POOLS],
-            )
         port = self._control[1]
         layouts, regions, plans = [], [], []
         pool_pages = self._pool_pages()
@@ -706,11 +641,6 @@ class KVCRStore(HiCacheStorage):
                         framework_control=channel,
                         key_adapter=StorageKeyAdapter(),
                         on_resilience_event=self._resilience_event,
-                        inventory_sink=(
-                            self._record_inventory
-                            if self._inventory is not None
-                            else None
-                        ),
                     ),
                     backend_configs=KVCRBackendConfigs(
                         framework_regions=regions,
@@ -902,37 +832,6 @@ class KVCRStore(HiCacheStorage):
             )
             self._stop_poll.wait(wait)
 
-    def _record_inventory(self, event):
-        # KVCR calls its sink from deposit/deliver/poll_completed, which run
-        # under self._lock. Only its local DRAM tier ("DRAM") is advertised.
-        if event.tier.value == "DRAM":
-            self._inventory.update(event)
-
-    def pending_kv_events(self):
-        # Called every scheduler step. A racy length is fine: events appended
-        # after this read are drained at the next step.
-        return len(self._inventory.events) if self._inventory is not None else 0
-
-    def take_kv_events(self):
-        # Lock-free: storage threads may hold self._lock across native calls,
-        # and this runs on the scheduler thread before a collective gather.
-        return self._inventory.take() if self._inventory is not None else []
-
-    @contextmanager
-    def _inventory_operation(self, extra_info, blocks):
-        """Hold the IO's page identities while it may change residency."""
-        if self._inventory is None:
-            yield
-            return
-        extra = getattr(extra_info, "extra_info", None) or {}
-        retained = self._inventory.register(
-            extra.get("kv_event_metadata") or {}, blocks
-        )
-        try:
-            yield
-        finally:
-            self._inventory.release(retained)
-
     def _io(self, transfers, *, is_set, extra_info):
         from kvcr.types import MemoryRef
 
@@ -971,12 +870,11 @@ class KVCRStore(HiCacheStorage):
             if not blocks:
                 return {name: [True] * len(group) for name, group in groups.items()}
             # _wait releases the condition's recursive lock while sleeping.
-            with self._inventory_operation(extra_info, blocks):
-                if is_set:
-                    # Writes carry no kv_hints; deposits are always local.
-                    result = self._wait(self._runner.deposit(blocks))
-                else:
-                    result = self._deliver(blocks, pages, shared, extra_info)
+            if is_set:
+                # Writes carry no kv_hints; deposits are always local.
+                result = self._wait(self._runner.deposit(blocks))
+            else:
+                result = self._deliver(blocks, pages, shared, extra_info)
         return {
             name: [
                 logical or (key in result and result[key].success)
