@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import secrets
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -43,7 +44,11 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
     scheduler_stage_method,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    is_control_broadcast_local,
+)
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -120,6 +125,9 @@ class SchedulerRequestReceiver:
 
     def _recv_and_broadcast(self, local_reqs: Optional[List[AbortReq]]) -> List:
         recv_reqs = self._pull_raw_reqs()
+        # Drawn on the first stage's leader, before any other rank sees the requests.
+        if recv_reqs is not None and get_parallel().pp_rank == 0:
+            _draw_filler_seeds(recv_reqs)
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
@@ -196,11 +204,7 @@ class SchedulerRequestReceiver:
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = (
-                get_parallel().enable_dp_attention_local_control_broadcast
-                or get_exec().moe.is_ep_scale_joiner
-            )
-            if _local_ctrl:
+            if is_control_broadcast_local():
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
@@ -362,6 +366,20 @@ class SchedulerRequestReceiver:
             )
         ]
         return work_reqs, control_reqs
+
+
+def _draw_filler_seeds(recv_reqs: List) -> None:
+    """Give each generate request a filler seed no client can predict or set."""
+    for req in recv_reqs:
+        if isinstance(req, TokenizedGenerateReqInput):
+            tokenized_reqs = [req]
+        elif isinstance(req, BatchTokenizedGenerateReqInput):
+            tokenized_reqs = req.batch
+        else:
+            continue
+        for tokenized_req in tokenized_reqs:
+            # The seeded samplers hash each seed as uint64; any int64 works.
+            tokenized_req.filler_seed = secrets.randbits(63)
 
 
 def _broadcast_via_exchange(
