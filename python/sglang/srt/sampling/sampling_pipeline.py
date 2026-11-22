@@ -226,14 +226,14 @@ def _adjust_after_watermark(
 ) -> torch.Tensor:
     """Decode's stages after the watermark, in place: the custom logit
     processor, then non-finite sanitizing."""
-    _apply_custom_logit_processor(logits, sampling_info, logprob_logits=logprob_logits)
+    _custom_logit_processor_stage(logits, sampling_info, logprob_logits=logprob_logits)
     sanitize_nan_logits(logits, "sampler: next_token_logits")
     if logprob_logits is not None:
         sanitize_nan_logits(logprob_logits, "sampler: next_token_logits")
     return logits
 
 
-def _apply_custom_logit_processor(
+def _custom_logit_processor_stage(
     logits: torch.Tensor,
     sampling_info: SamplingBatchInfo,
     *,
@@ -402,7 +402,7 @@ def adjust_verify_logits(
             logits, sampling_info=sampling_info
         )
     if has_custom_logit_processor:
-        _apply_custom_logit_processor(
+        _custom_logit_processor_stage(
             verify_logits,
             sampling_info,
             logprob_logits=None if verify_logits is logits else logits,
