@@ -863,6 +863,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._init_verify_planner()
         self._tree = self._maybe_tree_buffers()
         self._kv_move = None
+        if hasattr(target_model, "set_dflash_context_projector") and getattr(
+            self.draft_model, "projects_rows", False
+        ):
+            target_model.set_dflash_context_projector(
+                self.draft_model.project_target_rows
+            )
+            self.draft_model.target_projects_rows = True
 
     def _maybe_tree_buffers(self):
         """Static tree arrays, made before the target graphs' capture. Rows: the largest decode
@@ -1179,6 +1186,59 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
+            self._warm_cublas_shapes()
+
+    def _warm_cublas_shapes(self) -> None:
+        """A GEMM shape's first cuBLASLt use stalls the host: run each eager GEMM per row count once."""
+        dm = self.draft_model
+        if getattr(dm, "quantizable", True) or not dm.fast_path:
+            return
+        from sglang.srt.models.dflash import _FC_ROW_SPLIT_MIN_TOKENS as rows
+
+        # the TP-split fc below the row split (gemm_ag or column slices) and the KV GEMM
+        w, kv = dm.fc.weight, self._fused_kv_helper
+        for t in range(1, rows):
+            h = dm._tp_split_fc(w.new_zeros(t, w.shape[1]))
+            if kv and h is not None:
+                torch.mm(h, kv.flat_kv_weight.t())
+        # Row-split fc, KV and the target's SP o_proj GEMMs up to a chunk,
+        # largest first so every output reuses the first one's allocator block.
+        n = max(get_schedule().chunked_prefill_size or 0, rows)
+        x, h = (
+            w.new_zeros(-(-n // get_parallel().tp_group.world_size), w.shape[1]),
+            w.new_zeros(n, w.shape[0]),
+        )
+        tm = self.target_worker.model_runner.model
+        # lp: lm_head GEMM of the input-logprob chunks
+        ms, lp = list(tm.modules()), getattr(tm, "logits_processor", None)
+        fw = next(
+            (
+                m._sp_full_weight
+                for m in ms
+                if getattr(m, "_sp_full_weight", None) is not None
+            ),
+            None,
+        )
+        # fp32 router GEMM
+        gw = next(
+            (
+                m._split2_hilo
+                for m in ms
+                if getattr(m, "_split2_hilo", None) is not None
+            ),
+            None,
+        )
+        for t in range(n, 0, -1):
+            if t <= x.shape[0]:
+                torch.mm(x[:t], w.t())
+            if kv and t >= rows:
+                torch.mm(h[:t], kv.flat_kv_weight.t())
+            if fw is not None:
+                torch.mm(h[:t], fw.t())
+            if gw is not None:
+                torch.mm(h[:t], gw, out_dtype=torch.float32)
+            if lp is not None and t <= envs.SGLANG_LOGPROB_CHUNK_SIZE.get():
+                lp._compute_lm_head(h[:t], tm.lm_head)
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -2606,9 +2666,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 tree_perm=tree_perm,
             )
             return
-        # A TP-split fc all-reduces, so project on the main stream in program order;
-        # the aux graph may replay on a side stream beside other collectives.
-        projected = self.draft_model.fc_tp_columns is not None
+        # A TP-split fc all-reduces (or all-gathers, on the draft fast path), so project
+        # on the main stream in program order; the aux graph may replay on a side stream
+        # beside other collectives.
+        projected = self.draft_model.fc_tp_columns is not None or (
+            getattr(self.draft_model, "fast_path", False)
+            and get_parallel().tp_group.world_size > 1
+        )
         if projected:
             with torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
                 target_hidden = self._project_context(target_hidden, tree_perm)

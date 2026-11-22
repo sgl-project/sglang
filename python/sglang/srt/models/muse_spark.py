@@ -1814,6 +1814,11 @@ class MuseSparkTextForCausalLM(nn.Module):
             config, logit_scale=config.output_multiplier
         )
         self.capture_aux_hidden_states = False
+        self._dflash_context_projector = None
+
+    def set_dflash_context_projector(self, projector) -> None:
+        if _hopper_kernels_enabled():
+            self._dflash_context_projector = projector
 
     def supports_tree_verify(self) -> bool:
         """Token-tree verify needs the fused Hopper attention (tree masks)."""
@@ -1853,6 +1858,12 @@ class MuseSparkTextForCausalLM(nn.Module):
             # duplicate the full replicated draft context with torch.cat.
             # Release the tap list before allocating the gathered output.
             aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+            projector = self._dflash_context_projector
+            lp = self.logits_processor
+            if projector is not None and (
+                lp.expected_aux_hidden_states is None or lp._aux_hidden_states_checked
+            ):
+                aux_hidden_states = projector(aux_hidden_states)
             aux_hidden_states = layernorm_sp.sp_exit_gather(
                 aux_hidden_states, num_tokens=num_tokens
             )

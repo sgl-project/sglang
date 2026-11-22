@@ -26,7 +26,7 @@ draft decode's kv indices) read the same ids.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -365,6 +365,7 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
         )
+        worker._project_context = MethodType(DFlashWorkerV2._project_context, worker)
 
         self.assertIsNone(
             DFlashWorkerV2._draft_write_ids(worker, plan, IdSpaceKind.SLIDING_WINDOW)

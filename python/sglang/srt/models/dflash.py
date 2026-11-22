@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.communication import sp_collective
+from sglang.kernels.ops.communication.muse_spark_all_gather import gemm_ag_supported
 from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import (
     dflash_grouped_conv,
@@ -26,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
+from sglang.srt.layers.communication.muse_spark_gemm_ag import gemm_ag, muse_workspace
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -37,8 +39,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
+    row_gather,
     should_apply_lm_head_quant_method,
 )
+from sglang.srt.layers.muse_spark.fused.glue import ar_out, row_split
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -86,6 +90,31 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
+
+_FC_ROW_SPLIT_MIN_TOKENS = 512
+
+
+def _fast_path() -> bool:
+    return envs.SGLANG_OPT_DFLASH_DRAFT_FAST_PATH.get()
+
+
+def _gemm_ag(x, w):
+    if not _fast_path():
+        return None
+    c = muse_workspace()
+    return gemm_ag(c, x, w) if gemm_ag_supported(c, x, w) else None
+
+
+def _ar_out(layer, x):
+    # CustomAllReduceV2.mc_out storage for a BF16 TP-reduced output (reduced in place), or None
+    if (
+        isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and x.dtype == layer.weight.dtype == torch.bfloat16
+        and layer.reduce_results
+        and not layer.use_dp_attention_reduce
+        and layer.tp_group is get_parallel().tp_group
+    ):
+        return ar_out(x.shape[0], layer.output_size)
 
 
 def _gfx1250_try_gfx95():
@@ -305,13 +334,41 @@ def candidate_topk(
         vals, ids = radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
-    global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered = _fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
-    if gathered is not None:
-        gathered_vals, gathered_ids = gathered
+    start = int(lm_head.shard_indices.org_vocab_start_index)
+    if (
+        vals.element_size() == 2
+        and _fast_path()
+        and lm_head.tp_group is get_parallel().tp_group
+    ):
+        # 16-byte rows (bf16 value, int32 global id): one row gather instead of two all-gathers.
+        (n, kk), dev = vals.shape, vals.device
+        rows = torch.empty((n, kk, 4), dtype=torch.float32, device=dev)
+        rows.view(vals.dtype)[..., 0] = vals
+        torch.add(ids, start, out=rows.view(torch.int32)[..., 2])
+        g = (
+            row_gather(lm_head.tp_group)
+            .gather_stacked(rows.view(-1, 4))
+            .view(-1, n, kk, 4)
+            .transpose(0, 1)
+        )
+        gathered_vals = (
+            torch.empty(g.shape[:3], dtype=torch.float32, device=dev)
+            .copy_(g.view(vals.dtype)[..., 0])
+            .view(n, -1)
+        )
+        gathered_ids = torch.bitwise_and(
+            g.view(torch.int32)[..., 2],
+            0x7FFFFFFF,
+            out=torch.empty(g.shape[:3], dtype=torch.int64, device=dev),
+        ).view(n, -1)
     else:
-        gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
-        gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
+        global_ids = ids.long() + start
+        gathered = _fused_candidate_all_gather(lm_head.tp_group, vals, global_ids)
+        if gathered is not None:
+            gathered_vals, gathered_ids = gathered
+        else:
+            gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+            gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
@@ -605,7 +662,9 @@ class DFlashAttention(nn.Module):
                 q, k, v, forward_batch, sinks=self.attention_sink_bias, **kwargs
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(
+            attn_output, output_tensor=_ar_out(self.o_proj, attn_output)
+        )
         return output
 
     def apply_attention_output(
@@ -893,11 +952,18 @@ class DFlashMLP(nn.Module):
         else:
             gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, output_tensor=_ar_out(self.down_proj, x))
         return x
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    disable=_is_npu,
+    options={"triton.enable_pdl": True}
+    if get_compiler_backend() == "inductor" and _fast_path()
+    else None,
+)
 def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
@@ -1008,7 +1074,10 @@ class DFlashGroupedConv(nn.Module):
                 taps=self.taps,
                 num_groups=self.num_groups,
             )
-        coefficients = self.kernel_projection(hidden_states)[0].reshape(
+        coefficients = _gemm_ag(hidden_states, self.kernel_projection.weight)
+        if coefficients is None:
+            coefficients = self.kernel_projection(hidden_states)[0]
+        coefficients = coefficients.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -1160,6 +1229,9 @@ class DFlashDraftModel(nn.Module):
     own_quant_config = staticmethod(keeps_no_quant_config)
     # `project_target_hidden` gathers a TP-split `fc` (SGLANG_OPT_DFLASH_TP_AUX_FC).
     supports_fc_tp_split = True
+    # Set by the worker once the target projects its own context rows
+    # (set_dflash_context_projector); target_hidden is then already projected.
+    target_projects_rows = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -1340,6 +1412,14 @@ class DFlashDraftModel(nn.Module):
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+        hidden = self.config.hidden_size
+        if (
+            self.target_projects_rows
+            and expected != hidden
+            and target_hidden.ndim == 2
+            and target_hidden.shape[-1] == hidden
+        ):
+            return target_hidden
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -1349,6 +1429,9 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        split = self._tp_split_fc(target_hidden)
+        if split is not None:
+            return split
         if self.quantizable:
             projected = self.fc(target_hidden)[0]
         elif self.fc_tp_columns is not None:
@@ -1364,6 +1447,50 @@ class DFlashDraftModel(nn.Module):
         else:
             projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
+
+    @property
+    def fast_path(self) -> bool:
+        return _fast_path()
+
+    @property
+    def projects_rows(self) -> bool:
+        """Whether the target may project its own context rows with project_target_rows."""
+        return (
+            _fast_path()
+            and type(self).project_target_hidden
+            is DFlashDraftModel.project_target_hidden
+            and not self.quantizable
+            and self.fc_tp_columns is None
+        )
+
+    def project_target_rows(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        return self.hidden_norm(F.linear(target_hidden, self.fc.weight))
+
+    def _tp_split_fc(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Fast path: the replicated fc split over the TP ranks (row split for long
+        inputs, else column slices gathered by gemm_ag or an all-gather); None if not."""
+        parallel = get_parallel()
+        if (
+            not _fast_path()
+            or self.quantizable
+            or self.fc_tp_columns is not None
+            # Same conditions as the other TP fc splits: all TP ranks run it together.
+            or not self.shards_context_fc
+            or not self.supports_fc_tp_split
+            or parallel.attn_dp_enabled
+            or not x.is_cuda
+        ):
+            return None
+        group, w = parallel.tp_group, self.fc.weight
+        tp, t = group.world_size, x.shape[0]
+        if tp == 1 or w.shape[0] % tp or t == 0:
+            return None
+        if t >= _FC_ROW_SPLIT_MIN_TOKENS:
+            return row_split(group, x, self.project_target_rows)
+        out = _gemm_ag(x, w)
+        if out is None:
+            out = self._project_target_hidden_tp(x)
+        return self.hidden_norm(out)
 
     def _resolve_fc_tp_columns(self) -> Optional[Tuple[int, int]]:
         hidden_size = int(self.config.hidden_size)
@@ -1806,7 +1933,7 @@ class CandidateSelector(nn.Module):
         """
         # Everything but the batch is a model constant. Left symbolic, inductor
         # recovers indices with an integer division per element instead of folding.
-        hidden = self.hidden_projection(hidden_states)
+        hidden = bf16_gemm_dispatch(hidden_states, self.hidden_projection.weight, None)
         for tensor in (candidate_ids, unary_logits, hidden):
             torch._dynamo.mark_static(tensor, 1)
             torch._dynamo.mark_static(tensor, 2)
