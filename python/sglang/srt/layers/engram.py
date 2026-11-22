@@ -17,7 +17,7 @@ import mmap
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -659,6 +659,30 @@ def _libc() -> ctypes.CDLL:
     return libc
 
 
+@functools.lru_cache(maxsize=256)
+def _is_safetensors_file(path: str, key: Tuple[int, int]) -> bool:
+    """Whether this path is a safetensors file, by its header rather than its name.
+
+    ``key`` is (st_dev, st_ino) and only memoizes per file identity: a Hugging Face
+    cache reaches a checkpoint through ``snapshots/<rev>/model-0000N.safetensors``,
+    a symlink whose target is ``blobs/<hash>``, and /proc/self/maps reports the
+    resolved target. Matching on the ``.safetensors`` suffix therefore missed every
+    checkpoint loaded from a Hub model ID -- the documented way to run this -- which
+    silently skipped the chunked load below and left the copied source pages
+    resident. The header is eight little-endian length bytes followed by that much
+    JSON, so it identifies the format wherever the file is reached from.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(9)
+    except OSError:
+        return False
+    if len(head) < 9:
+        return False
+    length = int.from_bytes(head[:8], "little")
+    return 0 < length <= (1 << 32) and head[8:9] == b"{"
+
+
 def _in_checkpoint_mapping(t: torch.Tensor) -> bool:
     """Whether a contiguous CPU tensor lies inside one mapping of a safetensors file."""
     if t.device.type != "cpu" or not t.is_contiguous() or t.numel() == 0:
@@ -670,8 +694,19 @@ def _in_checkpoint_mapping(t: torch.Tensor) -> bool:
             for line in f:
                 fields = line.split()
                 lo, hi = (int(x, 16) for x in fields[0].split("-"))
-                if lo <= start and end <= hi:
-                    return len(fields) >= 6 and fields[5].endswith(".safetensors")
+                if not (lo <= start and end <= hi):
+                    continue
+                # address perms offset dev inode pathname
+                if len(fields) < 6 or fields[4] == "0":
+                    return False
+                path = fields[5]
+                if path.endswith(".safetensors"):
+                    return True
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    return False
+                return _is_safetensors_file(path, (st.st_dev, st.st_ino))
     except OSError:
         pass
     return False
