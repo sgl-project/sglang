@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -54,6 +56,26 @@ def test_registry_variants_and_sampling() -> None:
     ):
         with pytest.raises(ValueError, match=match):
             PiH3SamplingParams(prompt="p", **kwargs)
+
+
+def test_default_steps_follow_variant_or_subfolder(monkeypatch) -> None:
+    from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        MiniMaxH3SamplingParams,
+    )
+
+    # only the step default is under test, not the generic path adjustments
+    monkeypatch.setattr(MiniMaxH3SamplingParams, "_adjust", lambda self, args: None)
+    for variant, subfolder, steps in (
+        ("2step", None, 2),
+        (None, "/m/2step_vae/", 2),
+        (None, None, 4),
+    ):
+        params = PiH3SamplingParams(prompt="p")
+        params._explicit_fields = set()
+        params._adjust(
+            SimpleNamespace(model_variant=variant, model_subfolder=subfolder)
+        )
+        assert params.num_inference_steps == steps
 
 
 def test_release_metadata() -> None:

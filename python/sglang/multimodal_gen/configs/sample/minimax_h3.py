@@ -458,9 +458,12 @@ class PiH3SamplingParams(MiniMaxH3SamplingParams):
     def _adjust(self, server_args) -> None:
         # the step count is a property of the served variant
         if "num_inference_steps" not in getattr(self, "_explicit_fields", set()):
-            self.num_inference_steps = self.trained_steps(
-                getattr(server_args, "model_variant", None)
-            )
+            variant = getattr(server_args, "model_variant", None)
+            subfolder = getattr(server_args, "model_subfolder", None)
+            if variant is None and subfolder:
+                # a variant picked by directory: 2step, 2step_vae, ...
+                variant = os.path.basename(os.path.normpath(subfolder))
+            self.num_inference_steps = self.trained_steps(variant)
         super()._adjust(server_args)
 
     def _validate(self) -> None:

@@ -224,6 +224,17 @@ def _diffusers_h3_checkpoint(
         )
 
 
+def _dwd_varlen_attention_available() -> bool:
+    """The DWD pixel head runs torch's varlen flash attention (CUDA, not ROCm)."""
+    if not current_platform.is_cuda() or torch.version.hip is not None:
+        return False
+    try:
+        from torch.nn.attention.varlen import varlen_attn  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 _MPS_MLP_TOKEN_CHUNK_SIZE = 128
@@ -3039,6 +3050,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 "MiniMax H3 serves only the Sol pixel refiner DWD head without a "
                 "linear head on a pruned (AdaLN curve) DiT, got "
                 f"dwd_head_config={config!r}"
+            )
+        if not _dwd_varlen_attention_available():
+            raise ValueError(
+                "the MiniMax H3 DWD pixel head needs PyTorch's CUDA varlen "
+                "attention (torch.nn.attention.varlen), which this platform lacks; "
+                "serve a VAE-output variant (e.g. --model-variant 4step-vae) instead"
             )
         # Under TP and SP every rank holds the whole (0.6B) head and decodes
         # the frames from the gathered features.
