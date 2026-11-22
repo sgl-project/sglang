@@ -97,6 +97,10 @@ def _covered(
         # the prepare's 2^-G stays finite only down to -5.5
         and -5.5 <= lower_bound < 0
         and query_start_loc.dtype in (torch.int32, torch.int64)
+        # an empty batch or zero tokens has no chunk table to walk
+        and query_start_loc.ndim == 1
+        and cache_indices.numel() > 0
+        and q.shape[1] > 0
         # the kernel takes one state row per sequence
         and cache_indices.shape == (query_start_loc.numel() - 1,)
         and q.shape == k.shape == v.shape == g.shape

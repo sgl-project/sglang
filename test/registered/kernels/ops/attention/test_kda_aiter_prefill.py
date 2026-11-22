@@ -17,6 +17,8 @@ register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 SLOTS = 40
 LOWER_BOUND = -5.0
+# Gluon vs Triton chunk_kda RMS ratio measured on MI355X: ~4e-3 to 6e-3 in bf16.
+RMS_TOL = 1e-2
 
 
 def _inputs(lengths, state_dtype, heads=12, seed=0) -> dict[str, torch.Tensor]:
@@ -125,13 +127,13 @@ class TestAiterKDAPrefill(CustomTestCase):
                     *_args(actual_inputs), **_kwargs(actual_inputs)
                 )
                 rows = inputs["cache_indices"].long()
-                self.assertLess(_rms_ratio(actual, expected), 1e-2)
+                self.assertLess(_rms_ratio(actual, expected), RMS_TOL)
                 self.assertLess(
                     _rms_ratio(
                         actual_inputs["ssm_states"][rows],
                         expected_inputs["ssm_states"][rows],
                     ),
-                    1e-2,
+                    RMS_TOL,
                 )
                 untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
                 untouched[rows] = False
@@ -143,6 +145,33 @@ class TestAiterKDAPrefill(CustomTestCase):
                 )
 
     @torch.inference_mode()
+    def test_chained_prefills_do_not_drift(self):
+        """Each prefill reads the previous one's pool, rounded to the pool dtype."""
+        for state_dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(state_dtype=state_dtype):
+                pool = _inputs((64, 96), state_dtype)
+                actual_inputs, expected_inputs = _clone(pool), _clone(pool)
+                rows = pool["cache_indices"].long()
+                for step in range(8):
+                    chunk = _inputs((64, 96), state_dtype, seed=step + 1)
+                    for inputs in (actual_inputs, expected_inputs):
+                        for name in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
+                            inputs[name] = chunk[name].clone()
+                    expected = _reference(expected_inputs)
+                    actual = kda_aiter_prefill.extend(
+                        *_args(actual_inputs), **_kwargs(actual_inputs)
+                    )
+                    with self.subTest(step=step):
+                        self.assertLess(_rms_ratio(actual, expected), RMS_TOL)
+                        self.assertLess(
+                            _rms_ratio(
+                                actual_inputs["ssm_states"][rows],
+                                expected_inputs["ssm_states"][rows],
+                            ),
+                            RMS_TOL,
+                        )
+
+    @torch.inference_mode()
     def test_padded_slot_starts_from_zeros_and_keeps_pool(self):
         """A negative cache index must start from a zero state and write no pool row."""
         inputs = _inputs((64, 96), torch.bfloat16)
@@ -152,7 +181,7 @@ class TestAiterKDAPrefill(CustomTestCase):
         actual = kda_aiter_prefill.extend(
             *_args(actual_inputs), **_kwargs(actual_inputs)
         )
-        self.assertLess(_rms_ratio(actual, expected), 1e-2)
+        self.assertLess(_rms_ratio(actual, expected), RMS_TOL)
         live_row = inputs["cache_indices"][0].item()
         untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
         untouched[live_row] = False
@@ -185,7 +214,7 @@ class TestAiterKDAPrefill(CustomTestCase):
                     )
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
-                self.assertLess(_rms_ratio(actual, expected), 1e-2)
+                self.assertLess(_rms_ratio(actual, expected), RMS_TOL)
                 rows = inputs["cache_indices"][inputs["cache_indices"] >= 0].long()
                 untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
                 untouched[rows] = False
@@ -195,7 +224,7 @@ class TestAiterKDAPrefill(CustomTestCase):
                             actual_inputs["ssm_states"][rows],
                             expected_inputs["ssm_states"][rows],
                         ),
-                        1e-2,
+                        RMS_TOL,
                     )
                 self.assertTrue(
                     torch.equal(
@@ -221,13 +250,13 @@ class TestAiterKDAPrefill(CustomTestCase):
         self.assertIsInstance(result, tuple)
         out, h = result
         self.assertIsNone(h)
-        self.assertLess(_rms_ratio(out, expected), 1e-2)
+        self.assertLess(_rms_ratio(out, expected), RMS_TOL)
         rows = inputs["cache_indices"].long()
         self.assertLess(
             _rms_ratio(
                 actual_inputs["ssm_states"][rows], expected_inputs["ssm_states"][rows]
             ),
-            1e-2,
+            RMS_TOL,
         )
 
     @torch.inference_mode()
@@ -247,6 +276,10 @@ class TestAiterKDAPrefill(CustomTestCase):
             {"beta_is_raw": False},
             {"is_spec_decode": True},
             {"cache_indices": inputs["cache_indices"][:1]},
+            {
+                "cache_indices": inputs["cache_indices"][:0],
+                "query_start_loc": inputs["query_start_loc"][:1],
+            },
         ):
             with self.subTest(overrides=list(overrides)):
                 self.assertIsNone(
