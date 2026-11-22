@@ -494,9 +494,14 @@ class TestAllocationIntegration(CustomTestCase):
         override = get_context().override_server_args(optimistic_prefill_attempts=3)
         override.install()
         self.addCleanup(override.restore)
-        req_logprob = ReqLogprob(top_logprobs_num=2, token_ids_logprob=None)
-        req_logprob.reset_output_records()
-        rows = SamplingMaskRows()
+        req_logprob = ReqLogprob(
+            top_logprobs_num=2,
+            token_ids_logprob=None,
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+        )
         req = FakeReq(
             rid="retry-token",
             cache_request_handle=CacheRequestHandle(rid="retry-token", attempt_id=0),
@@ -509,7 +514,7 @@ class TestAllocationIntegration(CustomTestCase):
             advance_cache_request_handle=Mock(),
             time_stats=MagicMock(),
             captures_sampling=True,
-            sampling_mask_rows=rows,
+            sampling_mask_rows=SamplingMaskRows(),
             metadata_buffer_index=0,
             cached_tokens=0,
             cached_tokens_device=0,
@@ -532,7 +537,9 @@ class TestAllocationIntegration(CustomTestCase):
                 top_logprobs_val=[top_val],
                 top_logprobs_idx=[top_idx],
             )
-            rows.append(logprob, np.array(mask_idx, np.int32), np.array(mask_val, "f4"))
+            req.sampling_mask_rows.append(
+                logprob, np.array(mask_idx, np.int32), np.array(mask_val, "f4")
+            )
 
         sample_first_token(
             token_id=101,
