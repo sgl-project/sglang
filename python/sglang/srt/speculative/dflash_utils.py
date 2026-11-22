@@ -24,6 +24,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -225,12 +226,12 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    verify_tokens: Optional[torch.Tensor],
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    `verify_tokens` [bs, draft_token_num]: the anchor, then the drafts. Only
+    penalties read them; None when the step has none.
     """
     if sampling_info is None:
         return
@@ -248,15 +249,6 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
-        )
-
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -268,44 +260,32 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
-    if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
+    # Same order as SamplingBatchInfo.apply_logits_bias.
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
+
+    if grammar_mask is not None:
+        vocab_mask_bias = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        grammar_mask.apply(vocab_mask_bias)
         get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
-
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
 
     if logit_bias is not None:
-        if (
-            logit_bias.device != next_token_logits.device
-            or logit_bias.dtype != next_token_logits.dtype
-        ):
-            logit_bias = logit_bias.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(logit_bias[:, None, :])
+        # In the bias's own dtype, so the sum rounds once to the logits dtype.
+        get_logits_3d().add_(logit_bias.to(device=next_token_logits.device)[:, None, :])
+
+    # Last, as Sampler applies it after ModelRunner._preprocess_logits.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -1317,8 +1297,18 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, bound_runtime: bool
+) -> Optional[str]:
+    """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if bound_runtime and uses_penalty(req.sampling_params):
+        return (
+            "DFLASH speculative decoding with the megakernel decode runtime does "
+            "not support sampling penalties (frequency_penalty, presence_penalty, "
+            "repetition_penalty, min_new_tokens)."
+        )
 
     return None

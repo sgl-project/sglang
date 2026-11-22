@@ -29,6 +29,11 @@ DEVICE = "cpu"
 
 
 # Helper: construct a minimal SamplingBatchInfo
+def _tables_step(additive, scaling=None):
+    """A step whose penalty tables are given."""
+    return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+
+
 def _make_info(batch_size=2, **overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
     defaults = dict(
@@ -43,7 +48,6 @@ def _make_info(batch_size=2, **overrides):
         need_min_p_sampling=False,
         vocab_size=VOCAB_SIZE,
         device=DEVICE,
-        penalizer_orchestrator=MagicMock(is_required=False),
     )
     defaults.update(overrides)
     return SamplingBatchInfo(**defaults)
@@ -223,7 +227,7 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
+        info.step_penalties = _tables_step(torch.tensor([[-1.0] * VOCAB_SIZE]))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 0].item(), -1.0, places=5)
@@ -248,32 +252,15 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         grammar.apply_vocab_mask.assert_called_once()
 
-    def test_applies_penalizer_orchestrator(self):
-        """Test that a required orchestrator's apply() is called on logits."""
-        orch = MagicMock(is_required=True)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        logits = torch.zeros(1, VOCAB_SIZE)
-        info.apply_logits_bias(logits)
-        orch.apply.assert_called_once_with(logits)
-
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = None
         info.logit_bias = None
         info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
         original = logits.clone()
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
-
-    def test_apply_logits_bias_without_penalizer_orchestrator(self):
-        info = _make_info(batch_size=1, penalizer_orchestrator=None)
-        logits = torch.zeros(1, VOCAB_SIZE)
-
-        info.apply_logits_bias(logits)
-
-        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
 
     def test_observer_sees_production_constraint_boundary(self):
         events = []
@@ -288,7 +275,7 @@ class TestApplyLogitsBias(CustomTestCase):
             -4.0
         )
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.ones(1, VOCAB_SIZE)
+        info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -312,11 +299,9 @@ class TestApplyLogitsBias(CustomTestCase):
                 logits.add_(vocab_mask)
             )
             info = _make_info(batch_size=1)
-            info.acc_additive_penalties = torch.linspace(
-                -0.5, 0.5, VOCAB_SIZE
-            ).unsqueeze(0)
-            info.acc_scaling_penalties = torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(
-                0
+            info.step_penalties = _tables_step(
+                torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
+                torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
             )
             info.grammar_mask = GrammarMask(
                 grammar,
@@ -337,29 +322,6 @@ class TestApplyLogitsBias(CustomTestCase):
         )
 
         self.assertTrue(torch.equal(observed_logits, ordinary_logits))
-
-
-# update_penalties
-class TestUpdatePenalties(CustomTestCase):
-    def test_required_creates_penalties_tensor(self):
-        """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
-        orch = MagicMock(is_required=True)
-        orch.accumulate_scaling_penalties.return_value = None
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNotNone(info.acc_additive_penalties)
-        self.assertEqual(info.acc_additive_penalties.shape, (2, VOCAB_SIZE))
-        orch.accumulate_additive_penalties.assert_called_once_with(
-            info.acc_additive_penalties
-        )
-        orch.accumulate_scaling_penalties.assert_called_once()
-
-    def test_not_required_sets_none(self):
-        """Test that update_penalties sets acc_additive_penalties to None when not required."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNone(info.acc_additive_penalties)
 
 
 # update_regex_vocab_mask
@@ -573,6 +535,23 @@ class TestFilterBatch(CustomTestCase):
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
+    def test_seeds_follow_rows_through_merge_and_filter(self):
+        """A merged-in unseeded side gets filler seeds; once the last seeded row
+        leaves, the batch returns to the unseeded samplers."""
+        info = _make_info(batch_size=1)
+        seeded = _make_info(
+            batch_size=1,
+            sampling_seed=torch.tensor([123], dtype=torch.int64),
+            rows_with_seed=[True],
+        )
+        info.merge_batch(seeded)
+        self.assertEqual(info.sampling_seed[1].item(), 123)
+        self.assertEqual(info.rows_with_seed, [False, True])
+
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(info.rows_with_seed)
+
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
         info = _make_info(batch_size=3)
@@ -675,12 +654,13 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy_without_orchestrator(self):
-        """Both copy implementations preserve every field except the forward-only
-        penalizer removal, including fields declared with init=False."""
+    def test_returns_copy(self):
+        """Both copy implementations preserve every field, including fields
+        declared with init=False, and leave the step's tables to sampling."""
         for fast_path in (False, True):
-            orch = MagicMock(is_required=False)
-            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+            info = _make_info(batch_size=1)
+            step = MagicMock()
+            info.step_penalties = step
             with (
                 self.subTest(fast_path=fast_path),
                 patch(
@@ -689,11 +669,9 @@ class TestCopyForForward(CustomTestCase):
                 ),
             ):
                 copied = info.copy_for_forward()
-            self.assertIsNone(copied.penalizer_orchestrator)
-            self.assertIs(info.penalizer_orchestrator, orch)
+            step.logit_penalties.assert_not_called()
             for name, value in info.__dict__.items():
-                if name != "penalizer_orchestrator":
-                    self.assertIs(copied.__dict__[name], value, name)
+                self.assertIs(copied.__dict__[name], value, name)
 
 
 # from_schedule_batch
@@ -713,6 +691,13 @@ class TestFromScheduleBatch(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
+        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
+        spec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_spec",
+            return_value=self._spec_ns,
+        )
+        spec_patch.start()
+        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -794,6 +779,28 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    def test_seed_without_deterministic_inference(self):
+        """A non-greedy request's seed applies and the other rows get seeds too; a
+        greedy seed, or speculative decoding, leaves the batch unseeded."""
+        batch = MagicMock()
+        batch.device = DEVICE
+        batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.sampling_seed.shape[0], 2)
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.rows_with_seed, [True, False])
+
+        batch.reqs = [self._make_req(seed=123, top_k=1)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
+
+        self._spec_ns.speculative_algorithm = "EAGLE"
+        batch.reqs = [self._make_req(seed=123, top_k=50)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
 
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""

@@ -22,9 +22,12 @@ live in :mod:`.cuda_graph_config`.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
@@ -46,6 +49,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_breakable_backend_cls(
+    phase: Literal["decode", "prefill"],
+) -> type[BaseBreakableGraphBackend]:
+    backend_cls = None
+    if current_platform.is_out_of_tree():
+        backend_cls = current_platform.get_breakable_graph_backend_cls(phase)
+
+    if backend_cls is None:
+        return BreakableCudaGraphBackend
+    if not isinstance(backend_cls, type) or not issubclass(
+        backend_cls, BaseBreakableGraphBackend
+    ):
+        raise TypeError(
+            f"{type(current_platform).__name__}.get_breakable_graph_backend_cls"
+            f"({phase!r}) must return a BaseBreakableGraphBackend subclass or None, "
+            f"got {backend_cls!r}"
+        )
+    return backend_cls
+
+
 def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     """Captured KDA state reads need graph-managed HiCache dependencies."""
     # KDA captures linear extend inside BCG, so the pool accessor's Python
@@ -54,8 +77,12 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     # Captured metadata in unrelated backends (e.g. DeepSeek V4) does not mean
     # they capture KDA state reads and need this mechanism.
     backend = model_runner.attn_backend
+    memory = get_memory()
+    loads_layer_wise = (
+        memory.enable_hierarchical_cache or memory.enable_unified_cache_external_linker
+    )
     if not (
-        get_memory().enable_hierarchical_cache
+        loads_layer_wise
         and backend.use_captured_forward_metadata_for_breakable_cuda_graph
     ):
         return False
@@ -108,7 +135,8 @@ def resolve_decode_backend(
         )
 
     if backend_name == Backend.BREAKABLE:
-        return BreakableCudaGraphBackend(
+        breakable_backend_cls = _resolve_breakable_backend_cls(Phase.DECODE)
+        return breakable_backend_cls(
             cuda_graph_runner,
             enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
@@ -170,7 +198,8 @@ def resolve_prefill_backend(
         )
 
     if backend_name == Backend.BREAKABLE:
-        return BreakableCudaGraphBackend(
+        breakable_backend_cls = _resolve_breakable_backend_cls(Phase.PREFILL)
+        return breakable_backend_cls(
             cuda_graph_runner,
             enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
