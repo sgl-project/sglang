@@ -401,6 +401,27 @@ class CustomReasoningDetector(BaseReasoningFormatDetector):
     def get_self_opened_think_start_token_ids(self, tokenizer):
         return tokenizer.encode(self.think_start_token, add_special_tokens=False)
 
+    def get_think_excluded_tokens(self, tokenizer):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        candidates = [tokenizer.eos_token, tokenizer.pad_token]
+        tool_parser = get_serving().tool_call_parser
+        if tool_parser:
+            detector = FunctionCallParser([], tool_parser, tokenizer=tokenizer).detector
+            candidates.extend((detector.bot_token.strip(), detector.eot_token.strip()))
+
+        end_ids = set(self.get_think_end_token_ids(tokenizer))
+        excluded = []
+        for token in dict.fromkeys(candidates):
+            if not token:
+                continue
+            token_ids = tokenizer.encode(token, add_special_tokens=False)
+            # The existing filter bans IDs independently. Flattening text markers
+            # would also ban ordinary text, potentially including the reason closer.
+            if len(token_ids) == 1 and token_ids[0] not in end_ids:
+                excluded.append(token)
+        return excluded
+
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """

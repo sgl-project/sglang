@@ -271,6 +271,93 @@ class TestReasonerGrammarBackend(CustomTestCase):
 
         self.assertIsNone(reasoner.init_strict_reasoning_grammar(reasoning=True))
 
+    def test_custom_strict_filter_blocks_tools_until_reason_end(self):
+        """Custom delimiters must not leave native tool tokens unmasked while thinking."""
+        tokenizer = _DummyTokenizer(
+            {
+                "</reason>": [7, 8, 9],
+                "<tool_call>": [3],
+                "</tool_call>": [4],
+                "<eos>": [5],
+                "<pad>": [6],
+            }
+        )
+        tokenizer.eos_token = "<eos>"
+        tokenizer.pad_token = "<pad>"
+        for strict, tool_parser, reasoning in itertools.product(
+            (False, True), (None, "qwen"), (False, True)
+        ):
+            with (
+                self.subTest(
+                    strict=strict, tool_parser=tool_parser, reasoning=reasoning
+                ),
+                patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "-1"}),
+                get_context().override_server_args(
+                    reasoning_parser="custom",
+                    reasoning_start_str="<reason>",
+                    reasoning_end_str="</reason>",
+                    tool_call_parser=tool_parser,
+                ),
+            ):
+                reasoner = ReasonerGrammarBackend(
+                    _DummyGrammarBackend(),
+                    ReasoningParser("custom"),
+                    tokenizer,
+                    enable_strict_thinking=strict,
+                )
+                obj = reasoner._make_grammar_object(None, reasoning=reasoning)
+                mask = torch.full((1, 2), -1, dtype=torch.int32)
+                obj.fill_vocab_mask(mask, 0)
+                expected = [3, 4, 5, 6, 7, 8, 9, 10]
+                if strict and reasoning:
+                    expected = [7, 8, 9, 10]
+                    if tool_parser is None:
+                        expected = [3, 4, *expected]
+                self.assertEqual(_allowed_token_ids(mask, range(3, 11)), expected)
+                for token in (7, 8, 9):
+                    obj.accept_token(token)
+                mask.fill_(-1)
+                obj.fill_vocab_mask(mask, 0)
+                self.assertEqual(
+                    _allowed_token_ids(mask, range(3, 11)), list(range(3, 11))
+                )
+
+    def test_custom_filter_spares_multitoken_markers_and_reason_closer(self):
+        """Flattening a tool marker must not ban ordinary text or a shared closer ID."""
+        tokenizer = _DummyTokenizer(
+            {
+                "</reason>": [5, 8, 9],
+                "<tool_call>": [10, 11],
+                "</tool_call>": [10, 12],
+                "<eos>": [5],
+                "<pad>": [6],
+            }
+        )
+        tokenizer.eos_token = "<eos>"
+        tokenizer.pad_token = "<pad>"
+        with (
+            patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "-1"}),
+            get_context().override_server_args(
+                reasoning_parser="custom",
+                reasoning_start_str="<reason>",
+                reasoning_end_str="</reason>",
+                tool_call_parser="qwen",
+            ),
+        ):
+            reasoner = ReasonerGrammarBackend(
+                _DummyGrammarBackend(),
+                ReasoningParser("custom"),
+                tokenizer,
+                enable_strict_thinking=True,
+            )
+            obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+            mask = torch.full((1, 2), -1, dtype=torch.int32)
+            obj.fill_vocab_mask(mask, 0)
+            self.assertEqual(
+                _allowed_token_ids(mask, [5, 6, 8, 9, 10, 11, 12]),
+                [5, 8, 9, 10, 11, 12],
+            )
+
     def test_wraps_inner_grammar_with_reasoning_state_machine(self):
         os.environ["SGLANG_MAX_THINK_TOKENS"] = "1"
         backend = _DummyGrammarBackend(support_token_filter=True)
@@ -1700,6 +1787,8 @@ class TestTextReasoningBoundary(CustomTestCase):
     def test_custom_cli_parser_uses_text_boundary_without_tokenizer_metadata(self):
         """CLI delimiters must drive the same gate as checkpoint-defined delimiters."""
         tokenizer = SimpleNamespace(
+            eos_token=None,
+            pad_token=None,
             init_xgrammar=self.tokenizer.init_xgrammar,
             encode=self.tokenizer.encode,
             decode=self.tokenizer.decode,

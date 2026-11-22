@@ -22,7 +22,7 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import CustomReasoningDetector, ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -596,11 +596,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     ) -> Optional[List[int]]:
         excluded_ids = []
-        if (not self.enable_strict_thinking) or (
-            not reasoning_parser.detector.think_excluded_tokens
-        ):
+        if not self.enable_strict_thinking:
             return None
-        for token in reasoning_parser.detector.think_excluded_tokens:
+        detector = reasoning_parser.detector
+        excluded_tokens = detector.think_excluded_tokens
+        if isinstance(detector, CustomReasoningDetector):
+            excluded_tokens = detector.get_think_excluded_tokens(tokenizer)
+        if not excluded_tokens:
+            return None
+        for token in excluded_tokens:
             new_ids = tokenizer.encode(token, add_special_tokens=False)
             if not new_ids:
                 raise ValueError(

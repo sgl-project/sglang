@@ -126,7 +126,16 @@ launch command without carrying a separate tokenizer directory.
 
 For tool use, select the tool parser matching the model's protocol separately,
 for example `--tool-call-parser qwen`. To enable the existing strict-thinking
-path, add `--enable-strict-thinking`. On supported XGrammar byte vocabularies,
+path, add `--enable-strict-thinking`. The custom parser reuses that path to
+exclude the configured tool parser's single-token start/end markers and the
+model's single-token EOS/pad markers while reasoning. Tokens used by the
+reasoning closer stay allowed. Multi-token tool markers are not flattened into
+independent banned tokens, since that would also suppress ordinary text.
+For parameter-schema constraints, also set `SGLANG_TOOL_STRICT_LEVEL=2` and
+provide the tool schemas in the request. These settings add no new custom-parser
+options and do not force `tool_choice=auto` requests to call a tool.
+
+On supported XGrammar byte vocabularies,
 ordinary multi-token closing delimiters are recognized even when the closing
 token also contains trailing newlines, allowing the deferred output grammar
 to become active. This does not guarantee that a model emits a complete
