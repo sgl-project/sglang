@@ -28,7 +28,6 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -45,12 +44,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
-    apply_dflash_verify_logits_adjustments,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
@@ -67,8 +66,10 @@ from sglang.srt.speculative.pard2_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -400,17 +401,28 @@ class Pard2WorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             iteration_ids=iteration_ids,
         )
+        # PARD2 rejects constrained decoding and watermarking.
+        verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits_output,
+            grammar_tree=None,
+            grammar_barrier=None,
+            watermark_engine=None,
+            watermark_full_mask=False,
+        )
         accept_len, bonus = self._accept(
             batch=batch,
             draft_input=draft_input,
             candidates=draft_tokens,
             next_token_logits=logits_output.next_token_logits,
+            grammar_mask=verify.grammar_mask,
         )
         out_tokens, commit_lens = _commit_accept(draft_tokens, accept_len, bonus)
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch, logits_output, out_tokens.reshape(-1), chain_stride=block_size
-            )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+        )
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
@@ -558,14 +570,17 @@ class Pard2WorkerV2(BaseSpecWorker):
         draft_input: DFlashDraftInputV2,
         candidates: torch.Tensor,
         next_token_logits: torch.Tensor,
+        grammar_mask: Optional["GrammarMask"],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         sampling_info = batch.sampling_info
         bs = candidates.shape[0]
         if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=next_token_logits,
+            adjust_verify_logits(
+                next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=self.block_size,
+                grammar_mask=grammar_mask,
+                draft_tokens=candidates,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
         if (
             sampling_info is not None
