@@ -47,8 +47,6 @@ from sglang.srt.models.utils import apply_qk_norm_rope, can_use_jit_qk_norm_rope
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 
-_is_cuda = is_cuda()
-
 
 def get_attention_sliding_window_size(config: PretrainedConfig) -> int:
     # HF's window counts the current token; SGLang's counts only earlier tokens.
@@ -298,7 +296,7 @@ class AionInstructModel(nn.Module):
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
-                alt_stream=get_stream("alt") if _is_cuda else None,
+                alt_stream=get_stream("alt") if is_cuda() else None,
             ),
             prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: AionInstructDecoderLayer.stage_facts(
