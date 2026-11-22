@@ -2838,9 +2838,12 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
         manager.enable_custom_mem_pool = False
         manager.max_transfer_batch_indices = 0
         manager.pp_size = 2
-        manager._transfer_data = Mock(return_value=0)
+        writes = Mock(return_value=0)
         # Decode registered 4 target entries plus 1 draft entry.
         dst_ptrs = [10000, 20000, 30000, 40000, 50000]
+        attach_mooncake_transport(
+            manager, engine_writes(writes), kv=[1000, 2000], peer_kv=dst_ptrs
+        )
         with patch(
             "sglang.srt.disaggregation.mooncake.conn.get_memory",
             return_value=SimpleNamespace(enable_unified_memory=False),
@@ -2856,7 +2859,7 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
             )
 
         self.assertEqual(status, 0)
-        blocks = manager._transfer_data.call_args.args[1]
+        blocks = writes.call_args.args[1]
         self.assertEqual(
             blocks,
             [
