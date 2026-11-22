@@ -13,6 +13,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -35,6 +36,7 @@ from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
@@ -87,6 +89,14 @@ class _CudaMemfdVideoBuffer:
             self.close()
             raise
 
+    def view(self, shape: tuple[int, ...]) -> tuple[np.ndarray, torch.Tensor]:
+        """The first bytes as ``shape``, an array and a pinned tensor."""
+        nbytes = int(np.prod(shape, dtype=np.int64))
+        return (
+            self.array.reshape(-1)[:nbytes].reshape(shape),
+            self.tensor.view(-1)[:nbytes].view(shape),
+        )
+
     def close(self) -> None:
         if self._registered and self.array is not None:
             try:
@@ -106,13 +116,16 @@ class _CudaMemfdVideoBuffer:
 
 @contextmanager
 def _acquire_cuda_video_buffer(shape: tuple[int, ...]):
+    """A staging buffer as ``(array, pinned tensor)`` views of ``shape``. The
+    cached one serves every request it is large enough for: registering a new
+    one with CUDA costs ~20 ms on B300 at each change of frame size."""
     global _cached_cuda_video_buffer
 
     buffer = None
     stale_buffer = None
     with _cuda_video_buffer_cache_lock:
         if _cached_cuda_video_buffer is not None:
-            if _cached_cuda_video_buffer.shape == shape:
+            if _cached_cuda_video_buffer.nbytes >= np.prod(shape, dtype=np.int64):
                 buffer = _cached_cuda_video_buffer
             else:
                 stale_buffer = _cached_cuda_video_buffer
@@ -125,7 +138,7 @@ def _acquire_cuda_video_buffer(shape: tuple[int, ...]):
         buffer = _CudaMemfdVideoBuffer(shape)
 
     try:
-        yield buffer
+        yield buffer.view(shape)
     finally:
         with _cuda_video_buffer_cache_lock:
             if (
@@ -505,6 +518,7 @@ class CudaVideoEncoder:
         try:
             self._process = subprocess.Popen(
                 command,
+                env=local_media_subprocess_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=self._stderr,
@@ -607,10 +621,9 @@ class CudaVideoEncoder:
                 torch.cuda.device(self._device),
                 _acquire_cuda_video_buffer(
                     (self._chunk_frames, self._height, self._width, 3)
-                ) as buffer,
-                memoryview(buffer.array).cast("B") as staged,
+                ) as (array, frames),
+                memoryview(array).cast("B") as staged,
             ):
-                assert buffer.tensor is not None
                 copy_stream = torch.cuda.Stream()
                 while (item := self._queue.get()) is not None:
                     chunk, ready = item
@@ -618,7 +631,7 @@ class CudaVideoEncoder:
                     count = int(chunk.shape[0])
                     copy_stream.wait_event(ready)
                     with torch.cuda.stream(copy_stream):
-                        buffer.tensor[:count].copy_(chunk, non_blocking=True)
+                        frames[:count].copy_(chunk, non_blocking=True)
                     copy_stream.synchronize()
                     # the copy is done, so the allocator may hand this block out again
                     del chunk, ready
@@ -806,6 +819,7 @@ def _mux_audio_np_into_mp4(
                 "experimental",
                 merged_path,
             ],
+            env=local_media_subprocess_env(),
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -917,6 +931,7 @@ def _save_video_ffmpeg(
     with tempfile.TemporaryFile() as stderr:
         with subprocess.Popen(
             command,
+            env=local_media_subprocess_env(),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=stderr,
@@ -1009,6 +1024,9 @@ def prepare_request(
         VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    if attention_backend_config.get("STA_mode") == "STA_SEARCHING":
+        # Assign before dispatch so all workers name the same calibration sample.
+        req.extra["sta_search_artifact_id"] = uuid.uuid4().hex
     if getattr(sampling_params, "max_sequence_length", None) is not None:
         req.max_sequence_length = sampling_params.max_sequence_length
 
@@ -1053,9 +1071,10 @@ def attach_audio_to_video_sample(
     sample: Any,
     audio: Any,
     output_idx: int,
+    num_outputs: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
-    audio = select_output_audio(audio, output_idx)
+    audio = select_output_audio(audio, output_idx, num_outputs)
     if audio is None:
         return sample
     if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
@@ -1063,12 +1082,20 @@ def attach_audio_to_video_sample(
     return sample
 
 
-def select_output_audio(audio: Any, output_idx: int) -> Any:
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    if isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    return audio
+def select_output_audio(
+    audio: Any, output_idx: int, num_outputs: int | None = None
+) -> Any:
+    """Audio of output ``output_idx``.
+
+    A leading dim is indexed as the output dim for 3D+ audio. 2D audio is indexed
+    only when ``num_outputs`` is unknown or equals ``shape[0]``; otherwise it is one
+    track (``(C, L)`` or ``(L, C)``, e.g. stereo) and kept whole.
+    """
+    if not isinstance(audio, (torch.Tensor, np.ndarray)) or audio.ndim < 2:
+        return audio
+    if audio.ndim == 2 and num_outputs is not None and audio.shape[0] != num_outputs:
+        return audio
+    return audio[output_idx] if audio.shape[0] > output_idx else None
 
 
 def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
@@ -1346,7 +1373,7 @@ def save_outputs(
     output_paths: list[str] = []
     samples = (
         [
-            attach_audio_to_video_sample(sample, audio, idx)
+            attach_audio_to_video_sample(sample, audio, idx, len(outputs))
             for idx, sample in enumerate(outputs)
         ]
         if data_type == DataType.VIDEO
@@ -1412,7 +1439,7 @@ def save_outputs(
                     if samples_out is not None:
                         samples_out.append(sample)
                     if audios_out is not None:
-                        audios_out.append(select_output_audio(audio, idx))
+                        audios_out.append(select_output_audio(audio, idx, len(outputs)))
                     output_paths.append(save_file_path)
                     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
                     continue
@@ -1440,7 +1467,7 @@ def save_outputs(
             samples_out.append(sample)
         if audios_out is not None:
             if data_type == DataType.VIDEO:
-                audios_out.append(select_output_audio(audio, idx))
+                audios_out.append(select_output_audio(audio, idx, len(outputs)))
             else:
                 audios_out.append(audio)
         if frames_out is not None:

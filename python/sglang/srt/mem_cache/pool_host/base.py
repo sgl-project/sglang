@@ -415,6 +415,9 @@ class HostKVCache(abc.ABC):
     # Names this pool's page byte format in storage keys when it has one of its
     # own, so pages persisted in another format miss instead of loading.
     storage_format_tag: Optional[str] = None
+    # Page strides are multiples of this many bytes (get_storage_page_align); the
+    # bytes from a page's end up to the next multiple belong to that page.
+    storage_page_align = 1
 
     def __init__(
         self,
@@ -616,6 +619,19 @@ class HostKVCache(abc.ABC):
         the page list, not a subsample.
         """
         return token_indices[:: self.page_size] // self.page_size
+
+    def _page_unified_buffer_meta(
+        self, indices: torch.Tensor
+    ) -> tuple[list[int], list[int]]:
+        """One (address, size) run per page; unified L3 chunks cut it by span."""
+        assert len(indices) % self.page_size == 0
+        bytes_per_page = self.page_unified_layout.bytes_per_page
+        base = self.kv_buffer.data_ptr()
+        ptr_list = [
+            base + page_id * bytes_per_page
+            for page_id in self._page_ids(indices).tolist()
+        ]
+        return ptr_list, [bytes_per_page] * len(ptr_list)
 
     def _init_page_unified_staging(self, staging: torch.Tensor | None = None) -> None:
         """Device-side scratch the write-back relayouts into before the D2H.

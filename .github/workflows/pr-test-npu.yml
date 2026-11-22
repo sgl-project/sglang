@@ -347,6 +347,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
+      git_ref: ${{ inputs.ref || '' }}
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64-npu
     secrets: inherit
@@ -360,11 +361,13 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: extra-b-test-1-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: ${{ inputs.coverage_mode == true && '120' || '60' }}
       timeout_per_file: '3600'
+      partitions: '{"size":2,"arr":[0, 1]}'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_extra_b_test_1_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
     secrets: inherit
@@ -378,11 +381,13 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: extra-b-test-2-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      run_timeout_minutes: ${{ inputs.coverage_mode == true && '120' || '60' }}
+      run_timeout_minutes: ${{ inputs.coverage_mode == true && '120' || '75' }}
       timeout_per_file: '3600'
+      partitions: '{"size":2,"arr":[0, 1]}'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_extra_b_test_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
     secrets: inherit
@@ -396,6 +401,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: extra-b-test-4-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-4' || 'linux-aarch64-a3-4-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -417,6 +423,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: extra-b-test-8-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-8' || 'linux-aarch64-a3-8-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -435,6 +442,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: extra-b-test-16-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
@@ -469,6 +477,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Mark repository safe
         run: |
@@ -612,6 +622,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Mark repository safe
         run: |
@@ -735,6 +747,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       test_type: 'accuracy'
       test_suite: extra-c-acc-test-2-npu-a3
@@ -755,6 +768,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
       test_type: 'accuracy'
       test_suite: extra-c-acc-test-16-npu-a3
@@ -774,6 +788,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
       test_suite: extra-c-perf-test-2-npu-a3
@@ -793,6 +808,7 @@ jobs:
       && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
       test_suite: extra-c-perf-test-16-npu-a3

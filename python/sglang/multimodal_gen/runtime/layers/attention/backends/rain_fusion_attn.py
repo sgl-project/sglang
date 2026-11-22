@@ -2,9 +2,9 @@ import math
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-import attentions  # noqa: F401
 import torch
 from einops import rearrange
+from sgl_kernel_npu.operators.attention import rain_fusion_attention
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -33,10 +33,6 @@ class RainFusionAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["RainFusionAttentionImpl"]:
         return RainFusionAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["RainFusionAttentionMetadata"]:
-        return RainFusionAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["RainFusionAttentionMetadataBuilder"]:
@@ -310,7 +306,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         actual_seq_lengths=Optional[torch.Tensor],
         actual_seq_lengths_kv=Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.rainfusionattention(
+        return rain_fusion_attention(
             query=query,
             key=key,
             value=value,

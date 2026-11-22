@@ -71,6 +71,10 @@ LINGBOT_VIDEO_FP32_MODULES = (
 
 logger = logging.getLogger(__name__)
 
+# Latched when the fused RMSNorm+modulate kernel fails; a failed Triton build
+# would otherwise be retried at two sites per block on every step.
+_norm_modulate_fusion_failed = False
+
 
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
@@ -137,16 +141,22 @@ def _lingbot_norm_modulate(
     quality-gated site is enabled; otherwise the reference chain. ``scale`` is
     the raw ``scale_msa/mlp``; the kernel applies ``x * (1 + scale)``.
     """
-    if LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(
-        block
-    ) and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift):
+    global _norm_modulate_fusion_failed
+    if (
+        not _norm_modulate_fusion_failed
+        and LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(block)
+        and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift)
+    ):
         try:
             out = rmsnorm_scale_shift_per_token(
                 x, norm.weight, scale, shift, norm.variance_epsilon
             )
             return out if out.dtype == out_dtype else out.to(out_dtype)
-        except Exception:
-            pass
+        except Exception as exc:
+            _norm_modulate_fusion_failed = True
+            logger.warning(
+                "Disabling LingBot Video fused RMSNorm+modulate fast path: %s", exc
+            )
     return (norm(x) * (1.0 + scale) + shift).to(out_dtype)
 
 
@@ -402,7 +412,6 @@ class LingBotVideoBlock(nn.Module):
 
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
-    _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]
