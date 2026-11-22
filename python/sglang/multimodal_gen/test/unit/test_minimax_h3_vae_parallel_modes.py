@@ -28,9 +28,13 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    attention as vit_attention,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
     Attention,
     _apply_qk_norm,
+    _sdpa_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
     RotaryEmbeddingND,
@@ -107,6 +111,71 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_gfx950_vit_attention_takes_flash_for_half_and_math_for_fp32():
+    """gfx950's fused SDPA corrupts the decoder: half inputs on the GPU
+    (autocast included) go to aiter's flash kernel as [B, S, H, D], FP32 to
+    the math replica."""
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+    q, k, v = (torch.randn(1, 5, 2, 8, device="cuda") for _ in range(3))
+    flash = mock.Mock(side_effect=lambda q, k, v, **_: torch.full_like(q, 7.0))
+    with (
+        mock.patch(f"{module}._FORCE_ROCM_MATH_SDPA", True),
+        mock.patch(f"{module}._rocm_flash_attn", flash),
+    ):
+        out_half = _sdpa_attention(q.half(), k.half(), v.half())
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            _sdpa_attention(q, k, v)
+        out_fp32 = _sdpa_attention(q, k, v)
+
+    assert [c.args[0].dtype for c in flash.call_args_list] == [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    assert flash.call_args.args[0].shape == q.shape
+    assert flash.call_args.kwargs == {"dropout_p": 0.0, "causal": False}
+    assert torch.equal(out_half, torch.full_like(out_half, 7.0))
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2) for t in (q, k, v))
+    ).transpose(1, 2)
+    torch.testing.assert_close(out_fp32, ref)
+
+
+def test_gfx950_vit_attention_keeps_the_math_replica_on_cpu():
+    """aiter's kernel is GPU-only: a CPU decode under BF16 autocast stays on
+    the math replica."""
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+    q, k, v = (torch.randn(1, 5, 2, 8) for _ in range(3))
+    flash = mock.Mock()
+    with (
+        mock.patch(f"{module}._FORCE_ROCM_MATH_SDPA", True),
+        mock.patch(f"{module}._rocm_flash_attn", flash),
+        torch.autocast("cpu", dtype=torch.bfloat16),
+    ):
+        out = _sdpa_attention(q, k, v)
+        math = vit_attention._math_sdpa(*(t.transpose(1, 2) for t in (q, k, v)))
+
+    flash.assert_not_called()
+    assert out.dtype == torch.bfloat16
+    assert torch.equal(out, math.transpose(1, 2))
+
+
+@pytest.mark.skipif(
+    vit_attention._rocm_flash_attn is None, reason="requires aiter on gfx950"
+)
+def test_gfx950_vit_flash_attention_matches_math_at_decoder_shape():
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 1797, 32, 64, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    )
+    flash = _sdpa_attention(q, k, v)
+    with mock.patch.object(vit_attention, "_rocm_flash_attn", None):
+        math = _sdpa_attention(q, k, v)
+    # both accumulate in FP32; they differ by the FP16 rounding of the output
+    torch.testing.assert_close(flash, math, atol=2e-3, rtol=2e-3)
 
 
 def test_vit_qk_norm_supports_affine_free_rmsnorm():
@@ -410,7 +479,7 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@requires_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_fused_decoder_runs_only_under_the_fast_path_gate():
     """The fused residual add + RMSNorm is not bit-exact, so it runs only while
     the decode-scoped gate is on (quality lossless/high); exact keeps the
@@ -443,9 +512,7 @@ def test_fused_decoder_runs_only_under_the_fast_path_gate():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_fused_decoder_is_disabled_off_nvidia():
-    # On ROCm tensor.is_cuda is true, but the fused Triton norms decoded to NaN
-    # on MI300; the decoder must keep the unfused path there.
+def test_fused_decoder_is_disabled_off_cuda_and_rocm():
     decoder = _h3_shaped_decoder()
     latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
     from sglang.kernels.ops import diffusion as diffusion_ops
@@ -459,7 +526,114 @@ def test_fused_decoder_is_disabled_off_nvidia():
         torch.autocast("cuda", dtype=torch.float16),
         set_forward_context(current_timestep=0, attn_metadata=None),
         mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
+        mock.patch(f"{vae_dir}.vae_vit.current_platform.is_rocm", return_value=False),
         mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
     ):
         decoder(latent)
     scale_add.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
+    """Both fused kernels store the residual as eager computes it: a rounded
+    FP32 multiply, then the add (no FMA; on ROCm the launch disables fusion)."""
+    from sglang.kernels.ops.diffusion import (
+        h3_vae_rmsnorm,
+        h3_vae_scale_add_rmsnorm,
+        try_fused_scaled_residual_add_exact,
+    )
+
+    torch.manual_seed(0)
+    residual = torch.randn(3, 1797, 2048, device="cuda") * 4
+    update = torch.randn(3, 1797, 2048, device="cuda").to(dtype)
+    scale = torch.randn(2048, device="cuda")
+    weight = torch.randn(2048, device="cuda")
+    expected = residual + update * scale
+    with torch.no_grad():
+        assert torch.equal(
+            try_fused_scaled_residual_add_exact(residual, update, scale), expected
+        )
+        added, normed = h3_vae_scale_add_rmsnorm(
+            residual.clone(), update, scale, weight, 1e-5
+        )
+    assert torch.equal(added, expected)
+    reference = nn.functional.rms_norm(expected, (2048,), weight, 1e-5)
+    torch.testing.assert_close(normed, reference, rtol=1e-5, atol=1e-5)
+
+    # stored in the autocast dtype, the rows round exactly as the linear's input
+    # cast; only ROCm stores it (vae_vit.py), and only there is it bit-equal
+    if not current_platform.is_rocm():
+        return
+    with torch.no_grad():
+        _, normed_half = h3_vae_scale_add_rmsnorm(
+            residual.clone(), update, scale, weight, 1e-5, out_dtype=dtype
+        )
+        first = h3_vae_rmsnorm(residual, weight, 1e-5)
+        first_half = h3_vae_rmsnorm(residual, weight, 1e-5, out_dtype=dtype)
+    assert torch.equal(normed_half, normed.to(dtype))
+    assert first.dtype == torch.float32
+    assert torch.equal(first_half, first.to(dtype))
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+@pytest.mark.parametrize("width", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rocm_qk_rms_norm_replays_aten(width, dtype):
+    """Strided per-head rows of a fused qkv normalize to aten's RMSNorm bytes,
+    and the VAE's qk norm returns them through the gate."""
+    from sglang.kernels.ops.diffusion import aten_rms_norm_rocm
+
+    torch.manual_seed(0)
+    qkv = torch.randn(1, 777, 8, 3 * width, device="cuda") * 3
+    qkv = (qkv + torch.randn(1, 777, 8, 1, device="cuda")).to(dtype)
+    q = qkv[..., :width]
+    ref = nn.functional.rms_norm(q, (width,), eps=1e-5)
+    assert torch.equal(aten_rms_norm_rocm(q, 1e-5), ref)
+
+    norm = nn.RMSNorm(width, eps=1e-5, elementwise_affine=False)
+    with torch.inference_mode():
+        assert torch.equal(_apply_qk_norm(norm, q), ref)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+@pytest.mark.parametrize("width,rot", [(64, 48), (64, 64), (128, 128)])
+def test_rocm_qk_norm_rope_replays_both_norms_and_the_rope(width, rot):
+    """One launch gives the bytes of the two aten RMSNorms plus sgl_kernel's
+    NeoX rope (BF16 products and sums each rounded), and the VAE attention
+    takes it through its gate."""
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    qkv = torch.randn(2, 777, 8, 3 * width, device="cuda") * 3
+    qkv = (qkv + torch.randn(2, 777, 8, 1, device="cuda")).to(dtype)
+    query, key, _ = torch.chunk(qkv, 3, dim=-1)
+    angle = torch.rand(777, rot // 2, device="cuda") * 50
+    cache = torch.cat((angle.cos(), angle.sin()), -1).to(dtype).contiguous()
+    positions = torch.arange(777, device="cuda").repeat(2)
+    rope = (None, None, cache, positions)
+    norm = nn.RMSNorm(width, eps=1e-5, elementwise_affine=False)
+    attn = SimpleNamespace(norm_q=norm, norm_k=norm)
+
+    with torch.inference_mode():
+        expected = apply_rotary_pos_emb_qk(
+            _apply_qk_norm(norm, query), _apply_qk_norm(norm, key), rope
+        )
+        fused = vit_attention._rocm_qk_norm_rope(attn, query, key, rope)
+
+    assert fused is not None
+    assert all(map(torch.equal, fused, expected))
+    assert vit_attention._ROCM_QK_NORM_ROPE.is_verified((width, rot, dtype))
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+def test_rocm_decoder_attention_takes_the_fused_qk_norm_rope():
+    # H3's rope_dim_ratio 0.75 rotates 48 of the 64 head dims
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda")
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.bfloat16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+    ):
+        decoder(latent)
+    assert vit_attention._ROCM_QK_NORM_ROPE.is_verified((64, 48, torch.bfloat16))

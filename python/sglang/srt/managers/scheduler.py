@@ -342,6 +342,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
     make_abort_req,
@@ -1060,6 +1061,10 @@ class Scheduler(
                         tuple(sequence) for sequence in selectable_sequences
                     )
                 ]
+
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
 
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
@@ -3707,6 +3712,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4222,6 +4228,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             self._add_request_to_queue(req)
@@ -5361,8 +5368,8 @@ class Scheduler(
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
            only need sampling_info restored - V1 carries spec_info forward as
            next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy that carries this
-           step's logit penalties, built on the forward stream.
+        2. Substitute sampling_info with a forward-only copy, so the forward's
+           edits to it do not reach the scheduler's.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
