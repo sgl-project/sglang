@@ -534,7 +534,6 @@ class StepPenalties:
         )
 
     def commit_accept(self, accept: VerifyAccept) -> None:
-        """Commit a verify's accepted tokens to the penalty history."""
         self.commit(accept.accept_tokens(), accept_mask=accept.accept_mask())
 
 

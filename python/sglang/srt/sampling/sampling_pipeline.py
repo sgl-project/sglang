@@ -9,9 +9,10 @@ Two entries run it:
 - decode: `SamplingPipeline.sample`, which binds, applies, samples, and commits
   in one call;
 - verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
-  target forward launches; its route picks the verify's fast paths, and the
-  verify worker then calls `build_grammar_mask`, the adjust, its accept core,
-  and `commit`.
+  target forward launches; its route picks the verify's fast paths. After the
+  launch the verify worker calls `build_grammar_mask`, the stages
+  (`VerifyStep.adjust` for a chain, `adjust_verify_logits` inside `eagle_sample`
+  for a tree), its accept core, and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each

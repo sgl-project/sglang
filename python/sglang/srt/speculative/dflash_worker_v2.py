@@ -3656,6 +3656,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_tree, logits_output=logits_output, barrier=grammar_barrier
         )
         if sampling_info is not None and target_predict is None:
+            # In place: DFlash refuses the watermark, the one stage that returns
+            # new logits.
             verify.adjust(logits_output.next_token_logits, draft_tokens)
 
         candidates = draft_tokens

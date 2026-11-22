@@ -582,7 +582,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
-    # The target verify's sampling route (VerifyStep.route); None otherwise.
+    # The target verify's sampling route (VerifyStep.route). Set only by
+    # eagle_prepare_for_verify: EAGLE is the one verify whose logits may stay
+    # vocab-sharded, and LogitsProcessor.verify_uses_vocab_shards reads it.
     verify_route: Optional[VerifyRoute] = None
 
     # === Derived from ScheduleBatch.reqs ===
