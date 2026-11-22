@@ -67,7 +67,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -301,15 +301,6 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
-
-
-def _verify_logits_unadjusted(sampling_info) -> bool:
-    return not (
-        sampling_info.has_custom_logit_processor
-        or sampling_info.step_penalties is not None
-        or sampling_info.logit_bias is not None
-        or sampling_info.sampling_mask_batch_indices is not None
-    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -922,11 +913,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.has_grammar or batch.return_logprob:
+        if batch.return_logprob:
             return False
         if sampling_info is None:
-            return self._selector_sample is None
-        if not _verify_logits_unadjusted(sampling_info):
+            return not batch.has_grammar and self._selector_sample is None
+        if (
+            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
+            # A sampling mask is captured from the full target distribution.
+            or sampling_info.sampling_mask_batch_indices is not None
+        ):
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
