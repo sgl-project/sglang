@@ -111,6 +111,7 @@ jobs:
             sglang_xeon
 
       - name: Check AMX support
+        id: check_amx
         timeout-minutes: 5
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
@@ -132,10 +133,10 @@ jobs:
       # resident -> no dual-model OOM. Four balanced partitions run as two
       # serial batches per GNR, keeping each step below the 360-minute limit.
       # Pair 0+2 and 1+3 so both machines get one larger and one smaller batch.
-      # Continue the sweep after test failures; an explicit cancellation skips it.
+      # Continue after test failures once container and AMX setup succeeded.
       - name: Run nightly model accuracy + perf (batch 1)
         id: model_batch_1
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' }}
         timeout-minutes: 300
         run: |
           set -o pipefail
@@ -149,7 +150,7 @@ jobs:
 
       - name: Run nightly model accuracy + perf (batch 2)
         id: model_batch_2
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' }}
         timeout-minutes: 300
         run: |
           set -o pipefail

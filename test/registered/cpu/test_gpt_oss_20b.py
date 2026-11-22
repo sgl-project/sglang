@@ -39,7 +39,7 @@ class TestGPTOSS20BXeon(unittest.TestCase):
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
                 baseline_accuracy=0.80,
-                api="completion",
+                api="chat",
                 num_threads=64,
                 return_latency=True,
             ),

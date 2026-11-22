@@ -14,7 +14,9 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
+# The full GSM8K evaluation exceeded the previous 90-minute file timeout.
+# With --timeout-from-est-time, this estimate gives the file a 3-hour budget.
+register_cpu_ci(est_time=7200, suite="nightly-xeon-models")
 
 MODEL_PATH = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
 
