@@ -83,7 +83,6 @@ from sglang.multimodal_gen.runtime.utils.argparse import (
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
-    is_valid_ipv6_address,
     normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -95,6 +94,7 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
 
@@ -2961,8 +2961,10 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
-            help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+            help="Pin CPU-offloaded weights for faster host-to-device transfers, "
+            "subject to the host memory budget. Pinned memory cannot be reclaimed; "
+            "use --pin-cpu-memory false to reduce host/cgroup memory pressure "
+            'or work around CUDA pinning errors such as "invalid argument".',
         )
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
@@ -3913,6 +3915,16 @@ class ServerArgs(DisaggServerArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
+                    abbreviated = {
+                        dest
+                        for name, dest in destinations.items()
+                        if name.startswith(arg_name)
+                    }
+                    if len(abbreviated) == 1:
+                        arg_name = abbreviated.pop()
                 provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.
