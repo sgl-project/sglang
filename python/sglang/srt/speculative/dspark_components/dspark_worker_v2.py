@@ -1254,11 +1254,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         verify.commit(
-            batch,
+            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,
-            accept=VerifyAccept(
-                tokens=accept.out_tokens, accept_lens=accept.commit_lens
-            ),
         )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
