@@ -55,7 +55,7 @@ import sys
 import weakref
 from array import array
 from concurrent.futures import Future
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -148,6 +148,8 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.sampling.logit_bias import LogitBiasEntries
+from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -912,6 +914,14 @@ class Req(ReqDllmMixin):
             self.cache_request_handle,
             attempt_id=self.cache_request_handle.attempt_id + 1,
         )
+
+    @cached_property
+    def logit_bias_entries(self) -> Optional[LogitBiasEntries]:
+        """sampling_params.logit_bias parsed at the first launch, None without
+        one; the request's sampling_params no longer change once it is admitted."""
+        if self.sampling_params.logit_bias is None:
+            return None
+        return LogitBiasEntries.parse(self.sampling_params.logit_bias)
 
     @property
     def seqlen(self) -> int:
@@ -3189,6 +3199,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+        # Workers launch some idle batches themselves, without the scheduler's gather.
+        self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
@@ -3460,9 +3472,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        self.sampling_info.refresh_top_k_flags(
-            [req.sampling_params.top_k for req in self.reqs]
-        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
