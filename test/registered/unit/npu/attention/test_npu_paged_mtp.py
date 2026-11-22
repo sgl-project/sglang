@@ -347,7 +347,6 @@ def test_target_verify_preserves_cpu_path_unless_backend_opts_out(needs_cpu, mir
             verify_cache_loc=torch.arange(8),
             iteration_ids=object(),
         ),
-        sampling_info=None,
     )
     method(executor, **kwargs)
     assert fb.seq_lens.tolist() == [127]

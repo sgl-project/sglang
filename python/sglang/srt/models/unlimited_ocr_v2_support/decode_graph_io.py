@@ -57,7 +57,7 @@ class UOCRDecodeGraphIO:
             and batch.return_logprob is False
             and sampling.is_all_greedy
             and sampling.logit_bias is None
-            and sampling.grammar_mask is None
+            and sampling.grammars is None
             and not sampling.has_custom_logit_processor
             and sampling.watermark is None
             and sampling.step_penalties is None
