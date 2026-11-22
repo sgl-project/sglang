@@ -2336,18 +2336,20 @@ class Scheduler(
         # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
         # synced, so all ranks decide the same (no deadlock).
         early_prefill = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
-        if not early_prefill and _is_npu and get_exec().moe.eplb_async_rebalance:
-            manager = self.tp_worker.model_runner.eplb_manager
-            # Avoid holding first tokens behind the next forward during the
-            # initial expert migration. Keep steady-state batch overlap.
-            early_prefill = manager is not None and manager.first_rebalance_active
-        if early_prefill:
+        npu_async_eplb = _is_npu and get_exec().moe.eplb_async_rebalance
+        if early_prefill or npu_async_eplb:
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
             else:
                 last_batch_is_extend = last_batch.forward_mode.is_extend()
             if last_batch_is_extend:
-                return True
+                if early_prefill:
+                    return True
+                manager = self.tp_worker.model_runner.eplb_manager
+                if manager is not None and manager.should_release_first_prefill(
+                    has_pending_chunk=self.chunked_req is not None
+                ):
+                    return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()
