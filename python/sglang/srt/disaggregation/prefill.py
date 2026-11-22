@@ -1404,6 +1404,10 @@ class SchedulerDisaggregationPrefillMixin:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
                 if hasattr(req.disagg_kv_sender, "abort"):
+                    # The sender reports the abort as a failed transfer, even after
+                    # a success. Timeout aborts (abort_message) stay transfer failures.
+                    if not recv_req.abort_message:
+                        req.disagg_transfer_aborted = True
                     req.disagg_kv_sender.abort()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1571,8 +1575,9 @@ class SchedulerDisaggregationPrefillMixin:
         except Exception as e:
             exc = e
             error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
+        # Mute error message for propagated exceptions to avoid duplicate logging,
+        # and for a failure that a request abort caused.
+        if req.disagg_transfer_aborted or getattr(exc, "is_from_another_rank", False):
             logger.debug(error_message)
         else:
             logger.warning(error_message)
@@ -1582,7 +1587,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
         self.request_retirer.release(req, checkpoint=False)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not req.disagg_transfer_aborted:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
 
