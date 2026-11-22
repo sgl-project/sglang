@@ -1410,6 +1410,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
 
         self._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+        if self.use_flashinfer_trtllm_moe:
+            config = layer.moe_runner_config
+            swiglu_limit = config.swiglu_limit
+            if (
+                swiglu_limit is not None
+                and config.activation == "silu"
+                and config.is_gated
+                and not hasattr(layer, "_flashinfer_trtllm_gemm1_clamp_limit")
+            ):
+                # Weight reloads can reuse CUDA graphs that read this tensor.
+                layer._flashinfer_trtllm_gemm1_clamp_limit = layer.w13_weight.new_full(
+                    (layer.num_local_experts,), swiglu_limit, dtype=torch.float32
+                )
 
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
@@ -1806,6 +1819,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                gemm1_clamp_limit=getattr(
+                    layer, "_flashinfer_trtllm_gemm1_clamp_limit", None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
