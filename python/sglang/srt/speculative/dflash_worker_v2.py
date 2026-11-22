@@ -321,7 +321,6 @@ class _DraftBlock(msgspec.Struct, frozen=True):
     verify_out_cache_loc_2d: torch.Tensor
     iteration_ids: IterationIds
     ring_block_locs: Optional[torch.Tensor]
-    tree: bool
 
 
 class _TailRows(msgspec.Struct, frozen=True):
@@ -3239,17 +3238,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         self._info_dumper.begin_step()
-        want_tree = (
-            self._tree is not None
-            # logits adjustments (penalties, grammar, watermark) and spec logprobs
-            # assume chain rows (row j = depth j)
-            and _plain_greedy(batch.sampling_info, has_grammar=batch.has_grammar)
-            and not batch.return_logprob
-            and batch.hisparse_coordinator is None
-            and get_global_experts_capturer() is None
-            and bs <= tree_max_batch(self.model_runner)
-        )
-        draft = self._draft_block(batch, draft_input, bs, tree=want_tree)
+        draft = self._draft_block(batch, draft_input, bs)
         return self._verify_block(
             batch,
             draft_input,
@@ -3259,10 +3248,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_barrier=grammar_barrier,
         )
 
-    def _draft_block(self, batch, draft_input, bs: int, tree: bool) -> "_DraftBlock":
+    def _draft_block(self, batch, draft_input, bs: int) -> "_DraftBlock":
         device = self.device
-        is_tree = False
-
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3605,8 +3592,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_tokens[:, 0].copy_(block_ids[:, 0])
             draft_tokens[:, 1:].copy_(draft_next)
-        if self._tree is not None and not is_tree and bs <= self._tree.tok.shape[0]:
-            self._tree.set_chains(bs)
         return _DraftBlock(
             tokens=draft_tokens,
             positions=positions,
@@ -3615,7 +3600,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d=verify_out_cache_loc_2d,
             iteration_ids=iteration_ids,
             ring_block_locs=ring_block_locs,
-            tree=is_tree,
         )
 
     def _verify_block(
@@ -4101,7 +4085,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             tail_input,
             n_dec,
-            tree=self._tree is not None and n_dec <= tree_max_batch(self.model_runner),
         )
         if self._bind:
             self._bind()
@@ -4137,8 +4120,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             return_hidden_states_before_norm=False,
         )
         forward_batch.mixed_verify_rows = n_dec
-        if draft.tree:
-            forward_batch.mixed_verify_tree = (self._tree.anc, self._tree.depth)
         forward_batch.extend_logits_row_index = torch.cat(
             [
                 torch.tensor(ext_lens, dtype=torch.int64).cumsum(0) - 1,
@@ -4169,7 +4150,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=committed,
             bs=n_dec,
             target_predict=predict[n_ext:],
-            tree_loc=draft.verify_out_cache_loc_2d if draft.tree else None,
         )
         if tail_seq_lens is None:
             tail_seq_lens = committed + commit_lens.to(committed.dtype)
@@ -4206,7 +4186,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         tail_hidden = hidden[n_ext_tok : n_ext_tok + n_dec * block_size]
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=tail_hidden,
-            tree_perm=self._tree.perm[:n_dec] if draft.tree else None,
             cache_loc=tail_loc,
             cache_loc_2d=tail_loc.view(n_dec, block_size),
             swa_cache_loc=self._draft_write_ids(
