@@ -43,12 +43,14 @@ DCP=1.
 
 Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
 
-- `control_advertise_host` (`127.0.0.1`): host peers and routers dial for this
-  worker's control endpoint.
+- `control_advertise_host` (`127.0.0.1`): IPv4 address or host name peers and
+  routers dial for this worker's control endpoint.
 - `control_host` (`0.0.0.0` with remote hints, else `127.0.0.1`): IPv4 address
-  or host name the control endpoint binds (KVCR 0.2.0 binds IPv4 only). The endpoint exists only with `enable_remote_hint` or
-  `share_replicated_kv`; peers fetch through it without authentication, so bind
-  it to the peer-facing interface where possible.
+  or host name the control endpoint binds. KVCR 0.2.0's control channel is
+  IPv4 only, so both hosts are rejected as IPv6 literals. The endpoint exists
+  only with `enable_remote_hint` or `share_replicated_kv`; peers fetch through
+  it without authentication, so bind it to the peer-facing interface where
+  possible.
 - `control_port` (`32100`): base control port.
 - `nixl_listen_port` (`control_port + 1024`): base NIXL listen port. The
   default lies in Linux's ephemeral port range; prefer a base outside it, or

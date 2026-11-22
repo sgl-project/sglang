@@ -297,6 +297,12 @@ class KVCRStore(HiCacheStorage):
                 "KVCR abandon_timeout_ms must be at least twice operation_timeout_ms"
             )
         self._control = control_address(self.config, self._extra)
+        if self._needs_control() and self._control[0].startswith("["):
+            # KVCR 0.2.0's control channel listens on IPv4 only, so peers and
+            # routers could not reach an IPv6 endpoint.
+            raise ValueError(
+                "KVCR control_advertise_host must be an IPv4 address or host name"
+            )
         port = self._control[1]
         dp_stride = self.config.tp_size * self.config.attn_cp_size * self.config.pp_size
         offset = self.config.dp_rank * dp_stride + self._offset
@@ -738,14 +744,17 @@ class KVCRStore(HiCacheStorage):
         self._poll_thread.start()
         logger.info(
             "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s "
-            "shared_replicated=%s writer=%s operation_timeout_ms=%d "
-            "abandon_timeout_ms=%d",
+            "shared_replicated=%s writer=%s sibling_readers=%d "
+            "operation_timeout_ms=%d abandon_timeout_ms=%d",
             channel.endpoint if channel is not None else None,
             layouts,
             sum(size for _, _, size in allocations),
             self._namespace,
             self._shared,
             self._writer_endpoint or "self",
+            # Ranks whose shared-pool reads this writer serves within the
+            # per-rank deadlines below.
+            self.config.tp_size - 1 if self._shared and self._writer else 0,
             operation_timeout_ms,
             abandon_timeout_ms,
         )

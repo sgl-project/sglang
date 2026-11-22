@@ -736,6 +736,10 @@ class TestKVCRStorage(CustomTestCase):
             # KVCR 0.2.0's control channel binds IPv4 only.
             ({"control_host": "::"}, "IPv4"),
             ({"control_host": "fd00::1"}, "IPv4"),
+            (
+                {"enable_remote_hint": True, "control_advertise_host": "2001:db8::1"},
+                "control_advertise_host must be an IPv4",
+            ),
             ({"control_port": 65535}, "control-port range"),
             ({"control_port": 40000, "nixl_listen_port": 40000}, "overlaps"),
             ({"control_advertise_host": "0.0.0.0"}, "unspecified"),
@@ -1559,7 +1563,7 @@ class TestKVCRInventoryPublication(CustomTestCase):
         config.tp_size = 2
         config.extra_config = {
             "enable_remote_hint": True,
-            "control_advertise_host": "2001:db8::1",
+            "control_advertise_host": "192.0.2.7",
             "control_port": 29017,
         }
         # Replica 2 of a TP2 deployment, without attention DP.
@@ -1571,7 +1575,7 @@ class TestKVCRInventoryPublication(CustomTestCase):
             {
                 "dp_rank": 2,
                 "capabilities": ["router_hint"],
-                "source_control_endpoint": "tcp://[2001:db8::1]:29021",
+                "source_control_endpoint": "tcp://192.0.2.7:29021",
             },
         )
         host, port = control_address(backend.config, backend._extra)
@@ -2158,6 +2162,9 @@ class TestSharedReplicatedKV(CustomTestCase):
             self.assertEqual(store._idle_poll_max, 0.02)
         self.assertIsNone(writer._writer_endpoint)
         self.assertEqual(replica._writer_endpoint, "tcp://127.0.0.1:32100")
+        # Siblings dial the control endpoint, which KVCR 0.2.0 binds on IPv4.
+        with self.assertRaisesRegex(ValueError, "control_advertise_host"):
+            KVCRStore(self._config(1, control_advertise_host="fd00::1"), _HostPool())
         # The controller elects the same writer and skips the replica's backup.
         controller = object.__new__(HiCacheController)
         for store, skipped in ((writer, False), (replica, True)):
