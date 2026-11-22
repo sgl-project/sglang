@@ -23,7 +23,10 @@ projection. Adapted from gemma3n_audio.py with Gemma 4 specific changes:
   - Output projection (hidden_size -> output_proj_dims)
 """
 
+import bisect
+import logging
 import math
+import time
 from typing import Optional, Tuple
 
 import torch
@@ -31,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Gemma4AudioConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.clippable_linear import (
     ClippableColumnParallelLinear,
     ClippableGLUParallelLinear,
@@ -55,6 +59,13 @@ _SSCP_CONV_STRIDE_SIZES = ((2, 2), (2, 2))
 # ---------------------------------------------------------------------------
 # Relative Position Embedding
 # ---------------------------------------------------------------------------
+
+
+logger = logging.getLogger(__name__)
+
+# Mel-frame buckets (10 ms frames) for the single-clip CUDA graphs; clips up
+# to 30.72 s replay a graph, longer ones run eagerly.
+_AUDIO_GRAPH_FRAME_BUCKETS = tuple(range(128, 3072 + 1, 128))
 
 
 class Gemma4AudioRelativePositionEmbedding(nn.Module):
@@ -828,12 +839,88 @@ class Gemma4AudioEncoder(nn.Module):
             local_causal_valid_mask * lower_causal_mask * upper_causal_mask,
             persistent=False,
         )
+        self._graphs = {}
+        self._graph_pool = None
+        self._graph_capture_failed = False
 
     @property
     def device(self):
         return next(self.parameters()).device
 
     def forward(
+        self, audio_mel: torch.Tensor, audio_mel_mask: torch.BoolTensor
+    ) -> Tuple[torch.Tensor, torch.BoolTensor]:
+        """Encode a batch of mel spectrograms (see ``_forward_eager``).
+
+        A single clip replays a CUDA graph captured for the next frame-count
+        bucket. The extra frames are padding: they are masked like the
+        processor's own padding, so the valid frames are unchanged.
+        """
+        if self._cuda_graphs_enabled(audio_mel):
+            out = self._forward_graph(audio_mel, audio_mel_mask)
+            if out is not None:
+                return out
+        return self._forward_eager(audio_mel, audio_mel_mask)
+
+    def _cuda_graphs_enabled(self, audio_mel: torch.Tensor) -> bool:
+        return (
+            audio_mel.shape[0] == 1
+            and audio_mel.shape[1] <= _AUDIO_GRAPH_FRAME_BUCKETS[-1]
+            and audio_mel.is_cuda
+            and not self._graph_capture_failed
+            and envs.SGLANG_GEMMA4_AUDIO_CUDA_GRAPH.get()
+            and get_parallel().attn_tp_size == 1
+            and not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _capture_graphs(self, mel_bins: int, dtype: torch.dtype) -> None:
+        """Capture every frame bucket once, largest first, in one private pool."""
+        start = time.perf_counter()
+        self._graph_pool = torch.cuda.graph_pool_handle()
+        for frames in reversed(_AUDIO_GRAPH_FRAME_BUCKETS):
+            mel = torch.zeros(1, frames, mel_bins, dtype=dtype, device=self.device)
+            mask = torch.zeros(1, frames, dtype=torch.bool, device=self.device)
+            with torch.no_grad():
+                self._forward_eager(mel, mask)  # warmup outside the capture
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(graph, pool=self._graph_pool):
+                out = self._forward_eager(mel, mask)
+            self._graphs[frames] = (graph, mel, mask, out)
+        torch.cuda.synchronize()
+        logger.info(
+            "Captured %d Gemma 4 audio encoder CUDA graphs in %.2f s",
+            len(self._graphs),
+            time.perf_counter() - start,
+        )
+
+    def _forward_graph(
+        self, audio_mel: torch.Tensor, audio_mel_mask: torch.BoolTensor
+    ) -> Optional[Tuple[torch.Tensor, torch.BoolTensor]]:
+        if not self._graphs:
+            try:
+                self._capture_graphs(audio_mel.shape[-1], audio_mel.dtype)
+            except Exception:
+                logger.exception("Gemma 4 audio CUDA graph capture failed; eager")
+                self._graph_capture_failed = True
+                self._graphs.clear()
+                return None
+        num_frames = audio_mel.shape[1]
+        bucket = _AUDIO_GRAPH_FRAME_BUCKETS[
+            bisect.bisect_left(_AUDIO_GRAPH_FRAME_BUCKETS, num_frames)
+        ]
+        graph, mel, mask, (encodings, out_mask) = self._graphs[bucket]
+        if mel.dtype != audio_mel.dtype:
+            return None
+        mel[:, :num_frames].copy_(audio_mel)
+        mel[:, num_frames:].zero_()
+        mask[:, :num_frames].copy_(audio_mel_mask)
+        mask[:, num_frames:].fill_(True)
+        graph.replay()
+        return encodings.clone(), out_mask.clone()
+
+    def _forward_eager(
         self, audio_mel: torch.Tensor, audio_mel_mask: torch.BoolTensor
     ) -> Tuple[torch.Tensor, torch.BoolTensor]:
         """Encode a batch of mel spectrograms.

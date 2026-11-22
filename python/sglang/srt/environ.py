@@ -1927,6 +1927,9 @@ class Envs:
     # its CPU pool's thread count. None = unset = min(8, CPU cores).
     SGLANG_MM_RS_THREADS = EnvInt(None)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Replay a single Gemma 4 audio clip's encoder from a CUDA graph (per
+    # frame-count bucket, TP 1).
+    SGLANG_GEMMA4_AUDIO_CUDA_GRAPH = EnvBool(True)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
     # set False to fall back to the per-image loop.
