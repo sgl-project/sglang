@@ -943,7 +943,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
 
 class TestQwenVideoConfigRouting(CustomTestCase):
     def test_preprocessed_video_drops_sglang_owned_config(self):
-        from sglang.srt.multimodal.processors.qwen_vl import (
+        from sglang.srt.multimodal.qwen_vl_media_processing import (
             _get_processor_video_config,
         )
 
@@ -960,7 +960,7 @@ class TestQwenVideoConfigRouting(CustomTestCase):
         self.assertEqual(processor_config, {"do_normalize": False})
 
     def test_unprocessed_video_uses_original_config(self):
-        from sglang.srt.multimodal.processors.qwen_vl import (
+        from sglang.srt.multimodal.qwen_vl_media_processing import (
             _get_processor_video_config,
         )
 

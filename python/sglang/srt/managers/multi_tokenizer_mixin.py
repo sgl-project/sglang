@@ -231,6 +231,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "input_top_logprobs_val_flat",
         "input_top_logprobs_idx_flat",
         "input_top_logprobs_flat_null_prefix",
+        "input_top_logprobs_weights",
         "output_top_logprobs_val",
         "output_top_logprobs_idx",
         "input_token_ids_logprobs_val",
@@ -456,6 +457,15 @@ class MultiTokenizerRouter:
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
+
+    def dispatch_to_scheduler(self, obj: BaseReq) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                async_sock_send(self.send_to_scheduler, obj, flags=zmq.NOBLOCK),
+                self._loop,
+            ).result()
+        except zmq.Again:
+            logger.warning(f"No scheduler is connected; dropped {type(obj).__name__}.")
 
     def _run_loop(self):
         self._loop.run_forever()
