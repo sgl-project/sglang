@@ -121,7 +121,14 @@ class MultimodalProcessorMixin:
             )
             self.mm_processor_worker_num = 1
         self.mm_processor_executor = None
-        if self.mm_processor_worker_num > 1:
+        # An explicit count of 1 (or a processor built without the pool) keeps
+        # running inline; only the auto-sized single worker may move to a thread.
+        single_worker_on_thread = (
+            not requested_mm_processor_worker_num
+            and processor_config.run_single_worker_on_thread
+            and self.supports_mm_processor_concurrency
+        )
+        if self.mm_processor_worker_num > 1 or single_worker_on_thread:
             try:
                 # A callable, not the object: subclasses finish customizing
                 # `_processor` after this returns, and the workers must clone it
@@ -140,8 +147,7 @@ class MultimodalProcessorMixin:
                 self.mm_processor_worker_num = 1
         if self.mm_processor_executor is not None:
             logger.info(
-                "Multimodal processor concurrency enabled with %d isolated "
-                "worker threads (%s).",
+                "Multimodal processing runs on %d isolated worker thread(s) (%s).",
                 self.mm_processor_worker_num,
                 "auto" if requested_mm_processor_worker_num == 0 else "explicit",
             )
