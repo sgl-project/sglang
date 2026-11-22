@@ -7,8 +7,7 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative import eagle_utils, target_verify
-from sglang.srt.speculative.target_verify import adjust_verify_logits
+from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,11 +91,11 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             [[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]],
         )
 
-    def test_verify_adjust_runs_decoding_order(self):
-        """Every verify adjusts its logits in decoding's order: penalties, grammar
-        mask, logit bias, then the custom processor over each request's rows."""
+    def test_eagle_sample_adjusts_in_decoding_order_per_request_tree(self):
         bs, width = 2, 3
         verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
+        next_child = torch.tensor([[1, 2, -1]] * bs)
+        next_sibling = torch.full((bs, width), -1)
         banned = torch.zeros(bs * width, VOCAB_SIZE, dtype=torch.bool)
         banned[:width, 4] = banned[width:, 6] = True
         grammar_mask = SimpleNamespace(
@@ -111,38 +110,17 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         )
 
         expected = logits.clone()
-        info.step_penalties.apply_verify(expected, verify_tokens)
+        info.step_penalties.apply_verify(
+            expected, verify_tokens, next_child=next_child, next_sibling=next_sibling
+        )
         expected.masked_fill_(banned, float("-inf"))
         expected.view(bs, width, VOCAB_SIZE).add_(info.logit_bias[:, None, :])
 
-        seen = []
-        with patch.object(
-            target_verify,
-            "apply_custom_logit_processor",
-            side_effect=lambda t, *_, **kwargs: seen.append((t.clone(), kwargs)),
-        ):
-            adjust_verify_logits(
-                logits,
-                sampling_info=info,
-                grammar_mask=grammar_mask,
-                draft_tokens=verify_tokens,
-                custom_logit_processor=True,
-            )
-        self.assertEqual(len(seen), 1)
-        self.assertTrue(torch.equal(seen[0][0], expected))
-        self.assertEqual(seen[0][1], dict(num_tokens_in_batch=width))
-
-    def test_eagle_sample_runs_the_custom_processor_on_each_request_tree(self):
-        """EAGLE verify, which used to skip custom logit processors, hands one a
-        request's tree nodes, rows i * width to (i + 1) * width, with its params."""
-        bs, width = 2, 3
-
         def processor(logits, custom_params):
-            seen.append((logits[:, 0].tolist(), custom_params))
+            seen.append((logits.clone(), custom_params))
             raise _Stop
 
         seen = []
-        info = _sampling_info(bs)
         info.has_custom_logit_processor = True
         info.custom_params = [{"req": 0}, {"req": 1}]
         info.custom_logit_processor = {
@@ -150,9 +128,9 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         }
         verify_input = SimpleNamespace(
             draft_token_num=width,
-            draft_token=torch.zeros(bs * width, dtype=torch.int64),
-            retrieve_next_token=torch.tensor([[1, 2, -1]] * bs),
-            retrieve_next_sibling=torch.full((bs, width), -1),
+            draft_token=verify_tokens.reshape(-1),
+            retrieve_next_token=next_child,
+            retrieve_next_sibling=next_sibling,
         )
         batch = SimpleNamespace(
             device="cpu",
@@ -161,16 +139,19 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
         logits_output = SimpleNamespace(
-            next_token_logits=torch.arange(bs * width, dtype=torch.float32)[:, None]
-            .expand(-1, VOCAB_SIZE)
-            .clone(),
-            next_token_logits_vocab_shard=None,
+            next_token_logits=logits, next_token_logits_vocab_shard=None
         )
         with self.assertRaises(_Stop):
             eagle_utils.eagle_sample(
-                verify_input, batch, logits_output, custom_logit_processor=True
+                verify_input,
+                batch,
+                logits_output,
+                grammar_mask,
+                has_custom_logit_processor=True,
             )
-        self.assertEqual(seen, [([3.0, 4.0, 5.0], [{"req": 1}] * width)])
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(torch.equal(seen[0][0], expected[width:]))
+        self.assertEqual(seen[0][1], [{"req": 1}] * width)
 
 
 if __name__ == "__main__":

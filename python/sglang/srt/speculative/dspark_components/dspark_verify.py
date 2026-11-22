@@ -479,8 +479,7 @@ class TargetVerifyExecutor:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
         if full_block:
-            # Nothing to pack: the verify rows are the verify window, the anchor
-            # then the drafts.
+            # Nothing to pack: the verify rows are the verify window.
             verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
@@ -1234,8 +1233,8 @@ def sample_simulated_bonus(
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
-    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+    distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
+    if need_truncated_sampling(sampling_info):
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)

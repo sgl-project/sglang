@@ -1,4 +1,3 @@
-import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,8 +13,6 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestNativeEagerVerify(CustomTestCase):
     def test_master_selects_native_sampling_or_runtime_hooks(self):
-        """A custom logit processor keeps native sampling under the master switch:
-        the runtime hooks' sampling view carries none."""
         # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
         eagle_options = dict(
             uno_target_max_top_k=17,
@@ -23,7 +20,8 @@ class TestNativeEagerVerify(CustomTestCase):
             sparse_bonus_argmax=True,
         )
         for label, options in (("eagle", eagle_options), ("defaults", {})):
-            for enabled, custom in itertools.product((False, True), (False, True)):
+            # A custom processor matters only with the switch on.
+            for enabled, custom in ((False, False), (True, False), (True, True)):
                 with self.subTest(options=label, enabled=enabled, custom=custom):
                     batch = SimpleNamespace(
                         sampling_info=SimpleNamespace(
@@ -95,7 +93,7 @@ class TestNativeEagerVerify(CustomTestCase):
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False
                             ),
-                            custom_logit_processor=custom,
+                            has_custom_logit_processor=custom,
                         )
 
 

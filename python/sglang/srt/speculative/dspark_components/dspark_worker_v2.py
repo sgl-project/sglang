@@ -1219,7 +1219,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 grammar_mask=verify.grammar_mask,
                 draft_tokens=verify_ids_2d,
-                custom_logit_processor=sampling_info.has_custom_logit_processor,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
 
         target_logits = logits_output.next_token_logits

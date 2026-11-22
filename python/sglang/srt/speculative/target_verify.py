@@ -36,19 +36,12 @@ def adjust_verify_logits(
     draft_tokens: torch.Tensor,
     next_child: Optional[torch.Tensor] = None,
     next_sibling: Optional[torch.Tensor] = None,
-    custom_logit_processor: bool,
+    has_custom_logit_processor: bool,
 ) -> None:
-    """Apply the sampler's logit adjustments to the verify logits in place, in
-    decoding's order: penalties, grammar mask, logit bias, custom logit
-    processor. The watermark, if any, applies after.
-
-    ``draft_tokens`` [bs, width]: each request's verify tokens, a tree's nodes
-    linked by ``next_child`` / ``next_sibling``, or a chain without them. Row
-    ``i * width + j`` of ``logits`` is request i's token j, so a custom
-    processor sees ``width`` rows per request, each with that request's params.
-    ``custom_logit_processor``: run the batch's custom logit processors; a
-    provider's sampling view carries none.
-    """
+    """The sampler's logit adjustments, in place and in its order: penalties,
+    grammar mask, logit bias, custom logit processor. Row ``i * width + j`` of
+    ``logits`` is request i's draft token j, so a custom processor gets ``width``
+    rows per request, each with that request's params."""
     width = draft_tokens.shape[1]
     if sampling_info.step_penalties is not None:
         sampling_info.step_penalties.apply_verify(
@@ -61,7 +54,7 @@ def adjust_verify_logits(
         logits.view(-1, width, logits.shape[-1]).add_(
             sampling_info.logit_bias[:, None, :]
         )
-    if custom_logit_processor:
+    if has_custom_logit_processor:
         apply_custom_logit_processor(logits, sampling_info, num_tokens_in_batch=width)
 
 

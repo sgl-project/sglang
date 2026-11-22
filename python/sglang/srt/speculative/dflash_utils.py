@@ -1158,8 +1158,8 @@ def build_speculative_verify_target_probs(
     from sglang.srt.utils import is_cuda
 
     device = next_token_logits.device
-    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
-    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    need_top_k = sampling_info.need_top_k_sampling
+    need_top_p = sampling_info.need_top_p_sampling
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
