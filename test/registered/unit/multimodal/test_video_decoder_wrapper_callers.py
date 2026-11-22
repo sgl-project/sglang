@@ -9,7 +9,7 @@ models raised ``AttributeError``.
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import numpy as np
 import torch
@@ -56,9 +56,7 @@ class TestVideoDecoderWrapperCallers(CustomTestCase):
     def test_ernie45_vl_preprocess_video(self):
         video = _InMemoryVideo(_frames(16, 28, 56), fps=8.0)
 
-        # The CPU engine skips pinning, which needs an accelerator.
-        with patch.object(ernie45_vl, "is_cpu", return_value=True):
-            frames, metadata = asyncio.run(ernie45_vl.preprocess_video(video))
+        frames, metadata = asyncio.run(ernie45_vl.preprocess_video(video))
 
         num_frames, height, width, channels = frames.shape
         self.assertEqual((num_frames, channels), (16, 3))

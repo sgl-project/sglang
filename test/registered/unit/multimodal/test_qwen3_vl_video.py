@@ -11,7 +11,6 @@ the total_pixels and min_pixels bounds, and an explicit resized size.
 """
 
 import sys
-from unittest.mock import patch
 
 import av
 import numpy as np
@@ -63,12 +62,6 @@ _CASES = [
         (96, 160),
     ),
 ]
-
-
-@pytest.fixture(autouse=True)
-def _decode_without_pinned_memory():
-    with patch("sglang.srt.utils.video_decoder._is_cpu_engine", return_value=True):
-        yield
 
 
 @pytest.fixture(scope="module")

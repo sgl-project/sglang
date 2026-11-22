@@ -24,7 +24,7 @@ from sglang.srt.multimodal.qwen_vl_media_processing import (
     floor_by_factor,
     round_by_factor,
 )
-from sglang.srt.utils import is_cpu, is_npu, logger
+from sglang.srt.utils import is_npu, logger
 
 _is_npu = is_npu()
 
@@ -188,8 +188,6 @@ async def preprocess_video(
     )
 
     video = video.permute(0, 2, 3, 1)
-    if not is_cpu() and video.device.type == "cpu":
-        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
