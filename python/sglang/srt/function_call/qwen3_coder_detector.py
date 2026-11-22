@@ -20,9 +20,30 @@ from sglang.srt.function_call.utils import (
 logger = logging.getLogger(__name__)
 
 
+# Markers XGrammar binds to tokens for qwen_3_coder with token_markers=True.
+_QWEN_MARKER_TOKENS = ("<think>", "</think>", "<tool_call>", "</tool_call>")
+
+
+def _markers_are_single_tokens(tokenizer, markers) -> bool:
+    if tokenizer is None:
+        return False
+    try:
+        return all(
+            len(tokenizer.encode(marker, add_special_tokens=False)) == 1
+            for marker in markers
+        )
+    except Exception:
+        return False
+
+
 class Qwen3CoderDetector(BaseFormatDetector):
-    def __init__(self):
+    def __init__(self, tokenizer=None):
         super().__init__()
+
+        # Start the structural tag on the <tool_call> token, not on the text
+        # "<tool_call>\n<function=", when the tokenizer has the markers as
+        # single tokens (Qwen3-Coder, Qwen3.5/3.6).
+        self._token_markers = _markers_are_single_tokens(tokenizer, _QWEN_MARKER_TOKENS)
 
         # Sentinel tokens
         self.tool_call_start_token: str = "<tool_call>"
@@ -497,3 +518,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "qwen_3_coder"
+
+    def use_structural_tag_token_markers(self) -> bool:
+        return self._token_markers

@@ -555,24 +555,30 @@ def strip_structural_tag_excludes(structural_tag: Any, tokens: Iterable[str]) ->
     if not tokens:
         return
 
+    # Tags built with token_markers=True carry the same tokens in
+    # ``exclude_tokens`` (token_triggered_tags, any_tokens).
+    fields = ("excludes", "exclude_tokens")
+
     def visit(node: Any) -> None:
         if isinstance(node, list):
             for item in node:
                 visit(item)
             return
         if isinstance(node, dict):
-            excludes = node.get("excludes")
-            if isinstance(excludes, list):
-                node["excludes"] = [s for s in excludes if s not in tokens]
+            for field in fields:
+                excludes = node.get(field)
+                if isinstance(excludes, list):
+                    node[field] = [s for s in excludes if s not in tokens]
             for key in ("format", "content", "tags", "elements"):
                 if key in node:
                     visit(node[key])
             return
         if not hasattr(node, "__dict__"):
             return
-        excludes = getattr(node, "excludes", None)
-        if isinstance(excludes, list):
-            node.excludes = [s for s in excludes if s not in tokens]
+        for field in fields:
+            excludes = getattr(node, field, None)
+            if isinstance(excludes, list):
+                setattr(node, field, [s for s in excludes if s not in tokens])
         for key in ("format", "content", "tags", "elements"):
             if hasattr(node, key):
                 visit(getattr(node, key))

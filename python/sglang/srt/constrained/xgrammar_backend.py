@@ -351,7 +351,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         elif fmt_type in {"sequence", "or"}:
             for element in structural_format.get("elements", []):
                 XGrammarGrammarBackend._sanitize_structural_format(element)
-        elif fmt_type in {"triggered_tags", "tags_with_separator"}:
+        elif fmt_type in {
+            "triggered_tags",
+            "token_triggered_tags",
+            "tags_with_separator",
+        }:
             for tag in structural_format.get("tags", []):
                 XGrammarGrammarBackend._sanitize_structural_format(tag)
 
