@@ -364,6 +364,10 @@ class FlashAttentionBackend(AttentionBackend):
         return FlashAttentionMetadataBuilder
 
 
+def _skip_softmax_off() -> tuple[bool, None]:
+    return False, None
+
+
 class FlashAttentionImpl(AttentionImpl):
     def __init__(
         self,
@@ -385,10 +389,11 @@ class FlashAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
+        if is_cross_attention:
+            # Cross-attention never takes Skip Softmax, so it never reads the request.
+            self._request_skip_softmax_threshold = _skip_softmax_off
 
     def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
-        if self.is_cross_attention:
-            return False, None
         params = get_request_skip_softmax_params()
         if params is None:
             return False, None
