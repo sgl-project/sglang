@@ -537,6 +537,26 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
+    def test_weight_cache_rejects_elastic_ep(self):
+        """Elastic EP moves and reloads expert weights in place,
+        which the weight cache shares with the daemon and other engines."""
+        for mode in ("client", "daemon"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(ValueError, "together with elastic EP"),
+            ):
+                handle_load_format(
+                    ServerArgs(
+                        model_path="dummy",
+                        weight_cache_mode=mode,
+                        elastic_ep_backend="mooncake",
+                    )
+                )
+        # Elastic EP without the weight cache resolves as before.
+        handle_load_format(
+            ServerArgs(model_path="dummy", elastic_ep_backend="mooncake")
+        )
+
     def test_eplb_recorder_mode_compatibility(self):
         def make_args(mode):
             return ServerArgs(

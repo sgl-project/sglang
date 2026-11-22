@@ -8,6 +8,7 @@ import torch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
+    CheckWeightsReqInput,
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
@@ -330,6 +331,15 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         override = get_parallel().override(tp_rank=0, tp_size=1)
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
+        # Stubbed, not published: a published config carries a parallel topology,
+        # which the partial tp_size overrides in these tests would contradict.
+        self.engine_config = SimpleNamespace(weight_cache_mode="off")
+        engine_config = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.get_model",
+            return_value=self.engine_config,
+        )
+        engine_config.start()
+        self.addCleanup(engine_config.stop)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -580,6 +590,29 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertIn("already open", output.message)
         target.weight_updater.begin_weight_update.assert_not_called()
 
+    def test_weight_cache_refuses_a_session_whatever_the_selector(self):
+        """The weight cache is engine-wide, so the refusal precedes runner selection;
+        a draft selector on such an engine selects no runner to ask."""
+        target = _runner()
+        manager = self._manager(target, session=False)
+        for mode in ("client", "daemon"):
+            self.engine_config.weight_cache_mode = mode
+            for selector in ("target", "draft", "all"):
+                with (
+                    self.subTest(mode=mode, selector=selector),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+                    ) as barrier,
+                ):
+                    output = manager.begin_weight_update(
+                        BeginWeightUpdateReqInput(selector=selector)
+                    )
+                    self.assertFalse(output.success)
+                    self.assertIn("--weight-cache-mode off", output.message)
+                    self.assertIsNone(manager._session)
+                    barrier.assert_not_called()
+        target.weight_updater.begin_weight_update.assert_not_called()
+
     def test_end_without_session_is_rejected(self):
         """Finalizing runners begin never restored would repack weights twice."""
         target = _runner()
@@ -775,6 +808,27 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class TestResetTensorsRefusal(_WeightUpdaterManagerTestBase):
+    def test_weight_cache_refuses_reset_tensors_whatever_the_selector(self):
+        """reset_tensors overwrites the model's tensors in place;
+        the read-only actions stay available on a weight-cache engine."""
+        target = _runner()
+        target.check_weights.return_value = None
+        manager = self._manager(target, session=False)
+        self.engine_config.weight_cache_mode = "client"
+        for selector in ("target", "draft", "all"):
+            with self.subTest(selector=selector):
+                output = manager.check_weights(
+                    CheckWeightsReqInput(action="reset_tensors", selector=selector)
+                )
+                self.assertFalse(output.success)
+                self.assertIn("--weight-cache-mode off", output.message)
+        target.check_weights.assert_not_called()
+
+        self.assertTrue(manager.check_weights(CheckWeightsReqInput()).success)
+        target.check_weights.assert_called_once()
 
 
 class TestRepeatedMemoryOccupationRequests(_WeightUpdaterManagerTestBase):

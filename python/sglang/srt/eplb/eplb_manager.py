@@ -63,9 +63,22 @@ class EPLBManager:
         if not get_global_expert_distribution_recorder().recording:
             get_global_expert_distribution_recorder().start_record()
 
-        logger.info(
-            f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
-        )
+        # Weight-cache weights are shared, and a rebalance moves expert rows in place;
+        # the other engines' expert locations would not follow.
+        self._weight_cache_mode = _weight_cache_mode()
+        if self._weight_cache_mode == "off":
+            logger.info(
+                f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
+            )
+        else:
+            logger.warning(
+                "[EPLBManager] rebalancing is disabled while the weight cache is "
+                f"active (--weight-cache-mode {self._weight_cache_mode}): expert "
+                "weights are shared with the daemon and every co-attached engine, "
+                "so moving them in place would corrupt them all. The initial "
+                "expert layout stays. Restart with --weight-cache-mode off to "
+                "rebalance."
+            )
 
         self._main_generator = self._entrypoint()
 
@@ -94,6 +107,12 @@ class EPLBManager:
             yield from self.rebalance()
 
     def rebalance(self):
+        # Not a _rebalance_disabled_reason: enable_rebalance() would clear it.
+        if self._weight_cache_mode != "off":
+            # The recorder keeps recording; only this periodic dump resets its window.
+            get_global_expert_distribution_recorder().dump_record(output_mode="object")
+            return
+
         if self._rebalance_disabled_reason is not None:
             if not self._rebalance_disabled_logged:
                 logger.debug(
@@ -351,3 +370,8 @@ def update_expert_location_with_recovery(
 def _chunk_list(items: List, chunk_size):
     for start_index in range(0, len(items), chunk_size):
         yield items[start_index : start_index + chunk_size]
+
+
+def _weight_cache_mode() -> str:
+    # Module level, since EPLBManager.__init__ shadows get_model with its argument.
+    return get_model().weight_cache_mode

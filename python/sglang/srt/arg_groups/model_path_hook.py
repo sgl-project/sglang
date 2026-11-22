@@ -286,6 +286,16 @@ def handle_load_format(server_args: Any):
             "(--weight-cache-mode off) for this configuration."
         )
 
+    # Same predicate as handle_elastic_ep, which sets up elastic EP for any value but None.
+    if cfg.weight_cache_mode != "off" and cfg.elastic_ep_backend is not None:
+        raise ValueError(
+            "--weight-cache-mode is not supported together with elastic EP "
+            "(--elastic-ep-backend): recovering or adding EP ranks moves and "
+            "reloads expert weights in place, and cached weights are shared "
+            "with the daemon and every co-attached engine. Disable one of them "
+            "(--weight-cache-mode off) for this configuration."
+        )
+
 
 def validate_transfer_engine(server_args: Any):
     cfg = resolving_view(server_args)
