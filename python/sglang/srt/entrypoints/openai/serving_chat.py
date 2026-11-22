@@ -477,9 +477,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
-        self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
-            OrderedDict()
-        )
+        # Each entry is [prompt ids, their decoded text or None]; the text is
+        # filled in by the first request that reads it.
+        self._chat_template_cache: OrderedDict[bytes, list] = OrderedDict()
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
         )
@@ -1183,9 +1183,8 @@ class OpenAIServingChat(OpenAIServingBase):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
 
-    def _can_reuse_text_only_prompt_ids(
-        self, processed_messages: MessageProcessingResult, is_multimodal: bool
-    ) -> bool:
+    def _reuses_text_only_prompt_ids(self, is_multimodal: bool) -> bool:
+        """The request-independent half of _can_reuse_text_only_prompt_ids."""
         # Moss-VL invokes its processor for text-only requests, and that processor
         # requires the rendered text rather than pre-tokenized ids.
         is_moss_vl = (
@@ -1199,6 +1198,28 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
             and not self._tokenizer_auto_adds_specials
+        )
+
+    def _sends_text_only_prompt_ids(self, is_multimodal: bool) -> bool:
+        """Whether a request with no media and a non-empty list of prompt ids
+        reaches the engine as those ids rather than as its prompt text.
+
+        _convert_to_internal_request sends them when
+        _can_reuse_text_only_prompt_ids allows it, and otherwise _engine_prompt
+        sends them when the text round trip is lossy (or the model is not
+        multimodal). For such requests the decoded prompt is never read.
+        """
+        return (
+            not is_multimodal
+            or self._prompt_text_round_trip_is_lossy
+            or self._reuses_text_only_prompt_ids(is_multimodal)
+        )
+
+    def _can_reuse_text_only_prompt_ids(
+        self, processed_messages: MessageProcessingResult, is_multimodal: bool
+    ) -> bool:
+        return (
+            self._reuses_text_only_prompt_ids(is_multimodal)
             and isinstance(processed_messages.prompt_ids, list)
             and bool(processed_messages.prompt_ids)
             and not processed_messages.image_data
@@ -1261,7 +1282,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = self._process_messages(
+            request, is_multimodal, reuse_prompt_ids=True
+        )
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1738,8 +1761,14 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
         *,
         output_constrained: bool = False,
+        reuse_prompt_ids: bool = False,
     ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template"""
+        """Process chat messages and apply chat template
+
+        ``reuse_prompt_ids``: the caller sends ``prompt_ids`` to the engine
+        whenever ``_sends_text_only_prompt_ids`` says so, so ``prompt`` is left
+        empty for those requests.
+        """
         if self.is_minimax_m3:
             # Settle the request's own thinking and effort first; server defaults
             # only fill what it left unset.
@@ -1907,7 +1936,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = self._apply_jinja_template(
+                request, tools, is_multimodal, reuse_prompt_ids=reuse_prompt_ids
+            )
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
@@ -1965,6 +1996,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         tools: list[dict] | None,
         is_multimodal: bool,
+        *,
+        reuse_prompt_ids: bool = False,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
@@ -2145,6 +2178,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
+            # Prompt ids that go to the engine as they are are never read back
+            # as text, so a request without media skips decoding them.
+            reuses_prompt_ids = (
+                reuse_prompt_ids
+                and self._sends_text_only_prompt_ids(is_multimodal)
+                and not (image_data or video_data or audio_data or modalities)
+            )
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
@@ -2153,6 +2193,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
                     add_generation_prompt=add_generation_prompt is not False,
+                    decode_prompt=not reuses_prompt_ids,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -2170,6 +2211,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
                         add_generation_prompt=add_generation_prompt is not False,
+                        decode_prompt=not reuses_prompt_ids,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -2185,7 +2227,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
 
-            if is_multimodal:
+            if is_multimodal and not (
+                reuses_prompt_ids and isinstance(prompt_ids, list) and prompt_ids
+            ):
                 prompt = (
                     decoded_prompt
                     if decoded_prompt is not None
@@ -2216,7 +2260,10 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
         add_generation_prompt: bool = True,
+        decode_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
+        """Return the prompt ids and, with ``use_cache``, the text they decode
+        to; ``decode_prompt=False`` returns that text only if it is cached."""
         cache_key = None
         if use_cache:
             try:
@@ -2242,8 +2289,12 @@ class OpenAIServingChat(OpenAIServingBase):
             cached = self._chat_template_cache.get(cache_key)
             if cached is not None:
                 self._chat_template_cache.move_to_end(cache_key)
-                prompt_ids, decoded_prompt = cached
-                return list(prompt_ids), decoded_prompt
+                prompt_ids = list(cached[0])
+                decoded_prompt = cached[1]
+                if decoded_prompt is None and decode_prompt:
+                    decoded_prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                    cached[1] = decoded_prompt
+                return prompt_ids, decoded_prompt
 
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
@@ -2284,12 +2335,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
+            if cache_key is not None and decode_prompt
             else None
         )
 
         if cache_key is not None:
-            self._chat_template_cache[cache_key] = (tuple(prompt_ids), decoded_prompt)
+            self._chat_template_cache[cache_key] = [tuple(prompt_ids), decoded_prompt]
             if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
                 self._chat_template_cache.popitem(last=False)
 
