@@ -58,7 +58,9 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             num_matched_prefix_tokens=20,
             cache_request_handle=CacheRequestHandle("waiting", 0),
         )
-        chunked_req = SimpleNamespace(seqlen=50, prefix_len=10)
+        chunked_req = SimpleNamespace(
+            seqlen=50, prefix_len=10, kv=SimpleNamespace(kv_allocated_len=10)
+        )
         return SchedulerLoadInquirer(
             disaggregation_mode=disaggregation_mode,
             server_args=None,
@@ -118,13 +120,14 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                     CacheRequestHandle("waiting", 0)
                 )
 
-    def test_decode_loads_count_prealloc_requests_waiting_for_input(self):
-        """A preallocated request whose input has arrived is ready, with its tokens."""
+    def decode_loads(self, host_pool_blocked=False, input_arrived=True):
         ready, pending = FakeReq(seqlen=30), FakeReq(seqlen=70)
         prealloc = decode_queue(
             ListKind.PD_PREALLOC,
             [
-                DecodeRequest(req=ready, kv_receiver=None, waiting_for_input=True),
+                DecodeRequest(
+                    req=ready, kv_receiver=None, waiting_for_input=input_arrived
+                ),
                 DecodeRequest(req=pending, kv_receiver=None),
             ],
         )
@@ -138,7 +141,11 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             get_running_batch=lambda: SimpleNamespace(reqs=[]),
             get_stats=SchedulerStats,
-            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(queue=prealloc),
+            get_disagg_decode_prealloc_queue=lambda: SimpleNamespace(
+                queue=prealloc,
+                host_pool_blocked=host_pool_blocked,
+                transfer_queue=SimpleNamespace(num_host_staged_landed=2),
+            ),
             get_request_lists=lambda: {
                 ListKind.WAITING: [],
                 ListKind.PD_PREALLOC: prealloc,
@@ -156,11 +163,80 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             ),
             patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
         ):
-            loads = inquirer.get_loads()
+            return inquirer.get_loads()
 
+    def test_decode_loads_count_prealloc_requests_waiting_for_input(self):
+        """A preallocated request whose input has arrived is ready, with its tokens."""
+        loads = self.decode_loads()
         self.assertEqual(loads.disaggregation.decode_prealloc_queue_reqs, 2)
         self.assertEqual(loads.queues.prealloc_ready, 1)
         self.assertEqual(loads.num_prealloc_ready_tokens, 30)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 0)
+        self.assertEqual(loads.disaggregation.decode_host_staged_landed_reqs, 2)
+
+    def test_decode_loads_report_a_full_host_pool_holding_a_ready_request(self):
+        loads = self.decode_loads(host_pool_blocked=True)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 1)
+
+    def test_decode_loads_report_no_host_pool_block_without_a_ready_request(self):
+        """A block from the last admission pass is not reported once nothing is ready."""
+        loads = self.decode_loads(host_pool_blocked=True, input_arrived=False)
+        self.assertEqual(loads.queues.prealloc_ready, 0)
+        self.assertEqual(loads.disaggregation.decode_host_pool_blocked, 0)
+
+    def get_loads_with_used_tokens(self, inquirer, num_used_tokens):
+        inquirer = replace(
+            inquirer,
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_kv_token_stats=lambda: (num_used_tokens, 0.0)
+                )
+            ),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_stats=SchedulerStats,
+            get_request_lists=lambda: {},
+            get_total_prefill_uncached_tokens=lambda: 0,
+            get_total_prefill_busy_us=lambda: 0,
+            get_decode_moment_totals=lambda: (0,),
+        )
+        module = "sglang.srt.managers.scheduler_components.load_inquirer"
+        with (
+            patch(
+                f"{module}.get_lora", return_value=SimpleNamespace(enable_lora=False)
+            ),
+            patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
+        ):
+            return inquirer.get_loads()
+
+    def test_total_tokens_count_the_rest_of_a_chunked_prefill(self):
+        """The unprefilled part of the chunked request counts toward the DP load."""
+        loads = self.get_loads_with_used_tokens(self.make_inquirer(), 200)
+
+        # 200 KV tokens in use + 100 waiting + (50 - 10) still to prefill.
+        self.assertEqual(loads.num_total_tokens, 340)
+        self.assertEqual(loads.num_active_tokens, 340)
+
+    def test_total_tokens_count_a_just_run_chunk_once(self):
+        """A chunk already allocated in the KV pool is not counted again as unprefilled,
+        though prefix_len only reaches it on the next scheduling pass."""
+        chunked_req = SimpleNamespace(
+            seqlen=16384, prefix_len=0, kv=SimpleNamespace(kv_allocated_len=4096)
+        )
+        inquirer = replace(
+            self.make_inquirer(),
+            get_waiting_queue=lambda: [],
+            get_chunked_req=lambda: chunked_req,
+        )
+        loads = self.get_loads_with_used_tokens(inquirer, 4096)
+
+        self.assertEqual(loads.num_total_tokens, 16384)
+
+    def test_total_tokens_without_a_chunked_prefill(self):
+        inquirer = replace(self.make_inquirer(), get_chunked_req=lambda: None)
+        loads = self.get_loads_with_used_tokens(inquirer, 200)
+
+        self.assertEqual(loads.num_total_tokens, 300)
 
     def test_storage_exclusion_requires_per_request_matching(self):
         for prefix_matched, expected in ((True, 60), (False, 65)):
