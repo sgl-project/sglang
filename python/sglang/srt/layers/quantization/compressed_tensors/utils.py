@@ -9,6 +9,8 @@ from typing import Iterable, List, Mapping, Optional
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
+from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
+
 
 def is_activation_quantization_format(format: str) -> bool:
     _ACTIVATION_QUANTIZATION_FORMATS = [
@@ -39,9 +41,15 @@ def should_ignore_layer(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping and layer_name not in ignore:
-        shard_proj_names = fused_mapping[proj_name]
+    shard_proj_names = fused_mapping.get(proj_name)
+    if shard_proj_names is None and not check_equal_or_regex_match(
+        layer_name=layer_name, targets=ignore
+    ):
+        # No model mapping: fall back to the known shard names. A direct match
+        # wins, since some checkpoints store a real qkv_proj / gate_up_proj.
+        shard_proj_names = _FALLBACK_FUSED_SHARDS.get(proj_name)
 
+    if shard_proj_names is not None and layer_name not in ignore:
         # Convert fused_name --> [shard_names]
         shard_names = [
             layer_name.replace(proj_name, shard_proj_name)

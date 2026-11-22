@@ -404,5 +404,99 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.group_size, 128)
 
 
+# Layer-0 excerpt of cyankiwi/GLM-4.5-Air-AWQ-4bit's ignore list. Glm4Moe declares
+# no packed_modules_mapping; AFMoE and DeepSeek-V3 AWQ repos use the same names.
+GLM_IGNORE = [
+    "model.layers.0.self_attn.q_proj",
+    "model.layers.0.self_attn.k_proj",
+    "model.layers.0.self_attn.v_proj",
+    "model.layers.0.self_attn.o_proj",
+    "model.layers.0.mlp.gate_proj",
+    "model.layers.0.mlp.up_proj",
+    "model.layers.0.mlp.down_proj",
+]
+
+# Layer-0/2 excerpt of cyankiwi/LFM2-8B-A1B-AWQ-4bit's ignore list.
+LFM2_IGNORE = [
+    "model.layers.0.conv.in_proj",
+    "model.layers.0.feed_forward.w1",
+    "model.layers.0.feed_forward.w3",
+    "model.layers.0.feed_forward.w2",
+    "model.layers.2.self_attn.q_proj",
+    "model.layers.2.self_attn.k_proj",
+    "model.layers.2.self_attn.v_proj",
+    "model.layers.2.self_attn.out_proj",
+]
+
+
+class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
+    """Ignore lists name unfused shards even when the model declares no mapping."""
+
+    def test_fused_layers_follow_their_ignored_shards(self):
+        """qkv_proj / gate_up_proj are ignored exactly when all their shards are."""
+        for name in ("self_attn.qkv_proj", "mlp.gate_up_proj"):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    should_ignore_layer(f"model.layers.0.{name}", ignore=GLM_IGNORE)
+                )
+                self.assertFalse(
+                    should_ignore_layer(f"model.layers.1.{name}", ignore=GLM_IGNORE)
+                )
+
+    def test_direct_match_on_a_real_fused_tensor_wins(self):
+        """A checkpoint that stores a real qkv_proj tensor can ignore it by name."""
+        for ignore in (
+            ["model.layers.0.self_attn.qkv_proj"],
+            ["re:.*self_attn\\.qkv_proj$"],
+        ):
+            with self.subTest(ignore=ignore):
+                self.assertTrue(
+                    should_ignore_layer(
+                        "model.layers.0.self_attn.qkv_proj", ignore=ignore
+                    )
+                )
+
+    def test_partially_ignored_fused_layer_raises(self):
+        """Ignoring only some shards of a fused layer is rejected, not half-loaded."""
+        with self.assertRaisesRegex(ValueError, "same scheme"):
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj", ignore=GLM_IGNORE[:2]
+            )
+
+    def test_lfm2_moe_ignore_list_reaches_its_dense_layers(self):
+        """LFM2-MoE's w1/w3/w2 names leave its ignored dense layers unquantized."""
+        from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
+
+        quant_config = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {"group_0": {**WNA16_GROUP, "targets": ["Linear"]}},
+                "ignore": LFM2_IGNORE,
+            }
+        )
+        quant_config.update_packed_modules_mapping(
+            Lfm2MoeForCausalLM.packed_modules_mapping
+        )
+        quant_config.apply_weight_name_mapper(Lfm2MoeForCausalLM.hf_to_sglang_mapper)
+
+        def scheme(name):
+            return quant_config.get_scheme_dict(torch.nn.Linear(1, 1), name)
+
+        for name in (
+            "model.layers.0.feed_forward.gate_up_proj",
+            "model.layers.0.feed_forward.down_proj",
+            "model.layers.2.self_attn.qkv_proj",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(scheme(name))
+        for name in (
+            "model.layers.1.feed_forward.gate_up_proj",
+            "model.layers.6.self_attn.qkv_proj",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNotNone(scheme(name))
+
+
 if __name__ == "__main__":
     unittest.main()
