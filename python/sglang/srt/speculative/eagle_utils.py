@@ -75,10 +75,6 @@ _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
-# The binding defaults probe this explicit capability once instead of relying on
-# exception handling in the hot path.  Runtime itself remains independent of the
-# optional binding contract.
-LOCAL_KEYS_SUPPORTED = True
 LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
 _provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
 _ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
@@ -887,10 +883,7 @@ def eagle_sample(
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     device = batch.device
-    is_idle = getattr(batch, "is_idle", None)
-    if is_idle is None:
-        is_idle = batch.forward_mode.is_idle()
-    if is_idle:
+    if batch.forward_mode.is_idle():
         predict = torch.empty(0, dtype=torch.int32, device=device)
         num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
         accept_index = torch.empty(0, dtype=torch.int32, device=device)

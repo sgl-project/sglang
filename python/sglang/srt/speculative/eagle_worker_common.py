@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from importlib import import_module
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -17,7 +16,15 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_verify_commit_outputs,
 )
 from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    PostVerifyIO,
+    VerifySamplingView,
+    VerifyTreeView,
+)
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.speculative_runtime import (
+    default_speculative_runtime_hooks,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -50,63 +57,7 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
-_PostVerifyIO = getattr(_provider_spec, "PostVerifyIO", None)
-_VerifySamplingView = getattr(_provider_spec, "VerifySamplingView", None)
-_VerifyTreeView = getattr(_provider_spec, "VerifyTreeView", None)
-
-
-def _fallback_post_verify(io: Any) -> Any:
-    """Runtime-owned stock verifier when no binding defines runtime hooks."""
-    from sglang.srt.speculative.eagle_utils import eagle_sample
-
-    token_ids, accepted_lengths, accepted_indices = eagle_sample(
-        io.verify_tree,
-        io,
-        io.logits,
-        io.grammar_mask,
-        uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark=io.watermark,
-        simulated_acc_len=io.simulated_accept_length,
-        simulated_acc_len_rng=io.simulated_accept_length_rng,
-        sparse_bonus_argmax=io.sparse_bonus_argmax,
-        local_keys=None,
-    )
-    return SimpleNamespace(
-        token_ids=token_ids,
-        accepted_lengths=accepted_lengths,
-        accepted_indices=accepted_indices,
-    )
-
-
-class _FallbackPostVerifyStrategy:
-    # Structural match for the optional binding contract.  ``None`` means the
-    # runtime's native greedy key producer, not a provider decline.
-    local_keys = None
-
-    def __call__(self, io: Any) -> Any:
-        return _fallback_post_verify(io)
-
-
-class _FallbackRuntimeHooks:
-    post_verify = _FallbackPostVerifyStrategy()
-
-
-def stock_speculative_runtime_hooks() -> Any:
-    """The always-callable verification bundle used before binding."""
-    try:
-        from sglang.srt.kernel_plugins.nvidia.speculative_runtime import (
-            default_speculative_runtime_hooks,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name != "sglang.srt.kernel_plugins.nvidia.speculative_runtime":
-            raise
-        return _FallbackRuntimeHooks()
-
-    return default_speculative_runtime_hooks()
-
-
-STOCK_SPECULATIVE_RUNTIME_HOOKS = stock_speculative_runtime_hooks()
+STOCK_SPECULATIVE_RUNTIME_HOOKS = default_speculative_runtime_hooks()
 
 
 _SHARDED_VERIFY_TARGET_MODEL_CLASSES = frozenset(
@@ -181,36 +132,11 @@ def make_post_verify_io(
     simulated_accept_length_rng: Optional[torch.Generator] = None,
     sparse_target_max_top_k: Optional[int] = None,
     sparse_bonus_argmax: bool = False,
-) -> Any:
+) -> PostVerifyIO:
     """Build the immutable, borrowed view shared by eager and captured verify."""
-    if _PostVerifyIO is None:
-        # Without the provider ABI the view is passed to eagle_sample as its
-        # batch, so it also carries the batch field names eagle_sample reads.
-        return SimpleNamespace(
-            logits=logits_output,
-            verify_tree=verify_input,
-            sampling=sampling_info,
-            sampling_info=sampling_info,
-            grammar_mask=grammar_mask,
-            watermark=watermark,
-            watermark_full_mask=watermark_full_mask,
-            request_pool_indices=request_pool_indices,
-            req_pool_indices=request_pool_indices,
-            sequence_lengths=sequence_lengths,
-            seq_lens=sequence_lengths,
-            return_logprob=return_logprob,
-            is_idle=is_idle,
-            forward_mode=SimpleNamespace(is_idle=lambda: is_idle),
-            device=torch.device(device),
-            simulated_accept_length=simulated_accept_length,
-            simulated_accept_length_rng=simulated_accept_length_rng,
-            sparse_target_max_top_k=sparse_target_max_top_k,
-            sparse_bonus_argmax=sparse_bonus_argmax,
-        )
-
-    return _PostVerifyIO(
+    return PostVerifyIO(
         logits=logits_output,
-        verify_tree=_VerifyTreeView(
+        verify_tree=VerifyTreeView(
             draft_tokens=verify_input.draft_token,
             draft_probabilities=getattr(verify_input, "draft_probs", None),
             retrieve_index=verify_input.retrieve_index,
@@ -222,7 +148,7 @@ def make_post_verify_io(
             max_depth=verify_input.max_tree_depth,
             topk=verify_input.tree_topk,
         ),
-        sampling=_VerifySamplingView(
+        sampling=VerifySamplingView(
             sequence_lengths=sequence_lengths,
             temperatures=sampling_info.temperatures,
             top_ks=sampling_info.top_ks,

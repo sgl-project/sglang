@@ -79,21 +79,17 @@ def default_post_verify(
         req_pool_indices=io.req_pool_indices,
         return_logprob=io.return_logprob,
     )
-    kwargs = dict(
-        uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark=io.watermark,
-        simulated_acc_len=io.simulated_accept_length,
-        simulated_acc_len_rng=io.simulated_accept_length_rng,
-        sparse_bonus_argmax=io.sparse_bonus_argmax,
-    )
-    if getattr(eagle_utils, "LOCAL_KEYS_SUPPORTED", False):
-        kwargs["local_keys"] = local_keys
     token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
         io.verify_tree,
         batch,
         io.logits,
         io.grammar_mask,
-        **kwargs,
+        uno_target_max_top_k=io.sparse_target_max_top_k,
+        watermark=io.watermark,
+        simulated_acc_len=io.simulated_accept_length,
+        simulated_acc_len_rng=io.simulated_accept_length_rng,
+        sparse_bonus_argmax=io.sparse_bonus_argmax,
+        local_keys=local_keys,
     )
     return PostVerifyOutput(
         token_ids=token_ids,

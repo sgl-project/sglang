@@ -951,18 +951,15 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             torch.tensor([0]),
             torch.tensor([0]),
         )
-        with (
-            patch(
-                "sglang.srt.speculative.eagle_utils.LOCAL_KEYS_SUPPORTED",
-                False,
-                create=True,
-            ),
-            patch(
-                "sglang.srt.speculative.eagle_utils.eagle_sample",
-                return_value=expected,
-            ) as sample,
-        ):
-            output = speculative_runtime.default_post_verify(io, lambda view: None)
+
+        def local_keys(view):
+            return None
+
+        with patch(
+            "sglang.srt.speculative.eagle_utils.eagle_sample",
+            return_value=expected,
+        ) as sample:
+            output = speculative_runtime.default_post_verify(io, local_keys)
         self.assertEqual(
             sample.call_args.kwargs,
             {
@@ -971,6 +968,7 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
                 "simulated_acc_len": None,
                 "simulated_acc_len_rng": None,
                 "sparse_bonus_argmax": False,
+                "local_keys": local_keys,
             },
         )
         self.assertTrue(torch.equal(output.token_ids, expected[0]))
