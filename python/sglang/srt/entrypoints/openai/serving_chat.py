@@ -1875,6 +1875,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 request, parser, answer_json_schema, thinking_mode=answer_thinking
             )
             tool_call_constraint_covers_answer = tool_call_constraint is not None
+            # Unseparated reasoning reaches the tool parser ahead of the calls.
+            request._response_parser_answer_excludes_calls = (
+                tool_call_constraint_covers_answer
+                and (request.separate_reasoning or not self.reasoning_parser)
+            )
             request._response_parser_thinking_end = (
                 GlmSpecialTokenConfig().end_of_thinking
                 if tool_call_constraint_covers_answer
@@ -3139,6 +3144,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                     thinking_end=request._response_parser_thinking_end,
                     keep_thinking_before_calls=not request.separate_reasoning,
+                    answer_excludes_calls=(
+                        request._response_parser_answer_excludes_calls
+                    ),
                     response_unwrapped=response_unwrapped,
                 )
 
@@ -3357,6 +3365,7 @@ class OpenAIServingChat(OpenAIServingBase):
         *,
         thinking_end: str = "",
         keep_thinking_before_calls: bool = False,
+        answer_excludes_calls: bool = False,
         response_unwrapped: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
@@ -3376,13 +3385,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 constrained=constrained,
                 thinking_end=thinking_end,
                 keep_thinking_before_calls=keep_thinking_before_calls,
+                answer_excludes_calls=answer_excludes_calls,
             )
-            text = parser.strip_thinking(text)
+            answers = parser.answers_without_calls(text)
+            thinking, text = parser.split_thinking(text)
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
-            if should_try_parser and parser.has_tool_call(text):
+            if should_try_parser and not answers and parser.has_tool_call(text):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    text, thinking = thinking + text, ""
                     if not call_info_list:
                         logger.warning(
                             "Tool call marker present but no complete call parsed "
@@ -3419,7 +3431,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    return ToolCallProcessingResult(None, text, finish_reason)
+                    return ToolCallProcessingResult(
+                        None, thinking + text, finish_reason
+                    )
+            text = thinking + text
 
             if is_required and detector_owns_format:
                 logger.warning(
@@ -3878,6 +3893,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     constrained=constrained,
                     thinking_end=request._response_parser_thinking_end,
                     keep_thinking_before_calls=not request.separate_reasoning,
+                    answer_excludes_calls=(
+                        request._response_parser_answer_excludes_calls
+                    ),
                 )
 
         parser = parser_dict[index]

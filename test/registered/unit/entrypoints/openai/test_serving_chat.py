@@ -3116,6 +3116,10 @@ class ServingChatTestCase(CustomTestCase):
                 ("", '{"word": "a</think>b"}', []),
             ),
             (
+                self._stopped_on_token('Plan.</think>{"word": "<tool_call>"}', 1),
+                ("", '{"word": "<tool_call>"}', []),
+            ),
+            (
                 self._stopped_on_token("Plan.</think>" + call, 1),
                 ("", "", [("read_file", {"path": "note.txt"})]),
             ),
@@ -3154,6 +3158,18 @@ class ServingChatTestCase(CustomTestCase):
                 self._stopped_on_token('Plan.</think>{"word": "hi"}', 1),
                 ("", '{"word": "hi"}', []),
             ),
+            (
+                self._stopped_on_token('Plan.</think>{"word": "<tool_call>"}', 1),
+                ("", '{"word": "<tool_call>"}', []),
+            ),
+            (
+                self._stopped_on_token("I may <tool_call> later.</think>" + call, 1),
+                (
+                    "",
+                    "I may <tool_call> later.</think>",
+                    [("read_file", {"path": "note.txt"})],
+                ),
+            ),
             (cut_off, ("", "Plan the", [])),
         )
         modes = ((False, False), (True, False), (True, True))
@@ -3182,14 +3198,43 @@ class ServingChatTestCase(CustomTestCase):
         )
         streamed += parser.parse_stream_end()[0]
         self.assertTrue(streamed.startswith("Plan.</think>"), streamed)
-        # A marker quoted in the answer does not make it a tool-call turn.
-        served = self._served(
-            self._stopped_on_token('Plan.</think>{"word": "<tool_call>"}', 1),
-            False,
-            separate_reasoning=False,
-            **self._json_answer_fields(),
+
+    def test_glm_json_answer_with_reasoning_parser_parses_calls_by_turn(self):
+        """With --reasoning-parser glm45, a JSON answer quoting the call marker
+        stays an answer, streamed or not, while unseparated reasoning ahead of
+        a call does not hide the call."""
+        self.chat.tool_call_parser = "glm47"
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
         )
-        self.assertEqual(served, ("", '{"word": "<tool_call>"}', []))
+        call = (
+            "<tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>note.txt</arg_value></tool_call>"
+        )
+        cases = (
+            (
+                'Plan.</think>{"word": "<tool_call>"}',
+                True,
+                ("Plan.", '{"word": "<tool_call>"}', []),
+            ),
+            (
+                "Plan.</think>" + call,
+                False,
+                ("", "Plan.</think>", [("read_file", {"path": "note.txt"})]),
+            ),
+        )
+        for text, separate, expected in cases:
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(text=text, stream=stream, incremental=incremental):
+                    served = self._served(
+                        self._stopped_on_token(text, 1),
+                        stream,
+                        incremental=incremental,
+                        separate_reasoning=separate,
+                        **self._json_answer_fields(),
+                    )
+                    self.assertEqual(served, expected)
 
     def test_kimi_k3_json_answer_content_matches_streaming(self):
         """A Kimi-K3 answer loses only its response-channel markers: unseparated
@@ -4048,6 +4093,8 @@ class ServingChatTestCase(CustomTestCase):
             call_info2.tool_index = 1
 
             parser_instance.has_tool_call.return_value = True
+            parser_instance.answers_without_calls.return_value = False
+            parser_instance.split_thinking.side_effect = lambda text: ("", text)
             parser_instance.parse_non_stream.return_value = (
                 "",
                 [call_info, call_info2],
@@ -4105,6 +4152,8 @@ class ServingChatTestCase(CustomTestCase):
                 call_info.tool_index = 0
                 calls.append(call_info)
             parser_instance.has_tool_call.return_value = True
+            parser_instance.answers_without_calls.return_value = False
+            parser_instance.split_thinking.side_effect = lambda text: ("", text)
             parser_instance.parse_non_stream.return_value = ("", calls)
 
             tool_calls, _, finish_reason = self.chat._process_tool_calls(
@@ -6639,6 +6688,8 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
 
             parser_instance = ParserMock.return_value
             parser_instance.has_tool_call.return_value = True
+            parser_instance.answers_without_calls.return_value = False
+            parser_instance.split_thinking.side_effect = lambda text: ("", text)
             parser_instance.parse_non_stream.return_value = ("", [call_info])
 
             finish_reason = {"type": "stop", "matched": None}
@@ -6662,6 +6713,8 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         ) as ParserMock:
             parser_instance = ParserMock.return_value
             parser_instance.has_tool_call.return_value = True
+            parser_instance.answers_without_calls.return_value = False
+            parser_instance.split_thinking.side_effect = lambda text: ("", text)
             parser_instance.detector.supports_structural_tag.return_value = True
             parser_instance.parse_non_stream.return_value = ("Visible prefix.", [])
 

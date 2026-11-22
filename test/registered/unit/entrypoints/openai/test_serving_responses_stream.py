@@ -699,17 +699,30 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
     def test_json_answer_without_reasoning_parser_matches_full_and_streamed(self):
         """Without a reasoning parser, GLM's leading thinking block and the
-        Kimi-K3 response markers stay out of a JSON answer, streamed or not."""
+        Kimi-K3 response markers stay out of a JSON answer, streamed or not,
+        and a quoted call marker does not turn the answer into a call."""
         cases = (
-            ("glm47", "</think>", 'Plan.</think>{"word": "a</think>b"}'),
+            (
+                "glm47",
+                "</think>",
+                'Plan.</think>{"word": "a</think>b"}',
+                '{"word": "a</think>b"}',
+            ),
+            (
+                "glm47",
+                "</think>",
+                'Plan.</think>{"word": "<tool_call>"}',
+                '{"word": "<tool_call>"}',
+            ),
             (
                 "kimi_k3",
                 "",
                 '{"word": "a</think>b"}<|close|>response<|sep|><|close|>message<|sep|>',
+                '{"word": "a</think>b"}',
             ),
         )
-        for parser_name, thinking_end, raw in cases:
-            with self.subTest(parser=parser_name):
+        for parser_name, thinking_end, raw, answer in cases:
+            with self.subTest(parser=parser_name, raw=raw):
                 serving = make_serving()
                 serving.reasoning_parser = None
                 serving.tool_call_parser = parser_name
@@ -741,9 +754,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                 )
                 (stream_item,) = find_completed_event(events)["response"]["output"]
                 for item in (full_item.model_dump(), stream_item):
-                    self.assertEqual(
-                        item["content"][0]["text"], '{"word": "a</think>b"}'
-                    )
+                    self.assertEqual(item["content"][0]["text"], answer)
 
     def test_final_output_preserves_text_tool_text_order(self):
         from sglang.srt.function_call.core_types import (

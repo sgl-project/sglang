@@ -580,6 +580,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
 
         def fake_process(chat_request, is_multimodal, **_):
             chat_request._response_parser_thinking_end = "</think>"
+            chat_request._response_parser_answer_excludes_calls = True
             return MessageProcessingResult(
                 prompt="prompt",
                 prompt_ids=[1, 2, 3],
@@ -598,6 +599,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         )
 
         self.assertEqual(request._response_parser_thinking_end, "</think>")
+        self.assertTrue(request._response_parser_answer_excludes_calls)
 
     def test_harmony_forced_choices_explain_missing_routing_constraints(self):
         serving = make_serving()
@@ -1507,6 +1509,7 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
+            instance.answers_without_calls.return_value = False
             instance.parse_non_stream.return_value = ("trailing text", [fake_call])
             output_items = serving._make_response_output_items(
                 self._function_tool_request(),
@@ -1539,6 +1542,7 @@ class OutputItemsTestCase(CustomTestCase):
         ) as parser_cls:
             instance = parser_cls.return_value
             instance.has_tool_call.return_value = True
+            instance.answers_without_calls.return_value = False
             instance.parse_non_stream.return_value = (
                 "I'll check the weather.",
                 [fake_call],

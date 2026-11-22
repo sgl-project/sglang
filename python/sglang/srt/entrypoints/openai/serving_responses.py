@@ -793,6 +793,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request._response_parser_thinking_end = (
             chat_request._response_parser_thinking_end
         )
+        request._response_parser_answer_excludes_calls = (
+            chat_request._response_parser_answer_excludes_calls
+        )
 
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
@@ -1227,11 +1230,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_grammar_start,
                 ),
                 thinking_end=request._response_parser_thinking_end,
+                answer_excludes_calls=request._response_parser_answer_excludes_calls,
             )
+            answers = parser.answers_without_calls(content)
             content = parser.strip_thinking(content)
             detector_owns_format = self._tool_parser_owns_format(parser)
             should_try_native = not is_required or detector_owns_format
-            if should_try_native and parser.has_tool_call(content):
+            if should_try_native and not answers and parser.has_tool_call(content):
                 try:
                     content, calls = parser.parse_non_stream(
                         content, preserve_incomplete=True
@@ -2362,6 +2367,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request._response_parser_grammar_start,
                 ),
                 thinking_end=request._response_parser_thinking_end,
+                answer_excludes_calls=request._response_parser_answer_excludes_calls,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:

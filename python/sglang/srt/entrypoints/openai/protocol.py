@@ -981,6 +981,8 @@ class ChatCompletionRequest(PDRoutingFields):
     # Ends the thinking block that the tool-call grammar opens the output with
     # and that no reasoning parser takes out of the content.
     _response_parser_thinking_end: str = PrivateAttr(default="")
+    # The grammar lets a turn either open with tool calls or answer without any.
+    _response_parser_answer_excludes_calls: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
@@ -2075,6 +2077,7 @@ class ResponsesRequest(PDRoutingFields):
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _response_parser_thinking_end: str = PrivateAttr(default="")
+    _response_parser_answer_excludes_calls: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
