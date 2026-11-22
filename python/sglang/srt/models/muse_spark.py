@@ -68,6 +68,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import MuseSpark1xBf16Experts
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
@@ -916,8 +917,8 @@ class MuseSpark1xMoE(nn.Module):
                 self.experts.post_expert_norm,
             )
         if self.sp_dispatcher is None:
-            raise RuntimeError(
-                "Muse Spark SP prefill requires an initialized FlashInfer A2A dispatcher."
+            return self._forward_sp_gathered_experts(
+                expert_input, topk_scores, topk_ids
             )
         dispatch_output = self.sp_dispatcher.dispatch(
             expert_input, StandardTopKOutput(topk_scores, topk_ids, router_logits)
@@ -926,6 +927,25 @@ class MuseSpark1xMoE(nn.Module):
             dispatch_output, self.experts.post_expert_norm
         )
         return self.sp_dispatcher.combine(combine_input)
+
+    def _forward_sp_gathered_experts(
+        self,
+        expert_input: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run this rank's experts on every token, as the replicated path does,
+        then reduce-scatter the partial sums back to this rank's rows."""
+        topk_scores, topk_ids = layernorm_sp.all_gather_topk_rows(
+            topk_weights=topk_scores, topk_ids=topk_ids
+        )
+        output = self.experts(
+            layernorm_sp.all_gather_token_rows(expert_input),
+            topk_scores,
+            topk_ids,
+            self.experts.post_expert_norm,
+        )
+        return layernorm_sp.reduce_scatter_token_rows(output)
 
 
 class MuseSpark1xDecoderLayer(nn.Module):
@@ -1181,8 +1201,14 @@ class MuseSpark1xModel(nn.Module):
                 for linear in linears:
                     linear._sp_use_cutlass = True
             moe_layers = [layer.mlp for layer in self.layers if layer.is_moe_layer]
-            if moe_layers and not getattr(
-                get_parallel(), "enable_megamoe_for_layernorm_sp", False
+            # With --moe-a2a-backend none, each rank runs its experts on the
+            # all-gathered tokens instead (_forward_sp_gathered_experts).
+            if (
+                moe_layers
+                and get_moe_a2a_backend().is_flashinfer()
+                and not getattr(
+                    get_parallel(), "enable_megamoe_for_layernorm_sp", False
+                )
             ):
                 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
                     FlashinferDispatcher,

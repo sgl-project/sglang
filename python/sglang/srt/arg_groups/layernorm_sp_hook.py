@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
-from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,9 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
         attn_dp_enabled=attn_dp_enabled_of(cfg),
         speculative_algorithm=cfg.speculative_algorithm,
         enable_megamoe_for_layernorm_sp=use_megamoe,
+        cuda_sm=_muse_marlin_cuda_sm(
+            architecture=architecture, moe_runner_backend=cfg.moe_runner_backend
+        ),
     )
     if architectures and architectures[0] in ("MuseSparkForConditionalGeneration",):
         from sglang.srt.environ import envs
@@ -122,6 +125,19 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
     )
 
 
+def _muse_marlin_cuda_sm(
+    *, architecture: Optional[str], moe_runner_backend: str
+) -> Optional[int]:
+    from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
+
+    if moe_runner_backend != "marlin" or not is_muse_spark_architecture(architecture):
+        return None
+    # Only this gate reads the device, and device_sm answers from NVML, so the
+    # launcher does not initialize CUDA before it forks.
+    platform = get_platform()
+    return platform.device_sm if platform.is_cuda else None
+
+
 def validate_layernorm_sp_min_tokens(
     *, min_tokens: int, prefill_backend, prefill_bs
 ) -> None:
@@ -161,6 +177,7 @@ def validate_layernorm_sp(
     moe_a2a_backend: str = "none",
     moe_runner_backend: str = "auto",
     enable_megamoe_for_layernorm_sp: bool = False,
+    cuda_sm: Optional[int] = None,
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
@@ -213,22 +230,12 @@ def validate_layernorm_sp(
                 "weights with --quantization modelopt_fp4, or BF16 weights with "
                 "--enable-megamoe-for-layernorm-sp."
             )
-        if enable_megamoe_for_layernorm_sp:
-            if moe_a2a_backend not in ("none", "flashinfer_nvlink_one_sided"):
-                raise ValueError(
-                    "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer_nvlink_one_sided; "
-                    "MegaMoE performs its own dispatch/combine and decode uses all-reduce."
-                )
-        elif moe_a2a_backend != "flashinfer_nvlink_one_sided":
-            raise ValueError(
-                "Muse Spark --enable-layernorm-sp requires "
-                "--moe-a2a-backend flashinfer_nvlink_one_sided."
-            )
-        if moe_runner_backend != "flashinfer_trtllm":
-            raise ValueError(
-                "Muse Spark --enable-layernorm-sp requires "
-                "--moe-runner-backend flashinfer_trtllm."
-            )
+        _validate_muse_sp_moe_backends(
+            moe_a2a_backend=moe_a2a_backend,
+            moe_runner_backend=moe_runner_backend,
+            enable_megamoe_for_layernorm_sp=enable_megamoe_for_layernorm_sp,
+            cuda_sm=cuda_sm,
+        )
     if attn_dp_enabled:
         raise ValueError(
             "--enable-layernorm-sp is not compatible with attention DP: "
@@ -253,6 +260,57 @@ def validate_layernorm_sp(
             "--enable-layernorm-sp is not compatible with pipeline parallelism: "
             "only the first rank's stack starts the sequence-sharded region, so "
             "the next rank would receive a stream it does not expect."
+        )
+
+
+def _validate_muse_sp_moe_backends(
+    *,
+    moe_a2a_backend: str,
+    moe_runner_backend: str,
+    enable_megamoe_for_layernorm_sp: bool,
+    cuda_sm: Optional[int],
+) -> None:
+    if moe_runner_backend == "marlin":
+        # Mirrors where auto picks Marlin for NVFP4 experts (muse_spark_fp4_moe).
+        if cuda_sm is None or not 80 <= cuda_sm < 100:
+            device = "no CUDA device" if cuda_sm is None else f"SM{cuda_sm}"
+            sm10x_advice = (
+                " On SM10x use --moe-runner-backend flashinfer_trtllm with "
+                "FlashInfer A2A or MegaMoE."
+                if cuda_sm is not None and 100 <= cuda_sm < 110
+                else ""
+            )
+            raise ValueError(
+                "Muse Spark --enable-layernorm-sp with --moe-runner-backend "
+                "marlin is validated only on CUDA SM80-SM90, where auto selects "
+                f"Marlin for NVFP4 experts; found {device}.{sm10x_advice}"
+            )
+        # Marlin experts cannot consume FlashInfer A2A dispatch output; each
+        # rank runs its local experts on the all-gathered tokens instead.
+        if enable_megamoe_for_layernorm_sp or moe_a2a_backend != "none":
+            raise ValueError(
+                "Muse Spark --enable-layernorm-sp with --moe-runner-backend "
+                "marlin requires --moe-a2a-backend none and "
+                "--no-enable-megamoe-for-layernorm-sp."
+            )
+        return
+    if enable_megamoe_for_layernorm_sp:
+        if moe_a2a_backend not in ("none", "flashinfer_nvlink_one_sided"):
+            raise ValueError(
+                "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer_nvlink_one_sided; "
+                "MegaMoE performs its own dispatch/combine and decode uses all-reduce."
+            )
+    elif moe_a2a_backend != "flashinfer_nvlink_one_sided":
+        raise ValueError(
+            "Muse Spark --enable-layernorm-sp requires "
+            "--moe-a2a-backend flashinfer_nvlink_one_sided, or "
+            "--moe-runner-backend marlin with --moe-a2a-backend none."
+        )
+    if moe_runner_backend != "flashinfer_trtllm":
+        raise ValueError(
+            "Muse Spark --enable-layernorm-sp requires "
+            "--moe-runner-backend flashinfer_trtllm, or marlin with "
+            "--moe-a2a-backend none."
         )
 
 

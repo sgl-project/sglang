@@ -40,7 +40,12 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
@@ -204,6 +209,21 @@ def reduce_scatter_token_rows(
     return output
 
 
+def all_gather_topk_rows(
+    *, topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather FP32 top-k weights and int32 ids bit for bit in one collective."""
+    top_k = topk_ids.shape[1]
+    packed = torch.cat(
+        (topk_weights.float().view(torch.int32), topk_ids.to(torch.int32)), dim=1
+    )
+    gathered = all_gather_token_rows(packed)
+    return (
+        gathered[:, :top_k].contiguous().view(torch.float32),
+        gathered[:, top_k:].contiguous(),
+    )
+
+
 def run_replicated_token_rows(
     hidden_states: torch.Tensor,
     compute: Callable[[torch.Tensor], torch.Tensor],
@@ -331,9 +351,11 @@ def _npu_hccl_comm_name() -> str:
 def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
-    Muse Spark selects CUTLASS; other models keep the Torch symmetric-memory
-    path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
-    depends only on static layer properties and is identical across TP ranks.
+    Muse Spark selects CUTLASS, whose kernels need SM100, and takes the TP
+    group's unfused all-gather and reduce-scatter on other GPUs; other models
+    keep the Torch symmetric-memory path. Every fused path requires an
+    unquantized, bias-free bf16/fp16 linear. The decision depends only on static
+    layer properties and the device, so it is identical across TP ranks.
     """
     if linear.bias is not None:
         return False
@@ -347,7 +369,7 @@ def sp_fused_matmul_eligible(linear) -> bool:
         # CANN MC2 fused ops are 2-D-only (matmul over 2-D [m, k] x [k, n]).
         return _HAS_NPU_MC2_FUSED and linear.weight.ndim == 2
     if getattr(linear, "_sp_use_cutlass", False):
-        return True
+        return get_platform().is_sm100
     return _HAS_TORCH_SYMM_MEM_FUSED
 
 

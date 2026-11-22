@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.arg_groups.layernorm_sp_hook import (
+    _muse_marlin_cuda_sm,
     validate_layernorm_sp,
     validate_layernorm_sp_min_tokens,
 )
@@ -34,6 +35,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
+    override_platform,
     publish,
     reset_context,
 )
@@ -262,6 +264,176 @@ class TestLayerNormSPValidation(CustomTestCase):
         validate_layernorm_sp_min_tokens(
             min_tokens=1000, prefill_backend=Backend.DISABLED, prefill_bs=[512, 1280]
         )  # must not raise
+
+
+class TestMuseLayerNormSPValidation(CustomTestCase):
+    """Muse Spark takes SP either through FlashInfer A2A / MegaMoE with TRT-LLM
+    experts, or with Marlin experts on all-gathered tokens and no A2A."""
+
+    MARLIN: ClassVar[dict[str, object]] = {
+        "architecture": "MuseSparkForConditionalGeneration",
+        "tp_size": 8,
+        "ep_size": 8,
+        "quantization": "modelopt_fp4",
+        "moe_a2a_backend": "none",
+        "moe_runner_backend": "marlin",
+        "attn_dp_enabled": False,
+        "speculative_algorithm": "DFLASH",
+        "cuda_sm": 90,
+    }
+
+    def test_marlin_passes_without_a2a(self):
+        for cuda_sm in (80, 90):
+            for tp in (4, 8):
+                with self.subTest(cuda_sm=cuda_sm, tp=tp):
+                    validate_layernorm_sp(
+                        **{
+                            **self.MARLIN,
+                            "cuda_sm": cuda_sm,
+                            "tp_size": tp,
+                            "ep_size": tp,
+                        }
+                    )  # must not raise
+
+    def test_marlin_runs_only_on_sm80_to_sm90(self):
+        """Marlin SP runs only where auto picks Marlin for NVFP4 experts, and only
+        SM10x has the TRT-LLM A2A / MegaMoE path to point to. The device check
+        comes first, since Blackwell resolves MegaMoE on by default."""
+        for cuda_sm, megamoe, points_to_trtllm in (
+            (75, False, False),
+            (100, False, True),
+            (103, False, True),
+            (100, True, True),
+            (120, False, False),
+            (None, False, False),
+        ):
+            with self.subTest(cuda_sm=cuda_sm, megamoe=megamoe):
+                with self.assertRaisesRegex(ValueError, "SM80-SM90") as raised:
+                    validate_layernorm_sp(
+                        **{
+                            **self.MARLIN,
+                            "cuda_sm": cuda_sm,
+                            "enable_megamoe_for_layernorm_sp": megamoe,
+                        }
+                    )
+                self.assertEqual(
+                    "flashinfer_trtllm" in str(raised.exception), points_to_trtllm
+                )
+
+    def test_marlin_rejects_a2a_dispatch_and_megamoe(self):
+        """Marlin experts cannot consume FlashInfer A2A dispatch output, and
+        MegaMoE runs TRT-LLM expert weights the Marlin runner does not prepare."""
+        for change in (
+            {"moe_a2a_backend": "flashinfer_nvlink_one_sided"},
+            {"enable_megamoe_for_layernorm_sp": True},
+        ):
+            with self.subTest(**change):
+                with self.assertRaisesRegex(ValueError, "moe-a2a-backend none"):
+                    validate_layernorm_sp(**{**self.MARLIN, **change})
+
+    def test_no_a2a_still_requires_marlin(self):
+        """Only Marlin gathers tokens for its experts; any other runner without
+        A2A or MegaMoE has no expert path under SP."""
+        for runner in ("flashinfer_trtllm", "triton", "auto"):
+            with self.subTest(runner=runner):
+                with self.assertRaisesRegex(
+                    ValueError, "marlin with --moe-a2a-backend none"
+                ):
+                    validate_layernorm_sp(
+                        **{**self.MARLIN, "moe_runner_backend": runner}
+                    )
+
+    def test_a2a_and_megamoe_still_require_trtllm_experts(self):
+        """A runner other than Marlin and TRT-LLM stays rejected behind A2A or
+        MegaMoE, which both feed TRT-LLM expert weights."""
+        for runner in ("triton", "auto"):
+            for change in (
+                {"moe_a2a_backend": "flashinfer_nvlink_one_sided"},
+                {"enable_megamoe_for_layernorm_sp": True},
+            ):
+                with self.subTest(runner=runner, **change):
+                    with self.assertRaisesRegex(
+                        ValueError, "requires --moe-runner-backend flashinfer_trtllm"
+                    ):
+                        validate_layernorm_sp(
+                            **{**self.MARLIN, "moe_runner_backend": runner, **change}
+                        )
+
+    def test_trtllm_a2a_and_megamoe_configs_still_pass(self):
+        trtllm = {**self.MARLIN, "moe_runner_backend": "flashinfer_trtllm"}
+        for change in (
+            {"moe_a2a_backend": "flashinfer_nvlink_one_sided"},
+            {"enable_megamoe_for_layernorm_sp": True},
+            {
+                "moe_a2a_backend": "flashinfer_nvlink_one_sided",
+                "enable_megamoe_for_layernorm_sp": True,
+            },
+        ):
+            with self.subTest(**change):
+                validate_layernorm_sp(**{**trtllm, **change})  # must not raise
+
+
+class TestMuseMarlinDeviceProbe(CustomTestCase):
+    MUSE = "MuseSparkForConditionalGeneration"
+
+    def test_only_muse_on_marlin_reads_the_device(self):
+        """Other SP launches validate without querying the GPU, so the launcher
+        stays free of a CUDA context before it forks."""
+        with (
+            patch("sglang.srt.utils.device.is_cuda", return_value=True),
+            patch("sglang.srt.utils.device.get_device_sm") as device_sm,
+        ):
+            for architecture, runner in (
+                ("Qwen3ForCausalLM", "marlin"),
+                (self.MUSE, "flashinfer_trtllm"),
+            ):
+                with self.subTest(architecture=architecture, runner=runner):
+                    self.assertIsNone(
+                        _muse_marlin_cuda_sm(
+                            architecture=architecture, moe_runner_backend=runner
+                        )
+                    )
+            device_sm.assert_not_called()
+
+    def test_rocm_capability_is_not_a_cuda_sm(self):
+        """ROCm reports MI300X / MI355X as capability 9.4 / 9.5, which must not
+        pass the SM80-SM90 Marlin gate."""
+        with override_platform(is_cuda=False, device_sm=95):
+            self.assertIsNone(
+                _muse_marlin_cuda_sm(
+                    architecture=self.MUSE, moe_runner_backend="marlin"
+                )
+            )
+        with override_platform(is_cuda=True, device_sm=90):
+            self.assertEqual(
+                _muse_marlin_cuda_sm(
+                    architecture=self.MUSE, moe_runner_backend="marlin"
+                ),
+                90,
+            )
+
+
+class TestSpFusedMatmulSelection(CustomTestCase):
+    def test_muse_linears_take_unfused_collectives_off_sm100(self):
+        """The CUTLASS SP collectives raise off SM100, and Muse linears must not
+        fall back to the Torch symmetric-memory path there either."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        def linear(**marks):
+            return SimpleNamespace(
+                weight=torch.zeros(8, 8, dtype=torch.bfloat16),
+                bias=None,
+                quant_method=UnquantizedLinearMethod(),
+                **marks,
+            )
+
+        muse, other = linear(_sp_use_cutlass=True), linear()
+        with patch.object(layernorm_sp, "_HAS_TORCH_SYMM_MEM_FUSED", True):
+            with override_platform(is_sm100=False):
+                self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(muse))
+                self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(other))
+            with override_platform(is_sm100=True):
+                self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(muse))
 
 
 class _Norm:
@@ -594,7 +766,8 @@ class TestNpuMc2FusedPaths(CustomTestCase):
         ):
             self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
             linear._sp_use_cutlass = True
-            self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
+            with override_platform(is_sm100=True):
+                self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
 
     # --- hccl handle -------------------------------------------------------------
 
