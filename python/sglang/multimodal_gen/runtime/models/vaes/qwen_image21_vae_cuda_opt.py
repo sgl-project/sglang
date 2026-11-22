@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen-Image 2.1 VAE decoder fast paths.
 
-Lossless, always on, verified bit-exact against the original module chain on
-first sight and disabled on a mismatch:
+Bit-exact, on at every quality tier, verified against the original module
+chain on first sight and disabled on a mismatch:
 
 - ``FusedChannelRMSNormSiLU`` keeps aten's fp32 channel L2 norm and runs the
   normalize / scale / gamma / SiLU tail as one CUDA launch wherever the decoder
@@ -19,8 +19,8 @@ first sight and disabled on a mismatch:
   separate bias pass over the conv output disappears. The upsampler conv does the
   same through ``dup_up3d_add``'s bias input on the up block's shortcut add.
 
-Quality-gated (``quality="extra-high"`` / ``"high"``, decode-scoped through
-:class:`VaeFastPathGate`; changes rounding, so never on the lossless path):
+Quality-gated (``quality="lossless"`` / ``"high"``, decode-scoped through
+:class:`VaeFastPathGate`; changes rounding, so never on the ``exact`` path):
 
 - The decoder runs in ``channels_last`` so the cuDNN NHWC conv kernels no
   longer wrap every 3x3 conv in NCHW/NHWC transposes.
@@ -84,7 +84,7 @@ _FOLD_MIN_OUTPUT_ELEMENTS = 2**18
 
 
 class FusedChannelRMSNormSiLU(nn.Module):
-    """``SiLU(RMS_norm(x))``: fused NHWC kernel under the quality gate, fused lossless tail otherwise."""
+    """``SiLU(RMS_norm(x))``: fused NHWC kernel under the quality gate, fused bit-exact tail otherwise."""
 
     def __init__(self, norm: nn.Module, gate: VaeFastPathGate) -> None:
         super().__init__()
@@ -428,7 +428,7 @@ def _decoder_layout_forward(self, x, *args, **kwargs):
     want_channels_last = self._sgl_gate.enabled
     if want_channels_last != self._sgl_channels_last:
         # Layout swaps permute parameter memory only; flipping back restores the
-        # NCHW cuDNN kernel selection of the lossless path exactly.
+        # NCHW cuDNN kernel selection of the gate-off path exactly.
         self.to(
             memory_format=(
                 torch.channels_last if want_channels_last else torch.contiguous_format
@@ -528,7 +528,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
     logger.info(
         "Qwen-Image 2.1 VAE: %d fused RMSNorm+SiLU sites, %d convs with folded padding, "
         "%d channels_last upsamplers, %d folded upsample+conv pairs "
-        "(channels_last decode and the fold at quality extra-high/high).",
+        "(channels_last decode and the fold at quality lossless/high).",
         n_norm,
         n_conv,
         n_up,

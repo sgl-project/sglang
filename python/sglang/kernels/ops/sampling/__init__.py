@@ -65,6 +65,22 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.verify_penalties",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.sampling.verify_penalties:apply_verify_penalties",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="sampling.accumulate_penalty_counts",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.sampling.penalty_counts:accumulate_penalty_counts",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 
 @functools.cache

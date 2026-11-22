@@ -134,6 +134,7 @@ from sglang.srt.utils.device import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -3505,10 +3506,16 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
+        # Foundry LOAD reuses the pool config SAVE resolved;
+        # the free-memory profile the pool sizes come from differs between the two.
+        replayed = get_foundry_adapter().replay_saved_memory_pool_config()
+        if replayed is not None:
+            return replayed
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
+            get_foundry_adapter().record_memory_pool_config(config)
             return config
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
@@ -3516,6 +3523,8 @@ class KVCacheConfigurator:
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
+        # Foundry SAVE records the resolved config for LOAD.
+        get_foundry_adapter().record_memory_pool_config(config)
         return config
 
     def config_from_budget(

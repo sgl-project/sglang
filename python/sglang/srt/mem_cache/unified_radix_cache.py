@@ -1131,7 +1131,12 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
             if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
                 self.evict_host(1, self.slot_id(TREE_STATE))
-            self.backup_node_for_write_back(node_id)
+            if not self.backup_node_for_write_back(node_id):
+                logger.warning(
+                    "write_back: Mamba checkpoint dropped without backup "
+                    "due to host memory pressure, node %d",
+                    node_id,
+                )
             result = self.tree_core.finish_mamba_state_eviction(node_id)
         elif result.swa_backup_node_id is not None:
             assert component_type in self.window_slots() and result.node_id is None
@@ -1285,6 +1290,8 @@ class UnifiedRadixCache(BasePrefixCache):
         takes another entry."""
         pending: list[NodeId] = []
         pending_tokens = 0
+        # Nodes whose device slots the queued copies read.
+        copied: set[NodeId] = set()
 
         def batch_need() -> int:
             return self._write_back_batch_tokens(
@@ -1299,6 +1306,7 @@ class UnifiedRadixCache(BasePrefixCache):
             nonlocal pending_tokens
             self._demote_backed_up(pending, tracker)
             pending_tokens = 0
+            copied.clear()
 
         self.tree_core.evict_device_start(ct, walk_quota)
         try:
@@ -1310,27 +1318,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 if node_id is None:
                     if not made_progress:
                         break
-                elif pending and self.tree_core.is_backuped(node_id):
+                elif (
+                    pending
+                    and self.tree_core.is_backuped(node_id)
+                    and not self.tree_core.needs_incremental_component_backup(node_id)
+                ):
                     pending.append(node_id)
                     pending_tokens += self.tree_core.mark_write_back_queued(node_id)
                 else:
+                    if node_id in copied and self.tree_core.is_backuped(node_id):
+                        # Land the batch first: a demote frees slots its copies read.
+                        demote_queued()
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
-                        if written == 0 and pending:
+                        if written is None and pending:
                             # Make the queued victims host-evictable, as the
                             # per-victim walk would have by now, and retry once.
                             demote_queued()
                             written = self._execute_and_commit_kv_backup(
                                 backup_kv, write_back=True
                             )
-                        if written > 0:
+                        if written is not None:
                             pending.append(node_id)
+                            receipt = self.ongoing_write_through.get(node_id)
+                            publish = (
+                                receipt.publish_node_ids if receipt is not None else ()
+                            )
+                            copied.update(publish)
                             pending_tokens += self.tree_core.mark_write_back_queued(
+                                node_id, publish
+                            )
+                        elif self.tree_core.is_backuped(node_id):
+                            # Keep host KV even if the component state can't be saved.
+                            self._demote(node_id, tracker)
+                            logger.warning(
+                                "write_back: device-only component state dropped "
+                                "without backup due to host memory pressure, node %d",
                                 node_id,
-                                self.ongoing_write_through[node_id].publish_node_ids,
                             )
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
@@ -1420,9 +1447,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if backup_kv is None:
             return
         written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
-        if written > 0:
+        if written is not None:
             self.writing_check(write_back=True)
             self._demote(node_id, tracker)
+        elif self.tree_core.is_backuped(node_id):
+            self._demote(node_id, tracker)
+            logger.warning(
+                "write_back: component state dropped without host backup, node %d",
+                node_id,
+            )
         elif self._drop_subtree_no_host(node_id, tracker):
             logger.warning(
                 "write_back: KV subtree dropped without backup "
@@ -2215,7 +2248,7 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
-        if written == 0:
+        if written is None:
             return False
         self.writing_check(write_back=True)
         return True
@@ -2238,8 +2271,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
-    ) -> int:
-        """Run a backup action top-down, stopping at the first failed backup."""
+    ) -> Optional[int]:
+        """Full-KV tokens queued (0 is success); None if no host copy was queued."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end
@@ -2247,7 +2280,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
                 self.buffer_pipeline.enqueue_backup_intent(node_id)
-            return 0
+            return None
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
@@ -2260,7 +2293,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
-                return 0
+                return None
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
             if not write_back:
@@ -3886,7 +3919,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
+            # Parked hits first, in line order (buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
                 while parked:
@@ -4124,6 +4157,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # What this rank wrote of the agreed prefix.
             collector.log_backuped_tokens(
                 min(operation.completed_tokens, agreed_tokens)
+            )
+            collector.observe_backup_storage_duration(
+                time.perf_counter() - operation.enqueue_time
             )
             if short:
                 collector.log_storage_backup_failed_tokens(

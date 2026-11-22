@@ -50,9 +50,12 @@ class TestShrinkControlFanOut(CustomTestCase):
             enable_dp_attention_local_control_broadcast=True,
             tp_size=1,
         )
-        patch = mock.patch.object(mixin, "get_parallel", lambda: parallel)
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (
+            mock.patch.object(mixin, "get_parallel", lambda: parallel),
+            mock.patch.object(mixin, "is_control_broadcast_local", lambda: True),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def test_shrink_start_narrows_all_but_the_scale_call_and_reopen_restores(self):
         tm = _Tokenizer()

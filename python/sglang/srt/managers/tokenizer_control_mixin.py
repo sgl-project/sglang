@@ -101,6 +101,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
     get_spec,
+    is_control_broadcast_local,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -228,8 +229,7 @@ class TokenizerControlMixin:
         """``keep_scale_fan_out``: leave scale_elastic_ep wide, as it still needs the
         retirees' acks while every other control call stops waiting on them."""
         primary_group_control = (
-            get_parallel().attn_dp_enabled
-            and not get_parallel().enable_dp_attention_local_control_broadcast
+            get_parallel().attn_dp_enabled and not is_control_broadcast_local()
         )
         if primary_group_control:
             control_fan_out = (
