@@ -1,13 +1,13 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative.dflash_utils import commit_block_accept_tokens_to_penalties
-from sglang.srt.speculative.eagle_utils import commit_accept_tokens_to_penalties
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,21 +69,27 @@ class TestVerifyPenaltyCommit(CustomTestCase):
             ]
         )
 
-    def test_tree_verify_commits_accept_index_rows(self):
-        predict = torch.tensor([4, 4, 6, 1, 2, 3, 5, 9, 9])
-        accept_index = torch.tensor([[0, 1, -1], [3, 4, 5], [6, -1, -1]])
-        commit_accept_tokens_to_penalties(
-            _info(self.reqs, self.pool), predict, accept_index
-        )
+    def _commit(self, accept):
+        watermark = Mock()
+        commit_verify_accept(_info(self.reqs, self.pool), accept, watermark=watermark)
+        watermark.commit.assert_called_once_with(accept)
         torch.testing.assert_close(self._counts(), self._expected([[4, 4], [], [5]]))
 
-    def test_block_verify_commits_the_committed_prefix(self):
+    def test_tree_verify_commits_accept_index_rows(self):
+        # A -1 pad reads the last token (7), which must not count.
+        predict = torch.tensor([4, 4, 6, 1, 2, 3, 5, 9, 7])
+        accept_index = torch.tensor([[0, 1, -1], [3, 4, 5], [6, -1, -1]])
+        accept_lens = torch.tensor([2, 3, 1], dtype=torch.int32)
+        self._commit(
+            VerifyAccept(
+                tokens=predict, accept_lens=accept_lens, accept_index=accept_index
+            )
+        )
+
+    def test_chain_verify_commits_the_accept_prefix(self):
         out_tokens = torch.tensor([[4, 4, 6], [1, 2, 3], [5, 9, 9]])
         commit_lens = torch.tensor([2, 3, 1], dtype=torch.int32)
-        commit_block_accept_tokens_to_penalties(
-            _info(self.reqs, self.pool), out_tokens, commit_lens
-        )
-        torch.testing.assert_close(self._counts(), self._expected([[4, 4], [], [5]]))
+        self._commit(VerifyAccept(tokens=out_tokens, accept_lens=commit_lens))
 
 
 if __name__ == "__main__":
