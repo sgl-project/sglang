@@ -470,12 +470,13 @@ def _rocm_gfx1250_configs(
         tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
     configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
     if spx and dev_kernarg:
-        # SPX (a whole 256-CU accelerator per rank), tuned at TP2/TP4: a push
-        # block per CU; 1shot_push beats RCCL to 6 MB at TP2 and 2 MB at TP4;
-        # 2shot_push beats ring_simple to 96 MB at TP2 and 160 MB at TP4, where
-        # ring_simple loses to RCCL at 80-112 MB. 2shot push workspace is 4x
-        # its top size per rank; a 2 MB ring FIFO is as fast as 4 MB and halves
-        # the ring's 1 GB.
+        # SPX (a whole accelerator per rank), tuned at TP2/TP4: a push block
+        # per CU, as many as the device reports (num_sm); 1shot_push beats
+        # RCCL to 6 MB at TP2 and 2 MB at TP4; 2shot_push beats ring_simple to
+        # 96 MB at TP2 and 160 MB at TP4, where ring_simple loses to RCCL at
+        # 80-112 MB. 2shot push workspace is 4x its top size per rank; a 2 MB
+        # ring FIFO per channel (one channel per CU) is as fast as 4 MB and
+        # halves the ring's workspace.
         def spx_row(world_size: int, one_shot: int, two_shot: int) -> AllReduceConfig:
             heuristic = Heuristic(
                 one_shot,

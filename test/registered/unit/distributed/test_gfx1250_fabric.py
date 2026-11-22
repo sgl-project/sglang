@@ -247,22 +247,24 @@ def test_probe_spx_survives_a_raising_probe(monkeypatch):
     assert gathered_local == [None]
 
 
-def test_gfx1250_spx_rows():
+# The rows follow the CU count the device reports, whatever it is.
+@pytest.mark.parametrize("num_sm", [96, 128, 256])
+def test_gfx1250_spx_rows(num_sm):
     from sglang.srt.distributed.device_communicators.configs import (
         custom_all_reduce_v2 as cfg,
     )
 
     MB = cfg.MB
-    dpx = cfg._rocm_gfx1250_configs(96, True)
-    spx = cfg._rocm_gfx1250_configs(256, True, True)
+    base = cfg._rocm_gfx1250_configs(num_sm, True)
+    spx = cfg._rocm_gfx1250_configs(num_sm, True, True)
     # SPX rows exist only with HIP_FORCE_DEV_KERNARG=1, where they were tuned
-    assert cfg._rocm_gfx1250_configs(256, False, True) == cfg._rocm_gfx1250_configs(
-        256, False
+    assert cfg._rocm_gfx1250_configs(num_sm, False, True) == cfg._rocm_gfx1250_configs(
+        num_sm, False
     )
     for ws in (3, 5, 6, 7, 8, 16):
-        assert spx[ws] == cfg._rocm_gfx1250_configs(256, True)[ws]
-    assert dpx[2].default_max_size == dpx[4].default_max_size == 0
-    assert dpx[2].ring_simple_buffer_size == dpx[4].ring_simple_buffer_size == 0
+        assert spx[ws] == base[ws]
+    assert base[2].default_max_size == base[4].default_max_size == 0
+    assert base[2].ring_simple_buffer_size == base[4].ring_simple_buffer_size == 0
 
     for ws, one_shot, two_shot, slot in (
         (2, 6 * MB, 96 * MB, 96 * MB),
@@ -270,7 +272,7 @@ def test_gfx1250_spx_rows():
     ):
         row = spx[ws]
         assert row.graph == row.eager
-        assert row.num_push_blocks == 256
+        assert row.num_push_blocks == num_sm
         assert row.graph.one_shot_push_threshold == one_shot
         assert row.graph.two_shot_push_threshold == two_shot
         assert row.graph.ring_simple.min_bytes == two_shot + 16
