@@ -187,11 +187,21 @@ class MambaPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
+            # A PP stage without Mamba layers holds no bytes per slot; it must not cap the
+            # group minimum, and sizes itself like the ratio path below.
+            no_mamba_layers = self.size_per_token == 0
             self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+                (
+                    torch.iinfo(torch.int64).max
+                    if no_mamba_layers
+                    else int(host_size * 1e9 // self.size_per_token)
+                ),
+                host_size,
             )
+            if self.size == torch.iinfo(torch.int64).max:
+                self.size = int(device_capacity * host_to_device_ratio)
             # The padding slot below would otherwise turn a sub-slot pin into a one-slot pool.
-            if self.size < 1 and get_memory().hicache_mamba_size > 0:
+            elif self.size < 1 and get_memory().hicache_mamba_size > 0:
                 raise ValueError(
                     f"--hicache-mamba-size {host_size:g} cannot hold one Mamba state slot, "
                     f"which takes {self.size_per_token / 1e9:.3f} GB across the target "

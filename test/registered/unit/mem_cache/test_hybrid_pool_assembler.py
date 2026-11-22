@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host import mamba as pool_host_mamba
 from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -1846,13 +1847,12 @@ class TestHicacheMambaSize(CustomTestCase):
             conv=(torch.empty((6, 2, 2, 2), device="meta"),),
         )
 
-        def meta_alloc(dims, *, dtype, **_):
-            return torch.empty(dims, dtype=dtype, device="meta")
+        alloc = Mock(side_effect=AssertionError("a rejected pin must not allocate"))
 
         with (
             self._hicache_args(mamba_size=1),
             host_memory_budget_scope(1 << 40),
-            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
             self.assertRaisesRegex(ValueError, "one Mamba state slot"),
         ):
             MambaPoolHost(
@@ -1863,6 +1863,38 @@ class TestHicacheMambaSize(CustomTestCase):
                 pin_memory=False,
                 layout="page_first",
             )
+
+    def test_pin_on_a_stage_without_mamba_layers_sizes_like_the_ratio_path(self):
+        """A PP stage that owns no Mamba layers has zero bytes per slot,
+        so a pin must neither divide by zero nor cap the other stages' capacity."""
+        buffer_info = MambaStateBufferInfo(
+            temporal=torch.empty((0, 2, 2, 2, 2), device="meta"),
+            conv=(torch.empty((0, 2, 2, 2), device="meta"),),
+        )
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        with (
+            self._hicache_args(mamba_size=1),
+            host_memory_budget_scope(1 << 40),
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+            patch.object(
+                pool_host_mamba, "sync_fixed_hicache_size", wraps=lambda size, _: size
+            ) as sync,
+        ):
+            host = MambaPoolHost(
+                buffer_info=buffer_info,
+                host_to_device_ratio=2,
+                host_size=1,
+                device_capacity=4,
+                pin_memory=False,
+                layout="page_first",
+            )
+        self.assertEqual(host.size_per_token, 0)
+        self.assertEqual(sync.call_args.args[0], torch.iinfo(torch.int64).max)
+        # Ratio-path size (4 * 2) plus the padding slot.
+        self.assertEqual(host.size, 9)
 
     def test_pin_holds_the_packed_mtp_draft_layers(self):
         """Each pinned host slot also carries every packed MTP draft Mamba layer,
@@ -1896,6 +1928,7 @@ class TestHicacheMambaSize(CustomTestCase):
                 self.subTest(draft_layers=len(drafts)),
                 host_memory_budget_scope(2 << 30),
                 patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+                self._hicache_args(hicache_size=2, mamba_size=1),
             ):
                 host = MambaPoolHost(
                     buffer_info=info(target),
