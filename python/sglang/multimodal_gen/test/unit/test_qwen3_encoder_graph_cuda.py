@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3 text encoder CUDA graph replay; no checkpoint needed."""
 
+import gc
+import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 import sglang.multimodal_gen.runtime.models.encoders.qwen3 as qwen3
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import (
@@ -15,8 +19,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    get_replica_group,
+    get_tp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
+    use_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -43,19 +54,26 @@ pytestmark = pytest.mark.skipif(
 SEQ_LEN = 40
 
 
+def _server_args(tp_size):
+    return ServerArgs(
+        model_path="black-forest-labs/FLUX.2-klein-4B",
+        num_gpus=tp_size,
+        tp_size=tp_size,
+        pipeline_config=Flux2KleinPipelineConfig(),
+        attention_backend="torch_sdpa",
+    )
+
+
 @pytest.fixture(scope="module")
 def encoder():
-    set_global_server_args(
-        ServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-            num_gpus=1,
-            pipeline_config=Flux2KleinPipelineConfig(),
-            attention_backend="torch_sdpa",
-        )
-    )
+    set_global_server_args(_server_args(1))
     if not model_parallel_is_initialized():
         ensure_distributed_env_defaults()
         maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    return _build_encoder()
+
+
+def _build_encoder():
     config = Qwen3TextConfig(
         arch_config=Qwen3TextArchConfig(
             vocab_size=64,
@@ -126,6 +144,67 @@ def test_prompts_of_any_length_replay_one_graph_bitwise_like_eager(
         assert len(have) == len(want)
         for a, b in zip(have, want):
             assert torch.equal(a, b)
+
+
+def _run_tp2_replay(rank, rendezvous, fold):
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        distributed_init_method=rendezvous,
+        backend="nccl",
+        timeout=60,
+    )
+    initialize_model_parallel(tensor_parallel_degree=2, sequence_parallel_degree=1)
+    try:
+        set_global_server_args(_server_args(2))
+        # as the loader binds it; the replica group (--encoder-parallel fold) has no
+        # custom all-reduce, so its all-reduces are captured as NCCL kernels
+        group = get_replica_group() if fold else get_tp_group()
+        with use_tensor_parallel_group(group):
+            encoder = _build_encoder()
+        encoder.bind_encoder_tp_group(group)
+        requests = [_request(n, seed) for seed, n in enumerate((23, 23, 31, SEQ_LEN))]
+        # ids, not graphs: a live graph holding NCCL kernels hangs process-group teardown
+        replays = []
+        replay = BreakableCUDAGraph.replay
+
+        def counting_replay(graph):
+            replays.append(id(graph))
+            return replay(graph)
+
+        try:
+            with torch.inference_mode():
+                graphs, encoder._cuda_graphs = encoder._cuda_graphs, None
+                expected = [_encode(encoder, *request) for request in requests]
+                encoder._cuda_graphs = graphs
+                with patch.object(BreakableCUDAGraph, "replay", counting_replay):
+                    got = [_encode(encoder, *request) for request in requests]
+            assert len(replays) == len(requests) - 1
+            assert len(set(replays)) == 1
+            for want, have in zip(expected, got):
+                for a, b in zip(have, want):
+                    assert torch.equal(a, b)
+        finally:
+            encoder.release_cuda_graphs()
+            gc.collect()
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+@pytest.mark.parametrize("fold", [False, True], ids=["tp", "fold"])
+def test_tensor_parallel_encoder_replays_bitwise_like_eager(tmp_path, fold):
+    # the row-parallel all-reduces are captured with the rest of the forward
+    mp.spawn(
+        _run_tp2_replay,
+        args=(f"file://{tmp_path / 'rendezvous'}", fold),
+        nprocs=2,
+        join=True,
+    )
 
 
 @torch.inference_mode()
