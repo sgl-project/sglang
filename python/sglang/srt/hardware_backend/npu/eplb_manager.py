@@ -64,14 +64,14 @@ class NpuAsyncEPLBManager(EPLBManager):
             get_global_expert_distribution_recorder()._reset()
         super().reset_generator()
 
-    def should_release_first_prefill(self, *, has_pending_chunk: bool) -> bool:
+    def should_release_first_prefill(self, *, has_pending_prefill: bool) -> bool:
         coordinator = self._async_coordinator
         if coordinator is None or coordinator.epoch != 1 or not coordinator.active:
             return False
         # Called at the same extend boundary on every rank. Keep scheduling
-        # the next prompt chunk before processing results if any rank needs it.
+        # prefill before processing results while any rank has prompts pending.
         all_finished, _ = coordinator.control.vote(
-            coordinator.epoch, coordinator.phase, -3, not has_pending_chunk, False
+            coordinator.epoch, coordinator.phase, -3, not has_pending_prefill, False
         )
         return all_finished
 

@@ -2347,7 +2347,9 @@ class Scheduler(
                     return True
                 manager = self.tp_worker.model_runner.eplb_manager
                 if manager is not None and manager.should_release_first_prefill(
-                    has_pending_chunk=self.chunked_req is not None
+                    has_pending_prefill=(
+                        self.chunked_req is not None or bool(self.waiting_queue)
+                    )
                 ):
                     return True
 
