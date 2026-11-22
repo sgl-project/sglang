@@ -19,9 +19,6 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
-from sglang.multimodal_gen.runtime.models.encoders.vision import (
-    resolve_visual_encoder_outputs,
-)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.clip import (
     CLIPEncoder,
@@ -301,35 +298,24 @@ class CLIPVisionTransformer(nn.Module):
         self,
         pixel_values: torch.Tensor,
         output_hidden_states: Optional[bool] = None,
-        feature_sample_layers: list[int] | None = None,
     ) -> BaseEncoderOutput:
 
         hidden_states = self.embeddings(pixel_values)
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        return_all_hidden_states = output_hidden_states or (
-            feature_sample_layers is not None
-        )
+        return_all_hidden_states = bool(output_hidden_states)
 
-        # Produces either the last layer output or all of the hidden states,
-        # depending on if we have feature_sample_layers or not
+        # Produces either the last layer output or all of the hidden states
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             return_all_hidden_states=return_all_hidden_states,
         )
 
-        if not return_all_hidden_states:
-            # Handle post-norm (if applicable) and stacks feature layers if needed
-            encoder_outputs = resolve_visual_encoder_outputs(
-                encoder_outputs,
-                feature_sample_layers,
-                self.post_layernorm,
-                self.config.num_hidden_layers,
-            )
-
         if return_all_hidden_states:
             return BaseEncoderOutput(hidden_states=encoder_outputs)
 
+        if self.post_layernorm is not None:
+            encoder_outputs = self.post_layernorm(encoder_outputs)
         return BaseEncoderOutput(last_hidden_state=encoder_outputs)
 
 
@@ -354,14 +340,12 @@ class CLIPVisionModel(ImageEncoder):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        feature_sample_layers: list[int] | None = None,
         output_hidden_states: Optional[bool] = None,
         **kwargs,
     ) -> BaseEncoderOutput:
         base_encoder_output = self.vision_model(
             pixel_values,
             output_hidden_states=output_hidden_states,
-            feature_sample_layers=feature_sample_layers,
         )
 
         return base_encoder_output

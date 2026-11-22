@@ -67,7 +67,7 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 - **Entropy gate.** A row uses ordinary sampling when its largest truncated probability exceeds the server's `max_probability`. Skipped contexts remain eligible for a later higher-entropy occurrence.
 - **Speculative decoding.** NGRAM, EAGLE, EAGLE3, NEXTN, and DSPARK reconstruct verify-row contexts from the committed ring tail, tree mask, draft tokens, and positions. DSPARK verifies a linear chain, so its rows use a lower-triangular mask, and its rejection-sampling accept emits the forced token on every forced row. Normal decode preserves a clone for logprobs while speculative decode forces a clone, so both report the pre-watermark target distribution. Fused kernels admit contexts and append only accepted tokens.
 - **Selector paths.** Finite `top_k <= 8,192` uses `torch.topk`, canonicalizes boundary ties, and performs small-k truncation. Unlimited top-k retains full-vocabulary sorting. Both paths use the same hash and selection contract.
-- **Disabled-batch exit.** A host-side candidate bit follows filtering and merging. Fully disabled or greedy-only batches skip prompt initialization, verify cloning, selector work, and append kernels.
+- **Disabled-batch exit.** Each launch builds the step's rows, with a host-side candidate bit per row, from the step's requests. Fully disabled or greedy-only batches skip prompt initialization, verify cloning, selector work, and append kernels.
 - **Retraction and slot reuse.** Re-prefill rebuilds the distinct-context history from accepted output. A new request resets all state for a reused request-pool slot.
 - **Dual key.** A deterministic per-context coin chooses key A with probability `P` and key B otherwise:
 
@@ -83,12 +83,21 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 
 | File | Role |
 | --- | --- |
-| `core.py` | Request policy resolution, batch configuration, ring/history state, PyTorch reference selection, and speculative orchestration. |
-| `config.py` | Key parsing, bounded JSON configuration loading, and shared protocol limits. |
-| `detector.py` | Torch-free single-key and dual-key reference detector. |
+| `interface.py` | The algorithm-neutral contract engine code calls: per-step rows, sample and verify hooks, and the per-server engine. |
+| `runtime.py` | Engine entry points; the one place that dispatches on `--watermark-algorithm`. |
+| `config.py` | Key parsing, bounded JSON configuration loading, request watermark objects, and shared protocol limits. |
+| `redaction.py` | Redaction of watermark secrets from logs, dumps, and the launch command. |
+| `gumbel/algorithm.py` | Hashing and the PyTorch reference selection and forcing. |
+| `gumbel/state.py` | Per-request ring and context-history state and its forcing operations. |
+| `gumbel/adapter.py` | Request policy, per-step rows, and the engine and hooks that bind them to the state. |
+| `gumbel/detector.py` | Torch-free single-key and dual-key reference detector. |
+| `synthid/algorithm.py` | SynthID hashing, configuration, and the PyTorch reference tournament. |
+| `synthid/state.py` | Per-request context, context-history ring, and call count, with Triton and PyTorch paths. |
+| `synthid/watermark.py` | The SynthID logits transform, fused sample, and state seed and commit. |
+| `synthid/adapter.py` | Request policy, per-step rows, server checks, and the engine and hooks that bind them to the watermark. |
 | `__init__.py` | Minimal public detector exports. |
 
-The Triton selector and state kernels live in `sglang/kernels/ops/sampling/textseal_selector.py`.
+The Gumbel Triton selector and state kernels live in `sglang/kernels/ops/sampling/textseal_selector.py`; the SynthID kernels in `sglang/kernels/ops/sampling/synthid_triton.py`, with their limits and hash constants in `synthid.py`. The SynthID operator guide is [SynthID Text Watermarking](../../../../../docs/docs/advanced_features/synthid_text_watermarking.mdx).
 
 ## Server configuration
 
@@ -150,7 +159,7 @@ python -m pip install msgspec
 ```
 
 ```python
-from watermarking.detector import WatermarkDetector
+from watermarking.gumbel.detector import WatermarkDetector
 
 detector = WatermarkDetector("0123456789abcdef", context_window=4)
 result = detector.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)
