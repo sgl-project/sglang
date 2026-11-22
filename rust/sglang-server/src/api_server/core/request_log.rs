@@ -40,7 +40,7 @@ use serde_json::{Map, Value};
 use super::frame::CoreOutput;
 use crate::message::config::{RequestLogConfig, ServerArgs};
 use crate::message::multimodal::MmItem;
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, PromptTokenIdsSlot};
 use crate::message::response::{ChunkEvent, ResponseItem};
 
 /// Python's `record_request_for_crash_dump` keeps a finished request this long.
@@ -65,8 +65,9 @@ pub(crate) struct RequestLog {
     incremental_streaming_output: bool,
 }
 
-/// The whitelisted request headers a request's lines carry.
-pub(crate) type LoggedHeaders = Arc<Vec<(String, String)>>;
+/// The whitelisted request headers a request's lines carry. None (the
+/// default) takes no allocation.
+pub(crate) type LoggedHeaders = Arc<[(String, String)]>;
 
 /// A native `/generate` body captured before the launch-time sampling defaults
 /// are merged into it (Python merges them into a copy), for the request's log
@@ -242,17 +243,15 @@ impl RequestLog {
         let Some(logger) = &self.logger else {
             return LoggedHeaders::default();
         };
-        Arc::new(
-            logger
-                .config
-                .headers
-                .iter()
-                .filter_map(|name| {
-                    let value = headers.get(name)?.to_str().ok()?;
-                    (!value.is_empty()).then(|| (name.clone(), value.to_owned()))
-                })
-                .collect(),
-        )
+        logger
+            .config
+            .headers
+            .iter()
+            .filter_map(|name| {
+                let value = headers.get(name)?.to_str().ok()?;
+                (!value.is_empty()).then(|| (name.clone(), value.to_owned()))
+            })
+            .collect()
     }
 
     /// Whether OpenAI requests get their own line (from level 2).
@@ -306,7 +305,11 @@ impl RequestLog {
             ReceivedAs::Typed(headers) => self.typed_views(requests, batch, headers),
         };
         if let Some(logger) = &self.logger {
-            logger.received(&obj, &headers);
+            match &obj {
+                Some(obj) => logger.received(obj, &headers),
+                // A single request's `Receive` object is its `Finish` one.
+                None => logger.received(&items[0], &headers),
+            }
         }
         items
             .into_iter()
@@ -339,6 +342,7 @@ impl RequestLog {
                     created_at,
                     incremental: request.stream && self.incremental_streaming_output,
                     output,
+                    prompt_token_ids: request.prompt_token_ids.clone(),
                     in_flight,
                     log_metrics,
                     admitted: false,
@@ -357,7 +361,7 @@ impl RequestLog {
         batch: bool,
     ) -> Views {
         let BodySnapshot {
-            fields,
+            mut fields,
             dump,
             headers,
         } = snapshot;
@@ -386,7 +390,7 @@ impl RequestLog {
                         item.insert("modalities".into(), modality);
                     }
                 } else {
-                    item = fields.clone();
+                    item = std::mem::take(&mut fields);
                 }
                 self.normalize(&mut item, request);
             }
@@ -398,9 +402,7 @@ impl RequestLog {
             });
             dumps.push(dump.clone().map(|body| (body, batch.then_some(i))));
         }
-        let obj = if !logging {
-            PyObj::default()
-        } else if batch {
+        let obj = (batch && logging).then(|| {
             // Python's batch object holds these as per-item lists.
             let mut obj = fields;
             for name in [
@@ -421,9 +423,7 @@ impl RequestLog {
                 // the items' put together.
                 multimodal: MediaSummary::sum(items.iter().map(|item| &item.multimodal)),
             }
-        } else {
-            items[0].clone()
-        };
+        });
         (obj, items, dumps, headers)
     }
 
@@ -454,14 +454,25 @@ impl RequestLog {
     }
 
     /// The Python object of a request an adapter or the core built. Its
-    /// fields are all known, so the log and the crash dump read one map.
+    /// fields are all known, so the log and the crash dump read one map: all
+    /// of it for the dump, what the log shows for the log.
     fn typed_views(
         &self,
         requests: &[GenerateRequest],
         batch: bool,
         headers: LoggedHeaders,
     ) -> Views {
-        let items: Vec<Map<String, Value>> = requests.iter().map(typed_fields).collect();
+        let shown = |name: &str| {
+            // The JSON format's `rid` comes from the object whatever it skips.
+            self.logger
+                .as_ref()
+                .is_some_and(|l| name == "rid" || !l.skip_names.contains(name))
+        };
+        let dumped = self.recorder.is_some();
+        let mut items: Vec<Map<String, Value>> = requests
+            .iter()
+            .map(|request| typed_fields(request, &|name| dumped || shown(name)))
+            .collect();
         let dumps = items
             .iter()
             .map(|item| {
@@ -475,8 +486,22 @@ impl RequestLog {
                 })
             })
             .collect();
-        let items: Vec<PyObj> = items.into_iter().map(PyObj::from).collect();
-        let obj = if batch {
+        if dumped {
+            for item in &mut items {
+                item.retain(|name, _| shown(name));
+            }
+        }
+        // The summary reads the request, not the fields the log shows.
+        let items: Vec<PyObj> = items
+            .into_iter()
+            .zip(requests)
+            .map(|(own, request)| PyObj {
+                own,
+                shared: Arc::default(),
+                multimodal: MediaSummary::of_request(request),
+            })
+            .collect();
+        let obj = (batch && self.logger.is_some()).then(|| {
             let mut obj = items.first().cloned().unwrap_or_default();
             obj.own.insert(
                 "rid".into(),
@@ -484,9 +509,7 @@ impl RequestLog {
             );
             obj.multimodal = MediaSummary::sum(items.iter().map(|item| &item.multimodal));
             obj
-        } else {
-            items.first().cloned().unwrap_or_default()
-        };
+        });
         (obj, items, dumps, headers)
     }
 
@@ -500,9 +523,10 @@ impl RequestLog {
 }
 
 /// `(Receive object, per-request Finish objects, per-request dump sources,
-/// headers)`.
+/// headers)`; a single request's `Receive` object is its `Finish` one
+/// (`None`). The objects are empty when not logging.
 type Views = (
-    PyObj,
+    Option<PyObj>,
     Vec<PyObj>,
     Vec<Option<(Arc<DumpBody>, Option<usize>)>>,
     LoggedHeaders,
@@ -521,16 +545,6 @@ struct PyObj {
 impl PyObj {
     fn get(&self, name: &str) -> Option<&Value> {
         self.own.get(name).or_else(|| self.shared.get(name))
-    }
-}
-
-impl From<Map<String, Value>> for PyObj {
-    fn from(own: Map<String, Value>) -> Self {
-        Self {
-            multimodal: MediaSummary::of(&own),
-            own,
-            shared: Arc::default(),
-        }
     }
 }
 
@@ -614,6 +628,24 @@ impl MediaSummary {
         for (slot, name) in summary.slots.iter_mut().zip(MEDIA_FIELDS) {
             if let Some(value) = fields.get(name) {
                 count_media(value, 0, slot);
+            }
+        }
+        summary
+    }
+
+    /// [`Self::of`] the fields [`typed_fields`] converts from `request`,
+    /// read off the request so the media need not be converted.
+    fn of_request(request: &GenerateRequest) -> Self {
+        let mut summary = Self::default();
+        if let Some(mm) = request.mm.as_deref() {
+            for (slot, items) in
+                summary
+                    .slots
+                    .iter_mut()
+                    .zip([&mm.image_data, &mm.video_data, &mm.audio_data])
+            {
+                slot.0 = items.len() as u64;
+                slot.1 = items.iter().map(mm_payload_len).sum();
             }
         }
         summary
@@ -733,21 +765,29 @@ fn count_media(value: &Value, depth: usize, slot: &mut (u64, u64)) {
     }
 }
 
-fn typed_fields(request: &GenerateRequest) -> Map<String, Value> {
+/// The request's fields that `keep` names; the large ones are not converted
+/// otherwise.
+fn typed_fields(request: &GenerateRequest, keep: &dyn Fn(&str) -> bool) -> Map<String, Value> {
     let mut item = Map::new();
     let mut set = |name: &str, value: Value| {
-        item.insert(name.into(), value);
+        if keep(name) {
+            item.insert(name.into(), value);
+        }
     };
     set("rid", request.rid.client_facing().into());
-    set("text", request.text.clone().into());
-    set("input_ids", request.input_ids.clone().into());
+    if keep("text") {
+        set("text", request.text.clone().into());
+    }
+    if keep("input_ids") {
+        set("input_ids", request.input_ids.clone().into());
+    }
     if let Some(mm) = request.mm.as_deref() {
         for (name, items) in [
             ("image_data", &mm.image_data),
             ("video_data", &mm.video_data),
             ("audio_data", &mm.audio_data),
         ] {
-            if !items.is_empty() {
+            if !items.is_empty() && keep(name) {
                 set(name, items.iter().map(media_item).collect());
             }
         }
@@ -783,10 +823,22 @@ fn typed_fields(request: &GenerateRequest) -> Map<String, Value> {
         request.disagg_prefill_dp_rank.into(),
     );
     set("require_reasoning", request.require_reasoning.into());
+    set(
+        "return_prompt_token_ids",
+        request.prompt_token_ids.is_some().into(),
+    );
     set("priority", request.priority.into());
     set("extra_key", request.extra_key.clone().into());
     set("cache_salt", request.cache_salt.clone().into());
     item
+}
+
+/// [`payload_len`] of the [`media_item`] of `item`.
+fn mm_payload_len(item: &MmItem) -> u64 {
+    match item {
+        MmItem::Source(source) => source.as_str().chars().count() as u64,
+        MmItem::Ref { url, .. } => url.as_str().chars().count() as u64,
+    }
 }
 
 /// A media item as Python's request takes it: the bare source, or
@@ -826,6 +878,8 @@ pub(crate) struct RequestRecord {
     incremental: bool,
     /// The output so far, shared with the crash recorder's in-flight entry.
     output: Arc<Mutex<CoreOutput>>,
+    /// The prompt ids its `out` reports, when the request asked for them.
+    prompt_token_ids: Option<PromptTokenIdsSlot>,
     /// Its in-flight entry, until it finishes or is dropped.
     in_flight: Option<u64>,
     /// Python's `log_metrics`: false for the health probe, which a crash dump
@@ -845,23 +899,17 @@ impl RequestRecord {
     /// Observe one runtime item of the call.
     pub(crate) fn observe(&mut self, item: &ResponseItem) {
         match item {
-            ResponseItem::Frame(chunk) => {
-                let delta = self.delta(chunk);
-                lock(&self.output).append_delta(&delta);
-            }
+            ResponseItem::Frame(chunk) => lock(&self.output).append_chunk(chunk, self.log.dp_rank),
             ResponseItem::Done(chunk) => {
-                let delta = self.delta(chunk);
                 let output = {
                     let mut output = lock(&self.output);
-                    output.append_delta(&delta);
+                    output.append_chunk(chunk, self.log.dp_rank);
                     if self.incremental {
                         // The stream's terminal frame: the last delta, with
-                        // the cumulative completion-token count.
-                        CoreOutput {
-                            completion_tokens: output.completion_tokens,
-                            weight_version: output.weight_version.clone(),
-                            ..delta
-                        }
+                        // what an incremental frame reports cumulatively.
+                        let mut terminal = self.delta(chunk).with_cumulative_counts(&output);
+                        terminal.weight_version = output.weight_version.clone();
+                        terminal
                     } else {
                         output.clone()
                     }
@@ -881,16 +929,32 @@ impl RequestRecord {
         }
     }
 
-    /// The `/generate` frame of the finished request is Python's `out`.
+    /// The `/generate` frame of the finished request is Python's `out`, built
+    /// only for a `Finish` line or a kept crash-dump record.
     fn finish(&mut self, output: CoreOutput) {
         let e2e_latency = self.created_at.elapsed().as_secs_f64();
-        let out = python_out(output, &self.rid, e2e_latency);
-        if let Some(logger) = &self.log.logger {
-            logger.finished(&self.obj, &self.headers, &out, e2e_latency);
+        let logger = self
+            .log
+            .logger
+            .as_ref()
+            .filter(|logger| logger.logs_finish(e2e_latency));
+        let in_flight = self.log.recorder.as_ref().zip(self.in_flight.take());
+        let kept = in_flight.is_some() && self.log_metrics;
+        let out = (logger.is_some() || kept).then(|| self.python_out(output, e2e_latency));
+        if let (Some(logger), Some(out)) = (logger, &out) {
+            logger.finished(&self.obj, &self.headers, out, e2e_latency);
         }
-        if let (Some(recorder), Some(id)) = (&self.log.recorder, self.in_flight.take()) {
-            recorder.finish(id, self.log_metrics, &out, unix_time());
+        if let Some((recorder, id)) = in_flight {
+            recorder.finish(id, out.as_ref().filter(|_| kept), unix_time());
         }
+    }
+
+    fn python_out(&self, mut output: CoreOutput, e2e_latency: f64) -> Map<String, Value> {
+        output.prompt_token_ids = self
+            .prompt_token_ids
+            .as_ref()
+            .and_then(|slot| slot.get().cloned());
+        python_out(output, &self.rid, e2e_latency)
     }
 
     fn unregister(&mut self) {
@@ -907,9 +971,11 @@ impl Drop for RequestRecord {
         };
         if self.admitted {
             // Dropped unfinished: kept with what it generated, unlogged.
-            let output = lock(&self.output).clone();
-            let out = python_out(output, &self.rid, self.created_at.elapsed().as_secs_f64());
-            recorder.finish(id, self.log_metrics, &out, unix_time());
+            let out = self.log_metrics.then(|| {
+                let output = lock(&self.output).clone();
+                self.python_out(output, self.created_at.elapsed().as_secs_f64())
+            });
+            recorder.finish(id, out.as_ref(), unix_time());
         } else {
             recorder.unregister(id);
         }
@@ -1047,8 +1113,7 @@ impl RequestLogger {
         out: &Map<String, Value>,
         e2e_latency: f64,
     ) {
-        let exceeded_ms = self.config.exceeded_ms;
-        if exceeded_ms > 0 && e2e_latency * 1000.0 < exceeded_ms as f64 {
+        if !self.logs_finish(e2e_latency) {
             return;
         }
         let line = if self.config.json {
@@ -1057,6 +1122,13 @@ impl RequestLogger {
             self.finished_line(obj, headers, out)
         };
         self.sink.emit(&line);
+    }
+
+    /// Whether a request that took `e2e_latency` seconds gets a `Finish` line
+    /// (`SGLANG_LOG_REQUEST_EXCEEDED_MS`).
+    fn logs_finish(&self, e2e_latency: f64) -> bool {
+        let exceeded_ms = self.config.exceeded_ms;
+        exceeded_ms <= 0 || e2e_latency * 1000.0 >= exceeded_ms as f64
     }
 
     /// Python `log_openai_received_request`'s message.
@@ -1514,12 +1586,18 @@ impl LogSink {
 /// Python's watermark redaction (`redact_watermark_secrets`), by key: the
 /// secret fields anywhere, and a watermark config's keys. Python redacts only
 /// with `--enable-watermark`; these lines always do.
-const WATERMARK_SECRET_FIELDS: [&str; 3] = ["watermark_key", "watermark_key_b", "watermark_config"];
+const WATERMARK_SECRET_FIELDS: [&str; 4] = [
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_keys",
+    "watermark_config",
+];
 
 /// Whether the value under key `name` is a watermark secret; `in_watermark`
 /// is set under a `watermark` key.
 fn is_watermark_secret(name: &str, in_watermark: bool) -> bool {
-    WATERMARK_SECRET_FIELDS.contains(&name) || (in_watermark && matches!(name, "key" | "key_b"))
+    WATERMARK_SECRET_FIELDS.contains(&name)
+        || (in_watermark && matches!(name, "key" | "key_b" | "keys"))
 }
 
 /// One field or dict entry: the value, or `'<redacted>'` for a watermark
@@ -1535,17 +1613,14 @@ fn write_field(out: &mut String, name: &str, value: &Value, max_length: usize, i
 /// One value as `_dataclass_to_string_truncated(value, max_length)` prints it.
 fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_watermark: bool) {
     match value {
-        Value::String(s) => {
-            let len = s.chars().count();
-            if len > max_length {
-                let (head, tail) = halves(len, max_length);
-                write_str_repr(out, &s.chars().take(head).collect::<String>());
+        Value::String(s) => match str_halves(s, max_length) {
+            Some((head, tail)) => {
+                write_str_repr(out, head);
                 out.push_str(" ... ");
-                write_str_repr(out, &s.chars().skip(tail).collect::<String>());
-            } else {
-                write_str_repr(out, s);
+                write_str_repr(out, tail);
             }
-        }
+            None => write_str_repr(out, s),
+        },
         Value::Array(items) if items.len() > max_length => {
             let (head, tail) = halves(items.len(), max_length);
             write_list(out, &items[..head], in_watermark);
@@ -1562,6 +1637,24 @@ fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_waterm
 fn halves(len: usize, max_length: usize) -> (usize, usize) {
     let half = max_length / 2;
     (half, if half == 0 { 0 } else { len - half })
+}
+
+/// [`halves`] of a string longer than `max_length` characters, as slices;
+/// `None` when it is not longer. Reads at most `max_length + 1` characters
+/// from the front and `max_length / 2` from the back, not the whole string.
+fn str_halves(s: &str, max_length: usize) -> Option<(&str, &str)> {
+    // No more bytes than `max_length` is no more characters either.
+    if s.len() <= max_length {
+        return None;
+    }
+    s.char_indices().nth(max_length)?;
+    let half = max_length / 2;
+    let head_end = s.char_indices().nth(half).map_or(s.len(), |(i, _)| i);
+    let tail_start = match half {
+        0 => 0,
+        half => s.char_indices().nth_back(half - 1).map_or(0, |(i, _)| i),
+    };
+    Some((&s[..head_end], &s[tail_start..]))
 }
 
 /// A dict level of `_dataclass_to_string_truncated`: keys quoted as they are,
@@ -1761,15 +1854,10 @@ impl serde::Serialize for Transformed<'_> {
         let max_length = self.max_length;
         match self.value {
             Value::String(s) => {
-                let len = s.chars().count();
-                if len <= max_length {
+                let Some((head, tail)) = str_halves(s, max_length) else {
                     return serializer.serialize_str(s);
-                }
-                let (head, tail) = halves(len, max_length);
-                let mut cut: String = s.chars().take(head).collect();
-                cut.push_str("...");
-                cut.extend(s.chars().skip(tail));
-                serializer.serialize_str(&cut)
+                };
+                serializer.serialize_str(&[head, "...", tail].concat())
             }
             Value::Array(items) => {
                 let item = |item| Transformed::new(item, max_length, self.in_watermark);
@@ -1980,6 +2068,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// as Python's `crash_dump_request_list` and `rid_to_state` hold them. One
 /// lock covers both, so a request moves from one to the other atomically and
 /// a snapshot sees it exactly once; JSON is written outside the lock.
+///
+/// Retention is bounded by time only, as Python's is: there is no byte cap.
+/// Memory grows with request rate × body size × the window, so multimodal
+/// bodies of several MiB at tens of requests per second reach tens of GiB per
+/// listener. A cap (dropping the oldest finished entries and counting them)
+/// is a possible follow-up.
 #[derive(Default)]
 struct CrashRecorder {
     state: Mutex<RecorderState>,
@@ -2081,20 +2175,25 @@ impl CrashRecorder {
         id
     }
 
+    /// What leaves the recorder is freed after unlocking: it may hold the last
+    /// reference to a large body.
     fn unregister(&self, id: u64) {
-        lock(&self.state).in_flight.remove(&id);
+        let entry = lock(&self.state).in_flight.remove(&id);
+        drop(entry);
     }
 
     /// Move a finished request to the window, evicting what finished five
-    /// minutes before it (Python `record_request_for_crash_dump`).
-    fn finish(&self, id: u64, log_metrics: bool, out: &Map<String, Value>, now: f64) {
-        let out = log_metrics
-            .then(|| Bytes::from(serde_json::to_vec(out).expect("a JSON map serializes")));
+    /// minutes before it (Python `record_request_for_crash_dump`). A request
+    /// without `out` (the health probe) is not kept.
+    fn finish(&self, id: u64, out: Option<&Map<String, Value>>, now: f64) {
+        let out =
+            out.map(|out| Bytes::from(serde_json::to_vec(out).expect("a JSON map serializes")));
         let mut state = lock(&self.state);
         let Some(entry) = state.in_flight.remove(&id) else {
             return;
         };
         let Some(out) = out else {
+            drop(state); // then `entry`
             return;
         };
         state.finished.push_back(FinishedRequest {
@@ -2103,13 +2202,14 @@ impl CrashRecorder {
             created_time: entry.created_time,
             finished_time: now,
         });
-        while state
+        let expired = state
             .finished
-            .front()
-            .is_some_and(|oldest| now - oldest.finished_time >= CRASH_DUMP_WINDOW_SECS)
-        {
-            state.finished.pop_front();
-        }
+            .iter()
+            .take_while(|oldest| now - oldest.finished_time >= CRASH_DUMP_WINDOW_SECS)
+            .count();
+        let evicted: Vec<FinishedRequest> = state.finished.drain(..expired).collect();
+        drop(state); // then `evicted`, as `unregister` frees
+        drop(evicted);
     }
 
     /// `{"bodies": {id: body}, "finished": [record], "unfinished": [record]}`,
@@ -2117,8 +2217,8 @@ impl CrashRecorder {
     /// "finished_time"}` and each body written once, however many items of a
     /// batch name it.
     fn snapshot(&self, now: f64) -> Vec<u8> {
-        // Capture under the lock (reference counts and the partial outputs),
-        // write outside it.
+        // Capture reference counts under the lock; read the partial outputs
+        // and write outside it.
         let (finished, unfinished) = {
             let state = lock(&self.state);
             let finished: Vec<(DumpRequest, Bytes, f64, f64)> = state
@@ -2133,16 +2233,10 @@ impl CrashRecorder {
                     )
                 })
                 .collect();
-            let unfinished: Vec<(DumpRequest, Map<String, Value>, f64)> = state
+            let unfinished: Vec<(DumpRequest, Arc<Mutex<CoreOutput>>, f64)> = state
                 .in_flight
                 .values()
-                .map(|e| {
-                    (
-                        e.request.clone(),
-                        partial_out(&lock(&e.output)),
-                        e.created_time,
-                    )
-                })
+                .map(|e| (e.request.clone(), e.output.clone(), e.created_time))
                 .collect();
             (finished, unfinished)
         };
@@ -2162,7 +2256,7 @@ impl CrashRecorder {
                 buf.push(b',');
             }
             bodies.insert(request.body.id, request.body.clone());
-            let out = serde_json::to_vec(out).expect("a JSON map serializes");
+            let out = serde_json::to_vec(&PartialOut::of(&lock(out))).expect("serializes");
             write_record(&mut buf, request, &out, *created, now);
         }
         buf.extend_from_slice(b"]}");
@@ -2182,15 +2276,21 @@ impl CrashRecorder {
 }
 
 /// Python's `ReqState.get_crash_dump_output`: what was generated so far.
-fn partial_out(output: &CoreOutput) -> Map<String, Value> {
-    let mut out = Map::new();
-    if !output.text.is_empty() {
-        out.insert("text".into(), output.text.clone().into());
+#[derive(serde::Serialize)]
+struct PartialOut<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
+    text: &'a str,
+    #[serde(skip_serializing_if = "<[i64]>::is_empty")]
+    output_ids: &'a [i64],
+}
+
+impl<'a> PartialOut<'a> {
+    fn of(output: &'a CoreOutput) -> Self {
+        Self {
+            text: &output.text,
+            output_ids: &output.token_ids,
+        }
     }
-    if !output.token_ids.is_empty() {
-        out.insert("output_ids".into(), output.token_ids.clone().into());
-    }
-    out
 }
 
 fn write_record(buf: &mut Vec<u8>, request: &DumpRequest, out: &[u8], created: f64, finished: f64) {
