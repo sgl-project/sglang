@@ -20,58 +20,51 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.logit_bias import build_logit_bias
 from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
-from sglang.srt.utils.device import async_h2d, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampler_params import SamplerParams
 
 
 logger = logging.getLogger(__name__)
 
 
-def _rows_with_seed(
-    reqs: List[Req], *, enable_deterministic: bool
-) -> Optional[List[bool]]:
-    """Which rows sample with their request's own seed, outside deterministic mode.
+def _any_row_with_seed(reqs: List[Req]) -> bool:
+    """Whether some row samples with its request's own seed, when deterministic
+    mode is off (it seeds every row).
 
-    None when no row does, in deterministic mode (which seeds every row), and under
-    speculative decoding, whose draft graphs have seed buffers only in deterministic
-    mode. A greedy row never draws, so its seed does not count.
+    False under speculative decoding, whose draft graphs have seed buffers only in
+    deterministic mode. A greedy row never draws, so its seed does not count.
     """
-    if enable_deterministic:
-        return None
-    rows = [
+    if not any(
         r.sampling_params.sampling_seed is not None and r.sampling_params.top_k > 1
         for r in reqs
-    ]
-    if not any(rows):
-        return None
+    ):
+        return False
     if get_spec().speculative_algorithm is not None:
         print_warning_once(
             "sampling_seed is ignored with speculative decoding unless "
             "--enable-deterministic-inference is set."
         )
-        return None
-    return rows
+        return False
+    return True
 
 
-# TP ranks sample independently, so their filler seeds must match. Every rank builds
-# the same batches, but other code (e.g. tracing) may draw from the global `random`
+# TP ranks sample independently, so their filler seeds must match. Every rank runs
+# the same steps, but other code (e.g. tracing) may draw from the global `random`
 # on one rank and not another, which would put the ranks' sequences out of step.
 _FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
 
 
-def _filler_seed() -> int:
-    # The seeded samplers hash each seed as uint64; any int64 works.
-    return _FILLER_SEED_RNG.getrandbits(63)
-
-
-def _filler_seeds(n: int, device: str) -> torch.Tensor:
-    return torch.tensor([_filler_seed() for _ in range(n)], dtype=torch.int64).to(
-        device, non_blocking=True
-    )
+def _filler_seed(req: Req) -> int:
+    """The random seed an unseeded request samples with beside seeded rows, drawn
+    the first time it is needed and kept for the request's later steps."""
+    if req.filler_sampling_seed is None:
+        # The seeded samplers hash each seed as uint64; any int64 works.
+        req.filler_sampling_seed = _FILLER_SEED_RNG.getrandbits(63)
+    return req.filler_sampling_seed
 
 
 @dataclasses.dataclass
@@ -112,15 +105,11 @@ class SamplingBatchInfo:
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
+    # Set by the scheduler at each launch (set_seeds_and_mask_rows).
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
-    # Outside deterministic mode, which rows sample with their own seed; None if none do.
-    rows_with_seed: Optional[List[bool]] = None
-
-    # CPU request flags and their derived device indices. The flags make batch
-    # filtering cheap; the indices keep sampler work limited to opted-in rows.
-    return_sampling_masks: Optional[List[bool]] = None
-    return_sampling_support_logprobs: Optional[List[bool]] = None
+    # Rows of the requests that return sampling masks, and each support-mode row's
+    # index among them; None when no row has one. They limit capture to those rows.
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
@@ -137,114 +126,6 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
-
-    @classmethod
-    def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
-
-        reqs = batch.reqs
-        device = batch.device
-        _pin = is_pin_memory_available(device)
-        rows_with_seed = _rows_with_seed(
-            reqs, enable_deterministic=enable_deterministic
-        )
-        sampling_seed = None
-        if enable_deterministic or rows_with_seed is not None:
-            seeds = []
-            for r in reqs:
-                seed = r.sampling_params.sampling_seed
-                if seed is None:
-                    # A deterministic run defaults to 42; otherwise the row stays random.
-                    seed = 42 if enable_deterministic else _filler_seed()
-                seeds.append(seed)
-            sampling_seed = torch.tensor(seeds, dtype=torch.int64, pin_memory=_pin).to(
-                device, non_blocking=True
-            )
-
-        return_sampling_masks = [r.return_sampling_mask for r in reqs]
-        return_sampling_support_logprobs = [
-            r.return_sampling_mask and r.sampling_logprobs_mode == "support"
-            for r in reqs
-        ]
-        sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
-            return_sampling_masks, device
-        )
-        sampling_support_logprobs_capture_indices = (
-            cls._make_sampling_support_logprobs_capture_indices(
-                return_sampling_masks,
-                return_sampling_support_logprobs,
-                device,
-            )
-        )
-        sampling_mask_top_ks = [
-            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
-        ]
-
-        ret = cls(
-            sampling_seed=sampling_seed,
-            rows_with_seed=rows_with_seed,
-            vocab_size=vocab_size,
-            device=device,
-            return_sampling_masks=return_sampling_masks,
-            return_sampling_support_logprobs=return_sampling_support_logprobs,
-            sampling_mask_batch_indices=sampling_mask_batch_indices,
-            sampling_support_logprobs_capture_indices=(
-                sampling_support_logprobs_capture_indices
-            ),
-            sampling_mask_top_ks=sampling_mask_top_ks,
-        )
-        ret.adjusted_from_schedule_batch(batch, vocab_size)
-        return ret
-
-    # placeholder for override
-    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
-        pass
-
-    # placeholder for override
-    def adjusted_merge_batch(self, other: SamplingBatchInfo):
-        pass
-
-    # placeholder for override
-    def adjusted_filter_batch(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
-        pass
-
-    @staticmethod
-    def _make_sampling_mask_batch_indices(
-        return_sampling_masks: List[bool], device: str
-    ) -> Optional[torch.Tensor]:
-        """Build device row indices for requests that return sampling masks."""
-        indices = [
-            i for i, should_return in enumerate(return_sampling_masks) if should_return
-        ]
-        if not indices:
-            return None
-        return async_h2d(indices, dtype=torch.long, device=device)
-
-    @staticmethod
-    def _make_sampling_support_logprobs_capture_indices(
-        return_sampling_masks: List[bool],
-        return_sampling_support_logprobs: Optional[List[bool]],
-        device: str,
-    ) -> Optional[torch.Tensor]:
-        """Map support-mode requests to rows in the compact mask capture."""
-        if return_sampling_support_logprobs is None:
-            return None
-        capture_index = -1
-        indices = []
-        for return_mask, return_support in zip(
-            return_sampling_masks,
-            return_sampling_support_logprobs,
-            strict=True,
-        ):
-            if return_mask:
-                capture_index += 1
-            if return_support:
-                indices.append(capture_index)
-        if not indices:
-            return None
-        return async_h2d(indices, dtype=torch.long, device=device)
 
     def set_sampler_params(self, params: SamplerParams) -> None:
         for name, value in zip(params._fields, params):
@@ -287,95 +168,46 @@ class SamplingBatchInfo:
             for processor_str, rows in rows_by_processor.items()
         }
 
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        if self.rows_with_seed is not None:
-            self.rows_with_seed = [self.rows_with_seed[i] for i in keep_indices]
-            if not any(self.rows_with_seed):
-                # The last seeded row left; go back to the unseeded samplers.
-                self.rows_with_seed = None
-                self.sampling_seed = None
+    def set_seeds_and_mask_rows(self, reqs: List[Req]) -> None:
+        """Build the per-row seeds and the sampling-mask rows from the step's requests."""
+        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
+        seeded = enable_deterministic or _any_row_with_seed(reqs)
+        seeds = []
+        if seeded:
+            for r in reqs:
+                seed = r.sampling_params.sampling_seed
+                if seed is None:
+                    # A deterministic run defaults to 42; otherwise the row stays random.
+                    seed = 42 if enable_deterministic else _filler_seed(r)
+                seeds.append(seed)
+        mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
+        capture_rows = [
+            j
+            for j, i in enumerate(mask_rows)
+            if reqs[i].sampling_logprobs_mode == "support"
+        ]
 
-        if self.sampling_seed is not None:
-            self.sampling_seed = self.sampling_seed[keep_indices_device]
-
-        if self.return_sampling_masks is not None:
-            self.return_sampling_masks = [
-                self.return_sampling_masks[i] for i in keep_indices
-            ]
-            if self.sampling_mask_top_ks is not None:
-                self.sampling_mask_top_ks = [
-                    self.sampling_mask_top_ks[i] for i in keep_indices
-                ]
-            if self.return_sampling_support_logprobs is not None:
-                self.return_sampling_support_logprobs = [
-                    self.return_sampling_support_logprobs[i] for i in keep_indices
-                ]
-            if self.sampling_mask_batch_indices is not None:
-                self.sampling_mask_batch_indices = (
-                    self._make_sampling_mask_batch_indices(
-                        self.return_sampling_masks, self.device
-                    )
-                )
-                self.sampling_support_logprobs_capture_indices = (
-                    self._make_sampling_support_logprobs_capture_indices(
-                        self.return_sampling_masks,
-                        self.return_sampling_support_logprobs,
-                        self.device,
-                    )
-                )
-
-        self.adjusted_filter_batch(keep_indices, keep_indices_device)
-
-    def merge_batch(self, other: SamplingBatchInfo, *, self_len: int, other_len: int):
-        if (
-            self.return_sampling_masks is not None
-            or other.return_sampling_masks is not None
-        ):
-            if other.sampling_mask_batch_indices is not None:
-                other_sampling_mask_batch_indices = (
-                    other.sampling_mask_batch_indices + self_len
-                )
-                self.sampling_mask_batch_indices = (
-                    other_sampling_mask_batch_indices
-                    if self.sampling_mask_batch_indices is None
-                    else torch.cat(
-                        [
-                            self.sampling_mask_batch_indices,
-                            other_sampling_mask_batch_indices,
-                        ]
-                    )
-                )
-            self.return_sampling_masks = (
-                self.return_sampling_masks or [False] * self_len
-            ) + (other.return_sampling_masks or [False] * other_len)
-            self.return_sampling_support_logprobs = (
-                self.return_sampling_support_logprobs or [False] * self_len
-            ) + (other.return_sampling_support_logprobs or [False] * other_len)
-            self.sampling_support_logprobs_capture_indices = (
-                self._make_sampling_support_logprobs_capture_indices(
-                    self.return_sampling_masks,
-                    self.return_sampling_support_logprobs,
-                    self.device,
-                )
-            )
-            self.sampling_mask_top_ks = (
-                self.sampling_mask_top_ks or [1] * self_len
-            ) + (other.sampling_mask_top_ks or [1] * other_len)
-
-        if self.rows_with_seed is not None or other.rows_with_seed is not None:
-            self.rows_with_seed = (self.rows_with_seed or [False] * self_len) + (
-                other.rows_with_seed or [False] * other_len
-            )
-            # Rows of an unseeded side sample with random seeds, as in from_schedule_batch.
-            if self.sampling_seed is None:
-                self.sampling_seed = _filler_seeds(self_len, self.device)
-            if other.sampling_seed is None:
-                other.sampling_seed = _filler_seeds(other_len, self.device)
-
-        if self.sampling_seed is not None and other.sampling_seed is not None:
-            self.sampling_seed = torch.cat([self.sampling_seed, other.sampling_seed])
-
-        self.adjusted_merge_batch(other)
+        rows = seeds + mask_rows + capture_rows
+        device_rows = None
+        if rows:
+            # One copy for the three int64 lists.
+            device_rows = async_h2d(rows, dtype=torch.int64, device=self.device)
+        elif seeded:
+            # A deterministic idle batch still seeds, with no rows.
+            device_rows = torch.empty(0, dtype=torch.int64, device=self.device)
+        num_seeds, num_masks = len(seeds), len(mask_rows)
+        self.sampling_seed = device_rows[:num_seeds] if seeded else None
+        self.sampling_mask_batch_indices = (
+            device_rows[num_seeds : num_seeds + num_masks] if mask_rows else None
+        )
+        self.sampling_support_logprobs_capture_indices = (
+            device_rows[num_seeds + num_masks :] if capture_rows else None
+        )
+        self.sampling_mask_top_ks = (
+            [r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs]
+            if mask_rows
+            else None
+        )
 
     def copy_for_forward(self):
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:

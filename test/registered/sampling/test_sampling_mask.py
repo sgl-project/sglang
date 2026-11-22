@@ -223,7 +223,6 @@ class TestSamplingMaskCapture(CustomTestCase):
                             indices=torch.tensor([0], device="cuda"),
                         )
                     },
-                    return_sampling_masks=[True, True],
                     sampling_mask_batch_indices=torch.tensor([0, 1], device="cuda"),
                 )
                 logits = _adjust_after_watermark(logits, info)
