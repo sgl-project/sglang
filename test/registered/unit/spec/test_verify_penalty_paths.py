@@ -93,16 +93,11 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         )
 
     def test_dflash_block_verify_applies_the_custom_processor_last(self):
-        """Decoding's order: penalties, grammar mask, logit bias, custom processor."""
+        """Decoding's order: penalties, logit bias, custom processor."""
         bs, width = 2, 3
         verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
-        banned = torch.zeros(bs, VOCAB_SIZE, dtype=torch.bool)
-        banned[0, 4] = banned[1, 6] = True
         info = _sampling_info(bs)
         info.step_penalties = _step(bs)
-        info.grammar_mask = SimpleNamespace(
-            apply=lambda t: t.masked_fill_(banned, float("-inf"))
-        )
         generator = torch.Generator().manual_seed(0)
         info.logit_bias = torch.randn(bs, VOCAB_SIZE, generator=generator)
         info.has_custom_logit_processor = True
@@ -112,9 +107,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
         expected = logits.clone()
         info.step_penalties.apply_verify(expected, verify_tokens)
-        by_request = expected.view(bs, width, VOCAB_SIZE)
-        by_request.masked_fill_(banned[:, None, :], float("-inf"))
-        by_request.add_(info.logit_bias[:, None, :])
+        expected.view(bs, width, VOCAB_SIZE).add_(info.logit_bias[:, None, :])
 
         seen = []
         with patch.object(

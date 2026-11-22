@@ -9,11 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import (
-    BaseGrammarObject,
-    GrammarMask,
-    GrammarRow,
-)
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
@@ -104,11 +100,9 @@ class SamplingBatchInfo:
     npu_top_k_top_p_eligible: bool = False
     max_top_k: Optional[int] = None
 
-    # Masking tensors for grammar-guided structured outputs
-    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
+    # Hashed request ids for the KV canary's token oracle; set in ForwardBatch.
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
-    grammar_mask: Optional[GrammarMask] = None
 
     # Set by the scheduler at each launch.
     step_penalties: Optional[StepPenalties] = None
@@ -141,6 +135,8 @@ class SamplingBatchInfo:
 
     # Set by the scheduler at each launch (set_plugin_state).
     logit_bias: Optional[torch.Tensor] = None
+    # The step's grammar objects, None when no request has one (see grammar_mask.py).
+    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -255,10 +251,13 @@ class SamplingBatchInfo:
             setattr(self, name, value)
 
     def set_plugin_state(self, reqs: List[Req]) -> None:
-        """Build logit_bias and the custom logit processors from the step's requests."""
+        """Build logit_bias, the grammars, and the custom logit processors from the
+        step's requests."""
         self.logit_bias = build_logit_bias(
             reqs, vocab_size=self.vocab_size, device=self.device
         )
+        grammars = [r.grammar for r in reqs]
+        self.grammars = grammars if any(grammars) else None
 
         # Group the step's requests by custom logit processor.
         enable_custom_processor = get_exec().features.enable_custom_logit_processor
@@ -287,33 +286,6 @@ class SamplingBatchInfo:
             )
             for processor_str, rows in rows_by_processor.items()
         }
-
-    def update_regex_vocab_mask(self):
-        if not self.grammars:
-            self.grammar_mask = None
-            return
-
-        # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
-
-        vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.grammars),
-            device=self.device,
-        )
-
-        # Rows omitted here (finished / terminated / non-grammar requests) retain
-        # the freshly allocated buffer's unconstrained value.
-        entries = [
-            GrammarRow(row=row, grammar=grammar)
-            for row, grammar in enumerate(self.grammars)
-            if grammar and not grammar.finished and not grammar.is_terminated()
-        ]
-        first_grammar.fill_vocab_mask_batched(entries, vocab_mask)
-
-        # Move the mask to the device if needed
-        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
-        self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         if self.rows_with_seed is not None:

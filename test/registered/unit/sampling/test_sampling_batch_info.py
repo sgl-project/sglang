@@ -7,16 +7,16 @@ register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import GrammarMask
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
 )
+from sglang.srt.sampling.grammar_mask import build_grammar_mask
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
@@ -125,9 +125,14 @@ class TestSamplingMaskBatchIndices(CustomTestCase):
         self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
 
 
-def _preset_grammar_mask(info, grammar_mask):
-    """Make the grammar slot build `grammar_mask`."""
-    info.update_regex_vocab_mask = lambda: setattr(info, "grammar_mask", grammar_mask)
+def _grammar(vocab_mask, apply_vocab_mask):
+    """An active grammar whose step mask is `vocab_mask`."""
+    grammar = MagicMock(finished=False)
+    grammar.is_terminated.return_value = False
+    grammar.allocate_vocab_mask.return_value = vocab_mask
+    grammar.move_vocab_mask.side_effect = lambda mask, device: mask
+    grammar.apply_vocab_mask.side_effect = apply_vocab_mask
+    return grammar
 
 
 # SamplingPipeline
@@ -137,9 +142,12 @@ class TestSamplingPipelineOrder(CustomTestCase):
         processor and sanitize also process the watermark's logprob logits."""
         events = []
         info = _make_info(batch_size=1)
-        _preset_grammar_mask(
-            info, SimpleNamespace(apply=lambda logits: events.append("grammar"))
-        )
+        info.grammars = [
+            _grammar(
+                torch.zeros(1, 4),
+                lambda logits, vocab_mask: events.append("grammar"),
+            )
+        ]
         info.step_penalties = SimpleNamespace(
             logit_penalties=lambda: events.append("penalty") or (None, None),
             commit=lambda token_ids: events.append("penalty commit"),
@@ -223,13 +231,13 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 events.append(("before", logits.clone()))
                 return object()
 
-        grammar = MagicMock()
-        grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: logits.fill_(
-            -4.0
+        grammar = _grammar(
+            torch.ones(1, VOCAB_SIZE),
+            lambda logits, vocab_mask: logits.fill_(-4.0),
         )
         info = _make_info(batch_size=1)
         info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
-        _preset_grammar_mask(info, GrammarMask(grammar, torch.ones(1, VOCAB_SIZE)))
+        info.grammars = [grammar]
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
         logits = torch.zeros(1, VOCAB_SIZE)
 
@@ -247,21 +255,16 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 return object()
 
         def make_info():
-            grammar = MagicMock()
-            grammar.apply_vocab_mask.side_effect = lambda logits, vocab_mask: (
-                logits.add_(vocab_mask)
+            grammar = _grammar(
+                torch.linspace(-2.0, 0.0, VOCAB_SIZE).unsqueeze(0),
+                lambda logits, vocab_mask: logits.add_(vocab_mask),
             )
             info = _make_info(batch_size=1)
             info.step_penalties = _tables_step(
                 torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
                 torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
             )
-            _preset_grammar_mask(
-                info,
-                GrammarMask(
-                    grammar, torch.linspace(-2.0, 0.0, VOCAB_SIZE).unsqueeze(0)
-                ),
-            )
+            info.grammars = [grammar]
             info.logit_bias = torch.linspace(0.0, 1.0, VOCAB_SIZE).unsqueeze(0)
             return info
 
@@ -276,21 +279,13 @@ class TestSamplingPipelineOrder(CustomTestCase):
         self.assertTrue(torch.equal(observed_logits, ordinary_logits))
 
 
-# update_regex_vocab_mask
-class TestUpdateRegexVocabMask(CustomTestCase):
-    def test_no_grammars_clears_mask(self):
-        """Test that None grammars clears the grammar_mask."""
-        info = _make_info(batch_size=1)
-        info.grammars = None
-        info.update_regex_vocab_mask()
-        self.assertIsNone(info.grammar_mask)
-
-    def test_empty_grammars_clears_mask(self):
-        """Test that empty grammars list clears the grammar_mask."""
-        info = _make_info(batch_size=1)
-        info.grammars = []
-        info.update_regex_vocab_mask()
-        self.assertIsNone(info.grammar_mask)
+# build_grammar_mask
+class TestBuildGrammarMask(CustomTestCase):
+    def test_no_grammars_builds_no_mask(self):
+        for grammars in (None, []):
+            self.assertIsNone(
+                build_grammar_mask(grammars, vocab_size=VOCAB_SIZE, device=DEVICE)
+            )
 
     def test_with_grammars_allocates_and_fills(self):
         """Test that an active grammar gets allocate, fill, and move called."""
@@ -300,14 +295,14 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         grammar.fill_vocab_mask_batched.side_effect = _serial_batched_fill
         grammar.allocate_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         grammar.move_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
-        info = _make_info(batch_size=1)
-        info.grammars = [grammar]
-        info.update_regex_vocab_mask()
+        grammar_mask = build_grammar_mask(
+            [grammar], vocab_size=VOCAB_SIZE, device=DEVICE
+        )
         grammar.allocate_vocab_mask.assert_called_once()
         grammar.fill_vocab_mask_batched.assert_called_once()
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
-        self.assertIs(info.grammar_mask.grammar, grammar)
+        self.assertIs(grammar_mask.grammar, grammar)
 
     def test_mixed_grammars_only_active_fills(self):
         """Test that finished, terminated, and None grammars are skipped."""
@@ -315,8 +310,8 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         active.finished = False
         active.is_terminated.return_value = False
         active.fill_vocab_mask_batched.side_effect = _serial_batched_fill
-        active.allocate_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
-        active.move_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
+        active.allocate_vocab_mask.return_value = torch.zeros(4, VOCAB_SIZE)
+        active.move_vocab_mask.return_value = torch.zeros(4, VOCAB_SIZE)
 
         finished = MagicMock()
         finished.finished = True
@@ -325,12 +320,12 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         terminated.finished = False
         terminated.is_terminated.return_value = True
 
-        info = _make_info(batch_size=3)
-        info.grammars = [active, finished, terminated]
-        info.update_regex_vocab_mask()
+        build_grammar_mask(
+            [None, active, finished, terminated], vocab_size=VOCAB_SIZE, device=DEVICE
+        )
 
         active.fill_vocab_mask_batched.assert_called_once()
-        active.fill_vocab_mask.assert_called_once()
+        active.fill_vocab_mask.assert_called_once_with(ANY, 1)
         finished.fill_vocab_mask.assert_not_called()
         terminated.fill_vocab_mask.assert_not_called()
 
@@ -346,9 +341,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         other.finished = False
         other.is_terminated.return_value = False
 
-        info = _make_info(batch_size=2)
-        info.grammars = [active, other]
-        info.update_regex_vocab_mask()
+        build_grammar_mask([active, other], vocab_size=VOCAB_SIZE, device=DEVICE)
 
         # The batched call happened with both active rows; serial fill skipped.
         active.fill_vocab_mask_batched.assert_called_once()
@@ -483,6 +476,7 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
+        req.grammar = None
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -548,6 +542,17 @@ class TestFromScheduleBatch(CustomTestCase):
         apply_custom_logit_processor(logits, info)
         self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
         self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+
+    def test_grammars_are_set_only_when_a_request_has_one(self):
+        reqs = [self._make_req(), self._make_req()]
+        info = _make_info(batch_size=2)
+        info.set_plugin_state(reqs)
+        self.assertIsNone(info.grammars)
+
+        grammar = object()
+        reqs[1].grammar = grammar
+        info.set_plugin_state(reqs)
+        self.assertEqual(info.grammars, [None, grammar])
 
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()

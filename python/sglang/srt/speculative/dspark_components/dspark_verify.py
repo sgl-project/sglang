@@ -115,8 +115,6 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return False
     if sampling_info.step_penalties is not None:
         return False
-    if getattr(sampling_info, "grammar_mask", None) is not None:
-        return False
     if getattr(sampling_info, "logit_bias", None) is not None:
         return False
     return True

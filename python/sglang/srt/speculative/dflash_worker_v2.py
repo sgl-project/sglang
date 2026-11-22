@@ -307,7 +307,6 @@ def _verify_logits_unadjusted(sampling_info) -> bool:
     return not (
         sampling_info.has_custom_logit_processor
         or sampling_info.step_penalties is not None
-        or sampling_info.grammar_mask is not None
         or sampling_info.logit_bias is not None
         or sampling_info.sampling_mask_batch_indices is not None
     )

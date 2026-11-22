@@ -249,22 +249,9 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
-
-    # Same order as SamplingPipeline.
+    # Same order as SamplingPipeline, minus the grammar mask the caller applies after.
     if sampling_info.step_penalties is not None:
         sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
-
-    if grammar_mask is not None:
-        vocab_mask_bias = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
-        grammar_mask.apply(vocab_mask_bias)
-        next_token_logits.reshape(bs, draft_token_num, -1).add_(
-            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
-        )
 
     apply_logit_bias(next_token_logits, sampling_info, rows_per_request=draft_token_num)
 
