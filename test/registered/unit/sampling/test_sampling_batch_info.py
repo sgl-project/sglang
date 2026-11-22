@@ -23,6 +23,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
     _adjust_before_watermark,
+    adjust_verify_logits,
 )
 from sglang.srt.sampling.watermarking.interface import SampleStep
 from sglang.test.test_utils import CustomTestCase
@@ -145,6 +146,44 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 "watermark commit",
                 "penalty commit",
             ],
+        )
+
+    def test_verify_runs_the_watermark_before_the_custom_processor(self):
+        """Verify runs sampling's order; the custom processor also processes the
+        unwatermarked logits the watermark keeps for the logprobs."""
+        events = []
+        logits = torch.zeros(2, 4)
+        watermarked = torch.zeros(2, 4)
+
+        def apply_watermark(logits, *, sampling_info):
+            events.append("watermark")
+            return watermarked, sampling_info
+
+        module = "sglang.srt.sampling.sampling_pipeline"
+        with (
+            patch(
+                f"{module}.apply_logit_bias",
+                side_effect=lambda *args, **kwargs: events.append("logit_bias"),
+            ),
+            patch(
+                f"{module}.apply_custom_logit_processor",
+                side_effect=lambda t, info, **kwargs: events.append(
+                    "custom " + ("logits" if t is logits else "watermarked")
+                ),
+            ),
+        ):
+            verify_logits, _ = adjust_verify_logits(
+                logits,
+                sampling_info=_make_info(),
+                grammar_mask=None,
+                draft_tokens=torch.zeros(1, 2, dtype=torch.long),
+                has_custom_logit_processor=True,
+                apply_watermark=apply_watermark,
+            )
+
+        self.assertIs(verify_logits, watermarked)
+        self.assertEqual(
+            events, ["logit_bias", "watermark", "custom watermarked", "custom logits"]
         )
 
     def test_observer_sees_production_constraint_boundary(self):
