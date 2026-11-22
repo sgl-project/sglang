@@ -2932,6 +2932,32 @@ class TestHiCacheArgs(CustomTestCase):
                 ):
                     handle_hicache(args)
 
+    def test_state_free_decode_tree_rejects_hicache_and_linker(self):
+        for cache, forced, rejected in (
+            ({"enable_hierarchical_cache": True}, None, True),
+            ({"enable_unified_cache_external_linker": True}, None, True),
+            ({"enable_hierarchical_cache": True}, False, False),
+            ({}, None, False),
+        ):
+            with self.subTest(cache=cache, forced=forced):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    **cache,
+                )
+                declare_resolution(
+                    args,
+                    "test",
+                    uses_mamba_radix_cache=True,
+                    decode_state_free_radix_default=True,
+                )
+                with envs.SGLANG_DECODE_STATE_FREE_RADIX.override(forced):
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "state-free"):
+                            handle_hicache(args)
+                    else:
+                        handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
