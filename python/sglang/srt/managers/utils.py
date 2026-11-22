@@ -437,10 +437,8 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
 
 def pp_output_rows_to_host(tensor_dict: dict) -> bool:
-    """Start host copies of the device tensors in the PP output message's per-request
-    row lists (top and token-id logprobs); returns whether any started. The message
-    pickles these lists, and the receiving stage would rebuild a pickled device tensor
-    on the sender's device index, opening a context on a GPU it does not own."""
+    """Start one host copy per row list of device tensors (top and token-id logprobs)
+    on the current stream; returns whether any started."""
     copied = False
     for key, rows in tensor_dict.items():
         if isinstance(rows, list) and any(
@@ -449,6 +447,22 @@ def pp_output_rows_to_host(tensor_dict: dict) -> bool:
             tensor_dict[key] = _async_d2h_rows(rows)
             copied = True
     return copied
+
+
+def pp_output_rows_to_lists(tensor_dict: dict, rows_ready: torch.Event) -> None:
+    """Before the output message is pickled: wait for the host copies and turn the rows
+    into Python lists. Pickle stores a view's whole storage, and the rows share one."""
+    if not any(
+        isinstance(rows, list) and any(torch.is_tensor(row) for row in rows)
+        for rows in tensor_dict.values()
+    ):
+        return
+    rows_ready.synchronize()
+    for key, rows in tensor_dict.items():
+        if isinstance(rows, list) and any(torch.is_tensor(row) for row in rows):
+            tensor_dict[key] = [
+                row.tolist() if torch.is_tensor(row) else row for row in rows
+            ]
 
 
 def get_logprob_from_pp_outputs(

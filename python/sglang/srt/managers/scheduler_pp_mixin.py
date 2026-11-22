@@ -28,6 +28,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
     pp_output_rows_to_host,
+    pp_output_rows_to_lists,
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
@@ -1032,9 +1033,6 @@ class SchedulerPPMixin:
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
                 self.device_module.current_stream().wait_event(ready_event)
-            if msg_type == "output" and pp_output_rows_to_host(tensor_dict):
-                # send_tensor_dict pickles the host rows right away.
-                self.device_module.current_stream().synchronize()
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
@@ -1638,6 +1636,7 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
+                    pp_output_rows_to_lists(pp_outputs_to_send.tensors, q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1811,6 +1810,7 @@ class SchedulerPPMixin:
                     else:
                         self.device_module.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
+                        pp_output_rows_to_lists(send_dict, q_event)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
             if pp_outputs.tensors.get("__skip__"):
@@ -1919,13 +1919,14 @@ class SchedulerPPMixin:
                 )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
+                    tensor_dict = self._pp_prepare_tensor_dict(result, cur_batch)
+                    ready_event = event
+                    if pp_output_rows_to_host(tensor_dict):
+                        # The send waits for these copies, which follow the forward.
+                        ready_event = self.device_module.Event()
+                        ready_event.record(self.device_module.current_stream())
                     last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
-                        )
+                        (ready_event, PPProxyTensors(tensor_dict))
                     )
         return result, event
 
