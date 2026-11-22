@@ -15,7 +15,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -175,6 +175,7 @@ if _is_hip:
         _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
+    from sglang.kernels.ops.layernorm.gemma_norm_fp8 import gemma_rmsnorm_bf16_fp8
     from sglang.kernels.ops.layernorm.norm import (
         fused_add_rmsnorm as _jit_fused_add_rmsnorm,
     )
@@ -429,6 +430,20 @@ def _forward_with_allreduce_fusion_quant_per_group(
     if use_bpreshuffle:
         scale_out = materialize_bpreshuffle_fp8_scale(scale_out)
     return (bf16_out, fp8_out, scale_out), residual_out
+
+
+class Fp8InputWithBf16(NamedTuple):
+    """A norm output read twice: ``bf16`` by an unquantized projection and the
+    static per-tensor FP8 ``(fp8, scale, orig_dtype)`` by an FP8 one."""
+
+    bf16: torch.Tensor
+    fp8: torch.Tensor
+    scale: torch.Tensor
+    orig_dtype: torch.dtype
+
+    @property
+    def fp8_input(self):
+        return (self.fp8, self.scale, self.orig_dtype)
 
 
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
@@ -1361,6 +1376,7 @@ class GemmaRMSNorm(BaseFusedOp):
     supports_non_attn_tp_allreduce = True
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
+    _quant_keep_bf16: bool = False
 
     def __init__(
         self,
@@ -1388,11 +1404,15 @@ class GemmaRMSNorm(BaseFusedOp):
         # CPU offload may move the parameter to host while the buffer stays on device.
         self.gemma_weight.copy_(self.weight.data).add_(1.0)
 
-    def fuse_input_quant(self, linear: nn.Module) -> None:
+    def fuse_input_quant(self, linear: nn.Module, keep_bf16: bool = False) -> None:
         """Fuse the input quantization of ``linear``, the projection that consumes
         this norm's output, whenever forward_cuda can: static per-tensor FP8, or
-        NVFP4 W4A4. The projection stays out of this module's children."""
+        NVFP4 W4A4. The projection stays out of this module's children.
+
+        ``keep_bf16`` is for a norm another bf16 projection also reads: only the
+        static FP8 case fuses, and the output is an ``Fp8InputWithBf16``."""
         self.__dict__["_quant_linear"] = linear
+        self.__dict__["_quant_keep_bf16"] = keep_bf16
 
     def _forward_with_input_quant(
         self,
@@ -1405,6 +1425,19 @@ class GemmaRMSNorm(BaseFusedOp):
         # The fused kernels apply the stored (1 + w) as a plain RMSNorm weight.
         linear = self._quant_linear
         scale = _fp8_static_input_scale(linear)
+        if self._quant_keep_bf16:
+            if scale is None or x.dim() != 2 or x.stride(-1) != 1:
+                return None
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                if not residual.is_contiguous():
+                    return None
+            y, q = gemma_rmsnorm_bf16_fp8(
+                x, self.weight.data, self.variance_epsilon, scale, residual
+            )
+            out = Fp8InputWithBf16(y, q, scale, x.dtype)
+            return out if residual is None else (out, residual)
         if scale is not None and _flashinfer_rmsnorm_quant_available:
             return _rmsnorm_per_tensor_fp8_quant(
                 x,
