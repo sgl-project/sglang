@@ -3,6 +3,7 @@ its best blocks, a consumer takes its top-k among them."""
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
@@ -302,11 +303,13 @@ class DenseBlocksBackend:
 
     def _torch_publish_prefill(self, inputs: PrefillInputs):
         picked = []  # (query rows, their block ids) per scored chunk
+        # The Triton kernel selects on its own, so FlashInfer keeps the torch path.
         select_blocks = (
             select_candidate_block_ids_triton
-            if envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
+            if self.selector.backend.is_sgl_kernel()
+            and envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
             and get_platform().is_sm90
-            else select_candidate_block_ids
+            else partial(select_candidate_block_ids, topk_op=self.selector.dense)
         )
         for request, chunks in prefill_requests(
             inputs=inputs,
@@ -321,7 +324,6 @@ class DenseBlocksBackend:
                             chunk.lens[:, None],
                             topk_blocks=self.topk_blocks,
                             block_size=self.block_size,
-                            topk_op=self.selector.dense,
                         ),
                     )
                 )
