@@ -22,8 +22,11 @@ from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
+    GDN_FP8_PREFILL_MAX_TOKENS,
     ModelOptFp4LinearMethod,
+    ModelOptFp8Config,
     ModelOptFp8LinearMethod,
+    enable_gdn_fp8_prefill,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.managers.scheduler_components.dp_attn import (
@@ -35,10 +38,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     prefill_graph_tolerates_sum_len,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
-    _requires_exact_gdn_prefill_bucket,
+    _gdn_prefill_padding_max_tokens,
     configure_gdn_prefill_model,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
@@ -46,13 +53,14 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
+    get_parallel,
     override_platform,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPrefillCudaGraphPadding(CustomTestCase):
@@ -103,11 +111,12 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
     def test_padding_below_first_bucket_still_honors_gdn_safety(self):
         runner = self._make_runner()
         batch = self._make_forward_batch(1)
-        # Main permits 1 -> 4 despite the usual 2x waste bound. This is not
-        # permission to replay a numerically unsafe GDN projection at M=4.
-        self.assertTrue(runner.can_run_graph(batch))
-        runner._requires_exact_prefill_bucket = True
-        self.assertFalse(runner.can_run_graph(batch))
+        # The waste bound does not apply below the first bucket. The captured
+        # shape must still fit the actual GDN kernels used by that bucket.
+        for limit, expected in ((None, True), (0, False), (3, False), (4, True)):
+            with self.subTest(limit=limit):
+                runner._prefill_padding_max_tokens = limit
+                self.assertEqual(runner.can_run_graph(batch), expected)
 
     def test_mixed_batch_uses_scoped_runner_policy(self):
         runner = self._make_runner()
@@ -366,25 +375,34 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
     @contextmanager
     def _gdn_platform(
-        self, *, is_cuda=True, is_sm100=True, is_sm120=False, sequence_parallel=False
+        self,
+        *,
+        is_cuda=True,
+        is_sm100=True,
+        is_sm120=False,
+        device_capability=None,
+        sequence_parallel=False,
     ):
+        if device_capability is None:
+            if is_sm100:
+                device_capability = (10, 0)
+            elif is_sm120:
+                device_capability = (12, 0)
+            elif is_cuda:
+                device_capability = (9, 0)
+            else:
+                device_capability = (None, None)
         with (
             get_context().override_server_args(enable_deterministic_inference=False),
             mock.patch.object(runner_module, "is_cuda", return_value=is_cuda),
-            override_platform(is_cuda=is_cuda, is_sm100=is_sm100, is_sm120=is_sm120),
+            override_platform(
+                is_cuda=is_cuda,
+                is_sm100=is_sm100,
+                is_sm120=is_sm120,
+                device_capability=device_capability,
+            ),
             get_flags().sp.override(enabled=sequence_parallel),
-            mock.patch(
-                "sglang.kernels.ops.attention.fla.layernorm_gated._get_sm_count",
-                return_value=188 if is_sm120 else 148,
-            ),
-            mock.patch(
-                "sglang.kernels.ops.attention.fla.layernorm_gated.is_batch_invariant_mode_enabled",
-                return_value=False,
-            ),
-            mock.patch(
-                "sglang.kernels.ops.attention.fla.layernorm_gated.check_cuda_graph_backend",
-                return_value=False,
-            ),
+            get_parallel().override(tp_size=1, pp_size=1),
         ):
             yield
 
@@ -416,10 +434,6 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         return projection
 
     def _make_gdn_policy_runner(self, method_cls=ModelOptFp8LinearMethod, gdn_cls=None):
-        from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
-        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
-        from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
-
         if gdn_cls is None:
             from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 
@@ -438,8 +452,6 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         )
         gdn._fused_in_proj_weight = None
         gdn.num_v_heads, gdn.head_v_dim, gdn.attn_tp_size = 48, 128, 1
-        norm_cls = FusedRMSNormGated if gdn_cls is Qwen3GatedDeltaNet else RMSNorm
-        gdn.norm = norm_cls(128, device="meta", dtype=torch.bfloat16)
         layer = torch.nn.Module()
         layer.linear_attn = gdn
         layer.self_attn = torch.nn.Module()
@@ -460,12 +472,19 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         )
 
     def _assert_gdn_bucket_policy(self, model_runner, *, exact):
-        self.assertEqual(_requires_exact_gdn_prefill_bucket(model_runner), exact)
+        expected_limit = 0 if exact else None
+        self.assertEqual(_gdn_prefill_padding_max_tokens(model_runner), expected_limit)
+        if isinstance(getattr(model_runner, "model", None), torch.nn.Module):
+            configure_gdn_prefill_model(
+                model_runner.model, attn_backend=model_runner.attn_backend
+            )
         runner = self._make_runner()
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.capture_num_tokens = [16, 20]
         runner.max_num_tokens = 20
-        runner._init_gdn_prefill_policy(model_runner)
+        runner._prefill_padding_max_tokens = _gdn_prefill_padding_max_tokens(
+            model_runner
+        )
         # Exercise admission of a real EXTEND shape, not just the stored flag.
         self.assertEqual(runner.can_run_graph(self._make_forward_batch(17)), not exact)
         for num_tokens in (16, 20):
@@ -696,32 +715,41 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             model_runner.attn_backend = GDNAttnBackend.__new__(GDNAttnBackend)
             self._assert_gdn_bucket_policy(model_runner, exact=False)
 
-    def test_legacy_rmsnorm_only_rejects_a_row_tile_transition(self):
-        with self._gdn_platform():
+    def test_sm120_fixed_projection_limit_is_checked_at_the_capture_bucket(self):
+        with self._gdn_platform(is_sm100=False, is_sm120=True):
             model_runner = self._make_gdn_policy_runner()
-            self.assertFalse(
-                hasattr(model_runner.model.model.layers[0].linear_attn, "tp_size")
-            )
+            for projection in model_runner.model.model.modules():
+                if isinstance(projection, LinearBase) and (
+                    type(projection.quant_method) is ModelOptFp8LinearMethod
+                ):
+                    projection.quant_method._gdn_prefill_config = (64, 128, 64)
+                    projection.quant_method.use_sm120_fp8 = True
+            limit = _gdn_prefill_padding_max_tokens(model_runner)
+            self.assertEqual(limit, GDN_FP8_PREFILL_MAX_TOKENS)
             runner = self._make_runner()
-            runner.capture_num_tokens = [8, 16, 20]
-            runner.max_num_tokens = 20
-            runner._init_gdn_prefill_policy(model_runner)
-            # 148 SMs and 48 value heads: 6 -> 8 changes one row/CTA to two;
-            # 7 -> 8 and 13 -> 16 keep their norm reduction layouts.
-            for tokens, expected in ((6, False), (7, True), (8, True), (13, True)):
+            runner.prefill_backend_name = Backend.BREAKABLE
+            runner.capture_num_tokens = [128, 256, 512]
+            runner.max_num_tokens = 512
+            runner._prefill_padding_max_tokens = limit
+            for tokens, expected in (
+                (193, True),
+                (256, True),
+                (257, False),
+                (512, True),
+            ):
                 with self.subTest(tokens=tokens):
                     self.assertEqual(
                         runner.can_run_graph(self._make_forward_batch(tokens)), expected
                     )
-            with mock.patch(
-                "sglang.kernels.ops.attention.fla.layernorm_gated.is_batch_invariant_mode_enabled",
-                return_value=True,
-            ):
-                self.assertTrue(runner.can_run_graph(self._make_forward_batch(6)))
+            # The effective kernel at the captured M matters: a valid 193-row
+            # kernel cannot replay a 384-row graph that selected cuBLAS, even
+            # though the padding ratio still fits the ordinary 2x limit.
+            runner.capture_num_tokens = [128, 384]
+            runner.max_num_tokens = 384
+            self.assertFalse(runner.can_run_graph(self._make_forward_batch(193)))
 
     def test_dp_gathered_counts_checked_against_common_replay_bucket(self):
         with (
-            self._gdn_platform(),
             mock.patch.object(
                 forward_batch_info,
                 "prefill_graph_tolerates_sum_len",
@@ -735,34 +763,31 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         ):
             runner = self._make_runner()
             runner.prefill_backend_name = Backend.BREAKABLE
-            runner.capture_num_tokens = [4, 8]
-            runner.max_num_tokens = 8
-            runner._init_gdn_prefill_policy(self._make_gdn_policy_runner())
-            # Rank 0 (3 tokens -> local bucket 4) and Rank 1 (8 tokens) both
-            # pass local checks, but replaying the shared 8-token bucket crosses
-            # the 1 -> 2 row/CTA norm boundary on 148 SMs with 48 local v_heads.
-            self.assertTrue(runner.can_run_graph(self._make_forward_batch(3)))
-            self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
-            self.assertFalse(runner.can_replay_dp_tokens([3, 8]))
-            self.assertTrue(runner.can_replay_dp_tokens([3, 4]))
-            self.assertTrue(runner.can_replay_dp_tokens([7, 8]))
+            runner.capture_num_tokens = [128, 256, 512]
+            runner.max_num_tokens = 512
+            runner._prefill_padding_max_tokens = GDN_FP8_PREFILL_MAX_TOKENS
+            # Rank 0 (193 -> local 256 <= 256) and Rank 1 (exact 512) both pass
+            # local checks, but the shared 512 bucket exceeds the 256 ceiling.
+            self.assertTrue(runner.can_run_graph(self._make_forward_batch(193)))
+            self.assertTrue(runner.can_run_graph(self._make_forward_batch(512)))
+            self.assertFalse(runner.can_replay_dp_tokens([193, 512]))
+            self.assertTrue(runner.can_replay_dp_tokens([193, 256]))
+            self.assertTrue(runner.can_replay_dp_tokens([512, 512]))
 
-            dp_batch = self._make_forward_batch(3)
-            dp_batch.global_num_tokens_cpu = [3, 8]
+            dp_batch = self._make_forward_batch(193)
+            dp_batch.global_num_tokens_cpu = [193, 512]
             dp_batch.can_run_dp_prefill_cuda_graph = True
             self.assertFalse(runner.can_run_graph(dp_batch))
 
-            runner._requires_exact_prefill_bucket = True
-            self.assertFalse(runner.can_replay_dp_tokens([4, 8]))
-            self.assertTrue(runner.can_replay_dp_tokens([8, 8]))
+            runner._prefill_padding_max_tokens = 0
+            self.assertFalse(runner.can_replay_dp_tokens([128, 256]))
+            self.assertTrue(runner.can_replay_dp_tokens([256, 256]))
 
     def test_shared_gdn_subclass_and_rocm_wrapper_hooks(self):
         import sglang.srt.models.qwen3_5 as qwen3_5_mod
         from sglang.srt.model_loader.loader import DefaultModelLoader
         from sglang.srt.models.gigachat35 import GigaChat35GatedDeltaNet
 
-        # Dense Qwen3.5 VLM wrapper must not forward prepare_before_cuda_graph_capture
-        # into Qwen3_5ForCausalLM's ROCm fused-projection packer.
         self.assertNotIn(
             "prepare_before_cuda_graph_capture",
             qwen3_5_mod.Qwen3_5ForConditionalGeneration.__dict__,
@@ -780,63 +805,120 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             self.assertEqual(gdn._gdn_prefill_max_tokens, 0)
             self.assertEqual(gdn.in_proj_ba._gdn_prefill_max_tokens, 0)
 
-    def test_later_gdn_norm_and_unknown_norm_cannot_bypass_admission(self):
-        with self._gdn_platform():
-            model_runner = self._make_gdn_policy_runner()
-            later = self._make_gdn_policy_runner().model.model.layers[0]
-            later.linear_attn.num_v_heads = 40
-            model_runner.model.model.layers.append(later)
-            runner = self._make_runner()
-            runner.capture_num_tokens = [8, 16]
-            runner._init_gdn_prefill_policy(model_runner)
-            self.assertFalse(runner.can_run_graph(self._make_forward_batch(7)))
-            self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
-            later.linear_attn.norm = torch.nn.Identity()
-            runner._init_gdn_prefill_policy(model_runner)
-            self.assertFalse(runner.can_run_graph(self._make_forward_batch(13)))
-            self.assertTrue(runner.can_run_graph(self._make_forward_batch(16)))
-
-    def test_sm103_fused_norm_checks_both_small_batch_heuristics(self):
-        from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
-
-        with (
-            self._gdn_platform(),
-            mock.patch(
-                "sglang.kernels.ops.attention.fla.fused_norm_gate.is_arch_support_pdl",
-                return_value=True,
-            ),
-            mock.patch(
-                "sglang.kernels.ops.attention.fla.fused_norm_gate.current_arch",
-                return_value=SimpleNamespace(
-                    is_sm=lambda major, minor: (major, minor) == (10, 3)
+    def test_sm120_fixed_prefill_requires_a_single_model_worker(self):
+        for tp_size, pp_size in ((2, 1), (1, 2)):
+            with (
+                self.subTest(tp_size=tp_size, pp_size=pp_size),
+                self._gdn_platform(is_sm100=False, is_sm120=True),
+                get_parallel().override(
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    attn_tp_size=tp_size,
+                    moe_tp_size=tp_size,
                 ),
+            ):
+                model_runner = self._make_gdn_policy_runner()
+                for projection in model_runner.model.model.modules():
+                    if isinstance(projection, LinearBase) and (
+                        type(projection.quant_method) is ModelOptFp8LinearMethod
+                    ):
+                        projection.quant_method._gdn_prefill_config = (64, 128, 64)
+                        projection.quant_method.use_sm120_fp8 = True
+                self._assert_gdn_bucket_policy(model_runner, exact=True)
+
+    def test_sm120_requires_every_fp8_projection_to_have_a_fixed_prefill_path(self):
+        with self._gdn_platform(is_sm100=False, is_sm120=True):
+            model_runner = self._make_gdn_policy_runner()
+            for projection in model_runner.model.model.modules():
+                if isinstance(projection, LinearBase) and (
+                    type(projection.quant_method) is ModelOptFp8LinearMethod
+                ):
+                    projection.quant_method._gdn_prefill_config = (64, 128, 64)
+                    projection.quant_method.use_sm120_fp8 = True
+            self.assertEqual(
+                configure_gdn_prefill_model(
+                    model_runner.model, attn_backend=model_runner.attn_backend
+                ),
+                GDN_FP8_PREFILL_MAX_TOKENS,
+            )
+            self.assertEqual(
+                model_runner.model.model.layers[0].linear_attn._gdn_prefill_max_tokens,
+                GDN_FP8_PREFILL_MAX_TOKENS,
+            )
+            self.assertTrue(
+                model_runner.model.model.layers[
+                    0
+                ].linear_attn.out_proj._gdn_model_prefill_enabled
+            )
+            model_runner.model.model.layers[
+                0
+            ].mlp.down_proj.quant_method._gdn_prefill_config = None
+            self._assert_gdn_bucket_policy(model_runner, exact=True)
+            self.assertEqual(
+                configure_gdn_prefill_model(
+                    model_runner.model, attn_backend=model_runner.attn_backend
+                ),
+                0,
+            )
+            self.assertFalse(
+                model_runner.model.model.layers[
+                    0
+                ].linear_attn.out_proj._gdn_model_prefill_enabled
+            )
+
+    def test_sm121_gb10_uses_exact_buckets_and_native_prefill_kernels(self):
+        with (
+            self._gdn_platform(
+                is_sm100=False, is_sm120=True, device_capability=(12, 1)
+            ),
+            mock.patch.object(
+                fp4_utils,
+                "FP4_GEMM_RUNNER_BACKEND",
+                Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
             ),
         ):
-            for activation, buckets, cases in (
-                ("swish", [2, 4, 8], ((1, False), (3, True))),
-                ("sigmoid", [8, 16], ((4, False), (5, True))),
-            ):
-                model_runner = self._make_gdn_policy_runner(gdn_cls=Qwen3GatedDeltaNet)
-                gdn = model_runner.model.model.layers[0].linear_attn
-                gdn.num_v_heads = 64
-                gdn.norm.activation = activation
-                runner = self._make_runner()
-                runner.capture_num_tokens = buckets
-                runner.max_num_tokens = max(buckets)
-                runner._init_gdn_prefill_policy(model_runner)
-                for tokens, expected in cases:
-                    with self.subTest(activation=activation, tokens=tokens):
-                        self.assertEqual(
-                            runner.can_run_graph(self._make_forward_batch(tokens)),
-                            expected,
-                        )
+            fp8_runner = self._make_gdn_policy_runner(ModelOptFp8LinearMethod)
+            for projection in fp8_runner.model.model.modules():
+                if isinstance(projection, LinearBase) and (
+                    type(projection.quant_method) is ModelOptFp8LinearMethod
+                ):
+                    projection.quant_method._gdn_prefill_config = (64, 128, 64)
+                    projection.quant_method.use_sm120_fp8 = True
+            self._assert_gdn_bucket_policy(fp8_runner, exact=True)
+            self.assertEqual(
+                configure_gdn_prefill_model(
+                    fp8_runner.model, attn_backend=fp8_runner.attn_backend
+                ),
+                0,
+            )
+            gdn = fp8_runner.model.model.layers[0].linear_attn
+            self.assertEqual(gdn._gdn_prefill_max_tokens, 0)
+            self.assertEqual(gdn.in_proj_ba._gdn_prefill_max_tokens, 0)
+            self.assertFalse(gdn.out_proj._gdn_model_prefill_enabled)
 
-    def test_existing_sm120_deterministic_method_can_keep_padding(self):
+            fp4_runner = self._make_gdn_policy_runner(ModelOptFp4LinearMethod)
+            for projection in fp4_runner.model.model.modules():
+                if isinstance(projection, LinearBase) and (
+                    type(projection.quant_method) is ModelOptFp4LinearMethod
+                ):
+                    projection.input_size_per_partition = 5120
+                    projection.output_size_per_partition = 34816
+            self._assert_gdn_bucket_policy(fp4_runner, exact=True)
+            with override_platform(device_capability=(12, 0)):
+                self.assertEqual(
+                    _gdn_prefill_padding_max_tokens(fp4_runner),
+                    GDN_FP8_PREFILL_MAX_TOKENS,
+                )
+
+    def test_existing_deterministic_path_is_not_limited_by_the_new_optimization(self):
         for device_capability in ((12, 0), (12, 1)):
             with (
                 self.subTest(device_capability=device_capability),
-                self._gdn_platform(is_sm100=False, is_sm120=True),
-                override_platform(device_capability=device_capability),
+                self._gdn_platform(
+                    is_sm100=False,
+                    is_sm120=True,
+                    device_capability=device_capability,
+                ),
             ):
                 model_runner = self._make_gdn_policy_runner()
                 for projection in model_runner.model.model.modules():
@@ -846,31 +928,19 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                         projection.quant_method.use_sm120_fp8 = True
                         projection.use_flashinfer_bmm = False
                 self._assert_gdn_bucket_policy(model_runner, exact=True)
-                self.assertEqual(
-                    configure_gdn_prefill_model(
-                        model_runner.model, attn_backend=model_runner.attn_backend
+                with (
+                    get_exec().deterministic.override(
+                        enable_deterministic_inference=True
                     ),
-                    0,
-                )
-                self.assertEqual(
-                    model_runner.model.model.layers[
-                        0
-                    ].linear_attn.in_proj_ba._gdn_prefill_max_tokens,
-                    0,
-                )
-                with get_exec().deterministic.override(
-                    enable_deterministic_inference=True
+                    get_parallel().override(
+                        tp_size=2, pp_size=1, attn_tp_size=2, moe_tp_size=2
+                    ),
                 ):
                     self._assert_gdn_bucket_policy(model_runner, exact=False)
                     self.assertIsNone(
                         configure_gdn_prefill_model(
                             model_runner.model, attn_backend=model_runner.attn_backend
                         )
-                    )
-                    self.assertIsNone(
-                        model_runner.model.model.layers[
-                            0
-                        ].linear_attn.in_proj_ba._gdn_prefill_max_tokens
                     )
 
     def test_external_prefill_body_is_not_certified_by_python_projection_types(self):
@@ -890,6 +960,53 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 0,
             )
 
+    def test_fixed_prefill_requires_model_opt_in_and_a_qualified_loaded_shape(self):
+        projection = self._make_projection()
+        projection.quant_method.use_sm120_fp8 = True
+        projection.orig_dtype = torch.bfloat16
+        projection.weight_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+        projection.weight = torch.nn.Parameter(
+            torch.empty(5120, 16384, dtype=torch.float8_e4m3fn, device="meta"),
+            requires_grad=False,
+        )
+        method = projection.quant_method
+        with self._gdn_platform(is_sm100=False, is_sm120=True):
+            method._prepare_gdn_prefill(projection)
+            self.assertEqual(method.gdn_prefill_max_tokens, 0)
+            for tp_size, pp_size in ((2, 1), (1, 2)):
+                with get_parallel().override(
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    attn_tp_size=tp_size,
+                    moe_tp_size=tp_size,
+                ):
+                    enable_gdn_fp8_prefill(torch.nn.ModuleList([projection]))
+                    method._prepare_gdn_prefill(projection)
+                    self.assertEqual(method.gdn_prefill_max_tokens, 0)
+            # SM121/GB10 (12, 1) reports major 12 (use_sm120_fp8=True) but must
+            # not enable the 188-SM SM120 Triton FP8 prefill path.
+            with override_platform(device_capability=(12, 1)):
+                enable_gdn_fp8_prefill(torch.nn.ModuleList([projection]))
+                method._prepare_gdn_prefill(projection)
+                self.assertEqual(method.gdn_prefill_max_tokens, 0)
+            with get_parallel().override(tp_size=1, pp_size=1):
+                enable_gdn_fp8_prefill(torch.nn.ModuleList([projection]))
+            method._prepare_gdn_prefill(projection)
+            self.assertEqual(method.gdn_prefill_max_tokens, 256)
+            with override_platform(device_capability=(12, 1)):
+                method._prepare_gdn_prefill(projection)
+                self.assertEqual(method.gdn_prefill_max_tokens, 0)
+            method._prepare_gdn_prefill(projection)
+            self.assertEqual(method.gdn_prefill_max_tokens, 256)
+            # Weight reload must clear a previously qualified path, not retain stale
+            # eligibility after a dtype/shape change.
+            projection.weight = torch.nn.Parameter(
+                torch.empty(4096, 4096, dtype=torch.float8_e4m3fn, device="meta"),
+                requires_grad=False,
+            )
+            method._prepare_gdn_prefill(projection)
+            self.assertEqual(method.gdn_prefill_max_tokens, 0)
+
     def test_exact_prefill_bucket_guard_and_dp_vote_consensus(self):
         """When exact GDN prefill buckets are required, padded token counts run
         eagerly while exact buckets replay, and active/idle DP ranks agree."""
@@ -897,7 +1014,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.capture_num_tokens = [4, 8, 12, 16, 20, 24, 28, 32]
         runner.max_num_tokens = 32
-        runner._requires_exact_prefill_bucket = True
+        runner._prefill_padding_max_tokens = 0
 
         padded_cases = (13, 14, 17, 21, 27, 29)
         exact_cases = (4, 16, 20, 24, 28, 32)
@@ -953,8 +1070,71 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     self.assertEqual(runner.can_run_graph(batch), expected)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for Triton GDN ba_proj")
+@unittest.skipUnless(
+    torch.cuda.is_available(), "CUDA required for invariant GDN prefill"
+)
 class TestGDNBatchInvariantBaProjCUDA(CustomTestCase):
+    @torch.no_grad()
+    def test_fixed_gated_norm_preserves_rows_across_tiny_buckets_and_graph_replay(self):
+        from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+
+        gen = torch.Generator(device="cuda").manual_seed(49613)
+        heads, dim = 48, 128
+        x = torch.randn(
+            (16 * heads, dim), device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        weight = torch.randn((dim,), device="cuda", dtype=torch.bfloat16, generator=gen)
+        # Exercise the 3D strided gate used by the real Qwen3.5 prefill path.
+        z = torch.randn(
+            (16, heads, 2 * dim), device="cuda", dtype=torch.bfloat16, generator=gen
+        )[..., :dim]
+
+        def norm(value, gate):
+            return _layer_norm_fwd(
+                value,
+                weight,
+                None,
+                1e-6,
+                z=gate,
+                is_rms_norm=True,
+                norm_before_gate=True,
+                batch_invariant=True,
+            )[0]
+
+        for real_tokens, bucket_tokens in ((7, 8), (15, 16)):
+            with self.subTest(real_tokens=real_tokens, bucket_tokens=bucket_tokens):
+                rows = real_tokens * heads
+                expected = norm(x[:rows], z[:real_tokens])
+                actual = norm(x[: bucket_tokens * heads], z[:bucket_tokens])
+                self.assertTrue(torch.equal(actual[:rows], expected))
+                reference = (
+                    x[:rows].float()
+                    * (x[:rows].float().square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+                    * weight.float()
+                    * torch.nn.functional.silu(
+                        z[:real_tokens].reshape(rows, dim).float()
+                    )
+                )
+                torch.testing.assert_close(
+                    expected.float(), reference, atol=1e-2, rtol=1e-2
+                )
+
+        static_x = torch.zeros_like(x)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            norm(static_x, z)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = norm(static_x, z)
+        static_x[: 15 * heads].copy_(x[: 15 * heads])
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(
+            torch.equal(actual[: 15 * heads], norm(x[: 15 * heads], z[:15]))
+        )
+
     def test_ba_proj_extend_is_batch_invariant_and_cuda_graph_safe(self):
         """EXTEND GDN ba_proj must keep real rows bit-identical across padded
         buckets and CUDA graph replay (default and side stream), while leaving
@@ -1045,26 +1225,38 @@ class TestGDNBatchInvariantBaProjCUDA(CustomTestCase):
                 expected_direct, _ = ba_proj(x_full[:4].contiguous())
                 self.assertTrue(torch.equal(out_non_prefill, expected_direct))
 
-            # Exact-bucket models (such as SM121/GB10 or BF16 checkpoints) keep
-            # native linear ba_proj on EXTEND with zero RuntimeContext lookups;
-            # deterministic mode stamps None at model-configuration time.
-            ba_proj._gdn_prefill_max_tokens = 0
-            try:
-                with (
-                    mock.patch(
-                        "sglang.srt.runtime_context.get_context",
-                        side_effect=AssertionError("unexpected per-layer get_context"),
-                    ),
-                    mock.patch.object(
-                        ba_proj, "forward", wraps=ba_proj.forward
-                    ) as spy_exact,
-                ):
-                    out_exact = helper(ba_proj, x_full[:13].contiguous(), extend_batch)
-                    spy_exact.assert_called_once()
-                expected_exact, _ = ba_proj(x_full[:13].contiguous())
-                self.assertTrue(torch.equal(out_exact, expected_exact))
-            finally:
-                del ba_proj._gdn_prefill_max_tokens
+            # Exact-bucket and bounded-bucket models keep native linear ba_proj
+            # outside the active padded token ceiling with zero RuntimeContext
+            # lookups; deterministic mode stamps None at configuration time.
+            for limit, m_native in ((0, 13), (32, 48)):
+                ba_proj._gdn_prefill_max_tokens = limit
+                try:
+                    with (
+                        mock.patch(
+                            "sglang.srt.runtime_context.get_context",
+                            side_effect=AssertionError(
+                                "unexpected per-layer get_context"
+                            ),
+                        ),
+                        mock.patch.object(
+                            ba_proj, "forward", wraps=ba_proj.forward
+                        ) as spy_exact,
+                    ):
+                        out_exact = helper(
+                            ba_proj, x_full[:m_native].contiguous(), extend_batch
+                        )
+                        spy_exact.assert_called_once()
+                    expected_exact, _ = ba_proj(x_full[:m_native].contiguous())
+                    self.assertTrue(torch.equal(out_exact, expected_exact))
+                    if limit > 0:
+                        self.assertTrue(
+                            torch.equal(
+                                helper(ba_proj, x_full[:13].contiguous(), extend_batch),
+                                ref_13,
+                            )
+                        )
+                finally:
+                    del ba_proj._gdn_prefill_max_tokens
 
         # Verify _forward_input_proj CUDA graph capture + replay on both
         # default stream and alt_stream for Qwen3.5 and Qwen3-Next GDN.
@@ -1206,6 +1398,121 @@ class TestPrefillGraphRankBarrierBreaks(CustomTestCase):
         self.assertEqual(seen, [True])
         self.assertIn(runner.capture_prepare.call_args.args[0], self._BARRIER_SHAPES)
         self.assertFalse(get_flags().dp.every_rank_reaches_rank_barrier)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0),
+    "SM120 (12.0) required for fixed FP8 GDN prefill",
+)
+class TestGDNFixedFp8PrefillCUDA(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        runtime = get_context().override_server_args(
+            enable_deterministic_inference=False
+        )
+        runtime.install()
+        self.addCleanup(runtime.restore)
+
+    @torch.no_grad()
+    def test_loaded_fp8_prefill_is_row_invariant_and_decode_is_unchanged(self):
+        from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+        gen = torch.Generator(device="cuda").manual_seed(49613)
+        for k, n in ((5120, 16384), (6144, 5120), (5120, 14336)):
+            with self.subTest(k=k, n=n):
+                layer = MergedColumnParallelLinear(
+                    input_size=k,
+                    output_sizes=[n],
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    quant_config=ModelOptFp8Config(
+                        is_checkpoint_fp8_serialized=True, packed_modules_mapping={}
+                    ),
+                    parallel_group="replicated",
+                ).cuda()
+                layer.weight.copy_(
+                    torch.randn(
+                        (n, k), device="cuda", dtype=torch.bfloat16, generator=gen
+                    )
+                )
+                layer.weight_scale.fill_(0.02)
+                layer.input_scale.fill_(0.02)
+                with get_parallel().override(tp_size=1, pp_size=1):
+                    enable_gdn_fp8_prefill(torch.nn.ModuleList([layer]))
+                method = layer.quant_method
+                method.process_weights_after_loading(layer)
+                self.assertEqual(method.gdn_prefill_max_tokens, 256)
+                x = torch.randn(
+                    (512, k), device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+                ctx = ForwardContext(attn_backend=None, forward_mode=ForwardMode.EXTEND)
+                with forward_context(ctx):
+                    for real_m, padded_m in ((13, 16), (17, 20), (193, 256)):
+                        real = method.apply(layer, x[:real_m])
+                        padded = torch.zeros(
+                            (padded_m, k), device="cuda", dtype=x.dtype
+                        )
+                        padded[:real_m].copy_(x[:real_m])
+                        self.assertTrue(
+                            torch.equal(real, method.apply(layer, padded)[:real_m])
+                        )
+                    q, scale = static_quant_fp8(x[:13], layer.input_scale)
+                    reference = (
+                        (q.float() @ layer.weight.float()) * scale * layer.weight_scale
+                    )
+                    torch.testing.assert_close(
+                        method.apply(layer, x[:13]).float(),
+                        reference,
+                        atol=1e-2,
+                        rtol=1e-2,
+                    )
+                    eager_193 = method.apply(layer, x[:193])
+                    static_x = torch.zeros((256, k), device="cuda", dtype=x.dtype)
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        method.apply(layer, static_x)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        result = method.apply(layer, static_x)
+                    static_x[:193].copy_(x[:193])
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(result[:193], eager_193))
+                native_193 = method.apply(layer, x[:193])
+                layer._gdn_model_prefill_enabled = False
+                try:
+                    with forward_context(ctx):
+                        self.assertTrue(
+                            torch.equal(method.apply(layer, x[:193]), native_193)
+                        )
+                finally:
+                    del layer._gdn_model_prefill_enabled
+                for mode, m in (
+                    (ForwardMode.DECODE, 4),
+                    (ForwardMode.TARGET_VERIFY, 17),
+                    (ForwardMode.DRAFT_EXTEND_V2, 17),
+                    (ForwardMode.EXTEND, 257),
+                ):
+                    # No active forward context uses the pre-existing dispatcher.
+                    expected = method.apply(layer, x[:m])
+                    with forward_context(
+                        ForwardContext(attn_backend=None, forward_mode=mode)
+                    ):
+                        self.assertTrue(
+                            torch.equal(method.apply(layer, x[:m]), expected)
+                        )
+                # An explicit deterministic-inference request must not change
+                # its math merely because a prefill forward context is present.
+                with get_exec().deterministic.override(
+                    enable_deterministic_inference=True
+                ):
+                    deterministic = method.apply(layer, x[:193])
+                    with forward_context(ctx):
+                        self.assertTrue(
+                            torch.equal(method.apply(layer, x[:193]), deterministic)
+                        )
 
 
 if __name__ == "__main__":

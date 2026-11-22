@@ -1,9 +1,9 @@
 """Blackwell GDN prefix-cache replay must match the same eager workload.
 
-BF16 projections and legacy SM120 FP8 use exact buckets. Qualified SM100
-projections retain padded replay unless padding changes the norm's row tile.
-Compare identical eager workloads with actual cache hits and graph-written
-recurrent checkpoints:
+SM100 covers BF16 fallback and qualified ModelOpt padded replay. SM120 covers
+bounded small-prefill replay, including a cached 7 -> 8 token normalization
+boundary. Compare eager execution with mixed chunk enabled, reusing recurrent
+checkpoints alongside uncached extends:
 
     python3 test/registered/cuda_graph/breakable/test_qwen35_prefix_cache_blackwell.py
 """
@@ -44,8 +44,10 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
     target_arch = "sm100"
     buckets = BUCKETS
     extend_lengths = (16, 17, 20)
-    norm_transition_extend = None
+    padded_limit = None
+    output_tokens = 1
     logprob_atol = 1e-5
+    seed_extra_token = True
     mem_fraction_static = 0.6
     attention_args = [
         "--kv-cache-dtype",
@@ -94,19 +96,29 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
 
     def _assert_forward_counts(self, before, backend, extend_len):
         after = self._graph_counts()
-        padded = self.allow_padded and extend_len != self.norm_transition_extend
-        replay = backend == "breakable" and (padded or extend_len in self.buckets)
+        bucket = next((n for n in self.buckets if n >= extend_len), None)
+        replay = (
+            backend == "breakable"
+            and bucket is not None
+            and (
+                bucket == extend_len
+                or (
+                    self.allow_padded
+                    and (self.padded_limit is None or bucket <= self.padded_limit)
+                )
+            )
+        )
         active_mode = "prefill_cuda_graph" if replay else "prefill_none"
         inactive_mode = "prefill_none" if replay else "prefill_cuda_graph"
         self.assertGreater(after[active_mode], before[active_mode])
         self.assertEqual(after[inactive_mode], before[inactive_mode])
 
-    def _generate(self, input_ids, *, logprob_start_len=None):
+    def _generate(self, input_ids, *, logprob_start_len=None, max_new_tokens=1):
         payload = {
             "input_ids": input_ids,
             "sampling_params": {
                 "temperature": 0,
-                "max_new_tokens": 1,
+                "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
         }
@@ -181,11 +193,13 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
                     )
                     response.raise_for_status()
                     if prefix_len:
-                        # Leave a full tracked checkpoint strictly inside the seed
-                        # prompt: prefix reuse excludes the prompt's final token.
-                        # The seed is larger than every bucket and runs eagerly in
-                        # both servers. Its last token differs from every suffix.
-                        seed = self._generate(prefix[:TRACK_INTERVAL] + [100])
+                        # SM100 uses a 129-token eager seed, with the tracked
+                        # checkpoint strictly inside it. SM120 also exercises
+                        # checkpoints written at the exact 128-token boundary.
+                        seed_ids = prefix[:TRACK_INTERVAL]
+                        if self.seed_extra_token:
+                            seed_ids.append(100)
+                        seed = self._generate(seed_ids)
                         self.assertEqual(seed["meta_info"]["cached_tokens"], 0)
                     if prefix_len == 2 * TRACK_INTERVAL:
                         # Advance the cached 128-token prefix through another
@@ -206,7 +220,9 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
                         self._assert_forward_counts(before, backend, TRACK_INTERVAL)
                     before = self._graph_counts()
                     result = self._generate(
-                        prefix + suffix, logprob_start_len=prefix_len
+                        prefix + suffix,
+                        logprob_start_len=prefix_len,
+                        max_new_tokens=self.output_tokens,
                     )
                     meta = result["meta_info"]
                     self.assertEqual(meta["cached_tokens"], prefix_len)
@@ -217,12 +233,12 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
 
                     # Input IDs are fixed, not the output of a preceding decode.
                     # The first input logprob is unavailable after a cache hit;
-                    # check the remaining suffix and the final sampled token.
+                    # check the remaining suffix and the sampled continuation.
                     input_logprobs = meta["input_token_logprobs"]
                     self.assertEqual([entry[1] for entry in input_logprobs], suffix)
                     self.assertIsNone(input_logprobs[0][0])
                     output_logprobs = meta["output_token_logprobs"]
-                    self.assertEqual(len(output_logprobs), 1)
+                    self.assertEqual(len(output_logprobs), self.output_tokens)
                     scored = input_logprobs[1:] + output_logprobs
                     self.assertTrue(all(math.isfinite(entry[0]) for entry in scored))
                     results[prefix_len, extend_len] = scored
@@ -231,7 +247,7 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
             # Release the first server's GPU allocations before loading the next.
             terminate_and_kill_process_tree(process)
 
-    def test_mixed_chunk_plain_extends_match_eager(self):
+    def _make_cases(self):
         # Fixed raw token IDs avoid tokenizer revisions, datasets, generated-prefix
         # drift, and concurrent scheduling changing the intended bucket sizes.
         rng = random.Random(2026)
@@ -241,7 +257,10 @@ class TestQwen35PrefixCacheSM100(CustomTestCase):
             for extend_len in self.extend_lengths:
                 suffix = [rng.randint(30001, 60000) for _ in range(extend_len)]
                 cases.append((prefix_len, extend_len, prefix, suffix))
+        return cases
 
+    def test_mixed_chunk_plain_extends_match_eager(self):
+        cases = self._make_cases()
         # TRT-LLM attention does not support batch-invariant mode with radix
         # caching. Compare the same requests with and without graph replay.
         eager = self._run_server("disabled", cases)
@@ -269,25 +288,17 @@ class TestQwen38NVFP4PrefixCacheSM100(TestQwen35PrefixCacheSM100):
     # Preserve the TP1 projection dimensions reported in #49133.
     tp_size = 1
     allow_padded = True
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # This checkpoint has 48 value heads at TP1. Cross the existing norm's
-        # one-row/two-row boundary using a power-of-two capture bucket.
-        boundary = 2 * torch.cuda.get_device_properties(0).multi_processor_count // 48
-        if boundary:
-            cls.norm_transition_extend = boundary
-            cls.buckets = sorted(
-                (set(BUCKETS) - {boundary}) | {1 << boundary.bit_length()}
-            )
-            cls.extend_lengths = tuple(sorted({16, 17, 20, boundary}))
+    buckets = [8, 16, 20, TRACK_INTERVAL]
+    extend_lengths = (5, 7, 13, 16, 17, 20)
 
 
 class TestQwen38NVFP4PrefixCacheSM120(TestQwen38NVFP4PrefixCacheSM100):
     target_arch = "sm120"
-    allow_padded = False
+    buckets = [8, 16, 32, 64, 128, 256, 512]
+    padded_limit = 256
+    output_tokens = 16
     logprob_atol = 0
+    seed_extra_token = False
     mem_fraction_static = 0.86
     attention_args = [
         "--kv-cache-dtype",
@@ -298,9 +309,61 @@ class TestQwen38NVFP4PrefixCacheSM120(TestQwen38NVFP4PrefixCacheSM100):
         "64",
     ]
 
+    def _make_cases(self):
+        # This repeated prompt reproduced divergent cached128+7 logprobs when
+        # padding changed the gated norm's reduction layout from 1 to 2 rows.
+        tokens = [
+            760,
+            2614,
+            1830,
+            90273,
+            264,
+            3177,
+            6522,
+            13,
+            1049,
+            682,
+            3712,
+            11,
+            7785,
+            11,
+            36352,
+            11,
+            321,
+            30223,
+            6265,
+            13,
+            62239,
+            628,
+            16686,
+            6265,
+            364,
+            2250,
+            5381,
+            13,
+            79091,
+            1204,
+            19573,
+            1438,
+            10428,
+            13,
+            220,
+        ]
+        cases = []
+        for prefix_len in (0, TRACK_INTERVAL, 2 * TRACK_INTERVAL):
+            for extend_len in (5, 7, 13, 17, 31, 193, 257, 512):
+                length = prefix_len + extend_len
+                prompt = (tokens * ((length + len(tokens) - 1) // len(tokens)))[:length]
+                cases.append(
+                    (prefix_len, extend_len, prompt[:prefix_len], prompt[prefix_len:])
+                )
+        return cases
+
 
 class TestQwen38NVFP4PrefixCacheSM121(TestQwen38NVFP4PrefixCacheSM120):
     target_arch = "sm121"
+    allow_padded = False
+    padded_limit = None
     mem_fraction_static = 0.35
 
 

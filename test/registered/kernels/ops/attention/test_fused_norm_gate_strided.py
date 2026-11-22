@@ -134,6 +134,69 @@ def test_strided_gate_launches_no_copy():
     assert kernels and not any("copy" in k for k in kernels), kernels
 
 
+@pytest.mark.parametrize(
+    "activation,heads,real_tokens,bucket_tokens",
+    [("swish", 64, 1, 2), ("sigmoid", 48, 5, 8)],
+)
+@torch.inference_mode()
+def test_batch_invariant_prefill_across_row_tile_boundaries(
+    activation, heads, real_tokens, bucket_tokens
+):
+    # These shapes cross the SM103 BT=8/32 heuristic. Prefill must use the same
+    # reduction for real and padded rows, including a strided fused-projection gate.
+    gen = torch.Generator(device="cuda").manual_seed(49613)
+    dim = 128
+    norm = FusedRMSNormGated(
+        dim, eps=1e-6, activation=activation, device="cuda", dtype=torch.bfloat16
+    )
+    norm.weight.copy_(1 + 0.1 * torch.randn(dim, device="cuda", generator=gen))
+    x = torch.randn(
+        (bucket_tokens, heads, dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=gen,
+    )
+    projection = torch.randn(
+        (bucket_tokens, 2 * heads * dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=gen,
+    )
+    gate = projection[:, : heads * dim].view(bucket_tokens, heads, dim)
+    expected = norm(x[:real_tokens].clone(), gate[:real_tokens], batch_invariant=True)
+    padded = norm(x.clone(), gate, batch_invariant=True)
+    torch.testing.assert_close(padded[:real_tokens], expected, rtol=0, atol=0)
+
+    real = x[:real_tokens].float()
+    real_gate = gate[:real_tokens].float()
+    activated_gate = (
+        real_gate.sigmoid()
+        if activation == "sigmoid"
+        else torch.nn.functional.silu(real_gate)
+    )
+    reference = (
+        real
+        * (real.square().mean(-1, keepdim=True) + norm.eps).rsqrt()
+        * norm.weight.float()
+        * activated_gate
+    )
+    torch.testing.assert_close(expected.float(), reference, rtol=1e-2, atol=1e-2)
+
+    static_x = torch.zeros_like(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        norm(static_x, gate, batch_invariant=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = norm(static_x, gate, batch_invariant=True)
+    static_x[:real_tokens].copy_(x[:real_tokens])
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual[:real_tokens], expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     import sys
 

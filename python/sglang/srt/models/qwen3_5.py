@@ -98,6 +98,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import enable_gdn_fp8_prefill
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -1147,7 +1148,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and _allows_batch_invariant_gdn_prefill(self, len(core_attn_out) // nv)
+        ):
+            # Padded GDN prefills require a fixed reduction layout on every
+            # qualifying CUDA architecture, not just the SM120 fixed-FP8 path.
+            core_attn_out, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                group_size=self.norm.group_size,
+                norm_before_gate=self.norm.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                batch_invariant=True,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],
@@ -1861,6 +1882,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.layers_block_type[idx]
             ].stage_facts(config, idx),
         )
+        enable_gdn_fp8_prefill(self.layers)
 
         self.flashinfer_mnnvl_cutedsl_fusion = None
         if _use_mnnvl_cutedsl_fusion(config, is_nextn):

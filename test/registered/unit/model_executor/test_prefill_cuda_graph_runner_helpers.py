@@ -126,7 +126,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                         return_value=cuda,
                     ),
                     runner._prefill_forward_context(
-                        SimpleNamespace(moe_num_token_non_padded=lambda: None),
+                        SimpleNamespace(
+                            forward_mode=ForwardMode.EXTEND,
+                            moe_num_token_non_padded=lambda: None,
+                        ),
                         num_tokens=4,
                         raw_num_tokens=2,
                     ),
