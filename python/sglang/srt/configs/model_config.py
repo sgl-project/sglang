@@ -924,15 +924,15 @@ class ModelConfig:
         # ERNIE 5.5 carries no marker key either; the routed-expert dtype in the
         # safetensors header tells mxfp4 from fp8 or bf16 experts.
         if is_ernie5_5(self.hf_config) and routed_experts_quant_method is None:
-            from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
+            from sglang.srt.configs.ernie55 import detect_fp4_routed_experts
 
-            detected = try_detect_fp4_experts(self.model_path)
-            if detected is not None:
-                self.is_fp4_experts = detected
-                logger.info(
-                    "Auto-detected ERNIE 5.5 routed-expert layout: is_fp4_experts=%s",
-                    self.is_fp4_experts,
-                )
+            self.is_fp4_experts = detect_fp4_routed_experts(
+                self.model_path, self.revision
+            )
+            logger.info(
+                "Detected ERNIE 5.5 routed-expert layout: is_fp4_experts=%s",
+                self.is_fp4_experts,
+            )
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None

@@ -616,7 +616,7 @@ class Ernie5_5Moe(nn.Module):
             intermediate_size=self.intermediate_size,
             top_k=self.top_k,
             num_tokens=latent.shape[0],
-            # DeepGEMM MegaMoE bakes SiTU beta=4.0/linear_beta=25.0; the checkpoint must match.
+            # The kernel bakes SiTU beta=4.0/linear_beta=25.0; checked at startup.
             activation="situ",
             buf=self.mega_moe_buffer(),
         )

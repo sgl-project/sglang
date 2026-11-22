@@ -523,6 +523,10 @@ class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+        if continue_final_message:
+            # The renderer closes the assistant turn's think block before its
+            # content, so a continued turn generates answer text.
+            self._in_reasoning = False
 
 
 class KimiDetector(BaseReasoningFormatDetector):

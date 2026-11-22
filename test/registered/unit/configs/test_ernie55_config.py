@@ -167,6 +167,25 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
         with patch(target, return_value=True):
             _ernie55_overrides(args, None)
 
+    def test_megamoe_rejects_other_situ_constants(self):
+        """The MegaMoE kernel bakes SiTU beta=4.0 / linear_beta=25.0; a checkpoint
+        with other constants ran its routed experts at the kernel's values and its
+        shared expert at its own."""
+        args = SimpleNamespace(**{**self._SUPPORTED, "moe_a2a_backend": "megamoe"})
+        target = "sglang.srt.arg_groups.model_overrides.ernie55.is_sm100_supported"
+        with patch(target, return_value=True):
+            for betas, ok in (((4.0, 25.0), True), ((2.0, 25.0), False)):
+                with self.subTest(betas=betas):
+                    hf = SimpleNamespace(
+                        activation_situ_beta=betas[0],
+                        activation_situ_linear_beta=betas[1],
+                    )
+                    if ok:
+                        _ernie55_overrides(args, hf)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "SiTU"):
+                            _ernie55_overrides(args, hf)
+
     def test_pd_rejects_pipeline_parallelism(self):
         for mode, pp, rejected in (
             ("prefill", 2, True),
@@ -215,6 +234,48 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                 }
                 with self.assertRaisesRegex(ValueError, "eagle-topk 1 only"):
                     _ernie55_overrides(SimpleNamespace(**tree), None)
+
+
+class TestErnie5_5Fp4ExpertDetection(CustomTestCase):
+    def test_uncached_expert_shard_is_read_from_the_requested_revision(self):
+        """On a first load from a hub ID the expert shard was not downloaded yet,
+        so detection fell back to FP8 experts and allocated full-width weights
+        for packed MXFP4 ones; a pinned revision also probed the cached main."""
+        import json
+        import os
+        import tempfile
+
+        from sglang.srt.configs import ernie55 as cfg
+
+        expert = "model.layers.0.block_sparse_moe.experts.0.w1.weight"
+        with tempfile.TemporaryDirectory() as snapshot:
+            index = os.path.join(snapshot, "model.safetensors.index.json")
+            with open(index, "w") as f:
+                json.dump({"weight_map": {expert: "model-00002.safetensors"}}, f)
+            header = SimpleNamespace(tensors={expert: SimpleNamespace(dtype="U8")})
+            with (
+                patch(
+                    "sglang.srt.utils.find_local_repo_dir", return_value=snapshot
+                ) as local,
+                patch("huggingface_hub.hf_hub_download", return_value=index) as dl,
+                patch("huggingface_hub.HfApi") as api,
+            ):
+                api.return_value.parse_safetensors_file_metadata.return_value = header
+                self.assertTrue(cfg.detect_fp4_routed_experts("org/ernie", "v1"))
+            local.assert_called_once_with("org/ernie", "v1")
+            self.assertEqual(dl.call_args.kwargs["revision"], "v1")
+            meta = api.return_value.parse_safetensors_file_metadata
+            self.assertEqual(meta.call_args.kwargs["revision"], "v1")
+
+    def test_unreadable_layout_fails_instead_of_guessing(self):
+        from sglang.srt.configs import ernie55 as cfg
+
+        with (
+            patch("sglang.srt.utils.find_local_repo_dir", return_value=None),
+            patch.object(cfg, "_remote_fp4_routed_experts", return_value=None),
+        ):
+            with self.assertRaisesRegex(ValueError, "routed_experts_quant_method"):
+                cfg.detect_fp4_routed_experts("org/ernie", None)
 
 
 if __name__ == "__main__":

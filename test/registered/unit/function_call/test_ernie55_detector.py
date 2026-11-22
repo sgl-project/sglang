@@ -19,6 +19,7 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.reasoning_parser import Ernie5_5ReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -220,6 +221,33 @@ class TestErnie5_5ToolCallStreaming(CustomTestCase):
                     normal += result.normal_text
                     args += "".join(c.parameters for c in result.calls)
                 self.assertEqual((normal, json.loads(args)), ("hi ", {"n": 5}))
+
+
+class TestErnie5_5ContinuedTurnReasoning(CustomTestCase):
+    def test_continued_assistant_turn_parses_as_answer(self):
+        """continue_final_message resumes after the turn's closed think block, but
+        the force-reasoning parser found no closing tag in the plain prefix and
+        put the whole continuation in reasoning_content."""
+        detector = Ernie5_5ReasoningDetector(
+            force_reasoning=True,
+            continue_final_message=True,
+            previous_content="The answer is",
+        )
+        result = detector.detect_and_parse(" 8.")
+        self.assertEqual((result.reasoning_text, result.normal_text), ("", " 8."))
+        streamed = Ernie5_5ReasoningDetector(
+            force_reasoning=True,
+            continue_final_message=True,
+            previous_content="The answer is",
+        ).parse_streaming_increment(" 8.")
+        self.assertEqual(streamed.normal_text, " 8.")
+
+    def test_fresh_turn_still_starts_in_reasoning(self):
+        detector = Ernie5_5ReasoningDetector(force_reasoning=True)
+        result = detector.detect_and_parse("let me think</ernie:think>8")
+        self.assertEqual(
+            (result.reasoning_text, result.normal_text), ("let me think", "8")
+        )
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ _SUPPORTED_KV_CACHE_DTYPES = ("auto", "fp8_e4m3", "bfloat16")
 # DSpark with DP attention is validated on DeepEP and MegaMoE here.
 register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep", "megamoe"))
 
+# The SiTU constants DeepGEMM's MegaMoE kernel computes with.
+_MEGAMOE_SITU_BETAS = (4.0, 25.0)
+
 
 def _validate_features(cfg: Any) -> None:
     if cfg.kv_cache_dtype not in _SUPPORTED_KV_CACHE_DTYPES:
@@ -145,6 +148,15 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     _validate_features(cfg)
     _validate_speculative(cfg)
+    if cfg.moe_a2a_backend == "megamoe" and hf_config is not None:
+        betas = (hf_config.activation_situ_beta, hf_config.activation_situ_linear_beta)
+        if betas != _MEGAMOE_SITU_BETAS:
+            # The routed experts would run the kernel's constants while the shared
+            # expert runs the checkpoint's.
+            raise ValueError(
+                "--moe-a2a-backend megamoe bakes SiTU beta/linear_beta "
+                f"{_MEGAMOE_SITU_BETAS}; this checkpoint uses {betas}"
+            )
     overrides: Dict[str, Any] = {
         "attention_backend": "ernie55",
         "page_size": DSV4_PAGE_SIZE,

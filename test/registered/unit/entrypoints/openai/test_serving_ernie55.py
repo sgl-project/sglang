@@ -67,7 +67,13 @@ class _ErnieLikeTokenizer:
 
 class TestErnie55ChatEncodingAdapter(CustomTestCase):
     def _encode(
-        self, *, thinking=False, chat_template_kwargs=None, messages=None, **req
+        self,
+        *,
+        thinking=False,
+        chat_template_kwargs=None,
+        messages=None,
+        default_chat_template_kwargs=None,
+        **req,
     ):
         messages = messages or [{"role": "user", "content": "hi"}]
         tokenizer = _ErnieLikeTokenizer()
@@ -80,6 +86,7 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
             reasoning_parser="ernie55",
             tool_call_parser="ernie55",
             chat_hooks=hooks,
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         request = ChatCompletionRequest(
             model="ernie",
@@ -165,6 +172,43 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
             tokenizer = self._encode(response_format=self._SCHEMA_FORMAT)
         self.assertFalse(tokenizer.adapter.renders_response_format)
         self.assertNotIn("response_format", tokenizer.template_kwargs[-1])
+
+    def test_request_effort_outranks_the_server_default(self):
+        """The handler moves a client chat_template_kwargs effort onto the request
+        before merging the server defaults, so a default effort of high kept the
+        prompt at high while the client asked for low."""
+        forwarded = self._encode(
+            default_chat_template_kwargs={"reasoning_effort": "high"},
+            reasoning_effort="low",
+        ).template_kwargs[-1]
+        self.assertEqual(forwarded["reasoning_effort"], "low")
+
+
+class TestErnie55ChatEncodingSpec(CustomTestCase):
+    def test_spec_needs_the_python_renderer(self):
+        """A tokenizer without ErnieChatTokenizer's renderer (no
+        --trust-remote-code, or a base checkpoint's) was forced onto the Python
+        adapter, whose startup warm-up crashed without a chat template."""
+        from types import SimpleNamespace
+
+        from sglang.srt.entrypoints.openai.chat_encoding import (
+            resolve_chat_encoding_spec,
+        )
+
+        hf_config = SimpleNamespace(
+            architectures=["Ernie5_5_MoeForCausalLM"], model_type="ernie5_5_moe"
+        )
+        for tokenizer, spec in (
+            (_ErnieLikeTokenizer(), "ernie5_5"),
+            (SimpleNamespace(chat_template=None), None),
+        ):
+            with self.subTest(tokenizer=type(tokenizer).__name__):
+                self.assertEqual(
+                    resolve_chat_encoding_spec(
+                        hf_config=hf_config, tokenizer=tokenizer, tool_call_parser=None
+                    ),
+                    spec,
+                )
 
 
 if __name__ == "__main__":

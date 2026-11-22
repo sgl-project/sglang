@@ -169,6 +169,10 @@ class Ernie55ChatEncodingAdapter:
         (see below), and multimodal is out of scope for this adapter."""
         kwargs: dict[str, Any] = dict(self._default_chat_template_kwargs)
         kwargs.update(request.chat_template_kwargs or {})
+        if request.reasoning_effort is not None:
+            # The handler moves a client chat_template_kwargs effort here before
+            # the server defaults are merged, so it outranks a default effort.
+            kwargs["reasoning_effort"] = request.reasoning_effort
         # Keep only keys the strict Python renderer accepts (the adapter sets
         # tokenize/return_dict/add_generation_prompt/tools itself); this drops a
         # frontend's DeepSeek-style ``thinking`` the renderer would reject.
@@ -178,9 +182,7 @@ class Ernie55ChatEncodingAdapter:
         # parser's force_reasoning reads `enable_thinking` (default on). Injecting
         # it here renders a thinking-off prompt under a force-reasoning parser, so
         # the answer lands in reasoning_content. Let both default to the
-        # enable_thinking toggle instead. A reasoning_effort only when the client set one.
-        if request.reasoning_effort is not None:
-            kwargs.setdefault("reasoning_effort", request.reasoning_effort)
+        # enable_thinking toggle instead.
         if self.renders_response_format and request.response_format is not None:
             kwargs["response_format"] = request.response_format.model_dump(
                 exclude_unset=True, by_alias=True

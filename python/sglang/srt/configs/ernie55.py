@@ -31,6 +31,8 @@ applied to the attention output, *SiTU* the gated activation
 projection, and ``multimax`` a four-segment transform of the logits.
 """
 
+import json
+import os
 from typing import Optional, Tuple
 
 from transformers import PretrainedConfig
@@ -74,6 +76,57 @@ _REQUIRED_CHECKPOINT_VALUES = {
     "routed_scaling_factor_learnable": True,
     "topk_group": 1,
 }
+
+
+def detect_fp4_routed_experts(model_path: str, revision: Optional[str]) -> bool:
+    """Whether the routed experts of ``revision`` are stored as MXFP4, read from
+    one expert's safetensors header before the experts are built. A hub ID whose
+    expert shard is not cached yet is read over HTTP."""
+    from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
+    from sglang.srt.utils import find_local_repo_dir
+
+    if os.path.isdir(model_path):
+        # None: no routed expert in the index; the experts are not MXFP4.
+        return bool(try_detect_fp4_experts(model_path))
+    local = find_local_repo_dir(model_path, revision)
+    detected = try_detect_fp4_experts(local) if local else None
+    if detected is None:
+        detected = _remote_fp4_routed_experts(model_path, revision)
+    if detected is None:
+        raise ValueError(
+            f"cannot tell whether the routed experts of {model_path} "
+            f"(revision {revision or 'main'}) are MXFP4: no expert header is "
+            "readable locally or from the hub. Set quantization_config."
+            "routed_experts_quant_method in config.json."
+        )
+    return detected
+
+
+def _remote_fp4_routed_experts(repo_id: str, revision: Optional[str]) -> Optional[bool]:
+    from huggingface_hub import HfApi, hf_hub_download
+
+    from sglang.srt.model_loader.weight_utils import _ROUTED_EXPERT_KEY_RE
+
+    try:
+        index = hf_hub_download(
+            repo_id, "model.safetensors.index.json", revision=revision
+        )
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+        name, shard = next(
+            (k, v) for k, v in weight_map.items() if _ROUTED_EXPERT_KEY_RE.search(k)
+        )
+        header = HfApi().parse_safetensors_file_metadata(
+            repo_id, shard, revision=revision
+        )
+    except Exception:  # noqa: BLE001 - offline, gated, or no routed expert
+        return None
+    dtype = header.tensors[name].dtype
+    if dtype in ("U8", "I8", "F4"):
+        return True
+    if dtype in ("F8_E4M3", "BF16", "F16", "F32"):
+        return False
+    return None
 
 
 def to_dspark_draft_config(hf_config) -> None:

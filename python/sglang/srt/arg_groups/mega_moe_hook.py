@@ -170,10 +170,12 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
         if (
-            model_label == "KimiK31ForConditionalGeneration"
+            model_label
+            in ("KimiK31ForConditionalGeneration", "Ernie5_5_MoeForCausalLM")
             and cfg.max_running_requests is not None
         ):
-            # Kimi repacks its experts at load and has no oversized eager fallback.
+            # Kimi and ERNIE run every batch through MegaMoE: an eager decode or
+            # verify past the largest graph bucket has no fallback either.
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
                 cfg.tp_size // cfg.attn_dp_size,

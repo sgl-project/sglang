@@ -57,8 +57,11 @@ def resolve_chat_encoding_spec(
 
     # ERNIE 5.5 renders its chat template in Python (ErnieChatTokenizer), not
     # Jinja, so prompts go through the tokenizer rather than apply_chat_template
-    # on a Jinja string.
-    if "Ernie5_5" in arch or hf_config.model_type == "ernie5_5_moe":
+    # on a Jinja string. A tokenizer without that renderer (loaded without
+    # --trust-remote-code, or a base checkpoint's) keeps the default path.
+    if ("Ernie5_5" in arch or hf_config.model_type == "ernie5_5_moe") and hasattr(
+        type(tokenizer), "render_chat"
+    ):
         return "ernie5_5"
 
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None

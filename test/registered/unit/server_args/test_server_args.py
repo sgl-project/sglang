@@ -728,6 +728,32 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
+    def test_megamoe_token_budget_covers_eager_decode_for_ernie(self):
+        """ERNIE has no non-mega MoE fallback, so an eager decode past the largest
+        graph bucket (256 requests here, graph max 64) overflowed the MegaMoE
+        workspace even though the graph-bucket check passed."""
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                chunked_prefill_size=128,
+                max_running_requests=256,
+                cuda_graph_max_bs_decode=64,
+                disaggregation_mode="decode",
+            )
+            args.resolve_once()
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                128
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+                with self.assertRaisesRegex(ValueError, "decode / verify"):
+                    validate_mega_moe_token_budget(args, "Ernie5_5_MoeForCausalLM")
+
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs
