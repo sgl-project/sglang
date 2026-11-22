@@ -3,50 +3,28 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import os.path
 import re
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-
-def _json_safe(obj: Any):
-    """
-    Recursively convert objects to JSON-serializable forms.
-    - Enums -> their name
-    - Callables -> stable module-qualified name
-    - Sets/Tuples -> lists
-    - Dicts/Lists -> recursively processed
-    """
-    if isinstance(obj, Enum):
-        return obj.name
-    if callable(obj):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
-        return f"{module}.{qualname}" if module else qualname
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
 
 
 def generate_request_id() -> str:
@@ -293,6 +271,11 @@ class SamplingParams:
     image_path: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
+    # Audio conditioning stays in the signature: S2V output follows the audio,
+    # so two requests with different audio must not share a batch.
+    audio_path: str | None = None
+    pose_video_path: str | None = None
+    num_clip: int | None = None
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -480,36 +463,9 @@ class SamplingParams:
             )
 
     def _set_output_file_name(self):
-        # settle output_file_name
-        if (
-            self.output_file_name is None
-            and self.prompt
-            and isinstance(self.prompt, str)
-        ):
-            # generate a random filename
-            # get a hash of current params
-            params_dict = dataclasses.asdict(self)
-            # Avoid recursion
-            params_dict["output_file_name"] = ""
-
-            # Convert to a stable JSON string
-            params_str = json.dumps(_json_safe(params_dict), sort_keys=True)
-            # Create a hash
-            hasher = hashlib.sha256()
-            hasher.update(params_str.encode("utf-8"))
-            param_hash = hasher.hexdigest()[:8]
-
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
-            self.output_file_name = base
-
         if self.output_file_name is None:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"output_{timestamp}"
-
+            self.output_file_name = f"output_{uuid.uuid4().hex}"
         self.output_file_name = _sanitize_filename(self.output_file_name)
-
-        # Ensure a proper extension is present
         self._set_output_file_ext()
 
     def __post_init__(self) -> None:
@@ -529,9 +485,9 @@ class SamplingParams:
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
         if self.enable_spectrum and isinstance(self.spectrum_params, dict):
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -724,7 +680,7 @@ class SamplingParams:
                 f"got {self.x264_preset!r}"
             )
 
-        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        # Used by the video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
@@ -825,6 +781,11 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
+        if self.num_clip is not None:
+            if not isinstance(self.num_clip, int) or self.num_clip <= 0:
+                raise ValueError(
+                    f"num_clip must be a positive int, got {self.num_clip!r}"
+                )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -864,6 +825,26 @@ class SamplingParams:
             and not task_type.accepts_video_input()
         ):
             raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+        if pipeline_config.task_type.requires_audio_input():
+            if self.audio_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'audio_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_audio_input():
+            if self.audio_path is not None:
+                raise ValueError(
+                    f"audio_path is not supported for {pipeline_config.task_type.name} models."
+                )
+
+        if (
+            self.pose_video_path is not None
+            and not pipeline_config.task_type.accepts_audio_input()
+        ):
+            raise ValueError(
+                f"pose_video_path is not supported for {pipeline_config.task_type.name} models."
+            )
 
     def resolve_task_type(self, pipeline_config) -> ModelTaskType:
         resolver = getattr(pipeline_config, "resolve_task_type", None)
@@ -984,7 +965,10 @@ class SamplingParams:
         else:
             self.enable_sequence_shard = False
 
-        if self.enable_sequence_shard:
+        if (
+            self.enable_sequence_shard
+            and pipeline_config.task_type != ModelTaskType.S2V
+        ):
             self.adjust_frames = False
             logger.info(
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
@@ -1010,7 +994,9 @@ class SamplingParams:
                 self.num_frames,
             )
 
-            if self.adjust_frames:
+            # Wan S2V trims one frame and shards its own padded sequence, so the
+            # generic per-GPU latent-frame alignment does not apply to it.
+            if self.adjust_frames and pipeline_config.task_type != ModelTaskType.S2V:
                 new_num_frames = align_num_frames_for_num_gpus(
                     self.num_frames,
                     num_gpus=server_args.num_gpus,
@@ -1112,12 +1098,6 @@ class SamplingParams:
 
         return sampling_params
 
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
-
-    def seconds(self) -> float:
-        return self.num_frames / self.fps
-
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields.
@@ -1138,8 +1118,8 @@ class SamplingParams:
             type=str,
             help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
         )
-        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
+        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)
@@ -1537,9 +1517,10 @@ class SamplingParams:
         )
         add_argument(
             "--sr-num-steps",
+            action=DeprecatedAction,
+            nargs=None,
             type=int,
-            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
-            "pi-Flow checkpoints.",
+            help="(Deprecated) No effect: Kandinsky6 SR reads --num-inference-steps.",
         )
         add_argument(
             "--sr-tiles-batch-size",
@@ -1607,9 +1588,26 @@ class SamplingParams:
             ),
         )
         add_argument(
-            "--moba-config-path",
+            "--audio-path",
             type=str,
-            help="Path to a JSON file containing V-MoBA specific configurations.",
+            help="Path to the input audio file for speech-driven video generation.",
+        )
+        add_argument(
+            "--pose-video-path",
+            type=str,
+            help="Optional pose guidance video for speech-driven video generation.",
+        )
+        add_argument(
+            "--num-clip",
+            type=int,
+            help="Optional clip repeat/count override for speech-driven video generation.",
+        )
+        add_argument(
+            "--moba-config-path",
+            action=DeprecatedAction,
+            nargs=None,
+            type=str,
+            help="(Deprecated) No effect: no sampling parameter reads this path.",
         )
         add_argument(
             "--return-trajectory-latents",
@@ -1829,20 +1827,6 @@ class SamplingParams:
         if explicit_fields is not None:
             self._explicit_fields = set(explicit_fields)
         self.__post_init__()
-
-    @property
-    def n_tokens(self) -> int:
-        # Calculate latent sizes
-        if self.height and self.width:
-            latents_size = [
-                (self.num_frames - 1) // 4 + 1,
-                self.height // 8,
-                self.width // 8,
-            ]
-            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
-        else:
-            n_tokens = -1
-        return n_tokens
 
 
 @dataclass

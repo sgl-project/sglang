@@ -22,7 +22,6 @@ QWEN3_6_35B_A3B_128K_PREFIX_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "30",
 }
 
 QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
@@ -78,6 +77,8 @@ QWEN3_6_35B_A3B_128K_PREFIX_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--prefill-delayer-max-delay-passes",
+    "30",
 ]
 
 
