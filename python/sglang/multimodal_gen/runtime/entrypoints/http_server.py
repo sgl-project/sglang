@@ -112,10 +112,18 @@ async def _wait_until_http_live(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
-async def _run_server_warmup_after_http_live(
-    server_args: ServerArgs, warmup_done: asyncio.Event
-) -> None:
+async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
+    server_args = app.state.server_args
+    warmup_done = app.state.server_warmup_done
+
+    def check_backend() -> None:
+        error = async_scheduler_client.failure_reason or _backend_failure(app)
+        if error is not None:
+            async_scheduler_client.mark_failed(error)
+            raise RuntimeError(error)
+
     try:
+        check_backend()
         if not should_run_synthetic_server_warmup(server_args):
             warmup_done.set()
             return
@@ -126,13 +134,19 @@ async def _run_server_warmup_after_http_live(
             server_args,
             async_scheduler_client.forward,
             fail_open=server_args.warmup_resolutions is None,
+            check_backend=check_backend,
         )
+        # A worker can exit after replying, before the periodic monitor runs.
+        check_backend()
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        if not async_scheduler_client.failure_reason:
+            async_scheduler_client.mark_failed(str(e))
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -169,9 +183,7 @@ async def lifespan(app: FastAPI):
         start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
-        warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_live(server_args, warmup_done)
-        )
+        warmup_task = asyncio.create_task(_run_server_warmup_after_http_live(app))
     else:
         warmup_done.set()
 
@@ -233,7 +245,11 @@ def _backend_failure(app: FastAPI) -> str | None:
                 continue
         except psutil.NoSuchProcess:
             pass
-        return "Scheduler worker exited; restart the server."
+        return (
+            f"Scheduler worker exited (pid={worker.pid}); restart the server. "
+            "Possible SIGKILL from a host/cgroup OOM: check memory.events "
+            "(oom_kill) and kernel logs."
+        )
     return None
 
 
@@ -510,45 +526,48 @@ async def stop_profile():
     errors = []
     profile_id = _global_profiler_state.get("profile_id", "unknown")
 
+    host_failed = False
     try:
-        # 1. Stop profiler in HTTP Server process
         profiler = _global_profiler_state["profiler"]
         if profiler is not None:
-            profiler.stop(export_trace=True, dump_rank=None)  # Save for all ranks
-
-        stop_req = StopProfileReq(export_trace=True)
-        try:
-            response = await async_scheduler_client.forward(stop_req)
-            if response.error:
-                errors.append(f"GPU Worker: {response.error}")
-        except Exception as e:
-            errors.append(f"GPU Worker: {str(e)}")
-
-        _global_profiler_state["profiler"] = None
-        _global_profiler_state["is_profiling"] = False
-        _global_profiler_state["profile_id"] = None
-
-        logger.info(f"Profilers stopped (profile_id={profile_id}). Traces saved.")
-
-        if errors:
-            return Response(
-                content=f"Profiling stopped (profile_id={profile_id}) with warnings: {'; '.join(errors)}\n",
-                status_code=200,
-            )
-        return Response(
-            content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
-            status_code=200,
-        )
-
+            profiler.stop(export_trace=True, dump_rank=None)
     except Exception as e:
-        logger.error(f"Failed to stop profiler: {e}")
+        host_failed = True
+        errors.append(f"HTTP Server: {e}")
+
+    try:
+        response = await async_scheduler_client.forward(
+            StopProfileReq(export_trace=True)
+        )
+        if response.error:
+            errors.append(f"GPU Worker: {response.error}")
+    except Exception as e:
+        errors.append(f"GPU Worker: {e}")
+    finally:
         _global_profiler_state["profiler"] = None
         _global_profiler_state["is_profiling"] = False
         _global_profiler_state["profile_id"] = None
-        return Response(
-            content=f"Failed to stop profiler: {str(e)}\n",
-            status_code=500,
+
+    if errors:
+        details = "; ".join(errors)
+        if host_failed:
+            logger.error(
+                "Failed to stop profiler (profile_id=%s): %s", profile_id, details
+            )
+            return Response(
+                content=f"Failed to stop profiler: {details}\n", status_code=500
+            )
+        message = (
+            f"Profiling stopped (profile_id={profile_id}) with warnings: {details}"
         )
+        logger.warning(message)
+        return Response(content=f"{message}\n", status_code=200)
+
+    logger.info("Profilers stopped (profile_id=%s).", profile_id)
+    return Response(
+        content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+        status_code=200,
+    )
 
 
 def make_serializable(obj):
@@ -689,7 +708,9 @@ def create_app(
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
         # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
+        if (
+            request.method == "POST" or request.url.path in ("/v1/models", "/models")
+        ) and async_scheduler_client.failure_reason:
             return orjson_response(
                 {"error": async_scheduler_client.failure_reason}, status_code=503
             )
@@ -700,6 +721,10 @@ def create_app(
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
         ):
             await warmup_done.wait()
+            if async_scheduler_client.failure_reason:
+                return orjson_response(
+                    {"error": async_scheduler_client.failure_reason}, status_code=503
+                )
         return await call_next(request)
 
     app.include_router(health_router)
