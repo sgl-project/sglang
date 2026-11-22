@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -11,12 +11,19 @@ from sglang.srt.layers.parameter import BasevLLMParameter, permute_param_layout_
 from sglang.srt.layers.quantization.marlin_utils import (
     apply_gptq_marlin_linear,
     check_marlin_supports_shape,
+    marlin_commit_buffer,
+    marlin_commit_param,
     marlin_is_k_full,
+    marlin_link_checkpoint_params,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
     marlin_moe_permute_scales,
     marlin_permute_scales,
+    marlin_restore_checkpoint_params,
     marlin_sort_g_idx,
+    marlin_stash_checkpoint_params,
+    marlin_to_gptq_weights,
+    marlin_unpermute_scales,
     marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import (
@@ -83,6 +90,8 @@ class GPTQMarlinLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_marlin_repacked", False):
+            return
         device = getattr(layer, "qweight").device
         c = self.kernel_config
 
@@ -96,8 +105,9 @@ class GPTQMarlinLinearKernel:
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # Allocate marlin workspace.
-        self.workspace = marlin_make_workspace(device)
+        # Allocate marlin workspace once; captured CUDA graphs keep its address.
+        if getattr(self, "workspace", None) is None:
+            self.workspace = marlin_make_workspace(device)
 
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
@@ -106,47 +116,14 @@ class GPTQMarlinLinearKernel:
         self.w_zp_name = "qzeros"
         self.w_gidx_name = "g_idx"
 
-        def _transform_param(
-            layer: torch.nn.Module, name: Optional[str], fn: Callable
-        ) -> None:
-            if name is not None and getattr(layer, name, None) is not None:
-                old_param = getattr(layer, name)
-                new_param = fn(old_param)
-                # replace the parameter with torch.nn.Parameter for TorchDynamo
-                # compatibility
-                replace_parameter(
-                    layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
-                )
-
-        def transform_w_q(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
-            return x
-
-        def transform_w_s(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size,
-            )
-            return x
+        marlin_stash_checkpoint_params(layer, ("qweight", "scales", "qzeros", "g_idx"))
 
         if c.has_g_idx:
             g_idx, g_idx_sort_indices = marlin_sort_g_idx(
-                getattr(layer, self.w_gidx_name)
+                getattr(layer, self.w_gidx_name).data
             )
-            _transform_param(layer, self.w_gidx_name, lambda _: g_idx)
-            layer.g_idx_sort_indices = g_idx_sort_indices
+            marlin_commit_param(layer, self.w_gidx_name, g_idx)
+            marlin_commit_buffer(layer, "g_idx_sort_indices", g_idx_sort_indices)
         else:
             setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
             layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
@@ -155,12 +132,12 @@ class GPTQMarlinLinearKernel:
             grouped_k = (
                 c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
             )
-            _transform_param(
+            marlin_commit_param(
                 layer,
                 self.w_zp_name,
-                lambda x: marlin_zero_points(
+                marlin_zero_points(
                     unpack_cols(
-                        x.t(),
+                        getattr(layer, self.w_zp_name).data.t(),
                         c.weight_type.size_bits,
                         grouped_k,
                         c.partition_weight_shape[1],
@@ -172,8 +149,61 @@ class GPTQMarlinLinearKernel:
             )
         else:
             setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
-        _transform_param(layer, self.w_q_name, transform_w_q)
-        _transform_param(layer, self.w_s_name, transform_w_s)
+
+        w_q = getattr(layer, self.w_q_name)
+        assert isinstance(w_q, BasevLLMParameter)
+        permute_param_layout_(w_q, input_dim=0, output_dim=1, packed_dim=0)
+        marlin_commit_param(
+            layer,
+            self.w_q_name,
+            gptq_marlin_repack(
+                w_q.data.contiguous(),
+                perm=layer.g_idx_sort_indices,
+                size_k=c.partition_weight_shape[0],
+                size_n=c.partition_weight_shape[1],
+                num_bits=c.weight_type.size_bits,
+            ),
+        )
+
+        w_s = getattr(layer, self.w_s_name)
+        assert isinstance(w_s, BasevLLMParameter)
+        permute_param_layout_(w_s, input_dim=0, output_dim=1)
+        marlin_commit_param(
+            layer,
+            self.w_s_name,
+            marlin_permute_scales(
+                w_s.data.contiguous(),
+                size_k=c.partition_weight_shape[0],
+                size_n=c.partition_weight_shape[1],
+                group_size=c.group_size,
+            ),
+        )
+        marlin_link_checkpoint_params(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_marlin_repacked", False):
+            return
+        c = self.kernel_config
+        size_k, size_n = c.partition_weight_shape
+        values = {
+            "qweight": marlin_to_gptq_weights(
+                getattr(layer, self.w_q_name).data,
+                layer.g_idx_sort_indices,
+                size_k,
+                size_n,
+                c.weight_type.size_bits,
+            ),
+            "scales": marlin_unpermute_scales(
+                getattr(layer, self.w_s_name).data, size_k, size_n, c.group_size
+            ),
+        }
+        if c.has_g_idx:
+            g_idx = torch.empty_like(getattr(layer, self.w_gidx_name).data)
+            g_idx[layer.g_idx_sort_indices.long()] = getattr(
+                layer, self.w_gidx_name
+            ).data
+            values["g_idx"] = g_idx
+        marlin_restore_checkpoint_params(layer, values)
 
     def apply(
         self,

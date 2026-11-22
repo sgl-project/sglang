@@ -36,6 +36,10 @@ class BaseLinearScheme(ABC):
         """
         raise NotImplementedError
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Undo a shape-changing repack so checkpoint-format weights load again."""
+        return
+
     @abstractmethod
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]

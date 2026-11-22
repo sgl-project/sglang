@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -451,6 +452,213 @@ def moe_awq_to_marlin_zero_points(
     for e in range(num_experts):
         output[e] = awq_to_marlin_zero_points(q_zp_packed[e], size_k, size_n, num_bits)
     return output
+
+
+# Undoing the dense Marlin repack, for online weight updates. A weight-update
+# session restores checkpoint-format parameters (`restore_weights_before_loading`),
+# loads into them, and repacks once at the end. Captured CUDA graphs keep the
+# addresses of the Marlin tensors, so every repack after the first one writes
+# into the tensors the first one registered, and the checkpoint-format
+# parameters are views of that same memory.
+
+
+@functools.lru_cache(maxsize=None)
+def _marlin_weight_perm(num_bits: int) -> torch.Tensor:
+    perm_list: list[int] = []
+    for i in range(32):
+        perm1: list[int] = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm_list.extend([p + 256 * j for p in perm1])
+    interleave = _marlin_interleave(num_bits).numpy()
+    perm = numpy.array(perm_list).reshape((-1, len(interleave)))[:, interleave]
+    return torch.from_numpy(perm.ravel())
+
+
+def _marlin_interleave(num_bits: int) -> torch.Tensor:
+    if num_bits == 4:
+        return torch.tensor([0, 2, 4, 6, 1, 3, 5, 7])
+    if num_bits == 8:
+        return torch.tensor([0, 2, 1, 3])
+    raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
+
+
+def _unpack_int32_cols(packed: torch.Tensor, num_bits: int) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    shifts = torch.arange(pack_factor, device=packed.device, dtype=torch.int32)
+    values = (packed.unsqueeze(-1) >> (shifts * num_bits)) & ((1 << num_bits) - 1)
+    return values.reshape(packed.shape[0], -1)
+
+
+def _to_int32(packed: torch.Tensor) -> torch.Tensor:
+    return torch.where(packed >= 2**31, packed - 2**32, packed).to(torch.int32)
+
+
+def _pack_int32_cols(q: torch.Tensor, num_bits: int) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    shifts = torch.arange(pack_factor, device=q.device, dtype=torch.int64) * num_bits
+    q = q.to(torch.int64).reshape(q.shape[0], -1, pack_factor)
+    return _to_int32((q << shifts).sum(-1))
+
+
+def _pack_int32_rows(q: torch.Tensor, num_bits: int) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    shifts = torch.arange(pack_factor, device=q.device, dtype=torch.int64) * num_bits
+    q = q.to(torch.int64).reshape(-1, pack_factor, q.shape[1])
+    return _to_int32((q << shifts.view(1, -1, 1)).sum(1))
+
+
+def _marlin_weights_to_int(
+    q_marlin: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    """Unpack a Marlin weight into its (size_k, size_n) integer values."""
+    perm = _marlin_weight_perm(num_bits).to(q_marlin.device)
+    q = _unpack_int32_cols(q_marlin, num_bits)
+    q = q.reshape(-1, perm.numel())[:, torch.argsort(perm)]
+    q = q.reshape(
+        size_k // GPTQ_MARLIN_TILE,
+        size_n // GPTQ_MARLIN_TILE,
+        GPTQ_MARLIN_TILE,
+        GPTQ_MARLIN_TILE,
+    )
+    return q.permute(0, 2, 1, 3).reshape(size_k, size_n)
+
+
+def marlin_to_gptq_weights(
+    q_marlin: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    """Inverse of `gptq_marlin_repack`: the (size_k // pack, size_n) GPTQ weight."""
+    q = _marlin_weights_to_int(q_marlin, size_k, size_n, num_bits)
+    if perm.numel() > 0:
+        unsorted = torch.empty_like(q)
+        unsorted[perm.long()] = q
+        q = unsorted
+    return _pack_int32_rows(q, num_bits)
+
+
+def marlin_to_awq_weights(
+    q_marlin: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    """Inverse of `awq_marlin_repack`: the (size_k, size_n // pack) AWQ weight."""
+    interleave = _marlin_interleave(num_bits).to(q_marlin.device)
+    q = _marlin_weights_to_int(q_marlin, size_k, size_n, num_bits)
+    q = q.reshape(-1, interleave.numel())[:, interleave].reshape(size_k, size_n)
+    return _pack_int32_cols(q, num_bits)
+
+
+def marlin_unpermute_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int
+) -> torch.Tensor:
+    """Inverse of `marlin_permute_scales`."""
+    scale_perm, scale_perm_single = get_scale_perms()
+    perm = scale_perm if group_size < size_k and group_size != -1 else scale_perm_single
+    inverse = torch.argsort(torch.tensor(perm, device=s.device))
+    return s.reshape(-1, len(perm))[:, inverse].reshape(-1, size_n).contiguous()
+
+
+def marlin_to_awq_zero_points(
+    zp_marlin: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    """Inverse of `awq_to_marlin_zero_points`."""
+    interleave = _marlin_interleave(num_bits).to(zp_marlin.device)
+    scale_perm, _ = get_scale_perms()
+    scale_perm = torch.tensor(scale_perm, device=zp_marlin.device)
+    zp = _unpack_int32_cols(zp_marlin, num_bits)
+    zp = zp.reshape(-1, interleave.numel())[:, torch.argsort(interleave)]
+    zp = zp.reshape(-1, scale_perm.numel())[:, torch.argsort(scale_perm)]
+    zp = zp.reshape(-1, interleave.numel())[:, interleave].reshape(size_k, size_n)
+    return _pack_int32_cols(zp, num_bits)
+
+
+def marlin_stash_checkpoint_params(layer: torch.nn.Module, names) -> None:
+    """Keep the checkpoint-format parameters (and their weight loaders) for restores."""
+    if "_marlin_checkpoint_params" in layer.__dict__:
+        return
+    layer._marlin_checkpoint_params = {
+        name: (getattr(layer, name), tuple(getattr(layer, name).shape))
+        for name in names
+        if getattr(layer, name, None) is not None
+    }
+    layer._marlin_kernel_params = {}
+
+
+def marlin_commit_param(layer: torch.nn.Module, name: str, value: torch.Tensor) -> None:
+    """Register `value` as the kernel-layout parameter `name`.
+
+    The first repack registers it; later repacks copy into that tensor.
+    """
+    kernel_params = layer.__dict__.setdefault("_marlin_kernel_params", {})
+    param = kernel_params.get(name)
+    if param is None:
+        param = torch.nn.Parameter(value, requires_grad=False)
+        kernel_params[name] = param
+    else:
+        if param.shape != value.shape or param.dtype != value.dtype:
+            raise RuntimeError(
+                f"Marlin repack of {name} changed from {tuple(param.shape)} "
+                f"{param.dtype} to {tuple(value.shape)} {value.dtype}"
+            )
+        param.data.copy_(value)
+    layer.register_parameter(name, param)
+
+
+def marlin_commit_buffer(
+    layer: torch.nn.Module, name: str, value: torch.Tensor
+) -> None:
+    """Like `marlin_commit_param`, for a plain tensor attribute."""
+    current = getattr(layer, name, None)
+    if (
+        isinstance(current, torch.Tensor)
+        and current.numel() > 0
+        and current.shape == value.shape
+        and current.dtype == value.dtype
+    ):
+        current.copy_(value)
+    else:
+        setattr(layer, name, value)
+
+
+def marlin_link_checkpoint_params(layer: torch.nn.Module) -> None:
+    """Make the stashed checkpoint parameters views of the kernel-layout memory.
+
+    Same-size pairs share memory so a restore costs no extra allocation; the
+    checkpoint values themselves are rebuilt by the restore.
+    """
+    kernel_params = layer.__dict__.get("_marlin_kernel_params", {})
+    for name, (param, shape) in layer._marlin_checkpoint_params.items():
+        kernel = kernel_params.get(name)
+        if (
+            kernel is not None
+            and getattr(layer, name) is kernel
+            and kernel.numel() == param.numel()
+            and kernel.dtype == param.dtype
+        ):
+            param.data = kernel.data.view(shape)
+    layer._marlin_repacked = True
+
+
+def marlin_restore_checkpoint_params(
+    layer: torch.nn.Module, values: dict[str, torch.Tensor]
+) -> None:
+    """Re-register the checkpoint parameters, writing `values` into them."""
+    for name, (param, shape) in layer._marlin_checkpoint_params.items():
+        value = values.get(name)
+        if value is not None:
+            param.data.copy_(value.reshape(shape))
+        layer.register_parameter(name, param)
+    layer._marlin_repacked = False
 
 
 def maybe_warn_marlin_atomic_add(device, dtype):
