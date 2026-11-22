@@ -581,6 +581,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         def fake_process(chat_request, is_multimodal, **_):
             chat_request._response_parser_thinking_end = "</think>"
             chat_request._response_parser_answer_excludes_calls = True
+            chat_request._response_parser_json_answer_channel = True
             return MessageProcessingResult(
                 prompt="prompt",
                 prompt_ids=[1, 2, 3],
@@ -600,6 +601,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
 
         self.assertEqual(request._response_parser_thinking_end, "</think>")
         self.assertTrue(request._response_parser_answer_excludes_calls)
+        self.assertTrue(request._response_parser_json_answer_channel)
 
     def test_harmony_forced_choices_explain_missing_routing_constraints(self):
         serving = make_serving()

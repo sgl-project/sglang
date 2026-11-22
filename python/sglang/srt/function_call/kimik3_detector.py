@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_format import (
     RESPONSE_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    closing_markers_len,
     partial_suffix_len,
     strip_partial_marker_suffix,
     strip_response_wrappers,
@@ -82,6 +83,10 @@ class KimiK3Detector(BaseFormatDetector):
         self._argument_value = ""
         self._argument_count = 0
         self.incomplete_tool_call_indices: set[int] = set()
+        # The response channel holds a JSON answer, so only its own opener and
+        # the closers that end it are markers; any others are quoted text.
+        self.keep_quoted_markers = False
+        self._response_opened = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -348,6 +353,8 @@ class KimiK3Detector(BaseFormatDetector):
         return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
+        if self.keep_quoted_markers:
+            return self._emit_answer_text(limit)
         if limit is None:
             holdback = partial_suffix_len(
                 self._buffer,
@@ -361,4 +368,27 @@ class KimiK3Detector(BaseFormatDetector):
             if marker in pending:
                 pending = pending.replace(marker, "")
         self._sent_normal_idx = limit
+        return pending
+
+    def _emit_answer_text(self, limit: int | None) -> str:
+        # A given limit ends the text, so closers there end the answer; until
+        # then they are held, since quoted text may still follow them.
+        end = len(self._buffer) if limit is None else limit
+        pending = self._buffer[self._sent_normal_idx : end]
+        if limit is None:
+            holdback = max(
+                partial_suffix_len(pending, [self.bot_token, RESPONSE_OPEN]),
+                closing_markers_len(pending),
+            )
+            pending = pending[: len(pending) - holdback]
+        else:
+            pending = pending[: len(pending) - closing_markers_len(pending)]
+        self._sent_normal_idx = (
+            end if limit is not None else (self._sent_normal_idx + len(pending))
+        )
+        if not self._response_opened:
+            head, opener, answer = pending.partition(RESPONSE_OPEN)
+            if opener:
+                self._response_opened = True
+                pending = head + answer
         return pending

@@ -55,6 +55,19 @@ def strip_response_wrappers(text: str) -> str:
     return strip_partial_marker_suffix(text)
 
 
+def closing_markers_len(text: str) -> int:
+    """Length of the response and message closers, complete or cut off, that
+    `text` ends with."""
+    end = len(text) - partial_suffix_len(text, [RESPONSE_CLOSE, MESSAGE_CLOSE])
+    while True:
+        for marker in (MESSAGE_CLOSE, RESPONSE_CLOSE):
+            if text.endswith(marker, 0, end):
+                end -= len(marker)
+                break
+        else:
+            return len(text) - end
+
+
 def strip_response_markers(text: str) -> str:
     """`text` without the opener and closers of its response channel, keeping
     the text before the opener and any marker quoted inside the answer."""

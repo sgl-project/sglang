@@ -796,6 +796,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request._response_parser_answer_excludes_calls = (
             chat_request._response_parser_answer_excludes_calls
         )
+        request._response_parser_json_answer_channel = (
+            chat_request._response_parser_json_answer_channel
+        )
 
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
@@ -2368,6 +2371,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
                 thinking_end=request._response_parser_thinking_end,
                 answer_excludes_calls=request._response_parser_answer_excludes_calls,
+                json_answer_channel=request._response_parser_json_answer_channel,
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:

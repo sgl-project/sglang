@@ -3357,6 +3357,43 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertIsNone(tool_calls)
                 self.assertEqual(text, answer or '{"word": "hi"}')
 
+    def test_kimi_k3_framed_json_answer_keeps_quoted_markers_streamed_or_not(self):
+        """A framed Kimi-K3 JSON answer that reaches the tool parser loses only
+        its own response markers, streamed or not; markers quoted inside the
+        JSON, including a closer, are answer text."""
+        self.chat.tool_call_parser = "kimi_k3"
+        opener, closer = "<|open|>response<|sep|>", "<|close|>response<|sep|>"
+        answers = (
+            '{"word": "' + opener + 'hi"}',
+            '{"word": "a' + closer + 'b"}',
+            '{"word": "x' + closer + '<|close|>message<|sep|>"}',
+        )
+        thinking = "Plan.<|close|>think<|sep|>"
+        for reasoning_parser, prefix in ((None, ""), ("kimi_k3", thinking)):
+            self.chat.reasoning_parser = reasoning_parser
+            self.template_manager.force_reasoning = reasoning_parser is not None
+            for answer in answers:
+                raw = prefix + opener + answer + closer + "<|close|>message<|sep|>"
+                for stream, incremental in (
+                    (False, False),
+                    (True, False),
+                    (True, True),
+                ):
+                    with self.subTest(
+                        parser=reasoning_parser,
+                        answer=answer,
+                        stream=stream,
+                        incremental=incremental,
+                    ):
+                        served = self._served(
+                            self._stopped_on_token(raw, 1),
+                            stream,
+                            incremental=incremental,
+                            separate_reasoning=False,
+                            **self._json_answer_fields(),
+                        )
+                        self.assertEqual(served, ("", prefix + answer, []))
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

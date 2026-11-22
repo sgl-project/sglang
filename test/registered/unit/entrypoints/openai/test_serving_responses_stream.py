@@ -720,6 +720,13 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                 '{"word": "a</think>b"}<|close|>response<|sep|><|close|>message<|sep|>',
                 '{"word": "a</think>b"}',
             ),
+            (
+                "kimi_k3",
+                "",
+                '<|open|>response<|sep|>{"word": "a<|close|>response<|sep|>b"}'
+                "<|close|>response<|sep|><|close|>message<|sep|>",
+                '{"word": "a<|close|>response<|sep|>b"}',
+            ),
         )
         for parser_name, thinking_end, raw, answer in cases:
             with self.subTest(parser=parser_name, raw=raw):
@@ -740,6 +747,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
                     ],
                 )
                 request._response_parser_thinking_end = thinking_end
+                request._response_parser_json_answer_channel = parser_name == "kimi_k3"
                 (full_item,) = serving._make_response_output_items(
                     request,
                     raw,

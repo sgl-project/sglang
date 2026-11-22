@@ -1950,6 +1950,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=xgrammar_reasoning,
                 )
                 tool_call_constraint_covers_answer = tool_call_constraint is not None
+                # The kimi_k3 reasoning parser unwraps a separated answer itself.
+                request._response_parser_json_answer_channel = (
+                    tool_call_constraint_covers_answer
+                    and isinstance(parser.detector, KimiK3Detector)
+                    and not (
+                        self.reasoning_parser == "kimi_k3"
+                        and request.separate_reasoning
+                    )
+                )
                 if tool_call_constraint is None:
                     tool_call_constraint = parser.get_structure_constraint(
                         request.tool_choice,
@@ -3920,6 +3929,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     answer_excludes_calls=(
                         request._response_parser_answer_excludes_calls
                     ),
+                    json_answer_channel=request._response_parser_json_answer_channel,
                 )
 
         parser = parser_dict[index]
