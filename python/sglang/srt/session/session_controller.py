@@ -273,6 +273,7 @@ class Session:
             cache_salt=req.cache_salt,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
+            filler_seed=req.filler_seed,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
