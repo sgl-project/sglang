@@ -2,10 +2,9 @@
 """A warm output and a different resolution must keep separate NVENC sessions."""
 
 import importlib.util
-import sys
+import os
 import tempfile
 import threading
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,24 +19,32 @@ class TestNvencAvailability(CustomTestCase):
         """A GPU without an H.264 encoder must fall back even when CUDA is available."""
         from sglang.multimodal_gen.runtime.utils import nvenc_video_encoder as nvenc
 
-        native = types.ModuleType("PyNvVideoCodec")
-        native.GetEncoderCaps = mock.Mock(return_value={"num_encoder_engines": 0})
-        nvenc._device_has_nvenc.cache_clear()
-        try:
+        # The fake binding deliberately ignores its ordinal, like version 2.2.3.
+        # A successful probe must choose the device via the child's environment.
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "PyNvVideoCodec.py").write_text(
+                "import os\n"
+                "def GetEncoderCaps(ordinal, codec):\n"
+                "    assert ordinal == 0 and codec == 'h264'\n"
+                "    device = os.environ['CUDA_VISIBLE_DEVICES']\n"
+                "    if device == 'GPU-broken':\n"
+                "        raise RuntimeError('encoder session unavailable')\n"
+                "    return {'num_encoder_engines': int(device in ('GPU-capable', 'GPU-second'))}\n"
+            )
+            self.addCleanup(nvenc._device_has_nvenc.cache_clear)
+            nvenc._device_has_nvenc.cache_clear()
             with (
-                mock.patch.dict(sys.modules, {"PyNvVideoCodec": native}),
+                mock.patch.dict(
+                    os.environ,
+                    PYTHONPATH=directory,
+                    CUDA_VISIBLE_DEVICES="GPU-capable,GPU-unsupported,GPU-broken,GPU-second",
+                ),
                 mock.patch.object(torch.cuda, "is_available", return_value=True),
             ):
-                self.assertFalse(nvenc.supports_nvenc(torch.device("cuda:0")))
-                native.GetEncoderCaps.assert_called_once_with(0, "h264")
-                native.GetEncoderCaps.return_value = {"num_encoder_engines": 1}
-                nvenc._device_has_nvenc.cache_clear()
                 self.assertTrue(nvenc.supports_nvenc(torch.device("cuda:0")))
-                native.GetEncoderCaps.side_effect = RuntimeError()
-                nvenc._device_has_nvenc.cache_clear()
-                self.assertFalse(nvenc.supports_nvenc(torch.device("cuda:0")))
-        finally:
-            nvenc._device_has_nvenc.cache_clear()
+                self.assertFalse(nvenc.supports_nvenc(torch.device("cuda:1")))
+                self.assertFalse(nvenc.supports_nvenc(torch.device("cuda:2")))
+                self.assertTrue(nvenc.supports_nvenc(torch.device("cuda:3")))
 
 
 @unittest.skipUnless(

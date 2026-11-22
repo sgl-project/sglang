@@ -7,6 +7,8 @@ import io
 import logging
 import math
 import os
+import subprocess
+import sys
 import threading
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -25,19 +27,41 @@ _cache_lock = threading.Lock()
 
 @lru_cache(maxsize=None)
 def _device_has_nvenc(pid: int, gpu_id: int) -> bool:
+    # In PyNvVideoCodec 2.2.x, GetEncoderCaps always probes ordinal 0.
+    # It can leave a new CUDA context current when opening the encoder fails.
+    # Restrict a short-lived interpreter to the requested GPU so a failed
+    # probe cannot invalidate the serving thread's CUDA streams.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     try:
-        import PyNvVideoCodec as nvc
-
-        caps = nvc.GetEncoderCaps(gpu_id, "h264")
-        supported = int(caps.get("num_encoder_engines", 0)) > 0
-    except Exception as exc:
-        message = str(exc).splitlines()
+        device = (
+            str(gpu_id)
+            if visible_devices is None
+            else visible_devices.split(",")[gpu_id].strip()
+        )
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import PyNvVideoCodec as nvc\n"
+                "caps = nvc.GetEncoderCaps(0, 'h264')\n"
+                "raise SystemExit(0 if int(caps.get('num_encoder_engines', 0)) > 0 else 2)",
+            ],
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": device},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (IndexError, OSError) as exc:
+        logger.warning("Cannot probe NVENC on CUDA device %d: %s", gpu_id, exc)
+        return False
+    if probe.returncode not in (0, 2):
         logger.warning(
-            "Cannot query NVENC on CUDA device %d; using CPU encoding: %s",
+            "NVENC probe on CUDA device %d exited with %d; using CPU encoding",
             gpu_id,
-            message[0] if message else type(exc).__name__,
+            probe.returncode,
         )
         return False
+    supported = probe.returncode == 0
     if not supported:
         logger.warning("CUDA device %d has no H.264 NVENC; using CPU encoding", gpu_id)
     return supported
@@ -47,7 +71,9 @@ def supports_nvenc(device: torch.device) -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
     gpu_id = device.index if device.index is not None else torch.cuda.current_device()
-    return _device_has_nvenc(os.getpid(), gpu_id)
+    # CreateEncoder also probes ordinal 0 internally, even for a nonzero GPU.
+    pid = os.getpid()
+    return _device_has_nvenc(pid, 0) and (gpu_id == 0 or _device_has_nvenc(pid, gpu_id))
 
 
 class _NvencSession:
