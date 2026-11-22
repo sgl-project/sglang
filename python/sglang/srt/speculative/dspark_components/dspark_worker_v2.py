@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -9,7 +9,6 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -26,8 +25,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
-from sglang.srt.sampling.watermarking.interface import VerifyWatermark
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -99,10 +97,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
-    build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
 )
+from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
@@ -1202,26 +1200,37 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        if batch.has_grammar:
+        verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits_output,
+            grammar_tree=grammar_tree,
+            grammar_barrier=grammar_barrier,
+            # Without sampling info (a simulated greedy accept drops it), no watermark.
+            watermark_engine=(
+                None
+                if sampling_info is None
+                else self.target_worker.model_runner.watermark
+            ),
+            watermark_full_mask=False,
+        )
+        if verify.grammar_mask is not None:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
-            )
-            if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
+            verify.grammar_mask.apply(logits_output.next_token_logits)
 
-        target_logits, sampling_info, watermark = self._force_watermark(
-            batch=batch,
-            logits_output=logits_output,
-            verify_ids_2d=verify_ids_2d,
-            positions_2d=verify_window.positions_2d,
-            sampling_info=sampling_info,
-        )
+        target_logits = logits_output.next_token_logits
+        if verify.watermark is not None:
+            target_logits, sampling_info = verify.watermark.apply(
+                target_logits,
+                sampling_info=sampling_info,
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_ids_2d,
+                positions=verify_window.positions_2d,
+                draft_token_num=verify_ids_2d.shape[1],
+                custom_mask=None,
+                # compute_spec_logprobs reads logits_output after acceptance.
+                keep_logits=batch.return_logprob,
+            )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
@@ -1266,10 +1275,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-        commit_verify_accept(
-            batch.sampling_info,
-            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
-            watermark=watermark,
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(
+                tokens=accept.out_tokens, accept_lens=accept.commit_lens
+            ),
         )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
@@ -1304,14 +1315,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 out_tokens=accept.out_tokens,
                 commit_lens=accept.commit_lens,
             )
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                accept.out_tokens.reshape(-1),
-                chain_stride=self.verify_num_draft_tokens,
-            )
-
         relay = self._future_relay_in_graph(
             run_compact=run_compact, folded_accept=graph_accept
         )
@@ -1394,37 +1397,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
-
-    def _force_watermark(
-        self,
-        *,
-        batch: ScheduleBatch,
-        logits_output,
-        verify_ids_2d: torch.Tensor,
-        positions_2d: torch.Tensor,
-        sampling_info,
-    ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
-        target_logits = logits_output.next_token_logits
-        engine = self.target_worker.model_runner.watermark
-        watermark = (
-            engine.bind_verify(sampling_info.watermark, full_mask=False)
-            if engine is not None and sampling_info is not None
-            else None
-        )
-        if watermark is None:
-            return target_logits, sampling_info, None
-        target_logits, sampling_info = watermark.apply(
-            target_logits,
-            sampling_info=sampling_info,
-            req_pool_indices=batch.req_pool_indices,
-            draft_tokens=verify_ids_2d,
-            positions=positions_2d,
-            draft_token_num=verify_ids_2d.shape[1],
-            custom_mask=None,
-            # compute_spec_logprobs reads logits_output after acceptance.
-            keep_logits=batch.return_logprob,
-        )
-        return target_logits, sampling_info, watermark
 
     def _sampling_graph_eligible(
         self,
