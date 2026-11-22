@@ -216,7 +216,7 @@ class FunctionCallParser:
             return "", answer
         if not end:
             return text, ""
-        if self._starts_with_call(answer):
+        if not self._starts_answer(answer):
             return thinking + end, answer
         return "", answer
 
@@ -233,6 +233,12 @@ class FunctionCallParser:
 
     def _starts_with_call(self, text: str) -> bool:
         return text.lstrip().startswith(self.detector.bot_token)
+
+    def _starts_answer(self, text: str) -> bool:
+        # Neither a tool call nor text that could still open one.
+        head = text.lstrip()
+        bot_token = self.detector.bot_token
+        return not (head.startswith(bot_token) or bot_token.startswith(head))
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -362,13 +368,13 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        # A stream cut off inside the thinking block keeps it only when it is
-        # kept; text after the block that never reached a tool call is the answer.
+        # A kept thinking block stays when the stream ends before the answer
+        # starts, the same as a turn that calls a tool.
         normal_text = ""
         if self._stream_phase == "thinking" and self._keep_thinking_before_calls:
             normal_text = "".join(self._held_thinking) + self._thinking_tail
         elif self._stream_phase == "undecided":
-            normal_text = self._undecided_text
+            normal_text = "".join(self._held_thinking) + self._undecided_text
         self._stream_phase = None
         self._thinking_tail = ""
         self._held_thinking = []

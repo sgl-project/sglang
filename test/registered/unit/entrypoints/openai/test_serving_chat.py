@@ -2813,15 +2813,24 @@ class ServingChatTestCase(CustomTestCase):
     }
 
     def _auto_tools_with_json_answer_sampling_params(
-        self, parser_name, strict, enable_thinking=False, schema=None
+        self,
+        parser_name,
+        strict,
+        enable_thinking=False,
+        schema=None,
+        assistant_prefix=None,
     ):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = parser_name
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        messages = [{"role": "user", "content": "Read note.txt, report the word."}]
+        if assistant_prefix is not None:
+            messages.append({"role": "assistant", "content": assistant_prefix})
         request = ChatCompletionRequest(
             model="x",
-            messages=[{"role": "user", "content": "Read note.txt, report the word."}],
+            messages=messages,
+            continue_final_message=assistant_prefix is not None,
             tools=[
                 {
                     "type": "function",
@@ -2979,6 +2988,32 @@ class ServingChatTestCase(CustomTestCase):
             _is_grammar_accept_string(grammar, 'Plan.</think>{"word": "banana"}')
         )
         self.assertFalse(_is_grammar_accept_string(grammar, '{"word": "banana"}'))
+
+    def test_glm_json_answer_continuing_closed_thinking_opens_no_block(self):
+        """Continuing an assistant message that already ends its thinking must
+        not require a second block: the reasoning parser reads that output as
+        content, so a fresh </think> ahead of a call hid the call."""
+        self.chat.reasoning_parser = "glm45"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        call = (
+            "<tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>note.txt</arg_value></tool_call>"
+        )
+        params = self._auto_tools_with_json_answer_sampling_params(
+            "glm47",
+            strict=False,
+            enable_thinking=True,
+            assistant_prefix="Plan.</think>",
+        )
+
+        grammar = Grammar.from_ebnf(params["ebnf"])
+        for output in (call, '{"word": "banana"}'):
+            self.assertTrue(_is_grammar_accept_string(grammar, output), output)
+        self.assertFalse(
+            _is_grammar_accept_string(grammar, '</think>{"word": "banana"}')
+        )
 
     def test_auto_tools_with_json_answer_keeps_whitespace_cap(self):
         """--constrained-json-max-whitespace-cnt bounds the answer branch as it
@@ -3172,6 +3207,11 @@ class ServingChatTestCase(CustomTestCase):
             ),
             (cut_off, ("", "Plan the", [])),
         )
+        # A turn that stops before the answer or call starts keeps its thinking.
+        for text in ("Plan.</think>", "Plan.</think> \n", "Plan.</think><tool_"):
+            stopped = self._stopped_on_token(text, 1)
+            stopped["meta_info"]["finish_reason"] = {"type": "length", "length": 3}
+            cases += ((stopped, ("", text, [])),)
         modes = ((False, False), (True, False), (True, True))
         for output, expected in cases:
             for stream, incremental in modes:
@@ -3201,8 +3241,8 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_glm_json_answer_with_reasoning_parser_parses_calls_by_turn(self):
         """With --reasoning-parser glm45, a JSON answer quoting the call marker
-        stays an answer, streamed or not, while unseparated reasoning ahead of
-        a call does not hide the call."""
+        stays an answer, streamed or not, also unseparated with thinking off,
+        while unseparated reasoning ahead of a call does not hide the call."""
         self.chat.tool_call_parser = "glm47"
         self.chat.reasoning_parser = "glm45"
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -3212,19 +3252,31 @@ class ServingChatTestCase(CustomTestCase):
             "<tool_call>read_file<arg_key>path</arg_key>"
             "<arg_value>note.txt</arg_value></tool_call>"
         )
+        quoted_call = '{"word": "<tool_call>ping</tool_call>"}'
+        thinking_off = {"enable_thinking": False}
         cases = (
             (
                 'Plan.</think>{"word": "<tool_call>"}',
                 True,
+                None,
                 ("Plan.", '{"word": "<tool_call>"}', []),
             ),
             (
                 "Plan.</think>" + call,
                 False,
+                None,
                 ("", "Plan.</think>", [("read_file", {"path": "note.txt"})]),
             ),
+            # With thinking off nothing precedes a call, so the answer check holds.
+            (quoted_call, False, thinking_off, ("", quoted_call, [])),
+            (
+                call,
+                False,
+                thinking_off,
+                ("", "", [("read_file", {"path": "note.txt"})]),
+            ),
         )
-        for text, separate, expected in cases:
+        for text, separate, template_kwargs, expected in cases:
             for stream, incremental in ((False, False), (True, False), (True, True)):
                 with self.subTest(text=text, stream=stream, incremental=incremental):
                     served = self._served(
@@ -3232,6 +3284,7 @@ class ServingChatTestCase(CustomTestCase):
                         stream,
                         incremental=incremental,
                         separate_reasoning=separate,
+                        chat_template_kwargs=template_kwargs,
                         **self._json_answer_fields(),
                     )
                     self.assertEqual(served, expected)

@@ -391,6 +391,20 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
     return config or None
 
 
+def _continues_closed_thinking(
+    request: ChatCompletionRequest, end_of_thinking: str
+) -> bool:
+    # Same test the reasoning parser applies to a continued assistant message.
+    last = request.messages[-1] if request.messages else None
+    return (
+        request.continue_final_message
+        and last is not None
+        and last.role == "assistant"
+        and isinstance(last.content, str)
+        and end_of_thinking in last.content
+    )
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -1871,6 +1885,12 @@ class OpenAIServingChat(OpenAIServingBase):
             # GLM-5.3 thinks even with enable_thinking=false, and a grammar
             # without the block leaves the JSON in reasoning_content.
             answer_thinking = thinking_mode if self.reasoning_parser else glm_thinking
+            # The reasoning parser reads thinking as closed in a continued message
+            # that ends it, so a second block would reach the content.
+            if _continues_closed_thinking(
+                request, GlmSpecialTokenConfig().end_of_thinking
+            ):
+                answer_thinking = False
             tool_call_constraint = self._answer_tool_call_constraint(
                 request, parser, answer_json_schema, thinking_mode=answer_thinking
             )
@@ -1878,7 +1898,11 @@ class OpenAIServingChat(OpenAIServingBase):
             # Unseparated reasoning reaches the tool parser ahead of the calls.
             request._response_parser_answer_excludes_calls = (
                 tool_call_constraint_covers_answer
-                and (request.separate_reasoning or not self.reasoning_parser)
+                and (
+                    request.separate_reasoning
+                    or not self.reasoning_parser
+                    or not answer_thinking
+                )
             )
             request._response_parser_thinking_end = (
                 GlmSpecialTokenConfig().end_of_thinking
