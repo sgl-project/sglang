@@ -16,13 +16,13 @@ from torchvision.transforms import InterpolationMode
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_resize
-from sglang.srt.utils import ImageData, VideoData
 
 # Per-request media limits; requests outside them are rejected with HTTP 400.
 MAX_IMAGE_PIXELS = 12845056

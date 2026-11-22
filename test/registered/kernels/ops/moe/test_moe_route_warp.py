@@ -24,6 +24,7 @@ DEVICE = "cuda"
 # name -> (experts, topk, scoring, groups, topk_groups, logits dtype)
 CONFIGS = {
     "deepseek_v3": (256, 8, "sigmoid", 8, 4, torch.float32),
+    "ling_3_1_flash": (512, 8, "sigmoid", 8, 4, torch.float32),
     "kimi_k2": (384, 8, "sigmoid", 1, 1, torch.float32),
     "glm4_5": (160, 8, "sigmoid", 1, 1, torch.float32),
     "glm5": (256, 8, "sigmoid", 1, 1, torch.float32),
@@ -328,9 +329,28 @@ def test_strided_bias_falls_back(config: str) -> None:
     bias = full[::2]
     assert not route_warp_module.bias_layout_ok(bias)
     assert not route_warp_module.bias_layout_ok(full[1 : num_experts + 1])
+    cpu_bias = torch.zeros(num_experts, dtype=bias.dtype)
+    assert cpu_bias.is_contiguous() and cpu_bias.data_ptr() % 16 == 0
+    assert not route_warp_module.bias_layout_ok(cpu_bias)
     kwargs = _kwargs(config)
     w, i = moe_fused_gate(scores, bias, **kwargs)
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
+
+
+@pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe"])
+def test_cpu_offloaded_bias_falls_back(config: str) -> None:
+    scores, _ = _inputs(config, 64, seed=12)
+    generator = torch.Generator(device=DEVICE).manual_seed(12)
+    bias = torch.randn(scores.shape[1], device=DEVICE, generator=generator) * 0.1
+    host_bias = bias.contiguous().cpu().pin_memory()
+    assert host_bias.is_pinned() and host_bias.is_contiguous()
+    assert host_bias.data_ptr() % 16 == 0
+    assert not route_warp_module.bias_layout_ok(host_bias)
+    kwargs = _kwargs(config)
+    weights, indices = moe_fused_gate(scores, host_bias, **kwargs)
+    _assert_matches(
+        weights, indices, _reference(scores, bias, **kwargs), kwargs["topk"]
+    )
 
 
 def test_softmax_bias_grouped_falls_back() -> None:

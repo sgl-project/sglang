@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import Optional
 
 from sglang.multimodal_gen.configs.models.dits.joy_echo import JoyEchoConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
@@ -34,9 +33,6 @@ class JoyEchoPipelineConfig(LTX2PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2V
     dit_config: JoyEchoConfig = field(default_factory=JoyEchoConfig)
     vae_config: LTXVideoVAEConfig = field(default_factory=_default_joy_echo_vae_config)
-
-    monolithic_checkpoint: Optional[str] = None
-    gemma_model_path: str = "google/gemma-3-12b-it"
 
     default_sigmas: tuple[float, ...] = field(
         default_factory=lambda: JOY_ECHO_DEFAULT_SIGMAS

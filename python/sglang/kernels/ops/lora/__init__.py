@@ -118,7 +118,9 @@ for _fn in _ENGINE_CUTE_DSL_KERNELS:
             op=f"lora.{_fn}",
             backend=KernelBackend.CUTE_DSL,
             target=f"sglang.kernels.ops.lora.moe.cutedsl.api:{_fn}",
-            capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(10, 9))}
+            ),
         )
     )
 del _fn

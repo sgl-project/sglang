@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.sam import make_windows, window_unpartition_add_reference
 
 register_cuda_ci(
-    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=8, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 

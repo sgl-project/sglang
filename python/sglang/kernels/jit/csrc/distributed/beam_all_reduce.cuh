@@ -25,7 +25,7 @@ struct Params {
   const bf16_t *input, *residual, *post_weight, *next_weight;
   bf16_t *combined, *normalized;
   float eps, x_scale, residual_scale, routed_scale;
-  uint32_t rows, rank, counters;
+  uint32_t rows, rank;
   device::distributed::PushWorkSpace<World> workspace;
 };
 
@@ -77,13 +77,6 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
   const auto row = blockIdx.x;
   const auto tx = blockIdx.y * blockDim.x + threadIdx.x;
   const auto epoch = distributed::PushEpoch<World>{p.workspace};
-  if (row == p.rows) {
-    // Keep every counter in phase when interleaving with generic all-reduces.
-    __syncthreads();
-    if (blockIdx.y == 0) epoch.unsafe_flip_range(row, p.counters);
-    device::PDLTriggerSecondary<true>();
-    return;
-  }
   // inv_rms writes peers' shared memory, which is valid only once every CTA in the cluster has started.
   if constexpr (Cluster > 1) cluster_arrive_relaxed();
   const auto idx = row * (Hidden / 8) + tx;
@@ -176,7 +169,7 @@ __global__ void __launch_bounds__(Hidden / 8 / Cluster) __cluster_dims__(1, Clus
     cooperative_groups::this_cluster().sync();
   else
     __syncthreads();
-  if (blockIdx.y == 0) epoch.flip();
+  if (blockIdx.y == 0) epoch.commit(row, p.rows);
 }
 }  // namespace beam_ar
 
@@ -238,7 +231,7 @@ struct BeamAllReduceNorm {
     }
     const auto n = rows.unwrap();
     const int64_t bytes = n * Hidden * sizeof(bf16_t);
-    CHECK_HOST(n > 0 && n <= push.num_blocks && bytes <= push.slot_bytes);
+    CHECK_HOST(n > 0 && bytes <= push.slot_bytes);
     const auto p = beam_ar::Params<World>{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
         .residual = static_cast<const bf16_t*>(residual.data_ptr()),
@@ -252,12 +245,10 @@ struct BeamAllReduceNorm {
         .routed_scale = static_cast<float>(routed_scale),
         .rows = static_cast<uint32_t>(n),
         .rank = push.rank,
-        .counters = push.num_blocks,
         .workspace = push.get_workspace<World>(bytes)};
     auto kernel = next ? beam_ar::kernel<World, Hidden, Cluster, TopK, true>
                        : beam_ar::kernel<World, Hidden, Cluster, TopK, false>;
-    LaunchKernel(dim3(n + (n < push.num_blocks), Cluster), Hidden / 8 / Cluster, input.device())
-        .enable_pdl(true)(kernel, p);
+    LaunchKernel(dim3(n, Cluster), Hidden / 8 / Cluster, input.device()).enable_pdl(true)(kernel, p);
   }
 };
 }  // namespace sglang

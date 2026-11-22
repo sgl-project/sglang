@@ -92,7 +92,7 @@ def test_pynccl_default(out_of_tree, platform_pynccl, explicit, expected):
 def test_custom_op_dispatch_key(out_of_tree, key):
     from torch.library import Library
 
-    from sglang.srt.utils import common
+    from sglang.srt.utils import custom_op
 
     lib_name = f"sglang_oot_test_{int(out_of_tree)}"
     lib = Library(lib_name, "FRAGMENT")
@@ -101,12 +101,12 @@ def test_custom_op_dispatch_key(out_of_tree, key):
         return x.clone()
 
     with (
-        patch.object(common, "current_platform", _platform(out_of_tree=out_of_tree)),
-        patch.object(common, "is_npu", return_value=False),
-        patch.object(common, "is_xpu", return_value=False),
-        patch.object(common, "is_musa", return_value=False),
+        patch.object(custom_op, "current_platform", _platform(out_of_tree=out_of_tree)),
+        patch.object(custom_op, "is_npu", return_value=False),
+        patch.object(custom_op, "is_xpu", return_value=False),
+        patch.object(custom_op, "is_musa", return_value=False),
     ):
-        common.direct_register_custom_op("op", op, mutates_args=[], target_lib=lib)
+        custom_op.direct_register_custom_op("op", op, mutates_args=[], target_lib=lib)
     assert torch._C._dispatch_has_kernel_for_dispatch_key(f"{lib_name}::op", key)
 
 

@@ -38,7 +38,7 @@ class TestLocateAnythingConfig(CustomTestCase):
 
     def test_registered_in_config_registry(self):
         """``model_type`` resolves to the config class via SGLang's registry."""
-        from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
+        from sglang.srt.hf_transformers.common import _CONFIG_REGISTRY
 
         self.assertIs(_CONFIG_REGISTRY.get("locateanything"), LocateAnythingConfig)
 
