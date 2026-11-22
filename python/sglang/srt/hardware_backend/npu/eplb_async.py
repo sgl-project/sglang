@@ -19,6 +19,7 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import update_expert_weights_single_layer
 from sglang.srt.hardware_backend.npu.eplb import (
     _ExpertWeightAdapter,
+    _expert_byte_alias,
     _validate_migration_topology,
     prewarm_eplb_communication,
 )
@@ -40,11 +41,31 @@ _DEVICE_ROUTING_FIELDS = (
 
 
 class EplbControl:
-    def __init__(self, group):
+    def __init__(self, group, *, shared_memory: bool = False):
         self.group = group
         self.wait_seconds = 0.0
+        self._shared = None
+        if shared_memory:
+            from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+                ShmTagExchange,
+            )
+
+            self._shared = ShmTagExchange(group, "npu_eplb", width=5)
+            self._shared.timeout_s = 60
+
+    def close(self):
+        if self._shared is not None:
+            self._shared.close()
 
     def vote(self, epoch, phase, layer, ready, error):
+        if self._shared is not None:
+            start = time.perf_counter()
+            key = [epoch, phase, layer + 2]
+            rows = self._shared.allgather((*key, int(ready), int(error)))
+            self.wait_seconds += time.perf_counter() - start
+            if any(row[:3] != key for row in rows):
+                raise RuntimeError("EPLB ranks reached different protocol boundaries")
+            return all(row[3] for row in rows), any(row[4] for row in rows)
         # MAX(x), MAX(-x) detects mismatched protocol positions on every rank.
         flags = torch.tensor(
             [epoch, -epoch, phase, -phase, layer, -layer, int(not ready), int(error)],
@@ -219,6 +240,7 @@ class NpuEplbRuntime:
         p2p_group,
         *,
         owns_p2p_group: bool = True,
+        use_ipc: bool = False,
     ):
         self.metadata = metadata
         self.spec = spec
@@ -236,7 +258,20 @@ class NpuEplbRuntime:
         self.weights = {
             layer: adapter.make_weight_views(weights[layer]) for layer in self.layer_ids
         }
-        self.staging = adapter.create_temp_buffers()
+        self._ipc = None
+        self._control = None
+        if use_ipc:
+            from sglang.srt.hardware_backend.npu.eplb_ipc import AclEplbTransport
+
+            self._ipc = AclEplbTransport(_expert_byte_alias)
+        try:
+            self.staging = adapter.create_temp_buffers(
+                allocate=None if self._ipc is None else self._ipc.allocate
+            )
+        except Exception:
+            if self._ipc is not None:
+                self._ipc.free()
+            raise
         # Reserve one layer before KV sizing. The same owner event fences reuse
         # of both the routing rows and the weight staging buffers.
         self._routing_rows = {
@@ -350,7 +385,8 @@ class NpuEplbRuntime:
         self._check_stream()
         # Single-flight staging lets each layer reuse the event after the
         # previous transfer finishes and its install is on the owner stream.
-        self._owner_ready.record(self._owner_stream)
+        ready = self._owner_ready if self._ipc is None else self._ipc.ready_event
+        ready.record(self._owner_stream)
 
     def stage(self, layer: int) -> WeightWriteback:
         """Run on the migration worker. The forward thread owns the writeback."""
@@ -360,23 +396,28 @@ class NpuEplbRuntime:
         # advertise readiness only after that dependency has completed.
         staged_rows = []
         pending_work = []
+        ipc_sends = []
 
         def submit_p2p_batch(ops):
+            if self._ipc is not None:
+                ipc_sends.extend(op for op in ops if op.op is dist.isend)
+                return []
             work = dist.batch_isend_irecv(ops)
             pending_work.extend(work)
             return work
 
         with self.device_module.stream(self._p2p_stream):
-            self._p2p_stream.wait_event(self._owner_ready)
+            ready = self._owner_ready if self._ipc is None else self._ipc.ready_event
+            self._p2p_stream.wait_event(ready)
             for name, row in self._routing_rows.items():
                 row.copy_(self._planned_rows[name][layer], non_blocking=True)
-            old_layout = self.metadata.physical_to_logical_map_cpu[layer]
-            new_layout = self._planned_rows["physical_to_logical_map"][layer]
+            old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
+            new_layout = self._planned_rows["physical_to_logical_map"][layer].tolist()
             update_expert_weights_single_layer(
                 routed_experts_weights=self.weights[layer],
                 temp_buffers=self.staging,
-                old_physical_to_logical_map=old_layout.tolist(),
-                new_physical_to_logical_map=new_layout.tolist(),
+                old_physical_to_logical_map=old_layout,
+                new_physical_to_logical_map=new_layout,
                 num_local_physical_experts=self.spec.local_experts,
                 num_gpu_per_node=self.ranks_per_node,
                 rank=self.rank,
@@ -389,7 +430,16 @@ class NpuEplbRuntime:
             writeback = _make_weight_writeback(
                 self.weights[layer], self.staging, staged_rows
             )
-            self._p2p_stream.synchronize()
+            if self._ipc is None:
+                self._p2p_stream.synchronize()
+            else:
+                self._ipc.transfer(
+                    self._p2p_stream,
+                    self.weights[layer],
+                    old_layout,
+                    new_layout,
+                    ipc_sends,
+                )
         self.stage_seconds += time.perf_counter() - start
         return writeback
 
@@ -411,8 +461,18 @@ class NpuEplbRuntime:
         self._planned_rows = None
 
     def close(self):
+        if self._ipc is not None:
+            self._ipc.close()
+            self._free_ipc_staging()
+        if self._control is not None:
+            self._control.close()
         if self._owns_p2p_group:
             dist.destroy_process_group(self.p2p_group)
+
+    def _free_ipc_staging(self):
+        if self._ipc is not None:
+            self.staging.clear()
+            self._ipc.free()
 
 
 def create_npu_async_eplb(model_config, weights, metadata):
@@ -442,17 +502,25 @@ def create_npu_async_eplb(model_config, weights, metadata):
     )
     # Fixed PP=1 TP=EP=WORLD: group construction order is identical on all ranks.
     timeout = timedelta(seconds=90)
-    control_group = dist.new_group(backend="gloo", timeout=timeout)
+    borrow_world_group = npu_eplb_reuses_world_group()
+    use_ipc = get_bool_env_var("SGLANG_NPU_EPLB_USE_ACL_IPC")
+    if use_ipc and (parallel.nnodes != 1 or not borrow_world_group or world_size < 2):
+        raise ValueError(
+            "ACL IPC EPLB requires monolithic serving on a single multi-NPU host"
+        )
+    control_group = None if use_ipc else dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
+    if control_group is None:
+        control_group = plan_group
     p2p_options = npu_eplb_hccl_options()
     p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
-    borrow_world_group = npu_eplb_reuses_world_group()
     if borrow_world_group:
         p2p_group = parallel.world_group.device_group
     else:
         p2p_group = dist.new_group(
             backend="hccl", timeout=timeout, pg_options=p2p_options
         )
+    runtime = None
     error = None
     signature = None
     try:
@@ -466,6 +534,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             plan_group,
             p2p_group,
             owns_p2p_group=not borrow_world_group,
+            use_ipc=use_ipc,
         )
         batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         if batch_size <= 0:
@@ -489,18 +558,30 @@ def create_npu_async_eplb(model_config, weights, metadata):
     signatures = [None] * world_size
     dist.all_gather_object(signatures, signature, group=control_group)
     if None in signatures:
+        if runtime is not None:
+            runtime._free_ipc_staging()
         raise RuntimeError("Async EPLB setup failed on at least one rank") from error
     if any(s != signature for s in signatures):
+        runtime._free_ipc_staging()
         raise ValueError(
             "Async EPLB ranks disagree on layout, weight geometry or batching"
         )
-    prewarm_eplb_communication(p2p_group)
+    if runtime._ipc is None:
+        prewarm_eplb_communication(p2p_group)
+    else:
+        try:
+            runtime._ipc.open(runtime.staging, runtime._owner_stream, plan_group)
+        except Exception:
+            runtime._free_ipc_staging()
+            raise
+    runtime._control = EplbControl(control_group, shared_memory=use_ipc)
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d reuse_world_group=%s",
+        "hccl_buffer_mib=%d reuse_world_group=%s acl_ipc=%s",
         sum(t.nbytes for t in runtime.staging),
         sum(row.nbytes for row in runtime._routing_rows.values()),
         p2p_buffer_mib,
         borrow_world_group,
+        use_ipc,
     )
-    return AsyncEplbCoordinator(EplbControl(control_group), runtime)
+    return AsyncEplbCoordinator(runtime._control, runtime)
