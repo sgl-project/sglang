@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.choices import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
@@ -23,7 +24,6 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
 from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
-    LinearAttnBackends,
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
@@ -32,7 +32,8 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     set_external_prefill_body,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -563,17 +564,27 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_flydsl_is_a_cli_choice(self):
         self.assertIn("flydsl", LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
 
-    def test_flydsl_rejects_decode_and_verify(self):
-        triton = LinearAttnKernelBackend.TRITON
-        flydsl = LinearAttnKernelBackend.FLYDSL
+    def test_flydsl_rejects_decode_and_verify_on_every_platform(self):
         cases = (
-            LinearAttnBackends(decode=flydsl, prefill=flydsl, verify=triton),
-            LinearAttnBackends(decode=triton, prefill=flydsl, verify=flydsl),
+            {"linear_attn_backend": "flydsl"},
+            {"linear_attn_decode_backend": "flydsl"},
+            {"linear_attn_verify_backend": "flydsl"},
         )
-        for backends in cases:
-            with self.subTest(backends=backends):
-                with self.assertRaisesRegex(ValueError, "supports prefill only"):
-                    GDNAttnBackend(SimpleNamespace(linear_attn_backends=backends))
+        for flags in cases:
+            for is_cuda in (True, False):
+                with (
+                    self.subTest(flags=flags, is_cuda=is_cuda),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=is_cuda),
+                ):
+                    args = ServerArgs(model_path="dummy", **flags)
+                    with self.assertRaisesRegex(ValueError, "prefill only"):
+                        handle_linear_attn_backend(args)
+
+        with override_platform(is_sm100=False), override_platform(is_cuda=False):
+            handle_linear_attn_backend(
+                ServerArgs(model_path="dummy", linear_attn_prefill_backend="flydsl")
+            )
 
     def test_flydsl_prefill_dispatch_requires_gfx95_and_aiter(self):
         backends = (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.FLYDSL)
@@ -695,7 +706,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIs(chunk_states, sentinel.h)
         self.assertIs(call["ssm_states"], state)
         torch.testing.assert_close(
-            call["cache_indices"], torch.tensor([2], dtype=torch.int32)
+            call["cache_indices"], torch.tensor([0], dtype=torch.int32)
         )
         self.assertIs(call["cu_seqlens"], cu_seqlens)
         self.assertIs(call["prefill_metadata"], sentinel.metadata)

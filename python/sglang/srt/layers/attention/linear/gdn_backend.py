@@ -345,11 +345,6 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
 
 
 def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
-    if backends.decode.is_flydsl() or backends.verify.is_flydsl():
-        raise ValueError(
-            "The FlyDSL GDN backend supports prefill only. Set "
-            "--linear-attn-prefill-backend flydsl and keep decode/verify on Triton."
-        )
     if (
         get_exec().deterministic.enable_deterministic_inference
         and backends.prefill.is_flashinfer()

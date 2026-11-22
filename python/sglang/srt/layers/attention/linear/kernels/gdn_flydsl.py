@@ -166,14 +166,13 @@ class FlyDSLGDNKernel(TritonGDNKernel):
 
         # DP-attention MLP-sync rows use -1 as a padding marker. AITER's
         # indexed K5 path expects an in-bounds slot, so send those ignored rows
-        # to the pool's reserved sentinel slot. The indices are fixed within a
-        # batch, so remap once per batch rather than once per layer.
+        # to row 0, the padding sink of both the pool and its staged copy.
+        # The indices are fixed within a batch, so remap once per batch rather
+        # than once per layer.
         if self._indices_batch is not prefill_metadata:
             self._indices_batch = prefill_metadata
             self._ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
+                cache_indices >= 0, cache_indices, 0
             ).to(torch.int32)
         output, h = self._prefill_fn(
             q,
