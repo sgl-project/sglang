@@ -453,7 +453,7 @@ SGL_DEVICE void zero_bf16_row(void* out, int row, int dim) {
   using vec_t = int4;
   constexpr int kElemsPerVec = sizeof(vec_t) / 2;
   const int tid = threadIdx.x;
-  vec_t* out_v = reinterpret_cast<vec_t*>(out) + static_cast<long long>(row) * dim / kElemsPerVec;
+  vec_t* out_v = reinterpret_cast<vec_t*>(out) + static_cast<int64_t>(row) * dim / kElemsPerVec;
   const int total_vecs = dim / kElemsPerVec;
   const vec_t zero = {0, 0, 0, 0};
   for (int i = tid; i < total_vecs; i += THREADS_PER_CTA)
