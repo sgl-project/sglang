@@ -88,11 +88,9 @@ class TestNativeEagerVerify(CustomTestCase):
                         hooks.post_verify.assert_not_called()
                         sample.assert_called_once_with(
                             verify_input,
-                            batch,
+                            verify,
                             logits_output,
-                            verify.grammar_mask,
                             uno_target_max_top_k=options.get("uno_target_max_top_k"),
-                            watermark=verify.watermark,
                             simulated_acc_len_rng=options.get("simulated_acc_len_rng"),
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False

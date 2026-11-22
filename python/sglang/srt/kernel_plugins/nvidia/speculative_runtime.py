@@ -25,10 +25,12 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.sampling.sampling_pipeline import VerifyStep
 
 
 class StockVerifyBatch(msgspec.Struct, frozen=True):
-    """The ScheduleBatch fields eagle_sample reads, and no others."""
+    """The ScheduleBatch fields eagle_sample and VerifyStep.adjust read, and no
+    others."""
 
     device: torch.device
     forward_mode: ForwardMode
@@ -81,11 +83,9 @@ def default_post_verify(
     )
     token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
         io.verify_tree,
-        batch,
+        _verify_step(io, batch),
         io.logits,
-        io.grammar_mask,
         uno_target_max_top_k=io.sparse_target_max_top_k,
-        watermark=io.watermark,
         simulated_acc_len=io.simulated_accept_length,
         simulated_acc_len_rng=io.simulated_accept_length_rng,
         sparse_bonus_argmax=io.sparse_bonus_argmax,
@@ -95,6 +95,32 @@ def default_post_verify(
         token_ids=token_ids,
         accepted_lengths=accepted_lengths,
         accepted_indices=accepted_indices,
+    )
+
+
+def _verify_step(io: PostVerifyIO, batch: StockVerifyBatch) -> VerifyStep:
+    """The verify step eagle_sample adjusts and routes with, from the view. The
+    route reads what the stages will apply: the view's grammar mask, watermark,
+    penalties, logit_bias, and custom logit processors (the view has none)."""
+    from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+
+    sampling = io.sampling
+    return VerifyStep(
+        batch=batch,
+        route=VerifyRoute(
+            adjusts_logits=(
+                io.grammar_mask is not None
+                or io.watermark is not None
+                or sampling.step_penalties is not None
+                or sampling.logit_bias is not None
+                or sampling.has_custom_logit_processor
+            ),
+            need_truncated_sampling=need_truncated_sampling(sampling),
+        ),
+        watermark=io.watermark,
+        watermark_full_mask=io.watermark_full_mask,
+        grammar_mask=io.grammar_mask,
     )
 
 

@@ -11,8 +11,8 @@ Two entries run it:
 - verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
   launch the verify worker calls `build_grammar_mask`, the stages
-  (`VerifyStep.adjust` for a chain, `adjust_verify_logits` inside `eagle_sample`
-  for a tree), its accept core, and `commit`.
+  (`VerifyStep.adjust`, inside `eagle_sample` for a tree), its accept core, and
+  `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         VerifyWatermark,
         WatermarkEngine,
     )
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
     from sglang.srt.speculative.spec_utils import GrammarTree
 
 
@@ -320,27 +321,41 @@ class VerifyStep(msgspec.Struct):
         draft_tokens: torch.Tensor,
         *,
         positions: Optional[torch.Tensor] = None,
+        tree: Optional[EagleVerifyInput] = None,
     ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
-        """`adjust_verify_logits` over a chain verify's logits (`draft_tokens`
-        is [bs, width]; `positions` too, read by the watermark)."""
+        """`adjust_verify_logits` over a verify's logits; `draft_tokens` is
+        [bs, width]. A chain verify passes `positions` [bs, width], read by the
+        watermark. A tree verify passes its verify input as `tree`: the penalty
+        walks its `retrieve_next_token` / `retrieve_next_sibling`, and the
+        watermark reads its flat draft tokens, positions, and custom mask."""
         batch = self.batch
-        info = batch.sampling_info
         apply_watermark = None
         if self.watermark is not None:
+            if tree is None:
+                geometry = dict(
+                    draft_tokens=draft_tokens, positions=positions, custom_mask=None
+                )
+            else:
+                geometry = dict(
+                    draft_tokens=tree.draft_token,
+                    positions=tree.positions,
+                    custom_mask=tree.custom_mask,
+                )
             apply_watermark = partial(
                 self.watermark.apply,
                 req_pool_indices=batch.req_pool_indices,
-                draft_tokens=draft_tokens,
-                positions=positions,
                 draft_token_num=draft_tokens.shape[1],
-                custom_mask=None,
+                # compute_spec_logprobs reads the unwatermarked logits after verify.
                 keep_logits=batch.return_logprob,
+                **geometry,
             )
         return adjust_verify_logits(
             logits,
-            sampling_info=info,
+            sampling_info=batch.sampling_info,
             grammar_mask=self.grammar_mask,
             draft_tokens=draft_tokens,
+            next_child=None if tree is None else tree.retrieve_next_token,
+            next_sibling=None if tree is None else tree.retrieve_next_sibling,
             apply_watermark=apply_watermark,
         )
 
@@ -386,8 +401,6 @@ def adjust_verify_logits(
     `VerifyWatermark.apply` given the logits and the sampling info; it may
     replace both, and when it keeps the unwatermarked logits for the logprobs,
     the custom logit processor runs on both, as in sampling."""
-    # Read before the watermark, which may replace the sampling info.
-    has_custom_logit_processor = sampling_info.has_custom_logit_processor
     _adjust_before_watermark(
         logits,
         sampling_info,
@@ -396,6 +409,8 @@ def adjust_verify_logits(
         next_sibling=next_sibling,
         grammar_mask=grammar_mask,
     )
+    # Read before the watermark, which may replace the sampling info.
+    has_custom_logit_processor = sampling_info.has_custom_logit_processor
     verify_logits = logits
     if apply_watermark is not None:
         verify_logits, sampling_info = apply_watermark(

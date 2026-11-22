@@ -232,11 +232,9 @@ def accept_draft_tree(
         )
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
-        batch,
+        verify,
         logits_output,
-        verify.grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
-        watermark=verify.watermark,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
     )

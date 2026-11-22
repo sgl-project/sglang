@@ -37,7 +37,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -57,15 +56,13 @@ from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -822,31 +819,24 @@ def _sharded_sampling_applies(
     *,
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
-    grammar_mask: Optional[GrammarMask],
-    watermark: bool,
-    has_local_keys: bool = False,
+    route: VerifyRoute,
+    has_local_keys: bool,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
 
     Greedy rows are bitwise-preserving and dispatch automatically. Temperature-only
     rows require a local key policy; a policy that declines returns to the stock
     gathered path before sampling. Anything that reads or edits full logits also
-    stays on the stock gathered path.
+    stays on the stock gathered path. A padded CUDA-graph replay keeps the shards
+    whatever the route says, so this gate still gathers them.
     """
-    info = batch.sampling_info
     return (
         _is_cuda
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
-            info,
-            # Not VerifyRoute: the provider hands eagle_sample loose parts and
-            # its VerifySamplingView, so this reads what the stages will apply.
-            adjusts_logits=grammar_mask is not None
-            or watermark
-            or info.has_custom_logit_processor
-            or info.step_penalties is not None
-            or info.logit_bias is not None,
-            need_truncated_sampling=need_truncated_sampling(info),
+            batch.sampling_info,
+            adjusts_logits=route.adjusts_logits,
+            need_truncated_sampling=route.need_truncated_sampling,
             return_logprob=batch.return_logprob,
             has_local_keys=has_local_keys,
         )
@@ -856,20 +846,20 @@ def _sharded_sampling_applies(
 
 def eagle_sample(
     verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
+    verify: VerifyStep,
     logits_output: LogitsProcessorOutput,
-    grammar_mask: Optional[GrammarMask] = None,
-    uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark: Optional[VerifyWatermark] = None,
+    uno_target_max_top_k: Optional[int] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
 ):
     """
-    Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information). simulated_acc_len: the injected
+    Verify and find accepted tokens based on logits output and the verify's
+    batch (which contains spec decoding information). `verify` gives the batch,
+    the route the shard gate reads, and the stages (`VerifyStep.adjust`).
+    simulated_acc_len: the injected
     acceptance length already drawn on the host, as a device int64 [1], so a CUDA
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
     it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
@@ -877,9 +867,9 @@ def eagle_sample(
     too, as on the dense one.
     """
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.sampling_pipeline import adjust_verify_logits
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
+    batch = verify.batch
     device = batch.device
     if batch.forward_mode.is_idle():
         predict = torch.empty(0, dtype=torch.int32, device=device)
@@ -888,14 +878,12 @@ def eagle_sample(
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
-    sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
     vocab_shard = logits_output.next_token_logits_vocab_shard
     if vocab_shard is not None and not _sharded_sampling_applies(
         verify_input=verify_input,
         batch=batch,
-        grammar_mask=grammar_mask,
-        watermark=watermark is not None,
+        route=verify.route,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -907,26 +895,8 @@ def eagle_sample(
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    apply_watermark = None
-    if watermark is not None:
-        apply_watermark = partial(
-            watermark.apply,
-            req_pool_indices=batch.req_pool_indices,
-            draft_tokens=verify_input.draft_token,
-            positions=verify_input.positions,
-            draft_token_num=verify_input.draft_token_num,
-            custom_mask=verify_input.custom_mask,
-            # compute_spec_logprobs reads logits_output after verify.
-            keep_logits=batch.return_logprob,
-        )
-    next_token_logits, sampling_info = adjust_verify_logits(
-        next_token_logits,
-        sampling_info=sampling_info,
-        grammar_mask=grammar_mask,
-        draft_tokens=candidates,
-        next_child=verify_input.retrieve_next_token,
-        next_sibling=verify_input.retrieve_next_sibling,
-        apply_watermark=apply_watermark,
+    next_token_logits, sampling_info = verify.adjust(
+        next_token_logits, candidates, tree=verify_input
     )
 
     return _tree_accept(
@@ -938,7 +908,7 @@ def eagle_sample(
         sampling_info=sampling_info,
         candidates=candidates,
         uno_target_max_top_k=uno_target_max_top_k,
-        watermark=watermark is not None,
+        watermark=verify.watermark is not None,
         simulated_acc_len=simulated_acc_len,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
