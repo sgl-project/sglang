@@ -5,14 +5,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import contextlib
+import dataclasses
 import random
 import types
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     _compute_logical_to_all_physical_map,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -366,6 +369,82 @@ class TestExpertLocationWeightLoading(CustomTestCase):
         for bad_id in (metadata.num_logical_experts, -1):
             with self.subTest(bad_id=bad_id), self.assertRaises(IndexError):
                 metadata.logical_to_all_physical(0, bad_id)
+
+    def test_adopt_layout_gives_what_init_by_mapping_builds(self):
+        """A process whose weights are in another layout of the same shape (a
+        snapshot reader's) takes that layout in place: it then holds what
+        init_by_mapping builds from it for the process's rank, in the tensors
+        it had, which the dispatch and MegaGate keep referring to."""
+        rng = random.Random(2)
+        cases = [
+            # name, the process's own layout, the one it takes, EP size, nodes
+            ("no_replicas", [[0, 1, 2, 3]] * 2, [[3, 2, 1, 0], [1, 0, 3, 2]], 2, 1),
+            ("same_rank_replicas", SAME_RANK_REPLICAS, [[3, 0, 1, 2, 2, 1]] * 3, 2, 1),
+            (
+                "same_node_narrowing",
+                SAME_NODE_NARROWING,
+                _random_layout(rng, 2, 4, 8),
+                4,
+                2,
+            ),
+        ]
+        for name, mine, theirs, ep_size, nnodes in cases:
+            num_logical_experts = max(mine[0]) + 1
+            num_redundant_experts = len(mine[0]) - num_logical_experts
+            shape = ModelConfigForExpertLocation(
+                num_layers=len(mine), num_logical_experts=num_logical_experts
+            )
+            for moe_a2a_backend in ["deepep", "none"]:
+                algorithm = "static" if moe_a2a_backend != "none" else "dynamic"
+                for rank in range(ep_size):
+                    with (
+                        self.subTest(name, backend=moe_a2a_backend, rank=rank),
+                        get_context().override_server_args(
+                            device="cpu",
+                            ep_size=ep_size,
+                            nnodes=nnodes,
+                            moe_a2a_backend=moe_a2a_backend,
+                            ep_dispatch_algorithm=algorithm,
+                            ep_num_redundant_experts=num_redundant_experts,
+                        ),
+                        # Stands in for the model registry lookup of the shape.
+                        mock.patch.object(
+                            ModelConfigForExpertLocation,
+                            "from_model_config",
+                            return_value=shape,
+                        ),
+                    ):
+                        metadata = ExpertLocationMetadata.init_by_mapping(
+                            None, mine, moe_ep_rank=rank
+                        )
+                        expected = ExpertLocationMetadata.init_by_mapping(
+                            None, theirs, moe_ep_rank=rank
+                        )
+                        held = {
+                            field.name: getattr(metadata, field.name)
+                            for field in dataclasses.fields(metadata)
+                        }
+                        cached = metadata.mega_gate_maps(algorithm)
+
+                        metadata.adopt_layout(torch.tensor(theirs), moe_ep_rank=rank)
+
+                        for field in dataclasses.fields(metadata):
+                            got = getattr(metadata, field.name)
+                            want = getattr(expected, field.name)
+                            if isinstance(want, torch.Tensor):
+                                self.assertIs(got, held[field.name], field.name)
+                                self.assertTrue(torch.equal(got, want), field.name)
+                            elif field.name != "_mega_gate_maps":
+                                self.assertEqual(got, want, field.name)
+                        self.assertEqual(
+                            metadata.physical_to_logical_map_cpu.tolist(), theirs
+                        )
+                        # The cached MegaGate maps are refreshed, not replaced.
+                        self.assertIs(metadata.mega_gate_maps(algorithm), cached)
+                        for got, want in zip(
+                            cached, expected.mega_gate_maps(algorithm), strict=True
+                        ):
+                            self.assertTrue(torch.equal(got, want))
 
 
 if __name__ == "__main__":

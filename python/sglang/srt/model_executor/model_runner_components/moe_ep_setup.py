@@ -103,14 +103,21 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
-    from sglang.srt.runtime_context import get_parallel
-
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
     # don't participate in the EP all-reduce (would deadlock under DP-
     # attention). Failure here happens before any forward pass.
     architectures = getattr(model_config.hf_config, "architectures", None)
     if architectures:
         assert_lplb_supported_model(architectures[0])
+
+    rebuild_lplb_solvers()
+
+
+def rebuild_lplb_solvers() -> None:
+    """Build the per-layer LPLB solvers from the current expert location
+    metadata, for a caller without a model config: init_lplb_solvers checked
+    the model when it first built them."""
+    from sglang.srt.runtime_context import get_parallel
 
     metadata = get_global_expert_location_metadata()
     if metadata is None:

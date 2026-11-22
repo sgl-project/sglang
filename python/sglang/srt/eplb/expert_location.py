@@ -360,6 +360,29 @@ class ExpertLocationMetadata:
                 to_physical_map.copy_(self.logical_to_all_physical_map)
                 logical_count.copy_(self.logical_to_all_physical_map_num_valid)
 
+    def adopt_layout(
+        self, physical_to_logical_map: torch.Tensor, *, moe_ep_rank: int
+    ) -> None:
+        """Take another layout of this shape in place, without moving weights:
+        the caller's weights are already in that layout. What derives from the
+        map is rebuilt for ``moe_ep_rank`` as init_by_mapping builds it."""
+        physical_to_logical_map = physical_to_logical_map.to(
+            self.physical_to_logical_map
+        )
+        assert physical_to_logical_map.shape == self.physical_to_logical_map.shape
+        other = ExpertLocationMetadata._init_raw(
+            ep_size=self.ep_size,
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=_compute_logical_to_all_physical_map(
+                physical_to_logical_map=physical_to_logical_map,
+                num_logical_experts=self.num_logical_experts,
+                ep_size=self.ep_size,
+                moe_ep_rank=moe_ep_rank,
+            ),
+            moe_ep_rank=moe_ep_rank,
+        )
+        self.update(other, list(range(self.num_layers)))
+
     # -------------------------------- usage ------------------------------------
 
     def mega_gate_maps(self, algorithm: str) -> tuple[torch.Tensor, torch.Tensor]:

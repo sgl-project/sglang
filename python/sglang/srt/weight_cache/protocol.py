@@ -208,8 +208,10 @@ MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
 # The socket protocol and the meaning of a fetch_state response. 2: the
 # entries are the GPU storages of a load-diff snapshot; the response's
 # "manifest" carries its load_diff bytes, every storage's size and device,
-# and the CPU storages' bytes (sglang.srt.weight_cache.load_diff).
-PROTOCOL_VERSION = 2
+# and the CPU storages' bytes (sglang.srt.weight_cache.load_diff). 3: the
+# load_diff bytes also carry the expert map the daemon placed its experts by
+# (load-diff format 2); an engine dispatches by it, not by its own.
+PROTOCOL_VERSION = 3
 
 
 class ProtocolVersionError(RuntimeError):

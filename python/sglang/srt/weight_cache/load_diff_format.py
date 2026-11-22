@@ -17,6 +17,9 @@ bytes of a SnapshotManifest) and checks it; load_diff.py makes and installs it.
   data, an encoding may name an object the reader already has: one of its
   modules, an object at a path in its model, or a member of an enum its
   process has already imported.
+- The owner's expert map says which logical expert each physical slot holds.
+  The owner's expert rows are in that order, and no model holds the map (it
+  is process state), so the walk does not find it: the manifest carries it.
 
 ``walk_model`` decides where to look, the same way for owner and reader: the
 registered parameters and buffers of every module, then its plain attributes
@@ -63,7 +66,7 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # nn.Module's own bookkeeping (_parameters, _buffers, _modules, hooks, ...):
 # never a module's plain attribute.
@@ -730,6 +733,15 @@ def structure_digest(model: nn.Module) -> Tuple[bytes, int, int]:
     return digest.digest(), modules, registrations
 
 
+def expert_map_digest(rows: Sequence[Sequence[int]]) -> bytes:
+    """SHA-256 of an expert map: its shape (layers, physical slots), then its
+    values in row order as little-endian int64."""
+    digest = hashlib.sha256(repr((len(rows), len(rows[0]) if rows else 0)).encode())
+    for row in rows:
+        digest.update(struct.pack(f"<{len(row)}q", *row))
+    return digest.digest()
+
+
 # ---------------------------------------------------------------------------
 # Values as data
 # ---------------------------------------------------------------------------
@@ -1079,13 +1091,27 @@ class Structure(
     registrations: Count
 
 
+class ExpertMap(
+    msgspec.Struct, array_like=True, frozen=True, forbid_unknown_fields=True
+):
+    """The owner's physical-to-logical expert map: the logical expert that
+    each physical slot of each layer holds. The owner's expert rows are in
+    this order, so a reader picks slots by it (expert_map.py)."""
+
+    num_logical_experts: Count
+    ep_size: Count
+    rows: List[List[Count]]  # (layers, physical slots)
+    digest: Digest  # expert_map_digest(rows)
+
+
 class Manifest(msgspec.Struct, kw_only=True):
     """What a reader installs. ``ops`` are what loading changed, in the
     owner's walk order: ["set", path, value], ["fill", path, value] or
     ["del", path], with paths from encode_path and values from encode_value.
     ``boundaries`` are the paths of the module-level objects the walk did not
     enter; ``removed_modules`` the modules loading removed; ``local`` the
-    process-local tensors."""
+    process-local tensors; ``expert_map`` the owner's expert map (None for a
+    model without one), carried since version 2."""
 
     version: int
     structure: Structure
@@ -1097,6 +1123,7 @@ class Manifest(msgspec.Struct, kw_only=True):
     boundaries: List[list]
     removed_modules: List[str]
     local: List[Local]
+    expert_map: Optional[ExpertMap] = None
 
 
 def encode_manifest(manifest: Manifest) -> bytes:
@@ -1124,8 +1151,8 @@ def decode_manifest(data: Any) -> Manifest:
 def validate_manifest(m: Manifest) -> None:
     """What the types do not say: the version, ids in range, every view inside
     its storage, every storage used, no name registered twice, every tensor's
-    home one of its places, and the paths and values, which are untyped.
-    Raises SnapshotError."""
+    home one of its places, the paths and values, which are untyped, and the
+    expert map. Raises SnapshotError."""
     if m.version != FORMAT_VERSION:
         raise SnapshotError("invalid load-diff manifest", [f"version {m.version!r}"])
     problems: List[str] = []
@@ -1178,8 +1205,32 @@ def validate_manifest(m: Manifest) -> None:
     for i, path in enumerate(m.boundaries):
         if not _valid_path(path):
             problems.append(f"boundaries[{i}]")
+    if m.expert_map is not None:
+        problems += _expert_map_problems(m.expert_map)
     if problems:
         raise SnapshotError("invalid load-diff manifest", problems[:20])
+
+
+def _expert_map_problems(e: ExpertMap) -> List[str]:
+    """Rows of one length, a multiple of the EP size; in every layer exactly
+    the logical experts, each in at least one slot; the digest of the rows."""
+    slots = len(e.rows[0]) if e.rows else 0
+    if not (
+        0 < e.num_logical_experts <= slots
+        and e.ep_size > 0
+        and slots % e.ep_size == 0
+        and all(len(row) == slots for row in e.rows)
+    ):
+        return ["expert_map: its shape"]
+    experts = set(range(e.num_logical_experts))
+    problems = [
+        f"expert_map: layer {layer_id} does not hold exactly the logical experts"
+        for layer_id, row in enumerate(e.rows)
+        if set(row) != experts
+    ]
+    if e.digest != expert_map_digest(e.rows):
+        problems.append("expert_map: its digest")
+    return problems
 
 
 def _is_int(value: Any) -> bool:

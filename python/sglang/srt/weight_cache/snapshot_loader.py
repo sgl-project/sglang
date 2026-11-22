@@ -53,16 +53,18 @@ def pre_load_check(
 ) -> Optional[SnapshotManifest]:
     """Every rank of ``group`` runs this before load_model: lookup, then vote.
 
-    After it returns, every rank loads the same snapshot version, or every rank
-    loads raw.
+    After it returns, every rank loads the same snapshot version, with the same
+    expert map, or every rank loads raw.
     """
-    manifest, error = None, None
+    manifest, error, expert_map = None, None, b""
     try:
         manifest = loader.lookup(spec=spec, device_config=device_config)
+        if manifest is not None:
+            expert_map = load_diff.owner_expert_map_digest(manifest)
     except Exception as e:  # every rank must learn it before any rank moves on
         error = repr(e)
     version = manifest.version if manifest is not None else ""
-    agree = f"{spec.without_rank().digest()}/{version}".encode()
+    agree = f"{spec.without_rank().digest()}/{version}/{expert_map.hex()}".encode()
     try:
         vote(group=group, ballot=Ballot(error=error, agree=agree))
     except BaseException:

@@ -487,3 +487,12 @@ def dist_barrier_after_load(
             raise ValueError(
                 f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+        if get_model().weight_cache_mode != "off":
+            # A rank that hit the weight cache dispatches by its daemon's
+            # expert map, one that fell back to disk by its own. The TP group
+            # holds every rank this one exchanges tokens with by expert slot
+            # (the MoE EP and TP groups are inside it; pipeline stages hold
+            # other layers), and its ranks have just passed the barrier above.
+            from sglang.srt.weight_cache.expert_map import agree_on_expert_map
+
+            agree_on_expert_map(get_parallel().tp_group)

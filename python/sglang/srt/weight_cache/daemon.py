@@ -5,8 +5,9 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Describes the loaded model for engines (weight_cache/load_diff.py): every
-   tensor it holds as a view of a storage, and every plain value that
-   loading changed; and exports the storages through the selected transport
+   tensor it holds as a view of a storage, every plain value that loading
+   changed, and the expert map it placed its experts by; and exports the
+   storages through the selected transport
    (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves the description and transport entries over a Unix socket to
@@ -60,7 +61,6 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     SpawnRanks,
-    get_exec,
     get_parallel,
     publish,
     spawn_world_rank,
@@ -355,7 +355,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
-        self._initialize_eplb_expert_location_metadata(model_config)
+        self._initialize_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -586,11 +586,11 @@ class WeightCacheDaemon:
             f"response {size / (1 << 20):.1f} MiB"
         )
 
-    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
-        """Build the same initial physical expert layout as the engine."""
-        if not get_exec().moe.enable_eplb:
-            return
-
+    def _initialize_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine, which
+        builds it with or without EPLB
+        (ModelRunner.maybe_init_expert_location_metadata). The experts are
+        loaded into it, and load_diff.export records it for the engines."""
         from sglang.srt.eplb.expert_location import (
             compute_initial_expert_location_metadata,
             set_global_expert_location_metadata,

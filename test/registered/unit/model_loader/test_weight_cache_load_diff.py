@@ -3,6 +3,8 @@ loaded model, an engine checks the response before mapping anything, builds
 the model on the meta device and installs the snapshot. Both sides run here
 on CPU, over a socket pair, with a transport that copies the bytes."""
 
+import contextlib
+import json
 import socket
 import threading
 import unittest
@@ -13,6 +15,17 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    compute_initial_expert_location_metadata,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
+from sglang.srt.eplb.expert_location_dispatch import (
+    ExpertLocationDispatchInfo,
+    topk_ids_logical_to_physical,
+)
+from sglang.srt.runtime_context import get_context, get_parallel, get_resources
 from sglang.srt.weight_cache import daemon as daemon_module
 from sglang.srt.weight_cache import ipc_loader, load_diff, load_diff_format
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
@@ -83,10 +96,10 @@ class CopyingClientTransport(TorchIpcTransportBackend):
         self.closed = True
 
 
-def daemon_with_snapshot(device=torch.device("cpu")):
-    owner = Model()
+def daemon_with_snapshot(device=torch.device("cpu"), model=Model, loading=load):
+    owner = model()
     constructed = load_diff.record_construction(owner)
-    load(owner)
+    loading(owner)
     daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
     daemon.gpu_id, daemon.tp_rank = 0, 0
     daemon.model = owner
@@ -142,9 +155,9 @@ def loader_for(daemon):
     return loader
 
 
-def install(loader, response):
+def install(loader, response, model=Model):
     with torch.device("meta"):
-        reader = Model()
+        reader = model()
     with mock.patch.object(ipc_loader, "_initialize_model", return_value=reader):
         return loader._install(
             SimpleNamespace(dtype=torch.float32),
@@ -257,6 +270,163 @@ class TestServeSnapshot(CustomTestCase):
             self.load(loader, response)
         self.assertTrue(loader._transport_backend.closed)
         self.assertNotIn(loader._transport_backend, ipc_loader._LOADED_MODEL_TRANSPORTS)
+
+
+# Initial expert layouts (--init-expert-location) of two MoE layers of four
+# experts: the logical expert in each physical slot.
+LAYOUT_A = [[3, 2, 1, 0], [1, 0, 3, 2]]
+LAYOUT_B = [[0, 1, 3, 2], [2, 3, 0, 1]]
+
+
+class Experts(nn.Module):
+    """Stands in for a model's MoE layers: row l holds, for each physical
+    slot of layer l, the id of the expert whose weights are there."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = nn.Parameter(torch.full((2, 4), -1.0), requires_grad=False)
+
+
+def load_experts(model):
+    """Place each checkpoint expert as FusedMoE.weight_loader does: in the
+    slots the process's expert map gives it, and without a map in the slot of
+    its own number."""
+    metadata = get_global_expert_location_metadata()
+    with torch.no_grad():
+        for layer_id in range(2):
+            for expert_id in range(4):
+                slots = [expert_id]
+                if metadata is not None:
+                    slots = metadata.logical_to_all_physical(layer_id, expert_id)
+                model.rows[layer_id, slots] = float(expert_id)
+
+
+@contextlib.contextmanager
+def process(layout, **settings):
+    """An emulated process started with --init-expert-location ``layout`` and
+    without --enable-eplb: its published config and EP rank, and no expert
+    map yet. The model registry lookup of the layout's shape is patched."""
+    with (
+        get_context().override_server_args(
+            device="cpu",
+            moe_a2a_backend="none",
+            init_expert_location=json.dumps({"physical_to_logical_map": layout}),
+            **settings,
+        ),
+        get_parallel().override(moe_ep_rank=0),
+        get_resources().override(expert_location_metadata=None),
+        mock.patch.object(
+            ModelConfigForExpertLocation,
+            "from_model_config",
+            return_value=ModelConfigForExpertLocation(
+                num_layers=2, num_logical_experts=4
+            ),
+        ),
+    ):
+        yield
+
+
+def daemon_with_layout(layout):
+    """A daemon started with ``layout``: it sets its expert map, loads by it
+    and snapshots its model, in the order of WeightCacheDaemon.load."""
+    with process(layout):
+        daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        daemon._initialize_expert_location_metadata(None)
+        return daemon_with_snapshot(model=Experts, loading=load_experts)
+
+
+@contextlib.contextmanager
+def engine_with_layout(layout, dispatch="dynamic"):
+    """An engine started with ``layout``, up to its load: the runner set its
+    expert map (ModelRunner.maybe_init_expert_location_metadata). With a
+    layout the argument pipeline resolves --ep-dispatch-algorithm for a real
+    model; ``dispatch`` states it here."""
+    with process(layout, ep_dispatch_algorithm=dispatch):
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(model_config=None, moe_ep_rank=0)
+        )
+        yield
+
+
+class TestExpertMap(CustomTestCase):
+    """The daemon's expert rows are in the layout of the daemon's expert map,
+    which its snapshot carries (weight_cache/expert_map.py)."""
+
+    def process_map(self):
+        metadata = get_global_expert_location_metadata()
+        return metadata.physical_to_logical_map_cpu.tolist()
+
+    def runs_the_experts_asked_for(self, model):
+        """Every token runs in a slot whose installed weights are those of
+        the expert the router picked for it."""
+        held = model.rows.data.to(torch.int64)
+        for layer_id in range(2):
+            logical = torch.arange(4).repeat(3, 1)
+            physical = topk_ids_logical_to_physical(
+                logical, ExpertLocationDispatchInfo.init_new(layer_id)
+            )
+            self.assertTrue(
+                torch.equal(held[layer_id][physical], logical),
+                (layer_id, physical.tolist()),
+            )
+
+    def test_a_daemon_without_eplb_loads_by_its_layout_and_exports_it(self):
+        """An engine sets its expert map from --init-expert-location with or
+        without EPLB, and dispatches by it. The daemon used to set its map
+        only with --enable-eplb: without it, it loaded every expert into the
+        slot of its own number, where the engine looks for another expert."""
+        owner, daemon = daemon_with_layout(LAYOUT_A)
+        self.assertEqual(owner.rows.to(torch.int64).tolist(), LAYOUT_A)
+        manifest = load_diff_format.decode_manifest(daemon.manifest["load_diff"])
+        self.assertEqual(manifest.expert_map.rows, LAYOUT_A)
+
+    def test_an_engine_with_another_layout_dispatches_by_the_daemons(self):
+        _, daemon = daemon_with_layout(LAYOUT_A)
+        cases = ((LAYOUT_B, True), (LAYOUT_A, False))
+        for layout, adopts in cases:
+            with self.subTest(adopts=adopts), engine_with_layout(layout):
+                response = fetch(daemon)
+                loader = loader_for(daemon)
+                loader._check_response(response, ENGINE)
+                logs = self.assertLogs if adopts else self.assertNoLogs
+                with logs("sglang.srt.weight_cache.expert_map", "WARNING"):
+                    model = install(loader, response, model=Experts)
+                try:
+                    self.assertEqual(self.process_map(), LAYOUT_A)
+                    self.runs_the_experts_asked_for(model)
+                finally:
+                    ipc_loader._LOADED_MODEL_TRANSPORTS.remove(
+                        loader._transport_backend
+                    )
+
+    def test_an_engine_that_cannot_follow_the_daemons_layout_is_refused(self):
+        # Without a dispatch algorithm its MoE layers run each token in the
+        # slot of its expert's number, whatever map the process holds.
+        _, daemon = daemon_with_layout(LAYOUT_A)
+        with engine_with_layout(LAYOUT_B, dispatch=None):
+            response = fetch(daemon)
+            loader = loader_for(daemon)
+            loader._check_response(response, ENGINE)
+            with torch.device("meta"):
+                reader = Experts()
+            try:
+                with mock.patch.object(
+                    ipc_loader, "_initialize_model", return_value=reader
+                ):
+                    with self.assertRaisesRegex(
+                        load_diff.SnapshotError, "cannot take the owner's expert map"
+                    ):
+                        loader._install(
+                            SimpleNamespace(dtype=torch.float32),
+                            SimpleNamespace(device_type="cpu", gpu_id=-1),
+                            response,
+                            None,
+                        )
+                # Nothing was attached, and the engine keeps its own map.
+                self.assertTrue(reader.rows.is_meta)
+                self.assertEqual(self.process_map(), LAYOUT_B)
+            finally:
+                ipc_loader._LOADED_MODEL_TRANSPORTS.remove(loader._transport_backend)
 
 
 class TestKernelScratch(CustomTestCase):
@@ -372,11 +542,18 @@ class TestProtocolVersion(CustomTestCase):
     def test_daemon_refuses_a_fetch_of_another_version_before_exporting(self):
         _, daemon = daemon_with_snapshot()
         daemon.transport_backend.send_fetch_state_response = mock.Mock()
-        for version in (None, 1, PROTOCOL_VERSION + 1, "2", True):
+        versions = (None, 1, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1, "2", True)
+        for version in versions:
             with self.subTest(version=version):
                 response = fetch(daemon, version=version, handshake=False)
                 self.assertEqual(response["status"], "protocol_mismatch")
         daemon.transport_backend.send_fetch_state_response.assert_not_called()
+
+    def test_the_protocol_version_follows_the_load_diff_format(self):
+        # The response carries load_diff bytes. An engine that reads another
+        # format than its daemon writes must be refused at the handshake,
+        # before anything is mapped: a change of one version needs the other.
+        self.assertEqual((PROTOCOL_VERSION, load_diff_format.FORMAT_VERSION), (3, 2))
 
     def test_engine_refuses_a_daemon_without_the_handshake(self):
         client, server = socket.socketpair()

@@ -316,7 +316,11 @@ class WeightCacheModelLoader(BaseModelLoader):
         view of a mapped storage, and every plain value that loading changed,
         then check the result (load_diff.install). Nothing is post-processed
         again: the daemon ran process_weights_after_loading before exporting,
-        and running it twice would corrupt the weights."""
+        and running it twice would corrupt the weights. The daemon's expert
+        rows are in the layout of the daemon's expert map, which the snapshot
+        carries: an engine that set another layout of the same shape
+        dispatches by the daemon's from here on, and one that cannot is
+        refused before anything is attached (expert_map.py)."""
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         tic = time.perf_counter()

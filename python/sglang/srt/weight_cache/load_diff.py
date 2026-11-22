@@ -10,6 +10,11 @@ values that loading changed, and checks the result. Nothing is ever
 post-processed again, nothing is imported by a name in a snapshot, and no
 code in a snapshot runs.
 
+The manifest also carries the expert map the owner placed its experts by
+(D2 of #50943, expert_map.py): ``install`` refuses a map the reader cannot
+dispatch by before it attaches anything, and takes the owner's map once the
+result is checked, without moving a row.
+
 It shares nothing with the validator but the schema.
 """
 
@@ -28,6 +33,11 @@ import msgspec
 import torch
 from torch import nn
 
+from sglang.srt.weight_cache.expert_map import (
+    adopt_expert_map,
+    check_expert_map,
+    export_expert_map,
+)
 from sglang.srt.weight_cache.load_diff_format import (
     FACTORIES,
     FORMAT_VERSION,
@@ -117,10 +127,11 @@ def export(
     included, and has not run. The storages are uint8 tensors, each covering
     one allocation (contiguous, offset 0) on the model's device or the CPU,
     named by first use; storages of no bytes are left out (the reader makes
-    them). Raises SnapshotError listing everything a reader could not get: a
-    value that is not data, a module added or replaced, hooks added or
-    removed, a tensor on another device, a module-level object that loading
-    changed."""
+    them). The manifest also records the expert map this process holds: its
+    expert rows are in that layout. Raises SnapshotError listing everything a
+    reader could not get: a value that is not data, a module added or
+    replaced, hooks added or removed, a tensor on another device, a
+    module-level object that loading changed."""
     if not isinstance(constructed, Baseline) or constructed.model() is not model:
         raise SnapshotError(
             "cannot hand the loaded model to a reader",
@@ -156,6 +167,7 @@ def export(
         boundaries=[encode_path(path) for path in after.boundaries],
         removed_modules=removed,
         local=_locals(after),
+        expert_map=export_expert_map(),
     )
     payload = encode_manifest(manifest)
     decode_manifest(payload)  # what a reader gets passes a reader's checks
@@ -193,16 +205,32 @@ def install(
     against the owner's export (check_install: views, registrations, values,
     BLAKE3 of every storage). Nothing is put back on failure: drop the
     skeleton and keep the storages mapped until the process exits, since it,
-    or a cache it shares, may still refer to them."""
+    or a cache it shares, may still refer to them.
+
+    The owner's expert rows are in the layout of the owner's expert map. A
+    map this process cannot dispatch by is refused before anything is
+    attached; one that differs from this process's own replaces it once the
+    result is checked (expert_map.py)."""
     m = decode_manifest(manifest.load_diff)
+    owner_expert_map = check_expert_map(m.expert_map)
     device = _check_storages(m, manifest.storages, storages)
     tensors, swapped = _install(skeleton, m, storages, device)
     stats = check_install(skeleton, m, tensors, device)
     stats.update(
         tensors=len(tensors), swapped=swapped, ops=len(m.ops), local=len(m.local)
     )
+    if owner_expert_map is not None:
+        stats["expert_map"] = adopt_expert_map(owner_expert_map)
     logger.info("load-diff: installed %s", stats)
     return skeleton
+
+
+def owner_expert_map_digest(manifest: SnapshotManifest) -> bytes:
+    """Reader: the digest of the expert map in ``manifest``, b"" without one.
+    Every rank of one load must find the same: the ranks would otherwise
+    dispatch by different maps."""
+    expert_map = decode_manifest(manifest.load_diff).expert_map
+    return b"" if expert_map is None else expert_map.digest
 
 
 def _model_device(model: nn.Module) -> torch.device:

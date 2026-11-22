@@ -315,40 +315,61 @@ class TestSnapshotLoader(CustomTestCase):
 
     def test_pre_load_check_votes_on_every_outcome_but_the_rank(self):
         ballots = []
-        manifest = SnapshotManifest(
-            version="v1", storages={}, load_diff=b"", attestation=b"", source={}
-        )
+
+        def found(load_diff_bytes):
+            manifest = SnapshotManifest(
+                version="v1",
+                storages={},
+                load_diff=load_diff_bytes,
+                attestation=b"",
+                source={},
+            )
+            return _Source(LoadConfig(), found=(manifest, _MemoryTransport()))
+
+        def collect(*, group, ballot):
+            ballots.append(ballot)
+
+        def check(loader, spec, vote=collect):
+            with mock.patch.object(snapshot_loader, "vote", vote):
+                snapshot_loader.pre_load_check(
+                    loader=loader, spec=spec, device_config=_CPU, group=None
+                )
+
         failing = _Source(LoadConfig())
         failing._find = mock.Mock(side_effect=OSError("daemon socket refused"))
-        found = _Source(LoadConfig(), found=(manifest, _MemoryTransport()))
         loaders_and_specs = [
             (_Source(LoadConfig()), _spec(0)),
             (_Source(LoadConfig()), _spec(1)),
             (failing, _spec(2)),
-            (found, _spec(3)),
+            (found(b"map A"), _spec(3)),
             (_Source(LoadConfig()), _spec(4, tp_size="4")),
+            (found(b"map B"), _spec(5)),
         ]
+        # Stands in for load-diff reading the expert map's digest in its bytes.
         with mock.patch.object(
-            snapshot_loader, "vote", lambda *, group, ballot: ballots.append(ballot)
+            load_diff, "owner_expert_map_digest", lambda manifest: manifest.load_diff
         ):
             for loader, spec in loaders_and_specs:
-                snapshot_loader.pre_load_check(
-                    loader=loader, spec=spec, device_config=_CPU, group=None
-                )
+                check(loader, spec)
+            # When the ranks reject the load, a rank that found a snapshot
+            # releases it.
+            rejected = found(b"map A")
+            with self.assertRaisesRegex(RuntimeError, "rank 1 failed"):
+                check(rejected, _spec(0), _vote_failing_at(1))
+        self.assertTrue(rejected.found[1].closed)
         self.assertEqual(ballots[0].agree, ballots[1].agree)
         self.assertIn("daemon socket refused", ballots[2].error)
+        self.assertIsNone(ballots[3].error)
         self.assertNotEqual(ballots[3].agree, ballots[0].agree)
         self.assertNotEqual(ballots[4].agree, ballots[0].agree)
+        # The same version with another expert map: the ranks would dispatch
+        # by different maps.
+        self.assertIsNone(ballots[5].error)
+        self.assertNotEqual(ballots[5].agree, ballots[3].agree)
 
-        # When the ranks reject the load, a rank that found a snapshot releases it.
-        transport = _MemoryTransport()
-        rejected = _Source(LoadConfig(), found=(manifest, transport))
-        with mock.patch.object(snapshot_loader, "vote", _vote_failing_at(1)):
-            with self.assertRaises(RuntimeError):
-                snapshot_loader.pre_load_check(
-                    loader=rejected, spec=_spec(0), device_config=_CPU, group=None
-                )
-        self.assertTrue(transport.closed)
+        # Bytes that load-diff cannot read are this rank's error, and voted on.
+        check(found(b"not a manifest"), _spec(0))
+        self.assertIn("invalid load-diff manifest", ballots[-1].error)
 
     def test_load_diff_and_validator_share_only_the_schema(self):
         # A validator built on load-diff's logic would only check what load-diff did.

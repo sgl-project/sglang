@@ -4,6 +4,8 @@ as data, and the checks a reader runs before it maps anything."""
 import collections
 import enum
 import functools
+import hashlib
+import struct
 import types
 import unittest
 
@@ -394,9 +396,21 @@ def manifest(**overrides):
         "boundaries": [],
         "removed_modules": [],
         "local": [],
+        "expert_map": None,
     }
     m.update(overrides)
     return m
+
+
+# Two MoE layers of four experts: the logical expert in each physical slot.
+EXPERT_ROWS = [[3, 2, 1, 0], [1, 0, 3, 2]]
+
+
+def expert_map(rows=EXPERT_ROWS, *, num_logical_experts=4, ep_size=2, digest=None):
+    """An expert map as plain data; by default with the digest of ``rows``."""
+    if digest is None:
+        digest = load_diff.expert_map_digest(rows)
+    return [num_logical_experts, ep_size, rows, digest]
 
 
 def check(m):
@@ -477,6 +491,58 @@ class TestValidateManifest(CustomTestCase):
             )
         )  # fmt: skip
 
+    def test_accepts_an_expert_map(self):
+        m = check(manifest(expert_map=expert_map()))
+        self.assertEqual(m.expert_map.rows, EXPERT_ROWS)
+        self.assertEqual(
+            (m.expert_map.num_logical_experts, m.expert_map.ep_size), (4, 2)
+        )
+        # Redundant experts: more slots than logical experts, some in two slots.
+        replicas = [[0, 1, 2, 3, 3, 0], [3, 3, 2, 1, 0, 0]]
+        check(manifest(expert_map=expert_map(replicas)))
+
+    def test_refuses_a_bad_expert_map(self):
+        other_digest = load_diff.expert_map_digest([[0, 1, 2, 3]] * 2)
+        bad = {
+            "ragged rows": expert_map([[3, 2, 1, 0], [1, 0, 3]]),
+            "no rows": expert_map([]),
+            "an expert the model does not have": expert_map(
+                [[3, 2, 1, 4], [1, 0, 3, 2]]
+            ),
+            "a negative expert": expert_map([[3, 2, 1, -1], [1, 0, 3, 2]]),
+            "a logical expert with no slot": expert_map([[3, 2, 1, 0], [1, 0, 3, 3]]),
+            "more logical experts than slots": expert_map(num_logical_experts=5),
+            "fewer logical experts than named": expert_map(num_logical_experts=3),
+            "slots that do not divide over the EP ranks": expert_map(ep_size=3),
+            "no EP rank": expert_map(ep_size=0),
+            "the digest of other rows": expert_map(digest=other_digest),
+            "a short digest": expert_map(digest=bytes(8)),
+            "an extra column": expert_map() + [0],
+        }
+        for why, value in bad.items():
+            with self.subTest(why=why):
+                with self.assertRaises(SnapshotError):
+                    check(manifest(expert_map=value))
+
+    def test_the_expert_map_digest_covers_shape_and_values(self):
+        # An owner and a reader compute it apart: the definition is the format.
+        packed = struct.pack("<8q", 3, 2, 1, 0, 1, 0, 3, 2)
+        self.assertEqual(
+            load_diff.expert_map_digest(EXPERT_ROWS),
+            hashlib.sha256(b"(2, 4)" + packed).digest(),
+        )
+        self.assertNotEqual(
+            load_diff.expert_map_digest([[3, 2, 1, 0, 1, 0, 3, 2]]),
+            load_diff.expert_map_digest(EXPERT_ROWS),
+        )
+
+    def test_refuses_format_1(self):
+        # Format 1 carried no expert map. Read as "no map", its reader would
+        # dispatch by its own map over rows the owner placed by another.
+        old = {k: v for k, v in manifest(version=1).items() if k != "expert_map"}
+        with self.assertRaisesRegex(SnapshotError, "version 1"):
+            check(old)
+
 
 class TestManifestBytes(CustomTestCase):
     def test_round_trip(self):
@@ -484,7 +550,8 @@ class TestManifestBytes(CustomTestCase):
             ops=[
                 ["set", ["a", [["a", "flag"]]], ["tuple", [1, 2.5, "x", b"y", None]]],
                 ["fill", ["a", [["a", "cfg"]]], ["dict", [["k", ["list", [True]]]]]],
-            ]
+            ],
+            expert_map=expert_map(),
         )
         data = msgspec.msgpack.encode(m)
         # The typed manifest encodes to the very bytes of the plain data.
