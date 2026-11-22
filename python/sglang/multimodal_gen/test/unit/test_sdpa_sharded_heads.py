@@ -169,6 +169,13 @@ class TestSDPAShardedHeads(CustomTestCase):
                 1, 6, 8192, 128, device="cuda", dtype=torch.bfloat16
             )
             self.assertEqual(impl._unsplit_query_len(long_query, 8192), 8192)
+        with self.subTest("calls with every head skip the plan cache"):
+            impl = _impl(global_num_heads=_GLOBAL_HEADS)
+            full = torch.empty(
+                1, _GLOBAL_HEADS, 1025, 128, device="cuda", dtype=torch.bfloat16
+            )
+            self.assertEqual(impl._unsplit_query_len(full, 1025), 1025)
+            self.assertEqual(impl._split_padding_plans, {})
         with self.subTest("short keys never split"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 128), 1025)

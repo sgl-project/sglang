@@ -165,6 +165,9 @@ class SDPAImpl(AttentionImpl):
         self, query: torch.Tensor, query_shape: torch.Size, key_len: int
     ) -> int:
         """Padded length for this call, or 0 when it runs unpadded."""
+        # All heads present: this call already runs the full layer's kernel.
+        if query_shape[1] >= self.global_num_heads:
+            return 0
         if torch.compiler.is_compiling():
             padded_len = self._split_padding_len(query, query_shape, key_len)
         else:
@@ -186,8 +189,7 @@ class SDPAImpl(AttentionImpl):
         """Length that moves the shard off the split kernel, or 0 if it need not move."""
         batch, heads, query_len, head_dim = query_shape
         if (
-            heads >= self.global_num_heads
-            or not query.is_cuda
+            not query.is_cuda
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
             or key_len <= _FLASH_UNSPLIT_KEY_LEN
