@@ -1751,6 +1751,30 @@ class ShardedStateLoader(BaseModelLoader):
             )
 
 
+def _gfx942_preshuffles_dense_fp8(
+    model_config: ModelConfig, load_config: LoadConfig
+) -> bool:
+    """Whether this launch preshuffles dense block-FP8 weights on gfx942.
+
+    Fp8LinearMethod decides it: the CK path is on and its own dispatch
+    (--fp8-gemm-backend, MXFP8 conversion) picks the aiter block-FP8 GEMM.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_gfx942,
+        aiter_w8a8_block_fp8_linear,
+    )
+
+    if not (_use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()):
+        return False
+    quant_config = _get_quantization_config(model_config, load_config)
+    if not isinstance(quant_config, Fp8Config):
+        return False
+    method = Fp8LinearMethod(quant_config)
+    return method.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+
+
 class PreshardedModelLoader(DefaultModelLoader):
     """Dump/reload post-process weights under ``<model_path>/presharded/<subdir>/``.
 
@@ -1882,14 +1906,10 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
-        if model_config.quantization == "fp8":
-            from sglang.srt.environ import envs
-            from sglang.srt.layers.quantization.fp8_utils import _use_aiter_gfx942
-
-            # gfx942 FP8 weights are preshuffled on the CK path; a cache dumped with the
-            # plain layout must not match, or reload would read it as preshuffled.
-            if _use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get():
-                shard_config["aiter_gfx942_bpreshuffle"] = True
+        if _gfx942_preshuffles_dense_fp8(model_config, self.load_config):
+            # The preshuffle changes the stored weight bytes, so a cache dumped with the
+            # plain layout (Triton backend, CK path off) must not match.
+            shard_config["aiter_gfx942_bpreshuffle"] = True
         return shard_config
 
     @staticmethod
