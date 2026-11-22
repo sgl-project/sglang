@@ -153,8 +153,7 @@ def _round(bs, generator, vocab=VOCAB):
             need_top_k_sampling=False,
             need_top_p_sampling=False,
             need_min_p_sampling=False,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             sampling_seed=None,
             watermark=None,
@@ -318,8 +317,7 @@ class TestPostVerifyGraphs(CustomTestCase):
 
         def key(can_run_cuda_graph=True, topk=1, **changes):
             info = dict(
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
+                step_penalties=None,
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
@@ -353,8 +351,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(topk=2),
             dict(has_grammar=True),
             dict(hisparse_coordinator=object()),
-            dict(acc_additive_penalties=torch.zeros(1)),
-            dict(acc_scaling_penalties=torch.zeros(1)),
+            dict(step_penalties=object()),
             dict(logit_bias=torch.zeros(1)),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
@@ -452,8 +449,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             forward_mode=ForwardMode.TARGET_VERIFY,
             seq_lens=torch.zeros(1),
             sampling_info=SimpleNamespace(
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
+                step_penalties=None,
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,

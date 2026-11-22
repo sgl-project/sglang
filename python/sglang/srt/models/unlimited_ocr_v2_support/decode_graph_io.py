@@ -48,7 +48,6 @@ class UOCRDecodeGraphIO:
     def can_defer(self, batch: ScheduleBatch) -> bool:
         """Return whether the CUDA graph can produce this batch's decode inputs."""
         sampling = batch.sampling_info
-        penalizer = sampling.penalizer_orchestrator
         return bool(
             batch.enable_overlap
             and batch.forward_mode.is_decode()
@@ -61,7 +60,7 @@ class UOCRDecodeGraphIO:
             and sampling.grammar_mask is None
             and not sampling.has_custom_logit_processor
             and sampling.watermark is None
-            and (penalizer is None or not penalizer.is_required)
+            and sampling.step_penalties is None
         )
 
     def seed(self, indices: torch.Tensor, tokens: torch.Tensor) -> None:

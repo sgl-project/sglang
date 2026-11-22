@@ -25,7 +25,11 @@ use sgl_router::{
         },
     },
     tokenizer::TokenizerRegistry,
-    workers::{introspect::worker_client, manager, WorkerRegistry},
+    workers::{
+        control::{ExternalWorkerSource, WorkerControlService},
+        introspect::worker_client,
+        manager, WorkerRegistry,
+    },
 };
 use std::{
     sync::Arc,
@@ -35,7 +39,6 @@ use tokio::{
     net::TcpListener,
     signal::unix::{signal, Signal, SignalKind},
     sync::{oneshot, watch},
-    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -123,25 +126,36 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
-        &config,
-        &worker_registry,
-        &engine_state,
-        &local_inflight_requests,
-    )
-    .await?;
+    let (worker_events, discovery_handle) =
+        spawn_discovery(&config).await.context("spawn discovery")?;
+    let external_source = match &config.discovery {
+        DiscoveryBackend::K8s(_) => ExternalWorkerSource::Kubernetes,
+        DiscoveryBackend::StaticUrls(_) => ExternalWorkerSource::Static,
+    };
+    let (worker_control, control_rx) =
+        WorkerControlService::new(Arc::clone(&worker_registry), external_source);
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
     let mut app_context = build_app_context(
         &config,
         tokenizers,
-        worker_registry,
+        Arc::clone(&worker_registry),
         routing_policies,
-        local_inflight_requests,
+        Arc::clone(&local_inflight_requests),
         &engine_state,
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    app_context.worker_control = Some(Arc::clone(&worker_control));
+    let worker_manager_handle = tokio::spawn(manager::run_with_config_and_control(
+        worker_events,
+        control_rx,
+        worker_control,
+        Some(Arc::new(config.clone())),
+        Some(Arc::clone(&engine_state)),
+        Some(local_inflight_requests),
+        Some(Arc::clone(&app_context.metrics)),
+    ));
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
@@ -352,25 +366,6 @@ async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
              config); the peer set stays unsynced",
         );
     }
-}
-
-async fn start_worker_discovery_and_manager(
-    config: &Config,
-    worker_registry: &Arc<WorkerRegistry>,
-    engine_state: &Arc<KvEventIndex>,
-    local_inflight_requests: &Arc<RouterInflightLoadRegistry>,
-) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let (worker_events, discovery_handle) =
-        spawn_discovery(config).await.context("spawn discovery")?;
-    // Keep engine subscriptions and local request counters in sync with worker membership.
-    let worker_manager_handle = tokio::spawn(manager::run_with_config(
-        worker_events,
-        Arc::clone(worker_registry),
-        Some(Arc::new(config.clone())),
-        Some(Arc::clone(engine_state)),
-        Some(Arc::clone(local_inflight_requests)),
-    ));
-    Ok((discovery_handle, worker_manager_handle))
 }
 
 fn build_app_context(
