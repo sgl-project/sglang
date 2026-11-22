@@ -888,88 +888,57 @@ under the MiniMax H3 Community License Agreement.
 ### pi-H3: 2- and 4-step adapters, decoder-free video
 
 [Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3) distills the AdaLN-pruned
-MiniMax-H3 DiT ([multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned))
-into 2- and 4-step samplers with pi-Flow. Its DWD ("Decoding Without a
-Decoder") adapters also predict the video frames directly at the last step,
-with a pixel head built from the last eight Sol-H3-VAE decoder layers, so the
-video skips the VAE decoder. The audio still decodes through the audio VAE.
+MiniMax-H3 DiT into 2- and 4-step samplers. Its DWD variants predict the frames
+directly at the last step with a pixel head, so the video skips the VAE decoder
+(audio still uses the audio VAE).
 
 | `--model-variant` | Steps | Video output |
 | --- | --- | --- |
-| `4step` (default) | 4 | DWD pixel head |
-| `2step` | 2 | DWD pixel head |
-| `4step-vae` | 4 | Video VAE |
-| `2step-vae` | 2 | Video VAE |
+| `4step` (default) | 4 | Pixel head |
+| `2step` | 2 | Pixel head |
+| `4step-vae`, `2step-vae` | 4, 2 | Video VAE |
 
-Pass the repository directly to `--model-path`. Its registered model overlay
-downloads the four adapters and the pruned DiT, and links the text encoder,
-tokenizer, processor and both VAEs from the MiniMax-H3 `FL2VA/` partition.
-Each adapter replaces some pruned DiT tensors (every block's AdaLN projection,
-the output heads, and in the DWD adapters blocks 46-49 and the pixel head).
-The overlay writes those once per variant next to a shared copy of the pruned
-shards (about 51 GB in total), so keep `SGLANG_DIFFUSION_CACHE_ROOT` on the
-same filesystem as the Hugging Face cache. The adapters' rank-64 LoRA factors
-load at startup through the LoRA path. Do not pass the adapter files to
-`--lora-path`: the replaced tensors, the pixel head and the pruned base would be
-missing, and the LoRA path cannot carry the sampling schedule.
+Pass the repository to `--model-path`. Its model overlay assembles the pruned
+DiT, the adapters and the MiniMax-H3 encoders and VAEs (about 51 GB under
+`SGLANG_DIFFUSION_CACHE_ROOT`). Do not use `--lora-path` with these files: the
+adapters also replace base tensors, add the pixel head and fix the sampling
+schedule.
 
 ```bash Command
-# 4-step, decoder-free (default), 1x H200
+# 1x H200
 sglang serve --model-path Lakonik/pi-H3 --port 30010
 
-# fastest measured lossless on 2x H200: Ulysses 2
+# 2x H200, fastest measured lossless: Ulysses 2
 sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
   --num-gpus 2 --ulysses-degree 2 --port 30010
-
-# 2-step, decoder-free, FP8 DiT linears and Sol sparse attention after block 1
-sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
-  --quantization fp8 \
-  --component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn \
-  --attention-backend-config '{"dense_steps": 0, "dense_layers": "0,1"}' \
-  --port 30010
 ```
 
-Use the requests in [Generate video and audio](#4-generate-video-and-audio)
-with `"model": "Lakonik/pi-H3"` and `task` `t2va` or `fl2va`; `ref2va` was not
-distilled. `num_inference_steps` defaults to the variant's step count, and any
-other value is rejected. The sampler is Euler on the adapters' trained
-unshifted knots (`0.96, 0.693, 0.427, 0.16` for 4 steps, `0.93, 0.349` for
-2 steps) with video shift 12 and audio shift 3; omit `flow_shift` and
-`audio_flow_shift`. `quality: "high"` is not supported. Under tensor or
-sequence parallelism every rank gathers the pixel-head features and decodes the
-frames with its own copy of the 0.6B head.
+Requests use [Generate video and audio](#4-generate-video-and-audio) with
+`"model": "Lakonik/pi-H3"` and `task` `t2va` or `fl2va`. Omit
+`num_inference_steps`, `flow_shift` and `audio_flow_shift`: the variant fixes
+them (Euler on the trained knots, video shift 12, audio shift 3). `ref2va` and
+`quality: "high"` are not supported, and breakable CUDA graph stays off.
 
-Breakable CUDA graph is not validated for pi-H3 and stays off: the release
-adapter loads through the LoRA path, and with two to four steps of several
-seconds each there is no launch overhead to recover.
+Warm `t2va` requests at 1344×768, 5 seconds, H200:
 
-Warm `t2va` requests at 1344×768 and 5 seconds through `sglang serve` on H200:
-
-| Variant | 1 GPU | 2 GPUs, Ulysses 2 | 2 GPUs, TP 2 |
+| Variant | 1 GPU | 2 GPUs, Ulysses 2 | 1 GPU, FP8 + Sol (approximate) |
 | --- | --- | --- | --- |
-| `2step` | 11.9 s | 6.8 s | 7.0 s |
-| `4step` | 22.6 s | 12.3 s | 12.7 s |
-
-With the base H3 two-GPU offload flags (`--performance-mode memory
---layerwise-offload-components dit,text_encoder,vae
---layerwise-resident-layers video_vae=36 --dit-offload-prefetch-size 1
---dit-layerwise-resident-layers 20`), `2step` on Ulysses 2 peaked at 50 GiB per
-H200 and took 7.2 to 7.9 s per request.
-
-Precision and attention options on 1× H200 (same workload, offline generation;
-FP8 and Sol are approximate):
-
-| Variant | BF16, `fa` | FP8 | FP8 + Sol after block 1 |
-| --- | --- | --- | --- |
-| `2step` | 11.9 s | 10.3 s | 6.7 s |
-| `4step` | 22.4 s | 19.1 s | 12.0 s |
+| `2step` | 11.9 s | 6.8 s | 6.7 s |
+| `4step` | 22.6 s | 12.3 s | 12.0 s |
 | `2step-vae` | 14.7 s | | |
-| `4step-vae` | 25.3 s | | |
 
-A DiT step takes 5.3 s in BF16, 4.4 s with FP8 linears and 2.7 s with FP8 and
-Sol. The DWD pixel head decodes the 5-second clip in 0.6 s, where the video VAE
-takes 4.2 s. FP8 and Sol are approximate; the Sol kernels compile on the first
-request.
+The pixel head decodes the clip in 0.6 s, the video VAE in 4.2 s. The
+approximate column adds `--quantization fp8
+--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn
+--attention-backend-config '{"dense_steps": 0, "dense_layers": "0,1"}'`. For
+80 GB cards, these offload flags keep `2step` on Ulysses 2 at 50 GiB per GPU
+(7.2 to 7.9 s per request on H200):
+
+```bash
+--performance-mode memory --layerwise-offload-components dit,text_encoder,vae \
+--layerwise-resident-layers video_vae=36 --dit-offload-prefetch-size 1 \
+--dit-layerwise-resident-layers 20
+```
 
 The pi-H3 adapters are Model Derivatives of MiniMax H3, distributed under the
 MiniMax H3 Community License Agreement.
