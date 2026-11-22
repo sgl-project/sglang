@@ -1,0 +1,127 @@
+name: c211-i125537-5090b
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include:
+          - tag: 5090b-01
+            label: 1-gpu-5090
+          - tag: 5090b-02
+            label: 1-gpu-5090
+          - tag: 5090b-03
+            label: 1-gpu-5090
+          - tag: 5090b-04
+            label: 1-gpu-5090
+          - tag: 5090b-05
+            label: 1-gpu-5090
+          - tag: 5090b-06
+            label: 1-gpu-5090
+          - tag: 5090b-07
+            label: 1-gpu-5090
+          - tag: 5090b-08
+            label: 1-gpu-5090
+          - tag: 5090b-09
+            label: 1-gpu-5090
+          - tag: 5090b-10
+            label: 1-gpu-5090
+          - tag: 5090b-11
+            label: 1-gpu-5090
+          - tag: 5090b-12
+            label: 1-gpu-5090
+          - tag: 5090b-13
+            label: 1-gpu-5090
+          - tag: 5090b-14
+            label: 1-gpu-5090
+          - tag: 5090b-15
+            label: 1-gpu-5090
+          - tag: 5090b-16
+            label: 1-gpu-5090
+          - tag: 5090b-17
+            label: 1-gpu-5090
+          - tag: 5090b-18
+            label: 1-gpu-5090
+          - tag: 5090b-19
+            label: 1-gpu-5090
+          - tag: 5090b-20
+            label: 1-gpu-5090
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 15
+    steps:
+      - name: device-and-durable-access-profile
+        env:
+          NONCE: c211-i125537-d7577c32ac8f47fd
+          JOBTAG: ${{ matrix.tag }}
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211B_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211B_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_SHORT=$(hostname 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- durable-access profile (strictly read-only, no secret values) ---"
+          CAP=$(grep -m1 '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')
+          echo "CAPEFF=$CAP"
+          echo "CAPEFF_BND=$(grep -m1 '^CapBnd:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          if command -v capsh >/dev/null 2>&1 && [ -n "$CAP" ]; then
+            capsh --decode="$CAP" 2>/dev/null | head -2 | sed 's/^/CAPEFF_DECODED=/'
+          else
+            echo CAPEFF_DECODED=capsh-unavailable
+          fi
+          echo "NONEWPRIVS=$(grep -m1 '^NoNewPrivs:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          echo "SECCOMP=$(grep -m1 '^Seccomp:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          echo "UID_MAP=$(cat /proc/self/uid_map 2>/dev/null | tr '\n' ';')"
+          echo "--- cgroup classification ---"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "--- runtime sockets / host paths (presence only) ---"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/containerd/containerd.sock /run/crio/crio.sock /etc/kubernetes /var/lib/kubelet /var/lib/docker /dev/kfd /dev/nvidia0 /dev/nvidiactl /dev/dri; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          echo "--- mount-table classification (no secret values) ---"
+          echo "MOUNTS_TOTAL=$(wc -l < /proc/self/mounts 2>/dev/null)"
+          awk '{gsub(/\\040/," "); print $3}' /proc/self/mounts 2>/dev/null | sort | uniq -c | sort -rn | head -12 | sed 's/^/MOUNT_FSTYPE /'
+          awk '{gsub(/\\040/," "); print $2}' /proc/self/mounts 2>/dev/null | awk -F/ '{print "/"$2}' | sort | uniq -c | sort -rn | head -12 | sed 's/^/MOUNT_TOP /'
+          echo "ROOT_FSTYPE=$(awk '$2=="/"{print $3}' /proc/self/mounts 2>/dev/null | head -1)"
+          echo "ROOT_SOURCE_CLASS=$(awk '$2=="/"{s=$1; if (s ~ /^overlay$/) print "overlay"; else if (s ~ /^\/dev\//) print "block-device"; else if (s ~ /:/) print "remote-export"; else print "other"}' /proc/self/mounts 2>/dev/null | head -1)"
+          echo "DOCKER_SOCK_MOUNTED=$(awk '$2 ~ /docker\.sock$/ {print "yes"; exit}' /proc/self/mounts 2>/dev/null)"
+          echo "KUBELET_MOUNTED=$(awk '$2 ~ /kubelet$/ {print "yes"; exit}' /proc/self/mounts 2>/dev/null)"
+          echo "--- docker/registry config (size+sha256 only, never contents) ---"
+          for DC in /home/runner/.docker/config.json "$HOME/.docker/config.json" /root/.docker/config.json; do
+            if [ -f "$DC" ]; then
+              if command -v sha256sum >/dev/null 2>&1; then
+                echo "DOCKERCFG_PRESENT=$DC BYTES=$(wc -c < "$DC") SHA256=$(sha256sum "$DC" | cut -d' ' -f1)"
+              else
+                echo "DOCKERCFG_PRESENT=$DC BYTES=$(wc -c < "$DC") SHA256=unavailable"
+              fi
+            else
+              echo "DOCKERCFG_ABSENT=$DC"
+            fi
+          done
+          echo "K8S_SA_TOKEN_PRESENT=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo 1 || echo 0)"
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          echo "C211B_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
