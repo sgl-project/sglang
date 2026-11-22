@@ -32,11 +32,12 @@ test('switching hardware selects the supported quantization and restores a GPU r
 
 test('one complete A3 emits a TP16 ModelSlim service using the Cookbook entry and port', () => {
   const command = build();
-  for (const expected of ['python3 -m sglang.launch_server', '--tp-size 16', '--attn-dp-size 16', '--device npu',
+  for (const expected of ['python3 -m sglang.launch_server', '--enable-prefill-delayer',
+    '--prefill-delayer-max-delay-passes 200', '--tp-size 16', '--attn-dp-size 16', '--device npu',
     '--quantization modelslim', '--attention-backend ascend', '--port 30000', '--max-total-tokens 100000']) {
     assert.ok(command.includes(expected), expected);
   }
-  assert.doesNotMatch(command, /SGLANG_SET_CPU_AFFINITY|--prefill-decode-interval/);
+  assert.doesNotMatch(command, /SGLANG_SET_CPU_AFFINITY|SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES|SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE|--prefill-decode-interval/);
   assert.doesNotMatch(command, /--disaggregation-mode|--nnodes 2|--tp-size 32|flashinfer|fp8_e4m3/);
 });
 
@@ -59,17 +60,18 @@ test('PD roles keep separate TP16 instances, role-specific attention DP, and Asc
 
 test('Router addresses both roles and uses a nonconflicting local port', () => {
   const command = build({ deployshape: 'pd2node', ascendRole: 'router' });
-  assert.match(command, /python -m sglang_router.launch_router/);
-  assert.match(command, /--prefill "http:\/\/<prefill-ip>:30000" 8998/);
-  assert.match(command, /--decode "http:\/\/<decode-ip>:30000"/);
+  assert.match(command, /^sgl-router\b/m);
+  assert.match(command, /--model-id "\$MODEL_PATH"/);
+  assert.match(command, /--no-tokenizer/);
+  assert.match(command, /--worker-urls "http:\/\/<prefill-ip>:30000" "http:\/\/<decode-ip>:30000"/);
   assert.match(command, /--port 6688/);
-  assert.doesNotMatch(command, /--model-path|sglang\.launch_server/);
+  assert.doesNotMatch(command, /launch_router|--model-path|sglang\.launch_server/);
 });
 
 test('unsupported selections do not emit a launch command', () => {
   for (const invalid of [{ quantization: 'fp8' }, { deployshape: 'unknown' },
     { deployshape: 'pd2node', ascendRole: 'unknown' }]) {
-    assert.doesNotMatch(build(invalid), /sglang\.launch_server|python -m sglang_router/);
+    assert.doesNotMatch(build(invalid), /sglang\.launch_server|sgl-router/);
   }
 });
 
@@ -104,12 +106,12 @@ test('the real generated shell passes a model path containing spaces', () => {
 test('A3 commands only carry the upstream recipe settings and MemFabric transfer variables', () => {
   for (const command of [build(), build({ deployshape: 'pd2node', ascendRole: 'prefill' }),
     build({ deployshape: 'pd2node', ascendRole: 'decode' })]) {
-    assert.doesNotMatch(command, /SGLANG_SCHEDULER_EXIT_TIMEOUT_SECS/);
+    assert.doesNotMatch(command, /SGLANG_SCHEDULER_EXIT_TIMEOUT_SECS|MF_CONFIG_STORE_URL|ASCEND_MF_TRANSFER_PROTOCOL/);
   }
   for (const role of ['prefill', 'decode']) {
     const command = build({ deployshape: 'pd2node', ascendRole: role });
-    assert.match(command, /^export (?:\S+ )*ASCEND_MF_TRANSFER_PROTOCOL=sdma(?: |$)/m);
-    assert.match(command, /^export MF_CONFIG_STORE_URL="tcp:\/\/<prefill-ip>:24670"$/m);
+    assert.match(command, /^export (?:\S+ )*SGLANG_SET_CPU_AFFINITY=1(?: |$)/m);
+    assert.match(command, /^export ASCEND_MF_STORE_URL="tcp:\/\/<prefill-ip>:24670"$/m);
   }
 });
 

@@ -122,7 +122,7 @@ Before launching:
      kernel.sched_migration_cost_ns=50000
    ```
 
-5. Replace the placeholders in the command. Use your host network interface for `<network-interface>`. For disaggregation, use the Prefill host address for `<prefill-ip>` and the Decode host address for `<decode-ip>`. Prefill creates the MemFabric store at `<prefill-ip>:24670`, so start Prefill and Decode first and the Router last. The Router listens on port `6688`. The `8998` after `--prefill` in the Router command is the Prefill bootstrap port, so keep it equal to the Prefill `--disaggregation-bootstrap-port`.
+5. Replace the placeholders in the command. Use your host network interface for `<network-interface>`. For disaggregation, use the Prefill host address for `<prefill-ip>` and the Decode host address for `<decode-ip>`, and keep `--model-id` in the Router command equal to `--model-path` on Prefill and Decode. Prefill creates the MemFabric store at `<prefill-ip>:24670`, so start Prefill and Decode first and the Router last (`sgl-router` discovers each worker's role and the Prefill bootstrap port automatically). The Router listens on port `6688`.
 
 After the service starts, [verify it](#4-3-verify-the-ascend-a3-service) and [run the benchmarks](#5-3-ascend-a3-benchmarks).
 
@@ -1060,7 +1060,7 @@ The [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment
 
 ```bash Command
 # 1×A3, PD co-located
-python3 -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --dataset-name random --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --max-concurrency 224 --num-prompts 896 \
@@ -1070,7 +1070,7 @@ python3 -m sglang.bench_serving \
 
 ```bash Command
 # 2×A3, PD disaggregated (through the Router)
-python3 -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --dataset-name random --backend sglang \
   --host 127.0.0.1 --port 6688 \
   --max-concurrency 416 --num-prompts 1664 --request-rate 24 \

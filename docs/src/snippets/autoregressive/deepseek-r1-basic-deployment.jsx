@@ -189,6 +189,8 @@ export const DeepSeekR1BasicDeployment = () => {
   ],
   "colocated": [
     "--model-path \"$MODEL_PATH\"",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes 200",
     "--host 127.0.0.1",
     "--port 30000",
     "--tp-size 16",
@@ -229,9 +231,7 @@ export const DeepSeekR1BasicDeployment = () => {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "72",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1"
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1"
   },
   "prefill": {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -242,8 +242,7 @@ export const DeepSeekR1BasicDeployment = () => {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "DEEPEP_HCCL_BUFFSIZE": "4000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "TASK_QUEUE_ENABLE": "2",
-    "ASCEND_MF_TRANSFER_PROTOCOL": "sdma"
+    "TASK_QUEUE_ENABLE": "2"
   },
   "decode": {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -251,11 +250,11 @@ export const DeepSeekR1BasicDeployment = () => {
     "SGLANG_USE_FIA_NZ": "1",
     "STREAMS_PER_DEVICE": "32",
     "ENABLE_MOE_NZ": "1",
+    "SGLANG_SET_CPU_AFFINITY": "1",
     "DEEPEP_HCCL_BUFFSIZE": "800",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "78",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "TASK_QUEUE_ENABLE": "1",
-    "ASCEND_MF_TRANSFER_PROTOCOL": "sdma"
+    "TASK_QUEUE_ENABLE": "1"
   }
 };
 
@@ -292,10 +291,12 @@ export const DeepSeekR1BasicDeployment = () => {
     const lines = ['# Ascend A3 ModelSlim W4A8: replace the <...> placeholders and the model path.'];
     if (role === 'router') {
       lines.push(
+        'MODEL_PATH="/path/to/DeepSeek-R1-0528-w4a8"',
         ...packWords(
-          ['--pd-disaggregation', '--policy cache_aware', '--prefill "http://<prefill-ip>:30000" 8998',
-            '--decode "http://<decode-ip>:30000"', '--host 127.0.0.1', '--port 6688'],
-          'python -m sglang_router.launch_router ', '  ', 80, ' \\',
+          ['--model-id "$MODEL_PATH"', '--no-tokenizer',
+            '--worker-urls "http://<prefill-ip>:30000" "http://<decode-ip>:30000"',
+            '--host 127.0.0.1', '--port 6688'],
+          'sgl-router ', '  ', 80, ' \\',
         ),
       );
       return lines.join('\n');
@@ -307,7 +308,6 @@ export const DeepSeekR1BasicDeployment = () => {
     if (role !== 'colocated') {
       lines.push(
         'export ASCEND_MF_STORE_URL="tcp://<prefill-ip>:24670"',
-        'export MF_CONFIG_STORE_URL="tcp://<prefill-ip>:24670"',
       );
     }
     lines.push(
