@@ -112,6 +112,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
   Local shared-memory reply files are cleaned up when the RPC completes, fails, or is cancelled; timing out does not abort GPU work already in flight. A hard process kill cannot run this cleanup, so isolate `/dev/shm` per deployment rather than sharing it across unrelated services.
+- `--request-time-limit {SECONDS|TASK=SECONDS} ...`: mark the server unhealthy when a request executes past its limit, queue time excluded. Off by default. See [Request time limit](#request-time-limit).
 - `--sleep-on-idle`: reduce idle scheduler CPU usage by waiting for socket events. Disabled by default, matching SRT, to minimize idle-to-active wake-up latency. Applies only to monolithic serving with one rank per DP replica; TP/SP/CFG multi-rank replicas keep polling. Each wait ends when a message arrives, a pending allocator-cache release is due, or one second elapses. Active generation is unchanged; benchmark low-QPS tail latency before enabling it in latency-sensitive deployments.
 - `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
@@ -369,15 +370,33 @@ therefore add weight-transfer latency to the first real request after warmup.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
 
+On NVIDIA CUDA GPUs with separate host and device memory, `component-offload`
+preserves existing checkpoint mappings when host headroom cannot accommodate a
+weight copy, every parameter is file-backed, and the dtype already matches.
+Swap-out restores those CPU views without weight
+D2H or a new pinned copy; mutable buffers still return to CPU. Ordinary, partially
+mapped, and dtype-converted weights keep the low-host-memory transfer path, without
+retaining a CPU weight copy during GPU execution. Shared-memory GPUs are unchanged.
+Mapped pages still consume physical RAM when resident and can count toward a
+container's memory limit; avoiding a new host allocation does not mean zero RAM use.
+When host memory is sufficient, the normal transfer path remains enabled: its
+pinned swap-out storage can make subsequent H2D faster than rereading a mapping.
+Preserving mappings is a memory-pressure fallback, not an unconditional latency win.
+
+Breakable CUDA graphs require a resident DiT. Explicit DiT offload with
+`--enable-breakable-cuda-graph` is rejected; auto-selected DiT offload disables graph
+capture with a warning. Offloading an encoder or VAE does not impose this restriction.
+
 #### Snapshot offload
 
 On NVIDIA CUDA GPUs with separate host and device memory, explicitly select
 `--component-residency vae=snapshot-offload` to avoid repeated weight D2H transfers.
-Existing defaults and `component-offload` behavior are unchanged.
+Use this explicit mode to retain ordinary CPU weights as well as checkpoint mappings.
 
 Snapshot offload retains a full host copy during GPU execution. With
 `--pin-cpu-memory` enabled (the default), it shares a per-worker host pin budget
-with layerwise offload. Layerwise initialization claims its allowance first;
+with layerwise offload. The budget divides host headroom among node-local GPU
+workers. Layerwise initialization claims its allowance first;
 snapshot weights use the remainder. Shared parameter storage is pinned once and
 reused across requests; its allowance is returned when the storage is released.
 Pinning also checks current host headroom, including the cgroup limit.
@@ -499,13 +518,33 @@ the whole server; workers and in-flight jobs are not automatically recovered.
 An allocator OOM during a multi-rank forward terminates the affected worker:
 other ranks may still be inside collectives, so continuing the next request is
 unsafe. Single-GPU replicas, including independent DP replicas, retain normal
-request-level OOM handling. The monitor does not detect arbitrary hangs, unusable
-CUDA contexts, or workers on other machines. A standalone disaggregation router
+request-level OOM handling. The monitor does not detect arbitrary hangs (see
+[Request time limit](#request-time-limit) for requests that stop making progress),
+unusable CUDA contexts, or workers on other machines. A standalone disaggregation router
 does not own remote worker processes and cannot validate their health through this
 check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
+
+### Request time limit
+
+A hung kernel or collective blocks the workers without logging anything, and the
+worker processes stay alive, so `/health` keeps returning `200`. Set
+`--request-time-limit 120` to mark the server unhealthy when a request executes
+for more than 120 seconds. Time spent queued behind other requests does not
+count, and warmup requests are not timed. A `TASK=SECONDS` entry limits one task
+of a model that names its request tasks (MiniMax-H3: `t2va`, `fl2va`, `ref2va`)
+and can follow a limit for everything else: `--request-time-limit 90 ref2va=120`.
+The limit is off by default and is not available with disaggregated roles.
+
+When a request passes its limit, the server logs the request id, task, stage and
+denoising step, asks every local worker to write the Python stacks of all its
+threads to stderr, and takes the path of a lost worker: `/health` returns `503`,
+outstanding scheduler requests fail, and new POST requests are rejected with
+`503`. The hung request is not aborted; remove the instance from routing and
+restart the whole server. `--scheduler-rpc-timeout` is a different bound: it
+fails one caller's wait, queue time included, and leaves `/health` unchanged.
 
 ### Cloud Storage
 
@@ -514,6 +553,14 @@ SGLang Diffusion can upload generated images and videos to S3-compatible object 
 On AWS, assign the serving workload an IAM role scoped to its output bucket.
 Leave both SGLang credential variables unset so [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)
 can obtain and refresh the role's temporary credentials.
+
+The video exporter and MiniMax H3 launch their local FFmpeg/FFprobe processes
+with executable and library paths, locale, temporary-directory, device and
+thread settings. They do not copy arbitrary service environment variables into
+these children. Custom codec wrappers should not depend on storage credentials.
+This is not a sandbox: use separate identities and filesystem and network
+restrictions for workloads that do not trust each other. Third-party libraries
+that launch their own processes are outside this guarantee.
 
 ```bash Command
 export SGLANG_CLOUD_STORAGE_TYPE=s3
