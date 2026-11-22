@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -32,6 +31,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     dispose_tensor,
+    get_bool_env_var,
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
@@ -106,20 +106,6 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_parallel().tp_group.barrier()
-
-
-# Consumed DeepEP event handles, dropped here on the forward thread once evicted. DeepEP's
-# wrapper frames also reference them; if a frame that outlived its call (e.g. one held by a
-# host stack sampler) dropped the last reference, the c10::Event would be destroyed on that
-# thread, whose device restore initializes a stray ~600 MiB CUDA context on GPU 0.
-_retired_event_handles: deque = deque(maxlen=4096)
-
-
-def _release_event_handles(*events) -> None:
-    for event in events:
-        if event is not None and event.event is not None:
-            _retired_event_handles.append(event.event)
-            event.event = None
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -675,7 +661,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        _release_event_handles(event)
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -703,7 +688,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank,
             num_tokens_per_expert,
             is_token_in_rank,
-            layout_event,
+            previous_event,
         ) = buffer.get_dispatch_layout(
             topk_ids,
             self.num_experts,
@@ -711,7 +696,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-        _release_event_handles(previous_event)
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -733,14 +717,13 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=layout_event,
+            previous_event=previous_event,
             async_finish=self.async_finish,
-            allocate_on_comm_stream=(layout_event is not None) and self.async_finish,
+            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
             **npu_quantization_opts,
         )
-        _release_event_handles(layout_event)
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -774,9 +757,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        _release_event_handles(previous_event, event)
-        # The current stream is now ordered after the combine read of `output`.
-        dispose_tensor(output)
         self.handle = None
         self.src2dst = None
         return hidden_states
