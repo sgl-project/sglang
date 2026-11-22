@@ -72,6 +72,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.dsa_token_shard import dsa_token_shard_enabled
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
 )
@@ -269,6 +270,7 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
         init_modelslim_mla_kv,
+        prepare_dcp_extend_metadata_npu,
     )
 else:
     pass
@@ -2274,6 +2276,22 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
+        # DSA token-shard: every head for this rank's slice of the tokens; the
+        # weights stay head-sharded. ``use_dsa``, not ``indexer is not None``: a
+        # skip-topk layer owns no Indexer but still attends, so it needs this.
+        self.attn_mqa_for_dsa_token_shard = None
+        if self.use_dsa and dsa_token_shard_enabled():
+            self.attn_mqa_for_dsa_token_shard = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
+
         self.attn_mha = RadixAttention(
             self.num_local_heads,
             self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -3157,6 +3175,7 @@ class DeepseekV2Model(nn.Module):
         self.layers_to_capture = []
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_deepep_v2()
         )
@@ -3608,7 +3627,22 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
-        if _is_npu or is_deepseek_dsa(self.config):
+        if _is_npu:
+            return prepare_dcp_extend_metadata_npu(
+                self,
+                seq_lens=seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                seq_lens_sum=seq_lens_sum,
+                kv_buffer_shape=kv_buffer_shape,
+                kv_cache_dtype=kv_cache_dtype,
+                kv_cache_device=kv_cache_device,
+                create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            )
+        if is_deepseek_dsa(self.config):
             return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,

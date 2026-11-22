@@ -138,12 +138,13 @@ class SchedulerOutputStreamer:
         """Whether Rust egress frames carry each request's cached tokens by
         tier, from which the frontend reports what
         ``get_cached_tokens_details`` would. Only a cache with a host or
-        storage tier, or a PD decode server (which takes the split from
-        prefill), serves hits from anywhere but the device; otherwise the
-        frontend reports every cached token on device."""
+        storage tier, an external cache linker, or a PD decode server (which
+        takes the split from prefill), serves hits from anywhere but the
+        device; otherwise the frontend reports every cached token on device."""
         return self.rust_server is not None and (
             self.server_args.enable_hierarchical_cache
             or self.server_args.enable_lmcache
+            or self.server_args.enable_unified_cache_external_linker
             or self.disaggregation_mode == DisaggregationMode.DECODE
         )
 
@@ -391,6 +392,7 @@ class SchedulerOutputStreamer:
         has_phs = False
         for req in reqs:
             if req.finished():
+                record_send(req, "stream")
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
@@ -512,6 +514,8 @@ class _GenerationStreamAccumulator:
     input_top_logprobs_idx_flat: Optional[list] = None
     input_top_logprobs_flat_null_prefix: Optional[list] = None
     has_input_top_logprobs_flat: bool = False
+    input_top_logprobs_weights: Optional[list] = None
+    has_input_top_logprobs_weights: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
@@ -559,6 +563,7 @@ class _GenerationStreamAccumulator:
             self.input_top_logprobs_val_flat = []
             self.input_top_logprobs_idx_flat = []
             self.input_top_logprobs_flat_null_prefix = []
+            self.input_top_logprobs_weights = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
@@ -748,6 +753,11 @@ class _GenerationStreamAccumulator:
                 )
                 if req.logprob.input_top_logprobs_val_flat is not None:
                     self.has_input_top_logprobs_flat = True
+                self.input_top_logprobs_weights.append(
+                    req.logprob.input_top_logprobs_weights
+                )
+                if req.logprob.input_top_logprobs_weights is not None:
+                    self.has_input_top_logprobs_weights = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -763,6 +773,7 @@ class _GenerationStreamAccumulator:
                 self.input_top_logprobs_val_flat.append(None)
                 self.input_top_logprobs_idx_flat.append(None)
                 self.input_top_logprobs_flat_null_prefix.append(None)
+                self.input_top_logprobs_weights.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
@@ -934,6 +945,11 @@ class _GenerationStreamAccumulator:
             input_top_logprobs_flat_null_prefix=(
                 self.input_top_logprobs_flat_null_prefix
                 if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_weights=(
+                self.input_top_logprobs_weights
+                if self.has_input_top_logprobs_weights
                 else None
             ),
             output_top_logprobs_val=self.output_top_logprobs_val,

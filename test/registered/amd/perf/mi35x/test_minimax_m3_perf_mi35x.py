@@ -19,7 +19,7 @@ spends most of its tokens inside `<mm:think>`. That published row is a tp8
 bench_serving run (~1678 output tok/s at concurrency 64) while this sweep is tp4
 under bench_one_batch_server, so treat it as a shape reference, not a target.
 
-Registry: nightly-perf-4-gpu-mi35x-minimax-m3 suite
+Registry: nightly-perf-test-4-gpu-amd-mi35x-minimax-m3 suite
 """
 
 import os
@@ -32,7 +32,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-4-gpu-mi35x-minimax-m3",
+    suite="nightly-perf-test-4-gpu-amd-mi35x-minimax-m3",
     nightly=True,
 )
 

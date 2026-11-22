@@ -9,8 +9,7 @@ module is the public-facing import surface for callers (``LPLBSolver``)
 and resolves/caches the backend on first use.
 
 LPLB requires Hopper-class hardware and Math-DX cuBLASDx headers. If
-either is missing, ``warmup`` and ``solve_ipm`` raise — there is no
-silent fallback.
+either is missing, ``warmup`` raises; there is no silent fallback.
 """
 
 import logging
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 # Backend dispatch state (resolved on first call, cached afterwards)
 _BACKEND_CHECKED = False
 _FUSED_AVAILABLE = False
-_FUSED_SOLVE_IPM = None  # type: ignore[assignment]
 _FUSED_WARMUP = None  # type: ignore[assignment]
 _FUSED_ASSERT_FITS = None  # type: ignore[assignment]
 
@@ -31,7 +29,7 @@ _FUSED_ASSERT_FITS = None  # type: ignore[assignment]
 def _init_fused_backend() -> None:
     """Resolve the fused backend once. Records WHY it's disabled when it is."""
     global _BACKEND_CHECKED, _FUSED_AVAILABLE
-    global _FUSED_SOLVE_IPM, _FUSED_WARMUP, _FUSED_ASSERT_FITS
+    global _FUSED_WARMUP, _FUSED_ASSERT_FITS
 
     if _BACKEND_CHECKED:
         return
@@ -50,7 +48,6 @@ def _init_fused_backend() -> None:
         return
 
     try:
-        from sglang.kernels.ops.lplb.cuda_solver import solve_ipm as fused_solve_ipm
         from sglang.kernels.ops.lplb.cuda_solver import warmup as fused_warmup
         from sglang.kernels.ops.lplb.shmem_budget import assert_fits
     except ImportError as e:
@@ -61,7 +58,6 @@ def _init_fused_backend() -> None:
         )
         return
 
-    _FUSED_SOLVE_IPM = fused_solve_ipm
     _FUSED_WARMUP = fused_warmup
     _FUSED_ASSERT_FITS = assert_fits
     _FUSED_AVAILABLE = True
@@ -93,44 +89,3 @@ def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:
         raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
     _FUSED_ASSERT_FITS(nc, nv)
     _FUSED_WARMUP(nc, nv, num_iters=num_iters, device=device)
-
-
-def solve_ipm(
-    A: torch.Tensor,
-    b: torch.Tensor,
-    c: torch.Tensor,
-    num_iters: int = 5,
-) -> torch.Tensor:
-    """Barrier-method Interior Point solver for standard-form LP.
-
-    Dispatches to the JIT-compiled CUDA C++ kernel (Hopper+ GPU with
-    Math-DX cuBLASDx headers, reachable via ``nvidia-mathdx`` PyPI
-    package or ``MATHDX_HOME``). Raises if the fused backend is
-    unavailable or the inputs aren't on CUDA in float32.
-
-    Args:
-        A: Constraint matrix, shape (NC, NV), float32, on CUDA.
-        b: RHS vector, shape (NC,), float32, on CUDA.
-        c: Objective coefficients, shape (NV,), float32, on CUDA.
-        num_iters: Number of barrier iterations (default 5).
-
-    Returns:
-        x: Solution vector, shape (NV,), float32. The kernel writes 0.5
-        for every entry on non-convergence.
-    """
-    nc, nv = A.shape
-    assert b.shape == (nc,), f"b shape mismatch: {b.shape} vs ({nc},)"
-    assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
-
-    _init_fused_backend()
-    if not _FUSED_AVAILABLE:
-        raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
-    if not A.is_cuda:
-        raise RuntimeError(
-            f"LPLB fused solver requires CUDA tensors; got A on {A.device}."
-        )
-    if A.dtype != torch.float32:
-        raise RuntimeError(
-            f"LPLB fused solver requires float32; got A.dtype={A.dtype}."
-        )
-    return _FUSED_SOLVE_IPM(A, b, c, num_iters=num_iters)

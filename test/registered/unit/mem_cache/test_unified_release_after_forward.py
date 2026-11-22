@@ -24,12 +24,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
-from sglang.srt.mem_cache.kv.alloc.band import (
-    relieve_for_alloc,
-    settle_pending_for_recovery,
-)
-from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan
+from sglang.srt.mem_cache.kv.alloc import band as band_module
+from sglang.srt.mem_cache.kv.alloc.band import settle_pending_for_recovery
+from sglang.srt.mem_cache.kv.alloc.pricing import NO_MOVE, plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftBand,
@@ -42,7 +41,8 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.token_demand import token_demand
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_mamba_cache,
@@ -50,6 +50,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
     build_unified_bundle,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -440,27 +441,29 @@ class TestFreedPagesPendUntilTheirStepIsProcessed(CustomTestCase):
         _launch(steps)
         allocator.free_window(window.sub_pool_name, ids[:16])  # window rows
         self.assertEqual(owner.available_size(), 0)
-        self.assertGreaterEqual(owner.schedulable_available_size(), 8)
         self.assertIsNotNone(owner.alloc(8))
         self.assertEqual(window._pending_until_retire_pages, 0)
         self.assertEqual(window._byte_accounting_violations(), [])
 
     def test_page_choice_does_not_depend_on_whether_the_forward_finished(self):
-        """Every rank picks the same pages, whatever its local event state."""
-        taken = []
+        """Every rank picks the same pages, whatever its local event state:
+        whether the forward fired decides only whether a wait is queued."""
+        taken, waited = [], []
         for fired in (True, False):
             allocator = build_swa_pool(page_size=4, lazy=True)
             owner = allocator.full_attn_allocator
             event = mock.Mock(spec=["query"])
-            event.query.side_effect = AssertionError("decisions never query")
-            owner._latest_forward_done_event = event
+            event.query.return_value = fired
             rows = [allocator.alloc(8) for _ in range(3)]
             self.assertIsNotNone(allocator.alloc(allocator.available_size()))
             _launch(allocator.forward_steps, event)
             allocator.free_segment(rows[1], start_pos=0)
-            out = allocator.alloc(allocator.available_size())  # needs them
+            with mock.patch.object(band_module, "wait_signals") as wait:
+                out = allocator.alloc(allocator.available_size())  # needs them
+            waited.append(wait.called)
             taken.append(_physical(owner, out).tolist())
         self.assertEqual(taken[0], taken[1])
+        self.assertEqual(waited, [False, True])
 
 
 class TestFloatPendingPages(CustomTestCase):
@@ -501,7 +504,8 @@ class TestFloatPendingPages(CustomTestCase):
         name = flt.sub_pool_name
         before = self.allocator.pricing_snapshot()
         self.assertFalse(before.bands[before.index(name)].transparent)
-        flt.compact_holes(retreat_side="high")  # its recovery entry settles
+        with settle_pending_for_recovery((flt,)):  # settles, then parks
+            pass
         self.assertEqual(flt._pending_until_retire_pages, 0)
         self.assertTrue(flt._is_frontier_transparent())
         self.assertEqual(flt._span_pages(), 0)
@@ -517,14 +521,14 @@ class TestFloatPendingPages(CustomTestCase):
         _launch(steps)
         flt.free(v[2:7], _pages=v[2:7])  # 5 interior pages, pending
         pending = _pending(flt)
-        plan = no_relief_plan(
-            self.allocator.pricing_snapshot(), ((flt.sub_pool_name, 5),)
+        layout = plan(
+            self.allocator.pricing_snapshot(), {flt.sub_pool_name: 5}, NO_MOVE
         )
-        self.assertIsNotNone(plan)
-        take = plan.takes[flt.sub_pool_name]
-        self.assertIsNone(take.fresh)
+        self.assertIsNotNone(layout)
+        take = layout.takes[flt.sub_pool_name]
+        self.assertIsNone(take.pages)
         span = (flt.low_wm_page, flt.high_wm_page)
-        taken = flt.take_planned_physical_pages(take)
+        taken = flt.take_planned_pages(take)
         self.assertEqual(set(taken.tolist()), pending)
         self.assertEqual((flt.low_wm_page, flt.high_wm_page), span)
 
@@ -552,7 +556,8 @@ class TestFloatPendingPages(CustomTestCase):
         _launch(steps)
         flt.free(v[2:4], _pages=v[2:4])  # interior, pending
         live = torch.cat([v[:2], v[4:]])
-        flt.compact_holes(retreat_side="high")
+        with settle_pending_for_recovery((flt,)):
+            flt.relocate_into(flt.low_wm_page, flt.low_wm_page + live.numel())
         self.assertEqual(flt._pending_until_retire_pages, 0)
         physical = flt.ids.virtual_to_physical[live]
         self.assertTrue(bool((physical > 0).all()))
@@ -639,7 +644,9 @@ class TestTwoFloatPlans(CustomTestCase):
         take_host, _ = allocator.storage.host_load_alloc("draft_swa")
         full = allocator.full_attn_allocator
         live = allocator.pricing_snapshot().band("draft_swa").live
-        with allocator.scoped_physical_takes(8, 0, auxiliary_swa_tokens=24):
+        with allocator.scoped_physical_takes(
+            token_demand(allocator, 8, 0, windows={"draft_swa": 24})
+        ):
             self.assertIsNotNone(take_host(24))  # 5 pending pages and 1 fresh
             self.assertEqual(draft._pending_until_retire_pages, 0)
             self.assertEqual(
@@ -664,6 +671,146 @@ def _fill(allocator):
     return rows
 
 
+class TestOneAllocationReadsBeforeItWaits(CustomTestCase):
+    def test_a_pending_reuse_over_two_bands_reads_nothing(self):
+        """Both bands of a chain take pages pending under an unfinished
+        forward that writes both of them: the settles wait the forward on the
+        stream and the allocation reads nothing on the host (checked at
+        invariant level STRICT too)."""
+        setup_allocator_context()
+        allocator = build_swa_pool(page_size=4, lazy=True)
+        steps = allocator.forward_steps
+        rows = allocator.alloc(allocator.available_size())
+        event = mock.Mock(spec=["query", "wait"])
+        event.query.return_value = False
+        _launch(steps, event)
+        allocator.set_latest_forward_done_event(event)
+        allocator.set_inflight_forward(event, rows[8:16].clone())
+        allocator.free_segment(rows[:8], start_pos=0)
+        for band in allocator.members:
+            self.assertGreater(band._pending_until_retire_pages, 0)
+        order = []
+        real_tolist, real_item = torch.Tensor.tolist, torch.Tensor.item
+        with (
+            _strict(),
+            mock.patch.object(
+                band_module,
+                "wait_signals",
+                lambda *a, **k: order.append("wait"),
+            ),
+            mock.patch.object(
+                torch.Tensor,
+                "tolist",
+                lambda t: order.append("read") or real_tolist(t),
+            ),
+            mock.patch.object(
+                torch.Tensor,
+                "item",
+                lambda t: order.append("read") or real_item(t),
+            ),
+        ):
+            self.assertIsNotNone(allocator.alloc(8))
+        # An ordinary pending reuse needs counts and stream order only.
+        self.assertIn("wait", order)
+        self.assertNotIn("read", order)
+        for band in allocator.members:
+            self.assertEqual(band._pending_until_retire_pages, 0)
+
+
+class TestAHostLoadThatNeedsRelief(CustomTestCase):
+    def test_a_window_load_short_after_its_own_settle_reads_everything_first(self):
+        """A window-only host load in a full + window + state chain: the window
+        has pending pages but too little room even with them, and the state
+        end's pending pages at its frontier can give it room. The settle, the
+        relief and the reservation succeed, and no host read follows the first
+        wait, at invariant levels WARN and STRICT."""
+        for level in (InvariantCheckLevel.WARN, InvariantCheckLevel.STRICT):
+            with self.subTest(level=level):
+                setup_allocator_context()
+                _, allocator = build_tri_pool(page_size=1)
+                window, state = (
+                    allocator.swa_attn_allocator,
+                    allocator.mamba_allocator,
+                )
+                ids = allocator.alloc(16).to(torch.int64)
+                slots = []
+                while (slot := allocator.alloc_state_slots(1)) is not None:
+                    slots.append(slot)
+                event = mock.Mock(spec=["query", "wait"])
+                event.query.return_value = False
+                _launch(allocator.forward_steps, event)
+                state.free(torch.cat(slots[-4:]))  # pending at its frontier
+                window.free(ids[:4], _pages=ids[:4])  # pending
+                need = window.available_size() + 8
+                order = []
+                real_tolist = torch.Tensor.tolist
+                with (
+                    mock.patch.object(band_module, "resolve_level", return_value=level),
+                    mock.patch.object(
+                        band_module,
+                        "wait_signals",
+                        lambda *a, **k: order.append("wait"),
+                    ),
+                    mock.patch.object(
+                        torch.Tensor,
+                        "tolist",
+                        lambda t: order.append("read") or real_tolist(t),
+                    ),
+                ):
+                    reserved = window.alloc_physical(need)
+                self.assertIsNotNone(reserved)
+                self.assertEqual(int(reserved.numel()), need)
+                self.assertIn("wait", order)
+                self.assertNotIn("read", order[order.index("wait") :])
+                # The reserved pages are bound by the load; cancelled, the
+                # chain's bytes account.
+                window.cancel_physical_reservation(reserved)
+                self.assertEqual(allocator.verify_byte_accounting(), [])
+
+
+class TestACancelledLoadReleasesItsPins(CustomTestCase):
+    """Regression: a cancelled host load releases every pin its reservation took,
+    also when its window take placed an emptied float afresh."""
+
+    def test_cancel_after_a_fresh_placement(self):
+        from sglang.srt.mem_cache.kv.alloc.band import _LOAD_RESERVATION
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+        setup_allocator_context()
+        _, allocator = build_tri_pool(page_size=1)
+        owner, window = allocator.full_attn_allocator, allocator.swa_attn_allocator
+        state_room = largest_take(allocator, allocator.sub_pool_roles()[2])
+        ids = allocator.alloc(8).to(torch.int64)
+        event = mock.Mock(spec=["query", "wait"])
+        event.query.return_value = False
+        launch = _launch(allocator.forward_steps, event)
+        window.free(ids, _pages=ids)  # the float holds pending pages only
+        self.assertEqual(window._live_pages(), 0)
+        self.assertTrue(window._pending_until_retire)
+        demand = KVDemand(4, {window.sub_pool_name: 4}, 1)
+        with mock.patch.object(band_module, "wait_signals", lambda *a, **k: None):
+            with allocator.scoped_physical_takes(demand):
+                full_rows = owner.alloc_physical(4)
+                window_rows = window.alloc_physical(4)
+                slot = allocator.alloc_state_slots(1)
+        self.assertIsNotNone(window_rows)
+        returned = sorted(int(p) for p in window_rows.tolist())
+        self.assertEqual(
+            sorted(window.usage.fixed.get(_LOAD_RESERVATION, ())), returned
+        )
+        window.cancel_physical_reservation(window_rows)
+        owner.cancel_physical_reservation(full_rows)
+        allocator.mamba_allocator.free(slot)
+        self.assertFalse(window.usage.fixed.get(_LOAD_RESERVATION))
+        self.assertFalse(owner.usage.fixed.get(_LOAD_RESERVATION))
+        owner.free(ids)
+        allocator.forward_steps.forward_processed(launch)
+        self.assertGreaterEqual(
+            largest_take(allocator, allocator.sub_pool_roles()[2]), state_room - 1
+        )
+        self.assertIsNotNone(allocator.alloc_state_slots(state_room - 1))
+
+
 class TestUrgentRecoverySettlesFirst(CustomTestCase):
     """Every urgent recovery settles the pending pages of its bands, after one
     host read and before it decides anything: these succeed on the first try
@@ -681,7 +828,9 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         self.assertEqual(draft._live_pages(), 0)
         self.assertGreater(allocator.swa_attn_allocator._live_pages(), 0)
         with _strict():
-            self.assertTrue(allocator.ensure_capacity(8, 8, state_slots=1))
+            self.assertTrue(
+                allocator.ensure_capacity(token_demand(allocator, 8, 8, state_slots=1))
+            )
             self.assertIsNotNone(allocator.alloc_state_slots(1))
             self.assertIsNotNone(allocator.alloc(8))
         self.assertEqual(draft._pending_until_retire_pages, 0)
@@ -752,41 +901,7 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         _launch(tri.forward_steps)
         flt.free(v[:2], _pages=v[:2])
         with _strict(), self.assertRaises(AssertionError):
-            flt._make_room("low", flt.entry_bytes_per_page)
-
-    def test_a_pinned_end_donor_is_left_out_of_the_recovery(self):
-        """An owner shortfall asks its pinned window to flush, which reclaims
-        nothing: the recovery reads nothing of the window and leaves its
-        pending pages pending (no forward wait)."""
-        allocator = build_swa_pool(page_size=4, lazy=True)
-        owner, window = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        ids = allocator.alloc(allocator.available_size())
-        _launch(allocator.forward_steps)
-        allocator.free_window(window.sub_pool_name, ids[:8])
-        window.add_pin_source(lambda: True)
-        pending = window._pending_until_retire
-        events = []
-        band = type(window)
-        real_settle, real_tolist = band.settle_pending, torch.Tensor.tolist
-        with (
-            _strict(),
-            mock.patch.object(
-                band,
-                "settle_pending",
-                autospec=True,
-                side_effect=lambda b, *a, **k: (
-                    events.append(("settle", b)) or real_settle(b, *a, **k)
-                ),
-            ),
-            mock.patch.object(
-                torch.Tensor,
-                "tolist",
-                lambda t: events.append(("read", None)) or real_tolist(t),
-            ),
-        ):
-            relieve_for_alloc(owner, 4)
-        self.assertIs(window._pending_until_retire, pending)
-        self.assertEqual(events, [])
+            flt.relocate_into(flt.low_wm_page, flt.high_wm_page)  # no entry
 
     def test_a_drained_move_source_keeps_the_host_view(self):
         """A partial compaction under an unfinished forward leaves its moved
@@ -802,7 +917,7 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         owner.set_latest_forward_done_event(event)
         owner.set_inflight_forward(event, rows[10].to(torch.int64))  # write race
         self.assertEqual(owner.flush_opportunistic(), 1)  # partial
-        self.assertTrue(owner._pending_reuse)
+        self.assertTrue(owner.usage.has_pending())
         self.assertIsNotNone(owner.alloc(int(owner._free_phys_pages.shape[0])))
         self.assertEqual(int(owner._free_phys_pages.shape[0]), 0)
         event.query.return_value = True
@@ -812,7 +927,7 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
                 return_value=level,
             ):
                 owner.flush_for_allocation()
-        self.assertFalse(owner._pending_reuse)
+        self.assertFalse(owner.usage.has_pending())
         self.assertEqual(owner._byte_accounting_violations(), [])
 
     def test_a_host_read_inside_a_recovery_raises(self):
@@ -820,10 +935,10 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         owner = allocator.full_attn_allocator
         allocator.free_segment(allocator.alloc(8), start_pos=0)
         with _strict(), settle_pending_for_recovery((owner,)):
-            self.assertEqual(len(owner._free_pages_host_view()), 2)  # read ahead
-            owner._free_phys_pages = owner._free_phys_pages.clone()  # view unknown
+            self.assertTrue(owner._free_pages_host_known())  # read ahead
+            owner._free_phys_pages = owner._free_phys_pages.clone()  # copy unknown
             with self.assertRaises(AssertionError):
-                owner._free_pages_host_view()
+                owner._free_pages_snapshot(after_wait=bool(owner._recovery_depth))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required (stream waits)")
@@ -832,7 +947,8 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         setup_allocator_context()
         allocator = build_swa_pool(page_size=4, lazy=True)
         owner = allocator.full_attn_allocator
-        event = object()
+        event = mock.Mock(spec=["query"])
+        event.query.return_value = False
         row = allocator.alloc(allocator.available_size())
         _launch(allocator.forward_steps, event)
         allocator.free_segment(row[:8], start_pos=0)
@@ -849,7 +965,9 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         allocator = build_swa_pool(page_size=4, lazy=True)
         owner = allocator.full_attn_allocator
         row = allocator.alloc(allocator.available_size())
-        events = (object(), object())
+        events = (mock.Mock(spec=["query"]), mock.Mock(spec=["query"]))
+        for event in events:
+            event.query.return_value = False
         _launch(allocator.forward_steps, events[0])
         allocator.free_segment(row[:8], start_pos=0)
         _launch(allocator.forward_steps, events[1])
@@ -871,23 +989,26 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         stream.wait_event.assert_called_once_with(events[0])
         self.assertEqual(owner._pending_until_retire_pages, 2)
 
-    def test_a_take_queues_one_wait_per_event_and_no_host_read(self):
+    def test_a_take_queues_one_wait_per_event_and_reads_only_before(self):
+        """The chain reads ahead what the rest of the allocation reads on the
+        host, then the stream waits each event once: no read follows a wait."""
         allocator, owner, events = self._two_forwards_pending()
         stream, patches = self._cuda_stream(owner)
-        reads = []
+        order = []
+        stream.wait_event.side_effect = lambda e: order.append("wait")
         real_tolist = torch.Tensor.tolist
         with (
             patches[0],
             patches[1],
             mock.patch.object(
-                torch.Tensor, "tolist", lambda t: reads.append(1) or real_tolist(t)
+                torch.Tensor, "tolist", lambda t: order.append("read") or real_tolist(t)
             ),
         ):
             self.assertIsNotNone(owner.take_physical_pages(3))
         self.assertEqual(
             [c.args[0] for c in stream.wait_event.call_args_list], list(events)
         )
-        self.assertEqual(reads, [])
+        self.assertNotIn("read", order[order.index("wait") :])
         self.assertEqual(owner._pending_until_retire_pages, 0)
 
 
@@ -901,8 +1022,10 @@ def _own_table_cache(*, window):
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             sliding_window_size=window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA), window=window
+            tree_slots=storage_tree_slots(
+                allocator.storage,
+                window=window,
+                components=(ComponentType.FULL, ComponentType.SWA),
             ),
         )
     )
@@ -973,7 +1096,7 @@ class TestCacheOperationsOverPendingFrees(CustomTestCase):
         _launch(steps)
         state.free(torch.cat(taken))
 
-        budget = allocator.create_prefill_budget(cache)
+        budget = create_prefill_budget(allocator, cache)
         self.assertTrue(budget.state_slots_fit(1))
         candidate = Req(
             rid="candidate",
@@ -1005,7 +1128,9 @@ class TestCacheOperationsOverPendingFrees(CustomTestCase):
 
         launch = _launch(steps)  # decode W reads the window
         cache.release_swa(lock)  # preparing W + 1
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=1000))
+        cache.evict(
+            EvictParams(num_tokens=0, window_num_tokens={window.sub_pool_name: 1000})
+        )
         evicted = physical - {p for p in physical if p <= 0}
         self.assertTrue(evicted <= _pending(window))
         self.assertFalse(evicted & set(window._free_phys_pages.tolist()))

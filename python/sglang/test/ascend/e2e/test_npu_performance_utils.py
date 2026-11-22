@@ -30,8 +30,8 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
-    launch_router,
     query_configmap,
+    start_router_thread,
     wait_for_prefill_decode_exit,
     wait_server_ready,
 )
@@ -168,6 +168,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -231,6 +232,7 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+REQUEST_THROUGHPUT_TOLERANCE = 0.98  # -2%
 
 
 def _get_spec_num_draft_tokens(other_args):
@@ -964,6 +966,7 @@ def assert_metrics(self, metrics):
     # defensively instead of relying on class attributes.
     tpot = getattr(self, "tpot", None)
     output_token_throughput = getattr(self, "output_token_throughput", None)
+    request_throughput = getattr(self, "request_throughput", None)
     ttft = getattr(self, "ttft", None)
     mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
     if tpot and metrics.get("mean_tpot"):
@@ -997,6 +1000,17 @@ def assert_metrics(self, metrics):
         dump_metric(
             "ttft_baseline",
             float(ttft),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+    if request_throughput and metrics.get("request_throughput"):
+        dump_metric(
+            "request_throughput",
+            float(metrics["request_throughput"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "request_throughput_baseline",
+            float(request_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
     if mean_e2e_latency and metrics.get("mean_e2e_latency"):
@@ -1054,6 +1068,15 @@ def assert_metrics(self, metrics):
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
             ttft * TTFT_TOLERANCE,
+        )
+    if request_throughput:
+        self.assertIsNotNone(
+            metrics.get("request_throughput"),
+            "request_throughput not found in benchmark output while a baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["request_throughput"]),
+            request_throughput * REQUEST_THROUGHPUT_TOLERANCE,
         )
     if mean_e2e_latency:
         self.assertLessEqual(
@@ -1168,6 +1191,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
     # Baseline for accept_length / speculative-num-draft-tokens; None disables
     # the assertion.
     accept_rate = None
@@ -1417,6 +1441,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1447,7 +1472,21 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        # Poll in slices so a dead launcher fails fast. When a rank is killed
+        # during distributed init, the launch thread raises and the plain
+        # wait_server_ready below would keep polling /health for the full
+        # 3600 s timeout before the job fails.
+        while sglang_thread.is_alive():
+            try:
+                wait_server_ready(f"{cls.base_url}/health", timeout=60)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(
+                "sglang launch thread exited before the server became ready; "
+                "check the server logs for the first rank that died"
+            )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
@@ -1550,6 +1589,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1596,14 +1636,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
         wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
-        logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
-        sglang_thread.daemon = True
-        sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."

@@ -112,12 +112,13 @@ def _call_server_info_with(
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
     scheduler_info: dict | None = None,
+    supports_inline_system: bool = False,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
     Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
-    `async def` that reads module-level `_global_state`, so wiring a
-    `SimpleNamespace` stub via `set_global_state` and awaiting the
+    `async def` that reads module-level `_global_state` and the request's
+    chat handler, so wiring `SimpleNamespace` stubs for both and awaiting the
     coroutine directly is enough to exercise the handler logic without
     booting a model server.
 
@@ -147,7 +148,11 @@ def _call_server_info_with(
         published = True
         tokenizer_manager.record_config_updates("test", **config_updates)
     try:
-        return asyncio.run(http_server.server_info())
+        chat = SimpleNamespace(supports_inline_system=supports_inline_system)
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(openai_serving_chat=chat))
+        )
+        return asyncio.run(http_server.server_info(request))
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
@@ -207,7 +212,13 @@ class TestServerInfoTransportParity(CustomTestCase):
                 # Every transport below reports the same fields.
                 for name in secrets:
                     self.assertEqual(http_info[name], "<redacted>")
-                for field in ("startup_time", "internal_states", "version", "frontend"):
+                for field in (
+                    "startup_time",
+                    "internal_states",
+                    "version",
+                    "frontend",
+                    "supports_inline_system",
+                ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
 
@@ -231,12 +242,18 @@ class TestServerInfoTransportParity(CustomTestCase):
                 self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
                 self.assertEqual(rust_launch, leader)
 
-                # The Rust listener is HTTP/1 only, so it never advertises h2.
+                # The Rust listener serves h2c with --enable-http2, so it
+                # advertises it and its stream limit, which a router reads to
+                # pick its protocol.
                 scheduler.server_args = ServerArgs(
-                    model_path="dummy", page_size=64, enable_http2=True
+                    model_path="dummy",
+                    page_size=64,
+                    enable_http2=True,
+                    http2_max_concurrent_streams=64,
                 )
                 rust_launch = json.loads(rust_config._launch_server_info(scheduler))
-                self.assertIs(rust_launch["enable_http2"], False)
+                self.assertIs(rust_launch["enable_http2"], True)
+                self.assertEqual(rust_launch["http2_max_concurrent_streams"], 64)
 
                 with (
                     patch.object(
@@ -245,8 +262,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                         return_value=SimpleNamespace(
                             host="127.0.0.1",
                             grpc_port=50051,
-                            smg_grpc_mode=False,
-                            grpc_mode=False,
                         ),
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -271,8 +286,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                 return_value=SimpleNamespace(
                     host="127.0.0.1",
                     grpc_port=50051,
-                    smg_grpc_mode=False,
-                    grpc_mode=False,
                 ),
             ),
             patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -363,7 +376,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             weight_version="v1",
             load_format="dummy",
             reasoning_parser="deepseek-r1",
-            tool_call_parser="qwen25",
+            tool_call_parser="qwen",
             disaggregation_mode="decode",
         )
         architectures = ["TestForCausalLM"]
@@ -408,6 +421,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             model_config=model_config,
             kv_events_publisher=SimpleNamespace(local_kv_event_sources=lambda _: []),
             page_size=1,
+            tree_cache=None,
             # The server loads the scheduler's tokenizer copy but reports the
             # public path.
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
@@ -834,6 +848,15 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
         self.assertEqual(info["frontend"], "python")
+
+    def test_supports_inline_system_is_what_messages_acts_on(self):
+        # sgl-router's /v1/messages keeps an inline system turn in place on this
+        # value; a constant would send one to a template that rejects it.
+        for value in (True, False):
+            info = _call_server_info_with(
+                ServerArgs(model_path="dummy"), supports_inline_system=value
+            )
+            self.assertIs(info["supports_inline_system"], value)
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the
