@@ -698,7 +698,7 @@ class Gemma3ForConditionalGeneration(
         n_image_tokens = int(special_image_mask.sum().item())
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
         n_image_features = int(image_features.shape[0] * image_features.shape[1])
-        if inputs_embeds[special_image_mask].numel() != image_features.numel():
+        if n_image_tokens != n_image_features:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
