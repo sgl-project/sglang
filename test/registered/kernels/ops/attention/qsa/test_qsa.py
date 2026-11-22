@@ -124,6 +124,46 @@ def test_fp8_operand_pipeline_matches_bf16_dot(monkeypatch, group_size, topk):
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def test_fp8_paged_operand_pipeline_matches_bf16_dot(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    q_len, kv_len, topk = 4096, 8192, 1024
+    group_size, head_dim = 3, 256
+    q = torch.randn(q_len, group_size, head_dim, dtype=torch.bfloat16, device=device)
+    k, v = [
+        torch.randn(kv_len, 1, head_dim, dtype=torch.bfloat16, device=device).to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    ]
+    slot_table = torch.arange(kv_len, dtype=torch.int32, device=device)[None, :]
+    indices = torch.randint(
+        0, kv_len - q_len + 1, (q_len, topk), dtype=torch.int32, device=device
+    )
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
+    args = (
+        q,
+        k,
+        v,
+        slot_table,
+        indices,
+        cu_q,
+        kv_lens,
+        head_dim**-0.5,
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
+    actual = sparse_gqa_paged_prefill_triton(*args, max_q=q_len)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H100")
+    expected = sparse_gqa_paged_prefill_triton(*args, max_q=q_len)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
 def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
         pytest.skip("FP8-capable CUDA GPU required")

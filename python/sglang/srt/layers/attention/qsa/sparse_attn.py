@@ -638,11 +638,18 @@ def sparse_gqa_paged_prefill_triton(
     )
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
-    use_fp8_pipeline = _use_fp8_chunk_pipeline(
-        total_q, max_q, k_cache.dtype, head_dim, group_size, topk
+    fp8_pipeline_config = _get_fp8_chunk_pipeline_config(
+        torch.cuda.get_device_name(q.device),
+        total_q,
+        num_entries,
+        k_cache.dtype,
+        head_dim,
+        group_size,
+        topk,
     )
-    if use_fp8_pipeline:
-        block_n = 32
+    use_fp8_pipeline = fp8_pipeline_config is not None
+    if fp8_pipeline_config is not None:
+        block_n = fp8_pipeline_config.block_n
     _sparse_gqa_chunk_prefill[(max_q, num_entries * num_kv_heads)](
         q,
         k_cache,
