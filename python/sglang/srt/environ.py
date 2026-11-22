@@ -1394,6 +1394,9 @@ class Envs:
     SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Build FlashInfer's JIT sampling and top-k modules at startup rather than
+    # on the first request that needs them, which stalls the scheduler.
+    SGLANG_FLASHINFER_PREBUILD_SAMPLING = EnvBool(True)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)

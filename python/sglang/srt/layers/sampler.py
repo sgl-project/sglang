@@ -1,5 +1,5 @@
 import logging
-from functools import partial
+from functools import cache, partial
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -1061,3 +1061,24 @@ def top_p_normalize_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+
+@cache
+def prebuild_flashinfer_sampling() -> None:
+    """Build and load FlashInfer's sampling module before serving.
+
+    Without flashinfer-jit-cache, FlashInfer compiles it on first use; reached
+    first from a request, that build stalls the scheduler for its duration. A
+    private generator leaves the default CUDA RNG stream untouched.
+    """
+    if not envs.SGLANG_FLASHINFER_PREBUILD_SAMPLING.get():
+        return
+    logger.info(
+        "Loading FlashInfer sampling kernels; an uncached first build takes about "
+        "a minute (SGLANG_FLASHINFER_PREBUILD_SAMPLING=0 defers it to the first "
+        "sampled request)."
+    )
+    probs = torch.full((1, 2), 0.5, device="cuda")
+    top_k_top_p_sampling_from_probs(
+        probs, 1, 1.0, generator=torch.Generator(device="cuda")
+    )

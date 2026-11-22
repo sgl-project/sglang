@@ -447,6 +447,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>402653184</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_PREBUILD_SAMPLING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Build FlashInfer's JIT sampling and top-k modules at startup instead of on the first request that needs them. Without <code>flashinfer-jit-cache</code>, that first build otherwise runs inside the scheduler loop and stalls every request; the top-k module takes minutes on a cold cache.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EAGER_INPUT_NO_COPY</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>In eager forward, wrap the ForwardBatch's own tensors instead of copying them into the CUDA graph buffer registry (skips a per-iter device-to-device copy).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

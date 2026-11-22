@@ -762,6 +762,7 @@ class ModelRunner:
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
         self.maybe_warmup_bf16_gemms()
+        self.maybe_prebuild_flashinfer_sampling()
 
         self.maybe_init_dwdp()
 
@@ -1355,6 +1356,15 @@ class ModelRunner:
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
+
+    def maybe_prebuild_flashinfer_sampling(self):
+        """Build FlashInfer's JIT sampling module before serving; see
+        prebuild_flashinfer_sampling."""
+        if self.device != "cuda" or get_exec().kernel.sampling_backend != "flashinfer":
+            return
+        from sglang.srt.layers.sampler import prebuild_flashinfer_sampling
+
+        prebuild_flashinfer_sampling()
 
     def maybe_warmup_bf16_gemms(self):
         """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
