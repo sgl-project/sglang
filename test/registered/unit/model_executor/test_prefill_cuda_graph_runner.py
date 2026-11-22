@@ -326,6 +326,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
         )
         runner.raw_bs = 1
+        runner.raw_logits_rows = 1
         runner._is_full_backend = True
         customized_info = {"per_request": [object()]}
         output = runner._trim_logits_output(
@@ -343,6 +344,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
         )
         runner.raw_bs = 1
+        runner.raw_logits_rows = 1
         runner._is_full_backend = True
         # Per request, not per padded token: the scheduler reads each of them
         # off the replayed output.
