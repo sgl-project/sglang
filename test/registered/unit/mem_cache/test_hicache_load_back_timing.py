@@ -61,7 +61,9 @@ class TestLoadBackDurationMetric(CustomTestCase):
 
         stub = object.__new__(UnifiedRadixCache)
         stub.components = {}
-        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
+        stub.cache_controller = SimpleNamespace(
+            ack_load_queue=[ack], layer_done_counter=MagicMock()
+        )
         stub.ongoing_load_back = {
             node_id: (object(), None, None) for node_id in ack.node_ids
         }

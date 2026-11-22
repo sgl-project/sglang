@@ -160,47 +160,16 @@ class L2TransferEngine:
 
     @contextmanager
     def _submission(self, transfers, stream, transfer_key, start_event=None):
-        start_event = self._start_event(start_event)
-        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
-        completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
-        domains = shared_host_layout_domains(t.host_pool for t in transfers)
-        for domain in domains:
-            domain.acquire_layout()
-        finish_recorded = False
-        own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
-        # A caller's stream prepares indices in order with its own copies.
-        index_stream = self.index_stream if own_stream else stream
-        # The host layout keeps one finish event per key, and a newer event
-        # covers an older one only on the same stream: a caller's stream keeps
-        # its own entry beside the engine stream's.
-        layout_key = (
-            (id(self), transfer_key) if own_stream else (id(self), transfer_key, stream)
+        submission = _TransferSubmission(
+            self, transfers, stream, transfer_key, start_event
         )
         try:
-            with device_module.stream(index_stream):
-                # Index preparation can read producer-owned device indices. On its
-                # own stream, a host read of them waits only for their producer,
-                # never for copies queued earlier on the transfer stream.
-                start_event.wait(index_stream)
-                prepared = self._prepare_transfers(transfers)
-                prepared_event = device_module.Event()
-                prepared_event.record()
             with device_module.stream(stream):
-                prepared_event.wait(stream)
-                ack_start.record()
-                yield prepared, completion
-                ack_finish.record()
-                finish_recorded = True
-                self._record_stream(transfers + prepared, stream)
+                yield submission.prepared, submission.completion
         except Exception:
-            index_stream.synchronize()
-            stream.synchronize()
+            submission.abort()
             raise
-        finally:
-            for domain in reversed(domains):
-                domain.release_layout(
-                    ack_finish if finish_recorded else None, layout_key
-                )
+        submission.finish()
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
         with self._submission(
@@ -223,43 +192,62 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
+        submission = self.begin_host_to_device(
+            transfers,
+            transfer_layer_id_max=transfer_layer_id_max,
+            start_event=start_event,
+            on_layer_done=on_layer_done,
+        )
+        submission.finish()
+        return submission.completion
+
+    def begin_host_to_device(
+        self,
+        transfers: list[L2Transfer],
+        *,
+        transfer_layer_id_max: int,
+        start_event=None,
+        on_layer_done=None,
+    ) -> LayerwiseHostToDevice:
+        """Start a host-to-device submission that enqueues no layer yet; the
+        caller must ``finish`` it before reading its completion events."""
         stream = (
             device_module.current_stream()
             if self._h2d_on_current_stream
             else self.host_to_device_stream
         )
-        with self._submission(transfers, stream, "host_to_device", start_event) as (
-            transfers,
-            completion,
-        ):
-            primary = transfers[0] if transfers else None
-            delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
-            for layer_id in range(transfer_layer_id_max):
-                if delay_cycles:
-                    torch.cuda._sleep(delay_cycles)
-                for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
-                if on_layer_done is not None:
-                    on_layer_done(layer_id)
-        return completion
+        return LayerwiseHostToDevice(
+            self,
+            _TransferSubmission(self, transfers, stream, "host_to_device", start_event),
+            num_layers=transfer_layer_id_max,
+            on_layer_done=on_layer_done,
+        )
+
+    def _load_layer(self, transfers: list[L2Transfer], layer_id: int) -> None:
+        primary = transfers[0] if transfers else None
+        delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
+        if delay_cycles:
+            torch.cuda._sleep(delay_cycles)
+        for transfer in transfers:
+            local_layer_id = (
+                transfer.layer_mapper(layer_id)
+                if transfer.layer_mapper is not None
+                else layer_id
+            )
+            if local_layer_id is None or (
+                transfer is not primary
+                and transfer.layer_mapper is None
+                and layer_id >= transfer.host_pool.layer_num
+            ):
+                continue
+            transfer.host_pool.load_to_device_per_layer_physical(
+                transfer.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                self.io_backend,
+                is_draft=transfer.is_draft,
+            )
 
     @staticmethod
     def _start_event(start_event):
@@ -280,3 +268,110 @@ class L2TransferEngine:
                 indices.is_cuda or indices.device.type == "xpu"
             ):
                 indices.record_stream(stream)
+
+
+class _TransferSubmission:
+    """One transfer between index preparation and its finish event."""
+
+    def __init__(self, engine, transfers, stream, transfer_key, start_event):
+        self._engine = engine
+        self._transfers = transfers
+        self.stream = stream
+        start_event = engine._start_event(start_event)
+        ack_start, ack_finish, timing_enabled = make_timing_event_pair()
+        self.completion = TransferCompletion(ack_start, ack_finish, timing_enabled)
+        self._domains = shared_host_layout_domains(t.host_pool for t in transfers)
+        for domain in self._domains:
+            domain.acquire_layout()
+        own_stream = stream in (
+            engine.host_to_device_stream,
+            engine.device_to_host_stream,
+        )
+        # A caller's stream prepares indices in order with its own copies.
+        self._index_stream = engine.index_stream if own_stream else stream
+        # The host layout keeps one finish event per key, and a newer event
+        # covers an older one only on the same stream: a caller's stream keeps
+        # its own entry beside the engine stream's.
+        self._layout_key = (
+            (id(engine), transfer_key)
+            if own_stream
+            else (id(engine), transfer_key, stream)
+        )
+        try:
+            with device_module.stream(self._index_stream):
+                # Index preparation can read producer-owned device indices. On its
+                # own stream, a host read of them waits only for their producer,
+                # never for copies queued earlier on the transfer stream.
+                start_event.wait(self._index_stream)
+                self.prepared = engine._prepare_transfers(transfers)
+                prepared_event = device_module.Event()
+                prepared_event.record()
+            with device_module.stream(stream):
+                prepared_event.wait(stream)
+                ack_start.record()
+        except Exception:
+            self.abort()
+            raise
+
+    def finish(self) -> None:
+        with device_module.stream(self.stream):
+            self.completion.finish_event.record()
+        self._engine._record_stream(self._transfers + self.prepared, self.stream)
+        self._release(self.completion.finish_event)
+
+    def abort(self) -> None:
+        self._index_stream.synchronize()
+        self.stream.synchronize()
+        self._release(None)
+
+    def _release(self, finish_event) -> None:
+        for domain in reversed(self._domains):
+            domain.release_layout(finish_event, self._layout_key)
+
+
+class LayerwiseHostToDevice:
+    """Host-to-device submission enqueued layer by layer on demand: a whole batch
+    of queued loads would stall every stream sharing its hardware queue."""
+
+    def __init__(
+        self,
+        engine: L2TransferEngine,
+        submission: _TransferSubmission,
+        *,
+        num_layers: int,
+        on_layer_done,
+    ):
+        self._engine = engine
+        self._submission = submission
+        self._num_layers = num_layers
+        self._on_layer_done = on_layer_done
+        self._next_layer = 0
+        self.completion = submission.completion
+
+    @property
+    def finished(self) -> bool:
+        return self._submission is None
+
+    def advance(self, num_layers: int) -> None:
+        """Enqueue every layer below ``num_layers``; finishes after the last."""
+        submission = self._submission
+        if submission is None:
+            return
+        stop = min(num_layers, self._num_layers)
+        try:
+            with device_module.stream(submission.stream):
+                for layer_id in range(self._next_layer, stop):
+                    self._engine._load_layer(submission.prepared, layer_id)
+                    if self._on_layer_done is not None:
+                        self._on_layer_done(layer_id)
+        except Exception:
+            self._submission = None
+            submission.abort()
+            raise
+        self._next_layer = max(self._next_layer, stop)
+        if self._next_layer == self._num_layers:
+            self._submission = None
+            submission.finish()
+
+    def finish(self) -> None:
+        self.advance(self._num_layers)

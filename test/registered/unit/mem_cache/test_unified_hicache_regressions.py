@@ -177,6 +177,48 @@ class TestTransferStreamOrdering(unittest.TestCase):
         completion.finish_event.synchronize()
         torch.testing.assert_close(output.cpu(), torch.tensor([102, 104, 107]))
 
+    def test_load_back_enqueues_layers_only_ahead_of_reads(self):
+        from sglang.srt.managers.cache_controller import (
+            _LOAD_LAYER_WINDOW,
+            LayerDoneCounter,
+        )
+
+        num_layers = _LOAD_LAYER_WINDOW + 4
+        engine = L2TransferEngine("kernel")
+        enqueued = []
+        output = torch.zeros(num_layers, dtype=torch.int64, device="cuda")
+
+        def load(pool, host_indices, device_indices, layer, backend, **kwargs):
+            enqueued.append(layer)
+            output[layer] = layer + 1
+
+        host = SimpleNamespace(
+            layer_num=num_layers,
+            prepare_transfer_indices=lambda host, device, backend: (host, device),
+            load_to_device_per_layer_physical=load,
+        )
+        transfer = L2Transfer(
+            host, SimpleNamespace(), torch.arange(2), torch.arange(2, device="cuda")
+        )
+        counter = LayerDoneCounter(num_layers)
+        event = counter.events[counter.update_producer()]
+        submission = engine.begin_host_to_device(
+            [transfer], transfer_layer_id_max=num_layers, on_layer_done=event.complete
+        )
+        event.attach_submission(submission)
+        self.assertEqual(enqueued, list(range(_LOAD_LAYER_WINDOW)))
+
+        event.wait(1)
+        self.assertEqual(enqueued, list(range(_LOAD_LAYER_WINDOW + 2)))
+        self.assertEqual(output[1].item(), 2)
+        self.assertFalse(submission.finished)
+
+        counter.finish_submissions()
+        self.assertEqual(enqueued, list(range(num_layers)))
+        self.assertTrue(submission.finished)
+        submission.completion.finish_event.synchronize()
+        torch.testing.assert_close(output.cpu(), torch.arange(1, num_layers + 1))
+
 
 class TestSwaBackupAfterCompaction(unittest.TestCase):
     def test_backup_names_window_rows_by_owner_ids(self):

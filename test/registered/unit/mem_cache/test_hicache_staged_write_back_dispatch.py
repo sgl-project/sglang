@@ -253,7 +253,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )
-        controller.l2_transfer_engine.submit_host_to_device.return_value = completion
+        controller.l2_transfer_engine.begin_host_to_device.return_value = mock.Mock(
+            completion=completion
+        )
         controller.transfer_layer_id_max = 2
         controller.ack_load_queue = []
 
@@ -266,7 +268,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(merged_transfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
         controller._l2_load_transfers.assert_called_once()
         l2_transfers = (
-            controller.l2_transfer_engine.submit_host_to_device.call_args.args[0]
+            controller.l2_transfer_engine.begin_host_to_device.call_args.args[0]
         )
         self.assertEqual(len(l2_transfers), 2)
         self.assertEqual(l2_transfers[1].host_indices.tolist(), [0, 1, 0, 1])
