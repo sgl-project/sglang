@@ -207,6 +207,7 @@ RUN set -eux; \
     ${PIP_INSTALL} \
         ./sgl_kernel_npu*.whl \
         ./deep_ep*.whl \
+        ./attentions*.whl \
         ./torch_memory_saver*.whl; \
     cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')"; \
     ln -sf deep_ep/deep_ep_cpp*.so; \

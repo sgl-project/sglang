@@ -103,6 +103,7 @@ mkdir -p sgl-kernel-npu
     ${UV_PIP_INSTALL} --no-deps ./sgl_kernel_npu*.whl
     ${UV_PIP_INSTALL} \
         ./deep_ep*.whl \
+        ./attentions*.whl \
         ./torch_memory_saver*.whl
 
     cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')"
