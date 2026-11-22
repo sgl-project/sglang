@@ -96,6 +96,11 @@ _MIN_OPERATION_TIMEOUT_MS = 5000
 _MIN_ABANDON_TIMEOUT_MS = 30000
 _ABANDON_PER_OPERATION = 3
 
+_KVCR_REQUIRED = (
+    "KVCR HiCache backend requires the kvcr>=0.2.0 package and its NIXL Python "
+    "bindings (0.1.x lacks the API this backend uses)"
+)
+
 # Extra-config keys this backend reads.
 _EXTRA_CONFIG_KEYS = frozenset(
     {
@@ -249,16 +254,22 @@ class KVCRStore(HiCacheStorage):
             raise ValueError("KVCR extra_backend_tag must be a non-empty string")
         self._offset = rank_offset(storage_config)
         # Fail the attach, not every later storage call, on a static
-        # misconfiguration. Memory registration and the port binds stay at the
-        # first IO: host pools (e.g. a draft sidecar) may still register.
+        # misconfiguration. Memory registration stays at the first IO: host
+        # pools (e.g. a draft sidecar) may still register.
         try:
             # Exported from 0.2.0 on; the import also loads its NIXL bindings.
-            from kvcr import ZmqPeerControlChannel  # noqa: F401
+            from kvcr import ZmqPeerControlChannel
         except ImportError as e:
-            raise ImportError(
-                "KVCR HiCache backend requires the kvcr>=0.2.0 package and its "
-                "NIXL Python bindings (0.1.x lacks the API this backend uses)"
-            ) from e
+            raise ImportError(_KVCR_REQUIRED) from e
+        if not hasattr(ZmqPeerControlChannel, "adopt_listener"):
+            # Takes the listener reserved at attach (_reserve_ports); 0.2.0 on.
+            raise ImportError(_KVCR_REQUIRED)
+        control_host = self._extra.get("control_host")
+        if control_host is not None and (
+            not isinstance(control_host, str) or ":" in control_host
+        ):
+            # KVCR 0.2.0's control channel binds IPv4 (tcp://host:port).
+            raise ValueError("KVCR control_host must be an IPv4 address or host name")
         self._budget = self._extra.get("local_dram_bytes", 8 << 30)
         self._pages_by_pool = self._extra.get("local_dram_pool_pages", {})
         if (
@@ -544,16 +555,13 @@ class KVCRStore(HiCacheStorage):
         before a slow but healthy transfer counts as uncertain.
         """
         layouts = self._layouts if layouts is None else layouts
-        # A writer may serve every sibling's batch beside its own.
-        fan_in = self.config.tp_size if self._shared else 1
-        batch_bytes = (
-            STORAGE_BATCH_SIZE
-            * fan_in
-            * sum(
-                component.size
-                for layout in layouts.values()
-                for component in layout.components
-            )
+        # Per rank, also with shared replicated KV: scaling by the writer's
+        # fan-in would stretch a dead peer's stall by TP; the rate is already
+        # far below measured same-host and peer reads.
+        batch_bytes = STORAGE_BATCH_SIZE * sum(
+            component.size
+            for layout in layouts.values()
+            for component in layout.components
         )
         derived = max(
             _MIN_OPERATION_TIMEOUT_MS,
@@ -661,9 +669,6 @@ class KVCRStore(HiCacheStorage):
         with ExitStack() as resources:
             if channel is not None:
                 resources.callback(channel.close)
-                if self._listener is not None:
-                    channel.adopt_listener(self._listener.detach())
-                    self._listener = None
             for name, length in plans:
                 allocation = _allocate_dram_pool(length)
                 resources.callback(allocation.close)
@@ -674,6 +679,9 @@ class KVCRStore(HiCacheStorage):
                 self._nixl_hold.close()
                 self._nixl_hold = None
             try:
+                if channel is not None and self._listener is not None:
+                    listener, self._listener = self._listener, None
+                    channel.adopt_listener(listener.detach())
                 self._runner = KVCR(
                     config=KVCRConfig(
                         nixl_agent_name=self._agent_name,
@@ -754,6 +762,8 @@ class KVCRStore(HiCacheStorage):
         if "source writes disabled" in str(error):
             # KVCR 0.2.0 latches a stalled source off until restart: every
             # peer, including this replica's other ranks, then misses here.
+            # 0.2.0 reports it only as this RuntimeError message (from
+            # dangling_ops.check_source_progress); re-check it on a KVCR bump.
             logger.error("KVCR stopped serving peers until restart: %s", error)
             return
         logger.warning("KVCR resilience event: %s", error)

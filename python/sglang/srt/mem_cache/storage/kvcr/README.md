@@ -45,8 +45,8 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
 
 - `control_advertise_host` (`127.0.0.1`): host peers and routers dial for this
   worker's control endpoint.
-- `control_host` (`0.0.0.0` with remote hints, else `127.0.0.1`): host the
-  control endpoint binds. The endpoint exists only with `enable_remote_hint` or
+- `control_host` (`0.0.0.0` with remote hints, else `127.0.0.1`): IPv4 address
+  or host name the control endpoint binds (KVCR 0.2.0 binds IPv4 only). The endpoint exists only with `enable_remote_hint` or
   `share_replicated_kv`; peers fetch through it without authentication, so bind
   it to the peer-facing interface where possible.
 - `control_port` (`32100`): base control port.
@@ -131,12 +131,19 @@ warns that every rank keeps a copy.
 
 Costs: each rank's control endpoint exists (bound to `127.0.0.1` unless remote
 hints or `control_host` say otherwise), unauthenticated to anything that can
-reach it; every non-writer read is a peer pull from the writer, which also
-serves remote replicas' ranks when remote hints are on; the default deadlines
-grow by the writer's fan-in (TP size). With KVCR 0.2.0, a writer whose progress
-stalls past `operation_timeout_ms` stops serving peers until restart (logged
-as an error): its replica then misses in L3 for the shared pools. Include `sm`
-in `UCX_TLS` so same-host pulls use shared memory.
+reach it. Every non-writer read is a peer pull from the writer: a restore of a
+shared pool no longer runs TP local reads in parallel, but goes through the
+writer's one KVCR source, which serves its own read and every sibling's pull of
+the same pages at once (and remote replicas' ranks, with remote hints). On
+DeepSeek-V2-Lite at TP2 with `sm` in `UCX_TLS`, restores took about 1.5 times
+as long as with a copy per rank; the cost grows with TP. A replica reads pages
+its writer lacks from the router-hinted replica only after the writer answers.
+The default deadlines stay per rank (one batch at 250 MB/s); raise
+`operation_timeout_ms` if the writer's link cannot serve TP batches at once
+well within it. With KVCR 0.2.0, a writer whose progress stalls past
+`operation_timeout_ms` stops serving peers until restart (logged as an error):
+its replica then misses in L3 for the shared pools. Include `sm` in `UCX_TLS`
+so same-host pulls use shared memory.
 
 ## Inventory publication (Dynamo KV state agent)
 

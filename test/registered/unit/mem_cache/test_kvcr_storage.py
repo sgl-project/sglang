@@ -104,10 +104,17 @@ def _page(router_hash):
     return f"{router_hash:016x}" + "0" * 48
 
 
+class _ControlChannelExport:
+    """kvcr>=0.2.0's control channel, as construction checks it."""
+
+    def adopt_listener(self, listener_fd):
+        raise AssertionError("not started in this test")
+
+
 def _kvcr_module():
     """A kvcr>=0.2.0 stand-in: construction checks only this export."""
     module = types.ModuleType("kvcr")
-    module.ZmqPeerControlChannel = object
+    module.ZmqPeerControlChannel = _ControlChannelExport
     return module
 
 
@@ -697,8 +704,11 @@ class TestKVCRStorage(CustomTestCase):
 
     def test_static_misconfiguration_fails_construction(self):
         """A missing package or bad option fails the attach, not every later IO."""
-        for module in (None, types.ModuleType("kvcr")):
-            # Missing, or older than 0.2.0 (no top-level ZmqPeerControlChannel).
+        no_adopt = types.ModuleType("kvcr")
+        no_adopt.ZmqPeerControlChannel = object
+        for module in (None, types.ModuleType("kvcr"), no_adopt):
+            # Missing, or older than 0.2.0 (no top-level ZmqPeerControlChannel,
+            # or a control channel that cannot adopt a reserved listener).
             with (
                 self.subTest(kvcr=module),
                 patch.dict("sys.modules", {"kvcr": module}),
@@ -723,6 +733,9 @@ class TestKVCRStorage(CustomTestCase):
             ({"nixl_listen_port": 70000}, "nixl_listen_port"),
             ({"nixl_listen_port": True}, "nixl_listen_port"),
             ({"control_port": 70000}, "control_port"),
+            # KVCR 0.2.0's control channel binds IPv4 only.
+            ({"control_host": "::"}, "IPv4"),
+            ({"control_host": "fd00::1"}, "IPv4"),
             ({"control_port": 65535}, "control-port range"),
             ({"control_port": 40000, "nixl_listen_port": 40000}, "overlaps"),
             ({"control_advertise_host": "0.0.0.0"}, "unspecified"),
@@ -2402,8 +2415,9 @@ class TestSharedReplicatedKV(CustomTestCase):
         self.assertEqual(pools["kv_1"], 3)
         self.assertEqual(pools["mamba_0"], pages["mamba"] * 5)
 
-    def test_shared_deadlines_cover_every_sibling(self):
-        # 128 pages of 1 MiB at 250 MB/s: 537 ms per rank, 1074 ms for two.
+    def test_shared_deadlines_stay_per_rank(self):
+        # 128 pages of 1 MiB at 250 MB/s: 537 ms. A writer's fan-in would
+        # stretch a dead peer's stall by TP, so it does not scale them.
         pool = _HostPool(sizes=(1 << 20,))
         writer = self._store(0, pool)
         unshared = KVCRStore(
@@ -2412,8 +2426,8 @@ class TestSharedReplicatedKV(CustomTestCase):
         with patch(
             "sglang.srt.mem_cache.storage.kvcr.kvcr_store._MIN_OPERATION_TIMEOUT_MS", 1
         ):
-            self.assertEqual(unshared._timeouts()[0], 537)
-            self.assertEqual(writer._timeouts()[0], 1074)
+            self.assertEqual(unshared._timeouts(), (537, 30000))
+            self.assertEqual(writer._timeouts(), (537, 30000))
 
 
 class TestPortReservation(CustomTestCase):
@@ -2504,6 +2518,56 @@ class TestPortReservation(CustomTestCase):
         self.assertFalse(self._bindable(nixl))
         store.close()
         self.assertTrue(self._bindable(nixl))
+
+
+class _RefusingChannel(_FakeChannel):
+    def adopt_listener(self, listener_fd):
+        socket.socket(fileno=listener_fd).close()
+        raise OSError("cannot adopt")
+
+
+class TestAdoptFailure(CustomTestCase):
+    def test_adopt_failure_is_a_startup_failure(self):
+        """Handled like the other startup failures, with no fd left behind."""
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        modules = _fake_kvcr_modules()
+        modules["kvcr"].ZmqPeerControlChannel = _RefusingChannel
+        self.enterContext(patch.dict("sys.modules", modules))
+        control = find_available_port(37100)
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="adopt",
+            extra_config={
+                "enable_remote_hint": True,
+                "control_host": "127.0.0.1",
+                "control_port": control,
+                "nixl_listen_port": find_available_port(control + 1500),
+                "local_dram_bytes": 256,
+            },
+        )
+        store = KVCRStore(config, _HostPool())
+        self.addCleanup(store.close)
+        store.on_host_pools_registered()
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                side_effect=SystemExit,
+            ) as exit_,
+            self.assertRaises(SystemExit),
+            self.assertLogs("sglang.srt.mem_cache.storage.kvcr.kvcr_store", "CRITICAL"),
+        ):
+            store._start()
+        exit_.assert_called_once_with(1)
+        self.assertIsNone(store._listener)
+        self.assertIsNone(store._runner)
 
 
 class TestCompletionPollThread(CustomTestCase):
