@@ -1,7 +1,6 @@
 """Speculative verify target probabilities: selecting the top-k on the raw logits
 and dividing only the selected values by the temperature must give the same
-distribution as dividing the whole vocabulary first and running ``torch.topk``;
-min-p filters the result as the sampler does.
+distribution as dividing the whole vocabulary first and running ``torch.topk``.
 
 When several logits tie at a row's top-k boundary, which of them keep the mass
 is chosen deterministically but may differ from ``torch.topk``; the kept count
@@ -16,8 +15,10 @@ import torch
 import torch.nn.functional as F
 
 import sglang.kernels.ops.sampling.topk as topk_ops
+from sglang.kernels.ops.speculative.dspark import dspark_accept
 from sglang.srt.layers.sampler import top_k_top_p_min_p_filter_sorted_probs_torch
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
@@ -63,7 +64,6 @@ def _case(device, logits, top_ks, *, need_top_p, seed, temperature=None):
         need_top_k_sampling=True,
         need_top_p_sampling=need_top_p,
         need_min_p_sampling=False,
-        min_ps=torch.zeros((bs,), device=device),
     )
     uniform = top_ks[0] if len(set(top_ks)) == 1 else None
     return dict(
@@ -240,29 +240,7 @@ def _sampler_min_p(probs, min_ps):
     return filtered / filtered.sum(dim=-1, keepdim=True)
 
 
-@pytest.mark.parametrize("device", _DEVICES)
-def test_min_p_filters_as_the_sampler_does(device):
-    """Min-p, which verify used to ignore, keeps what the sampler's min-p keeps of
-    the top-k / top-p distribution, renormalized."""
-    top_ks = [20, 7, 64]
-    rows = len(top_ks) * _DRAFT_TOKEN_NUM
-    logits = _random_logits(device, rows, 1000, seed=21)
-    kwargs = _case(device, logits, top_ks, need_top_p=device != "cpu", seed=22)
-    truncated = build_speculative_verify_target_probs(**kwargs).view(rows, -1)
-    info = kwargs["sampling_info"]
-    info.need_min_p_sampling = True
-    info.min_ps = torch.tensor([0.05, 0.0, 0.3], device=device)
-    got = build_speculative_verify_target_probs(**kwargs).view(rows, -1)
-    want = _sampler_min_p(
-        truncated, torch.repeat_interleave(info.min_ps, _DRAFT_TOKEN_NUM)
-    )
-    assert torch.equal(got > 0, want > 0)
-    torch.testing.assert_close(got, want)
-
-
 def test_eagle_dense_verify_applies_min_p():
-    """EAGLE's sampled tree verify, which used to ignore min-p, verifies against
-    the min-p filtered target distribution."""
     bs, width, vocab = 2, 3, 16
     probs = torch.softmax(_random_logits("cpu", bs * width, vocab, seed=31), dim=-1)
     info = SimpleNamespace(
@@ -314,6 +292,57 @@ def test_eagle_dense_verify_applies_min_p():
     want = _sampler_min_p(probs, torch.repeat_interleave(info.min_ps, width))
     assert torch.equal(seen[0] > 0, want > 0)
     torch.testing.assert_close(seen[0], want)
+
+
+def test_dspark_accept_min_p_does_not_depend_on_the_batch():
+    """A min-p request verifies against the same filtered distribution alone and
+    batched with a top-k request (DSpark's accept, also DFlash's selector draft)."""
+    width, vocab = 3, 16
+    # Unit-scale logits, so min-p keeps several tokens per row.
+    logits = _random_logits("cpu", 2 * width, vocab, seed=41) / 4
+
+    class _Stop(Exception):
+        pass
+
+    def verify_target_probs(bs):
+        info = SimpleNamespace(
+            temperatures=torch.ones((bs, 1)),
+            top_ks=torch.tensor([TOP_K_ALL, 4][:bs], dtype=torch.int32),
+            top_ps=torch.ones(bs),
+            min_ps=torch.tensor([0.2, 0.0][:bs]),
+            need_top_k_sampling=bs == 2,
+            need_top_p_sampling=False,
+            need_min_p_sampling=True,
+            sampling_seed=None,
+        )
+        seen = []
+
+        def sample(*, target_probs, **_):
+            seen.append(target_probs)
+            raise _Stop
+
+        with (
+            patch.object(dspark_accept, "chain_speculative_sampling_triton", sample),
+            pytest.raises(_Stop),
+        ):
+            dspark_accept.accept_sampling(
+                candidates=torch.zeros((bs, width), dtype=torch.int64),
+                target_logits=logits[: bs * width],
+                draft_probs=torch.zeros((bs, width - 1, vocab)),
+                sampling_info=info,
+                draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
+                gamma=width - 1,
+                verify_num_draft_tokens=width,
+            )
+        return seen[0][0]
+
+    alone, batched = verify_target_probs(1), verify_target_probs(2)
+    want = _sampler_min_p(
+        torch.softmax(logits[:width], dim=-1), torch.full((width,), 0.2)
+    )
+    for got in (alone, batched):
+        assert torch.equal(got > 0, want > 0)
+        torch.testing.assert_close(got, want)
 
 
 if __name__ == "__main__":
