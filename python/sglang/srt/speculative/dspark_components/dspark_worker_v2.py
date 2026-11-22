@@ -101,7 +101,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
 )
-from sglang.srt.speculative.target_verify import TargetVerify
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
@@ -1181,7 +1181,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=draft_tokens,
                     bs=bs,
                     device=device,
-                    sampling_info=sampling_info,
                     verify_window=verify_window,
                     inject_gate=fold_eligible,
                 )
@@ -1196,7 +1195,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_input=draft_input,
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
-                    sampling_info=sampling_info,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1214,10 +1212,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             watermark_full_mask=False,
         )
-        if verify.grammar_mask is not None:
-            # run_compact scatters its rows back to (bs * chain_len), so the mask
-            # lines up with the logits on both verify paths.
-            verify.grammar_mask.apply(logits_output.next_token_logits)
+        if sampling_info is not None:
+            # run_compact scatters its rows back to (bs * chain_len), so the rows
+            # line up with the verify ids on both verify paths.
+            adjust_verify_logits(
+                logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                grammar_mask=verify.grammar_mask,
+                draft_tokens=verify_ids_2d,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
+            )
 
         target_logits = logits_output.next_token_logits
         if verify.watermark is not None:
