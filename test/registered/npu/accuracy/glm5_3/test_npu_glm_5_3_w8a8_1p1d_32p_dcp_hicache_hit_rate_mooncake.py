@@ -96,8 +96,12 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     # case (DSV4), which drops prefill PP for the same KV-layout reason.
     "--tp-size",
     32,
+    # Keep prefill EP at 8 (4 EP replica groups within tp32): the prefill MoE
+    # uses alltoallv, which is only validated at ep8 -- at ep32 its dispatch
+    # hits an AI Core assert (index value 3 exceeds bounds 1). Decode uses
+    # low_latency and is unaffected, so it stays at ep32.
     "--ep-size",
-    32,
+    8,
     "--attn-dp-size",
     8,
     "--mem-fraction-static",
