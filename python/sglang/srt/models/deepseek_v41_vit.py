@@ -14,9 +14,45 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.layers.layernorm import RMSNorm
 
 
+class _VisionRMSNorm(RMSNorm):
+    """``forward_native`` with an fp32 weight; on CUDA it runs as three launches
+    (``rmsnorm_native``) instead of eight, with the same output bits."""
+
+    def __init__(self, dim: int):
+        # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
+        super().__init__(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
+        self._forward_method = self._forward_vision
+
+    def _fused(self, x: torch.Tensor) -> bool:
+        return (
+            x.is_cuda
+            and torch.version.hip is None
+            and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and self.weight.dtype == torch.float32
+        )
+
+    def _forward_vision(self, x, residual=None, *args, **kwargs):
+        if residual is None and self._fused(x):
+            from sglang.kernels.ops.layernorm.rmsnorm_native import rmsnorm_native
+
+            return rmsnorm_native(x, self.weight, self.variance_epsilon)
+        return self.forward_native(x, residual, *args, **kwargs)
+
+    def add_and_norm(
+        self, x: torch.Tensor, delta: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``x = x + delta`` (skipped for None), then ``(self(x), x)``."""
+        if delta is not None and self._fused(x) and delta.dtype == x.dtype:
+            from sglang.kernels.ops.layernorm.rmsnorm_native import rmsnorm_native
+
+            return rmsnorm_native(delta, self.weight, self.variance_epsilon, x)
+        if delta is not None:
+            x = x + delta
+        return self(x), x
+
+
 def _rms_norm(dim: int) -> RMSNorm:
-    # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
-    return RMSNorm(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
+    return _VisionRMSNorm(dim)
 
 
 @lru_cache(8)
@@ -27,6 +63,13 @@ def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
     freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
     freqs = freqs.flatten(1)
     return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
+
+
+@lru_cache(32)
+def _vision_cos_sin_on(device: torch.device, n_h: int, n_w: int, dim, theta):
+    # One host-to-device copy per grid, not a blocking copy per image.
+    cos, sin = get_vision_cos_sin(n_h, n_w, dim, theta)
+    return cos.to(device), sin.to(device)
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -107,7 +150,15 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.w1(x).chunk(2, dim=-1)
+        h = self.w1(x)
+        if h.is_cuda and torch.version.hip is None:
+            # silu(gate) rounded to the dtype, then times up: the eager bits.
+            from sglang.kernels.ops.activation.activation import (
+                silu_and_mul_with_activation_rounding,
+            )
+
+            return self.w2(silu_and_mul_with_activation_rounding(h))
+        gate, up = h.chunk(2, dim=-1)
         return self.w2(F.silu(gate) * up)
 
 
@@ -122,12 +173,16 @@ class Block(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        delta: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
         metadata: VisionAttentionMetadata,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin, metadata)
-        return x + self.mlp(self.norm2(x))
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Returns (x, delta) with the block output x + delta; each residual add
+        # runs inside the norm that reads it, in the same order and rounding.
+        h, x = self.norm1.add_and_norm(x, delta)
+        h, x = self.norm2.add_and_norm(x, self.attn(h, cos, sin, metadata))
+        return x, self.mlp(h)
 
 
 class ViT(nn.Module):
@@ -154,11 +209,11 @@ class ViT(nn.Module):
         """Encode images whose patches are concatenated row-wise in ``grids`` order."""
         x = self.patch_embed(patches)
         cos_sin = [
-            get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+            _vision_cos_sin_on(x.device, n_h, n_w, self.rope_dim, self.rope_theta)
             for n_h, n_w in grids
         ]
-        cos = torch.cat([c for c, _ in cos_sin]).to(x.device)
-        sin = torch.cat([s for _, s in cos_sin]).to(x.device)
+        cos = torch.cat([c for c, _ in cos_sin])
+        sin = torch.cat([s for _, s in cos_sin])
         lengths = [n_h * n_w for n_h, n_w in grids]
         cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32)
         cu_seqlens[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
@@ -166,9 +221,10 @@ class ViT(nn.Module):
         metadata = prepare_vision_attention_metadata(
             cu_seqlens, x.device, max_seqlen=max(lengths)
         )
+        delta = None
         for block in self.blocks:
-            x = block(x, cos, sin, metadata)
-        return self.norm(x)
+            x, delta = block(x, delta, cos, sin, metadata)
+        return self.norm.add_and_norm(x, delta)[0]
 
 
 class Aligner(nn.Module):
