@@ -169,16 +169,39 @@ def _adjust_before_watermark(
     logits: torch.Tensor,
     sampling_info: SamplingBatchInfo,
     *,
-    observer: Optional[SamplingObserver],
+    observer: Optional[SamplingObserver] = None,
+    draft_tokens: Optional[torch.Tensor] = None,
+    next_child: Optional[torch.Tensor] = None,
+    next_sibling: Optional[torch.Tensor] = None,
+    grammar_mask: Optional[GrammarMask] = None,
 ) -> Any:
-    """Penalty, grammar mask, then logit_bias; returns the observer's state."""
-    if sampling_info.step_penalties is not None:
-        sampling_info.step_penalties.apply(logits)
+    """Penalty, grammar mask, then logit_bias, in place; returns the observer's
+    state.
+
+    Without ``draft_tokens``, one row per request, and the grammar mask is built
+    here from the step's grammars. A verify passes ``draft_tokens`` [bs, width]
+    (row ``i * width + j`` is request i's draft token j) and the mask it built
+    over the draft tree: the penalty follows the draft chain, or the tree
+    ``next_child`` / ``next_sibling`` give, and logit_bias gets ``width`` rows
+    per request.
+    """
+    penalties = sampling_info.step_penalties
+    if penalties is not None:
+        if draft_tokens is None:
+            penalties.apply(logits)
+        else:
+            penalties.apply_verify(
+                logits, draft_tokens, next_child=next_child, next_sibling=next_sibling
+            )
     observer_state = (
         observer.before_grammar(logits, sampling_info) if observer is not None else None
     )
-    apply_grammar_mask(logits, sampling_info)
-    apply_logit_bias(logits, sampling_info)
+    if draft_tokens is None:
+        apply_grammar_mask(logits, sampling_info)
+    elif grammar_mask is not None:
+        grammar_mask.apply(logits)
+    rows_per_request = 1 if draft_tokens is None else draft_tokens.shape[1]
+    apply_logit_bias(logits, sampling_info, rows_per_request=rows_per_request)
     return observer_state
 
 
@@ -260,23 +283,14 @@ class VerifyStep(msgspec.Struct):
         *,
         positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
-        """Run the stages over a chain verify's logits (`draft_tokens` is
-        [bs, width]; `positions` too, read by the watermark). Returns the logits
-        and the sampling info to accept with: the watermark may replace both,
-        and leaves `logits` unwatermarked when the batch returns logprobs."""
+        """`adjust_verify_logits` over a chain verify's logits (`draft_tokens`
+        is [bs, width]; `positions` too, read by the watermark)."""
         batch = self.batch
         info = batch.sampling_info
-        adjust_verify_logits(
-            logits,
-            sampling_info=info,
-            grammar_mask=self.grammar_mask,
-            draft_tokens=draft_tokens,
-            has_custom_logit_processor=info.has_custom_logit_processor,
-        )
+        apply_watermark = None
         if self.watermark is not None:
-            logits, info = self.watermark.apply(
-                logits,
-                sampling_info=info,
+            apply_watermark = partial(
+                self.watermark.apply,
                 req_pool_indices=batch.req_pool_indices,
                 draft_tokens=draft_tokens,
                 positions=positions,
@@ -284,7 +298,14 @@ class VerifyStep(msgspec.Struct):
                 custom_mask=None,
                 keep_logits=batch.return_logprob,
             )
-        return logits, info
+        return adjust_verify_logits(
+            logits,
+            sampling_info=info,
+            grammar_mask=self.grammar_mask,
+            draft_tokens=draft_tokens,
+            has_custom_logit_processor=info.has_custom_logit_processor,
+            apply_watermark=apply_watermark,
+        )
 
     def commit(
         self, accept: VerifyAccept, *, logits_output: LogitsProcessorOutput
@@ -321,19 +342,32 @@ def adjust_verify_logits(
     next_child: Optional[torch.Tensor] = None,
     next_sibling: Optional[torch.Tensor] = None,
     has_custom_logit_processor: bool,
-) -> None:
-    """Penalty, grammar mask, logit_bias, then custom logit processor over a
-    verify's logits, in place. Row ``i * width + j`` of ``logits`` is request
-    i's draft token j (``draft_tokens`` is [bs, width]): the penalty follows the
-    draft chain, or the tree ``next_child`` / ``next_sibling`` give, and
-    logit_bias and the custom logit processor get ``width`` rows per request."""
-    width = draft_tokens.shape[1]
-    if sampling_info.step_penalties is not None:
-        sampling_info.step_penalties.apply_verify(
-            logits, draft_tokens, next_child=next_child, next_sibling=next_sibling
+    apply_watermark: Optional[Callable[..., Tuple[torch.Tensor, Any]]] = None,
+) -> Tuple[torch.Tensor, SamplingBatchInfo]:
+    """The stages over a verify's logits, in sampling's order (see
+    `_adjust_before_watermark` for the rows). Returns the logits and the
+    sampling info to accept with. `apply_watermark` is the bound
+    `VerifyWatermark.apply` given the logits and the sampling info; it may
+    replace both, and when it keeps the unwatermarked logits for the logprobs,
+    the custom logit processor runs on both, as in sampling."""
+    _adjust_before_watermark(
+        logits,
+        sampling_info,
+        draft_tokens=draft_tokens,
+        next_child=next_child,
+        next_sibling=next_sibling,
+        grammar_mask=grammar_mask,
+    )
+    verify_logits = logits
+    if apply_watermark is not None:
+        verify_logits, sampling_info = apply_watermark(
+            logits, sampling_info=sampling_info
         )
-    if grammar_mask is not None:
-        grammar_mask.apply(logits)
-    apply_logit_bias(logits, sampling_info, rows_per_request=width)
     if has_custom_logit_processor:
-        apply_custom_logit_processor(logits, sampling_info, rows_per_request=width)
+        width = draft_tokens.shape[1]
+        apply_custom_logit_processor(
+            verify_logits, sampling_info, rows_per_request=width
+        )
+        if verify_logits is not logits:
+            apply_custom_logit_processor(logits, sampling_info, rows_per_request=width)
+    return verify_logits, sampling_info

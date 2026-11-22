@@ -816,19 +816,10 @@ def eagle_sample(
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    adjust_verify_logits(
-        next_token_logits,
-        sampling_info=sampling_info,
-        grammar_mask=grammar_mask,
-        draft_tokens=candidates,
-        next_child=verify_input.retrieve_next_token,
-        next_sibling=verify_input.retrieve_next_sibling,
-        has_custom_logit_processor=has_custom_logit_processor,
-    )
+    apply_watermark = None
     if watermark is not None:
-        next_token_logits, sampling_info = watermark.apply(
-            next_token_logits,
-            sampling_info=sampling_info,
+        apply_watermark = partial(
+            watermark.apply,
             req_pool_indices=batch.req_pool_indices,
             draft_tokens=verify_input.draft_token,
             positions=verify_input.positions,
@@ -837,6 +828,16 @@ def eagle_sample(
             # compute_spec_logprobs reads logits_output after verify.
             keep_logits=batch.return_logprob,
         )
+    next_token_logits, sampling_info = adjust_verify_logits(
+        next_token_logits,
+        sampling_info=sampling_info,
+        grammar_mask=grammar_mask,
+        draft_tokens=candidates,
+        next_child=verify_input.retrieve_next_token,
+        next_sibling=verify_input.retrieve_next_sibling,
+        has_custom_logit_processor=has_custom_logit_processor,
+        apply_watermark=apply_watermark,
+    )
 
     return _tree_accept(
         verify_input=verify_input,
