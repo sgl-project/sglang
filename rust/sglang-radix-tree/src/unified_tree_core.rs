@@ -3108,8 +3108,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Evict one device leaf (demote if backuped, delete if write-through);
-    /// for an unbacked write-back node, return the BackupKV for the cache to
-    /// execute and then demote, else None.
+    /// for a write-back node with Full KV or component state missing from
+    /// host, return the BackupKV for the cache to execute and then demote,
+    /// else None.
     pub fn evict_device_leaf(
         &mut self,
         node_id: NodeId,
@@ -3137,7 +3138,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         assert!(self.tracked_unbacked_tokens.is_none());
         self.tracked_unbacked_tokens = Some(0);
-        if self.arena.node(node_id).backuped() {
+        let backuped = self.arena.node(node_id).backuped();
+        if is_write_back && (!backuped || self.needs_incremental_component_backup_(node_id)) {
+            let backup = self
+                .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ true);
+            result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
+            return Ok((Some(backup), result));
+        }
+        if backuped {
             self.demote_(
                 node_id,
                 &mut result.tracker,
@@ -3147,12 +3155,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             );
             result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
             return Ok((None, result));
-        }
-        if is_write_back {
-            let backup = self
-                .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ true);
-            result.unbacked_tokens = self.tracked_unbacked_tokens.take().unwrap();
-            return Ok((Some(backup), result));
         }
 
         // Write-through: node has no backup, delete entirely.
@@ -4646,6 +4648,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn node_backuped(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).backuped())
+    }
+
+    /// Whether an auxiliary component has device data missing from host.
+    pub fn needs_incremental_component_backup(
+        &self,
+        node_id: NodeId,
+    ) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self.needs_incremental_component_backup_(node_id))
     }
 
     /// Whether the node is a (default or named) root.

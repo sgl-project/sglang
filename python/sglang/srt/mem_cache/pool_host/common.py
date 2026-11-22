@@ -11,7 +11,7 @@ import time
 import weakref
 from collections import defaultdict
 from functools import lru_cache
-from typing import Union
+from typing import Callable, Union
 
 import torch
 
@@ -192,6 +192,26 @@ def get_allocator_type() -> str:
             except Exception:
                 pass
     return backend or "default"
+
+
+def get_storage_page_align(layout: str, allocator_type: str) -> int:
+    """Bytes each host page's stride is rounded up to; 1 keeps pages packed.
+
+    The storage backend asks for it: NIXL under O_DIRECT moves a
+    ``page_first_direct`` page in place only if it starts on a block and spans
+    whole blocks.
+    """
+    if layout != "page_first_direct" or allocator_type != "nixl":
+        return 1
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+    from sglang.srt.mem_cache.storage.nixl.nixl_utils import host_page_align
+
+    extra_config = HybridCacheController.parse_storage_backend_extra_config(
+        get_memory().hicache_storage_backend_extra_config
+    )[0]
+    return host_page_align(extra_config)
 
 
 def get_allocator_class_from_storage(
@@ -481,20 +501,36 @@ def _uses_hip_owned_host_memory(
     )
 
 
-def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    # Not torch pin_memory: its host allocator rounds each block up to a power of
-    # two, so a 180 GB pool would pin 256 GiB of GTT.
+def alloc_owned_host_tensor(
+    dims: tuple,
+    dtype: torch.dtype,
+    alloc: Callable[[int], int],
+    free: Callable[[int], None],
+) -> torch.Tensor:
+    """A host tensor over ``alloc(nbytes)`` memory, released by ``free(ptr)``.
+
+    Unlike torch pin_memory, whose host allocator rounds each block up to a
+    power of two, the allocation has exactly the tensor's size.
+    """
     numel = math.prod(dims)
     nbytes = numel * dtype.itemsize
-    ptr = _hip_host_malloc(nbytes)
+    ptr = alloc(nbytes)
     try:
         array = (ctypes.c_uint8 * nbytes).from_address(ptr)
         buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
     except BaseException:
-        _hip_host_free(ptr)
+        free(ptr)
         raise
     # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
-    weakref.finalize(array, _hip_host_free, ptr).atexit = False
+    weakref.finalize(array, free, ptr).atexit = False
+    return buffer
+
+
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: a 180 GB pool would pin 256 GiB of GTT.
+    buffer = alloc_owned_host_tensor(
+        dims=dims, dtype=dtype, alloc=_hip_host_malloc, free=_hip_host_free
+    )
     # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
@@ -584,6 +620,31 @@ def alloc_with_pin_memory_xpu(
             f"({n_bytes} bytes) returned a null pointer"
         )
     return buffer
+
+
+def alloc_padded_pages(
+    alloc_func,
+    page_dims: tuple,
+    page_num: int,
+    page_stride_bytes: int,
+    dtype: torch.dtype,
+    **kwargs,
+) -> torch.Tensor:
+    """Allocate a ``(page_num, *page_dims)`` view whose pages start
+    ``page_stride_bytes`` apart in one allocation (see get_storage_page_align)."""
+    assert page_stride_bytes % dtype.itemsize == 0
+    raw = alloc_func(
+        (page_num, page_stride_bytes // dtype.itemsize),
+        dtype=dtype,
+        registration_granularity_bytes=page_stride_bytes,
+        **kwargs,
+    )
+    pages = raw[:, : math.prod(page_dims)].unflatten(1, page_dims)
+    # destroy() unregisters the view it holds, so it needs the allocation's ranges.
+    registered_ranges = getattr(raw, _CUDA_HOST_REGISTERED_RANGES_ATTR, None)
+    if registered_ranges is not None:
+        setattr(pages, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+    return pages
 
 
 @lru_cache(maxsize=1)
