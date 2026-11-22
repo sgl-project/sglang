@@ -1,0 +1,1447 @@
+name: c211-127315-mi35x8q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-mi35x8-01:
+    name: probe-job-mi35x8-01
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-01 nonce=$NONCE"
+          exit 0
+  job-mi35x8-02:
+    name: probe-job-mi35x8-02
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-02 nonce=$NONCE"
+          exit 0
+  job-mi35x8-03:
+    name: probe-job-mi35x8-03
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-03 nonce=$NONCE"
+          exit 0
+  job-mi35x8-04:
+    name: probe-job-mi35x8-04
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-04 nonce=$NONCE"
+          exit 0
+  job-mi35x8-05:
+    name: probe-job-mi35x8-05
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-05 nonce=$NONCE"
+          exit 0
+  job-mi35x8-06:
+    name: probe-job-mi35x8-06
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-06 nonce=$NONCE"
+          exit 0
+  job-mi35x8-07:
+    name: probe-job-mi35x8-07
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-07 nonce=$NONCE"
+          exit 0
+  job-mi35x8-08:
+    name: probe-job-mi35x8-08
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-08 nonce=$NONCE"
+          exit 0
+  job-mi35x8-09:
+    name: probe-job-mi35x8-09
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-09 nonce=$NONCE"
+          exit 0
+  job-mi35x8-10:
+    name: probe-job-mi35x8-10
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-10 nonce=$NONCE"
+          exit 0
+  job-mi35x8-11:
+    name: probe-job-mi35x8-11
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-11 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-11 nonce=$NONCE"
+          exit 0
+  job-mi35x8-12:
+    name: probe-job-mi35x8-12
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-12 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-12 nonce=$NONCE"
+          exit 0
+  job-mi35x8-13:
+    name: probe-job-mi35x8-13
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-13 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-13 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-13 nonce=$NONCE"
+          exit 0
+  job-mi35x8-14:
+    name: probe-job-mi35x8-14
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-14 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-14 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-14 nonce=$NONCE"
+          exit 0
+  job-mi35x8-15:
+    name: probe-job-mi35x8-15
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-15 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-15 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-15 nonce=$NONCE"
+          exit 0
+  job-mi35x8-16:
+    name: probe-job-mi35x8-16
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-16 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-16 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-16 nonce=$NONCE"
+          exit 0
+  job-mi35x8-17:
+    name: probe-job-mi35x8-17
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-17 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-17 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-17 nonce=$NONCE"
+          exit 0
+  job-mi35x8-18:
+    name: probe-job-mi35x8-18
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-18 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-18 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-18 nonce=$NONCE"
+          exit 0
+  job-mi35x8-19:
+    name: probe-job-mi35x8-19
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-19 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-19 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-19 nonce=$NONCE"
+          exit 0
+  job-mi35x8-20:
+    name: probe-job-mi35x8-20
+    runs-on: [linux-mi35x-gpu-8]
+    timeout-minutes: 15
+    steps:
+      - name: fingerprint
+        shell: bash
+        env:
+          NONCE: c211-127315-88c0b609ebe1c9ed
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127315-88c0b609ebe1c9ed'
+          echo "C211_JOB=job-mi35x8-20 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x8-20 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; exit 0; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) SA_CA=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -e /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none}"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt /var/run/secrets/kubernetes.io/serviceaccount/namespace; do
+            if [ -s "$p" ]; then echo "SA_PATH_PRESENT=$p"; else echo "SA_PATH_ABSENT=$p"; fi
+          done
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IDFP'
+          import os, hashlib
+          # strictly read-only presence+sha256-only identity fingerprint: no values printed
+          sha_paths = ['/etc/machine-id', '/etc/hostname', '/proc/self/cgroup', '/proc/1/comm']
+          for p in sha_paths:
+              try:
+                  if os.path.exists(p) and os.path.isfile(p):
+                      st = os.stat(p)
+                      h = hashlib.sha256(open(p, 'rb').read()).hexdigest()[:32]
+                      print('FP_SHA', p, 'PRESENT', 'size', st.st_size, 'sha256_32', h)
+                  else:
+                      print('FP_SHA', p, 'ABSENT')
+              except Exception as e:
+                  print('FP_SHA', p, 'ERR', type(e).__name__)
+          pres_paths = ['/var/run/secrets/kubernetes.io/serviceaccount/token',
+                        '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                        '/dev/kfd']
+          for p in pres_paths:
+              try:
+                  print('FP_PRES', p, 'PRESENT' if os.path.exists(p) else 'ABSENT')
+              except Exception as e:
+                  print('FP_PRES', p, 'ERR', type(e).__name__)
+          print('FP_UID', os.getuid(), 'FP_GID', os.getgid())
+          for envk in ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME',
+                       'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'CI'):
+              v = os.environ.get(envk)
+              print('FP_ENV', envk, 'PRESENT' if v else 'ABSENT')
+          PYEOF_IDFP
+          else echo PY3_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x8-20 nonce=$NONCE"
+          exit 0
