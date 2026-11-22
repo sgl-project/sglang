@@ -148,9 +148,11 @@ def _receive_ahead_worker(rank, store_path, rounds):
     def message(i):
         return {"lens": torch.arange(i, i + 4), "odd": torch.full((3,), i), "seq": i}
 
+    depth = 2
     if rank == 0:
         works = []
-        for i in range(rounds + 1):
+        # `depth` more than the receiver pops: its thread runs that far ahead.
+        for i in range(rounds + depth):
             works += group.send_tensor_dict(message(i), dst=1, async_send=True)
         assert [group.recv_object(src=1) for _ in range(rounds)] == list(range(rounds))
         for work in works:
@@ -158,7 +160,7 @@ def _receive_ahead_worker(rank, store_path, rounds):
     else:
         receiver = PPReceiveAhead(
             recv_one=lambda: group.recv_tensor_dict_host_part(src=0),
-            depth=2,
+            depth=depth,
             name="t-recv-gloo",
         )
         works = []
@@ -170,7 +172,9 @@ def _receive_ahead_worker(rank, store_path, rounds):
             assert got.keys() == want.keys() and got["seq"] == i
             assert torch.equal(got["lens"], want["lens"])
             assert torch.equal(got["odd"], want["odd"])
-        # The receive posted after the last pop takes the sender's next message.
+        # The thread takes the extra messages, then waits for a permit: no receive
+        # is left posted when the channel closes.
+        _wait_until(lambda: receiver._queue.qsize() == depth)
         receiver.close()
         receiver._thread.join(timeout=30)
         assert not receiver._thread.is_alive()
