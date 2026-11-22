@@ -16,10 +16,16 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    WanI2V480PConfig,
+    WanT2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -36,6 +42,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    mmap_safetensors_to_device,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
@@ -479,6 +486,37 @@ def _initialize_direct_vae(vae_cls, config, dtype):
     return vae
 
 
+def _auto_mmap_vae(
+    args: ServerArgs,
+    component: str,
+    class_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    # Match the measured single-rank layouts, not subclasses with different VAEs.
+    if (
+        device.type != "cuda"
+        or not current_platform.is_cuda()
+        or args.num_gpus != 1
+        or dtype != torch.float32
+        or args.component_direct_gpu_weight_loading.get(component) is False
+        or component in args.component_paths
+        or component in args.component_weights_paths
+        or component in args.component_quantizations
+        or args.should_use_fsdp_for_component(component)
+        or get_bool_env_var("SGLANG_USE_RUNAI_MODEL_STREAMER")
+    ):
+        return False
+    layout = (type(args.pipeline_config), component, class_name)
+    if layout not in (
+        (MiniMaxH3PipelineConfig, "video_vae", "MiniMaxH3VideoVAE"),
+        (WanI2V480PConfig, "vae", "AutoencoderKLWan"),
+        (WanT2V480PConfig, "vae", "AutoencoderKLWan"),
+    ):
+        return False
+    return torch.cuda.get_device_name(device) == "NVIDIA B200"
+
+
 def _assign_direct_gpu_vae_state(
     vae: nn.Module,
     weight_files: list[str],
@@ -488,6 +526,7 @@ def _assign_direct_gpu_vae_state(
     vae_config: VAEConfig,
     key_filter: Callable[[str], bool] | None = None,
     key_mapper: Callable[[str], str] | None = None,
+    mmap_upload: bool = False,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
     num_deparameterized = adopt_plain_weight_norm_state(
@@ -498,9 +537,14 @@ def _assign_direct_gpu_vae_state(
     loaded_names: set[str] = set()
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
-        for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
-        ):
+        weights = (
+            mmap_safetensors_to_device(weight_files, device, key_filter=key_filter)
+            if mmap_upload
+            else safetensors_weights_iterator(
+                weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
+            )
+        )
+        for raw_name, tensor in weights:
             name = key_mapper(raw_name) if key_mapper is not None else raw_name
             if name in metadata_names:
                 metadata[name] = tensor
@@ -760,6 +804,14 @@ class VAELoader(WeightOverrideComponentLoader):
             if prepare_checkpoint_load is not None
             else None
         )
+        auto_mmap = configure_checkpoint is None and _auto_mmap_vae(
+            server_args, component_name, class_name, target_device, vae_dtype
+        )
+        if auto_mmap:
+            logger.info(
+                "Loading resident %s directly from CPU-mapped weights", component_name
+            )
+            direct_gpu_weight_loading = True
         stream_checkpoint = (
             direct_gpu_weight_loading or configure_checkpoint is not None
         )
@@ -788,6 +840,12 @@ class VAELoader(WeightOverrideComponentLoader):
                 vae_config=vae_config,
                 key_filter=checkpoint_key_filter,
                 key_mapper=checkpoint_key_mapper,
+                mmap_upload=auto_mmap
+                or (
+                    direct_gpu_weight_loading
+                    and target_device.type == "cuda"
+                    and not envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+                ),
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
