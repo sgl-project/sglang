@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS: int = 4
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
@@ -67,6 +69,10 @@ if TYPE_CHECKING:
     # picks it where it measured faster than NCCL (see plain_exchange_ready),
     # 1 forces it for every exchange, 0 keeps NCCL
     SGLANG_DIFFUSION_IPC_A2A_MULTI: bool | None = None
+    # Ordinary unquantized FlashInfer Ulysses; overrides the IPC pipeline.
+    # Set identically on every rank. Uneven sequence shards retain their transport.
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES: bool = False
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND: str = "auto"
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
     # or over the collective one for MiniMax-H3 on aiter:
@@ -75,9 +81,12 @@ if TYPE_CHECKING:
     # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
     # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
-    # a deadlock backstop, not a per-step budget: a rank can legitimately stall
-    # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
-    # retires the transport on every rank and fails the request
+    # every in-kernel peer wait of the copy-engine transports: a deadlock
+    # backstop, not a per-step budget, as a rank can legitimately stall for
+    # seconds (layerwise offload, wan2.2 expert-tower swaps). Expiry retires the
+    # transport on every rank; on the multi-rank transport it fails the request
+    # after its denoising stage and marks the server unusable, on the two-rank
+    # transport it fails the next request
     SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 10000.0
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
@@ -348,6 +357,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
     ),
+    # MiniMax-H3 image: quantize and LANCZOS-resize the decoded canvas on the
+    # GPU (byte-identical to Pillow, verified once per geometry at first use,
+    # with a Pillow fallback on any difference). Set 0 to always use Pillow.
+    "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU", "true"
+    ),
+    # Threads for the Pillow fallback resize (byte-identical to one call).
+    "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS", 4
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
@@ -422,6 +441,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES": _lazy_bool(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES", "false"
+    ),
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND": lambda: os.getenv(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND", "auto"
+    ),
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_optional_bool(
         "SGLANG_DIFFUSION_IPC_A2A_MULTI"
     ),
