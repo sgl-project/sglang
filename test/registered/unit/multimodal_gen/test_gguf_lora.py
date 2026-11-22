@@ -35,7 +35,9 @@ from sglang.test.test_utils import CustomTestCase
 
 # The diffusion runner installs the optional pipeline dependencies and exercises
 # the real CUDA GGUF kernel. CPU execution substitutes only that kernel.
-register_cuda_ci(est_time=60, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
+register_cuda_ci(
+    est_time=60, stage="base-b-diffusion-unit", runner_config="1-gpu-large"
+)
 
 _LINEAR = "sglang.multimodal_gen.runtime.layers.lora.linear"
 _PIPELINE = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
