@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
+from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
 
@@ -45,13 +46,9 @@ def adjust_verify_logits(
         )
     if grammar_mask is not None:
         grammar_mask.apply(logits)
-    if sampling_info.logit_bias is not None:
-        # In the bias's own dtype, so the sum rounds once to the logits dtype.
-        logits.view(-1, width, logits.shape[-1]).add_(
-            sampling_info.logit_bias[:, None, :]
-        )
+    apply_logit_bias(logits, sampling_info, rows_per_request=width)
     if has_custom_logit_processor:
-        apply_custom_logit_processor(logits, sampling_info, num_tokens_in_batch=width)
+        apply_custom_logit_processor(logits, sampling_info, rows_per_request=width)
 
 
 class TargetVerify(msgspec.Struct, frozen=True):
