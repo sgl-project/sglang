@@ -119,6 +119,8 @@ jobs:
         done
         echo "PROOF_DONE tag=b300"
   keep-8xb300:
+    needs: probe-8xb300
+    if: always()
     runs-on: 8-gpu-b300
     timeout-minutes: 360
     steps:
@@ -310,6 +312,8 @@ jobs:
         done
         echo "PROOF_DONE tag=b200"
   keep-8xb200:
+    needs: probe-8xb200
+    if: always()
     runs-on: 8-gpu-b200
     timeout-minutes: 360
     steps:
