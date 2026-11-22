@@ -360,19 +360,20 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    # Single-token TP4 decode otherwise launches only 48 CTAs and uses over
-    # 200 registers per thread. Smaller value tiles expose 192 independent
-    # CTAs without changing the recurrence or its one-warp K reductions.
-    use_small_value_tile = (
+    # On SM10x with an FP32 state, 4-row value tiles give 8x the programs of
+    # BV=32 (each with a quarter of the registers) and stream the state at close
+    # to copy bandwidth; on B300 BV=4 is the fastest tile from 6 to 48 value
+    # heads at every batch size from 1 to 256. Each program still reduces over
+    # the full K for its own rows, so output and state are bit-identical.
+    if (
         is_cuda()
-        and B == 1
-        and qkv_dim == 2560
-        and mixed_qkv.dtype == torch.bfloat16
+        and K == V == 128
         and initial_state.dtype == torch.float32
-        and (HV, V, K) == (12, 128, 128)
         and torch.cuda.get_device_capability(mixed_qkv.device)[0] == 10
-    )
-    BV = min(triton.next_power_of_2(V), 8 if use_small_value_tile else 32)
+    ):
+        BV = 4
+    else:
+        BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
     num_warps = 1
 
