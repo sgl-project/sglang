@@ -10,7 +10,7 @@ from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import async_h2d, is_cuda
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
@@ -40,7 +40,7 @@ class SynthIDRows(msgspec.Struct, frozen=True):
         if not indices:
             return None
         return cls(
-            indices=torch.tensor(indices, dtype=torch.int64, device=device),
+            indices=async_h2d(indices, dtype=torch.int64, device=device),
             candidates_host=candidates_host,
         )
 
@@ -50,27 +50,6 @@ class SynthIDRows(msgspec.Struct, frozen=True):
     @property
     def all_on(self) -> bool:
         return self.indices.shape[0] == len(self.candidates_host)
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: torch.Tensor
-    ) -> Optional[SynthIDRows]:
-        return SynthIDRows.from_candidates(
-            [self.candidates_host[index] for index in keep_indices],
-            self.indices.device,
-        )
-
-    def concat(
-        self, other: Optional[SynthIDRows], self_len: int, other_len: int
-    ) -> SynthIDRows:
-        other_on = other.candidates_host if other is not None else [False] * other_len
-        return SynthIDRows.from_candidates(
-            self.candidates_host + other_on, self.indices.device
-        )
-
-    def prepend_off(self, num_rows: int) -> SynthIDRows:
-        return SynthIDRows.from_candidates(
-            [False] * num_rows + self.candidates_host, self.indices.device
-        )
 
     def take(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor if self.all_on else tensor[self.indices]
