@@ -47,6 +47,7 @@ def _sampling_info(*, greedy: bool):
         min_ps=torch.zeros(2),
         step_penalties=None,
         logit_bias=None,
+        has_custom_logit_processor=False,
         sampling_seed=None,
         is_all_greedy=greedy,
         need_top_k_sampling=False,

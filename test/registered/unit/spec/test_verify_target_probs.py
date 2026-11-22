@@ -253,6 +253,7 @@ def test_eagle_dense_verify_applies_min_p():
         sampling_seed=None,
         step_penalties=None,
         logit_bias=None,
+        has_custom_logit_processor=False,
     )
     verify_input = SimpleNamespace(
         draft_token_num=width,

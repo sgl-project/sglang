@@ -824,7 +824,6 @@ def _sharded_sampling_applies(
     batch: ScheduleBatch,
     grammar_mask: Optional[GrammarMask],
     watermark: bool,
-    has_custom_logit_processor: bool,
     has_local_keys: bool = False,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
@@ -844,7 +843,7 @@ def _sharded_sampling_applies(
             # its VerifySamplingView, so this reads what the stages will apply.
             adjusts_logits=grammar_mask is not None
             or watermark
-            or has_custom_logit_processor
+            or info.has_custom_logit_processor
             or info.step_penalties is not None
             or info.logit_bias is not None,
             need_truncated_sampling=need_truncated_sampling(info),
@@ -867,7 +866,6 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
-    has_custom_logit_processor: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -898,7 +896,6 @@ def eagle_sample(
         batch=batch,
         grammar_mask=grammar_mask,
         watermark=watermark is not None,
-        has_custom_logit_processor=has_custom_logit_processor,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -929,7 +926,6 @@ def eagle_sample(
         draft_tokens=candidates,
         next_child=verify_input.retrieve_next_token,
         next_sibling=verify_input.retrieve_next_sibling,
-        has_custom_logit_processor=has_custom_logit_processor,
         apply_watermark=apply_watermark,
     )
 

@@ -97,7 +97,6 @@ class TestNativeEagerVerify(CustomTestCase):
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False
                             ),
-                            has_custom_logit_processor=custom,
                         )
 
 

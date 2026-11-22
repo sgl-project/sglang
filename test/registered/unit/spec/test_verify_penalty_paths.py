@@ -147,7 +147,6 @@ class TestVerifyPenaltyPaths(CustomTestCase):
                 batch,
                 logits_output,
                 grammar_mask,
-                has_custom_logit_processor=True,
             )
         self.assertEqual(len(seen), 1)
         self.assertTrue(torch.equal(seen[0][0], expected[width:]))

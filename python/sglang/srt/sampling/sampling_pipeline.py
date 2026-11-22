@@ -341,7 +341,6 @@ class VerifyStep(msgspec.Struct):
             sampling_info=info,
             grammar_mask=self.grammar_mask,
             draft_tokens=draft_tokens,
-            has_custom_logit_processor=info.has_custom_logit_processor,
             apply_watermark=apply_watermark,
         )
 
@@ -379,7 +378,6 @@ def adjust_verify_logits(
     draft_tokens: torch.Tensor,
     next_child: Optional[torch.Tensor] = None,
     next_sibling: Optional[torch.Tensor] = None,
-    has_custom_logit_processor: bool,
     apply_watermark: Optional[Callable[..., Tuple[torch.Tensor, Any]]] = None,
 ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
     """The stages over a verify's logits, in sampling's order (see
@@ -388,6 +386,8 @@ def adjust_verify_logits(
     `VerifyWatermark.apply` given the logits and the sampling info; it may
     replace both, and when it keeps the unwatermarked logits for the logprobs,
     the custom logit processor runs on both, as in sampling."""
+    # Read before the watermark, which may replace the sampling info.
+    has_custom_logit_processor = sampling_info.has_custom_logit_processor
     _adjust_before_watermark(
         logits,
         sampling_info,

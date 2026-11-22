@@ -174,10 +174,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
         ):
             verify_logits, _ = adjust_verify_logits(
                 logits,
-                sampling_info=_make_info(),
+                sampling_info=_make_info(has_custom_logit_processor=True),
                 grammar_mask=None,
                 draft_tokens=torch.zeros(1, 2, dtype=torch.long),
-                has_custom_logit_processor=True,
                 apply_watermark=apply_watermark,
             )
 
