@@ -123,14 +123,12 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--moe-dense-tp",
     1,
-    "--speculative-algorithm",
-    "NEXTN",
-    "--speculative-num-steps",
-    3,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
-    4,
+    # Speculative decoding is off on both roles. With DCP, the NEXTN draft KV
+    # entry has a different per-token geometry on prefill (dcp=1) and decode
+    # (dcp=4), and prepare_dcp_token_item_lens rejects the last (draft) entry
+    # (src 128 vs dst 1024 tokens). Without draft entries the check only
+    # compares the target layers, which already match. This case validates the
+    # Mooncake PD transfer path, not speculative decoding.
     # L2 host tier only: the L3 storage backend is intentionally left unset so
     # this case isolates the Mooncake PD KV transfer path.
     "--enable-hierarchical-cache",
@@ -196,14 +194,7 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    "--speculative-algorithm",
-    "NEXTN",
-    "--speculative-num-steps",
-    3,
-    "--speculative-eagle-topk",
-    1,
-    "--speculative-num-draft-tokens",
-    4,
+    # No NEXTN here either, so prefill and decode register the same KV entries.
     "--enable-cache-report",
 ]
 
@@ -219,8 +210,10 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_MOONCAKE_TRANSFER(
     # This case exists to exercise the Mooncake PD KV transfer end to end, not
     # the HiCache tiers, so no hit-rate baseline is asserted. Prefill is pure DP
     # attention (32 DP ranks), which spreads one prompt per rank and would make
-    # a prefix-reuse threshold meaningless. assert_metrics still fails the case
-    # if the bench produces no metrics.
+    # a prefix-reuse threshold meaningless. The test instead requires the bench
+    # to actually complete (see test body): assert_metrics alone cannot catch a
+    # failed bench because run_bench_serving always returns a dict, with None
+    # values when the run aborted.
     min_hit_rate_pcts = {}
 
     @classmethod
@@ -270,6 +263,15 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_MOONCAKE_TRANSFER(
             warmup_requests=16,
             cache_report=True,
         )
+        # run_bench_serving returns a dict with None values when the bench
+        # aborts (e.g. warmup failure), which assert_metrics would not reject
+        # since the dict is non-empty. Require the measured throughput instead.
+        self.assertIsNotNone(
+            metrics.get("total_tps"),
+            "bench did not complete: no output throughput parsed; "
+            "check the router log for request failures",
+        )
+        self.assertGreater(float(metrics["total_tps"]), 0)
         assert_metrics(self, metrics)
 
 
