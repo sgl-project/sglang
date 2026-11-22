@@ -3919,7 +3919,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
+            # Parked hits first, in line order (buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
                 while parked:
@@ -4157,6 +4157,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # What this rank wrote of the agreed prefix.
             collector.log_backuped_tokens(
                 min(operation.completed_tokens, agreed_tokens)
+            )
+            collector.observe_backup_storage_duration(
+                time.perf_counter() - operation.enqueue_time
             )
             if short:
                 collector.log_storage_backup_failed_tokens(

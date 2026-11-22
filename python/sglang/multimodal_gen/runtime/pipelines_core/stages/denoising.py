@@ -2757,6 +2757,10 @@ class DenoisingStage(PipelineStage):
         Args:
             batch: The current batch information.
         """
+        artifact_id = batch.extra.get("sta_search_artifact_id")
+        if artifact_id is None:
+            logger.warning("Skipping STA calibration export: no search artifact ID")
+            return
         size = (batch.width, batch.height)
         if size == (1280, 768):
             # TODO: make it configurable
@@ -2776,14 +2780,14 @@ class DenoisingStage(PipelineStage):
         if batch.mask_search_final_result_pos is not None and batch.prompt is not None:
             save_mask_search_results(
                 [dict(layer_data) for layer_data in batch.mask_search_final_result_pos],
-                prompt=str(batch.prompt),
+                artifact_id=artifact_id,
                 mask_strategies=sparse_mask_candidates_searching,
                 output_dir=f"output/mask_search_result_pos_{size[0]}x{size[1]}/",
             )
         if batch.mask_search_final_result_neg is not None and batch.prompt is not None:
             save_mask_search_results(
                 [dict(layer_data) for layer_data in batch.mask_search_final_result_neg],
-                prompt=str(batch.prompt),
+                artifact_id=artifact_id,
                 mask_strategies=sparse_mask_candidates_searching,
                 output_dir=f"output/mask_search_result_neg_{size[0]}x{size[1]}/",
             )
