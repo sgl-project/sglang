@@ -1127,7 +1127,8 @@ class Scheduler(
             self.draft_worker.init_hicache_draft_plan()
             if get_disagg().disaggregation_decode_retraction_backup == "cpu_tensor":
                 allocator.register_retraction_draft_pools(
-                    self.draft_worker.retraction_draft_pools()
+                    self.draft_worker.retraction_draft_pools(),
+                    supported=self.draft_worker.supports_cpu_retraction_backup(),
                 )
 
     def init_all_attention_backends(self):

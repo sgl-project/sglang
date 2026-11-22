@@ -338,31 +338,51 @@ class BaseSpecWorker(ABC):
     def init_hicache_draft_plan(self) -> None:
         self._hicache_draft_plan = self._build_hicache_draft_plan()
 
-    def retraction_draft_pools(self) -> tuple:
-        """Draft KV pools PD CPU retraction backs up with the target KV.
-
-        Only full-slot MHA pools with tensors of their own qualify: a fused
-        draft already lives in the target pool, MLA pools localize token ids to
-        this DCP rank's rows, and the page-major layout has no CPU copy.
-        """
+    def _classify_retraction_draft_pools(self) -> tuple[tuple, bool]:
         from sglang.srt.mem_cache.memory_pool import (
             MHATokenToKVPool,
+            MLATokenToKVPool,
+            MLATokenToKVPoolFP4,
+            NoOpMHATokenToKVPool,
             PageMajorMHATokenToKVPool,
         )
 
         target_pool = self.target_worker.model_runner.token_to_kv_pool
         pools = []
+        supported = True
         for runner in self._draft_model_runners():
             pool = runner.token_to_kv_pool
             if (
-                not runner.runner_ids.is_fused_draft
-                and pool is not target_pool
-                and pool not in pools
-                and isinstance(pool, MHATokenToKVPool)
-                and not isinstance(pool, PageMajorMHATokenToKVPool)
+                pool is None
+                or runner.runner_ids.is_fused_draft
+                or pool is target_pool
+                or isinstance(pool, NoOpMHATokenToKVPool)
             ):
-                pools.append(pool)
-        return tuple(pools)
+                continue
+            if isinstance(
+                pool, (MHATokenToKVPool, MLATokenToKVPool)
+            ) and not isinstance(
+                pool, (PageMajorMHATokenToKVPool, MLATokenToKVPoolFP4)
+            ):
+                if pool not in pools:
+                    pools.append(pool)
+            else:
+                supported = False
+        return tuple(pools), supported
+
+    def retraction_draft_pools(self) -> tuple:
+        """Draft KV pools PD CPU retraction backs up with the target KV.
+
+        Separate MHA and MLA pools indexed by the target's token slots qualify;
+        fused drafts and drafts sharing the target pool are already covered.
+        """
+        pools, _ = self._classify_retraction_draft_pools()
+        return pools
+
+    def supports_cpu_retraction_backup(self) -> bool:
+        """Whether every separate draft pool supports CPU-tensor retraction."""
+        _, supported = self._classify_retraction_draft_pools()
+        return supported
 
     def _wait_for_fused_hicache_load(self, batch) -> None:
         if (

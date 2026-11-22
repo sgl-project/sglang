@@ -382,6 +382,10 @@ def backup_kv_cache(
         torch.get_device_module(device).synchronize(device)
         return True
     if backend == "cpu_tensor":
+        if not getattr(
+            token_to_kv_pool_allocator, "retraction_draft_pools_supported", True
+        ):
+            return False
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
     if backend != "host_pool":

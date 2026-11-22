@@ -54,9 +54,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # PD CPU retraction backs them up with the target KV. Class-level: some
     # allocators do not call the base __init__.
     retraction_draft_pools: tuple[KVCache, ...] = ()
+    retraction_draft_pools_supported: bool = True
 
-    def register_retraction_draft_pools(self, pools: tuple[KVCache, ...]) -> None:
+    def register_retraction_draft_pools(
+        self, pools: tuple[KVCache, ...], *, supported: bool = True
+    ) -> None:
         self.retraction_draft_pools = pools
+        self.retraction_draft_pools_supported = supported
 
     @property
     def state_slots(self):
