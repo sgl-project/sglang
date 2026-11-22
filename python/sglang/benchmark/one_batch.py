@@ -518,6 +518,7 @@ def extend(reqs, model_runner):
     batch.sampling_info.set_sampler_params(
         sampler_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu)
     )
+    batch.sampling_info.set_plugin_state(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     if (
         batch.input_ids is None

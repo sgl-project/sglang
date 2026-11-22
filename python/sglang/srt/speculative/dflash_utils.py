@@ -16,14 +16,13 @@ from sglang.kernels.ops.speculative.verify_sampling import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import (
-    apply_custom_logit_processor,
-    top_p_normalize_probs_torch,
-)
+from sglang.srt.layers.sampler import top_p_normalize_probs_torch
 from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
+from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
@@ -251,17 +250,8 @@ def apply_dflash_verify_logits_adjustments(
         )
 
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
-    logit_bias = getattr(sampling_info, "logit_bias", None)
 
-    logits_3d: Optional[torch.Tensor] = None
-
-    def get_logits_3d() -> torch.Tensor:
-        nonlocal logits_3d
-        if logits_3d is None:
-            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
-        return logits_3d
-
-    # Same order as SamplingBatchInfo.apply_logits_bias.
+    # Same order as SamplingPipeline.
     if sampling_info.step_penalties is not None:
         sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
 
@@ -272,21 +262,15 @@ def apply_dflash_verify_logits_adjustments(
             device=next_token_logits.device,
         )
         grammar_mask.apply(vocab_mask_bias)
-        get_logits_3d().add_(
+        next_token_logits.reshape(bs, draft_token_num, -1).add_(
             vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
         )
 
-    if logit_bias is not None:
-        # In the bias's own dtype, so the sum rounds once to the logits dtype.
-        get_logits_3d().add_(logit_bias.to(device=next_token_logits.device)[:, None, :])
+    apply_logit_bias(next_token_logits, sampling_info, rows_per_request=draft_token_num)
 
-    # Last, as Sampler applies it after ModelRunner._preprocess_logits.
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
-        )
+    apply_custom_logit_processor(
+        next_token_logits, sampling_info, rows_per_request=draft_token_num
+    )
 
 
 def commit_block_accept_tokens_to_penalties(
