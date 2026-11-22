@@ -1882,6 +1882,14 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
+        if model_config.quantization == "fp8":
+            from sglang.srt.environ import envs
+            from sglang.srt.layers.quantization.fp8_utils import _use_aiter_gfx942
+
+            # gfx942 FP8 weights are preshuffled on the CK path; a cache dumped with the
+            # plain layout must not match, or reload would read it as preshuffled.
+            if _use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get():
+                shard_config["aiter_gfx942_bpreshuffle"] = True
         return shard_config
 
     @staticmethod

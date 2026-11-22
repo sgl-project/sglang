@@ -1533,6 +1533,10 @@ class Fp8LinearMethod(LinearMethodBase):
             extra_kwargs = (
                 {"weight_bf16": cached_weight} if cached_weight is not None else {}
             )
+            # The layer records the gfx942 preshuffle; the weight tensor can be a copy
+            # without its attributes (CPU offload), so read the flag from the layer.
+            if _use_aiter_gfx942 and getattr(layer, "aiter_bpreshuffled", False):
+                extra_kwargs["bpreshuffled"] = True
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],

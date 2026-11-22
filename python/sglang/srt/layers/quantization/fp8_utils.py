@@ -1999,6 +1999,7 @@ def aiter_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    bpreshuffled: bool = False,
 ) -> torch.Tensor:
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
@@ -2059,10 +2060,8 @@ def aiter_w8a8_block_fp8_linear(
         return output.to(dtype=out_dtype).view(*output_shape)
 
     n, k = weight.shape
-    # gfx942: a weight preshuffled at load (Fp8LinearMethod) takes the bpreshuffle GEMM.
-    use_bp_gemm = _use_aiter_bpreshuffle_gfx95 or (
-        _use_aiter_gfx942 and getattr(weight, "is_shuffled", False)
-    )
+    # gfx942: Fp8LinearMethod passes bpreshuffled for a weight it preshuffled at load.
+    use_bp_gemm = _use_aiter_bpreshuffle_gfx95 or bpreshuffled
 
     # decode-sized M on gfx950: the 1x128 activation quant fused into the GEMM
     if _use_aiter_bpreshuffle_gfx95 and input_scale is None and bias is None:
