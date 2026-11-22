@@ -1618,5 +1618,156 @@ class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
         inner_grammar.accept_token.assert_not_called()
 
 
+class TestTextReasoningBoundary(CustomTestCase):
+    """A textual closer must switch the gate even when its token holds answer bytes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from xgrammar import VocabType
+
+        cls.vocab = [bytes([i]) for i in range(256)] + [
+            b"</",
+            b"reason",
+            b">\n",
+            b">\n\n",
+            b">\n{",
+            b">x",
+            b"body</reason>{",
+            b'>"\xe4',
+            b"<eos>",
+            b"END\n",
+            b">" + b"\n" * 256,
+            b">" + b"\n" * 256 + b"x",
+        ]
+        cls.end_ids = [256, 257, ord(">")]
+        info = TokenizerInfo(cls.vocab, VocabType.RAW, stop_token_ids=[264])
+        cls.tokenizer = SimpleNamespace(
+            init_xgrammar=lambda: (info, None),
+            encode=lambda text, add_special_tokens=False: (
+                cls.end_ids if text == "</reason>" else list(text.encode())
+            ),
+            decode=lambda ids, **kwargs: b"".join(cls.vocab[i] for i in ids).decode(
+                errors="replace"
+            ),
+            response_template={
+                "start_anchor": "<assistant>",
+                "fields": {
+                    "thinking": {"open": "<reason>", "close": "</reason>"},
+                    "content": {},
+                },
+            },
+        )
+        cls.inner = XGrammarGrammarBackend(cls.tokenizer, len(cls.vocab))
+
+    def _make(self, regex=r"\n*\{\}", strict=False):
+        parser = SimpleNamespace(
+            detector=ResponseTemplateReasoningDetector(tokenizer=self.tokenizer)
+        )
+        backend = ReasonerGrammarBackend(
+            self.inner, parser, self.tokenizer, enable_strict_thinking=strict
+        )
+        return backend._init_value_dispatch(("regex", regex), True)
+
+    def _allowed(self, obj, ids):
+        mask = torch.full((1, (len(self.vocab) + 31) // 32), -1, dtype=torch.int32)
+        obj.fill_vocab_mask(mask, 0)
+        return _allowed_token_ids(mask, ids)
+
+    def _accept(self, obj, ids):
+        for token in ids:
+            self.assertEqual(self._allowed(obj, [token]), [token])
+            obj.accept_token(token)
+
+    def test_merged_newline_and_alternate_segmentation_end_reasoning(self):
+        for ending in (
+            self.end_ids,
+            [256, 257, 258],
+            [256, 257, 259],
+            list(b"</reason>"),
+        ):
+            with self.subTest(ending=ending):
+                obj = self._make()
+                self._accept(obj, ending)
+                self.assertTrue(obj._is_generation())
+                self.assertEqual(self._allowed(obj, [ord("{"), ord("x")]), [ord("{")])
+
+    def test_suffix_is_consumed_not_discarded(self):
+        obj = self._make(r"\n{2}\{\}")
+        self._accept(obj, [256, 257, 259])
+        self.assertEqual(self._allowed(obj, [ord("{"), ord("\n")]), [ord("{")])
+
+    def test_invalid_suffix_is_masked_before_sampling(self):
+        obj = self._make()
+        self._accept(obj, [256, 257])
+        self.assertEqual(self._allowed(obj, [258, 259, 260, 261]), [258, 259, 260])
+
+    def test_full_closer_inside_one_token_replays_answer_prefix(self):
+        obj = self._make()
+        self._accept(obj, [262])
+        self.assertTrue(obj._is_generation())
+        self.assertEqual(self._allowed(obj, [ord("}"), ord("{")]), [ord("}")])
+
+    def test_suffix_preserves_incomplete_utf8(self):
+        obj = self._make('"中"')
+        self._accept(obj, [256, 257, 263])
+        self.assertTrue(obj._is_generation())
+        self._accept(obj, list(b'\xb8\xad"'))
+
+    def test_rollback_across_boundary_restores_suffix_and_match(self):
+        obj = self._make(r"\n{2}\{\}")
+        self._accept(obj, [256, 257, 259, ord("{")])
+        obj.rollback(2)
+        self.assertTrue(obj._is_thinking())
+        self._accept(obj, [259])
+        self.assertEqual(self._allowed(obj, [ord("{"), ord("\n")]), [ord("{")])
+
+    def test_copy_after_boundary_preserves_inner_state(self):
+        obj = self._make(r"\n{2}\{\}")
+        self._accept(obj, [256, 257, 259])
+        cloned = obj.copy()
+        self.assertEqual(self._allowed(cloned, [ord("{"), ord("\n")]), [ord("{")])
+        self._accept(cloned, [ord("{")])
+        self.assertEqual(self._allowed(obj, [ord("{"), ord("}")]), [ord("{")])
+
+    def test_shared_prefix_mismatch_does_not_end_reasoning(self):
+        obj = self._make()
+        self._accept(obj, list(b"</reasox>"))
+        self.assertTrue(obj._is_thinking())
+        self._accept(obj, [256, 257, 258])
+        self.assertTrue(obj._is_generation())
+
+    def test_request_terminator_rebuilds_text_matcher(self):
+        obj = self._make()
+        obj.set_request_think_end_ids(list(b"END"))
+        self._accept(obj, [265])
+        self.assertTrue(obj._is_generation())
+        self.assertEqual(self._allowed(obj, [ord("{"), ord("x")]), [ord("{")])
+
+    def test_budget_forces_canonical_end_without_widening_mask(self):
+        with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "2"}):
+            obj = self._make(strict=True)
+        self._accept(obj, list(b"ab"))
+        for token in self.end_ids:
+            self.assertEqual(self._allowed(obj, [token, ord("x")]), [token])
+            obj.accept_token(token)
+        self.assertEqual(self._allowed(obj, [ord("{"), ord("x")]), [ord("{")])
+
+    def test_framed_grammar_does_not_consume_suffix_twice(self):
+        obj = self._make(r"<reason>x</reason>\n\{\}")
+        obj.set_reasoning_in_grammar()
+        self._accept(obj, list(b"<reason>x") + [256, 257, 258])
+        self.assertTrue(obj._is_generation())
+        self._accept(obj, list(b"{}"))
+
+    def test_long_suffix_probe_and_boundary_rollback(self):
+        obj = self._make()
+        self._accept(obj, [256, 257])
+        self.assertEqual(self._allowed(obj, [266, 267]), [266])
+        self._accept(obj, [266, ord("{")])
+        obj.rollback(2)
+        self.assertTrue(obj._is_thinking())
+        self._accept(obj, [259, ord("{")])
+
+
 if __name__ == "__main__":
     unittest.main()
