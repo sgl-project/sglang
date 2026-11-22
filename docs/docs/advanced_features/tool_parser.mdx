@@ -78,6 +78,11 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`minicpm5`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>MiniCPM5 models with XML tool calls (e.g., `openbmb/MiniCPM5-2B`)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Parses `<function>` and `<param>` tags and recovers missing parameter closing tags in complete function blocks.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`mistral`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mistral (e.g. `mistralai/Mistral-7B-Instruct-v0.3`, `mistralai/Mistral-Nemo-Instruct-2407`, `mistralai/Mistral-7B-v0.3`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
@@ -111,6 +116,12 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
 </table>
 
 
+
+### MiniCPM5 Responses tools
+
+For MiniCPM5-15B-A2.5B (`model_type` is `minicpm5_moe`), launch with `--tool-call-parser minicpm5` to use namespace and custom tools with `/v1/responses`. Responses and streaming events use the public tool names.
+
+To reuse tools found by client-side search, include the `tool_search_output` items in `input`. You can also continue a stored response with `previous_response_id` when the server is launched with `--enable-response-store`. SGLang collects new members from repeated searches in the same namespace. Tool definitions you supply in `tools` take precedence over matching search results.
 
 ## OpenAI Compatible API
 
