@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
+    GPTQConfig,
     GPTQMarlinConfig,
     GPTQXPUConfig,
 )
@@ -52,6 +53,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
     is_xpu,
@@ -59,8 +61,11 @@ from sglang.srt.utils import (
 
 _is_gfx95_supported = is_gfx95_supported()
 
+from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
+    "inkling2": Inkling2QuantConfig,
     "fp8": Fp8Config,
     "mxfp8": Fp8Config,
     "minimax_m3_nvfp4": MiniMaxM3Nvfp4Config,
@@ -124,6 +129,14 @@ if is_cpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": CPUGPTQConfig,
+        }
+    )
+
+
+if is_hip():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQConfig,
         }
     )
 

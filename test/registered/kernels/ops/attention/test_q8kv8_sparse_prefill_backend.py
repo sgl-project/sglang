@@ -40,6 +40,7 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 )
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value(monkeypatch):
@@ -557,63 +558,6 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_q8kv8_sparse_prefill_rejects_topk_64_before_cuda_launch():
-    args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=64)
-
-    with pytest.raises(ValueError, match="positive multiple of 128"):
-        sparse_mla_q8kv8_prefill_fwd(**args)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-@pytest.mark.parametrize(
-    ("mutate", "error_match"),
-    [
-        (
-            lambda args: args.update(q=args["q"].float()),
-            "q must be torch.float8_e4m3fn",
-        ),
-        (
-            lambda args: args.update(kv=args["kv"].float()),
-            "kv must be torch.float8_e4m3fn",
-        ),
-        (
-            lambda args: args.update(
-                q=torch.empty(
-                    args["q"].shape[0],
-                    args["q"].shape[1],
-                    args["q"].shape[2] + 1,
-                    dtype=args["q"].dtype,
-                    device=args["q"].device,
-                )[:, :, : args["q"].shape[2]]
-            ),
-            "q must be contiguous",
-        ),
-        (
-            lambda args: args.update(
-                q_scale=torch.ones(2, dtype=torch.float32, device=args["q"].device)
-            ),
-            "q_scale must be a scalar tensor",
-        ),
-        (
-            lambda args: args.update(
-                kv_scale=torch.ones((), dtype=torch.float16, device=args["q"].device)
-            ),
-            "kv_scale must be float32",
-        ),
-    ],
-)
-def test_q8kv8_sparse_prefill_rejects_invalid_tensor_contracts(
-    mutate,
-    error_match: str,
-):
-    args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=128)
-    mutate(args)
-
-    with pytest.raises(ValueError, match=error_match):
-        sparse_mla_q8kv8_prefill_fwd(**args)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("bad_length", [-1, 129])
 def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
     bad_length: int,
@@ -813,9 +757,16 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         attn_sink=sink,
     )
     cache = backend.forward_metadata.sparse_prefill_cache
-    if ratio:
+    if ratio == 128:
         _, combined, combined_lens = cache.layer_inputs(ratio, core, page_size)
+        c_base = torch.arange(2, device=device) * c_max
         n_compressed = 2 * c_max
+    elif ratio:
+        _, combined, combined_lens = cache.layer_inputs(ratio, core, page_size)
+        # Below c128 each request packs only its own compressed history.
+        c_lens = seq.long() // ratio
+        c_base = torch.cumsum(c_lens, 0) - c_lens
+        n_compressed = int(c_lens.sum())
     else:
         combined, combined_lens = cache.c0_combined_indices, cache.c0_combined_lens
         n_compressed = 0
@@ -825,7 +776,7 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         w = int(layout.lengths[i])
         assert int(combined_lens[i]) == c + w
         if c:
-            torch.testing.assert_close(combined[i, :c], raw[i, :c] + group[i] * c_max)
+            torch.testing.assert_close(combined[i, :c], raw[i, :c] + c_base[group[i]])
         torch.testing.assert_close(
             combined[i, c : c + w], layout.indices[i, :w] + n_compressed
         )

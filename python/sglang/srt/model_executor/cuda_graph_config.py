@@ -281,21 +281,3 @@ def parse_cuda_graph_config_arg(raw: str) -> Dict[str, Dict[str, Any]]:
                 )
             result[phase][key] = value
     return result
-
-
-def explicit_keys_in(
-    settings: Optional[Dict[str, Dict[str, Any]]],
-) -> set:
-    """Return the set of (phase, key) tuples present in settings
-    (the raw dict form, as it arrives from CLI/SDK). Used by ServerArgs
-    to track keys the user explicitly set so the auto-disable cascade can
-    skip them."""
-    out: set = set()
-    if not settings:
-        return out
-    for phase, phase_settings in settings.items():
-        if not isinstance(phase_settings, dict):
-            continue
-        for key in phase_settings.keys():
-            out.add((phase, key))
-    return out

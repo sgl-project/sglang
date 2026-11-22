@@ -35,11 +35,11 @@ from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
 
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

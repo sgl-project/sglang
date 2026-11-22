@@ -9,8 +9,8 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType, parse_connector_type
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_config
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.hf_transformers import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +43,15 @@ def apply_muse_spark_env_defaults(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
+    config_kwargs = {}
+    if cfg.decrypted_config_file and cfg.decrypted_config_file.strip():
+        config_kwargs["_configuration_file"] = cfg.decrypted_config_file.strip()
     hf_config = get_config(
         cfg.model_path,
         trust_remote_code=cfg.trust_remote_code,
         revision=cfg.revision,
         model_config_parser=cfg.model_config_parser,
+        **config_kwargs,
     )
     arch = _muse_spark_arch_of(hf_config)
     if arch is None:

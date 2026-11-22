@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
 HOSTNAME_VALUE=$(hostname)
@@ -31,6 +34,12 @@ declare -A ENV_MAP=(
 # Conditionally add GPU_ARCHS only for mi35x
 if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
   ENV_MAP[GPU_ARCHS]="gfx950"
+fi
+
+# The download-sgl-router action puts the binary in the workspace, which the
+# container mounts at /sglang-checkout.
+if [[ -n "${SGLANG_TEST_PD_ROUTER_BINARY:-}" && -n "${GITHUB_WORKSPACE:-}" ]]; then
+  ENV_MAP[SGLANG_TEST_PD_ROUTER_BINARY]="/sglang-checkout${SGLANG_TEST_PD_ROUTER_BINARY#"${GITHUB_WORKSPACE}"}"
 fi
 
 # Parse -w/--workdir and -e ENV=VAL
@@ -69,7 +78,7 @@ done
 if docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
-  ci_sglang "$@"; then
+  "$CI_CONTAINER_NAME" "$@"; then
   exit 0
 else
   FIRST_EXIT_CODE=$?
@@ -94,4 +103,4 @@ docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
   -e HF_HUB_OFFLINE=1 \
-  ci_sglang "$@"
+  "$CI_CONTAINER_NAME" "$@"

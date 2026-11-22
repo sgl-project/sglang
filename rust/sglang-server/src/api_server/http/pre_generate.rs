@@ -104,7 +104,10 @@ pub mod test_support {
                 multimodal: false,
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
                 peer_endpoints: Vec::new(),
+                generate_validator: None,
+                abort_hook: None,
             },
         );
         let app = app.layer(Extension(PreGenerateCore(core.clone())));
@@ -178,7 +181,10 @@ mod tests {
                 multimodal: false,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
+                request_log: None,
                 peer_endpoints: Vec::new(),
+                generate_validator: None,
+                abort_hook: None,
             },
         );
         let state = Arc::new(AppState {

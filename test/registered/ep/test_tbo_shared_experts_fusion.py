@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -38,14 +37,11 @@ class TestTBOWithSharedExpertsFusion(CustomTestCase):
                 "deepep",
                 "--enable-two-batch-overlap",
                 "--enforce-shared-experts-fusion",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
                 "--max-running-requests",
                 "512",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod
