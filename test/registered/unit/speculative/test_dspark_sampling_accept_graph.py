@@ -38,8 +38,7 @@ def _sampling_info(**overrides):
         need_top_k_sampling=False,
         need_top_p_sampling=False,
         has_custom_logit_processor=False,
-        acc_linear_penalties=None,
-        penalizer_orchestrator=None,
+        step_penalties=None,
         grammar_mask=None,
         logit_bias=None,
     )

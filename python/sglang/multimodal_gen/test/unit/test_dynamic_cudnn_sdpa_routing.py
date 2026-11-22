@@ -5,6 +5,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
     SDPAImpl,
@@ -39,6 +42,7 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
         is_sm100: bool = True,
         *,
         graph: bool = False,
+        replay: bool = False,
         quality: str = "lossless",
     ) -> bool:
         impl = SimpleNamespace(
@@ -47,6 +51,7 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
         with (
             set_forward_context(0, None, quality=quality),
             enable_breakable_cuda_graph() if graph else nullcontext(),
+            replay_token_scope() if replay else nullcontext(),
         ):
             return DynamicCudnnSDPAImpl._use_cudnn_sdpa(
                 impl, *_qkv(q_len, kv_len, kv_heads=kv_heads)
@@ -64,6 +69,9 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
     def test_blackwell_keeps_cudnn_when_both_sides_fill_a_tile(self):
         for q_len, kv_len in ((128, 128), (1536, 1024), (6144, 6144), (192, 6144)):
             self.assertTrue(self._uses_cudnn(q_len, kv_len), (q_len, kv_len))
+            self.assertTrue(
+                self._uses_cudnn(q_len, kv_len, replay=True), (q_len, kv_len)
+            )
 
     def test_blackwell_subtile_route_depends_on_execution_mode(self):
         for q_len, kv_len in ((126, 1024), (1536, 126), (126, 1536), (32, 4096)):
@@ -71,7 +79,10 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
             self.assertFalse(
                 self._uses_cudnn(q_len, kv_len, graph=True), (q_len, kv_len)
             )
-            # Graph breaks replay eagerly after leaving the capture scope.
+            # a replay's eager breaks run outside the capture scope
+            self.assertFalse(
+                self._uses_cudnn(q_len, kv_len, replay=True), (q_len, kv_len)
+            )
             self.assertTrue(self._uses_cudnn(q_len, kv_len), (q_len, kv_len))
 
     def test_blackwell_keeps_cudnn_when_both_sides_are_short(self):
