@@ -574,7 +574,15 @@ def _chunk_scan_fwd_kernel(
             # column, so this is one more matmul-shaped reduction of the same
             # (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) shape as dot_raw/dot_safe
             # below, not a dot per sequence segment.
-            own_has_nonfinite = tl.dot(same_seq_mk.to(tl.float32), nonfinite_x) > 0.0
+            #
+            # Only count columns row m can actually read: with IS_CAUSAL, a column
+            # k > m is already zeroed in cb (cb is where-masked below), so a non-
+            # finite x there, even in the row's own sequence, is a future token
+            # and must not select dot_raw (where 0 * nan would reach row m).
+            own_k = same_seq_mk
+            if IS_CAUSAL:
+                own_k = own_k & (offs_m[:, None] >= k + offs_k[None, :])
+            own_has_nonfinite = tl.dot(own_k.to(tl.float32), nonfinite_x) > 0.0
             dot_raw = tl.dot(cb, x)
             dot_safe = tl.dot(cb, x_safe)
             acc += tl.where(own_has_nonfinite, dot_raw, dot_safe)

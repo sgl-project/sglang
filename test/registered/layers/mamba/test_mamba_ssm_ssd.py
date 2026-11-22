@@ -1097,7 +1097,16 @@ def test_mamba_chunk_scan_offender_x_matches_its_own_standalone_run():
     def classify(t):
         return torch.isnan(t), torch.isposinf(t), torch.isneginf(t)
 
-    for packed_flag, alone_flag in zip(classify(packed_out), classify(alone_out)):
+    # Compare from the offending token on. Tokens before it are causally
+    # independent of it, but the unpacked kernel itself turns them non-finite
+    # when they share a chunk with the offender (0 * inf through tl.dot with the
+    # causal-masked cb), and that depends on where chunk boundaries fall, which
+    # differs between packed and standalone runs. The packed run keeps them
+    # finite; see test_mamba_chunk_scan_future_nonfinite_does_not_reach_earlier_token.
+    first = offender[1]
+    for packed_flag, alone_flag in zip(
+        classify(packed_out[:, first:]), classify(alone_out[:, first:])
+    ):
         assert torch.equal(packed_flag, alone_flag), (
             "request 0's own non-finite classification diverged from its standalone run"
         )
@@ -1276,6 +1285,79 @@ def test_mamba_chunk_scan_isolates_nonfinite_channel_from_other_request():
     )
     assert not packed_out[:, len_a:, :, chan_b].isfinite().all(), (
         "request B's own non-finite channel must still surface as non-finite"
+    )
+
+
+def test_mamba_chunk_scan_future_nonfinite_does_not_reach_earlier_token():
+    """BBuf review (PR 51342): lengths [1, 257, 1] with chunk_size 256 put the
+    middle request's tokens 255 and 256 in the same physical chunk (global
+    positions 256 and 257) alongside a sequence boundary. A non-finite x at
+    token 256 is a FUTURE token for token 255: it is already zeroed in cb by the
+    causal mask, but a non-causal ownership flag still counted it and picked
+    `dot_raw` for token 255, where 0 * nan made a token that is finite when run
+    alone non-finite only when packed. Token 255 must match its standalone run;
+    token 256 itself must still surface as non-finite.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state, chunk_size = 1, 8, 8, 256
+    lens = [1, 257, 1]
+    total = sum(lens)
+    mid_start = lens[0]
+
+    gen = torch.Generator(device=device).manual_seed(11)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.rand(1, total, n_heads, device=device, generator=gen) * 0.1 + 0.01
+    A = -(torch.rand(n_heads, device=device, generator=gen) + 0.5)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    x[0, mid_start + 256, 0, 3] = torch.nan  # middle request's token 256
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, lens[0], lens[0] + lens[1], total], dtype=torch.int32, device=device
+    )
+
+    packed_out = torch.empty_like(x)
+    mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    sl = slice(mid_start, mid_start + lens[1])
+    alone_out = torch.empty_like(x[:, sl])
+    mamba_chunk_scan_combined(
+        x[:, sl], dt[:, sl], A, B[:, sl], C[:, sl], chunk_size, out=alone_out
+    )
+
+    assert alone_out[0, 255].isfinite().all(), "premise: token 255 finite alone"
+    assert packed_out[0, mid_start + 255].isfinite().all(), (
+        "future nan at token 256 leaked into token 255 only when packed"
+    )
+    torch.testing.assert_close(
+        packed_out[0, mid_start + 255],
+        alone_out[0, 255],
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    assert not packed_out[0, mid_start + 256].isfinite().all(), (
+        "the offending token itself must still surface as non-finite"
+    )
+    assert packed_out[0, mid_start + lens[1]].isfinite().all(), (
+        "the third request must stay finite"
     )
 
 
