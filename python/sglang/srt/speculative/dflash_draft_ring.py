@@ -36,9 +36,30 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_spec,
+)
 
 DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
+
+
+def dflash_dcp_mla_draft_backend() -> str:
+    """The draft backend of a DFLASH MLA draft under DCP; on gfx950, triton's
+    rank-local MLA window verify."""
+    return "triton" if get_platform().is_gfx95 else "cutedsl_mla"
+
+
+def dflash_draft_reads_rows_by_position(
+    draft_backend: Optional[str], dcp_size: int
+) -> bool:
+    """Whether an MLA draft on ``draft_backend`` reads its ``req_to_token`` rows by
+    absolute position, as the MLA-only backends do."""
+    return draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS or (
+        dcp_size > 1 and draft_backend == dflash_dcp_mla_draft_backend()
+    )
 
 
 def draft_kv_ring_unsupported_reason(
@@ -76,7 +97,7 @@ def draft_kv_ring_unsupported_reason(
             draft_window_size=draft_window_size,
             is_cuda=is_cuda,
         )
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if not dflash_draft_reads_rows_by_position(draft_backend, dcp_size):
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:
         return "--speculative-draft-window-size keeps the compact draft table"

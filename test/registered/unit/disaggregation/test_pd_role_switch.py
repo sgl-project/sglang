@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
@@ -502,7 +503,8 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         m._socket_lock = threading.Lock()
         m._socket_cache = {}
         m._monitor_cache = {}
-        m.engine = MagicMock()
+        m.transport = MagicMock()
+        m.request_status = MagicMock(spec=PPConsensusStore)
         # Built from KVArgs' own annotations: teardown walks several ptr/len
         # pairs, and hardcoding them here goes stale every time one is added.
         from sglang.srt.disaggregation.base.conn import KVArgs
@@ -526,6 +528,7 @@ class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
         self.assertEqual(m._worker_threads, [])
         self.assertEqual(m.transfer_queues, [])
         self.assertEqual(m.executors, [])
+        m.request_status.close.assert_called_once_with()
 
 
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")

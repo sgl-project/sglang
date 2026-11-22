@@ -59,7 +59,8 @@ class TestDPAttentionDP2TP2(
                 "2",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 
@@ -171,7 +172,8 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
                 "2",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 

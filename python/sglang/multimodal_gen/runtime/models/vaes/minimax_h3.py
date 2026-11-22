@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
     get_tile_parallel_state,
+    tile_owners,
 )
 
 
@@ -127,16 +128,15 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
                 and tile_indices == list(range(len(tiles)))
             )
             if parallel_decode:
-                tile_indices = self._local_tile_indices(
-                    len(tiles), tile_rank, tile_world_size
-                )
+                owners = tile_owners(len(tiles), tile_world_size)
+                tile_indices = self._local_tile_indices(owners, tile_rank)
             # Stack up to 128 samples of tiles per decoder forward.
             chunk_size = max(1, 128 // tiles[0].shape[0])
             outputs = super()._run_tile_tasks(
                 tiles, tile_indices, forward_fn, cls_agg, tile_batch=chunk_size
             )
             if parallel_decode:
-                return self._all_gather_tiled_results(outputs, len(tiles))
+                return self._all_gather_tiled_results(outputs, owners)
             return outputs
         return super()._run_tile_tasks(
             tiles, tile_indices, forward_fn, cls_agg, tile_batch=tile_batch

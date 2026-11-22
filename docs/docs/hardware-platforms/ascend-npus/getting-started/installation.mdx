@@ -289,8 +289,8 @@ We provide SGL kernels for Ascend NPU, check [installation guide](https://github
 <Note>
 Gemma-family models (including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`,
 whose implementation is chosen when the wheel is built: the native `torch_npu`
-operator for A2/A3 series, and ACLNN RMSNorm for 950PR/DT series, which does not
-register that operator. **950PR/DT series must install the `950` release
+operator for A2/A3 Series, and ACLNN RMSNorm for 950PR/DT Series, which does not
+register that operator. **950PR/DT Series must install the `950` release
 package** (`950` appears in the asset name), or build from source with
 `bash build.sh -a kernels Ascend950PR_9599`, the target that package is built
 with. On 950PR/DT, an `a2` or `a3` package fails on the first Gemma forward,
