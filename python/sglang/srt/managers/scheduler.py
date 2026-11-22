@@ -400,6 +400,7 @@ from sglang.srt.rust_server.server import (
 )
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -5472,6 +5473,9 @@ class Scheduler(
         if self.is_generation:
             batch.sampling_info.step_penalties = StepPenalties.build(
                 batch.reqs, self.penalty_status_pool
+            )
+            batch.sampling_info.watermark = build_watermark_rows(
+                batch.reqs, batch.device
             )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2

@@ -23,11 +23,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.penalties import StepPenalties, apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.watermarking.interface import (
-    WatermarkRows,
-    merge_watermark_rows,
-)
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
+from sglang.srt.sampling.watermarking.interface import WatermarkRows
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import print_warning_once
 
@@ -155,7 +151,8 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    # Per-row watermark policy; None unless some row is a watermark candidate.
+    # Per-row watermark policy, None unless some row is a watermark candidate;
+    # set by the scheduler at each launch.
     watermark: Optional[WatermarkRows] = None
 
     # Device
@@ -263,13 +260,6 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-        watermark = (
-            build_watermark_rows(reqs, device)
-            if isinstance(batch, ScheduleBatch)
-            else None
-        )
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -324,7 +314,6 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
-            watermark=watermark,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -471,9 +460,6 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
-        if self.watermark is not None:
-            self.watermark = self.watermark.filter(keep_indices, keep_indices_device)
-
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
         if self.return_sampling_masks is not None:
@@ -613,10 +599,6 @@ class SamplingBatchInfo:
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
-        self.watermark = merge_watermark_rows(
-            self.watermark, other.watermark, self_len, other_len
-        )
-
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
@@ -681,6 +663,26 @@ class SamplingBatchInfo:
         else:
             new = dataclasses.replace(self)
         return new
+
+
+def adjusts_logits(info: SamplingBatchInfo, *, has_grammar: bool) -> bool:
+    """Whether sampling edits the logits before choosing tokens. has_grammar comes
+    from the batch: verify builds its grammar mask per step, outside the sampling info.
+    """
+    return (
+        has_grammar
+        or info.step_penalties is not None
+        or info.logit_bias is not None
+        or info.has_custom_logit_processor
+        or info.watermark is not None
+    )
+
+
+def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
+    """Whether some row truncates its distribution with top-k, top-p, or min-p."""
+    return (
+        info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
+    )
 
 
 @cache
