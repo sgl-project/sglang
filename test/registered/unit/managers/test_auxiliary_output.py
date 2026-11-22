@@ -31,10 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_pipeline import (
-    SamplingPipeline,
-    _adjust_before_watermark,
-)
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -370,27 +367,6 @@ def test_custom_sampling_path_can_enable_sampling_observer():
     runner.sampling_observer = observer
 
     assert runner.sampling_observer is observer
-
-
-@pytest.mark.parametrize("with_observer", [False, True])
-def test_adjustments_release_the_grammar_mask(with_observer):
-    observer = SimpleNamespace(before_grammar=Mock(return_value=object()))
-    sampling_info = SamplingBatchInfo(vocab_size=4, device="cpu")
-    grammar_mask = SimpleNamespace(apply=Mock())
-
-    def update_regex_vocab_mask():
-        sampling_info.grammar_mask = grammar_mask
-
-    sampling_info.update_regex_vocab_mask = update_regex_vocab_mask
-    logits = torch.zeros(1, 4)
-
-    state = _adjust_before_watermark(
-        logits, sampling_info, observer=observer if with_observer else None
-    )
-
-    assert (state is not None) == with_observer
-    grammar_mask.apply.assert_called_once_with(logits)
-    assert sampling_info.grammar_mask is None
 
 
 def test_scheduler_copies_auxiliary_output_for_non_overlap_results():

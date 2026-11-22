@@ -1264,12 +1264,7 @@ class TestDisaggregationWire(unittest.TestCase):
             model_config=SimpleNamespace(vocab_size=32),
         )
 
-        with patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-            "SamplingBatchInfo.from_schedule_batch",
-            return_value=Mock(),
-        ):
-            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+        ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
 
         self.assertIsNone(batch.input_ids)
         self.assertEqual(batch.extend_num_tokens, 3)

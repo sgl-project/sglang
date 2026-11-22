@@ -25,7 +25,6 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -915,23 +914,6 @@ def alloc_verify_window(
         verify_cache_loc=verify_cache_loc,
         verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
         iteration_ids=plan,
-    )
-
-
-def apply_logits_adjustments_strided(
-    *,
-    next_token_logits: torch.Tensor,
-    sampling_info,
-    verify_num_draft_tokens: int,
-    verify_tokens: Optional[torch.Tensor],
-) -> None:
-    if sampling_info is None:
-        return
-    apply_dflash_verify_logits_adjustments(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=verify_num_draft_tokens,
-        verify_tokens=verify_tokens,
     )
 
 
