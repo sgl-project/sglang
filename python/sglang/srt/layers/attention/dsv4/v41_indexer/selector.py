@@ -10,7 +10,7 @@ torch has no V4.1 top-k of its own and runs them too, as on main, with
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -64,7 +64,12 @@ class TopKSelector:
         # FlashInfer's graph-safe CUB path cannot sort, and it is the only graph-safe
         # path on GPUs without FilteredTopK's 128 KiB of shared memory (SM120).
         values, indices = flashinfer.top_k(
-            scores.contiguous(), k, sorted=False, **_flashinfer_modes()
+            scores.contiguous(),
+            k,
+            sorted=False,
+            deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+            tie_break=_flashinfer_tie_break_value(),
+            dsa_graph_safe=True,
         )
         if sorted:
             values, order = values.sort(dim=-1, descending=True)
@@ -215,14 +220,6 @@ class TopKSelector:
             page_size,
             out_raw_indices=out_raw_indices,
         )
-
-
-def _flashinfer_modes() -> Dict[str, object]:
-    return {
-        "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
-        "tie_break": _flashinfer_tie_break_value(),
-        "dsa_graph_safe": True,
-    }
 
 
 def _sgl_kernel_ragged(
