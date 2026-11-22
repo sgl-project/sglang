@@ -22,7 +22,10 @@ def _fused_scaled_residual_add_exact_kernel(
     residual_ptr,
     x_ptr,
     scale_ptr,
-    numel: tl.constexpr,
+    # runtime, not constexpr: it follows the input shape (the H3 VAE decoder's
+    # tile batch), and each new value compiled a variant on the request path.
+    # A multiple of width, so it keeps width's divisibility class
+    numel,
     width: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     OPAQUE_MUL: tl.constexpr,
