@@ -264,6 +264,14 @@ RADIX_EVICTION_POLICY_CHOICES = [
     "state_cost",
 ]
 
+# Policies whose host tier holds KV only once it leaves the device.
+HICACHE_WRITE_BACK_POLICIES = ("write_back", "write_back_ahead")
+HICACHE_WRITE_POLICY_CHOICES = [
+    *HICACHE_WRITE_BACK_POLICIES,
+    "write_through",
+    "write_through_selective",
+]
+
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LORA_BACKEND_CHOICES = [

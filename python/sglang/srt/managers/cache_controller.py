@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.arg_groups.choices import HICACHE_WRITE_POLICY_CHOICES
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -448,11 +449,7 @@ class HiCacheController:
         self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
-        if write_policy not in [
-            "write_through",
-            "write_through_selective",
-            "write_back",
-        ]:
+        if write_policy not in HICACHE_WRITE_POLICY_CHOICES:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
         # self.write_queue = PriorityQueue[CacheOperation]()

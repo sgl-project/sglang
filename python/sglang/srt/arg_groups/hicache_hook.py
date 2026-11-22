@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.choices import HICACHE_WRITE_BACK_POLICIES
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
 
@@ -401,7 +402,7 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "(--hicache-storage-backend): host memory is only a staging buffer "
             "and all cached data lives in storage."
         )
-    if cfg.hicache_write_policy == "write_back":
+    if cfg.hicache_write_policy in HICACHE_WRITE_BACK_POLICIES:
         # buffer_only has no host tier to write back to; pages go to storage.
         declare_resolution(
             server_args,
@@ -410,7 +411,7 @@ def validate_hicache_host_memory_mode(server_args: Any):
         )
         logger.info(
             "--hicache-host-memory-mode buffer_only resolves "
-            "--hicache-write-policy write_back to write_through"
+            f"--hicache-write-policy {cfg.hicache_write_policy} to write_through"
         )
     if cfg.disaggregation_mode == "decode":
         raise ValueError(

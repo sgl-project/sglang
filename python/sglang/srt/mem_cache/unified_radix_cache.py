@@ -26,6 +26,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.choices import HICACHE_WRITE_BACK_POLICIES
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -227,6 +228,11 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # write_back_ahead cold-tail size in Full tokens; 0 when the policy is off.
+    write_back_ahead_tokens: int = 0
+    _evict_walk_backed_up: bool = False
+    # None forces the next cold-tail refill.
+    _evicted_since_tail_refill: Optional[int] = None
 
     def __init__(
         self,
@@ -514,6 +520,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._evict_walk_backed_up = False
+        self._evicted_since_tail_refill = None
         self.ongoing_load_back: dict[
             int, _OngoingLoadBack | list[_OngoingLoadBack]
         ] = {}
@@ -644,7 +652,11 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.is_write_back = (
             self.cache_controller is not None
-            and self.cache_controller.write_policy == "write_back"
+            and self.cache_controller.write_policy in HICACHE_WRITE_BACK_POLICIES
+        )
+        self.set_write_back_ahead(
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back_ahead"
         )
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
@@ -1066,11 +1078,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 request_by_type, tracker, demand=demand, satisfied=satisfied
             )
 
-        if (
-            self.cache_controller is not None
-            and self.cache_controller.write_policy == "write_back"
+        if self.cache_controller is not None and (
+            self._evict_walk_backed_up
+            if self.write_back_ahead_tokens
+            else self.cache_controller.write_policy == "write_back"
         ):
             self.writing_check(write_back=True)
+        if self._evict_walk_backed_up:
+            # The tail ran short: refill it on the next step.
+            self._evicted_since_tail_refill = None
+        elif self._evicted_since_tail_refill is not None:
+            self._evicted_since_tail_refill += tracker[BASE_COMPONENT_TYPE]
+        self._evict_walk_backed_up = False
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
@@ -1334,6 +1353,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        self._evict_walk_backed_up = True
                         if written is None and pending:
                             # Make the queued victims host-evictable, as the
                             # per-victim walk would have by now, and retry once.
@@ -1447,6 +1467,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if backup_kv is None:
             return
         written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        self._evict_walk_backed_up = True
         if written is not None:
             self.writing_check(write_back=True)
             self._demote(node_id, tracker)
@@ -2248,6 +2269,7 @@ class UnifiedRadixCache(BasePrefixCache):
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
+        self._evict_walk_backed_up = True
         if written is None:
             return False
         self.writing_check(write_back=True)
@@ -4615,6 +4637,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage:
             self._raise_if_storage_workers_died()
         self._bound_async_work()
+        self._backup_cold_tail()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
@@ -4665,6 +4688,40 @@ class UnifiedRadixCache(BasePrefixCache):
             or self.ongoing_prefetch
             or (self.buffer_pipeline is not None and not self.buffer_pipeline.is_idle())
         )
+
+    def set_write_back_ahead(self, enabled: bool) -> None:
+        """Turn the write_back_ahead cold tail on or off; it needs a host tier."""
+        enabled = enabled and self.host_memory_mode == "cache"
+        self.write_back_ahead_tokens = (
+            envs.SGLANG_HICACHE_WRITE_BACK_AHEAD_TOKENS.get() if enabled else 0
+        )
+        self._evicted_since_tail_refill = None
+
+    def _backup_cold_tail(self) -> None:
+        """write_back_ahead: back up the coldest evictable device KV
+        asynchronously, so eviction demotes already-backed nodes instead of
+        waiting on D2H."""
+        target = self.write_back_ahead_tokens
+        if target == 0:
+            return
+        # Selecting the tail scans every evictable D-leaf: refill only once
+        # evictions consumed half of it, or a walk found it short.
+        if (
+            self._evicted_since_tail_refill is not None
+            and self._evicted_since_tail_refill < target // 2
+        ):
+            return
+        self._evicted_since_tail_refill = 0
+        leaves, to_write = self.tree_core.cold_tail_backup_candidates(target)
+        if not leaves:
+            return
+        short = to_write - self.cache_controller.mem_pool_host.available_size()
+        if short > 0:
+            self.evict_host(short)
+        for node_id in leaves:
+            action = self.tree_core.build_backup_kv_action(node_id)
+            if self._execute_and_commit_kv_backup(action) is None:
+                break
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

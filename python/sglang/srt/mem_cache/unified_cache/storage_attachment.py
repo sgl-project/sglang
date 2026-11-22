@@ -14,6 +14,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.choices import (
+    HICACHE_WRITE_BACK_POLICIES,
+    HICACHE_WRITE_POLICY_CHOICES,
+)
 from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
@@ -35,7 +39,7 @@ logger = logging.getLogger(__name__)
 # Kept in sync with the server-args choices; validated here so an admin request
 # carrying a bad policy is rejected before it can touch the controller.
 _PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
-_WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
+_WRITE_POLICIES = tuple(HICACHE_WRITE_POLICY_CHOICES)
 
 
 class StorageAttachment:
@@ -69,7 +73,7 @@ class StorageAttachment:
         if invalid is not None:
             return False, invalid
         if (
-            hicache_write_policy == "write_back"
+            hicache_write_policy in HICACHE_WRITE_BACK_POLICIES
             and cache.host_memory_mode == "buffer_only"
         ):
             # Startup resolves write_back to write_through in buffer_only mode:
@@ -407,7 +411,8 @@ class StorageAttachment:
             cache.write_through_threshold = (
                 1 if hicache_write_policy == "write_through" else 2
             )
-            cache.is_write_back = hicache_write_policy == "write_back"
+            cache.is_write_back = hicache_write_policy in HICACHE_WRITE_BACK_POLICIES
+            cache.set_write_back_ahead(hicache_write_policy == "write_back_ahead")
             logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
 
     def _release_pending_storage_ops(self) -> None:

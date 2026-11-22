@@ -5,6 +5,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
+from sglang.srt.arg_groups.choices import HICACHE_WRITE_BACK_POLICIES
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
@@ -236,7 +237,7 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         and cfg.enable_hierarchical_cache
         and (
             cfg.hicache_storage_backend is not None
-            or cfg.hicache_write_policy != "write_back"
+            or cfg.hicache_write_policy not in HICACHE_WRITE_BACK_POLICIES
         )
     ):
         unsupported.append("prefill HiCache other than L2 write_back")

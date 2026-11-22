@@ -229,6 +229,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                     tree_core.full_coexisting_host_nodes.discard(node_id);
                     continue;
                 }
+                // Reclaiming a cold-tail copy only forces the same D2H again.
+                if node.cold_tail_backup {
+                    continue;
+                }
                 if spare_imminent_demotes && tree_core.is_device_walk_candidate_(node_id) {
                     continue;
                 }

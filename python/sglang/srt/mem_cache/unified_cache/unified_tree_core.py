@@ -142,6 +142,8 @@ class UnifiedTreeNode:
         self._tlru_history_len = 0
         self.external_cache_stored = False
         self.priority = priority
+        # In the write_back_ahead cold tail until touched again.
+        self.cold_tail_backup = False
         # A device and a host LRU pointer per tree component (`lru_pointer_slot`).
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
             2 * len(tree_components)
@@ -1182,6 +1184,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cur_time = get_and_increase_time_counter()
         while node_update:
             node_update.last_access_time = cur_time
+            node_update.cold_tail_backup = False
             cur_time -= 0.00001
             node_update = node_update.parent
 
@@ -1256,6 +1259,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
+        node.cold_tail_backup = False
         if node != self.root_node:
             for comp in self.components:
                 if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1896,6 +1900,40 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.evict_device_end(self.joint_window_type)
         self._joint_walk = None
 
+    def cold_tail_backup_candidates(self, num_tokens: int) -> tuple[list[NodeId], int]:
+        """Coldest evictable D-leaves whose backup chains, together with the
+        already-backed coldest leaves, cover num_tokens. Returns the leaves to
+        back up and the tokens their chains will write."""
+        comp = self.components_by_type[BASE_COMPONENT_TYPE]
+        comp._ensure_eviction_strategy()
+        heap = [
+            (comp.session_ref_eviction_strategy(n), n)
+            for n in self.evictable_device_leaves
+        ]
+        heapq.heapify(heap)
+        covered = 0
+        to_write = 0
+        leaves: list[NodeId] = []
+        chained: set[UnifiedTreeNode] = set()
+        while heap and covered < num_tokens:
+            _, leaf = heapq.heappop(heap)
+            chain_tokens = 0
+            node = leaf
+            while (
+                node is not self.root_node and not node.backuped and node not in chained
+            ):
+                chained.add(node)
+                chain_tokens += len(node.component_data[BASE_COMPONENT_TYPE].value)
+                node.cold_tail_backup = True
+                node = node.parent
+            if chain_tokens == 0:
+                covered += len(leaf.component_data[BASE_COMPONENT_TYPE].value)
+                continue
+            leaves.append(leaf.id)
+            covered += chain_tokens
+            to_write += chain_tokens
+        return leaves, to_write
+
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
     ) -> None:
@@ -2285,6 +2323,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # Queued victims count as demoted.
                 if cd.value is None or cd.host_value is None or node.write_back_queued:
                     swept_ids.append(node.id)  # stale entry
+                    continue
+                # Reclaiming a cold-tail copy only forces the same D2H again.
+                if node.cold_tail_backup:
                     continue
                 if spare_imminent_demotes and self._is_device_walk_candidate(node):
                     continue

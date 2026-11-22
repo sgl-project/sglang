@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.choices import HICACHE_WRITE_BACK_POLICIES
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
@@ -424,7 +425,8 @@ def handle_other_validations(server_args: Any):
         elif cfg.enable_hierarchical_cache and not (
             (
                 cfg.hicache_storage_backend is None
-                and cfg.hicache_write_policy in ("write_back", "write_through")
+                and cfg.hicache_write_policy
+                in (*HICACHE_WRITE_BACK_POLICIES, "write_through")
             )
             or (
                 cfg.hicache_storage_backend is not None

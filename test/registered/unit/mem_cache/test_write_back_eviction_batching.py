@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -796,11 +797,104 @@ class _WriteBackBatchingSuite:
                     )
 
 
-class TestWriteBackBatchingRustCore(_WriteBackBatchingSuite, CustomTestCase):
+class _WriteBackAheadSuite(_WriteBackBatchingSuite):
+    def _back_up_cold_tail(self, cache, tail_tokens):
+        cache.cache_controller.write_policy = "write_back_ahead"
+        with envs.SGLANG_HICACHE_WRITE_BACK_AHEAD_TOKENS.override(tail_tokens):
+            cache.set_write_back_ahead(True)
+        cache._backup_cold_tail()
+        cache.cache_controller.start_writing()
+        cache.writing_check()
+        self.assertEqual(cache.ongoing_write_through, {})
+
+    def test_cold_tail_lets_eviction_demote_without_waiting(self):
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            host_tokens=2 * BATCH_TOKENS,
+        )
+        for batch in (0, 1):
+            for seq in batch_seqs(batch):
+                insert_seq(cache, allocator, seq)
+        self._back_up_cold_tail(cache, BATCH_TOKENS)
+        self.assertEqual(host_pool.available_size(), BATCH_TOKENS)
+
+        waits, patch = self._count_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+
+        self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
+        self.assertEqual(waits, [])
+        self.assertEqual(host_pool.available_size(), BATCH_TOKENS)
+        for seq in batch_seqs(0):
+            self.assertEqual(match_seq(cache, seq).host_hit_length, SEQ_TOKENS)
+        for seq in batch_seqs(1):
+            self.assertEqual(match_seq(cache, seq).device_prefix_len, SEQ_TOKENS)
+        cache.sanity_check()
+
+    def test_tail_refill_writes_only_unbacked_chains(self):
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            host_tokens=2 * BATCH_TOKENS,
+        )
+        for batch in (0, 1):
+            for seq in batch_seqs(batch):
+                insert_seq(cache, allocator, seq)
+        self._back_up_cold_tail(cache, BATCH_TOKENS)
+        for seq in batch_seqs(0):
+            match_seq(cache, seq)
+
+        self.assertEqual(
+            cache.tree_core.cold_tail_backup_candidates(BATCH_TOKENS)[1],
+            BATCH_TOKENS,
+        )
+        self.assertEqual(
+            cache.tree_core.cold_tail_backup_candidates(2 * BATCH_TOKENS)[1],
+            BATCH_TOKENS,
+        )
+        cache.sanity_check()
+
+    def test_cold_tail_covers_swa_window_eviction(self):
+        cache, allocator, kv_host, swa_host = hybrid_write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            swa_device_tokens=4 * BATCH_TOKENS,
+            host_tokens=4 * BATCH_TOKENS,
+            swa_host_tokens=4 * BATCH_TOKENS,
+            sliding_window=3 * PAGE,
+        )
+        chains = batch_seqs(0)[:2]
+        for seq in chains:
+            insert_hybrid_seq(cache, allocator, seq[:PAGE])
+            insert_hybrid_seq(cache, allocator, seq)
+        self._back_up_cold_tail(cache, 2 * SEQ_TOKENS)
+        self.assertLess(swa_host.available_size(), 4 * BATCH_TOKENS)
+        window = cache.window_sub_pool_of_slot(ComponentType.SWA)
+
+        waits, patch = self._count_waits(cache)
+        with patch:
+            swa_result = cache.evict(
+                EvictParams(window_num_tokens={window: 2 * SEQ_TOKENS})
+            )
+            full_result = cache.evict(EvictParams(num_tokens=2 * SEQ_TOKENS))
+
+        self.assertGreater(swa_result.window_num_tokens_evicted.get(window, 0), 0)
+        self.assertEqual(
+            swa_result.num_tokens_evicted + full_result.num_tokens_evicted,
+            2 * SEQ_TOKENS,
+        )
+        self.assertEqual(waits, [])
+        for seq in chains:
+            self.assertEqual(match_seq(cache, seq).host_hit_length, SEQ_TOKENS)
+        cache.sanity_check()
+
+
+class TestWriteBackBatchingRustCore(_WriteBackAheadSuite, CustomTestCase):
     tree_core_backend = "rust"
 
 
-class TestWriteBackBatchingPythonCore(_WriteBackBatchingSuite, CustomTestCase):
+class TestWriteBackBatchingPythonCore(_WriteBackAheadSuite, CustomTestCase):
     tree_core_backend = "python"
 
 
