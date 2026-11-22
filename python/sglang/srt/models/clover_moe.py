@@ -57,7 +57,11 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
     _fp8_tuple_input,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
@@ -607,6 +611,13 @@ class CloverMoeModelLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if get_exec().dllm.dllm_algorithm == "CloverPureBlock":
+            from sglang.srt.models.clover_pure_eager import forward_eager
+
+            hidden_states = forward_eager(self, input_ids, forward_batch)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
         hidden_states = self.model(
             input_ids,
             positions,

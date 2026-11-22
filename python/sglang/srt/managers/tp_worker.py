@@ -577,7 +577,13 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         algo_states = None
-        if self.dllm_algorithm.fdfo and batch is not None:
+        if self.dllm_algorithm.requires_request_inputs:
+            if batch is None:
+                raise ValueError(
+                    "This diffusion algorithm requires scheduler request inputs"
+                )
+            algo_states = batch.reqs
+        elif self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
         (

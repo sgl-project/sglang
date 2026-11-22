@@ -12,22 +12,22 @@ logger = logging.getLogger(__name__)
 @_register_for("CloverMoeModelLM")
 def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if (
-        cfg.speculative_algorithm is None
-        or cfg.speculative_algorithm.upper() != "CLOVER"
-    ):
-        raise ValueError("CloverMoeModelLM requires --speculative-algorithm clover")
-    if cfg.dllm_algorithm is not None:
+    pure = cfg.dllm_algorithm == "CloverPureBlock" and cfg.speculative_algorithm is None
+    speculative = (
+        cfg.speculative_algorithm or ""
+    ).upper() == "CLOVER" and cfg.dllm_algorithm is None
+    if not (pure or speculative):
         raise ValueError(
-            "Clover does not support --dllm-algorithm; use --speculative-algorithm clover"
+            "CloverMoeModelLM requires --speculative-algorithm clover or --dllm-algorithm CloverPureBlock, exclusively"
         )
     if cfg.device != "cuda" or cfg.dtype not in ("auto", "bfloat16"):
         raise ValueError(
             "Clover preview kernels require CUDA; serving dtypes other than BF16 are unvalidated"
         )
-    if get_device_sm() // 10 not in (9, 10):
+    supported_sm = (9, 10, 12) if pure else (9, 10)
+    if get_device_sm() // 10 not in supported_sm:
         raise ValueError(
-            "Clover preview kernels require compute capability 9.x or 10.x"
+            f"Clover requires compute capability in {supported_sm} for the selected mode"
         )
     if (
         cfg.linear_attn_backend not in ("triton", "flashinfer")
@@ -65,7 +65,7 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Clover supports only unquantized models")
     if cfg.disaggregation_mode != "null" or cfg.enable_hierarchical_cache:
         raise ValueError("Clover with disaggregation or HiCache is unvalidated")
-    strategy = "no_buffer" if cfg.disable_radix_cache else "extra_buffer"
+    strategy = "no_buffer" if pure or cfg.disable_radix_cache else "extra_buffer"
     if cfg.mamba_radix_cache_strategy not in ("auto", strategy):
         logger.warning(
             "Clover requires mamba_radix_cache_strategy=%s, overriding %s.",

@@ -3163,8 +3163,24 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
+        # Pure block diffusion validates its whole canvas before publishing any token.
+        pure_block = (
+            self.dllm_config is not None
+            and self.dllm_config.algorithm == "CloverPureBlock"
+        )
+        requested_tokens = req.sampling_params.max_new_tokens
         self.init_req_max_new_tokens(req)
+        if pure_block and requested_tokens != req.sampling_params.max_new_tokens:
+            req.set_finish_with_abort("Clover request exceeds the server token budget")
+            self._release_aborted_request(req)
+            req.update_finish_state()
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
+        if pure_block and requested_tokens == 0:
+            req.update_finish_state()
+            req.time_stats.set_completion_time()
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
 
         # Validate prompt length
         error_msg = validate_input_length(

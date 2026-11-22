@@ -33,6 +33,7 @@ class DllmAlgorithm:
 
     supported_architectures: Tuple[str, ...] = ()
     requires_separate_context_encoding = False
+    requires_request_inputs = False
     required_attention_backend: Optional[str] = None
     reuse_forward_metadata: bool = False
     supported_attention_backends: Tuple[str, ...] = ()

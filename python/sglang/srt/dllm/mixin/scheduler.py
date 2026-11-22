@@ -111,9 +111,14 @@ class SchedulerDllmMixin:
                     if new_tokens == 0:
                         continue
 
-                    req.full_untruncated_fill_ids[
-                        req.extend_end - new_tokens : req.extend_end
-                    ] = array("q", next_token_ids)
+                    start = (
+                        req.dllm_block_offset
+                        if self.dllm_config.requires_separate_context_encoding
+                        else req.extend_end - new_tokens
+                    )
+                    req.full_untruncated_fill_ids[start : start + new_tokens] = array(
+                        "q", next_token_ids
+                    )
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
                     req.output_ids.extend(next_token_ids)
@@ -202,6 +207,7 @@ class SchedulerDllmMixin:
         req.kv.kv_allocated_len = context_len
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
+        req.already_computed = context_len
         self.stash_chunked_request(req)
 
     def finish_dllm_forward(self: Scheduler, req: Req) -> None:

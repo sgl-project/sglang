@@ -18,7 +18,7 @@ python3 -m sglang.launch_server \
 
 ## First-Done-First-Out (FDFO) Scheduling
 
-FDFO scheduling is **enabled by default**: each request leaves the batch as soon as its block is resolved, instead of advancing in lockstep where fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). This improves throughput and is orthogonal to `--dllm-algorithm`, so it works with any dLLM algorithm. Pass `--no-dllm-fdfo` to fall back to synchronous lockstep scheduling:
+FDFO scheduling is **enabled by default**: each request leaves the batch as soon as its block is resolved, instead of advancing in lockstep where fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). This improves throughput for algorithms that support FDFO. Pass `--no-dllm-fdfo` to fall back to synchronous lockstep scheduling:
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -27,6 +27,25 @@ python3 -m sglang.launch_server \
   --no-dllm-fdfo \
   --host 0.0.0.0 \
   --port 30000
+```
+
+## Clover pure block diffusion
+
+On a single NVIDIA GPU with BF16 weights, select `CloverPureBlock` for greedy generation with
+`Diffuspace/Clover-35B-A3B-Preview`. It reads the confidence threshold and response penalties
+from the checkpoint and resolves all 32 positions before returning any tokens from a block.
+Requests run one at a time. Use synchronous scheduling and non-streaming requests.
+
+```bash
+SGLANG_FLASHINFER_USE_PAGED=1 python3 -m sglang.launch_server \
+  --model-path Diffuspace/Clover-35B-A3B-Preview --trust-remote-code \
+  --dllm-algorithm CloverPureBlock --no-dllm-fdfo \
+  --dtype bfloat16 --tp-size 1 --max-running-requests 1 --context-length 2048
+```
+
+```bash
+curl http://127.0.0.1:30000/generate -H 'Content-Type: application/json' \
+  -d '{"text":"Explain block diffusion.","sampling_params":{"temperature":0,"max_new_tokens":65}}'
 ```
 
 ## Example Configuration File

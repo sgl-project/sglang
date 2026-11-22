@@ -51,6 +51,11 @@ class DllmConfig:
         )
         DLLM_PARAMS = {
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "CloverMoeModelLM": {
+                "block_size": getattr(model_config.hf_config, "block_size", None),
+                "mask_id": getattr(model_config.hf_config, "mask_token_id", None),
+                "algorithm": "CloverPureBlock",
+            },
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
             "DiffusionGemmaForBlockDiffusion": {
@@ -153,6 +158,22 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        if arch == "CloverMoeModelLM":
+            from sglang.srt.dllm.clover_sampling import validate_threshold
+
+            if (
+                not isinstance(mask_id, int)
+                or not 0 <= mask_id < model_config.vocab_size
+            ):
+                raise ValueError(
+                    "CloverPureBlock requires a valid checkpoint mask_token_id"
+                )
+            if block_size != 32 or algorithm_config.keys() - {"threshold"}:
+                raise ValueError(
+                    "CloverPureBlock uses width 32 and accepts only threshold"
+                )
+            if "threshold" in algorithm_config:
+                validate_threshold(algorithm_config["threshold"])
         checkpoint_block_size = getattr(model_config.hf_config, "block_size", None)
         if (
             getattr(model_config.hf_config, "expert_capacity", None) is not None

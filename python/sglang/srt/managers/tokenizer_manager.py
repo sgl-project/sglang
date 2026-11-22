@@ -1577,6 +1577,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
+        if self.server_args.dllm_algorithm == "CloverPureBlock":
+            from sglang.srt.dllm.clover_sampling import prepare_sampling_params
+
+            if not input_ids or input_embeds is not None or mm_inputs is not None:
+                raise ValueError(
+                    "CloverPureBlock requires a non-empty text token sequence"
+                )
+            prepare_sampling_params(
+                sampling_kwargs, self.model_config, len(input_ids), self.context_len
+            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
