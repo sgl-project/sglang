@@ -205,10 +205,7 @@ class DenseBlocksBackend:
             fast_block_topk=self.use_sm90_deep_gemm_consume,
         )
         data.write_selection(selected, inputs)
-        return BlockIds(
-            blocks=self.selector.order_candidates(blocks),
-            rows_per_request=data.rows_per_request,
-        )
+        return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
 
     def _deep_gemm_consume_prefill(
         self,
@@ -431,6 +428,9 @@ def _publish_prefill_blocks(
         padding = torch.iinfo(torch.int32).max
         blocks = blocks.masked_fill_(blocks < 0, padding).sort(dim=-1).values
         blocks.masked_fill_(blocks == padding, -1)
+    else:
+        # Ascending above is already the order FlashInfer's consumers need.
+        blocks = selector.order_candidates(blocks)
     return selected, blocks
 
 

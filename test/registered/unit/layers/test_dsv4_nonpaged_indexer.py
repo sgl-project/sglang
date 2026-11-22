@@ -294,9 +294,10 @@ class TestDSV41FlashInferTopK(CustomTestCase):
 
     def test_flashinfer_dense_blocks_publish_ascending_ids(self):
         """Dense-block consumers lay out candidate columns in published order and
-        FlashInfer breaks ties by column, so every dense-block publish path hands
-        out ascending block ids (-1 last) under FlashInfer, and the selected order
-        otherwise."""
+        FlashInfer breaks ties by column, so the decode and torch-scored prefill
+        publish paths hand out ascending block ids (-1 last) under FlashInfer, and
+        the selected order otherwise. The DeepGEMM prefill publish orders its blocks
+        in _publish_prefill_blocks, which test_dense_prefill_indexer.py runs."""
         from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks as mod
         from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
             ChunkScores,
@@ -347,18 +348,9 @@ class TestDSV41FlashInferTopK(CustomTestCase):
                 patch.object(
                     mod, "prefill_requests", return_value=[(request, [chunk])]
                 ),
-                patch.object(
-                    mod, "get_deep_gemm_prefill_data", return_value=MagicMock()
-                ),
-                patch.object(
-                    mod,
-                    "_publish_prefill_blocks",
-                    side_effect=lambda **kwargs: (MagicMock(), unsorted.clone()),
-                ),
             ):
                 published = {
                     "decode": backend.publish_decode(inputs),
-                    "deep_gemm_prefill": backend._deep_gemm_publish_prefill(inputs),
                     "torch_prefill": backend._torch_publish_prefill(inputs),
                 }
             for path, blocks in published.items():

@@ -101,8 +101,7 @@ def run_dense(inputs, *, publish_candidates, candidates, selector=None):
             selector=selector,
         )
         return selected, dense_blocks.BlockIds(
-            blocks=selector.order_candidates(blocks),
-            rows_per_request=data.rows_per_request,
+            blocks=blocks, rows_per_request=data.rows_per_request
         )
     if candidates is not None:
         selected = dense_blocks._consume_prefill_blocks(
