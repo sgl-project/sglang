@@ -22,7 +22,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supported,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import get_scalar_types
+from sglang.srt.layers.quantization.utils import (
+    get_scalar_types,
+    resolve_dynamic_fused_shards,
+)
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -58,8 +61,35 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 
-def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
-    return any(module_name in prefix for module_name in modules_to_not_convert)
+def is_layer_skipped_awq(
+    prefix: str,
+    *,
+    modules_to_not_convert: List[str],
+    quant_config: QuantizationConfig,
+) -> bool:
+    def _is_not_converted(name: str) -> bool:
+        return any(module_name in name for module_name in modules_to_not_convert)
+
+    if _is_not_converted(prefix):
+        return True
+
+    # The list names checkpoint shards (self_attn.q_proj),
+    # not SGLang's fused layer (self_attn.qkv_proj), so match through the shards.
+    proj_name = prefix.rsplit(".", 1)[-1]
+    shards = resolve_dynamic_fused_shards(quant_config, proj_name)
+    if not shards:
+        return False
+    parent = prefix[: -len(proj_name)]
+    shard_not_converted = [_is_not_converted(parent + shard) for shard in shards]
+    if all(shard_not_converted):
+        return True
+    if any(shard_not_converted):
+        raise ValueError(
+            f"AWQ modules_to_not_convert lists only some shards of the fused "
+            f"layer {prefix} ({dict(zip(shards, shard_not_converted))}). All "
+            "shards of a fused layer must have the same precision."
+        )
+    return False
 
 
 class AWQConfig(QuantizationConfig):
@@ -131,7 +161,11 @@ class AWQConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
-        return cls(weight_bits, group_size, zero_point, modules_to_not_convert)
+        quant_config = cls(weight_bits, group_size, zero_point, modules_to_not_convert)
+        quant_config.update_packed_modules_mapping(
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], None) or {}
+        )
+        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -141,19 +175,31 @@ class AWQConfig(QuantizationConfig):
 
         if _is_npu:
             if isinstance(layer, LinearBase):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if is_layer_skipped_awq(
+                    prefix,
+                    modules_to_not_convert=self.modules_to_not_convert,
+                    quant_config=self,
+                ):
                     return UnquantizedLinearMethod()
                 layer.scheme = self.get_linear_scheme(layer)
                 return AWQLinearMethod(self)
             elif isinstance(layer, FusedMoE):
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if is_layer_skipped_awq(
+                    prefix,
+                    modules_to_not_convert=self.modules_to_not_convert,
+                    quant_config=self,
+                ):
                     return None
                 layer.scheme = self.get_moe_scheme(layer)
                 return AWQMoEMethod(self)
             return None
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix,
+                modules_to_not_convert=self.modules_to_not_convert,
+                quant_config=self,
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
@@ -190,12 +236,20 @@ class AWQCPUConfig(AWQConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix,
+                modules_to_not_convert=self.modules_to_not_convert,
+                quant_config=self,
+            ):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix,
+                modules_to_not_convert=self.modules_to_not_convert,
+                quant_config=self,
+            ):
                 return None
             layer.scheme = self.get_moe_scheme(layer)
             return AWQMoEMethod(self)
@@ -320,7 +374,7 @@ class AWQMarlinConfig(QuantizationConfig):
         modules_to_not_convert = cls.get_from_keys_or(
             config, ["modules_to_not_convert"], None
         )
-        return cls(
+        quant_config = cls(
             weight_bits,
             group_size,
             zero_point,
@@ -328,6 +382,10 @@ class AWQMarlinConfig(QuantizationConfig):
             modules_to_not_convert,
             config,
         )
+        quant_config.update_packed_modules_mapping(
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], None) or {}
+        )
+        return quant_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
@@ -362,7 +420,11 @@ class AWQMarlinConfig(QuantizationConfig):
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix,
+                modules_to_not_convert=self.modules_to_not_convert,
+                quant_config=self,
+            ):
                 return UnquantizedLinearMethod()
             # Check if the layer is supported by AWQMarlin.
             if not check_marlin_supports_layer(layer, self.group_size):
@@ -376,7 +438,11 @@ class AWQMarlinConfig(QuantizationConfig):
             layer.scheme = self.get_linear_scheme(layer)
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+            if is_layer_skipped_awq(
+                prefix,
+                modules_to_not_convert=self.modules_to_not_convert,
+                quant_config=self,
+            ):
                 return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
