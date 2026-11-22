@@ -2409,6 +2409,8 @@ class Envs:
     # ===================================================================
     # Muse Spark
     # ===================================================================
+    # Muse Spark Hopper (SM90) kernels; off: the stock paths.
+    SGLANG_MUSE_SPARK_HOPPER_KERNELS = EnvBool(True)
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
     # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
