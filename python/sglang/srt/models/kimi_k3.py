@@ -2395,9 +2395,9 @@ class KimiK3DeltaAttention(nn.Module):
 
     def _merge_kda_inproj_fp8(self) -> bool:
         # Copy the Quark FP8 [f_a | b] rows into fused_qkvg_proj's reserved tail;
-        # False where no tail was reserved. Leaves _bfa_w None. A re-run after weight
-        # processing keeps the merge, since the weights no longer have the checkpoint layout.
+        # False where no tail was reserved, and _bfa_w stays None.
         if self._qkvgbfa_in_qkvg_proj:
+            # A re-run after weight processing keeps the merge (the layout changed).
             return True
         if not self._kda_inproj_tail_rows:
             return False
@@ -2652,8 +2652,8 @@ class KimiK3DeltaAttention(nn.Module):
     ):
         if self.use_full_rank_gate:
             if _is_hip and self._qkvgbfa_in_qkvg_proj:
-                # Quark FP8: one GEMM through fused_qkvg_proj's own weight, which
-                # holds the [f_a | b] tail (_merge_kda_inproj_fp8), at every batch.
+                # Quark FP8: one GEMM through fused_qkvg_proj's own weight,
+                # which holds the [f_a | b] tail (_merge_kda_inproj_fp8).
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states, f_a, beta, _pad = torch.split(
                     fused_states, self._qkvgbfa_sizes, dim=-1

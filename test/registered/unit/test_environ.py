@@ -183,10 +183,9 @@ class TestEnvField(unittest.TestCase):
                         self.assertIsNone(child.get())
 
 
-# Renamed env vars that still accept their former name through a *WithAlias
-# descriptor: (new name, former name, former raw, former parsed, new raw, new
-# parsed). The former value is non-default so a read that ignores the alias
-# shows up. Add a row here when renaming a variable.
+# Renamed env vars that still accept the former name: (new name, former name,
+# former raw, former parsed, new raw, new parsed).
+# The former value is non-default so a read that ignores the alias shows up.
 RENAMED_ENV_ALIASES = [
     (
         "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
@@ -218,8 +217,8 @@ class TestRenamedEnvAliases(CustomTestCase):
 
     def test_former_name_applies_with_a_visible_warning(self):
         for new_name, old_name, old_raw, old_value, _, _ in RENAMED_ENV_ALIASES:
-            # The former name has no descriptor, and patch.dict also drops the
-            # copy the alias fallback writes to the new name.
+            # The former name has no descriptor;
+            # patch.dict also drops the copy the alias fallback writes.
             with self.subTest(new_name), patch.dict(os.environ):
                 self.assertEqual(vars(type(envs))[new_name].deprecated_name, old_name)
                 getattr(envs, new_name).clear()

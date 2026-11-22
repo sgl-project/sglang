@@ -297,9 +297,8 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
                 ):
                     rel = _relative_error(got, want)
                     self.assertLess(rel, TOL / 2, f"{name} rel err {rel:.2e}")
-                # beta now quantizes its activation (the split b_proj is BF16)
-                # and f_b runs in BF16 (the split f_b_proj quantizes f_a). The
-                # e4m3 activation alone costs ~2.7% here, as for qkv.
+                # beta quantizes its activation (the split b_proj is BF16) and f_b runs in BF16;
+                # the e4m3 activation alone costs ~2.7% here, as for qkv.
                 exact_f_a = x.float() @ self.exact["f_a_proj"].t()
                 for name, got, want in (
                     ("beta", beta, x.float() @ self.exact["b_proj"].t()),

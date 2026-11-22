@@ -27,6 +27,7 @@ from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_merg
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
+    k3_kda_inproj_fp8_f_b,
     k3_kda_inproj_fp8_tail_rows,
     k3_kv_b_for_absorb,
     k3_merge_kda_inproj_fp8,
@@ -113,6 +114,22 @@ class TestMergeDtypeGuard(CustomTestCase):
         self.assertFalse(_is_unquantized_mergeable(weights))
 
 
+class TestKdaInprojFp8FbGemm(CustomTestCase):
+    def test_off_gfx95_f_b_runs_the_tiny_gemm(self):
+        f_a, f_b_weight = torch.zeros(2, 4), torch.zeros(8, 4)
+
+        with (
+            mock.patch.object(kimi_k3_rocm_quant, "_is_gfx95", False),
+            mock.patch(
+                "sglang.kernels.ops.gemm.kimi_k3_tiny_gemm", return_value="tiny"
+            ) as tiny,
+        ):
+            out = k3_kda_inproj_fp8_f_b(f_a=f_a, f_b_weight=f_b_weight)
+
+        self.assertEqual(out, "tiny")
+        tiny.assert_called_once_with(x=f_a, w=f_b_weight)
+
+
 _FORWARD_MLA_ROCM = (
     "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm"
 )
@@ -166,6 +183,15 @@ class TestKvBForAbsorb(CustomTestCase):
 
         self.assertIsNone(tensor_scale)
         torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, module.weight))
+
+    def test_the_opt_in_is_off_when_unset(self):
+        module = _quark_fp8_linear(8)
+
+        with envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(None):
+            envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.clear()
+            _, tensor_scale = k3_kv_b_for_absorb(module=module, w_scale=1.0)
+
+        self.assertIsNone(tensor_scale)
 
     def test_no_requant_where_the_absorb_has_no_fp8_kernel(self):
         """Off gfx950 + AITER the absorb dequantizes an FP8 w_kc/w_vc to BF16,

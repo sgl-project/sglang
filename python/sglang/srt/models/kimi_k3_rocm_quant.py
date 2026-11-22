@@ -16,8 +16,8 @@
 Quark serializes K3 as per-output-channel FP8, which is not the layout the
 AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
 point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise, except
-the KDA in-proj merge hooks (k3_kda_inproj_fp8_tail_rows, k3_kda_inproj_fp8_f_b),
-which it calls on every platform: they decide here where the merge runs.
+k3_kda_inproj_fp8_tail_rows, which it calls on every platform and which returns 0
+off ROCm, so the merge only runs where this module reserves a tail.
 """
 
 from typing import Optional, Union
@@ -306,11 +306,11 @@ def _kda_inproj_fp8_processed_sizes(
             "fused_qkvg_proj has a processed [f_a | b] tail but the KDA in-proj "
             "weights are not the processed Quark per-channel FP8 layout it holds."
         )
-    # A state saved without the tail loads into a narrowed view and leaves the tail
-    # uninitialized; the weight may be preshuffled, the scales never are.
+    # A state saved without the tail loads into a narrowed view;
+    # the weight may be preshuffled, the scales never are.
     scale = qkvg_proj.weight_scale.reshape(-1)
-    # The merge writes pad scales of 1.0, which processing may rescale like every channel
-    # (2x for e4m3fnuz); ask only for one positive value.
+    # The merge writes pad scales of 1.0 that processing may rescale (2x for e4m3fnuz);
+    # ask only for one positive value.
     pad_scale = scale[wide + n_fa + n_b :]
     if not (
         torch.equal(scale[wide : wide + n_fa], f_a_proj.weight_scale.reshape(-1))
