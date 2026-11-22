@@ -134,8 +134,7 @@ class EaglePostVerifyGraphs:
             or batch.has_grammar
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or info.acc_additive_penalties is not None
-            or info.acc_scaling_penalties is not None
+            or info.step_penalties is not None
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling
@@ -266,8 +265,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
     # capture round's values.
     assert slot.is_all_greedy or "temperatures" in staged
     sampling_info = SimpleNamespace(
-        acc_additive_penalties=None,
-        acc_scaling_penalties=None,
+        step_penalties=None,
         logit_bias=None,
         sampling_seed=None,
         watermark=None,

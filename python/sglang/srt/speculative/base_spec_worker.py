@@ -415,6 +415,12 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    @property
+    def has_bound_runtime(self) -> bool:
+        """Whether a kernel build's runtime runs the decode round in place of
+        this worker's own round."""
+        return False
+
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.
 
