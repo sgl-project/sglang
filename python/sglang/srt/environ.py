@@ -487,6 +487,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -722,6 +723,8 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -919,6 +922,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
+    # prefix cannot be reused after its host state is evicted.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1065,6 +1071,16 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
+    # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_GEMM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: residual-stream boundaries that need no FP8 or router copy of their output run the
+    # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel,
+    # and the fused unpooler + FFN boundary (2-16 rows) runs the TLX mm before it. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_BOUNDARY_NORM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: FP32 MoE router logits outside the shared router + pooler front run the vendored
+    # tlx.ops.router_gemm (plain Triton) on an [E, K] copy of each router weight, 8 MiB per MoE layer.
+    SGLANG_USE_TLX_ROUTER_GEMM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
@@ -1087,6 +1103,12 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
@@ -1304,6 +1326,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
@@ -1555,6 +1583,10 @@ class Envs:
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # The CUDA target of a JIT module whose load_jit names no cuda_arch_policy:
+    # "specific" (the local GPU's arch-specific target, e.g. sm_103a) or
+    # "family" (its family target, e.g. sm_100f: one build for 10.0 and 10.3).
+    SGLANG_JIT_CUDA_ARCH_POLICY = EnvStr("specific")
     # Log, at INFO, which dependency changed whenever a module is rebuilt.
     SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
     # How many builds to keep per module variant. None = unset = keep all, which
@@ -1678,6 +1710,13 @@ class Envs:
     # equal torch.topk's; the default on every platform), 2 exact with the same
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
+    # DeepSelect bf16 top-k with more rows than any cluster tier runs in one wave:
+    # off keeps the one-CTA-per-row kernel, whose time follows the longest row. On
+    # runs the cluster tier with the most rows per wave over several waves instead,
+    # whose time follows the total row length. It wins on long-tailed row lengths
+    # (the DSV4.1 decode indexer at mixed contexts) and loses on uniform long ones.
+    # Same values as off; on ties it may pick other columns.
+    SGLANG_DEEP_SELECT_MULTIWAVE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -1822,7 +1861,7 @@ class Envs:
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
-    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
@@ -1844,8 +1883,6 @@ class Envs:
     # Defer the TP gather of an unsoftcapped target-verify vocab shard. The DFLASH
     # sampled and megakernel accept paths defer it unless this is set to 0.
     SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
-    # Capture the megakernel post-verify tail as CUDA graphs.
-    SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH = EnvBool(False)
     # Split the DFLASH draft's context fc across TP by output columns.
     SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
@@ -2045,6 +2082,7 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
@@ -2124,6 +2162,8 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
@@ -2154,11 +2194,15 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Use the shared FP8 scorer and ragged top-k for Hopper prefill candidates.
+    SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
     # Prefill index top-k by the sampled-threshold indexers of kernels/ops/attention/dsa/litetopk_prefill
     # (after LiteTopK, https://arxiv.org/abs/2607.11976) instead of dense logits + top-k, on SM100.
     SGLANG_OPT_USE_PREFILL_LITE_TOPK = EnvBool(False)
+    SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION = EnvBool(False)
     # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
     SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
+    SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -2241,6 +2285,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
@@ -2290,6 +2337,22 @@ class Envs:
     # directive is always emitted.
     SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    # MTP verify attention up to 64 tokens through the split-KV relative-bias
+    # decode kernel, all draft tokens of a sequence in one launch; changes the
+    # softmax reduction order.
+    SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
+    # Decode and MTP verify attention all-reduce through the push all-reduce
+    # (rank-order FP32 sum) instead of the multimem one-shot.
+    SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
+    # the FP32 token sums.
+    SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
+    # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
+    # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
+    SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
@@ -2508,12 +2571,11 @@ class Envs:
     # Gemma 4
     # ===================================================================
     # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
-    # quant of the dense layer stack as one NVLS kernel per site, for extend
-    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
-    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
-    # srt/layers/communication/gemma4_ar_fusion.py).
+    # quant of the dense layer stack as one NVLS kernel per site, for extend,
+    # mixed and decode batches of up to MAX tokens (SM90 with NVLink multicast,
+    # block-FP8 weights). MAX also sizes the symmetric buffers; keep it at least
+    # the chunked prefill size so every prefill chunk is fused.
     SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
-    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
     SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
 
     # ===================================================================
@@ -2612,6 +2674,10 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # A request-log line that finds the log writer's buffer full: "wait" holds
+    # the request until the sink takes it, as in the Python server; "drop"
+    # drops the line (counted in sglang:request_log_dropped_lines_total).
+    SGLANG_RUST_REQUEST_LOG_FULL_BUFFER = EnvStr("wait")
 
     # ===================================================================
     # Weight Cache Daemon
