@@ -7,6 +7,7 @@ from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
+    get_free_port_below_ephemeral,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -16,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.utils import normalize_base_url, release_port, reserve_port
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 class TestTryBindSocket(CustomTestCase):
@@ -152,6 +153,21 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+    def test_get_free_port_below_ephemeral_skips_port_held_on_ipv6(self):
+        """A port whose IPv6 side is held is skipped even if its IPv4 side is free."""
+        try:
+            holder = socket.create_server(("::1", 0), family=socket.AF_INET6)
+        except OSError:
+            self.skipTest("IPv6 loopback unavailable")
+        with holder:
+            held_port = holder.getsockname()[1]
+            free_port = get_free_port()
+            with patch(
+                "sglang.srt.utils.network.random.sample",
+                return_value=[held_port, free_port],
+            ):
+                self.assertEqual(get_free_port_below_ephemeral(), free_port)
 
 
 class TestReservePort(CustomTestCase):

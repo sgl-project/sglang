@@ -1,26 +1,24 @@
 from __future__ import annotations
 
 import functools
-import gc
 import json
 import logging
 import os
 import re
 import socket
 import sys
-import time
 import warnings
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import parent_process
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Union
 
 import orjson
 import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_observability, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.device import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
@@ -38,9 +36,6 @@ __all__ = [
     "print_info_once",
     "log_info_on_rank0",
     "log_debug_on_rank0",
-    "gc_object_counts",
-    "configure_gc_logging",
-    "freeze_gc",
 ]
 
 
@@ -311,62 +306,3 @@ def log_debug_on_rank0(logger, msg):
                 logger.debug(f"{msg} (rank-check failed: {e})")
         else:
             logger.debug(f"{msg} (rank-check failed: {e})")
-
-
-def gc_object_counts():
-    import gc
-
-    g0 = len(gc.get_objects(0))
-    g1 = len(gc.get_objects(1))
-    g2 = len(gc.get_objects(2))
-    return g0, g1, g2
-
-
-def configure_gc_logging(process_name: str) -> None:
-    """Log every GC pass with SGLANG_LOG_GC, and warn on a pass longer than
-    --gc-warning-threshold-secs."""
-    log_every_gc = envs.SGLANG_LOG_GC.get()
-    warning_threshold_secs = get_observability().gc_warning_threshold_secs
-    if not log_every_gc and warning_threshold_secs <= 0:
-        return
-    start_time = 0.0
-
-    def gc_callback(phase, info):
-        nonlocal start_time
-        gen = info["generation"]
-        if phase == "start":
-            start_time = time.perf_counter()
-            if log_every_gc:
-                logger.info(f"GC start: {process_name} | Generation {gen}")
-            return
-        duration = time.perf_counter() - start_time
-        if log_every_gc:
-            logger.info(
-                f"GC end: {process_name} | Generation {gen} | "
-                f"Duration: {duration:.4f}s | Collected: {info['collected']} | "
-                f"Uncollectable: {info['uncollectable']}"
-                f"{' (LONG GC)' if duration > 0.1 else ''}"
-            )
-        if 0 < warning_threshold_secs < duration:
-            g0, g1, g2 = gc_object_counts()
-            logger.warning(
-                f"LONG GARBAGE COLLECTION DETECTED | {process_name} | Generation {gen} | "
-                f"Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
-                f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
-            )
-
-    gc.callbacks.append(gc_callback)
-
-
-def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
-    if gc_threshold is not None:
-        gc.set_threshold(*gc_threshold)
-    g0_before, g1_before, g2_before = gc_object_counts()
-    gc.freeze()
-    g0_after, g1_after, g2_after = gc_object_counts()
-    logger.debug(
-        f"Freezing GC in {context} process. "
-        f"gen0: {g0_before}->{g0_after}, "
-        f"gen1: {g1_before}->{g1_after}, "
-        f"gen2: {g2_before}->{g2_after}"
-    )

@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _cached_latent_mean_std,
     minimax_h3_scoped_encode_rng,
 )
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
@@ -360,7 +361,9 @@ def _load_waveform(
     if max_duration_seconds is not None:
         command += ["-t", f"{max_duration_seconds:.9g}"]
     command += ["-f", "f32le", "pipe:1"]
-    decoded = subprocess.run(command, check=True, capture_output=True)
+    decoded = subprocess.run(
+        command, env=local_media_subprocess_env(), check=True, capture_output=True
+    )
     payload = decoded.stdout
     if not isinstance(payload, bytes):
         raise TypeError("ffmpeg float PCM output must be bytes")
@@ -532,21 +535,25 @@ def minimax_h3_decode_reference_video_frames(
     )
 
 
+def _create_reference_video_memfd(name: str) -> int:
+    """Return an anonymous output fd, or -1 when memfd is unavailable."""
+    if not sys.platform.startswith("linux") or not hasattr(os, "memfd_create"):
+        return -1
+    try:
+        return os.memfd_create(name, flags=os.MFD_CLOEXEC)
+    except OSError:
+        # The Python API can exist while the syscall is unavailable or blocked
+        # by the container's seccomp policy.
+        return -1
+
+
 def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     """Write one worker's RGB stream without a large stdout aggregation."""
 
     # Linux workers can let ffmpeg write the exact RGB24 stream into an
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
-    output_fd = -1
-    if sys.platform.startswith("linux"):
-        try:
-            output_fd = os.memfd_create(
-                "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
-            )
-        except OSError:
-            output_fd = -1
+    output_fd = _create_reference_video_memfd("sglang-h3-reference-video")
 
     payload: Any = b""
     payload_size = 0
@@ -564,6 +571,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     else:
         decoded = subprocess.run(
             [*command, "pipe:1"],
+            env=local_media_subprocess_env(),
             check=True,
             capture_output=True,
         )
@@ -577,6 +585,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
 def _write_reference_video_to_fd(command: list[str], output_fd: int) -> int:
     subprocess.run(
         [*command, f"pipe:{output_fd}"],
+        env=local_media_subprocess_env(),
         check=True,
         pass_fds=(output_fd,),
         stdout=subprocess.DEVNULL,
@@ -625,12 +634,10 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     leader_state = None
     if is_leader:
         try:
-            try:
-                leader_fd = os.memfd_create(
-                    "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
-                )
-            except OSError:
+            leader_fd = _create_reference_video_memfd(
+                "sglang-h3-reference-video-shared"
+            )
+            if leader_fd < 0:
                 # Anonymous file descriptors can be disabled by a container's
                 # seccomp policy. Tell every host to use the unchanged local
                 # decode path instead of failing a valid request.

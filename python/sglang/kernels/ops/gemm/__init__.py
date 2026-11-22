@@ -550,6 +550,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.int8_scaled_mm_via_int_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:int8_scaled_mm_via_int_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.muse_spark_router_gemv",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
@@ -594,9 +601,19 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "bf16 x fp32 router logits, tuned split-K at verify widths",
     ),
     (
+        "router_gemm_fp32",
+        "router_gemm_tlx",
+        "bf16 x fp32 router logits on the vendored tlx.ops.router_gemm, any M",
+    ),
+    (
         "unpool_gemm_norm_residual",
         "unpool_gemm_norm_residual",
         "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual_tlx",
+        "MoE unpooler GEMM + boundary norms + gated residual on the TLX mm and norm_residual_norm",
     ),
 ]
 for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
@@ -609,6 +626,23 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="gemm.tlx_linear",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.tlx:linear",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.hopper_fp8_block_gemv",
