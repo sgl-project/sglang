@@ -538,18 +538,23 @@ def _chunk_scan_fwd_kernel(
             # sanitizing x itself (replacing it wholesale) would also hide the
             # owning request's own non-finite x.
             #
-            # Compute both a raw and a sanitized dot and select per row instead:
-            # dot_safe never touches a non-finite value, so it is exact for every
-            # row whose own columns are finite (true whenever this tile's only
-            # non-finite x, if any, belongs to a different request). dot_raw keeps
-            # a row's own non-finite propagation, and is exact for a row whose own
-            # columns hold the non-finite value, since every column it does not
-            # own is exactly 0 * (that other request's own finite x) = 0. This
-            # does not reconstruct the exact reference when two different
-            # requests in the same tile both carry non-finite values (an
-            # unsupported compound case; see the PR's known-limitations note).
-            # On finite input, x_safe == x bit-for-bit, so dot_raw == dot_safe ==
-            # tl.dot(cb, x) and this is a no-op past the extra select.
+            # Compute both a raw and a sanitized dot and select per (row, channel)
+            # instead: dot_safe never touches a non-finite value, so it is exact
+            # for every (row, channel) whose own columns are finite there. dot_raw
+            # keeps a row's own non-finite propagation, and is exact wherever the
+            # row's own sequence holds the non-finite value in that channel, since
+            # every column it does not own is exactly 0 * (that other request's
+            # value) there. The select must be per-channel, not just per-row: two
+            # requests in the same tile can each carry a non-finite value in a
+            # different channel of the same head, and a row-only select (one flag
+            # per m, broadcast over every n) would pick dot_raw for a channel the
+            # row's own sequence never touched, letting 0 * (other request's nan)
+            # leak through. This still does not reconstruct the exact reference
+            # when two different requests in the same tile are non-finite in the
+            # exact same channel (an unsupported compound case; see the PR's
+            # known-limitations note). On finite input, x_safe == x bit-for-bit, so
+            # dot_raw == dot_safe == tl.dot(cb, x) and this is a no-op past the
+            # extra select.
             #
             # Not applied with HAS_INITSTATES: there each program's whole tile
             # already covers exactly one sequence (seq_idx_m is only built as a
@@ -562,16 +567,17 @@ def _chunk_scan_fwd_kernel(
             )
             same_seq_mk = seq_idx_m[:, None] == seq_idx_k[None, :]
             x_safe = tl.where((x - x) == 0.0, x, 0.0)
-            # Does column k hold a non-finite value at any n?
-            k_has_nonfinite = tl.sum(tl.where(x == x_safe, 0, 1), axis=1) > 0
-            # Does row m own any column with a non-finite value?
-            own_has_nonfinite = (
-                tl.sum(tl.where(same_seq_mk & k_has_nonfinite[None, :], 1, 0), axis=1)
-                > 0
-            )
+            # Per (k, n): is column k's value non-finite at exactly this channel?
+            nonfinite_x = tl.where(x == x_safe, 0.0, 1.0)
+            # Per (m, n): does row m's own sequence own a non-finite value in this
+            # exact channel? same_seq_mk already zeroes out every other sequence's
+            # column, so this is one more matmul-shaped reduction of the same
+            # (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) shape as dot_raw/dot_safe
+            # below, not a dot per sequence segment.
+            own_has_nonfinite = tl.dot(same_seq_mk.to(tl.float32), nonfinite_x) > 0.0
             dot_raw = tl.dot(cb, x)
             dot_safe = tl.dot(cb, x_safe)
-            acc += tl.where(own_has_nonfinite[:, None], dot_raw, dot_safe)
+            acc += tl.where(own_has_nonfinite, dot_raw, dot_safe)
         else:
             acc += tl.dot(cb, x)
         cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k

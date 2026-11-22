@@ -1193,6 +1193,92 @@ def test_mamba_chunk_scan_offender_dt_underflowed_cb_matches_standalone():
     )
 
 
+def test_mamba_chunk_scan_isolates_nonfinite_channel_from_other_request():
+    """BBuf review (PR 51342): two fresh requests (no carried/init state) packed
+    into one chunk can each carry a non-finite value in a DIFFERENT channel of
+    the same head. The old select (`own_has_nonfinite[:, None]`) was a per-row
+    flag broadcast across every channel, so once a row's own sequence owned a
+    non-finite value in ANY channel, `dot_raw` was picked for ALL of that row's
+    channels -- including ones where the row's own data was finite but another
+    packed request's `0 * nan` leaked in. Each request's output must match its
+    standalone run exactly in every channel it does not itself corrupt, and its
+    own non-finite channel must still surface as non-finite, matching standalone.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 1, 8, 8
+    len_a, len_b, chunk_size = 4, 4, 16  # both fresh requests share one tile
+    total = len_a + len_b
+
+    gen = torch.Generator(device=device).manual_seed(7)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.rand(1, total, n_heads, device=device, generator=gen) * 0.1 + 0.01
+    A = -(torch.rand(n_heads, device=device, generator=gen) + 0.5)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+
+    chan_a, chan_b = 1, 5  # different channels of the same (only) head
+    x[0, 1, 0, chan_a] = torch.nan  # request A's own non-finite channel
+    x[0, len_a + 1, 0, chan_b] = torch.inf  # request B's own non-finite channel
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([len_a, len_b], device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor([0, len_a, total], dtype=torch.int32, device=device)
+
+    packed_out = torch.empty_like(x)
+    mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    def run_alone(start, n):
+        sl = slice(start, start + n)
+        alone_out = torch.empty_like(x[:, sl])
+        mamba_chunk_scan_combined(
+            x[:, sl], dt[:, sl], A, B[:, sl], C[:, sl], chunk_size, out=alone_out
+        )
+        return alone_out
+
+    alone_a = run_alone(0, len_a)
+    alone_b = run_alone(len_a, len_b)
+
+    other_chans_a = [c for c in range(d_head) if c != chan_a]
+    torch.testing.assert_close(
+        packed_out[:, :len_a, :, other_chans_a],
+        alone_a[:, :, :, other_chans_a],
+        rtol=1e-3,
+        atol=1e-3,
+        msg="request A's channels untouched by its own nan must match its standalone run",
+    )
+    assert not packed_out[:, :len_a, :, chan_a].isfinite().all(), (
+        "request A's own non-finite channel must still surface as non-finite"
+    )
+
+    other_chans_b = [c for c in range(d_head) if c != chan_b]
+    torch.testing.assert_close(
+        packed_out[:, len_a:, :, other_chans_b],
+        alone_b[:, :, :, other_chans_b],
+        rtol=1e-3,
+        atol=1e-3,
+        msg="request B's channels untouched by its own inf must match its standalone run",
+    )
+    assert not packed_out[:, len_a:, :, chan_b].isfinite().all(), (
+        "request B's own non-finite channel must still surface as non-finite"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
