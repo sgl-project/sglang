@@ -534,6 +534,29 @@ def test_fused_decoder_is_disabled_off_cuda_and_rocm():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_fused_scaled_residual_add_compiles_once_per_width():
+    """The decoder's tile batch moves numel; a new batch must not compile a
+    variant, and each stays the eager FP32 add."""
+    from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+    from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
+        _fused_scaled_residual_add_exact_kernel as kernel,
+    )
+
+    torch.manual_seed(0)
+    scale = torch.randn(2048, device="cuda")
+    variants = None
+    for tiles in (1, 2, 3, 5):
+        residual = torch.randn(tiles, 1797, 2048, device="cuda") * 4
+        update = torch.randn(tiles, 1797, 2048, device="cuda").to(torch.bfloat16)
+        with torch.no_grad():
+            fused = try_fused_scaled_residual_add_exact(residual, update, scale)
+        assert torch.equal(fused, residual + update * scale)
+        if variants is None:
+            variants = len(kernel.device_caches[torch.cuda.current_device()][0])
+    assert len(kernel.device_caches[torch.cuda.current_device()][0]) == variants
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
     """Both fused kernels store the residual as eager computes it: a rounded
