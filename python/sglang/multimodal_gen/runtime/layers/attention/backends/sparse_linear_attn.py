@@ -62,10 +62,6 @@ class SparseLinearAttentionBackend(AttentionBackend):
         return SparseLinearAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["SparseLinearAttentionMetadata"]:
-        return SparseLinearAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["SparseLinearAttentionMetadataBuilder"]:
         return SparseLinearAttentionMetadataBuilder
 
@@ -287,10 +283,6 @@ class SageSparseLinearAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SageSparseLinearAttentionImpl"]:
         return SageSparseLinearAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SageSparseLinearAttentionMetadata"]:
-        return SageSparseLinearAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SageSparseLinearAttentionMetadataBuilder"]:

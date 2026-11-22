@@ -7,8 +7,12 @@ name: PR Test Stage (Diffusion)
 on:
   workflow_call:
     inputs:
+      job_display_name:
+        description: 'Diffusion lane name shown in GitHub; independent of the internal suite key.'
+        required: true
+        type: string
       stage:
-        description: 'Diffusion stage (base-b-diffusion, base-b-diffusion-unit, ...); its kind picks the install. The suite run is <stage>-test-<runner_config>, which also names the lane in job and artifact names.'
+        description: 'Diffusion stage (base-b-diffusion, base-b-diffusion-unit, ...); its kind picks the install. The suite run is <stage>-test-<runner_config>, which also names its artifacts.'
         required: true
         type: string
       runner_config:
@@ -58,7 +62,7 @@ env:
 
 jobs:
   run:
-    name: ${{ inputs.stage }}-test-${{ inputs.runner_config }} (${{ matrix.part }})
+    name: ${{ inputs.job_display_name }} (${{ matrix.part }})
     runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: ${{ inputs.job_timeout_minutes }}
     strategy:
@@ -123,7 +127,8 @@ jobs:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
+          # Finish independent files sharing a shard. The suite returns the first failure.
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.partition_plan != '' && 'true' || fromJson(inputs.caller_inputs).continue_on_error }}
           # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags;
           # format() keeps part 0 from reading as false.
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
