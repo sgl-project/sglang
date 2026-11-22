@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -124,6 +125,48 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
             destination.copy_(source)
 
     return writeback
+
+
+def _hccl_expert_order(old_layout, new_layout, num_logical, world_size, batch_size):
+    """Spread busy rank pairs across HCCL batches without changing the transfers."""
+    block_size = 4
+    if batch_size % block_size or num_logical <= batch_size:
+        return None
+
+    num_batches = (num_logical + batch_size - 1) // batch_size
+    padded = num_batches * batch_size
+    ranks = np.arange(world_size)[:, None]
+    owners = np.zeros((world_size, padded), dtype=bool)
+    receivers = np.zeros_like(owners)
+    owners[ranks, np.asarray(old_layout).reshape(world_size, -1)] = True
+    receivers[ranks, np.asarray(new_layout).reshape(world_size, -1)] = True
+    receivers &= ~owners
+
+    # The updater splits each expert's destinations evenly among its old
+    # owners, giving the remainder to the lowest owner ranks.
+    quotient, remainder = np.divmod(
+        receivers.sum(axis=0), owners.sum(axis=0).clip(min=1)
+    )
+    sends = owners * (quotient + (owners.cumsum(axis=0) <= remainder))
+    endpoint_rows = np.concatenate((sends, receivers), axis=0)
+    contiguous = endpoint_rows.reshape(-1, num_batches, batch_size).sum(axis=2)
+    interleaved = endpoint_rows.reshape(
+        -1, batch_size // block_size, num_batches, block_size
+    ).sum(axis=(1, 3))
+
+    # Require a substantial drop in busiest-endpoint rows to offset extra
+    # submissions on lightly loaded ranks.
+    if interleaved.max(axis=0).sum() * 3 > contiguous.max(axis=0).sum() * 2:
+        return None
+    if not contiguous.any():
+        return None
+    return (
+        np.arange(padded)
+        .reshape(-1, num_batches, block_size)
+        .transpose(1, 0, 2)
+        .flatten()
+        .tolist()
+    )
 
 
 def _install_routing_layer(current, planned, layer: int, staged_rows) -> None:
@@ -256,9 +299,11 @@ class NpuEplbRuntime:
         self._owner_ready = self.device_module.Event()
         self._planned_rows = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
+        self.interleaved_layers = 0
 
     def planner(self, counts):
         self.stage_seconds = self.install_enqueue_seconds = 0.0
+        self.interleaved_layers = 0
         self._owner_stream = self.device_module.current_stream()
         # dump_record returns a fresh, globally reduced tensor. Keep it in the
         # worker closure and copy it on the migration stream only on rank 0.
@@ -360,6 +405,18 @@ class NpuEplbRuntime:
         # advertise readiness only after that dependency has completed.
         staged_rows = []
         pending_work = []
+        old_layout = self.metadata.physical_to_logical_map_cpu[layer].tolist()
+        new_layout = self._planned_rows["physical_to_logical_map"][layer].tolist()
+        p2p_expert_order = None
+        if self.world_size == self.ranks_per_node:
+            p2p_expert_order = _hccl_expert_order(
+                old_layout,
+                new_layout,
+                self.metadata.num_logical_experts,
+                self.world_size,
+                envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get(),
+            )
+        self.interleaved_layers += p2p_expert_order is not None
 
         def submit_p2p_batch(ops):
             work = dist.batch_isend_irecv(ops)
@@ -370,13 +427,11 @@ class NpuEplbRuntime:
             self._p2p_stream.wait_event(self._owner_ready)
             for name, row in self._routing_rows.items():
                 row.copy_(self._planned_rows[name][layer], non_blocking=True)
-            old_layout = self.metadata.physical_to_logical_map_cpu[layer]
-            new_layout = self._planned_rows["physical_to_logical_map"][layer]
             update_expert_weights_single_layer(
                 routed_experts_weights=self.weights[layer],
                 temp_buffers=self.staging,
-                old_physical_to_logical_map=old_layout.tolist(),
-                new_physical_to_logical_map=new_layout.tolist(),
+                old_physical_to_logical_map=old_layout,
+                new_physical_to_logical_map=new_layout,
                 num_local_physical_experts=self.spec.local_experts,
                 num_gpu_per_node=self.ranks_per_node,
                 rank=self.rank,
@@ -385,6 +440,7 @@ class NpuEplbRuntime:
                 group=self.p2p_group,
                 staged_rows=staged_rows,
                 submit_p2p_batch=submit_p2p_batch,
+                p2p_expert_order=p2p_expert_order,
             )
             writeback = _make_weight_writeback(
                 self.weights[layer], self.staging, staged_rows

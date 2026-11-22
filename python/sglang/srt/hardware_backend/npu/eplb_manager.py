@@ -107,7 +107,7 @@ class NpuAsyncEPLBManager(EPLBManager):
         runtime = coordinator.runtime
         logger.info(
             "Async EPLB epoch=%d layers=%d elapsed=%.3fs control_wait=%.6fs "
-            "stage=%.6fs install_enqueue=%.6fs snapshot=%.6fs",
+            "stage=%.6fs install_enqueue=%.6fs snapshot=%.6fs interleaved_layers=%d",
             coordinator.epoch,
             coordinator.layers_installed,
             time.perf_counter() - start,
@@ -115,4 +115,5 @@ class NpuAsyncEPLBManager(EPLBManager):
             runtime.stage_seconds,
             runtime.install_enqueue_seconds,
             snapshot_seconds,
+            runtime.interleaved_layers,
         )

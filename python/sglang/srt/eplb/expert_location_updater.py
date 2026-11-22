@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import einops
 import torch
@@ -247,12 +247,15 @@ def update_expert_weights_single_layer(
     submit_p2p_batch: Optional[
         Callable[[List[P2POp]], List[torch.distributed.Work]]
     ] = None,
+    p2p_expert_order: Optional[Sequence[int]] = None,
 ):
     """Move expert weights, optionally leaving writeback to the caller.
 
     When `staged_rows` is provided, fill it with local (buffer, weight) row
     pairs. A custom `submit_p2p_batch` may retain the work handles. The
     updater still calls wait on every handle before returning.
+    A custom expert order must be identical across ranks and include every
+    expert participating in P2P once.
     """
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -577,11 +580,14 @@ def update_expert_weights_single_layer(
         # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
         batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         ops_by_expert = {eid: ops for eid, ops in sorted_infos}
-        for start in range(0, num_physical_experts, batch_chunk_size):
+        expert_order = (
+            range(num_physical_experts)
+            if p2p_expert_order is None
+            else p2p_expert_order
+        )
+        for start in range(0, len(expert_order), batch_chunk_size):
             batch_ops = []
-            for eid in range(
-                start, min(start + batch_chunk_size, num_physical_experts)
-            ):
+            for eid in expert_order[start : start + batch_chunk_size]:
                 if eid in ops_by_expert:
                     batch_ops.extend(ops_by_expert[eid])
             if batch_ops:
