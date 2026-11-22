@@ -1,12 +1,13 @@
 """Sampling metadata built on the host and copied to the device in one transfer."""
 
+import random
 import unittest
 from types import SimpleNamespace
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.logit_bias import build_logit_bias
+from sglang.srt.sampling.logit_bias import LogitBiasEntries, build_logit_bias
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -19,10 +20,16 @@ VOCAB_SIZE = 32
 
 
 def _req(**sampling_params):
+    params = SamplingParams(**sampling_params)
     return SimpleNamespace(
         penalty_index=None,
         output_ids=[],
-        sampling_params=SamplingParams(**sampling_params),
+        sampling_params=params,
+        logit_bias_entries=(
+            None
+            if params.logit_bias is None
+            else LogitBiasEntries.parse(params.logit_bias)
+        ),
         eos_token_ids=None,
         tokenizer=SimpleNamespace(eos_token_id=None, additional_stop_token_ids=None),
         custom_logit_processor=None,
@@ -115,6 +122,39 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         expected[3, 2] = -1.25
         self.assert_device_tensor(logit_bias, expected, torch.float32)
 
+    def test_logit_bias_matches_a_dense_build(self):
+        rng = random.Random(0)
+        for _ in range(100):
+            reqs = []
+            expected = torch.zeros(rng.randint(1, 8), VOCAB_SIZE)
+            for row in range(len(expected)):
+                if rng.random() < 0.3:
+                    reqs.append(_req())
+                    continue
+                # Distinct ids, so no two keys scatter to one element; negative keys wrap.
+                bias = {
+                    rng.choice([str(key), f"0{key}", str(key - VOCAB_SIZE)]): (
+                        rng.uniform(-100, 100)
+                    )
+                    for key in rng.sample(range(VOCAB_SIZE), rng.randint(0, 6))
+                }
+                reqs.append(_req(logit_bias=bias))
+                for key, value in bias.items():
+                    expected[row, int(key)] = value
+            logit_bias = build_logit_bias(
+                reqs, vocab_size=VOCAB_SIZE, device=self.device
+            )
+            if any(r.logit_bias_entries is not None for r in reqs):
+                self.assert_device_tensor(logit_bias, expected, torch.float32)
+            else:
+                self.assertIsNone(logit_bias)
+        with self.assertRaises(IndexError):
+            build_logit_bias(
+                [_req(logit_bias={str(VOCAB_SIZE): 1.0})],
+                vocab_size=VOCAB_SIZE,
+                device=self.device,
+            )
+
     def test_logit_bias_is_none_without_any_bias(self):
         """Once its last biased request finished, a running batch used to keep a
         zero [bs, vocab] bias, which kept the bias-free fast paths off."""
@@ -162,6 +202,7 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
                 reqs, vocab_size=VOCAB_SIZE, device=self.device
             )
         torch.cuda.synchronize()
+        self.assertEqual(len(copies.numels), 1)
         self.assertLess(max(copies.numels), VOCAB_SIZE)
         expected = torch.zeros(len(reqs), VOCAB_SIZE)
         expected[0, 1], expected[0, 31] = 2, -1
