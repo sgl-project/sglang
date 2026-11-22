@@ -12,7 +12,6 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.sampling.watermarking.config import load_watermark_config
-from sglang.srt.sampling.watermarking.interface import merge_watermark_rows
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
 from sglang.srt.sampling.watermarking.synthid.adapter import SynthIDRows
@@ -190,16 +189,6 @@ class TestSynthIDRequestPolicy(CustomTestCase):
         self.assertIsNone(
             adapter.build_rows(requests[1:3], features=_features(), device="cpu")
         )
-
-        kept = rows.filter([3, 1], torch.tensor([3, 1]))
-        self.assertEqual(
-            (kept.indices.tolist(), kept.candidates_host), ([0], [True, False])
-        )
-        self.assertIsNone(rows.filter([1, 2], torch.tensor([1, 2])))
-        merged = merge_watermark_rows(None, kept, 2, 2)
-        self.assertEqual(merged.indices.tolist(), [2])
-        merged = merge_watermark_rows(kept, None, 2, 1)
-        self.assertEqual(merged.candidates_host, [True, False, False])
 
 
 class TestSynthIDEngine(CustomTestCase):

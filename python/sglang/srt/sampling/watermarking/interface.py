@@ -23,37 +23,13 @@ if TYPE_CHECKING:
 
 
 class WatermarkRows(Protocol):
-    """One batch's per-row watermark policy.
+    """One step's per-row watermark policy, built by the scheduler at each
+    launch from the step's requests.
 
     Exists only if at least one row is a candidate (enabled and top_k > 1); the
-    batch carries None otherwise. Immutable: an overlapped forward may still read
-    the old object, so filter and concat return new objects.
+    batch carries None otherwise. Only the algorithm's own engine reads its
+    fields; other code only checks it for None.
     """
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: Tensor
-    ) -> Optional[WatermarkRows]:
-        """The kept rows, or None when no candidate row is kept."""
-        ...
-
-    def concat(
-        self, other: Optional[WatermarkRows], self_len: int, other_len: int
-    ) -> WatermarkRows:
-        """These rows followed by ``other``'s, or by ``other_len`` off rows."""
-        ...
-
-    def prepend_off(self, num_rows: int) -> WatermarkRows: ...
-
-
-def merge_watermark_rows(
-    a: Optional[WatermarkRows],
-    b: Optional[WatermarkRows],
-    a_len: int,
-    b_len: int,
-) -> Optional[WatermarkRows]:
-    if a is None:
-        return None if b is None else b.prepend_off(a_len)
-    return a.concat(b, a_len, b_len)
 
 
 @dataclass(frozen=True)
