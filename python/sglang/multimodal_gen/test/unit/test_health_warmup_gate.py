@@ -134,7 +134,9 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                                 self.assertTrue(ready)
                                 self.assertTrue(aborted.is_set())
                                 self.assertEqual(response.status_code, 503)
-                                self.assertIn("unsupported probe", client.failure_reason)
+                                self.assertIn(
+                                    "unsupported probe", client.failure_reason
+                                )
                             else:
                                 self.assertTrue(
                                     ready
