@@ -41,8 +41,8 @@ _MXFP4_MAX_TOKENS = forward_mla_rocm._FUSED_FP4_BMM_ROPE_CACHE_MAX_TOKENS
 
 
 def _CAN_FUSE(attn):
-    # FP8 terms ignore the forward mode, capture state and token count; the caller
-    # gates the mode.
+    # FP8 terms ignore the forward mode, capture state and token count;
+    # the caller gates the mode.
     return _CAN_FUSE_GATE(
         attn,
         forward_mode=ForwardMode.EXTEND,

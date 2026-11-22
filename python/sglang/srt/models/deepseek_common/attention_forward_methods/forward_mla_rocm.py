@@ -567,8 +567,8 @@ def _can_fuse_bmm_rope_cat_and_cache(
     return False
 
 
-# Measured on gfx950 at 8, 16 and 32 local heads: above 256 tokens the fused MXFP4
-# grid is slower than the split launches (2.4x at 32 heads and 320 tokens).
+# Measured on gfx950 at 8, 16 and 32 local heads;
+# above 256 tokens split is faster (2.4x at 32 heads and 320 tokens).
 _FUSED_FP4_BMM_ROPE_CACHE_MAX_TOKENS = 256
 
 
@@ -616,14 +616,12 @@ def _fused_bmm_rope_cat_and_cache(
     the first half of this kernel's grid.
     """
     if attn.w_kc.dtype == torch.uint8:
-        # Same weight and scale views the MXFP4 branch of rocm_absorb_q_bmm passes
-        # to batched_gemm_afp4wfp4_pre_quant.
+        # Same views as rocm_absorb_q_bmm's MXFP4 branch.
         kernel = fused_fp4_bmm_rope_cat_and_cache_mla
         w_scale = attn.w_scale_k.transpose(-2, -1)
         kernel_kwargs = {}
     else:
-        # Same weights and group size the fp8 branch of rocm_absorb_q_bmm passes to
-        # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.
+        # Same weights and group size as rocm_absorb_q_bmm's FP8 branch.
         kernel = fused_fp8_bmm_rope_cat_and_cache_mla
         w_scale = attn.w_scale
         kernel_kwargs = {"group_size": 128}
