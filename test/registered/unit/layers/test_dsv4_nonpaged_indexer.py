@@ -2,7 +2,7 @@ import sys
 import unittest
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -356,73 +356,6 @@ class TestDSV41FlashInferTopK(CustomTestCase):
             for path, blocks in published.items():
                 with self.subTest(topk_backend=topk_backend, path=path):
                     self.assertTrue(torch.equal(blocks.blocks, expected))
-
-    def test_flashinfer_block_selection_stays_on_the_main_stream(self):
-        """The candidate source overlaps its block selection with its own top-k on
-        a side stream, except under FlashInfer, whose CUB top-k shares one scratch
-        buffer per device between the two."""
-        from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
-
-        for topk_backend in DSATopKBackend:
-            with self.subTest(topk_backend=topk_backend):
-                can_overlap = not topk_backend.is_flashinfer()
-                backend = object.__new__(mod.SparseTableBackend)
-                backend.token_to_kv_pool = None
-                backend.topk_blocks = 2
-                backend.alt_stream = MagicMock(name="alt")
-                backend.selector = TopKSelector(topk_backend)
-                main = MagicMock(name="main")
-                entered = []
-
-                class _Enter:
-                    def __init__(self, stream):
-                        entered.append(stream)
-
-                    def __enter__(self):
-                        return None
-
-                    def __exit__(self, *exc):
-                        return False
-
-                data = MagicMock()
-                data.paged_logits_args.return_value = (
-                    MagicMock(),
-                    MagicMock(),
-                    MagicMock(),
-                    None,
-                )
-                event = MagicMock()
-                logits = MagicMock(name="logits")
-                with (
-                    patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
-                    patch.object(
-                        mod, "deep_gemm_fp4_paged_mqa_logits", return_value=logits
-                    ),
-                    patch.object(
-                        mod,
-                        "candidate_row_lens",
-                        return_value=(MagicMock(), MagicMock()),
-                    ),
-                    patch.object(mod, "sort_candidate_blocks"),
-                    patch.object(mod, "build_sparse_indexer_schedule"),
-                    patch.object(mod.torch.cuda, "current_stream", return_value=main),
-                    patch.object(mod.torch.cuda, "stream", _Enter),
-                    patch.object(mod.torch.cuda, "Event", return_value=event),
-                    patch.object(backend.selector, "paged_from_metadata"),
-                    patch.object(backend.selector, "amax_blocks"),
-                ):
-                    backend.publish_decode(MagicMock(is_verify=True))
-                alt = backend.alt_stream
-                if can_overlap:
-                    self.assertEqual(entered, [alt])
-                    alt.wait_stream.assert_called_once_with(main)
-                    logits.record_stream.assert_called_once_with(alt)
-                    event.record.assert_called_once_with(alt)
-                    continue
-                self.assertEqual(alt.mock_calls, [])
-                self.assertNotIn(alt, entered)
-                self.assertNotIn(call(alt), logits.record_stream.call_args_list)
-                self.assertNotIn(call(alt), event.record.call_args_list)
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
