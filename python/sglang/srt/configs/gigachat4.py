@@ -12,6 +12,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
 class GigaChat4Config(GigaChat35Config):
     model_type = "gigachat4"
     dsa_draft_attends_to_own_chain = True
+    gdn_round_beta_to_input_dtype = True
 
     def __init__(
         self,

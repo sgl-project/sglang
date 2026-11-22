@@ -679,13 +679,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        # Match GigaChat 4 beta precision in Triton packed decode.
         self._round_beta_to_input_dtype = (
             not is_cpu()
             and not is_npu()
             and backends.decode.is_triton()
-            and getattr(self._model_runner.model_config.hf_config, "model_type", None)
-            == "gigachat4"
+            and getattr(
+                self._model_runner.model_config.hf_config,
+                "gdn_round_beta_to_input_dtype",
+                False,
+            )
         )
         return GDNKernelDispatcher(
             backends.decode,
@@ -1930,9 +1932,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             is_kda=False,
             disable_state_update=True,
             cache_ring=True,
-            round_beta_to_input_dtype=getattr(
-                self, "_round_beta_to_input_dtype", False
-            ),
+            round_beta_to_input_dtype=self._round_beta_to_input_dtype,
             replayssm_rawv=layer_cache.replayssm_rawv,
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
