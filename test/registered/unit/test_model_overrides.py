@@ -210,6 +210,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_replicate_q_proj",
                     "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
+                    "num_continuous_decode_steps",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "decode_state_free_radix_default",
