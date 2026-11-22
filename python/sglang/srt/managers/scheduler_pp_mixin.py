@@ -27,6 +27,7 @@ from sglang.srt.managers.utils import (
     allocate_distinct_stream,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
+    pp_output_rows_to_host,
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
@@ -1031,6 +1032,9 @@ class SchedulerPPMixin:
         with self.pp_comm_stream_ctx:
             if ready_event is not None:
                 self.device_module.current_stream().wait_event(ready_event)
+            if msg_type == "output" and pp_output_rows_to_host(tensor_dict):
+                # send_tensor_dict pickles the host rows right away.
+                self.device_module.current_stream().synchronize()
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,

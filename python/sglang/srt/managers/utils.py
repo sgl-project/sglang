@@ -436,6 +436,21 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
     }
 
 
+def pp_output_rows_to_host(tensor_dict: dict) -> bool:
+    """Start host copies of the device tensors in the PP output message's per-request
+    row lists (top and token-id logprobs); returns whether any started. The message
+    pickles these lists, and the receiving stage would rebuild a pickled device tensor
+    on the sender's device index, opening a context on a GPU it does not own."""
+    copied = False
+    for key, rows in tensor_dict.items():
+        if isinstance(rows, list) and any(
+            torch.is_tensor(row) and row.device.type != "cpu" for row in rows
+        ):
+            tensor_dict[key] = _async_d2h_rows(rows)
+            copied = True
+    return copied
+
+
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
 ) -> tuple[LogitsProcessorOutput, list[int], list[int]]:

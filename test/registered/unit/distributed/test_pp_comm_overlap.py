@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod
+from sglang.srt.managers import utils as managers_utils
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -98,6 +99,73 @@ class TestPPCommOverlap(CustomTestCase):
 
         self.assertIs(received, tensor_dict)
         self.assertIs(event, recv_event)
+
+    def _send_and_record(self, tensor_dict, msg_type):
+        ops = []
+        stream = SimpleNamespace(
+            wait_event=lambda event: ops.append(("wait", event)),
+            synchronize=lambda: ops.append(("sync",)),
+        )
+
+        def send_tensor_dict(tensor_dict, all_gather_group, async_send):
+            ops.append(("send", dict(tensor_dict)))
+            return []
+
+        scheduler = _make_scheduler(
+            pp_comm_stream_ctx=nullcontext(),
+            device_module=SimpleNamespace(current_stream=lambda: stream),
+            pp_group=SimpleNamespace(send_tensor_dict=send_tensor_dict),
+            attn_tp_group=None,
+        )
+        host_rows = {}
+
+        def to_host(rows):
+            host_rows[id(rows)] = [torch.zeros(row.shape) for row in rows]
+            return host_rows[id(rows)]
+
+        with patch.object(managers_utils, "_async_d2h_rows", side_effect=to_host):
+            scheduler._pp_send_dict_to_next_stage(
+                tensor_dict, msg_type=msg_type, ready_event="forward"
+            )
+        return ops, list(host_rows.values())
+
+    def test_output_row_lists_reach_the_host_before_pickling(self):
+        """The output message pickles per-request row lists; a device tensor in
+        them would be rebuilt on the sender's device index by the receiver."""
+        device_rows = [torch.empty(2, device="meta"), torch.empty(3, device="meta")]
+        token_ids = [[1, 2], [3]]
+        next_token_ids = torch.arange(2)
+        ops, copies = self._send_and_record(
+            {
+                "next_token_ids": next_token_ids,
+                "next_token_top_logprobs_val": device_rows,
+                "next_token_token_ids_logprobs_idx": token_ids,
+                "input_top_logprobs_val": None,
+            },
+            msg_type="output",
+        )
+
+        self.assertEqual([op[0] for op in ops], ["wait", "sync", "send"])
+        sent = ops[-1][1]
+        self.assertEqual(len(copies), 1)
+        self.assertIs(sent["next_token_top_logprobs_val"], copies[0])
+        self.assertIs(sent["next_token_token_ids_logprobs_idx"], token_ids)
+        self.assertIs(sent["next_token_ids"], next_token_ids)
+        self.assertIsNone(sent["input_top_logprobs_val"])
+
+    def test_messages_without_device_rows_send_without_a_host_wait(self):
+        host_rows = [torch.zeros(2)]
+        ops, copies = self._send_and_record(
+            {"next_token_top_logprobs_val": host_rows}, msg_type="output"
+        )
+        self.assertEqual([op[0] for op in ops], ["wait", "send"])
+        self.assertEqual(copies, [])
+
+        ops, copies = self._send_and_record(
+            {"hidden_states": [torch.empty(2, device="meta")]}, msg_type="proxy"
+        )
+        self.assertEqual([op[0] for op in ops], ["wait", "send"])
+        self.assertEqual(copies, [])
 
     def test_npu_pp2_outputs_match_across_paired_and_one_sided_transfers(self):
         """Output receives during graph replay must avoid model collectives,
