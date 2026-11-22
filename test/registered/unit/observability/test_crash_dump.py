@@ -130,6 +130,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
             finished = (_request("done"), _out("done"), 100.0, 101.5)
             unfinished_state = SimpleNamespace(
                 finished=False,
+                prompt_released=False,
                 obj=_request("running"),
                 out_list=[],
                 get_crash_dump_output=lambda: {"text": " par", "output_ids": [7]},
