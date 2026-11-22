@@ -17,6 +17,7 @@ def _info(temps):
         temperatures=torch.tensor(temps, device="cuda"),
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
     )
 
 
