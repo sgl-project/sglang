@@ -328,10 +328,10 @@ class TestReceiverControlMessages(CustomTestCase):
                 if backend == "mooncake":
                     self.assertEqual(info.num_draft_entries, 0)
                     # A peer that predates the draft-count field parses None.
-                    legacy = registration_type.from_zmq(frames[:-1])
+                    legacy = registration_type.from_zmq(frames[:-2])
                     self.assertIsNone(legacy.num_draft_entries)
                     self.assertEqual(legacy.dst_kv_item_lens, [16])
-                    with_draft = registration_type.from_zmq(frames[:-1] + [b"1"])
+                    with_draft = registration_type.from_zmq(frames[:-2] + [b"1"])
                     self.assertEqual(with_draft.num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
