@@ -2436,6 +2436,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], "flashinfer"
         )
 
+    def test_dllm_rejects_lora_requested_by_flag_or_adapter(self):
+        for option, kwargs in (
+            ("--enable-lora", {"enable_lora": True}),
+            ("--lora-paths", {"lora_paths": ["adapter"]}),
+        ):
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(ValueError, rf"--dllm-algorithm.*{option}"),
+            ):
+                args = self._construct(
+                    "SDARForCausalLM", "llama", dllm_algorithm="LowConfidence", **kwargs
+                )
+                args.check_server_args()
+
+    def test_dllm_accepts_disabled_lora(self):
+        for kwargs in ({}, {"enable_lora": False, "lora_paths": ["adapter"]}):
+            with self.subTest(kwargs=kwargs):
+                args = self._construct(
+                    "SDARForCausalLM", "llama", dllm_algorithm="LowConfidence", **kwargs
+                )
+                args.check_server_args()
+                self.assertFalse(self._resolved(args, "enable_lora"))
+
+    def test_lora_paths_enable_lora_without_dllm(self):
+        args = self._construct("LlamaForCausalLM", "llama", lora_paths=["adapter"])
+        args.check_server_args()
+        self.assertTrue(self._resolved(args, "enable_lora"))
+
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the
         # leaf must equal the last declared value while the server_args field

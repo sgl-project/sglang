@@ -24,6 +24,12 @@ def handle_dllm_inference(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return
+    if cfg.enable_lora or (cfg.enable_lora is None and cfg.lora_paths):
+        raise ValueError(
+            "--dllm-algorithm does not support LoRA. Remove --enable-lora and "
+            "--lora-paths to run diffusion LLM inference."
+        )
+
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
     run_post_process_pass(server_args, _dllm_attention_backend)
@@ -97,10 +103,6 @@ def handle_dllm_inference(server_args: Any):
             "_handle_dllm_inference",
             pp_size=1,
         )
-
-    if cfg.enable_lora:
-        logger.warning("Currently LoRA is not supported by diffusion LLM inference.")
-        declare_resolution(server_args, "_handle_dllm_inference", enable_lora=False)
 
     if cfg.disaggregation_mode != "null":
         logger.warning(
