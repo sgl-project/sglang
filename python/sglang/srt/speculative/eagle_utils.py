@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.logit_bias import apply_logit_bias
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -816,12 +817,11 @@ def eagle_sample(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
         )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
+    apply_logit_bias(
+        next_token_logits,
+        sampling_info,
+        rows_per_request=verify_input.draft_token_num,
+    )
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
