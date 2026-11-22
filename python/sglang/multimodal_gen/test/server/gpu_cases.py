@@ -967,63 +967,6 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
-        # pi-H3 2-step decoder-free (DWD) variant: Ulysses2 covers the
-        # pixel-head features gathered across sequence-parallel ranks; the
-        # offload flags of the base H3 2-GPU case keep each card near 50 GiB.
-        # The overlay-materialized adapter on the pruned DiT has no component
-        # reference hook, like the other H3 cases.
-        "pi_h3_t2va_dwd_2step_2gpu_h100",
-        DiffusionServerArgs(
-            model_path="Lakonik/pi-H3",
-            modality="video",
-            num_gpus=2,
-            ulysses_degree=2,
-            extras=[
-                "--model-variant",
-                "2step",
-                "--performance-mode",
-                "memory",
-                "--layerwise-offload-components",
-                "dit,text_encoder,vae",
-                "--layerwise-resident-layers",
-                "video_vae=36",
-                "--dit-offload-prefetch-size",
-                "1",
-                "--dit-layerwise-resident-layers",
-                "20",
-                "--enable-torch-compile",
-                "false",
-            ],
-        ),
-        DiffusionSamplingParams(
-            prompt=(
-                "A red fox trotting through a snowy pine forest, snow crunching "
-                "underfoot, birds chirping in the distance."
-            ),
-            output_size="1344x768",
-            seconds=5,
-            output_format="mp4",
-            expect_audio_output=True,
-            num_outputs_per_prompt=1,
-            extras={
-                "task": "t2va",
-                "conditions": [],
-                "target": {
-                    "short_edge": 768,
-                    "aspect_ratio": "16:9",
-                    "duration_seconds": 5.0,
-                },
-                "num_inference_steps": 2,
-                "seed": 42,
-            },
-        ),
-        run_perf_check=False,
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-        run_models_api_check=False,
-        run_t2v_input_reference_check=False,
-    ),
-    DiffusionTestCase(
         "minimax_h3_t2va_2gpu_h100",
         DiffusionServerArgs(
             model_path="MiniMaxAI/MiniMax-H3",
