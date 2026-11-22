@@ -202,19 +202,6 @@ class SamplingBatchInfo:
         return new
 
 
-def adjusts_logits(info: SamplingBatchInfo, *, has_grammar: bool) -> bool:
-    """Whether sampling edits the logits before choosing tokens. has_grammar comes
-    from the batch: verify builds its grammar mask per step, outside the sampling info.
-    """
-    return (
-        has_grammar
-        or info.step_penalties is not None
-        or info.logit_bias is not None
-        or info.has_custom_logit_processor
-        or info.watermark is not None
-    )
-
-
 def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
     """Whether some row truncates its distribution with top-k, top-p, or min-p."""
     return (

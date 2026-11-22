@@ -38,7 +38,6 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -256,7 +255,7 @@ def make_post_verify_io(
 def accept_draft_tree(
     batch: ScheduleBatch,
     *,
-    verify: TargetVerify,
+    verify: VerifyStep,
     verify_input: Any,
     logits_output: Any,
     speculative_runtime_hooks: Any,
@@ -329,6 +328,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.sampling.sampling_pipeline import VerifyStep
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
         EAGLEDraftCudaGraphRunner,
     )
@@ -868,6 +868,14 @@ def run_eagle_verify(
 
     bs = len(batch.seq_lens)
 
+    attn_verify_mask = target_worker.model_runner.attn_backend.verify_mask
+    verify = target_worker.model_runner.sampling_pipeline.bind_verify(
+        batch,
+        watermark_full_mask=(
+            attn_verify_mask is None or attn_verify_mask.mode == TreeMaskMode.FULL_MASK
+        ),
+    )
+
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
@@ -880,6 +888,7 @@ def run_eagle_verify(
             req_to_token_pool,
             batch,
             target_worker,
+            route=verify.route,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -948,16 +957,8 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    attn_verify_mask = target_worker.model_runner.attn_backend.verify_mask
-    verify = TargetVerify.prepare(
-        batch,
-        logits_output=logits_output,
-        grammar_tree=grammar_tree,
-        grammar_barrier=grammar_barrier,
-        watermark_engine=target_worker.model_runner.watermark,
-        watermark_full_mask=(
-            attn_verify_mask is None or attn_verify_mask.mode == TreeMaskMode.FULL_MASK
-        ),
+    verify.build_grammar_mask(
+        grammar_tree, logits_output=logits_output, barrier=grammar_barrier
     )
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
@@ -968,6 +969,7 @@ def run_eagle_verify(
         if post_verify_graphs is None or clears_c128
         else post_verify_graphs.run(
             batch=batch,
+            route=verify.route,
             verify_input=verify_input,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -985,11 +987,10 @@ def run_eagle_verify(
                 num_draft_tokens=num_draft_tokens,
             )
         verify.commit(
-            batch,
-            logits_output=logits_output,
-            accept=VerifyAccept(
+            VerifyAccept(
                 tokens=predict, accept_lens=accept_lens, accept_index=accept_index
             ),
+            logits_output=logits_output,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -1018,7 +1019,7 @@ def run_eagle_verify(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
     )
-    verify.commit(batch, logits_output=logits_output, accept=accept)
+    verify.commit(accept, logits_output=logits_output)
     predict, accept_lens, accept_index = (
         accept.tokens,
         accept.accept_lens,

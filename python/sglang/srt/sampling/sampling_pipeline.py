@@ -15,23 +15,32 @@ adapters over their existing code.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.sampler import Sampler
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_observer import SamplingObserver
-    from sglang.srt.sampling.watermarking.interface import WatermarkEngine
+    from sglang.srt.sampling.verify_accept import VerifyAccept
+    from sglang.srt.sampling.watermarking.interface import (
+        VerifyWatermark,
+        WatermarkEngine,
+    )
+    from sglang.srt.speculative.spec_utils import GrammarTree
 
 
 class SamplingPipeline(msgspec.Struct, frozen=True):
@@ -115,6 +124,29 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             sampling_info.step_penalties.commit(next_token_ids)
         return next_token_ids
 
+    def bind_verify(
+        self, batch: ScheduleBatch, *, watermark_full_mask: bool
+    ) -> VerifyStep:
+        """Bind a target verify's sampling state: its route and its watermark.
+        Call it before the target forward launches, so the route can pick the
+        forward's own fast paths.
+
+        `watermark_full_mask`: the verify's custom mask has the FULL_MASK layout,
+        prefix columns included.
+        """
+        info = batch.sampling_info
+        watermark = None
+        if self.watermark is not None:
+            watermark = self.watermark.bind_verify(
+                info.watermark, full_mask=watermark_full_mask
+            )
+        return VerifyStep(
+            batch=batch,
+            route=VerifyRoute.derive(info, has_grammar=batch.has_grammar),
+            watermark=watermark,
+            watermark_full_mask=watermark_full_mask,
+        )
+
     def compute_logprobs_only(
         self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
     ) -> None:
@@ -157,3 +189,151 @@ def _adjust_after_watermark(
     apply_custom_logit_processor(logits, sampling_info)
     sanitize_nan_logits(logits, "sampler: next_token_logits")
     return logits
+
+
+class VerifyRoute(msgspec.Struct, frozen=True):
+    """The sampling facts that pick a target verify's fast paths."""
+
+    # Some stage edits the logits before the accept reads them.
+    adjusts_logits: bool
+    # Some row truncates its distribution with top-k, top-p, or min-p.
+    need_truncated_sampling: bool
+
+    @classmethod
+    def derive(
+        cls, info: Optional[SamplingBatchInfo], *, has_grammar: bool
+    ) -> VerifyRoute:
+        """`has_grammar` comes from the batch: verify builds its grammar mask over
+        the draft tree, not from the sampling info."""
+        # Without sampling info, only a grammar edits the logits.
+        if info is None:
+            return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
+        return cls(
+            adjusts_logits=(
+                has_grammar
+                or info.step_penalties is not None
+                or info.logit_bias is not None
+                or info.has_custom_logit_processor
+                or info.watermark is not None
+            ),
+            need_truncated_sampling=need_truncated_sampling(info),
+        )
+
+
+class VerifyStep(msgspec.Struct):
+    """One target verify's sampling state, from `SamplingPipeline.bind_verify`:
+    the route its fast paths read, the bound watermark, and the grammar mask,
+    built after the target forward launches."""
+
+    batch: ScheduleBatch
+    route: VerifyRoute
+    watermark: Optional[VerifyWatermark]
+    watermark_full_mask: bool
+    grammar_mask: Optional[GrammarMask] = None
+
+    def build_grammar_mask(
+        self,
+        tree: Optional[GrammarTree],
+        *,
+        logits_output: LogitsProcessorOutput,
+        barrier: Optional[Callable[[], None]],
+    ) -> None:
+        """Build the grammar mask over the verify tree. Call it after the target
+        verify launches, so the mask's host work overlaps the forward."""
+        if tree is None:
+            return
+        # Lazy: spec_utils imports the scheduler stack.
+        from sglang.srt.speculative.spec_utils import build_grammar_vocab_mask
+
+        self.grammar_mask = build_grammar_vocab_mask(
+            reqs=self.batch.reqs,
+            tree=tree,
+            sampling_info=self.batch.sampling_info,
+            device=logits_output.next_token_logits.device,
+            barrier=barrier,
+        )
+
+    def adjust(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        *,
+        positions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
+        """Run the stages over a chain verify's logits (`draft_tokens` is
+        [bs, width]; `positions` too, read by the watermark). Returns the logits
+        and the sampling info to accept with: the watermark may replace both,
+        and leaves `logits` unwatermarked when the batch returns logprobs."""
+        batch = self.batch
+        info = batch.sampling_info
+        adjust_verify_logits(
+            logits,
+            sampling_info=info,
+            grammar_mask=self.grammar_mask,
+            draft_tokens=draft_tokens,
+            has_custom_logit_processor=info.has_custom_logit_processor,
+        )
+        if self.watermark is not None:
+            logits, info = self.watermark.apply(
+                logits,
+                sampling_info=info,
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=draft_tokens,
+                positions=positions,
+                draft_token_num=draft_tokens.shape[1],
+                custom_mask=None,
+                keep_logits=batch.return_logprob,
+            )
+        return logits, info
+
+    def commit(
+        self, accept: VerifyAccept, *, logits_output: LogitsProcessorOutput
+    ) -> None:
+        """Commit `accept` to each stage's per-request state, then compute the
+        logprobs of its tokens when the batch returns them."""
+        batch = self.batch
+        info = batch.sampling_info
+        if info.step_penalties is not None:
+            info.step_penalties.commit_accept(accept)
+        if self.watermark is not None:
+            self.watermark.commit(accept)
+        if not batch.return_logprob or batch.forward_mode.is_idle():
+            return
+        if accept.accept_index is not None:
+            compute_spec_logprobs(
+                batch, logits_output, accept.tokens, accept_index=accept.accept_index
+            )
+        else:
+            compute_spec_logprobs(
+                batch,
+                logits_output,
+                accept.tokens.reshape(-1),
+                chain_stride=accept.tokens.shape[1],
+            )
+
+
+def adjust_verify_logits(
+    logits: torch.Tensor,
+    *,
+    sampling_info: SamplingBatchInfo,
+    grammar_mask: Optional[GrammarMask],
+    draft_tokens: torch.Tensor,
+    next_child: Optional[torch.Tensor] = None,
+    next_sibling: Optional[torch.Tensor] = None,
+    has_custom_logit_processor: bool,
+) -> None:
+    """Penalty, grammar mask, logit_bias, then custom logit processor over a
+    verify's logits, in place. Row ``i * width + j`` of ``logits`` is request
+    i's draft token j (``draft_tokens`` is [bs, width]): the penalty follows the
+    draft chain, or the tree ``next_child`` / ``next_sibling`` give, and
+    logit_bias and the custom logit processor get ``width`` rows per request."""
+    width = draft_tokens.shape[1]
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(
+            logits, draft_tokens, next_child=next_child, next_sibling=next_sibling
+        )
+    if grammar_mask is not None:
+        grammar_mask.apply(logits)
+    apply_logit_bias(logits, sampling_info, rows_per_request=width)
+    if has_custom_logit_processor:
+        apply_custom_logit_processor(logits, sampling_info, rows_per_request=width)

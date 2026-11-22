@@ -9,6 +9,7 @@ import msgspec
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -56,7 +57,7 @@ def _worker(enabled=True, mode="static"):
 
 def _eligible(worker, info, *, folded=True, grammar=False, sim_bonus=None):
     return worker._sampling_graph_eligible(
-        batch=SimpleNamespace(has_grammar=grammar),
+        route=VerifyRoute.derive(info, has_grammar=grammar),
         proposal_folded=folded,
         sampling_info=info,
         simulate_bonus_sampling_info=sim_bonus,
@@ -136,6 +137,7 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
         target_logits=io.logits[: bs * STRIDE],
         draft_block=block,
         sampling_info=info,
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         gamma=GAMMA,
         verify_num_draft_tokens=STRIDE,

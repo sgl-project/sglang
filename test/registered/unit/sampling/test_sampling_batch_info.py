@@ -6,6 +6,7 @@ register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
@@ -17,6 +18,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
+from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
@@ -32,7 +34,9 @@ DEVICE = "cpu"
 # Helper: construct a minimal SamplingBatchInfo
 def _tables_step(additive, scaling=None):
     """A step whose penalty tables are given."""
-    return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+    step = SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+    step.apply = partial(StepPenalties.apply, step)
+    return step
 
 
 def _make_info(**overrides):
@@ -69,7 +73,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             )
         ]
         info.step_penalties = SimpleNamespace(
-            logit_penalties=lambda: events.append("penalty") or (None, None),
+            apply=lambda logits: events.append("penalty"),
             commit=lambda token_ids: events.append("penalty commit"),
         )
         logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))

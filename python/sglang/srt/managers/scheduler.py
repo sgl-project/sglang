@@ -5627,6 +5627,12 @@ class Scheduler(
                         # input_ids, out_cache_loc); without the restore the
                         # next get_next_batch_to_run treats this decode batch
                         # as extend and re-merges it (duplicate reqs).
+                        # PP speculative decoding refuses the watermark.
+                        verify = (
+                            self.tp_worker.model_runner.sampling_pipeline.bind_verify(
+                                batch, watermark_full_mask=False
+                            )
+                        )
                         with self._forward_isolation(batch, overlap=False):
                             verify_forward_batch, can_run_cuda_graph = (
                                 eagle_prepare_for_verify(
@@ -5634,6 +5640,7 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
+                                    route=verify.route,
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(

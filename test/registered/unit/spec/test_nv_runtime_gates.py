@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_worker_common
-from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,10 +33,14 @@ class TestNativeEagerVerify(CustomTestCase):
                         return_logprob=False,
                         forward_mode=SimpleNamespace(is_idle=lambda: False),
                     )
-                    verify = TargetVerify(
-                        grammar_mask=object(),
+                    verify = VerifyStep(
+                        batch=batch,
+                        route=VerifyRoute(
+                            adjusts_logits=True, need_truncated_sampling=False
+                        ),
                         watermark=object(),
                         watermark_full_mask=True,
+                        grammar_mask=object(),
                     )
                     verify_input = object()
                     logits_output = SimpleNamespace(next_token_logits=None)
