@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import torch
 from xgrammar import (
@@ -192,6 +192,41 @@ class XGrammarGrammar(BaseGrammarObject):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
 
+def _special_token_ids(tokenizer) -> Set[int]:
+    """Ids of the tokenizer's special tokens, such as ``<|im_start|>`` or ``[TOOL_CALLS]``."""
+    token_ids = set(getattr(tokenizer, "all_special_ids", None) or ())
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None)
+    if isinstance(added_tokens, dict):
+        token_ids.update(
+            token_id
+            for token_id, token in added_tokens.items()
+            if getattr(token, "special", False)
+        )
+    return {token_id for token_id in token_ids if isinstance(token_id, int)}
+
+
+def _without_tokens(info: TokenizerInfo, token_ids: Iterable[int]) -> TokenizerInfo:
+    """Return ``info`` with the given tokens emptied out of the vocabulary.
+
+    XGrammar treats an empty token as special: the mask never allows it, except
+    as a stop token where the grammar can end. (``reserve_framing_tokens``
+    prefixes 0xFF instead, because its token elements must still match by id.)
+    """
+    dropped = {token_id for token_id in token_ids if 0 <= token_id < info.vocab_size}
+    if not dropped:
+        return info
+    vocab = [
+        b"" if token_id in dropped else piece
+        for token_id, piece in enumerate(info.decoded_vocab)
+    ]
+    return TokenizerInfo(
+        vocab,
+        VocabType.RAW,
+        vocab_size=info.vocab_size,
+        stop_token_ids=info.stop_token_ids,
+    )
+
+
 class TokenizerNotSupportedError(Exception):
     """Raised when tokenizer is not supported by XGrammar backend."""
 
@@ -238,8 +273,27 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         # would free nothing. Both caches reference one C++ object, so giving
         # the compiler the same budget keeps the total near one budget.
         compiler_limit = self.cache_limit_bytes if self.cache_limit_bytes > 0 else -1
+        # JSON is text, so it compiles over a vocabulary without the special
+        # tokens; otherwise a JSON string could contain ``<|im_start|>`` or
+        # ``[TOOL_CALLS]``. Regex, EBNF and structural tags keep the full
+        # vocabulary, because SGLang's own grammars spell special tokens as
+        # literals (the Whisper language auto-detect regex, the GLM-4.7
+        # tool-call EBNF, tool-call structural tags).
+        json_tokenizer_info = _without_tokens(
+            tokenizer_info, _special_token_ids(tokenizer)
+        )
+        if json_tokenizer_info is not tokenizer_info and compiler_limit > 0:
+            # Each compiler caches only its own grammars; split the budget.
+            compiler_limit //= 2
         self.grammar_compiler = GrammarCompiler(
             tokenizer_info=tokenizer_info, cache_limit_bytes=compiler_limit
+        )
+        self.json_compiler = (
+            self.grammar_compiler
+            if json_tokenizer_info is tokenizer_info
+            else GrammarCompiler(
+                tokenizer_info=json_tokenizer_info, cache_limit_bytes=compiler_limit
+            )
         )
         self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
@@ -382,13 +436,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             if key_string == "$$ANY$$":
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
-                ctx = self.grammar_compiler.compile_builtin_json_grammar()
+                ctx = self.json_compiler.compile_builtin_json_grammar()
             else:
                 # Inspect the decoded schema for semantic loss, then give the
                 # original string to XGrammar to preserve its parser behavior.
                 schema = json.loads(key_string)
                 validate_xgrammar_json_schema(schema)
-                ctx = self.grammar_compiler.compile_json_schema(
+                ctx = self.json_compiler.compile_json_schema(
                     schema=key_string,
                     any_whitespace=self.any_whitespace,
                     max_whitespace_cnt=self.max_whitespace_cnt,
@@ -456,6 +510,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def reset(self):
         super().reset()
         self.grammar_compiler.clear_cache()
+        self.json_compiler.clear_cache()
 
 
 def demo_test():

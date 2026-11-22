@@ -192,7 +192,7 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
 class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
     def test_xgrammar_rejects_before_compilation(self):
         backend = object.__new__(XGrammarGrammarBackend)
-        backend.grammar_compiler = MagicMock()
+        backend.json_compiler = backend.grammar_compiler = MagicMock()
 
         result = backend.dispatch_json(
             '{"type":"string","pattern":"^[a-z]+$","minLength":2}'
