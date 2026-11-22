@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_components import profiler_manager
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
+from sglang.srt.observability.profile_utils import ProfileManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -165,6 +166,15 @@ class TestHostSendsBeforeProfilerStop(CustomTestCase):
         profiler.stop.assert_not_called()
         self.assertFalse(manager.profile_in_progress)
         self.assertIsNone(manager.torch_profiler)
+
+        # SGLANG_PROFILE_V2: a failed stop leaves no capture behind either.
+        with published_topology():
+            v2 = ProfileManager(cpu_group=None)
+        v2.profiler = Mock(stop=Mock(side_effect=RuntimeError("gone")))
+        v2.profiler_kwargs = {"output_dir": "unused"}
+        with self.assertRaises(RuntimeError):
+            v2._do_stop()
+        self.assertIsNone(v2.profiler)
 
     def test_only_pp_loops_defer_the_step_predicate_to_the_iteration_boundary(self):
         for at_boundary in (False, True):

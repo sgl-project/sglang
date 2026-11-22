@@ -164,15 +164,18 @@ class ProfileManager:
 
     def _do_stop(self):
         logger.info("Stop profiling...")
-        self.profiler.stop()
+        # Cleared first, so a stop that raises (a PP peer gone) leaves no capture.
+        profiler, self.profiler = self.profiler, None
+        try:
+            profiler.stop()
+        finally:
+            # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
+            # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
+            # this guarantees the flag resets on every stop path.
+            set_detailed_annotations_enabled(False)
         logger.info(
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
-        self.profiler = None
-        # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
-        # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
-        # this guarantees the flag resets on every stop path.
-        set_detailed_annotations_enabled(False)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):

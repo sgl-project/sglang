@@ -21,7 +21,7 @@ from sglang.srt.observability.profile_utils import _ProfilerTorch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REQ_TAG, OUT_TAG = 11, 12
 
@@ -33,7 +33,7 @@ def _init(rank, world, tmp):
         store=dist.FileStore(os.path.join(tmp, "store"), world),
         rank=rank,
         world_size=world,
-        timeout=timedelta(seconds=20),
+        timeout=timedelta(seconds=60),
     )
     group = object.__new__(GroupCoordinator)
     group.__dict__.update(
@@ -84,26 +84,33 @@ def _poll_relay_worker(rank, tmp):
         dist.destroy_process_group()
 
 
-# Iteration at which each stage stops its profiler, and whether the stop is decided
-# at the iteration's end or at the next iteration's ingest (a manual /stop_profile).
-RING_SCENARIOS = (((3, 5, 4), False), ((8, 2, 5), False), ((3, 5, 4), True))
+# Iteration at which each stage stops its profiler; whether the stop is decided at the
+# iteration's end or at the next iteration's ingest (a manual /stop_profile); and how
+# many iterations later stage 0 receives an output (pp_size - 1, more with async depth).
+RING_SCENARIOS = (
+    ((3, 5, 4), False, 2),
+    ((8, 2, 5), False, 2),
+    ((3, 5, 4), True, 2),
+    ((8, 5, 2), False, 3),
+    ((8, 5, 2), True, 3),
+)
 
 
 def _ring_worker(rank, tmp):
     """Three stages in lockstep: a request relay sent at the end of each iteration
     (waited at the next), main's poll relay, and the last stage's output relay back
-    to stage 0 (received pp_size - 1 iterations later). Each stage stops its
-    profiler at its own iteration."""
+    to stage 0 (received `lag` iterations later). Each stage stops its profiler at
+    its own iteration."""
     pp = 3
     with published_topology(role="scheduler", ranks={"world_rank": rank}, pp_size=pp):
         group, profiler = _init(rank, pp, tmp)
-        for stop_at, at_ingest in RING_SCENARIOS:
-            _ring_scenario(group, profiler, rank, pp, stop_at[rank], at_ingest)
+        for stop_at, at_ingest, lag in RING_SCENARIOS:
+            _ring_scenario(group, profiler, rank, pp, stop_at[rank], at_ingest, lag)
             dist.barrier()
         dist.destroy_process_group()
 
 
-def _ring_scenario(group, profiler, rank, pp, stop_at, at_ingest):
+def _ring_scenario(group, profiler, rank, pp, stop_at, at_ingest, lag):
     window = PPSyncSendWindow(rounds=pp)
     req_work, out_work, sends = [], [], []
     profiler.start()
@@ -125,15 +132,15 @@ def _ring_scenario(group, profiler, rank, pp, stop_at, at_ingest):
                 ("out", t), dst=0, async_send=True, tag=OUT_TAG
             )
             sends.extend(out_work)
-        if rank == 0 and t >= pp - 1:
-            assert group.recv_object(src=pp - 1, tag=OUT_TAG) == ("out", t - (pp - 1))
+        if rank == 0 and t >= lag:
+            assert group.recv_object(src=pp - 1, tag=OUT_TAG) == ("out", t - lag)
         if rank < pp - 1:
             req_work = group.send_object(t, dst=rank + 1, async_send=True, tag=REQ_TAG)
             sends.extend(req_work)
         if not at_ingest and t == stop_at:
             _stop(profiler, sends)
     if rank == 0:
-        for t in range(iterations - (pp - 1), iterations):
+        for t in range(iterations - lag, iterations):
             assert group.recv_object(src=pp - 1, tag=OUT_TAG) == ("out", t)
     for w in req_work + out_work:
         w.wait()
