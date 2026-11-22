@@ -37,19 +37,20 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # An entry naming the fused layer itself wins, with or without a model
+    # mapping, since some checkpoints store a real qkv_proj / gate_up_proj.
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
     shard_proj_names = fused_mapping.get(proj_name)
-    if shard_proj_names is None and not check_equal_or_regex_match(
-        layer_name=layer_name, targets=ignore
-    ):
-        # No model mapping: fall back to the known shard names. A direct match
-        # wins, since some checkpoints store a real qkv_proj / gate_up_proj.
+    if shard_proj_names is None:
         shard_proj_names = _FALLBACK_FUSED_SHARDS.get(proj_name)
 
-    if shard_proj_names is not None and layer_name not in ignore:
+    if shard_proj_names is not None:
         # Convert fused_name --> [shard_names]
         shard_names = [
             layer_name.replace(proj_name, shard_proj_name)
@@ -82,9 +83,7 @@ def should_ignore_layer(
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
     else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=layer_name, targets=ignore
-        )
+        should_ignore_layer = False
 
     assert should_ignore_layer is not None
     return should_ignore_layer

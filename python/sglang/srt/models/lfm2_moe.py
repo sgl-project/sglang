@@ -12,6 +12,7 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
+import re
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -602,8 +603,12 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     # Quantization ignore lists use the checkpoint's dense MLP names (w1/w3/w2).
     packed_modules_mapping = {"gate_up_proj": ["w1", "w3"]}
+    # The second entry renames the escaped form inside `re:` ignore patterns.
     hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={_CKPT_DENSE_DOWN_PROJ: _DENSE_DOWN_PROJ}
+        orig_to_new_substr={
+            _CKPT_DENSE_DOWN_PROJ: _DENSE_DOWN_PROJ,
+            re.escape(_CKPT_DENSE_DOWN_PROJ): re.escape(_DENSE_DOWN_PROJ),
+        }
     )
 
     def __init__(

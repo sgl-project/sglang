@@ -463,8 +463,9 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
                 "model.layers.0.self_attn.qkv_proj", ignore=GLM_IGNORE[:2]
             )
 
-    def test_lfm2_moe_ignore_list_reaches_its_dense_layers(self):
-        """LFM2-MoE's w1/w3/w2 names leave its ignored dense layers unquantized."""
+    @staticmethod
+    def _lfm2_scheme(ignore):
+        """Scheme lookup with LFM2-MoE's class mapping and mapper, as the loader applies them."""
         from sglang.srt.models.lfm2_moe import Lfm2MoeForCausalLM
 
         quant_config = CompressedTensorsConfig.from_config(
@@ -472,17 +473,18 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
                 "quant_method": "compressed-tensors",
                 "format": "pack-quantized",
                 "config_groups": {"group_0": {**WNA16_GROUP, "targets": ["Linear"]}},
-                "ignore": LFM2_IGNORE,
+                "ignore": list(ignore),
             }
         )
         quant_config.update_packed_modules_mapping(
             Lfm2MoeForCausalLM.packed_modules_mapping
         )
         quant_config.apply_weight_name_mapper(Lfm2MoeForCausalLM.hf_to_sglang_mapper)
+        return lambda name: quant_config.get_scheme_dict(torch.nn.Linear(1, 1), name)
 
-        def scheme(name):
-            return quant_config.get_scheme_dict(torch.nn.Linear(1, 1), name)
-
+    def test_lfm2_moe_ignore_list_reaches_its_dense_layers(self):
+        """LFM2-MoE's w1/w3/w2 names leave its ignored dense layers unquantized."""
+        scheme = self._lfm2_scheme(LFM2_IGNORE)
         for name in (
             "model.layers.0.feed_forward.gate_up_proj",
             "model.layers.0.feed_forward.down_proj",
@@ -496,6 +498,18 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
         ):
             with self.subTest(name=name):
                 self.assertIsNotNone(scheme(name))
+
+    def test_lfm2_moe_fused_name_entry_still_wins_over_its_shards(self):
+        """An entry naming the fused gate_up_proj keeps working once w1/w3 are declared."""
+        scheme = self._lfm2_scheme(["layers.0.feed_forward.gate_up_proj"])
+        self.assertIsNone(scheme("model.layers.0.feed_forward.gate_up_proj"))
+        self.assertIsNotNone(scheme("model.layers.1.feed_forward.gate_up_proj"))
+
+    def test_lfm2_moe_regex_w2_entry_reaches_down_proj(self):
+        """A regex written against w2 matches the renamed dense down_proj."""
+        scheme = self._lfm2_scheme(["re:.*layers\\.0\\.feed_forward\\.w2$"])
+        self.assertIsNone(scheme("model.layers.0.feed_forward.down_proj"))
+        self.assertIsNotNone(scheme("model.layers.1.feed_forward.down_proj"))
 
 
 if __name__ == "__main__":
