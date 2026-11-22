@@ -672,7 +672,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
 
 class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
     """The opt-in launches with the schedule its metadata was planned with;
-    the default route launches exactly as before the opt-in existed."""
+    the default route launches with the module schedule."""
 
     def _launch_kwargs(
         self, *, verify, auto_kv_splits, fp8_q_asm=True, launch_has_fast_mode=True
@@ -865,8 +865,8 @@ class TestFp8QAsmQueryCast(CustomTestCase):
                 quant.assert_called_once()
 
     def test_default_wide_window_keeps_plain_cast(self):
-        """With the opt-in off, a >4-token window keeps the plain fp8 cast at a fresh
-        unit scale, as before the opt-in; the quant kernel is not called."""
+        """With the opt-in off, a >4-token window casts q to fp8 directly at a fresh
+        unit scale; the quant kernel is not called."""
         q, q_in, scale, _, be, quant = self._run_decode(enabled=False, qlen=8)
         quant.assert_not_called()
         self.assertTrue(
@@ -1008,7 +1008,7 @@ class TestFp8QOut(CustomTestCase):
     def test_default_route_never_takes_the_writer_passthrough(
         self, mock_quant, mock_mla
     ):
-        """Off the opt-in, a query at the padded head count keeps main's zero-pad
+        """Off the opt-in, a query at the padded head count still runs the zero-pad
         launch with the caller's q scale, even if it is already fp8."""
         be = self._make_backend()
         be.use_mla_fp8_q_asm = False
