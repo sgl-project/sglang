@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
+    get_disagg,
     get_parallel,
 )
 from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
@@ -46,7 +47,8 @@ _cutedsl_logged_scalarize: set = set()
 
 
 def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
-    """Select the same weight and execution layout on Blackwell SM100/SM103."""
+    """Select the same weight and execution layout on Blackwell SM100/SM103,
+    except on a PD prefill that keeps the 64-row layout."""
     if device.type != "cuda":
         return False
     # Resolve the current device before caching so an unindexed "cuda" device
@@ -54,12 +56,33 @@ def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    return _use_cutedsl_moe_swap_ab(device_index)
+    if not _use_cutedsl_moe_swap_ab(device_index):
+        return False
+    return not pd_prefill_keeps_cutedsl_moe_64_row_layout()
 
 
 @lru_cache(maxsize=None)
 def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
     return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
+
+
+def pd_prefill_keeps_cutedsl_moe_64_row_layout() -> bool:
+    """SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB on a PD prefill server, whose MoE
+    calls are prefill chunks; the layout is fixed at weight load for every M."""
+    if not envs.SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB.get():
+        return False
+    if get_disagg().disaggregation_mode != "prefill":
+        return False
+    _log_pd_prefill_64_row_layout_once()
+    return True
+
+
+@lru_cache(maxsize=1)
+def _log_pd_prefill_64_row_layout_once() -> None:
+    logger.info(
+        "SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB engaged: this PD prefill "
+        "loads and runs the CuTe DSL MoE in the 64-row (non-swap-AB) layout"
+    )
 
 
 def cutedsl_quant_scale_to_scalar(

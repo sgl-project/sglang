@@ -45,15 +45,17 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 
 # isort: on
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
     _use_cutedsl_moe_swap_ab,
+    pd_prefill_keeps_cutedsl_moe_64_row_layout,
     use_cutedsl_moe_swap_ab,
 )
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.runtime_context import get_flags
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 # Representative NVFP4 MoE shapes (name, num_experts, hidden, intermediate,
 # is_gated). Only num_experts and is_gated matter to the scale helpers; hidden
@@ -151,6 +153,34 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
         with mock.patch("torch.cuda.get_device_capability") as get_capability:
             self.assertFalse(use_cutedsl_moe_swap_ab(torch.device("cpu")))
             get_capability.assert_not_called()
+
+    def test_cutedsl_pd_prefill_keeps_the_64_row_layout_under_its_child(self):
+        """A PD prefill with SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB on loads the
+        64-row layout on SM100/SM103; every other role, and the child off, keep swap-AB."""
+        self.addCleanup(_use_cutedsl_moe_swap_ab.cache_clear)
+        device = torch.device("cuda:0")
+        for capability in ((10, 0), (10, 3), (12, 0)):
+            for role in ("prefill", "decode", "null"):
+                for child in (True, False):
+                    _use_cutedsl_moe_swap_ab.cache_clear()
+                    with (
+                        self.subTest(capability=capability, role=role, child=child),
+                        mock.patch(
+                            "torch.cuda.get_device_capability", return_value=capability
+                        ),
+                        envs.SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB.override(
+                            child
+                        ),
+                        published_topology(disaggregation_mode=role),
+                    ):
+                        on_sm100 = capability in ((10, 0), (10, 3))
+                        keeps = child and role == "prefill"
+                        self.assertEqual(
+                            pd_prefill_keeps_cutedsl_moe_64_row_layout(), keeps
+                        )
+                        self.assertEqual(
+                            use_cutedsl_moe_swap_ab(device), on_sm100 and not keeps
+                        )
 
     def test_global_scales_keep_gate_up_order_across_weight_layouts(self):
         """Changing backend layout must not change which projection an alpha scales.

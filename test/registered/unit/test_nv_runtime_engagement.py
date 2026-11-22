@@ -31,8 +31,9 @@ from sglang.srt.disaggregation import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
 from sglang.srt.layers import lm_head_all_to_all
+from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl
 from sglang.srt.layers.moe.token_dispatcher import flashinfer as a2a_dispatcher
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
@@ -372,6 +373,17 @@ def _a2a_output_in_workspace(shape: Shape) -> bool:
     )
 
 
+def _pd_prefill_cutedsl_moe_no_swap_ab(shape: Shape) -> bool:
+    # The CuTe DSL standard path (no A2A or FlashInfer A2A) on an SM100 device.
+    backend = MoeRunnerBackend(shape.args.get("moe_runner_backend", "auto"))
+    a2a = MoeA2ABackend(shape.args.get("moe_a2a_backend", "none"))
+    return (
+        backend.is_flashinfer_cutedsl()
+        and (a2a.is_none() or a2a.is_flashinfer())
+        and flashinfer_cutedsl.pd_prefill_keeps_cutedsl_moe_64_row_layout()
+    )
+
+
 def _tp_lm_head_fp32(shape: Shape) -> bool:
     platform = SimpleNamespace(is_blackwell=True)
     with patch.object(lm_head_all_to_all, "get_platform", return_value=platform):
@@ -392,6 +404,7 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
     "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
     "SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32": _tp_lm_head_fp32,
+    "SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB": _pd_prefill_cutedsl_moe_no_swap_ab,
 }
 
 
@@ -495,7 +508,11 @@ EXPECTED = {
     | _children(),
     "decode-tp8-one-request": _PD_DECODE | _PD_DECODE_TP | _TWO_HOSTS | _QWEN35_TP_SPEC,
     "prefill-tp1-pp2": _PP_PREFILL
-    | _children("PP_PROXY_RECV_AFTER_FORWARD", "HICACHE_WB_SETTLED_STATE_VICTIM"),
+    | _children(
+        "PP_PROXY_RECV_AFTER_FORWARD",
+        "HICACHE_WB_SETTLED_STATE_VICTIM",
+        "PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB",
+    ),
     "aggregated-tp4": _QWEN35_TP_SPEC,
     "aggregated-tp8": _QWEN35_TP_SPEC,
     "decode-tp2": _PD_DECODE | _PD_DECODE_TP | _NO_STAGING | _QWEN35_TP_SPEC,
