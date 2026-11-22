@@ -1,0 +1,823 @@
+name: c211-128318-mi35xfab3
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  fab-01:
+    name: probe-job-fab-01
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-01 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-01 nonce=$NONCE"
+          exit 0
+  fab-02:
+    name: probe-job-fab-02
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-02 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-02 nonce=$NONCE"
+          exit 0
+  fab-03:
+    name: probe-job-fab-03
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-03 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-03 nonce=$NONCE"
+          exit 0
+  fab-04:
+    name: probe-job-fab-04
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-04 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-04 nonce=$NONCE"
+          exit 0
+  fab-05:
+    name: probe-job-fab-05
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-05 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-05 nonce=$NONCE"
+          exit 0
+  fab-06:
+    name: probe-job-fab-06
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-06 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-06 nonce=$NONCE"
+          exit 0
+  fab-07:
+    name: probe-job-fab-07
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-07 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-07 nonce=$NONCE"
+          exit 0
+  fab-08:
+    name: probe-job-fab-08
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-08 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-08 nonce=$NONCE"
+          exit 0
+  fab-09:
+    name: probe-job-fab-09
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-09 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-09 nonce=$NONCE"
+          exit 0
+  fab-10:
+    name: probe-job-fab-10
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-10 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-10 nonce=$NONCE"
+          exit 0
+  fab-11:
+    name: probe-job-fab-11
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-11 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-11 nonce=$NONCE"
+          exit 0
+  fab-12:
+    name: probe-job-fab-12
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-12 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-12 nonce=$NONCE"
+          exit 0
+  fab-13:
+    name: probe-job-fab-13
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-13 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-13 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-13 nonce=$NONCE"
+          exit 0
+  fab-14:
+    name: probe-job-fab-14
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-14 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-14 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-14 nonce=$NONCE"
+          exit 0
+  fab-15:
+    name: probe-job-fab-15
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-15 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-15 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-15 nonce=$NONCE"
+          exit 0
+  fab-16:
+    name: probe-job-fab-16
+    runs-on: linux-mi35x-gpu-8.fabric
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=fab-16 NONCE=$NONCE"
+          echo "C211_MARKER job=fab-16 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=fab-16 nonce=$NONCE"
+          exit 0
+  plain-01:
+    name: probe-job-plain-01
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-01 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-01 nonce=$NONCE"
+          exit 0
+  plain-02:
+    name: probe-job-plain-02
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-02 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-02 nonce=$NONCE"
+          exit 0
+  plain-03:
+    name: probe-job-plain-03
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-03 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-03 nonce=$NONCE"
+          exit 0
+  plain-04:
+    name: probe-job-plain-04
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-04 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-04 nonce=$NONCE"
+          exit 0
+  plain-05:
+    name: probe-job-plain-05
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-05 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-05 nonce=$NONCE"
+          exit 0
+  plain-06:
+    name: probe-job-plain-06
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-06 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-06 nonce=$NONCE"
+          exit 0
+  plain-07:
+    name: probe-job-plain-07
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-07 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-07 nonce=$NONCE"
+          exit 0
+  plain-08:
+    name: probe-job-plain-08
+    runs-on: linux-mi35x-gpu-8
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-128318-df9104289468182c
+        run: |
+          set -u
+          NONCE='c211-128318-df9104289468182c'
+          echo "C211_JOB=plain-08 NONCE=$NONCE"
+          echo "C211_MARKER job=plain-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC ---"
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+            echo "--- AMD_SMI_ASIC_SERIAL ---"
+            amd-smi static 2>&1 | grep -i 'ASIC_SERIAL' | head -40 || echo AMD_SMI_ASIC_SERIAL_ABSENT
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "C211_PROBE_END job=plain-08 nonce=$NONCE"
+          exit 0
