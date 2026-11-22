@@ -213,6 +213,7 @@ def _tp_worker() -> int:
     from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
         TP_PEER_PARTIALS,
     )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_tp_group
     from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
     from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
         projected_residual_gate_add,
@@ -224,8 +225,12 @@ def _tp_worker() -> int:
         zimage_rmsnorm_tanh_mul_add,
     )
 
-    if not torch.cuda.can_device_access_peer(rank, 1 - rank):
-        print("SKIP no peer-to-peer access between the two devices", flush=True)
+    # the path's own gate: peer access reported AND a peer write delivered
+    if not TP_PEER_PARTIALS.ready(get_tp_group()):
+        if rank == 0:
+            print("TP_PEER_PARTIALS_PARITY SKIP: unavailable on these GPUs", flush=True)
+        dist.barrier()
+        dist.destroy_process_group()
         return 0
 
     def raw(t):
@@ -363,6 +368,8 @@ class TestIpcA2ATwoGpu(CustomTestCase):
         if proc.returncode != 0:
             print(proc.stderr[-4000:], file=sys.stderr)
         self.assertEqual(proc.returncode, 0, "peer partials diverged from all-reduce")
+        if "TP_PEER_PARTIALS_PARITY SKIP" in proc.stdout:
+            self.skipTest("TP peer partials are unavailable between these GPUs")
         self.assertIn("TP_PEER_PARTIALS_PARITY PASS", proc.stdout)
 
 
