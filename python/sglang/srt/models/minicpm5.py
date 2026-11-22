@@ -27,8 +27,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -61,7 +59,6 @@ from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
-    filter_moe_weight_param_global_expert,
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -343,16 +340,6 @@ class MiniCPM5Moe(nn.Module):
 
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-    def get_moe_weights(self):
-        return [
-            weight.data
-            for name, weight in self.experts.named_parameters()
-            if name != "correction_bias"
-            and filter_moe_weight_param_global_expert(
-                name, weight, self.experts.num_local_experts
-            )
-        ]
-
     def _forward_routed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -583,10 +570,9 @@ class MiniCPM5Model(nn.Module):
                 if layer_id in self.layers_to_capture
                 else None
             )
-            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-                hidden_states = self.layers[layer_id](
-                    positions, hidden_states, forward_batch, capture_output=capture
-                )
+            hidden_states = self.layers[layer_id](
+                positions, hidden_states, forward_batch, capture_output=capture
+            )
 
         if tbo_start < self.end_layer:
             hidden_states = model_forward_stages(
@@ -678,14 +664,6 @@ class MiniCPM5ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.n_routed_experts,
-            num_groups=config.n_group,
-        )
 
     @torch.no_grad()
     def forward(
