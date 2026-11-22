@@ -420,6 +420,7 @@ def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
     stage._manage_dit_use_site = lambda module, name, batch: calls.append(
         ("use", name, module)
     )
+    stage._declared_component_use = lambda *, component_name: component_name
 
     stage._component_residency_manager = None
     assert stage._begin_dit_use(True, None) is (
@@ -427,7 +428,9 @@ def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
     )
     assert calls == []
 
-    stage._component_residency_manager = object()
+    stage._component_residency_manager = SimpleNamespace(
+        begin_use=lambda use, module: calls.append(("use", use, module))
+    )
     ref2va = stage._begin_dit_use(True, None)
     t2va = stage._begin_dit_use(False, None)
     assert t2va is stage.transformer
@@ -446,6 +449,34 @@ def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
         ("release", "transformer_2", stage.transformer_2),
         ("use", "transformer", stage.transformer),
     ]
+
+
+@pytest.mark.parametrize("performance_mode", ["auto", "speed"])
+@pytest.mark.parametrize("explicit_mode", [None, "component-offload"])
+def test_dual_variant_dit_uses_keep_the_last_dit_ready(performance_mode, explicit_mode):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.vae = None
+    stage.pipeline = None
+    stage._registered_stage_name = "denoising"
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1)
+    server_args = SimpleNamespace(
+        performance_mode=performance_mode,
+        explicit_residency_mode=lambda name: explicit_mode,
+    )
+    uses = stage.component_uses(server_args)
+    assert [use.component_name for use in uses] == ["transformer", "transformer_2"]
+    for use in uses:
+        # a request alone says which DiT it runs: never prefetch the first one
+        assert not use.allow_prefetch and use.memory_intensive
+        # the automatic placement keeps the DiT that ran last on the GPU
+        assert use.keep_ready_after_request == (
+            performance_mode == "auto" and explicit_mode is None
+        )
+
+    stage.transformer_2 = None
+    (single,) = stage.component_uses(server_args)
+    assert single.allow_prefetch and not single.keep_ready_after_request
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():

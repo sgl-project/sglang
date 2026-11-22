@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -529,7 +530,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Image releases have no residency plan: a plain DiT use, with no
             # phase, prefetch or keep-ready-after-request policy.
             return [ComponentUse(self._component_stage_name(stage_name), "transformer")]
-        return super().component_uses(server_args, stage_name)
+        uses = super().component_uses(server_args, stage_name)
+        if self.transformer_2 is None:
+            return uses
+        # fl2va+ref2va: only the request says which DiT it runs, so the manager
+        # must not prefetch the first one declared. Under the automatic policy
+        # the DiT that ran last stays on the GPU; _begin_dit_use releases it
+        # when a request runs the other one.
+        keep_ready = server_args.performance_mode == "auto"
+        return [
+            (
+                replace(
+                    use,
+                    allow_prefetch=False,
+                    keep_ready_after_request=keep_ready
+                    and server_args.explicit_residency_mode(use.component_name) is None,
+                )
+                if use.component_name in ("transformer", "transformer_2")
+                else use
+            )
+            for use in uses
+        ]
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -996,15 +1017,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             else "transformer"
         )
         transformer = getattr(self, name)
-        if self._component_residency_manager is not None:
-            if self.transformer_2 is not None:
-                # The FL2VA DiT stays ready after its request. Release the DiT this
-                # request does not run before placing the other: both may not fit.
-                idle = "transformer" if name == "transformer_2" else "transformer_2"
-                self.finish_unused_declared_component(
-                    component_name=idle, module=getattr(self, idle)
-                )
+        manager = self._component_residency_manager
+        if manager is None:
+            return transformer
+        if self.transformer_2 is None:
             self._manage_dit_use_site(transformer, name, batch)
+            return transformer
+        # The DiT that ran last may still be on the GPU. Release the one this
+        # request does not run before placing the other: both may not fit.
+        idle = "transformer" if name == "transformer_2" else "transformer_2"
+        self.finish_unused_declared_component(
+            component_name=idle, module=getattr(self, idle)
+        )
+        manager.begin_use(
+            self._declared_component_use(component_name=name), module=transformer
+        )
         return transformer
 
     def _run_image_loop(self, batch: Req, plan: Any, server_args: ServerArgs) -> None:
