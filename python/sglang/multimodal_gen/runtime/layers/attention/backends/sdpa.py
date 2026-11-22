@@ -308,8 +308,9 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
         )
         self._is_sm100 = capability is not None and capability[0] == 10
         self._is_sm103 = capability == (10, 3)
+        self._is_sm120 = capability is not None and capability[0] == 12
         # Set once cuDNN SDPA raised for this layer; permanently pins the
-        # fail-safe FA path so we do not retry a failing kernel every step.
+        # fail-safe path so we do not retry a failing kernel every step.
         self._cudnn_failed = False
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
             set_fa_ver(4)
@@ -322,7 +323,10 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             prefix=f"{prefix}.cudnn",
             **extra_impl_args,
         )
-        self.fa_impl = FlashAttentionImpl(
+        # SM12.x falls back to Torch SDPA (PyTorch's FA2 kernel), its previous
+        # default: the FA4 CuTe kernels run slower than both there.
+        fallback_cls = SDPAImpl if self._is_sm120 else FlashAttentionImpl
+        self.fa_impl = fallback_cls(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -363,6 +367,13 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
                     return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128
+        if self._is_sm120:
+            # SM12.x: cuDNN's sm120 SDPA kernel beats PyTorch's FA2 kernel on
+            # dense non-causal diffusion attention, self- and cross-attn (a
+            # MiniMax-H3 DiT step on 2x RTX PRO 6000 TP2 is 4.3% faster end to
+            # end). Like sm_100's tile-sized shapes, this does not depend on the
+            # request quality: there is no sub-tile kernel to keep apart here.
+            return True
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
@@ -395,11 +406,15 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
                 return self.cudnn_impl.forward(query, key, value, attn_metadata)
             except RuntimeError as e:
                 # cuDNN raises "No available kernel" for some shapes; pin the
-                # FA fail-safe path for this layer and keep going.
+                # fail-safe path for this layer and keep going.
                 logger.warning_once(
-                    "cuDNN SDPA failed (%s); falling back to FlashAttention for %s.",
+                    "cuDNN SDPA failed (%s); falling back to %s for %s.",
                     e,
+                    type(self.fa_impl).__name__,
                     type(self).__name__,
                 )
                 self._cudnn_failed = True
+        if self._is_sm120:
+            # SDPAImpl takes no FA-only keywords, as when Torch SDPA was the default
+            return self.fa_impl.forward(query, key, value, attn_metadata)
         return self.fa_impl.forward(query, key, value, attn_metadata, **kwargs)

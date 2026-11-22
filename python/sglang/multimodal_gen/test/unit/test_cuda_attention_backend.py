@@ -253,10 +253,18 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "12.0"):
             self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
 
-    def test_default_backend_uses_torch_sdpa_on_sm120(self):
+    def test_default_backend_uses_cudnn_first_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
 
-        self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
+        self.assertEqual(
+            self.resolve(None),
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
+        )
+
+    def test_default_backend_keeps_torch_sdpa_for_fp32_on_sm120(self):
+        FakeCudaPlatform.is_sm120_device = True
+
+        self.assertEqual(self.resolve(None, dtype=torch.float32), SDPA_BACKEND_CLS_STR)
 
     def test_requested_flash_attention_on_sm120_initializes_fa4(self):
         FakeCudaPlatform.is_sm120_device = True

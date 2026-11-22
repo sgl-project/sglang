@@ -537,7 +537,8 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
         # Explicit FA requests use the native FA4 preparation on Blackwell.
-        # The SM12.x default remains SDPA in _resolve_default_attn_backend.
+        # The SM12.x default is cuDNN SDPA with a Torch SDPA fallback, set in
+        # get_attn_backend_cls_str.
         return AttentionBackendEnum.FA
 
 
@@ -736,7 +737,8 @@ class CudaPlatformBase(Platform):
     def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
         if cls.is_sm120():
             # On SM12.x, the sgl-kernel FlashAttention wheels may not include
-            # support yet. Default to Torch SDPA for correctness.
+            # support yet. Default to Torch SDPA for correctness;
+            # get_attn_backend_cls_str routes it through cuDNN SDPA first.
             logger.info("Defaulting to Torch SDPA backend on SM12.x")
             return AttentionBackendEnum.TORCH_SDPA
         return AttentionBackendEnum.FA
@@ -829,6 +831,16 @@ class CudaPlatformBase(Platform):
             raise ValueError("FlashInfer FA2 requires float16 or bfloat16 inputs.")
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
+            if (
+                target_backend == AttentionBackendEnum.TORCH_SDPA
+                and cls.is_sm120()
+                and dtype in (torch.float16, torch.bfloat16)
+            ):
+                # cuDNN's sm120 SDPA kernel beats PyTorch's FA2 kernel (the
+                # Torch SDPA default here) and the FA4 CuTe kernels on SM12.x;
+                # DYNAMIC_CUDNN_SDPA keeps Torch SDPA as the fallback for
+                # causal/GQA calls and for shapes cuDNN has no kernel for.
+                return _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR
             if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():
                 # cuDNN SDPA is 1.25-1.5x faster than the FA4 CuTe kernels on
                 # sm_100 for dense diffusion attention; DYNAMIC_CUDNN_SDPA
