@@ -9,6 +9,8 @@ the scheduler.
 
 from __future__ import annotations
 
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -18,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
+    MINIMAX_H3_MATERIAL_PROBE_EXTRA_KEY,
     MINIMAX_H3_TEMP_DIRS_EXTRA_KEY,
     minimax_h3_cleanup_temp_dirs,
     minimax_h3_probe_material,
@@ -37,6 +40,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 
 MINIMAX_H3_PROBE_FACTS_EXTRA_KEY = "minimax_h3_probe_facts_by_condition"
 MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY = "minimax_h3_resolved_material_shapes"
+# threads one request may use to localize and probe its materials
+_PROBE_MAX_THREADS = 8
 
 
 def _replace_plan_shape(
@@ -239,6 +244,56 @@ def _preserve_prequeue_material_dirs(batch: Any) -> None:
                 prequeue_paths.append(path)
 
 
+def _is_concurrent_material_uri(uri: Any) -> bool:
+    if not isinstance(uri, str) or not uri:
+        return False
+    if uri.startswith(("data:", "base64:", "tar+offset:", "tar+b64header:")):
+        return False
+    scheme = urllib.parse.urlsplit(uri).scheme
+    return scheme in ("", "file", "http", "https")
+
+
+def _probe_materials(batch: Any, plan: Any) -> list[dict[str, Any]]:
+    """Probe every condition; local files and HTTP(S) downloads run concurrently.
+
+    The first condition of each URI is localized and probed on a pool thread,
+    at most _PROBE_MAX_THREADS at a time: a download writes its own
+    condition-index file in the request's single material workdir, and its
+    facts land under a distinct (uri, condition_type) key. A repeated URI is
+    probed afterwards from that cached file, as on the sequential path. Results
+    are taken in request order once every thread has finished, so the first
+    failing condition raises its own exception and the caller's cleanup never
+    races a thread that is still writing. A single material, and any request
+    with an inline or tar-member URI, keeps the sequential path.
+    """
+
+    materials = list(plan.materials)
+
+    def probe(material):
+        return minimax_h3_probe_material(
+            batch,
+            material.uri,
+            condition_type=material.condition_type,
+            condition_index=int(material.condition_index),
+        )
+
+    if len(materials) < 2 or not all(
+        _is_concurrent_material_uri(m.uri) for m in materials
+    ):
+        return [probe(m) for m in materials]
+    batch.extra.setdefault(MINIMAX_H3_MATERIAL_PROBE_EXTRA_KEY, {})
+    first_by_uri = {}
+    for material in materials:
+        first_by_uri.setdefault(material.uri, material)
+    workers = min(_PROBE_MAX_THREADS, len(first_by_uri))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {uri: pool.submit(probe, m) for uri, m in first_by_uri.items()}
+    return [
+        futures[m.uri].result() if first_by_uri[m.uri] is m else probe(m)
+        for m in materials
+    ]
+
+
 def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
     """Freeze MiniMax H3 media/shape facts before queue admission."""
 
@@ -250,13 +305,8 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
             )
 
         probe_facts: dict[int, dict[str, Any]] = {}
-        for material in plan.materials:
-            probe_facts[int(material.condition_index)] = minimax_h3_probe_material(
-                batch,
-                material.uri,
-                condition_type=material.condition_type,
-                condition_index=int(material.condition_index),
-            )
+        for material, facts in zip(plan.materials, _probe_materials(batch, plan)):
+            probe_facts[int(material.condition_index)] = facts
         batch.extra[MINIMAX_H3_PROBE_FACTS_EXTRA_KEY] = probe_facts
 
         shape = dict(plan.shape)
