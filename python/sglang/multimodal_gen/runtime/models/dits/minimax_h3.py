@@ -73,7 +73,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
-    get_sp_world_size,
     get_ulysses_ctx,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
@@ -3041,11 +3040,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 "linear head on a pruned (AdaLN curve) DiT, got "
                 f"dwd_head_config={config!r}"
             )
-        if get_tp_world_size() > 1 or get_sp_world_size() > 1:
-            raise ValueError(
-                "the MiniMax H3 DWD pixel head runs on one GPU; serve the DWD "
-                "variants without tensor or sequence parallelism"
-            )
+        # Under TP and SP every rank holds the whole (0.6B) head and decodes
+        # the frames from the gathered features.
         self.dwd_norm_out = MiniMaxH3DWDNormOut(
             arch.hidden_size, arch.time_embed_dim, arch.final_norm_eps
         )
@@ -3694,10 +3690,16 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if kwargs.get("return_dwd_features"):
             if self.dwd_norm_out is None:
                 raise ValueError("this MiniMax H3 checkpoint has no DWD pixel head")
-            # single-GPU only (_init_dwd_head): the local rows are all rows
-            dwd_features = self.dwd_norm_out(
-                hidden, adaln_input, block_inverse
-            ).index_select(0, infer_out_pos.to(device))
+            # full-width rows under TP; sequence-parallel ranks gather their
+            # row shards like the logits below
+            dwd_features = self.dwd_norm_out(hidden, adaln_input, block_inverse)
+            if sp_ws > 1:
+                from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                    get_sp_group,
+                )
+
+                dwd_features = get_sp_group().all_gather(dwd_features, dim=0)
+            dwd_features = dwd_features.index_select(0, infer_out_pos.to(device))
             if not skip_mask_out_condition:
                 # condition rows have no frames to predict
                 live = update_mask.view(-1).to(device).bool()

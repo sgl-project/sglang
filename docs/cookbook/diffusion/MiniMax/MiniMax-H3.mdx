@@ -914,8 +914,12 @@ load at startup through the LoRA path. Do not pass the adapter files to
 missing, and the LoRA path cannot carry the sampling schedule.
 
 ```bash Command
-# 4-step, decoder-free (default)
+# 4-step, decoder-free (default), 1x H200
 sglang serve --model-path Lakonik/pi-H3 --port 30010
+
+# fastest measured lossless on 2x H200: Ulysses 2
+sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
+  --num-gpus 2 --ulysses-degree 2 --port 30010
 
 # 2-step, decoder-free, FP8 DiT linears and Sol sparse attention after block 1
 sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
@@ -931,10 +935,23 @@ distilled. `num_inference_steps` defaults to the variant's step count, and any
 other value is rejected. The sampler is Euler on the adapters' trained
 unshifted knots (`0.96, 0.693, 0.427, 0.16` for 4 steps, `0.93, 0.349` for
 2 steps) with video shift 12 and audio shift 3; omit `flow_shift` and
-`audio_flow_shift`. The DWD variants run on one GPU (no tensor or sequence
-parallelism), and `quality: "high"` is not supported.
+`audio_flow_shift`. `quality: "high"` is not supported. Under tensor or
+sequence parallelism every rank gathers the pixel-head features and decodes the
+frames with its own copy of the 0.6B head.
 
-On 1× H200, warm `t2va` requests at 1344×768 and 5 seconds took:
+Breakable CUDA graph is not validated for pi-H3 and stays off: the release
+adapter loads through the LoRA path, and with two to four steps of several
+seconds each there is no launch overhead to recover.
+
+Warm `t2va` requests at 1344×768 and 5 seconds through `sglang serve` on H200:
+
+| Variant | 1 GPU | 2 GPUs, Ulysses 2 | 2 GPUs, TP 2 |
+| --- | --- | --- | --- |
+| `2step` | 11.9 s | 6.8 s | 7.0 s |
+| `4step` | 22.6 s | 12.3 s | 12.7 s |
+
+Precision and attention options on 1× H200 (same workload, offline generation;
+FP8 and Sol are approximate):
 
 | Variant | BF16, `fa` | FP8 | FP8 + Sol after block 1 |
 | --- | --- | --- | --- |
