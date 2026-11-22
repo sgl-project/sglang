@@ -133,6 +133,7 @@ def _run_grouped_requests(worker, monkeypatch, error, replica_size):
     [
         (RuntimeError(_DRIVER_ERROR), 1),
         (torch.OutOfMemoryError("allocator OOM"), 2),
+        (torch.AcceleratorError("CUDA error: out of memory"), 2),
     ],
 )
 def test_grouped_request_fatal_error_exits_the_worker(

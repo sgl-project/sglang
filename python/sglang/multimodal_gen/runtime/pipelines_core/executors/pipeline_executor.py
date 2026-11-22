@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_out_of_memory_error,
     is_unrecoverable_device_error,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -58,7 +59,7 @@ def _forward_error_ends_the_replica(error: Exception) -> bool:
     ranks are still inside the failed forward's collectives, or keep serving
     from a device that can no longer be trusted.
     """
-    if isinstance(error, torch.OutOfMemoryError):
+    if is_out_of_memory_error(error):
         return get_replica_group().world_size > 1
     # Only RuntimeError messages are matched: a request error may quote the
     # caller's text (e.g. a Cosmos3 domain name) that contains a marker.
