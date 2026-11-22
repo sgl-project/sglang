@@ -111,6 +111,9 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     flashinfer_tactics_cache_for_persistence,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
