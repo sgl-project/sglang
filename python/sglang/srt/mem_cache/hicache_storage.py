@@ -424,6 +424,10 @@ class HiCacheStorage(ABC):
     # must back up on every rank, even where is_storage_writer elects one
     # writer for rank-replicated KV such as MLA.
     requires_rank_local_backup = False
+    # Where HiCache does elect one writer, the backend keys MHA draft and
+    # draft-SWA pools by rank, so every rank backs them up (see
+    # HybridCacheController.should_backup).
+    rank_keyed_mha_drafts = False
 
     # Opt-in: the backend reports its own residency as KV events, published
     # by the scheduler's KV event publisher. The value must be identical on
@@ -752,6 +756,10 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
     @property
     def requires_rank_local_backup(self) -> bool:
         return self._backend.requires_rank_local_backup
+
+    @property
+    def rank_keyed_mha_drafts(self) -> bool:
+        return self._backend.rank_keyed_mha_drafts
 
     @property
     def publishes_kv_events(self) -> bool:

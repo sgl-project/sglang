@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 
 def _publishes_kv_events(controller) -> bool:
-    backend = getattr(controller, "storage_backend", None)
-    return getattr(backend, "publishes_kv_events", False) is True
+    backend = controller.storage_backend
+    return backend is not None and backend.publishes_kv_events
 
 
 # Kept in sync with the server-args choices; validated here so an admin request

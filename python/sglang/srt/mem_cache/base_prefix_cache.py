@@ -947,7 +947,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         See HiCacheStorage.get_kv_hint_source.
         """
-        backend = getattr(self.cache_controller, "storage_backend", None)
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
         source = backend.get_kv_hint_source() if backend is not None else None
         return [source] if source is not None else []
 

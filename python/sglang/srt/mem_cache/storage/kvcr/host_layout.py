@@ -65,26 +65,34 @@ def page_slots(layout: PoolLayout, keys: list[str], indices: torch.Tensor) -> li
         raise ValueError("KVCR storage indices must be integers")
     if len(indices) != len(keys) * layout.page_size:
         raise ValueError("Keys and host-page indices have different lengths")
+    if not len(keys):
+        return []
     pages = indices.reshape(-1, layout.page_size)
-    starts = pages[:, 0]
-    if len(keys) and (
-        torch.any(starts < 0)
-        or torch.any(starts % layout.page_size != 0)
-        or torch.any(starts // layout.page_size >= layout.components[0].count)
-        or not torch.equal(
-            pages, starts[:, None] + torch.arange(layout.page_size)[None, :]
-        )
+    slots = pages[:, 0] // layout.page_size
+    # Equal to the aligned run from each slot's first index only when every
+    # page is whole, aligned and contiguous.
+    expected = slots[:, None] * layout.page_size + torch.arange(
+        layout.page_size, dtype=indices.dtype
+    )
+    lowest, highest = torch.aminmax(slots)
+    if (
+        not torch.equal(pages, expected)
+        or lowest < 0
+        or highest >= layout.components[0].count
     ):
         raise ValueError("KVCR received unaligned, noncontiguous or out-of-range pages")
-    return (starts // layout.page_size).tolist()
+    return slots.tolist()
 
 
-def storage_namespace(config, layouts: dict[str, PoolLayout]) -> str:
+def storage_namespace(
+    config, layouts: dict[str, PoolLayout], *, shared: bool = False
+) -> str:
     """Model, byte format and shard identity, but not replica/DP identity.
 
     The served model name does not identify the weights: deployments that
     serve different weights under one name tell their pages apart with an
-    ``extra_backend_tag``.
+    ``extra_backend_tag``. ``shared`` marks a store that keeps rank-replicated
+    pools on the writer shard only, so it never pairs with one that does not.
     """
     identity = [
         "sglang-kvcr-v1",
@@ -109,6 +117,8 @@ def storage_namespace(config, layouts: dict[str, PoolLayout]) -> str:
     if tag is not None:
         # Appended only when set, so untagged namespaces keep their value.
         identity.append(["extra_backend_tag", tag])
+    if shared:
+        identity.append(["shared_replicated_pools", True])
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
 

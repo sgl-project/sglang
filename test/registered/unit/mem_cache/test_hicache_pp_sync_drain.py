@@ -177,7 +177,7 @@ class TestStorageKvEventSync(CustomTestCase):
             (in_interval, True, True),
         ):
             with self.subTest(drained_at=drained_at, peer_due=peer_due):
-                cache = self._make_cache(_PublishingBackend(pending=2))
+                cache = self._make_cache(_PublishingBackend(pending=2, shard_count=2))
                 cache.attn_cp_group, cache.attn_tp_group = None, object()
                 cache.tp_world_size = 2
                 if drained_at != float("-inf"):
@@ -198,13 +198,21 @@ class TestStorageKvEventSync(CustomTestCase):
                 world_size.assert_called_once()
 
     def test_drain_without_a_gather_publishes_every_step(self):
-        # TP1 gathers nothing, so the interval would only delay its events.
-        cache = self._make_cache(_PublishingBackend(pending=2))
-        cache.attn_cp_group = cache.attn_tp_group = None
-        cache.tp_world_size = 1
-        cache._storage_events_drained_at = time.monotonic() + 3600
-        self.assertEqual(self._sync_event_column(cache), 0)
-        cache._drain_storage_kv_events.assert_called_once()
+        # TP1, or one shard holding every page at TP2, gathers nothing, so the
+        # interval would only delay its events.
+        for world_size, shard_count in ((1, 1), (2, 1)):
+            with self.subTest(world_size=world_size):
+                cache = self._make_cache(
+                    _PublishingBackend(pending=2, shard_count=shard_count)
+                )
+                cache.attn_cp_group, cache.attn_tp_group = None, object()
+                cache.tp_world_size = world_size
+                cache._storage_events_drained_at = time.monotonic() + 3600
+                with patch.object(
+                    torch.distributed, "get_world_size", return_value=world_size
+                ):
+                    self.assertEqual(self._sync_event_column(cache), 0)
+                cache._drain_storage_kv_events.assert_called_once()
 
     def test_drain_records_when_it_ran(self):
         cache = object.__new__(UnifiedRadixCache)
@@ -213,38 +221,62 @@ class TestStorageKvEventSync(CustomTestCase):
         cache.tree_core = SimpleNamespace(kv_events=SimpleNamespace(enabled=False))
         cache.attn_cp_group = cache.attn_tp_group = None
         cache.tp_world_size = 1
+        cache._storage_event_reducer = StorageEventReducer(1)
         before = time.monotonic()
         UnifiedRadixCache._drain_storage_kv_events(cache)
         self.assertLessEqual(before, cache._storage_events_drained_at)
         self.assertLessEqual(cache._storage_events_drained_at, time.monotonic())
         backend.take_kv_events.assert_called_once()
 
-    def test_follower_joins_the_gather_without_retaining_events(self):
-        # A follower that skipped the collective would hang the publisher.
+    def _gathering_cache(self, backend, recorder, *, cp_size=1, tp_size=2):
         cache = object.__new__(UnifiedRadixCache)
-        backend = _PublishingBackend(shard=1, shard_count=2)
-        backend.take_kv_events.return_value = ["event"]
         cache.cache_controller = SimpleNamespace(storage_backend=backend)
-        cache.tree_core = SimpleNamespace(kv_events=SimpleNamespace(enabled=False))
-        group = object()
-        cache.attn_cp_group = None
-        cache.attn_tp_group = group
-        cache.tp_world_size = 2
-        cache._storage_event_reducer = MagicMock()
+        cache.tree_core = SimpleNamespace(kv_events=recorder)
+        cache.attn_cp_group = "cp" if cp_size > 1 else None
+        cache.attn_tp_group = "tp"
+        cache.tp_world_size = cp_size * tp_size
+        cache._storage_event_reducer = StorageEventReducer(backend.kv_event_shard_count)
+        sizes = {"cp": cp_size, "tp": tp_size}
+        return cache, sizes
+
+    def _drain(self, cache, sizes, *, rank, roots, peers):
+        """Run one drain as `rank`; peers[group] are the other members' batches."""
         sent = []
 
-        def gather(out, batch, group):
-            sent.append((batch, group))
-            out[:] = [{0: []}, batch]
+        def gather(batch, out, dst, group):
+            sent.append((group, dst, batch))
+            self.assertEqual(out is not None, rank == dst)
+            if out is not None:
+                self.assertEqual(len(out), sizes[group])
+                out[:] = [batch, *peers[group]]
 
         with (
-            patch.object(torch.distributed, "get_world_size", return_value=2),
-            patch.object(torch.distributed, "all_gather_object", side_effect=gather),
+            patch.object(
+                torch.distributed,
+                "get_world_size",
+                side_effect=lambda group: sizes[group],
+            ),
+            patch.object(
+                torch.distributed,
+                "get_global_rank",
+                side_effect=lambda group, index: roots[group],
+            ),
+            patch.object(torch.distributed, "get_rank", return_value=rank),
+            patch.object(torch.distributed, "gather_object", side_effect=gather),
+            patch.object(torch.distributed, "all_gather_object") as all_gather,
         ):
             UnifiedRadixCache._drain_storage_kv_events(cache)
+        all_gather.assert_not_called()
+        return sent
 
-        self.assertEqual(sent, [({1: ["event"]}, group)])
-        cache._storage_event_reducer.update.assert_not_called()
+    def test_follower_sends_to_the_publisher_and_keeps_nothing(self):
+        # A follower that skipped the collective would hang the publisher.
+        backend = _PublishingBackend(shard=1, shard_count=2)
+        backend.take_kv_events.return_value = ["event"]
+        recorder = SimpleNamespace(enabled=False)
+        cache, sizes = self._gathering_cache(backend, recorder)
+        sent = self._drain(cache, sizes, rank=1, roots={"tp": 0}, peers={})
+        self.assertEqual(sent, [("tp", 0, {1: ["event"]})])
 
     def test_publisher_reduces_shards_and_enqueues(self):
         from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
@@ -259,30 +291,43 @@ class TestStorageKvEventSync(CustomTestCase):
             medium=StorageMedium.CPU,
             ownership="owner",
         )
-        cache = object.__new__(UnifiedRadixCache)
         backend = _PublishingBackend(shard=0, shard_count=2)
         backend.take_kv_events.return_value = [stored]
-        cache.cache_controller = SimpleNamespace(storage_backend=backend)
         recorder = KVCacheEventRecorder(enabled=True, page_size=2)
-        cache.tree_core = SimpleNamespace(kv_events=recorder)
-        group = object()
-        cache.attn_cp_group = None
-        cache.attn_tp_group = group
-        cache.tp_world_size = 3
-        cache._storage_event_reducer = StorageEventReducer(2)
-        # Shard 1 also holds the page; rank 2 replicates a shard out of range.
-        peers = [{1: [stored]}, {2: [stored]}]
-
-        def gather(out, batch, group):
-            out[:] = [batch, *peers]
-
-        with (
-            patch.object(torch.distributed, "get_world_size", return_value=3),
-            patch.object(torch.distributed, "all_gather_object", side_effect=gather),
-        ):
-            UnifiedRadixCache._drain_storage_kv_events(cache)
-
+        cache, sizes = self._gathering_cache(backend, recorder, tp_size=3)
+        # Shard 1 also holds the page; rank 2 replicates a shard out of range
+        # and sends nothing.
+        self._drain(
+            cache, sizes, rank=0, roots={"tp": 0}, peers={"tp": [{1: [stored]}, {}]}
+        )
         self.assertEqual(recorder.take(), [stored])
+
+    def test_cp_gathers_to_cp_rank_0_before_tp(self):
+        backend = _PublishingBackend(shard=2, shard_count=4)
+        recorder = SimpleNamespace(enabled=False)
+        # TP2 x CP2: rank 2 is (cp 1, tp 0); its CP root is rank 0.
+        cache, sizes = self._gathering_cache(backend, recorder, cp_size=2)
+        sent = self._drain(cache, sizes, rank=2, roots={"cp": 0, "tp": 2}, peers={})
+        self.assertEqual(sent, [("cp", 0, {2: []})])
+        # A CP root joins its TP gather with its CP peers' shards.
+        backend = _PublishingBackend(shard=1, shard_count=4)
+        cache, sizes = self._gathering_cache(backend, recorder, cp_size=2)
+        sent = self._drain(
+            cache, sizes, rank=1, roots={"cp": 1, "tp": 0}, peers={"cp": [{3: []}]}
+        )
+        self.assertEqual(sent, [("cp", 1, {1: []}), ("tp", 0, {1: [], 3: []})])
+
+    def test_one_shard_drains_without_a_collective(self):
+        for shard, enabled in ((0, True), (1, False)):
+            with self.subTest(shard=shard):
+                backend = _PublishingBackend(shard=shard, shard_count=1)
+                backend.take_kv_events.return_value = []
+                recorder = MagicMock(enabled=enabled)
+                cache, sizes = self._gathering_cache(backend, recorder)
+                self.assertEqual(
+                    self._drain(cache, sizes, rank=shard, roots={}, peers={}), []
+                )
+                backend.take_kv_events.assert_called_once()
 
 
 def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:

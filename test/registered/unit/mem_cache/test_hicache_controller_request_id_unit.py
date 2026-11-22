@@ -80,6 +80,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
         ctrl.storage_backend.batch_exists.return_value = 2
 
         op = SimpleNamespace(
+            kv_event_metadata=None,
             token_ids=[1, 2, 3],
             last_hash=None,
             prefix_keys=["p0"],
@@ -115,6 +116,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
 
         transfers = [PoolTransfer(name=PoolName.SWA, indices_from_pool=None)]
         op = SimpleNamespace(
+            kv_event_metadata=None,
             token_ids=[1, 2, 3],
             last_hash=None,
             prefix_keys=["p0"],
@@ -145,6 +147,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
         ctrl = _hybrid_ctrl()
         ctrl.storage_backend.batch_exists.return_value = 2
         op = SimpleNamespace(
+            kv_event_metadata=None,
             token_ids=[1, 2],
             last_hash=None,
             prefix_keys=None,
@@ -179,6 +182,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
         ctrl = _hybrid_ctrl()
         ctrl.storage_backend.batch_exists.return_value = 2
         op = SimpleNamespace(
+            kv_event_metadata=None,
             token_ids=[1, 2],
             last_hash=None,
             prefix_keys=None,
@@ -221,6 +225,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
 
         transfers = [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)]
         op = SimpleNamespace(
+            kv_event_metadata=None,
             request_id="r-1",
             trace_ctx=object(),
         )
@@ -246,6 +251,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
         ctrl.prefetch_sync_queue = MagicMock()
 
         op = SimpleNamespace(
+            kv_event_metadata=None,
             pool_transfers=[PoolTransfer(name=PoolName.SWA, indices_from_pool=None)],
             is_terminated=lambda: False,
             hash_value=["h0", "h1"],
@@ -279,6 +285,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
 
         ctrl.page_set_func = fake_set
         op = SimpleNamespace(
+            kv_event_metadata=None,
             prefix_keys=None,
             hash_value=["h0", "h1", "h2"],
             host_indices=list(range(6)),
@@ -311,6 +318,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
 
         ctrl.page_set_func = fake_set
         op = SimpleNamespace(
+            kv_event_metadata=None,
             prefix_keys=None,
             hash_value=["h0", "h1", "h2"],
             host_indices=list(range(6)),

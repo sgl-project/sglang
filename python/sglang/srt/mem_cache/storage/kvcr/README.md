@@ -14,8 +14,9 @@ KVCR owns its deposited DRAM cache:
 
 This is not a direct-HBM restore. Peer delivery does not require an
 intermediate allocation in the target's KVCR DRAM cache. Unpinned SGLang host
-pages are never offered as remote sources. Every rank stores its own shard,
-including rank-replicated MLA KV.
+pages are never offered as remote sources. By default every rank stores its own
+shard, including rank-replicated MLA KV; `share_replicated_kv` keeps one copy
+per replica instead (see Shared replicated KV).
 
 ## Configuration
 
@@ -44,13 +45,19 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
 
 - `control_advertise_host` (`127.0.0.1`): host peers and routers dial for this
   worker's control endpoint.
-- `control_host` (`0.0.0.0`): host the control endpoint binds. The endpoint
-  exists only with `enable_remote_hint`; peers fetch through it without
-  authentication, so bind it to the peer-facing interface where possible.
+- `control_host` (`0.0.0.0` with remote hints, else `127.0.0.1`): host the
+  control endpoint binds. The endpoint exists only with `enable_remote_hint` or
+  `share_replicated_kv`; peers fetch through it without authentication, so bind
+  it to the peer-facing interface where possible.
 - `control_port` (`32100`): base control port.
-- `nixl_listen_port` (`control_port + 1024`): base NIXL listen port.
+- `nixl_listen_port` (`control_port + 1024`): base NIXL listen port. The
+  default lies in Linux's ephemeral port range; prefer a base outside it, or
+  reserve the ports (`ip_local_reserved_ports`).
 - `local_dram_bytes` (8 GiB): KVCR DRAM per rank; each pool gets the same
-  fraction of its host pages (bytes split in proportion to host bytes).
+  fraction of its host pages (bytes split in proportion to host bytes). For
+  rank-replicated KV (MLA), every attention rank keeps its own copy of each
+  page unless `share_replicated_kv` is on: TP x CP copies in DRAM and in backup
+  traffic. The startup log names the multiplier.
 - `local_dram_pool_pages` (`{}`): `{pool name: pages}`, an integer of at least
   1 per named pool, overriding that split.
 - `operation_timeout_ms` and `abandon_timeout_ms` (derived): KVCR's deadlines,
@@ -65,6 +72,8 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
   both. Lower abandonment shortens a dead peer's stall; raise both for links
   slower than that rate.
 - `enable_remote_hint` and `publish_inventory` (`false`): see below.
+- `share_replicated_kv` (`false`): one copy of rank-replicated KV per replica;
+  see below.
 - `extra_backend_tag` (unset): hashed into the storage namespace. The namespace
   keys on the served model name and the KV layout, not on the weights, so
   deployments that serve different weights under one served model name and
@@ -106,6 +115,28 @@ prove that the peer holds the checkpoint state, so those pools count only local
 hits, and every restorable prefix must end where the checkpoint is in local
 DRAM. Peer pages cannot extend a prefix past that point. Confirming peer
 checkpoint state is left to a follow-up.
+
+## Shared replicated KV
+
+With `"share_replicated_kv": true`, a deployment whose KV is replicated across
+attention TP ranks (MLA: DeepSeek V2/V3/V4, GLM and Kimi DSA indexers) keeps
+one copy of those pools per replica, on the rank HiCache elects as their writer
+(TP rank 0), as HiCache's other backends do. The other ranks hold no KVCR DRAM
+for them: they restore each page from the writer's KVCR on the same host,
+through its control endpoint, and defer lookups to the writer (HiCache takes
+the minimum hit across ranks). Pools HiCache keeps per rank (Mamba/KDA state,
+MHA draft pools) stay per rank. It applies only with one node per worker
+(`--nnodes 1`) and attention CP=1; otherwise, or when it is off, the startup log
+warns that every rank keeps a copy.
+
+Costs: each rank's control endpoint exists (bound to `127.0.0.1` unless remote
+hints or `control_host` say otherwise), unauthenticated to anything that can
+reach it; every non-writer read is a peer pull from the writer, which also
+serves remote replicas' ranks when remote hints are on; the default deadlines
+grow by the writer's fan-in (TP size). With KVCR 0.2.0, a writer whose progress
+stalls past `operation_timeout_ms` stops serving peers until restart (logged
+as an error): its replica then misses in L3 for the shared pools. Include `sm`
+in `UCX_TLS` so same-host pulls use shared memory.
 
 ## Inventory publication (Dynamo KV state agent)
 
@@ -157,8 +188,11 @@ What SGLang reports at startup (`scheduler_infos` of the engine):
 Events are single-page `BlockStored`/`BlockRemoved` with `ownership: "kvcr"`
 and medium `CPU_PINNED`, published from KVCR's native residency (not from an
 acknowledged write). A page is stored once every attention TP x CP shard holds
-it in every pool that must hold all pages (trailing SWA/Mamba/state pools are
-not advertised), and removed as soon as any shard drops it. Event identities
+it (the writer alone with `share_replicated_kv`) in every pool that must hold
+all pages (trailing SWA/Mamba/state pools are not advertised), and removed as
+soon as any shard drops it. `/flush_cache` leaves KVCR DRAM and these events in
+place: its `AllBlocksCleared` carries no ownership, and Dynamo clears only the
+worker's own residency for it. Event identities
 come from the HiCache tree backups and prefetches that move a page; a page
 resident only through a decode-side offload backup is not advertised.
 
@@ -204,11 +238,12 @@ HiCache can reuse their buffers. If native transfer state is uncertain, the
 worker exits (`os._exit(1)`) because HiCache cannot quarantine pages that NIXL
 may still access. Startup, progress and shutdown failures likewise must not
 release registered memory while native access may remain possible. The `kvcr`
-version and the options are checked when the backend is created, and the
-per-pool DRAM split when the cache attaches its host pools; memory
-registration and the control/NIXL binds happen on the first storage operation
-(a draft sidecar pool may still register until then), where a failure, e.g. a
-port already in use, terminates the worker.
+version and the options are checked when the backend is created; the per-pool
+DRAM split and the control and NIXL listen ports when the cache attaches its
+host pools, which fails the launch if a port is taken (the ports stay reserved
+until KVCR starts). Memory registration happens on the first storage operation
+(a draft sidecar pool may still register until then), where a failure
+terminates the worker.
 
 A peer that dies or hangs during a fetch is the main case of an uncertain
 transfer. Nothing fails fast: the reading rank's prefetch IO waits until
@@ -230,6 +265,7 @@ python test/registered/unit/mem_cache/test_kvcr_endpoints.py -v
 Most of these CPU tests replace the native transport with a byte-copying fake
 and always run. `TestRealKVCR` runs only on Linux with KVCR and its NIXL
 bindings installed, and is skipped otherwise: it starts real KVCR on host
-memory and checks a backup, query, local restore and inventory round trip.
+memory and checks a backup, query, local restore and inventory round trip, and
+a shared replicated rank restoring from its writer.
 None of these tests cover peer reads across hosts, model accuracy or inference
 performance.

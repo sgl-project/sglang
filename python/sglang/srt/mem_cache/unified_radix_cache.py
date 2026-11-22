@@ -781,8 +781,9 @@ class UnifiedRadixCache(BasePrefixCache):
     _storage_event_groups: Optional[list] = None
 
     def _init_storage_kv_events(self) -> None:
-        backend = getattr(self.cache_controller, "storage_backend", None)
-        if getattr(backend, "publishes_kv_events", False) is not True:
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
+        if backend is None or not backend.publishes_kv_events:
             return
         if self.pp_size > 1 or self.cache_controller.storage_config.dcp_size > 1:
             # PP tickets and the PP sync placeholders carry neither the event
@@ -4423,7 +4424,11 @@ class UnifiedRadixCache(BasePrefixCache):
         return get_shm_exchange(group, "hicache", multihost=True, width=width)
 
     def _storage_event_gather_groups(self) -> list:
-        """The attention groups the storage KV event drain gathers over."""
+        """The attention groups the storage KV event drain gathers over.
+
+        Empty when one shard holds every published page: the publisher keeps
+        its own batch, with no collective.
+        """
         if self._storage_event_groups is None:
             groups = [
                 group
@@ -4433,34 +4438,44 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
             if not groups and self.tp_world_size > 1:
                 groups = [self.tp_group]
+            if self._storage_event_reducer.shard_count == 1:
+                groups = []
             self._storage_event_groups = groups
         return self._storage_event_groups
 
     def _drain_storage_kv_events(self) -> None:
         """Join every attention shard's backend residency into published events.
 
-        Collective over this DP replica's attention groups: every rank calls
-        it in the same sync step. Only the rank that publishes KV events keeps
-        the reduced events.
+        Every rank calls it in the same sync step. It gathers this DP
+        replica's attention groups to the rank that publishes KV events (CP
+        first, then TP among CP rank 0); a rank that is not a group's root
+        drops out after sending.
         """
         self._storage_events_drained_at = time.monotonic()
         backend = self.cache_controller.storage_backend
-        batches = {backend.kv_event_shard: backend.take_kv_events()}
+        reducer = self._storage_event_reducer
+        events = backend.take_kv_events()
+        # Replicas of a shard are out of range; they send nothing.
+        batches = (
+            {backend.kv_event_shard: events}
+            if backend.kv_event_shard < reducer.shard_count
+            else {}
+        )
         for group in self._storage_event_gather_groups():
-            gathered = [None] * torch.distributed.get_world_size(group=group)
-            torch.distributed.all_gather_object(gathered, batches, group=group)
+            root = torch.distributed.get_global_rank(group, 0)
+            gathered = (
+                [None] * torch.distributed.get_world_size(group=group)
+                if torch.distributed.get_rank() == root
+                else None
+            )
+            torch.distributed.gather_object(batches, gathered, dst=root, group=group)
+            if gathered is None:
+                return
             batches = {
                 shard: events for batch in gathered for shard, events in batch.items()
             }
         if not self.tree_core.kv_events.enabled:
-            # Followers join the gather but keep nothing.
             return
-        reducer = self._storage_event_reducer
-        batches = {
-            shard: events
-            for shard, events in batches.items()
-            if shard < reducer.shard_count
-        }
         for event in reducer.update(batches):
             self.tree_core.kv_events.enqueue(event)
 

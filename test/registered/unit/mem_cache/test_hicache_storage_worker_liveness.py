@@ -647,6 +647,7 @@ class TestStorageWorkerStop(unittest.TestCase):
             host_indices=torch.arange(3 * PAGE),
             prefix_keys=None,
             completed_tokens=0,
+            kv_event_metadata=None,
         )
         with patch.object(hybrid_cache_controller, "STORAGE_BATCH_SIZE", 1):
             cc._page_backup_kv_with_trace(operation)
@@ -664,10 +665,12 @@ class TestStorageWorkerStop(unittest.TestCase):
             return {str(t.name): [True] * len(t.keys) for t in transfers}
 
         cc.storage_backend = SimpleNamespace(
-            batch_set_v2=Mock(side_effect=batch_set_v2)
+            batch_set_v2=Mock(side_effect=batch_set_v2),
+            requires_rank_local_backup=False,
         )
         operation = SimpleNamespace(
             id=7,
+            kv_event_metadata=None,
             hash_value=["h0", "h1"],
             host_indices=torch.arange(2 * PAGE),
             prefix_keys=["p"],

@@ -387,6 +387,12 @@ class _RustKVCacheEventRecorder(KVCacheEventRecorder):
             lora_names=lora_names,
         )
 
+    def record_store(self, node, medium=None, *, session_id=None) -> None:
+        raise NotImplementedError("The Rust tree core records placements natively")
+
+    def record_remove(self, node, medium=None) -> None:
+        raise NotImplementedError("The Rust tree core records placements natively")
+
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
 

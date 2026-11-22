@@ -13,13 +13,14 @@ import logging
 import math
 import mmap
 import os
+import socket
 import threading
 import uuid
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from queue import Empty, SimpleQueue
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorage,
@@ -28,12 +29,19 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage.kvcr.endpoints import (
     control_address,
+    rank_endpoint,
     rank_offset,
     require_routable_host,
 )
-from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
+from sglang.srt.mem_cache.storage.kvcr.hints import (
+    fetch_hint,
+    parse_router_hint,
+    peer_hint,
+    router_hash,
+)
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     StorageKeyAdapter,
     block_key,
@@ -49,9 +57,16 @@ logger = logging.getLogger(__name__)
 
 # Waiters poll at this interval themselves. The background poll runs at it only
 # after draining completions and otherwise backs off to the cap: each wakeup
-# takes the GIL from the scheduler.
+# takes the GIL from the scheduler. A peer asking for pages this rank lacks
+# waits up to the source cap for its refusal; without a control endpoint there
+# are no peers, only lease releases.
 _POLL_INTERVAL_SECONDS = 0.001
 _IDLE_POLL_MAX_SECONDS = 0.02
+_IDLE_POLL_MAX_SECONDS_WITHOUT_PEERS = 0.1
+
+# Parsed router hints kept per (envelope, mapping) object pair: the prefetch
+# thread's operation and the scheduler's lookup may interleave. Arbitrary.
+_ROUTER_HINT_CACHE_SIZE = 8
 
 # Pools HiCache restores as TRAILING_PAGES windows (SWA, its DeepSeek V4
 # compressor states, Mamba): a page need not have state in them.
@@ -66,6 +81,12 @@ _TRAILING_POOLS = frozenset(
         PoolName.DEEPSEEK_V4_C128_STATE,
     )
 )
+
+# Pools HiCache backs up on every rank even where it elects one writer for
+# rank-replicated KV (HybridCacheController.should_backup): their bytes are
+# TP-sharded, so each rank keeps its own. So are MHA draft pools, by type.
+_RANK_SHARDED_POOLS = frozenset({str(PoolName.MAMBA)})
+_MHA_DRAFT_POOLS = frozenset({str(PoolName.DRAFT), str(PoolName.DRAFT_SWA)})
 
 # Default KVCR deadlines scale with one HiCache storage batch (128 pages of
 # every pool): the operation deadline is that batch at this per-rank rate, and
@@ -89,6 +110,7 @@ _EXTRA_CONFIG_KEYS = frozenset(
         "nixl_listen_port",
         "operation_timeout_ms",
         "publish_inventory",
+        "share_replicated_kv",
         "startup_timeout_seconds",
     }
 )
@@ -107,8 +129,8 @@ _HICACHE_GENERIC_KEYS = frozenset(
 )
 
 
-def _bool_option(options: dict, name: str) -> bool:
-    value = options.get(name, False)
+def _bool_option(options: dict, name: str, default: bool = False) -> bool:
+    value = options.get(name, default)
     if type(value) is not bool:
         raise ValueError(f"{name} must be a boolean")
     return value
@@ -154,9 +176,11 @@ class _NoFrameworkPinning:
 class KVCRStore(HiCacheStorage):
     """Optional NIXL/UCX L3 backend using KVCR's indexed-region public API."""
 
-    # Objects are keyed by this rank's shard, so every rank backs up its own
-    # copy, including rank-replicated MLA KV.
+    # Objects of rank-sharded pools are keyed by this rank's shard, so every
+    # rank backs up its own copy. Rank-replicated pools (MLA) are shared
+    # unless share_replicated_kv is off; see _share_replicated.
     requires_rank_local_backup = True
+    rank_keyed_mha_drafts = True
 
     def __init__(self, storage_config, mem_pool_host):
         if storage_config.should_split_heads:
@@ -208,6 +232,13 @@ class KVCRStore(HiCacheStorage):
             raise ValueError(
                 "KVCR enable_remote_hint (and publish_inventory) requires --nnodes 1"
             )
+        self._shared = self._share_replicated(storage_config)
+        # The controller elects the writer from the config it holds; with CP=1
+        # (required to share) KVCR's own config does not renumber it.
+        self._writer = storage_config.is_storage_writer
+        if self._shared and self._writer != (rank_offset(storage_config) == 0):
+            raise ValueError("KVCR expects the replica's first shard to write")
+        self.requires_rank_local_backup = not self._shared
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
@@ -265,6 +296,19 @@ class KVCRStore(HiCacheStorage):
         if not 0 < self._nixl_port <= 65535 or port == self._nixl_port:
             raise ValueError("KVCR control/NIXL port range is invalid or overlaps")
         self._agent_name = f"sglang-kvcr-{uuid.uuid4().hex}"
+        # A shared rank's source: the replica's first shard, on this host.
+        self._writer_endpoint = None
+        if self._shared and not self._writer:
+            self._writer_endpoint = rank_endpoint(
+                f"tcp://{self._peer_host()}:{port}", -self._offset
+            )
+            if self._writer_endpoint is None:
+                raise ValueError("KVCR cannot address the replica's first shard")
+        self._idle_poll_max = (
+            _IDLE_POLL_MAX_SECONDS
+            if self._needs_control()
+            else _IDLE_POLL_MAX_SECONDS_WITHOUT_PEERS
+        )
         # Publish this shard's DRAM residency as KV events (ownership "kvcr")
         # for an external KV state agent, e.g. Dynamo's.
         self.publishes_kv_events = _bool_option(self._extra, "publish_inventory")
@@ -278,12 +322,71 @@ class KVCRStore(HiCacheStorage):
             require_routable_host(self._control[0])
         self._inventory = KVCRInventory() if self.publishes_kv_events else None
         # Each attention TP x CP rank stores its own shard (no PP, no DCP), and a
-        # page is advertised once every shard holds it.
+        # page is advertised once every shard holds it. Shared replicated pools
+        # live on the first shard alone; the others are its replicas.
         self.kv_event_shard = self._offset
-        self.kv_event_shard_count = self.config.tp_size * self.config.attn_cp_size
+        self.kv_event_shard_count = (
+            1 if self._shared else self.config.tp_size * self.config.attn_cp_size
+        )
+        # External hints name the source replica's first shard; a rank reads
+        # its shared pools from that replica's first shard too.
+        self._source_offset = 0 if self._shared else self._offset
+        self._router_hints = OrderedDict()
+        self._rank_local_pools = set(_RANK_SHARDED_POOLS)
+        # This shard's and its writer's storage namespaces, fixed at start.
+        self._namespace = self._shared_namespace = None
+        # The control listener and the NIXL port, held from the attach until
+        # KVCR binds them at start (_reserve_ports).
+        self._listener = self._nixl_hold = None
         # Set once advertised; fixed for this backend's (and engine's) lifetime.
         self._cache_owner_id = None
         self.register_mem_pool_host(mem_pool_host)
+
+    def _share_replicated(self, storage_config) -> bool:
+        """Keep one copy of rank-replicated pools per replica, on its writer.
+
+        Like HiCache's other backends, which elect one writer for MLA KV, but
+        a KVCR rank holds only its own DRAM: the other ranks restore those
+        pages from the writer's KVCR on the same host, through its control
+        endpoint. Pools HiCache keeps per rank stay per rank. Opt-in: it opens
+        that endpoint and makes the writer every sibling's source (README).
+        """
+        copies = storage_config.tp_size * storage_config.attn_cp_size
+        if not storage_config.is_rank_replicated or copies == 1:
+            return False
+        reason = None
+        if not _bool_option(self._extra, "share_replicated_kv"):
+            reason = "share_replicated_kv is off"
+        elif storage_config.attn_cp_size != 1:
+            reason = "attention CP > 1"
+        elif get_parallel().nnodes != 1:
+            # Ranks reach the writer at its port on their own host.
+            reason = "--nnodes > 1"
+        if reason is not None:
+            logger.warning(
+                "KVCR keeps a copy of rank-replicated KV on every attention rank "
+                "(%d copies per page in L3 DRAM and backup traffic) because %s",
+                copies,
+                reason,
+            )
+            return False
+        return True
+
+    def _shares(self, pool: str) -> bool:
+        return self._shared and pool not in self._rank_local_pools
+
+    def _namespaces(self, layouts=None) -> tuple[str, str]:
+        """(this shard's, the writer's) storage namespace; equal on the writer."""
+        layouts = self._layouts if layouts is None else layouts
+        own = storage_namespace(self.config, layouts, shared=self._shared)
+        if not self._shared or self._writer:
+            return own, own
+        writer = dataclasses.replace(self.config, tp_rank=0)
+        return own, storage_namespace(writer, layouts, shared=True)
+
+    def _key(self, page_key: str, pool: str) -> bytes:
+        namespace = self._shared_namespace if self._shares(pool) else self._namespace
+        return block_key(page_key, namespace, pool)
 
     def consumes_kv_hints(self) -> bool:
         return self._remote_hint
@@ -324,7 +427,7 @@ class KVCRStore(HiCacheStorage):
             if self._cache_owner_id is None:
                 if not self._layouts:
                     raise ValueError("KVCR has no registered physical host pools")
-                namespace = storage_namespace(self.config, self._layouts)
+                namespace = self._namespaces()[1]
                 self._cache_owner_id = (
                     f"{namespace[:32]}:{namespace[32:]}/{'0' * 16}/"
                     f"{self._agent_name.rsplit('-', 1)[-1]}"
@@ -354,6 +457,16 @@ class KVCRStore(HiCacheStorage):
                 # The advertised owner names the namespace of these pools.
                 raise ValueError("KVCR host pools must be registered before discovery")
             layout = describe_pool(name, host_pool)
+            if name in _MHA_DRAFT_POOLS and isinstance(host_pool, MHATokenToKVPoolHost):
+                # Its heads are this rank's (should_backup writes it everywhere).
+                if self._shared and self.publishes_kv_events:
+                    # Only the writer's residency is published, which says
+                    # nothing of the other ranks' own draft pages.
+                    raise ValueError(
+                        "KVCR share_replicated_kv with publish_inventory does "
+                        f"not support an MHA {name} pool yet"
+                    )
+                self._rank_local_pools.add(name)
             if self._pools_attached:
                 # A late sidecar shrinks every pool's share: fail its
                 # registration, not the first IO.
@@ -365,7 +478,64 @@ class KVCRStore(HiCacheStorage):
         # Fail the attach if the budget cannot give a registered pool one page.
         if self._layouts:
             self._pool_pages()
+        self._reserve_ports()
         self._pools_attached = True
+
+    def _needs_control(self) -> bool:
+        # KVCR serves and fetches peer pages only through its control endpoint.
+        return self._remote_hint or self._shared
+
+    def _reserve_ports(self) -> None:
+        """Fail the attach, not the first IO, when a listen port is taken.
+
+        KVCR starts (and binds) at the first IO, after the worker reported its
+        sources and passed health checks. The control listener is bound here
+        and handed to KVCR at start. The NIXL port stays bound, not listening,
+        until KVCR binds it, so no outgoing connection takes it meanwhile
+        (by default it lies in Linux's ephemeral port range).
+        """
+        if self._nixl_hold is not None or self._runner is not None:
+            return
+        host, port = self._control
+        try:
+            with ExitStack() as reserved:
+                hold = reserved.enter_context(socket.socket())
+                # As listeners bind it: only a live socket on the port collides.
+                hold.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                hold.bind(("", self._nixl_port))
+                if self._needs_control():
+                    self._listener = reserved.enter_context(
+                        socket.create_server((self._control_bind_host(), port))
+                    )
+                reserved.pop_all()
+        except OSError:
+            # One rank failing a runtime attach would leave the others in its
+            # collectives; at launch this fails the launch all the same.
+            logger.critical(
+                "KVCR cannot bind its control port %d or NIXL port %d; "
+                "terminating worker",
+                port,
+                self._nixl_port,
+                exc_info=True,
+            )
+            os._exit(1)
+        self._nixl_hold = hold
+
+    def _control_bind_host(self) -> str:
+        # Only the replica's own ranks dial a shared-only endpoint.
+        default = "0.0.0.0" if self._remote_hint else "127.0.0.1"
+        return self._extra.get("control_host", default)
+
+    def _peer_host(self) -> str:
+        """The host peers dial and sources reply to.
+
+        The advertised host with remote hints; otherwise only this replica's
+        ranks dial it, at the host it is bound to.
+        """
+        if self._remote_hint:
+            return self._control[0]
+        host = self._control_bind_host()
+        return "127.0.0.1" if host in ("0.0.0.0", "") else host
 
     def _timeouts(self, layouts=None) -> tuple[int, int]:
         """KVCR's operation and abandonment deadlines, in ms.
@@ -374,10 +544,16 @@ class KVCRStore(HiCacheStorage):
         before a slow but healthy transfer counts as uncertain.
         """
         layouts = self._layouts if layouts is None else layouts
-        batch_bytes = STORAGE_BATCH_SIZE * sum(
-            component.size
-            for layout in layouts.values()
-            for component in layout.components
+        # A writer may serve every sibling's batch beside its own.
+        fan_in = self.config.tp_size if self._shared else 1
+        batch_bytes = (
+            STORAGE_BATCH_SIZE
+            * fan_in
+            * sum(
+                component.size
+                for layout in layouts.values()
+                for component in layout.components
+            )
         )
         derived = max(
             _MIN_OPERATION_TIMEOUT_MS,
@@ -435,18 +611,31 @@ class KVCRStore(HiCacheStorage):
             raise ValueError("KVCR has no registered physical host pools")
         self._warn_unmatched_pool_pages()
         operation_timeout_ms, abandon_timeout_ms = self._timeouts()
-        self._namespace = storage_namespace(self.config, self._layouts)
+        self._namespace, self._shared_namespace = self._namespaces()
         if self._inventory is not None:
+            # Only the writer's pages are advertised (kv_event_shard_count).
             self._inventory.configure(
-                self._namespace,
+                self._shared_namespace,
                 [name for name in self._layouts if name not in _TRAILING_POOLS],
             )
-        host, port = self._control
+        port = self._control[1]
         layouts, regions, plans = [], [], []
-        for name, pages in self._pool_pages().items():
+        pool_pages = self._pool_pages()
+        # KVCR's DRAM pools must match its pool layouts, which name every
+        # pool a restore lands in. A replica keeps one page of a shared pool
+        # beside its own pools, and no DRAM if it has none.
+        replica = [
+            name for name in pool_pages if not self._writer and self._shares(name)
+        ]
+        if len(replica) == len(pool_pages):
+            pool_pages = {name: 0 for name in pool_pages}
+        else:
+            pool_pages.update({name: 1 for name in replica})
+        for name, pages in pool_pages.items():
             layout = self._layouts[name]
             for component in layout.components:
-                plans.append((component.name, pages * component.size))
+                if pages:
+                    plans.append((component.name, pages * component.size))
                 layouts.append((component.name, component.size))
                 regions.append(
                     RegionDescriptor(
@@ -458,24 +647,32 @@ class KVCRStore(HiCacheStorage):
                     )
                 )
         # Peers fetch through the control endpoint, unauthenticated, so it
-        # exists only with remote hints on; local DRAM IO does not use it.
+        # exists only with remote hints or shared replicated pools; local DRAM
+        # IO does not use it. A rank without DRAM needs it to start at all.
         channel = None
-        if self._remote_hint:
+        if self._needs_control():
             channel = ZmqPeerControlChannel(
-                bind_host=self._extra.get("control_host", "0.0.0.0"),
+                bind_host=self._control_bind_host(),
                 bind_port=port,
-                advertise_host=host,
+                # Sources reply here.
+                advertise_host=self._peer_host(),
             )
         allocations, mappings = [], []
         with ExitStack() as resources:
             if channel is not None:
                 resources.callback(channel.close)
+                if self._listener is not None:
+                    channel.adopt_listener(self._listener.detach())
+                    self._listener = None
             for name, length in plans:
                 allocation = _allocate_dram_pool(length)
                 resources.callback(allocation.close)
                 mappings.append(allocation)
                 address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
                 allocations.append((name, address, length))
+            if self._nixl_hold is not None:
+                self._nixl_hold.close()
+                self._nixl_hold = None
             try:
                 self._runner = KVCR(
                     config=KVCRConfig(
@@ -533,11 +730,14 @@ class KVCRStore(HiCacheStorage):
         self._poll_thread.start()
         logger.info(
             "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s "
-            "operation_timeout_ms=%d abandon_timeout_ms=%d",
+            "shared_replicated=%s writer=%s operation_timeout_ms=%d "
+            "abandon_timeout_ms=%d",
             channel.endpoint if channel is not None else None,
             layouts,
             sum(size for _, _, size in allocations),
             self._namespace,
+            self._shared,
+            self._writer_endpoint or "self",
             operation_timeout_ms,
             abandon_timeout_ms,
         )
@@ -551,22 +751,103 @@ class KVCRStore(HiCacheStorage):
             # Returning a miss would let it reuse memory still exposed to NIXL.
             logger.critical("Unsafe KVCR transfer; terminating worker: %s", error)
             os._exit(1)
+        if "source writes disabled" in str(error):
+            # KVCR 0.2.0 latches a stalled source off until restart: every
+            # peer, including this replica's other ranks, then misses here.
+            logger.error("KVCR stopped serving peers until restart: %s", error)
+            return
         logger.warning("KVCR resilience event: %s", error)
 
+    def _router_hint(self, extra_info, page_keys, offset=None):
+        """The request's router hint for a source shard, narrowed to these pages.
+
+        The shard is the source replica's first (for shared pools) or this
+        rank's own offset there. The controller rebuilds extra_info for every
+        storage batch but carries the operation's envelope object, so it is
+        parsed once per operation and offset; the cache holds it, so its id is
+        not reused while cached. Its key mapping is read per batch: a lookup
+        builds a new one each time. Called under self._lock.
+        """
+        extra = extra_info.extra_info if extra_info is not None else None
+        if not self._remote_hint or not extra or extra.get("kv_hints") is None:
+            return None
+        envelope = extra["kv_hints"]
+        offset = self._source_offset if offset is None else offset
+        key = (id(envelope), offset)
+        cached = self._router_hints.get(key)
+        if cached is None or cached[0] is not envelope:
+            cached = (envelope, parse_router_hint(envelope, offset))
+            self._router_hints[key] = cached
+            if len(self._router_hints) > _ROUTER_HINT_CACHE_SIZE:
+                self._router_hints.popitem(last=False)
+        else:
+            self._router_hints.move_to_end(key)
+        return peer_hint(cached[1], page_keys, extra.get("storage_key_to_event_hash"))
+
+    def _writer_hint(self, page_keys):
+        """Fetch these pages from this replica's writer."""
+        return fetch_hint(
+            self._writer_endpoint, dict.fromkeys(map(router_hash, page_keys))
+        )
+
     @contextmanager
-    def _hint(self, extra_info, keys=None):
+    def _hint(self, hint):
         request_id = None
-        hint = peer_hint(extra_info, self._offset, keys) if self._remote_hint else None
         if hint is not None:
             request_id = uuid.uuid4().hex
-            self._runner.submit_hint(
-                decode_kv_hints_envelope(hint), request_id=request_id
-            )
+            self._runner.submit_hint(hint, request_id=request_id)
         try:
             yield request_id
         finally:
             if request_id is not None:
                 self._runner.discard_hint(request_id)
+
+    def _deliver(self, blocks, pages, shared, extra_info):
+        """One terminal read of these blocks (identity -> page key in pages).
+
+        KVCR binds one source per request. A replica rank reads its shared
+        pools as the writer would, local first: from this replica's writer,
+        then pages it lacks that a router hint names from the hinted replica's
+        writer. Its own pools come from local DRAM or, hinted, from its shard
+        of the hinted replica, in flight beside the shared read.
+        """
+        if self._writer_endpoint is None:
+            hint = self._router_hint(extra_info, list(dict.fromkeys(pages.values())))
+            with self._hint(hint) as request_id:
+                return self._wait(self._runner.deliver(blocks, request_id=request_id))
+        own = {key: refs for key, refs in blocks.items() if key not in shared}
+        local = {key: refs for key, refs in blocks.items() if key in shared}
+        own_hint = self._router_hint(
+            extra_info, [pages[key] for key in own], offset=self._offset
+        )
+        result = self._deliver_parts(
+            ((own, own_hint), (local, self._replica_hint(local, pages)))
+        )
+        missed = {
+            key: refs
+            for key, refs in local.items()
+            if key not in result or not result[key].success
+        }
+        remote = self._router_hint(extra_info, [pages[key] for key in missed])
+        if missed and remote is not None:
+            result.update(self._deliver_parts(((missed, remote),)))
+        return result
+
+    def _replica_hint(self, blocks, pages):
+        return self._writer_hint([pages[key] for key in blocks]) if blocks else None
+
+    def _deliver_parts(self, parts):
+        """Deliver each (blocks, hint) part under its own request; wait for all."""
+        with ExitStack() as scopes:
+            handles = []
+            for blocks, hint in parts:
+                if blocks:
+                    request_id = scopes.enter_context(self._hint(hint))
+                    handles.append(self._runner.deliver(blocks, request_id=request_id))
+            result = {}
+            for handle in handles:
+                result.update(self._wait(handle))
+        return result
 
     def _wait(self, handle):
         # There can be concurrent backup and prefetch threads. One caller may
@@ -598,9 +879,7 @@ class KVCRStore(HiCacheStorage):
                 )
                 os._exit(1)
             wait = (
-                _POLL_INTERVAL_SECONDS
-                if busy
-                else min(wait * 2, _IDLE_POLL_MAX_SECONDS)
+                _POLL_INTERVAL_SECONDS if busy else min(wait * 2, self._idle_poll_max)
             )
             self._stop_poll.wait(wait)
 
@@ -640,18 +919,21 @@ class KVCRStore(HiCacheStorage):
 
         with self._lock:
             self._start()
-            blocks, groups = {}, {}
+            blocks, groups, pages, shared = {}, {}, {}, set()
             for transfer in transfers:
                 name = str(transfer.name)
                 keys = transfer.keys or []
                 if name == str(PoolName.KV) and name not in self._layouts:
                     groups[name] = [(None, True) for _ in keys]
                     continue
+                if is_set and keys and self._shares(name) and not self._writer:
+                    # HiCache elects one writer (backup_skip); this is a bug.
+                    raise ValueError(f"Only the writer shard backs up shared {name}")
                 layout = self._layouts[name]
                 slots = page_slots(layout, keys, transfer.host_indices)
                 groups.setdefault(name, [])
                 for key, slot in zip(keys, slots, strict=True):
-                    identity = block_key(key, self._namespace, name)
+                    identity = self._key(key, name)
                     refs = [
                         MemoryRef(
                             end_point_name=self._agent_name,
@@ -663,6 +945,9 @@ class KVCRStore(HiCacheStorage):
                     if identity in blocks:
                         raise ValueError("Duplicate pool/page in one KVCR operation")
                     blocks[identity] = refs
+                    pages[identity] = key
+                    if self._shares(name):
+                        shared.add(identity)
                     groups[name].append((identity, False))
             if not blocks:
                 return {name: [True] * len(group) for name, group in groups.items()}
@@ -672,9 +957,7 @@ class KVCRStore(HiCacheStorage):
                     # Writes carry no kv_hints; deposits are always local.
                     result = self._wait(self._runner.deposit(blocks))
                 else:
-                    with self._hint(extra_info, blocks) as request_id:
-                        handle = self._runner.deliver(blocks, request_id=request_id)
-                        result = self._wait(handle)
+                    result = self._deliver(blocks, pages, shared, extra_info)
         return {
             name: [
                 logical or (key in result and result[key].success)
@@ -719,18 +1002,35 @@ class KVCRStore(HiCacheStorage):
             # An empty intersection is not evidence of stored data. In
             # particular, trailing-only layouts cannot prove a bare prefix.
             return PoolTransferResult(0, {}, [])
+        # Shared pools are the writer's to answer: every rank's lookup is
+        # MIN-reduced (or, for trailing pools, intersected) across the
+        # replica's attention ranks, so this rank claims every page and the
+        # writer's own answer decides.
+        replica = self._shared and not self._writer
+        queried = [t for t in required if not (replica and self._shares(str(t.name)))]
+        statuses = {}
         with self._lock:
+            # A replica starts here too, not in its first (critical-path) read.
             self._start()
-            identities = [
-                block_key(key, self._namespace, str(transfer.name))
-                for transfer in required
-                for key in keys
-            ]
-            with self._hint(extra_info, identities) as request_id:
-                statuses = self._runner.query(identities, request_id=request_id)
+            if queried:
+                identities = [
+                    self._key(key, str(transfer.name))
+                    for transfer in queried
+                    for key in keys
+                ]
+                # A replica queries only its own pools: at its own shard.
+                hint = self._router_hint(
+                    extra_info, keys, offset=self._offset if replica else None
+                )
+                with self._hint(hint) as request_id:
+                    flat = self._runner.query(identities, request_id=request_id)
+            for index, transfer in enumerate(queried):
+                statuses[id(transfer)] = flat[
+                    index * len(keys) : (index + 1) * len(keys)
+                ]
         restorable, hits = set(range(1, len(keys) + 1)), {}
-        for index, transfer in enumerate(required):
-            status = statuses[index * len(keys) : (index + 1) * len(keys)]
+        for transfer in required:
+            status = statuses.get(id(transfer))
             trailing = None
             # FETCHABLE only means a router hint named the logical page; it
             # does not prove the peer holds this pool's checkpoint. A resume
@@ -741,7 +1041,11 @@ class KVCRStore(HiCacheStorage):
                 accepted = (QueryStatus.HIT,)
             elif transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
                 raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
-            exists = [s in accepted for s, _ in status]
+            exists = (
+                [True] * len(keys)
+                if status is None
+                else [s in accepted for s, _ in status]
+            )
             valid = resume_boundaries(exists, trailing=trailing)
             hits[str(transfer.name)] = max(valid, default=0)
             restorable.intersection_update(valid)
@@ -790,3 +1094,8 @@ class KVCRStore(HiCacheStorage):
             for allocation in self._maps:
                 allocation.close()
             self._maps.clear()
+            # Reserved but never handed to KVCR.
+            for reserved in (self._listener, self._nixl_hold):
+                if reserved is not None:
+                    reserved.close()
+            self._listener = self._nixl_hold = None

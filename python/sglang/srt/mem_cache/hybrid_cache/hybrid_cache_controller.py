@@ -327,7 +327,7 @@ def _storage_read_extra(operation: PrefetchOperation) -> Optional[dict]:
     if metadata is not None:
         fields.update(metadata)
     # Separate from storage_read_metadata, which is gated on kv_hints actions.
-    event_metadata = getattr(operation, "kv_event_metadata", None)
+    event_metadata = operation.kv_event_metadata
     if event_metadata is not None:
         fields["kv_event_metadata"] = event_metadata
     return fields or None
@@ -336,7 +336,7 @@ def _storage_read_extra(operation: PrefetchOperation) -> Optional[dict]:
 def _storage_write_extra(operation: StorageOperation) -> Optional[dict]:
     """Backup-write metadata: trace ids and, if any, the pages' event identities."""
     fields = _storage_trace_extra(operation, include_request_id=False)
-    event_metadata = getattr(operation, "kv_event_metadata", None)
+    event_metadata = operation.kv_event_metadata
     if event_metadata is not None:
         fields["kv_event_metadata"] = event_metadata
     return fields or None
@@ -1717,8 +1717,13 @@ class HybridCacheController(BaseHiCacheController):
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         # A publishing backend's metadata is keyed by this same chain, already
         # hashed on the scheduler thread; reuse it when it covers every page.
-        hash_value = list(getattr(operation, "kv_event_metadata", None) or ())
-        if len(hash_value) != len(operation.token_ids) // self.page_size:
+        metadata = operation.kv_event_metadata
+        if (
+            metadata is not None
+            and len(metadata) == len(operation.token_ids) // self.page_size
+        ):
+            hash_value = list(metadata)
+        else:
             hash_value = get_storage_hash_str(
                 operation.token_ids, operation.last_hash, page_size=self.page_size
             )
@@ -2144,9 +2149,14 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
-        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
-        # MLA/DeepSeek-V4 draft pools remain TP0-only.
-        if self.storage_backend_type == "mooncake" and transfer.name in (
+        # Mooncake (and a backend that says so) gives MHA draft and draft-SWA
+        # objects rank-specific keys. MLA/DeepSeek-V4 draft pools remain
+        # TP0-only.
+        rank_keyed = (
+            self.storage_backend_type == "mooncake"
+            or self.storage_backend.rank_keyed_mha_drafts is True
+        )
+        if rank_keyed and transfer.name in (
             PoolName.DRAFT,
             PoolName.DRAFT_SWA,
         ):

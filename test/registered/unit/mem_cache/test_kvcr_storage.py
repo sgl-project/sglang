@@ -13,6 +13,7 @@ import mmap
 import re
 import socket
 import sys
+import threading
 import time
 import types
 import unittest
@@ -56,7 +57,7 @@ from sglang.srt.mem_cache.storage.kvcr.endpoints import (
     control_address,
     require_routable_host,
 )
-from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
+from sglang.srt.mem_cache.storage.kvcr.hints import parse_router_hint, peer_hint
 from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     block_key,
     describe_pool,
@@ -80,10 +81,27 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.network import is_port_available
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def _route(info, offset, page_keys):
+    """A request's router hint for one shard, narrowed to these pages."""
+    extra = info.extra_info
+    hint = peer_hint(
+        parse_router_hint(extra["kv_hints"], offset),
+        page_keys,
+        extra.get("storage_key_to_event_hash"),
+    )
+    return None if hint is None else msgspec.to_builtins(hint)
+
+
+def _page(router_hash):
+    """A full storage-page key whose router hash is router_hash."""
+    return f"{router_hash:016x}" + "0" * 48
 
 
 def _kvcr_module():
@@ -187,6 +205,9 @@ class _CopyTransport:
     def discard_hint(self, request_id):
         del self.hints[request_id]
 
+    def close(self):
+        pass
+
 
 class _StrictPeerTransport(_CopyTransport):
     """Native-style hint membership at the external dependency boundary."""
@@ -212,7 +233,14 @@ class _StrictPeerTransport(_CopyTransport):
     def query(self, keys, request_id=None):
         available = self._authorized(request_id)
         return [
-            (_QueryStatus.FETCHABLE if key in available else _QueryStatus.MISS, None)
+            (
+                _QueryStatus.HIT
+                if key in self.storage
+                else _QueryStatus.FETCHABLE
+                if key in available
+                else _QueryStatus.MISS,
+                None,
+            )
             for key in keys
         ]
 
@@ -256,6 +284,8 @@ class TestKVCRStorage(CustomTestCase):
         )
         # A standalone replica on one node: no DP controller numbered this process.
         self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        # Real port reservations are covered by TestPortReservation.
+        self.enterContext(patch.object(KVCRStore, "_reserve_ports"))
         types_module = types.ModuleType("kvcr.types")
         types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
         self.stub = patch.dict(
@@ -499,8 +529,7 @@ class TestKVCRStorage(CustomTestCase):
         info = HiCacheStorageExtraInfo(
             extra_info={"kv_hints": hint, "storage_key_to_event_hash": mapping}
         )
-        physical = [block_key(h, "0" * 64, "kv") for h in pages]
-        translated = peer_hint(info, 1, physical)
+        translated = _route(info, 1, pages)
         payload = translated["actions"][0]["payload"]
         self.assertEqual(payload["source_control_endpoint"], "tcp://peer:32101")
         self.assertEqual(payload["block_hashes"], [int(h[:16], 16) for h in pages[:2]])
@@ -508,12 +537,15 @@ class TestKVCRStorage(CustomTestCase):
         other = get_storage_hash_str(
             RadixKey(array("q", range(8)), cache_salt="tenant-b"), page_size=2
         )
-        self.assertIsNone(
-            peer_hint(info, 0, [block_key(h, "0" * 64, "kv") for h in other])
+        self.assertIsNone(_route(info, 0, other))
+        # Narrowed to the batch: a page outside the hint is not named.
+        self.assertEqual(
+            _route(info, 0, pages[1:])["actions"][0]["payload"]["block_hashes"],
+            [int(pages[1][:16], 16)],
         )
         for invalid in ({}, [], {pages[0]: True}, {pages[0]: -1}):
             info.extra_info["storage_key_to_event_hash"] = invalid
-            self.assertIsNone(peer_hint(info, 0, physical))
+            self.assertIsNone(_route(info, 0, pages))
 
     def test_salted_peer_prefetch_restores_kv_and_indexer_bytes(self):
         """Separate owners, strict advertised membership, actual continuation bytes."""
@@ -1190,7 +1222,7 @@ class TestKVCRStorage(CustomTestCase):
                 }
             )
             with self.subTest(no_retain=value):
-                hint = peer_hint(info, 0)
+                hint = _route(info, 0, [_page(7), _page(8)])
                 if not kept:
                     self.assertIsNone(hint)
                     continue
@@ -1218,25 +1250,32 @@ class TestKVCRStorage(CustomTestCase):
                 }
             }
         )
+        page = _page((1 << 63) + 1)
         self.assertEqual(
-            peer_hint(info, 3)["actions"][0]["payload"]["source_control_endpoint"],
+            _route(info, 3, [page])["actions"][0]["payload"]["source_control_endpoint"],
             "tcp://source:32003",
         )
         # The default backend ignores hints even when a caller passes one.
-        with self.backend._hint(info) as request_id:
-            self.assertIsNone(request_id)
-            self.assertEqual(self.transport.hints, {})
+        self.assertIsNone(self.backend._router_hint(info, [page]))
         hinted = KVCRStore(
             dataclasses.replace(self.config, extra_config={"enable_remote_hint": True}),
             self.pool,
         )
         transport = hinted._runner = _CopyTransport(hinted._layouts)
-        with hinted._hint(info) as request_id:
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store.parse_router_hint",
+            wraps=parse_router_hint,
+        ) as parse:
+            hint = hinted._router_hint(info, [page])
+            # Parsed once per request envelope, however many batches it spans.
+            self.assertEqual(hinted._router_hint(info, [page]), hint)
+        parse.assert_called_once()
+        with hinted._hint(hint) as request_id:
             self.assertEqual(len(transport.hints), 1)
             self.assertIn(request_id, transport.hints)
         self.assertEqual(transport.hints, {})
         info.extra_info["kv_hints"]["actions"][0]["payload"]["block_hashes"] = [True]
-        self.assertIsNone(peer_hint(info, 0))
+        self.assertIsNone(_route(info, 0, [page]))
 
     def test_namespace_separates_model_format_and_shard_not_replica(self):
         namespace = storage_namespace(self.config, self.backend._layouts)
@@ -1446,6 +1485,7 @@ class TestKVCRInventoryPublication(CustomTestCase):
             model_name="glm-test",
         )
         self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        self.enterContext(patch.object(KVCRStore, "_reserve_ports"))
         self.pool = _HostPool()
         types_module = types.ModuleType("kvcr.types")
         types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
@@ -1930,6 +1970,651 @@ class TestKVCRInventoryPublication(CustomTestCase):
         self.assertEqual(len(wire_events[0]["token_ids"]), wire_events[0]["block_size"])
 
 
+class _FakeChannel:
+    """ZmqPeerControlChannel stand-in: records its addresses and listener."""
+
+    def __init__(self, bind_host, bind_port, advertise_host):
+        self.bind = (bind_host, bind_port)
+        self.endpoint = f"tcp://{advertise_host}:{bind_port}"
+        self.adopted = None
+
+    def adopt_listener(self, listener_fd):
+        self.adopted = socket.socket(fileno=listener_fd)
+
+    def close(self):
+        if self.adopted is not None:
+            self.adopted.close()
+
+
+class _FakeKVCR(_CopyTransport):
+    """KVCR stand-in whose completions only the store's poll thread drains."""
+
+    def __init__(self, *, config, bindings, backend_configs):
+        regions = backend_configs.framework_regions
+        super().__init__(
+            {
+                "regions": SimpleNamespace(
+                    components=[
+                        SimpleNamespace(
+                            name=r.label, address=r.addr, size=r.size, stride=r.stride
+                        )
+                        for r in regions
+                    ]
+                )
+            }
+        )
+        self.config, self.bindings = config, bindings
+        self.backend_configs = backend_configs
+        self.held, self.polls, self.closed, self.fail = {}, 0, 0, False
+
+    def _complete(self, result):
+        self.next_handle += 1
+        self.held[self.next_handle] = result
+        return self.next_handle
+
+    def poll_completed(self):
+        if threading.current_thread().name != "kvcr-storage-completions":
+            return []
+        self.polls += 1
+        if self.fail:
+            raise RuntimeError("progress failed")
+        done, self.held = list(self.held.items()), {}
+        return done
+
+    def close(self):
+        self.closed += 1
+        if self.bindings.framework_control is not None:
+            self.bindings.framework_control.close()
+
+
+def _fake_kvcr_modules():
+    kvcr = types.ModuleType("kvcr")
+    kvcr.KVCR, kvcr.KVCRBindings = _FakeKVCR, SimpleNamespace
+    kvcr.ZmqPeerControlChannel = _FakeChannel
+    config = types.ModuleType("kvcr.config")
+    config.KVCRBackendConfigs = config.KVCRConfig = SimpleNamespace
+    config.LocalDramOptions = SimpleNamespace
+    kvcr_types = types.ModuleType("kvcr.types")
+    kvcr_types.MemoryRef, kvcr_types.QueryStatus = _MemoryRef, _QueryStatus
+    kvcr_types.RegionDescriptor = SimpleNamespace
+    kvcr_types.KVCRStartupError = type("KVCRStartupError", (Exception,), {})
+    kvcr_types.TransferError = type("TransferError", (Exception,), {})
+    return {"kvcr": kvcr, "kvcr.config": config, "kvcr.types": kvcr_types}
+
+
+def _hint_payload(transport, request_id):
+    return transport.hints[request_id]["actions"][0]["payload"]
+
+
+class TestSharedReplicatedKV(CustomTestCase):
+    """share_replicated_kv: one copy of rank-replicated pools, on the writer."""
+
+    def setUp(self):
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        self.enterContext(patch.object(KVCRStore, "_reserve_ports"))
+        self.enterContext(patch.dict("sys.modules", _fake_kvcr_modules()))
+        # Distinct router hashes (the leading 16 hex digits) per page.
+        self.keys = [f"{i + 1:016x}" * 4 for i in range(4)]
+
+    def _config(self, tp_rank, tp_size=2, **extra):
+        return HiCacheStorageConfig(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=True,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="mla-test",
+            extra_config={
+                "share_replicated_kv": True,
+                "local_dram_bytes": 256,
+                **extra,
+            },
+        )
+
+    def _store(self, tp_rank, pool=None, **extra):
+        store = KVCRStore(self._config(tp_rank, **extra), pool or _HostPool())
+        self.addCleanup(store.close)
+        return store
+
+    def _ready(self, store, transport):
+        store._namespace, store._shared_namespace = store._namespaces()
+        store._runner = transport
+        return transport
+
+    def _pair(self, *, replica_pools=(), **extra):
+        writer, replica = self._store(0, **extra), self._store(1, **extra)
+        for name, pool in replica_pools:
+            replica.register_mem_host_pool_v2(pool, name)
+        source = self._ready(writer, _CopyTransport(writer._layouts))
+        peers = {replica._writer_endpoint: source.storage}
+        reader = self._ready(replica, _StrictPeerTransport(replica._layouts, peers))
+        return writer, replica, source, reader
+
+    def test_sharing_is_opt_in_and_needs_one_node_without_cp(self):
+        logger = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        with self.assertLogs(logger, "WARNING") as logs:
+            store = KVCRStore(
+                dataclasses.replace(self._config(1), extra_config={}), _HostPool()
+            )
+        self.assertIn("2 copies per page", logs.output[0])
+        self.assertIn("share_replicated_kv is off", logs.output[0])
+        self.assertFalse(store._shared)
+        self.assertTrue(store.requires_rank_local_backup)
+        self.assertEqual(store.kv_event_shard_count, 2)
+        # The store reads attention TP/CP placement and node count from the
+        # runtime topology; a stub keeps it free of the topology validator.
+        cp = dataclasses.replace(self._config(1), tp_size=4, attn_cp_size=2)
+        for reason, config, topology in (
+            ("--nnodes > 1", self._config(1), {"nnodes": 2}),
+            ("attention CP > 1", cp, {"attn_tp_rank": 1, "attn_tp_size": 2}),
+        ):
+            parallel = SimpleNamespace(
+                **{"dp_rank": None, "dp_size": 1, "nnodes": 1, **topology}
+            )
+            with (
+                self.subTest(reason=reason),
+                patch(
+                    "sglang.srt.mem_cache.storage.kvcr.kvcr_store.get_parallel",
+                    return_value=parallel,
+                ),
+                self.assertLogs(logger, "WARNING") as logs,
+            ):
+                self.assertFalse(KVCRStore(config, _HostPool())._shared)
+            self.assertIn(reason, logs.output[0])
+        # Nothing to share: rank-sharded KV, or a single attention rank.
+        for config in (
+            dataclasses.replace(self._config(1), is_mla_model=False),
+            self._config(0, tp_size=1),
+        ):
+            self.assertFalse(KVCRStore(config, _HostPool())._shared)
+
+    def test_shared_store_elects_the_writer_shard(self):
+        writer, replica = self._store(0), self._store(1)
+        for store, is_writer in ((writer, True), (replica, False)):
+            self.assertTrue(store._shared)
+            self.assertFalse(store.requires_rank_local_backup)
+            self.assertEqual(store._writer, is_writer)
+            # The writer's own pages are the replica's only published shard.
+            self.assertEqual(store.kv_event_shard_count, 1)
+            self.assertEqual(store._source_offset, 0)
+            # Its control endpoint lets siblings reach the writer.
+            self.assertEqual(store._idle_poll_max, 0.02)
+        self.assertIsNone(writer._writer_endpoint)
+        self.assertEqual(replica._writer_endpoint, "tcp://127.0.0.1:32100")
+        # The controller elects the same writer and skips the replica's backup.
+        controller = object.__new__(HiCacheController)
+        for store, skipped in ((writer, False), (replica, True)):
+            controller.storage_config = store.config
+            controller.storage_backend = store
+            self.assertEqual(controller.backup_skip, skipped)
+
+    def test_shared_pools_use_the_writers_namespace(self):
+        writer, replica = self._store(0), self._store(1)
+        mamba = PoolName.MAMBA
+        for store in (writer, replica):
+            store.register_mem_host_pool_v2(_HostPool(sizes=(5,)), mamba)
+            store._namespace, store._shared_namespace = store._namespaces()
+        self.assertEqual(writer._namespace, writer._shared_namespace)
+        self.assertEqual(replica._shared_namespace, writer._namespace)
+        self.assertNotEqual(replica._namespace, writer._namespace)
+        key = self.keys[0]
+        self.assertEqual(replica._key(key, "kv"), writer._key(key, "kv"))
+        self.assertNotEqual(replica._key(key, "mamba"), writer._key(key, "mamba"))
+        # A store that keeps every rank's copy never pairs with a shared one.
+        unshared = KVCRStore(
+            dataclasses.replace(self._config(0), extra_config={}), _HostPool()
+        )
+        unshared.register_mem_host_pool_v2(_HostPool(sizes=(5,)), mamba)
+        self.assertNotEqual(unshared._namespaces()[0], writer._namespace)
+
+    def test_replica_restores_shared_pools_from_the_writer(self):
+        writer, replica, source, reader = self._pair()
+        for part, buffer in enumerate(writer.mem_pool_host.buffers):
+            buffer[:2].fill_(40 + part)
+        self.assertEqual(
+            writer.batch_set_v1(self.keys[:2], torch.arange(4)), [True] * 2
+        )
+        hints = []
+        submit = reader.submit_hint
+        reader.submit_hint = lambda hint, request_id=None: (
+            hints.append(hint),
+            submit(hint, request_id),
+        )
+        self.assertEqual(
+            replica.batch_get_v1(self.keys[:2], torch.arange(8, 12)), [True] * 2
+        )
+        for part, buffer in enumerate(replica.mem_pool_host.buffers):
+            self.assertTrue(torch.all(buffer[4:6] == 40 + part))
+        payload = hints[0].actions[0].payload
+        self.assertEqual(payload["source_control_endpoint"], "tcp://127.0.0.1:32100")
+        # KVCR rejects any other container type for block_hashes.
+        self.assertIs(type(payload["block_hashes"]), list)
+        self.assertEqual(
+            payload["block_hashes"], [int(key[:16], 16) for key in self.keys[:2]]
+        )
+        self.assertEqual(reader.hints, {})
+        # The writer reads its own DRAM and never names itself as a source.
+        self.assertEqual(
+            writer.batch_get_v1(self.keys[:2], torch.arange(12, 16)), [True] * 2
+        )
+        self.assertEqual(source.hints, {})
+
+    def test_replica_lookup_defers_shared_pools_to_the_writer(self):
+        _, replica, _, reader = self._pair(
+            replica_pools=[(PoolName.MAMBA, _HostPool(sizes=(5,)))]
+        )
+        queries = []
+        query = reader.query
+        reader.query = lambda keys, request_id=None: (
+            queries.append((list(keys), request_id)) or query(keys, request_id)
+        )
+        # KV alone: the writer's answer decides, so nothing is asked here.
+        self.assertEqual(replica.batch_exists(self.keys), 4)
+        self.assertEqual(queries, [])
+        # Its own (rank-sharded) Mamba checkpoints come from local DRAM.
+        mamba = PoolTransfer(
+            PoolName.MAMBA, keys=self.keys[-1:], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        replica.batch_set_v2(
+            [
+                PoolTransfer(
+                    PoolName.MAMBA, keys=self.keys[1:2], host_indices=torch.arange(2)
+                )
+            ]
+        )
+        result = replica.batch_exists_v2(self.keys, [mamba])
+        self.assertEqual(result.extra_pool_hit_pages, {"kv": 4, "mamba": 2})
+        self.assertEqual(result.restorable_prefix_pages, [2])
+        self.assertEqual(
+            queries,
+            [([replica._key(key, "mamba") for key in self.keys], None)],
+        )
+
+    def test_replica_reads_hinted_pages_remotely_then_from_its_writer(self):
+        extra = {"enable_remote_hint": True, "control_advertise_host": "10.0.0.9"}
+        writer, replica, source, reader = self._pair(**extra)
+        remote = self._store(0, **extra)
+        remote_source = self._ready(remote, _CopyTransport(remote._layouts))
+        reader.peers["tcp://peer:32100"] = remote_source.storage
+        # The remote replica holds page 0, this replica's writer page 1.
+        for store, key in ((remote, self.keys[0]), (writer, self.keys[1])):
+            store.mem_pool_host.buffers[0][0].fill_(7)
+            self.assertEqual(store.batch_set_v1([key], torch.arange(2)), [True])
+        envelope = {
+            "protocol_version": "0.1",
+            "message_id": "m",
+            "actions": [
+                {
+                    "action_id": "a",
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        # Advertised at the source replica's first shard.
+                        "source_control_endpoint": "tcp://peer:32100",
+                        "block_hashes": [int(k[:16], 16) for k in self.keys[:2]],
+                    },
+                }
+            ],
+        }
+        info = HiCacheStorageExtraInfo(extra_info={"kv_hints": envelope})
+        self.assertEqual(
+            replica.batch_get_v1(self.keys[:3], torch.arange(6), info),
+            [True, True, False],
+        )
+        ids = [replica._key(key, "kv") for key in self.keys[:3]]
+        # This replica's writer first, as the writer reads its own DRAM first;
+        # then its misses from the remote writer, which the hint names only
+        # for page 0 (page 2 goes nowhere and misses).
+        self.assertEqual(reader.reads, [tuple(ids), (ids[0], ids[2])])
+        self.assertTrue(torch.all(replica.mem_pool_host.buffers[0][:2] == 7))
+
+    def _draft_replica(self, **extra):
+        mha = patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store.MHATokenToKVPoolHost",
+            _HostPool,
+        )
+        with mha:
+            replica = self._store(1, **extra)
+            replica.register_mem_host_pool_v2(_HostPool(sizes=(6,)), PoolName.DRAFT)
+        return replica
+
+    def test_replica_hints_its_own_pools_at_its_own_shard(self):
+        """An MHA draft is per rank: rank 1 reads it from the peer's rank 1."""
+        extra = {"enable_remote_hint": True, "control_advertise_host": "10.0.0.9"}
+        replica = self._draft_replica(**extra)
+        reader = self._ready(replica, _StrictPeerTransport(replica._layouts, {}))
+        draft = replica._key(self.keys[0], "draft")
+        reader.peers["tcp://peer:32101"] = {draft: {"draft_0": bytes(6)}}
+        envelope = {
+            "protocol_version": "0.1",
+            "actions": [
+                {
+                    "action_id": "a",
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        "source_control_endpoint": "tcp://peer:32100",
+                        "block_hashes": [int(self.keys[0][:16], 16)],
+                    },
+                }
+            ],
+        }
+        info = HiCacheStorageExtraInfo(extra_info={"kv_hints": envelope})
+        result = replica.batch_exists_v2(
+            self.keys[:1], [PoolTransfer(PoolName.DRAFT)], info
+        )
+        self.assertEqual(result.extra_pool_hit_pages, {"kv": 1, "draft": 1})
+        transfers = [
+            PoolTransfer(
+                PoolName.DRAFT, keys=self.keys[:1], host_indices=torch.arange(2)
+            )
+        ]
+        self.assertEqual(replica.batch_get_v2(transfers, info), {"draft": [True]})
+        self.assertEqual(reader.reads, [(draft,)])
+
+    def test_published_shared_store_rejects_an_mha_draft(self):
+        # Only the writer's residency is published; it cannot vouch for the
+        # other ranks' own draft pages.
+        extra = {
+            "enable_remote_hint": True,
+            "publish_inventory": True,
+            "control_advertise_host": "10.0.0.9",
+        }
+        with self.assertRaisesRegex(ValueError, "MHA draft pool"):
+            self._draft_replica(**extra)
+
+    def test_replica_never_backs_up_a_shared_pool(self):
+        _, replica, _, reader = self._pair()
+        with self.assertRaisesRegex(ValueError, "Only the writer shard"):
+            replica.batch_set_v1(self.keys[:1], torch.arange(2))
+        self.assertEqual(reader.storage, {})
+
+    def test_mha_draft_pools_stay_rank_local(self):
+        controller = object.__new__(HybridCacheController)
+        controller.storage_backend_type = "dynamic"
+        controller.storage_config = SimpleNamespace(is_storage_writer=False)
+        draft = PoolTransfer(PoolName.DRAFT)
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store.MHATokenToKVPoolHost",
+            _HostPool,
+        ):
+            replica = self._store(1)
+            replica.register_mem_host_pool_v2(_HostPool(), PoolName.DRAFT)
+        self.assertTrue(replica._shares("kv"))
+        self.assertFalse(replica._shares("draft"))
+        # HiCache backs it up on every rank, keyed by rank, here too.
+        controller.storage_backend = replica
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
+            "MHATokenToKVPoolHost",
+            _HostPool,
+        ):
+            controller.mem_pool_host = SimpleNamespace(
+                entry_map={
+                    PoolName.DRAFT: SimpleNamespace(host_pool=_HostPool()),
+                }
+            )
+            self.assertTrue(controller.should_backup(draft))
+            controller.storage_backend = SimpleNamespace(
+                requires_rank_local_backup=False, rank_keyed_mha_drafts=False
+            )
+            self.assertFalse(controller.should_backup(draft))
+
+    def _started(self, store):
+        store._start()
+        return store._runner
+
+    def test_start_gives_a_replica_no_shared_dram(self):
+        writer, replica = self._store(0), self._store(1)
+        kv_parts = ["kv_0", "kv_1"]
+        runner = self._started(writer)
+        self.assertEqual(
+            [name for name, _, _ in runner.backend_configs.local_dram.pools], kv_parts
+        )
+        runner = self._started(replica)
+        # Restores still land in every registered pool.
+        self.assertEqual(
+            [r.label for r in runner.backend_configs.framework_regions], kv_parts
+        )
+        self.assertIsNone(runner.backend_configs.local_dram)
+        self.assertEqual(replica._maps, [])
+        channel = runner.bindings.framework_control
+        # Only this replica dials it: bound and advertised on loopback.
+        self.assertEqual(channel.bind, ("127.0.0.1", 32101))
+        self.assertEqual(channel.endpoint, "tcp://127.0.0.1:32101")
+        self.assertEqual(replica.batch_exists(self.keys), 4)
+
+    def test_start_keeps_one_shared_page_beside_rank_local_pools(self):
+        # KVCR's DRAM pools must match its pool layouts.
+        replica = self._store(1)
+        replica.register_mem_host_pool_v2(_HostPool(sizes=(5,)), PoolName.MAMBA)
+        pages = replica._pool_pages()
+        runner = self._started(replica)
+        pools = {
+            name: length for name, _, length in runner.backend_configs.local_dram.pools
+        }
+        self.assertEqual(list(pools), [name for name, _ in runner.config.pool_layouts])
+        self.assertEqual(pools["kv_0"], 8)
+        self.assertEqual(pools["kv_1"], 3)
+        self.assertEqual(pools["mamba_0"], pages["mamba"] * 5)
+
+    def test_shared_deadlines_cover_every_sibling(self):
+        # 128 pages of 1 MiB at 250 MB/s: 537 ms per rank, 1074 ms for two.
+        pool = _HostPool(sizes=(1 << 20,))
+        writer = self._store(0, pool)
+        unshared = KVCRStore(
+            dataclasses.replace(self._config(0), extra_config={}), pool
+        )
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store._MIN_OPERATION_TIMEOUT_MS", 1
+        ):
+            self.assertEqual(unshared._timeouts()[0], 537)
+            self.assertEqual(writer._timeouts()[0], 1074)
+
+
+class TestPortReservation(CustomTestCase):
+    """Taken listen ports fail the attach, before the worker reports ready."""
+
+    def setUp(self):
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        self.enterContext(patch.dict("sys.modules", _fake_kvcr_modules()))
+
+    def _store(self, **extra):
+        control = find_available_port(36100)
+        nixl = find_available_port(control + 1500)
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="ports",
+            extra_config={
+                "control_port": control,
+                "nixl_listen_port": nixl,
+                "control_host": "127.0.0.1",
+                "local_dram_bytes": 256,
+                **extra,
+            },
+        )
+        store = KVCRStore(config, _HostPool())
+        self.addCleanup(store.close)
+        return store, control, nixl
+
+    def _bindable(self, port, host=""):
+        with socket.socket() as probe:
+            try:
+                probe.bind((host, port))
+            except OSError:
+                return False
+            return True
+
+    def test_taken_ports_fail_the_attach(self):
+        for which in ("control", "nixl"):
+            with self.subTest(which=which):
+                store, control, nixl = self._store(enable_remote_hint=True)
+                with socket.create_server(
+                    (
+                        "127.0.0.1" if which == "control" else "",
+                        control if which == "control" else nixl,
+                    )
+                ):
+                    # Fatal: one rank failing a runtime attach would strand
+                    # the others in its collectives.
+                    with (
+                        patch(
+                            "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                            side_effect=SystemExit,
+                        ) as exit_,
+                        self.assertRaises(SystemExit),
+                        self.assertLogs(
+                            "sglang.srt.mem_cache.storage.kvcr.kvcr_store", "CRITICAL"
+                        ),
+                    ):
+                        store.on_host_pools_registered()
+                    exit_.assert_called_once_with(1)
+                self.assertIsNone(store._listener)
+                self.assertIsNone(store._nixl_hold)
+
+    def test_reserved_ports_pass_to_kvcr_and_close_with_the_store(self):
+        store, control, nixl = self._store(enable_remote_hint=True)
+        store.on_host_pools_registered()
+        # Held until KVCR binds them.
+        self.assertFalse(self._bindable(control, "127.0.0.1"))
+        self.assertFalse(self._bindable(nixl))
+        store._start()
+        channel = store._runner.bindings.framework_control
+        self.assertIsNotNone(channel.adopted)
+        self.assertIsNone(store._listener)
+        self.assertIsNone(store._nixl_hold)
+        self.assertTrue(self._bindable(nixl))
+        store.close()
+        # Unstarted stores release what they reserved.
+        store, control, nixl = self._store()
+        store.on_host_pools_registered()
+        self.assertIsNone(store._listener)
+        self.assertFalse(self._bindable(nixl))
+        store.close()
+        self.assertTrue(self._bindable(nixl))
+
+
+class TestCompletionPollThread(CustomTestCase):
+    """_start, _poll_loop, _wait and close() with KVCR faked at its module."""
+
+    def setUp(self):
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        self.enterContext(patch.object(KVCRStore, "_reserve_ports"))
+        self.enterContext(patch.dict("sys.modules", _fake_kvcr_modules()))
+        self.exits = []
+        self.enterContext(
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                side_effect=self.exits.append,
+            )
+        )
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="poll",
+            extra_config={"local_dram_bytes": 256},
+        )
+        self.pool = _HostPool()
+        self.store = KVCRStore(config, self.pool)
+        self.addCleanup(self.store.close)
+        self.keys = [f"{i + 1:064x}" for i in range(4)]
+
+    def test_poll_thread_completes_concurrent_backup_and_restore(self):
+        # Every completion arrives through the poll thread's handoff.
+        self.assertEqual(
+            self.store.batch_set_v1(self.keys[:2], torch.arange(4)), [True] * 2
+        )
+        thread = self.store._poll_thread
+        self.assertTrue(thread.is_alive())
+        results = Queue()
+
+        def run(call):
+            results.put(call())
+
+        workers = [
+            threading.Thread(
+                target=run,
+                args=(
+                    lambda: self.store.batch_set_v1(self.keys[2:], torch.arange(4, 8)),
+                ),
+            ),
+            threading.Thread(
+                target=run,
+                args=(
+                    lambda: self.store.batch_get_v1(self.keys[:2], torch.arange(8, 12)),
+                ),
+            ),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        self.assertEqual(
+            sorted([results.get_nowait(), results.get_nowait()]), [[True] * 2] * 2
+        )
+        self.assertEqual(self.store._completed, {})
+        runner = self.store._runner
+        self.store.close()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(runner.closed, 1)
+        self.assertEqual(self.store._maps, [])
+        self.store.close()
+        self.assertEqual(runner.closed, 1)
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            self.store._start()
+        self.assertEqual(self.exits, [])
+
+    def test_idle_poll_backs_off_without_peers(self):
+        self.assertEqual(self.store._idle_poll_max, 0.1)
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_store._POLL_INTERVAL_SECONDS", 0.05
+        ):
+            self.store.batch_set_v1(self.keys[:1], torch.arange(2))
+            polls = self.store._runner.polls
+            time.sleep(0.5)
+        # Doubling from 50 ms to the 100 ms cap: a handful of wakeups.
+        self.assertLessEqual(self.store._runner.polls - polls, 8)
+
+    def test_progress_failure_terminates_the_worker(self):
+        self.store.batch_set_v1(self.keys[:1], torch.arange(2))
+        self.store._runner.fail = True
+        deadline = time.monotonic() + 5
+        while not self.exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.exits[:1], [1])
+
+    def test_stalled_source_is_an_error_not_an_exit(self):
+        logger = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        with self.assertLogs(logger, "ERROR") as logs:
+            KVCRStore._resilience_event(
+                RuntimeError(
+                    "KVCR source progress stalled for 6000 ms; "
+                    "new source writes disabled until restart"
+                )
+            )
+        self.assertIn("stopped serving peers", logs.output[0])
+        self.assertEqual(self.exits, [])
+
+
 _REAL_KVCR = sys.platform == "linux" and all(
     importlib.util.find_spec(name) is not None for name in ("kvcr", "nixl")
 )
@@ -2068,6 +2753,132 @@ class TestRealKVCR(CustomTestCase):
         # Nothing listens on the control port.
         with socket.socket() as probe:
             self.assertNotEqual(probe.connect_ex(("127.0.0.1", control_port)), 0)
+
+    def _shared_pair(self, model_name, *, pools=()):
+        """A TP2 MLA replica's writer and second rank, on real KVCR and NIXL."""
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        exits = []
+
+        def fail_instead_of_exit(code):
+            # Also reached from the poll thread, where a raise alone is lost.
+            exits.append(code)
+            raise RuntimeError(f"KVCR store called os._exit({code})")
+
+        # Cleanups run last-in first-out: this check runs after the closes.
+        self.addCleanup(lambda: self.assertEqual(exits, []))
+        self.enterContext(
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                side_effect=fail_instead_of_exit,
+            )
+        )
+        # Both ranks' ports: base and base + 1, free in both ranges.
+        while True:
+            control_port = find_available_port(35100)
+            nixl_port = find_available_port(control_port + 2000)
+            ports = (control_port, control_port + 1, nixl_port, nixl_port + 1)
+            if all(is_port_available(port) for port in ports):
+                break
+        stores = []
+        for tp_rank in (0, 1):
+            config = HiCacheStorageConfig(
+                tp_rank=tp_rank,
+                tp_size=2,
+                pp_rank=0,
+                pp_size=1,
+                attn_cp_rank=0,
+                attn_cp_size=1,
+                is_mla_model=True,
+                enable_storage_metrics=False,
+                is_page_first_layout=True,
+                model_name=model_name,
+                extra_config={
+                    "share_replicated_kv": True,
+                    "control_port": control_port,
+                    "nixl_listen_port": nixl_port,
+                    "local_dram_bytes": 1 << 20,
+                    "startup_timeout_seconds": 60,
+                },
+            )
+            store = KVCRStore(config, _HostPool())
+            self.addCleanup(store.close)
+            for name, sizes in pools:
+                store.register_mem_host_pool_v2(_HostPool(sizes=sizes), name)
+            # Binds (and so verifies) both listen ports, as an attach would.
+            store.on_host_pools_registered()
+            stores.append(store)
+        return stores
+
+    def _restore_from_the_writer(self, writer, replica):
+        keys = [f"{i + 1:016x}" * 4 for i in range(2)]
+        for buffer in writer.mem_pool_host.buffers:
+            buffer[:2].copy_(torch.randint(0, 256, buffer[:2].shape, dtype=torch.uint8))
+        self.assertEqual(writer.batch_set_v1(keys, torch.arange(4)), [True] * 2)
+        # The writer answers lookups; the replica defers to it.
+        self.assertEqual(writer.batch_exists(keys), 2)
+        self.assertEqual(replica.batch_exists(keys), 2)
+        self.assertEqual(replica.batch_get_v1(keys, torch.arange(8, 12)), [True] * 2)
+        for source, restored in zip(
+            writer.mem_pool_host.buffers, replica.mem_pool_host.buffers
+        ):
+            self.assertTrue(torch.equal(source[:2], restored[4:6]))
+        # A page the writer never stored is a clean miss, not an exit.
+        missing = [f"{9:016x}" * 4]
+        self.assertEqual(replica.batch_get_v1(missing, torch.arange(2)), [False])
+        return keys
+
+    def test_shared_replica_restores_from_its_writer_without_dram(self):
+        """Pure MLA: the replica holds no KVCR DRAM and no remote hints run."""
+        writer, replica = self._shared_pair("kvcr-real-shared")
+        self._restore_from_the_writer(writer, replica)
+        self.assertEqual(replica._maps, [])
+        self.assertEqual(len(writer._maps), 2)
+        # Only this host's ranks dial the control endpoints, on loopback.
+        self.assertTrue(replica._writer_endpoint.startswith("tcp://127.0.0.1:"))
+
+    def test_shared_replica_keeps_its_own_rank_sharded_pools(self):
+        """KV shared on the writer; each rank's Mamba checkpoints its own."""
+        writer, replica = self._shared_pair(
+            "kvcr-real-shared-mamba", pools=[(PoolName.MAMBA, (5,))]
+        )
+        keys = self._restore_from_the_writer(writer, replica)
+        # KVCR's DRAM pools must match its layouts: one shared page each.
+        self.assertEqual(len(replica._maps), 3)
+        mamba = replica.registered_pools["mamba"]
+        mamba.buffers[0][1].fill_(99)
+        self.assertEqual(
+            replica.batch_set_v2(
+                [
+                    PoolTransfer(
+                        PoolName.MAMBA, keys=keys[1:], host_indices=torch.arange(2, 4)
+                    )
+                ]
+            ),
+            {"mamba": [True]},
+        )
+        result = replica.batch_exists_v2(
+            keys,
+            [
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=keys[-1:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+        self.assertEqual(result.restorable_prefix_pages, [2])
+        self.assertEqual(
+            replica.batch_get_v2(
+                [
+                    PoolTransfer(PoolName.KV, keys=keys, host_indices=torch.arange(4)),
+                    PoolTransfer(
+                        PoolName.MAMBA, keys=keys[1:], host_indices=torch.arange(6, 8)
+                    ),
+                ]
+            ),
+            {"kv": [True, True], "mamba": [True]},
+        )
+        self.assertTrue(torch.all(mamba.buffers[0][3] == 99))
 
 
 if __name__ == "__main__":
