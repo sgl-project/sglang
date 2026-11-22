@@ -572,6 +572,27 @@ class TestDSAMetadataKernels(CustomTestCase):
             fill_ctx_lens=False,
         )
 
+    def test_draft_extend_programs_stride_over_column_blocks(self):
+        """Few programs per request (600 requests) over many live column blocks,
+        with row offsets summed across more than one 256-request chunk."""
+        num_slots = 600
+        verify_lens = [i % 6 + 1 for i in range(num_slots)]
+        kv_lens = [i * 677 % 30000 + 1 + rows for i, rows in enumerate(verify_lens)]
+        # One request fills the table, so its last strided block is the partial one.
+        kv_lens[301] = 32843
+        self._check_draft_extend(
+            kv_lens,
+            verify_lens,
+            # Not a multiple of the 512-column block: the last block is partial.
+            max_seqlen_k=32843,
+            dsa_index_topk=2048,
+            physical_page_size=64,
+            max_extend_len=6,
+            max_total_len=sum(verify_lens),
+            static_extend_len=False,
+            seq_lens_dtype=torch.int32,
+        )
+
     def test_large_shape_coverage(self):
         max_len = 1_000_003
         self._check_decode(
