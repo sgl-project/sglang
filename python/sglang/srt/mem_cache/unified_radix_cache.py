@@ -2761,7 +2761,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def _l3vt_unsupported(self) -> Optional[str]:
         """Why this cache's layout cannot carry the victim tier, which reads keys
         per host page and per state slot, and writes Full KV, Mamba state and the
-        sidecars derived from them."""
+        sidecars derived from KV (a victim put builds sidecars from its KV pages
+        only, so a sidecar indexed by another pool would be left out)."""
         cc = self.cache_controller
         anchor_pool = (
             cc.mem_pool_host.anchor_entry.host_pool if cc is not None else None
@@ -2777,10 +2778,9 @@ class UnifiedRadixCache(BasePrefixCache):
         }:
             return f"components {sorted(c.name for c in self.tree_components)}"
         if any(
-            spec.indices_from_pool not in (PoolName.KV, PoolName.MAMBA)
-            for spec in self.sidecar_pool_specs
+            spec.indices_from_pool != PoolName.KV for spec in self.sidecar_pool_specs
         ):
-            return "a sidecar not derived from KV or Mamba"
+            return "a sidecar not derived from KV"
         return None
 
     def _l3vt_resolve(self) -> L3VictimTierConfig:

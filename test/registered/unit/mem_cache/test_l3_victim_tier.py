@@ -156,6 +156,7 @@ PoolTransferResult, SidecarPoolSpec = _hs.PoolTransferResult, _hs.SidecarPoolSpe
 
 class ComponentType(IntEnum):
     FULL = 0
+    SWA = 1
     MAMBA = 2
 
 
@@ -200,6 +201,7 @@ _URC_METHODS = [
     "UnifiedRadixCache.evict_host",
     "UnifiedRadixCache._prefetch_occupied_span",
     "UnifiedRadixCache._l3vt_charge",
+    "UnifiedRadixCache._l3vt_unsupported",
 ]
 _urc = _lift(
     os.path.join(_SRT, "mem_cache/unified_radix_cache.py"),
@@ -978,6 +980,35 @@ class TestL3VictimTierUnits(unittest.TestCase):
         self.assertTrue(a.victim and not a.lease_touch)
         self.assertEqual(a.ignored, {"lease_touch": "off on another rank"})
         self.assertTrue(engaged.lease_touch, "agreed() must not mutate the input")
+
+    def test_layout_checks(self):
+        """The served ``_l3vt_unsupported``: FULL + Mamba with a KV-derived sidecar
+        carries the tier. A victim put builds sidecars from its KV pages only, so a
+        sidecar indexed by another pool (Mamba here) declines, as do another tree
+        component and a shared or DCP host layout."""
+        host_pool = SimpleNamespace(shared_allocation_domain=None, dcp_size=1)
+        c = FakeCache()
+        c.cache_controller = SimpleNamespace(
+            mem_pool_host=SimpleNamespace(
+                anchor_entry=SimpleNamespace(host_pool=host_pool)
+            )
+        )
+        c.tree_components = [ComponentType.FULL, ComponentType.MAMBA]
+        c.slot_id = lambda family: ComponentType.MAMBA if family == TREE_STATE else None
+        c.sidecar_pool_specs = [
+            SidecarPoolSpec(PoolName.DRAFT, indices_from_pool=PoolName.KV)
+        ]
+        self.assertIsNone(c._l3vt_unsupported())
+        c.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.MAMBA)
+        )
+        self.assertEqual(c._l3vt_unsupported(), "a sidecar not derived from KV")
+        c.sidecar_pool_specs.pop()
+        c.tree_components = [ComponentType.FULL, ComponentType.SWA]
+        self.assertTrue(c._l3vt_unsupported().startswith("components "))
+        c.tree_components = [ComponentType.FULL, ComponentType.MAMBA]
+        host_pool.dcp_size = 2
+        self.assertEqual(c._l3vt_unsupported(), "shared or DCP host layout")
 
     def test_env_switch_follows_the_runtime_master(self):
         with open(os.path.join(_SRT, "environ.py")) as f:
