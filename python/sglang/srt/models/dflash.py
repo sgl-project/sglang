@@ -1285,21 +1285,31 @@ class DFlashDraftModel(nn.Module):
         # checkpoint weights are loaded.
         self.projector_type = draft_config.projector_type
         self.shift_label = draft_config.shift_label
+        self.corrector: Optional[nn.Module] = None
         self.prefix_gru: Optional[nn.GRU] = None
         self.embed_proj: Optional[nn.Sequential] = None
         if draft_config.is_domino:
-            assert draft_config.gru_hidden_dim is not None
             assert draft_config.emb_dim is not None
-            self.prefix_gru = nn.GRU(
-                input_size=hidden_size,
-                hidden_size=int(draft_config.gru_hidden_dim),
-                num_layers=1,
-                batch_first=True,
-                bias=False,
-            )
+            if draft_config.corrector is not None:
+                from sglang.srt.speculative.domino_corrector import TransformerCorrector
+
+                state_size = draft_config.corrector["d_model"]
+                self.corrector = TransformerCorrector(
+                    hidden_size, draft_config.corrector, rms_norm_eps
+                )
+            else:
+                state_size = draft_config.gru_hidden_dim
+                assert state_size is not None
+                self.prefix_gru = nn.GRU(
+                    input_size=hidden_size,
+                    hidden_size=state_size,
+                    num_layers=1,
+                    batch_first=True,
+                    bias=False,
+                )
             self.embed_proj = nn.Sequential(
                 nn.Linear(
-                    hidden_size + int(draft_config.gru_hidden_dim),
+                    hidden_size + state_size,
                     int(draft_config.emb_dim),
                     bias=False,
                 ),
@@ -1499,10 +1509,11 @@ class DFlashDraftModel(nn.Module):
                 return aliased_name
             return None
 
+        domino_weights = ("prefix_gru.", "corrector.", "embed_proj.")
         for name, loaded_weight in weights:
             unprefixed_name = name.removeprefix("model.")
             if self.projector_type != "domino" and unprefixed_name.startswith(
-                ("prefix_gru.", "embed_proj.")
+                domino_weights
             ):
                 raise ValueError(
                     "DFLASH checkpoint contains Domino projector weights but "
@@ -1563,7 +1574,7 @@ class DFlashDraftModel(nn.Module):
                             f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
                             f"but got {loaded_shape} for weight '{name}'."
                         )
-                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
+                if resolved_name.startswith(domino_weights) and tuple(
                     loaded_weight.shape
                 ) != tuple(param.shape):
                     raise ValueError(
@@ -1576,12 +1587,7 @@ class DFlashDraftModel(nn.Module):
                 loaded_params.add(resolved_name)
 
         if self.projector_type == "domino":
-            required = {
-                "prefix_gru.weight_ih_l0",
-                "prefix_gru.weight_hh_l0",
-                "embed_proj.0.weight",
-                "embed_proj.2.weight",
-            }
+            required = {name for name in params_dict if name.startswith(domino_weights)}
             missing = required - loaded_params
             if missing:
                 raise ValueError(
@@ -1950,6 +1956,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         return ids, self._transform_unary_logits(vals)
 
 
+class DFlash2DominoDraftModel(DFlashDraftModel):
+    """DFlash backbone with a Domino conditional projection head."""
+
+
 class MiniMaxDFlash2DraftModel(DFlash2DraftModel):
     """Compatibility alias for existing MiniMax DFlash2 checkpoint configs."""
 
@@ -1967,6 +1977,7 @@ EntryClass = [
     DFlashLagunaForCausalLM,
     MuseGlimmerAssistantModel,
     DFlash2DraftModel,
+    DFlash2DominoDraftModel,
     DFlash2BeamDraftModel,
     MiniMaxDFlash2DraftModel,
 ]

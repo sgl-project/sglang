@@ -1,10 +1,11 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlash2DominoDraftModel, DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.domino_utils import validate_domino_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,6 +36,25 @@ def _domino_config(**overrides):
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
+
+
+def _transformer_config(**overrides):
+    return _domino_config(
+        dflash_config={
+            "conditional_head": "transformer",
+            "pure_draft_prefix_len": 0,
+            "shift_label": False,
+            "gru_hidden_dim": None,
+            "corrector": {
+                "d_model": 4,
+                "heads": 2,
+                "layers": 1,
+                "context_window": 3,
+                "context_attention": True,
+            },
+            **overrides,
+        }
+    )
 
 
 def _projector_model(projector_type="domino"):
@@ -91,6 +111,16 @@ class TestDFlashDominoConfig(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "block_size > 1"):
             parse_dflash_draft_config(draft_hf_config=_domino_config(block_size=1))
 
+    def test_transformer_rejects_unimplemented_context(self):
+        for override in ({"layer_fusion": "dflare"}, {"context_kv": "separate"}):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ValueError, "shared target context"),
+            ):
+                parse_dflash_draft_config(
+                    draft_hf_config=_transformer_config(**override)
+                )
+
     def test_conflicting_emb_dim_fails(self):
         with self.assertRaisesRegex(ValueError, "emb_dim differs"):
             parse_dflash_draft_config(draft_hf_config=_domino_config(emb_dim=6))
@@ -104,6 +134,35 @@ class TestDFlashDominoWeights(CustomTestCase):
         for name, expected in weights.items():
             torch.testing.assert_close(
                 dict(model.named_parameters())[name], expected, rtol=0, atol=0
+            )
+
+    def test_transformer_projector_weights_load_exactly(self):
+        # The corrector and loader are independent of the attention backend and TP.
+        with (
+            patch.object(DFlash2DominoDraftModel, "decoder_layer_cls") as layer_cls,
+            patch.object(
+                DFlash2DominoDraftModel, "_resolve_fc_tp_columns", return_value=None
+            ),
+        ):
+            layer_cls.return_value = nn.Module()
+            layer_cls.return_value.self_attn = nn.Identity()
+            model = DFlash2DominoDraftModel(_transformer_config())
+        self.assertIsNone(model.prefix_gru)
+        self.assertEqual(model.draft_config.pure_draft_prefix_len, 0)
+        weights = {
+            name: torch.randn_like(param)
+            for name, param in model.named_parameters()
+            if name.startswith(("corrector.", "embed_proj."))
+        }
+        missing = "corrector.input_token.weight"
+        expected = weights.pop(missing)
+        with self.assertRaisesRegex(ValueError, missing):
+            model.load_weights(weights.items())
+        weights[missing] = expected
+        model.load_weights((f"model.{k}", v) for k, v in weights.items())
+        for name, expected in weights.items():
+            torch.testing.assert_close(
+                model.get_parameter(name), expected, rtol=0, atol=0
             )
 
     def test_each_required_projector_weight_is_checked(self):

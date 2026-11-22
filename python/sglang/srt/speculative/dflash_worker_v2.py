@@ -1,3 +1,4 @@
+import functools
 import logging
 import math
 import os
@@ -60,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_parallel,
@@ -93,6 +95,10 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+)
+from sglang.srt.speculative.domino_corrector import (
+    CorrectorContext,
+    CorrectorDraftSampler,
 )
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
@@ -618,15 +624,34 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+        self.corrector = getattr(self.draft_model, "corrector", None)
+        self.corrector_context: Optional[CorrectorContext] = None
+        self._corrector_sampler: Optional[CorrectorDraftSampler] = None
+        # No transfer carries the corrector's window: on a PD decode server it
+        # starts at a request's first decode position.
+        self._corrector_cold_start = (
+            self.corrector is not None and get_disagg().disaggregation_mode == "decode"
+        )
         self._is_domino = draft_config.is_domino
         if get_parallel().attn_dp_enabled and not _is_npu:
-            if self._is_domino or self.lilicorr is not None:
+            if (
+                self._is_domino and self.corrector is None
+            ) or self.lilicorr is not None:
                 raise ValueError(
-                    "DFLASH with dp attention supports plain DFlash and DFlash2 "
-                    "drafts; Domino and LiLiCorr heads are not supported."
+                    "DFLASH with dp attention supports plain DFlash, DFlash2 and "
+                    "transformer-corrector drafts; Domino GRU and LiLiCorr heads "
+                    "are not supported."
                 )
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
+        )
+        # A sampled proposal hands the accept its q over the candidate pool.
+        self._corrector_sampling_enabled = (
+            self.corrector is not None
+            and self._selector_sampling_enabled
+            and 0
+            < self.domino_candidate_pool_size
+            < int(self.model_runner.model_config.vocab_size)
         )
         if self._is_domino:
             if self.domino_candidate_pool_size < 0:
@@ -639,25 +664,34 @@ class DFlashWorkerV2(BaseSpecWorker):
             lm_head = getattr(target_model, "lm_head", None)
             prefix_gru = getattr(self.draft_model, "prefix_gru", None)
             embed_proj = getattr(self.draft_model, "embed_proj", None)
-            if lm_head is None or prefix_gru is None or embed_proj is None:
+            if (
+                lm_head is None
+                or embed_proj is None
+                or (self.corrector is None and prefix_gru is None)
+            ):
                 raise ValueError(
                     "DFLASH Domino requires target lm_head and loaded Domino projector modules."
                 )
-            validate_domino_runtime(
-                device=torch.device(self.device),
-                tp_size=int(get_parallel().tp_group.world_size),
-                tp_rank=int(get_parallel().tp_rank),
-                target_vocab_size=int(self.model_runner.model_config.vocab_size),
-                draft_vocab_size=int(self.draft_model_runner.model_config.vocab_size),
-                hidden_size=int(self.draft_model.config.hidden_size),
-                target_embedding=target_embedding,
-                lm_head=lm_head,
-                prefix_gru=prefix_gru,
-                embed_proj=embed_proj,
-            )
+            # Under dp attention the head is sharded over the draft's attention TP.
+            with draft_tp_context(self.draft_parallel_layout):
+                validate_domino_runtime(
+                    device=torch.device(self.device),
+                    tp_size=int(get_parallel().tp_group.world_size),
+                    tp_rank=int(get_parallel().tp_rank),
+                    target_vocab_size=int(self.model_runner.model_config.vocab_size),
+                    draft_vocab_size=int(
+                        self.draft_model_runner.model_config.vocab_size
+                    ),
+                    hidden_size=int(self.draft_model.config.hidden_size),
+                    target_embedding=target_embedding,
+                    lm_head=lm_head,
+                    prefix_gru=prefix_gru,
+                    embed_proj=embed_proj,
+                )
         self._block_verification = get_spec().speculative_use_block_verification
         if (
             self._block_verification
+            and not self._corrector_sampling_enabled
             and (
                 self._is_domino
                 or (self.selector is None and not self._lilicorr_sampling_enabled)
@@ -718,7 +752,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
-            if self._is_domino:
+            if self._is_domino and self.corrector is None:
                 logger.info(
                     "DFLASH Domino rollout enabled (BF16, TP=%s, block-shared candidate pool size=%s).",
                     int(get_parallel().tp_group.world_size),
@@ -980,6 +1014,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
+        if self.corrector is not None:
+            self.corrector_context = CorrectorContext(
+                self.corrector,
+                pool=self.draft_model_runner.token_to_kv_pool,
+                req_pool_rows=self.model_runner.req_to_token_pool.req_to_token.shape[0],
+            )
 
     def _init_draft_kv_ring(self) -> None:
         parallel = get_parallel()
@@ -1095,7 +1135,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
-                        make_draft_sampler_capture_hook(self._draft_sampler)
+                        self._draft_sampler.capture_hook
+                        if self.corrector is not None
+                        else make_draft_sampler_capture_hook(self._draft_sampler)
                     )
                 if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
                     self._install_draft_l2_prefetch()
@@ -1312,6 +1354,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
                 block_size=self.block_size,
             )
+        if self.corrector is not None:
+            if self._target_tp_rank == 0:
+                logger.info(
+                    "DFLASH corrector rollout folded into the draft cuda graph "
+                    "(candidate pool size=%s, sampling_enabled=%s).",
+                    self.domino_candidate_pool_size,
+                    self._corrector_sampling_enabled,
+                )
+            self._corrector_sampler = self._build_corrector_sampler(
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs)
+            )
+            return self._corrector_sampler
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
         if not is_dense_head_weight(lm_head.weight):
@@ -1374,6 +1428,32 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
+        )
+
+    def _build_corrector_sampler(self, *, max_bs: int) -> CorrectorDraftSampler:
+        """Call inside the draft TP scope: the sampler's collectives span that group."""
+        target_model = self._target_worker.model_runner.model
+        embedding = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(self.draft_model, target_model)
+        )
+        if self._full_embed_gpu is not None:
+            # As the noise embedding: a borrowed one may use target-wide collectives.
+            embedding = functools.partial(
+                torch.nn.functional.embedding, weight=self._full_embed_gpu
+            )
+        return CorrectorDraftSampler(
+            corrector=self.corrector,
+            context=self.corrector_context,
+            embedding=embedding,
+            lm_head=unwrap_lora_layer(target_model.lm_head),
+            embed_proj=self.draft_model.embed_proj,
+            tp_group=get_parallel().tp_group,
+            vocab_size=int(self.model_runner.model_config.vocab_size),
+            block_size=self.block_size,
+            num_unary_slots=self.draft_model.draft_config.pure_draft_prefix_len,
+            candidate_pool_size=self.domino_candidate_pool_size,
+            sampling_enabled=self._corrector_sampling_enabled,
+            max_bs=max_bs,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -2268,6 +2348,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         extend_lens: Optional[torch.Tensor] = None,
         swa_cache_loc: Optional[torch.Tensor] = None,
         projected: bool = False,
+        corrector_locs: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -2383,6 +2464,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 if projected
                 else self.draft_model.project_target_hidden(target_hidden)
             )
+            if corrector_locs is not None:
+                self.corrector_context.write(
+                    corrector_locs, self.corrector.project_context(ctx_hidden)
+                )
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2503,6 +2588,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: torch.Tensor,
         commit_lens: torch.Tensor,
         swa_cache_loc: Optional[torch.Tensor] = None,
+        corrector_locs: Optional[torch.Tensor] = None,
     ) -> None:
         # The aux graphs hold no sliding-window locations: such drafts append eagerly.
         if not self._use_aux_graph or swa_cache_loc is not None:
@@ -2513,6 +2599,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 swa_cache_loc=swa_cache_loc,
+                corrector_locs=corrector_locs,
             )
             return
         # A TP-split fc all-reduces, so project on the main stream in program order;
@@ -2525,11 +2612,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
         entry = self._aux_graphs.get(key)
         inputs = (target_hidden, cache_loc, positions, commit_lens)
+        if corrector_locs is not None:
+            inputs += (corrector_locs,)
         if entry is None:
             static = tuple(torch.empty_like(t) for t in inputs)
             for dst, src in zip(static, inputs):
                 dst.copy_(src)
-            hidden_buf, loc_buf, pos_buf, commit_buf = static
+            hidden_buf, loc_buf, pos_buf, commit_buf, *corrector_bufs = static
 
             def append():
                 self._append_target_hidden_to_draft_kv_by_loc(
@@ -2539,6 +2628,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     cache_loc_2d=loc_buf.view(cache_loc_2d.shape),
                     commit_lens=commit_buf,
                     projected=projected,
+                    corrector_locs=corrector_bufs[0] if corrector_bufs else None,
                 )
 
             stream = torch.cuda.Stream(device=target_hidden.device)
@@ -2966,8 +3056,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
 
         # The sampled head hands verify the q it drew from, so no fallback is needed.
-        if self.lilicorr is not None and self._lilicorr_sampling_enabled:
+        if (
+            self.lilicorr is not None and self._lilicorr_sampling_enabled
+        ) or self._corrector_sampling_enabled:
             return
+
+        if self.corrector is not None and not is_dflash_sampling_verify_available():
+            raise ValueError(
+                "Non-greedy decoding with a DFLASH transformer corrector requires "
+                "the target-only sampling verification kernel."
+            )
 
         if (
             not is_dflash_sampling_verify_available()
@@ -3113,6 +3211,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
+                corrector_locs=(
+                    self.corrector_context.extend_locs(
+                        batch,
+                        positions,
+                        ctx_lens,
+                        self.model_runner.req_to_token_pool.req_generation,
+                    )
+                    if self.corrector is not None
+                    else None
+                ),
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -3398,11 +3506,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             forward_batch.out_cache_loc = ring_block_locs
             forward_batch.out_cache_loc_virtual = None
 
-        if self.selector is not None or self.lilicorr is not None:
+        if (
+            self.selector is not None
+            or self.lilicorr is not None
+            or self._corrector_sampling_enabled
+        ):
             self._selector_sample = None
             self._draft_feature = self._draft_confidence = None
             # Consumed by the in-graph sample; must be staged before the replay.
             self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
+        if self._corrector_cold_start:
+            self.corrector_context.start_windows(
+                batch.reqs, self.model_runner.req_to_token_pool.req_generation
+            )
 
         self._join_aux()
         with (
@@ -3413,6 +3529,39 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         if (
+            self.corrector is not None
+            and self._draft_sampler is not None
+            and draft_out.can_run_graph
+        ):
+            draft_next = self._draft_sampler.out[: bs * (block_size - 1)].view(
+                bs, block_size - 1
+            )
+            if self._corrector_sampling_enabled and not _is_all_greedy(
+                batch.sampling_info
+            ):
+                self._selector_sample = (
+                    self._draft_sampler.candidate_out[:bs],
+                    self._draft_sampler.q_out[:bs],
+                )
+        elif self.corrector is not None:
+            with draft_tp_context(self.draft_parallel_layout):
+                if self._corrector_sampler is None:
+                    self._corrector_sampler = self._build_corrector_sampler(max_bs=0)
+                draft_next, corrector_candidate_ids, corrector_q_rows = (
+                    self._corrector_sampler.propose(
+                        hidden_states=draft_logits_output.hidden_states,
+                        input_ids=forward_batch.input_ids,
+                        req_pool_indices=batch.req_pool_indices,
+                        positions=positions,
+                        in_cuda_graph=False,
+                        sampling=self._corrector_sampler.eager_sampling(
+                            bs=bs, sampling_info=batch.sampling_info
+                        ),
+                    )
+                )
+            if corrector_q_rows is not None and not _is_all_greedy(batch.sampling_info):
+                self._selector_sample = (corrector_candidate_ids, corrector_q_rows)
+        elif (
             self._is_domino
             and self._draft_sampler is not None
             and draft_out.can_run_graph
@@ -3787,6 +3936,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
+            corrector_locs=(
+                self.corrector_context.verify_locs(
+                    batch.req_pool_indices, positions.view(bs, block_size), commit_lens
+                )
+                if self.corrector is not None
+                else None
+            ),
             swa_cache_loc=(
                 None
                 if ring_block_locs is not None

@@ -671,6 +671,7 @@ class DFlashDraftConfig:
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
     is_mla: bool = False
+    corrector: Optional[dict] = None
 
     @property
     def is_domino(self) -> bool:
@@ -717,6 +718,36 @@ class DFlashDraftConfig:
                     f"target_layer_ids[{idx}]={val}, target_num_layers={target_num_layers}."
                 )
         return resolved
+
+
+def _parse_domino_corrector(config: dict) -> dict:
+    corrector = config.get("corrector")
+    dimensions = ("d_model", "layers", "heads", "context_window")
+    if not isinstance(corrector, dict) or set(corrector) != {
+        *dimensions,
+        "context_attention",
+    }:
+        raise ValueError(
+            "DFLASH transformer corrector requires d_model, layers, heads, "
+            "context_window and context_attention."
+        )
+    for key in dimensions:
+        value = corrector[key]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"DFLASH corrector.{key} must be a positive integer.")
+    if corrector["d_model"] % (2 * corrector["heads"]):
+        raise ValueError("DFLASH corrector requires an even rotary dimension per head.")
+    if corrector["context_attention"] is not True:
+        raise ValueError(
+            "DFLASH transformer corrector requires context_attention=true."
+        )
+    if (
+        config.get("layer_fusion") is not None
+        or config.get("layer_fusion_tap_norm") not in (None, "none")
+        or config.get("context_kv") not in (None, "shared")
+    ):
+        raise ValueError("DFLASH transformer corrector requires shared target context.")
+    return corrector
 
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
@@ -872,6 +903,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     pure_draft_prefix_len = None
     gru_hidden_dim = None
     emb_dim = None
+    corrector = None
+    conditional_head = dflash_cfg.get("conditional_head", "gru")
     if projector_type == "domino":
         shift_label = dflash_cfg.get(
             "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
@@ -917,19 +950,44 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 "DFLASH Domino requires dflash_config.shift_label to be a bool, "
                 f"got {shift_label!r}."
             )
-        if pure_draft_prefix_len != 1:
+        if conditional_head == "transformer":
+            corrector = _parse_domino_corrector(dflash_cfg)
+            if shift_label or pure_draft_prefix_len is None:
+                raise ValueError(
+                    "DFLASH transformer corrector requires shift_label=false and "
+                    "a non-negative pure_draft_prefix_len."
+                )
+            if gru_hidden_dim is not None or selector_rank:
+                raise ValueError(
+                    "DFLASH transformer corrector replaces the GRU and selector."
+                )
+            if output_multiplier != 1.0 or final_logit_softcapping is not None:
+                raise ValueError(
+                    "DFLASH transformer corrector requires unscaled LM head logits."
+                )
+        elif conditional_head == "gru":
+            if pure_draft_prefix_len != 1:
+                raise ValueError(
+                    "DFLASH Domino GRU requires pure_draft_prefix_len=1, "
+                    f"got {pure_draft_prefix_len!r}."
+                )
+            if gru_hidden_dim is None:
+                raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
+        else:
             raise ValueError(
-                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
-                f"got {pure_draft_prefix_len!r}."
+                f"Unsupported DFLASH Domino conditional_head={conditional_head!r}."
             )
-        if gru_hidden_dim is None:
-            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
         if emb_dim is None:
             raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
         if block_size is not None and block_size <= 1:
             raise ValueError(
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
+
+    if corrector is None and (
+        "corrector" in dflash_cfg or conditional_head == "transformer"
+    ):
+        raise ValueError("DFLASH corrector requires a Domino transformer head.")
 
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
@@ -952,6 +1010,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
         is_mla=is_mla,
+        corrector=corrector,
     )
 
 
