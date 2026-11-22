@@ -26,6 +26,7 @@ def _info(temps, **overrides):
         is_any_greedy=False,
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -227,6 +228,10 @@ def test_routes_to_blockwise_only_with_noise(monkeypatch):
     )
     assert (
         accept(_info(temps, need_top_k_sampling=True), rejection_noise=noise)
+        == "classic"
+    )
+    assert (
+        accept(_info(temps, need_min_p_sampling=True), rejection_noise=noise)
         == "classic"
     )
     assert (

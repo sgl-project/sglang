@@ -1326,6 +1326,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # DCP extend on NPU: rows per prefix-gather collective, capping the scratch.
+    # <= 0 gathers the whole prefix in one.
+    SGLANG_NPU_DCP_EXTEND_GATHER_PIECE_ROWS = EnvInt(1 << 18)
+    # DCP extend on NPU: above this many new tokens the prefix KV is gathered
+    # whatever the bytes say, as the query path's fp32 merge grows with them.
+    SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
@@ -1704,6 +1710,13 @@ class Envs:
     # equal torch.topk's; the default on every platform), 2 exact with the same
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
+    # DeepSelect bf16 top-k with more rows than any cluster tier runs in one wave:
+    # off keeps the one-CTA-per-row kernel, whose time follows the longest row. On
+    # runs the cluster tier with the most rows per wave over several waves instead,
+    # whose time follows the total row length. It wins on long-tailed row lengths
+    # (the DSV4.1 decode indexer at mixed contexts) and loses on uniform long ones.
+    # Same values as off; on ties it may pick other columns.
+    SGLANG_DEEP_SELECT_MULTIWAVE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -2149,6 +2162,8 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
@@ -2659,6 +2674,10 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # A request-log line that finds the log writer's buffer full: "wait" holds
+    # the request until the sink takes it, as in the Python server; "drop"
+    # drops the line (counted in sglang:request_log_dropped_lines_total).
+    SGLANG_RUST_REQUEST_LOG_FULL_BUFFER = EnvStr("wait")
 
     # ===================================================================
     # Weight Cache Daemon
