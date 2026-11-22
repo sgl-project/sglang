@@ -136,6 +136,17 @@ class WeightTransport(ABC):
     the daemon connection that vmm_fd sends its file descriptors over.
     """
 
+    @property
+    @abstractmethod
+    def zero_copy(self) -> bool:
+        """Reader: whether the storages that fetch returned are views of memory that
+        other processes map. Valid after fetch.
+
+        One transport may map on one load and copy on another; one that never varies
+        may set a class attribute. There is no default: a wrong False would let
+        writers into memory that other processes map.
+        """
+
     @abstractmethod
     def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
         """Owner: make ``storages`` readable; returns the manifest's ``source``.

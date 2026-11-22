@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Data contracts of snapshot loading.
 
-msgspec types only, importing nothing from sglang: load-diff and the validator
-share this module and nothing else.
+msgspec types and one enum, importing nothing from sglang: load-diff and the
+validator share this module and nothing else.
 """
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import json
 from typing import Any
@@ -51,3 +52,11 @@ class SnapshotManifest(msgspec.Struct, frozen=True, kw_only=True):
     attestation: bytes
     # Where the bytes are; only the transport reads it.
     source: dict[str, Any]
+
+
+class WeightsOrigin(enum.Enum):
+    """How a loaded model holds its weights on one rank."""
+
+    RAW = "raw"  # loaded and post-processed in this process
+    SNAPSHOT = "snapshot"  # installed from a snapshot into memory this process owns
+    ZERO_COPY = "zero_copy"  # installed as views of memory that other processes map

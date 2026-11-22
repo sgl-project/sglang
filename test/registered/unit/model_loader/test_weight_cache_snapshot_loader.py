@@ -16,7 +16,12 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.runtime_context import get_context
 from sglang.srt.weight_cache import load_diff, schema, snapshot_loader, validator
 from sglang.srt.weight_cache.coordinator import Ballot
-from sglang.srt.weight_cache.schema import LoadSpec, SnapshotManifest, StorageMeta
+from sglang.srt.weight_cache.schema import (
+    LoadSpec,
+    SnapshotManifest,
+    StorageMeta,
+    WeightsOrigin,
+)
 from sglang.srt.weight_cache.transport import WeightTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -54,6 +59,8 @@ class _TinyModel(nn.Module):
 class _MemoryTransport(WeightTransport):
     """Copies bytes in memory; publish consumes its input, as vmm_fd does."""
 
+    zero_copy = False
+
     def __init__(self, fetch_error=None):
         self.published, self.closed, self.fetch_error = {}, False, fetch_error
 
@@ -69,6 +76,18 @@ class _MemoryTransport(WeightTransport):
 
     def close(self):
         self.closed = True
+
+
+class _MappedTransport(_MemoryTransport):
+    """Returns views of the published storages, and says so only after its fetch."""
+
+    @property
+    def zero_copy(self):
+        return self.mapped  # set by fetch
+
+    def fetch(self, *, manifest, device):
+        self.mapped = True
+        return {name: self.published[name][:] for name in manifest.storages}
 
 
 class _Source(snapshot_loader.SnapshotLoader):
@@ -262,7 +281,14 @@ class TestSnapshotLoader(CustomTestCase):
             )
         self.assertFalse(model.training)
 
-    def _read(self, *, fetch_error=None, install_error=None, validate_error=None):
+    def _read(
+        self,
+        *,
+        transport_cls=_MemoryTransport,
+        fetch_error=None,
+        install_error=None,
+        validate_error=None,
+    ):
         manifest = SnapshotManifest(
             version="v1",
             storages={"proj": StorageMeta(nbytes=16, device="cpu")},
@@ -270,16 +296,19 @@ class TestSnapshotLoader(CustomTestCase):
             attestation=b"attestation",
             source={},
         )
-        self.transport = _MemoryTransport(fetch_error=fetch_error)
+        self.transport = transport_cls(fetch_error=fetch_error)
         self.transport.published = {"proj": torch.zeros(16, dtype=torch.uint8)}
-        source = _Source(LoadConfig(), found=(manifest, self.transport))
-        self.assertIs(source.lookup(spec=_spec(0), device_config=_CPU), manifest)
+        self.source = _Source(LoadConfig(), found=(manifest, self.transport))
+        self.assertIs(self.source.lookup(spec=_spec(0), device_config=_CPU), manifest)
 
         def install(*, skeleton, manifest, storages):
             if install_error is not None:
                 raise install_error
             self.skeleton = skeleton
-            return _TinyModel(None)
+            model = _TinyModel(None)
+            # As load-diff does, the model's tensors are views of the storages.
+            model.proj.weight.data = storages["proj"].view(torch.float32).view(2, 2)
+            return model
 
         def validate(*, model, storages, attestation, constructed):
             if validate_error is not None:
@@ -296,7 +325,9 @@ class TestSnapshotLoader(CustomTestCase):
             ),
             mock.patch.object(load_diff, "install", install),
         ):
-            return source.load_model(model_config=_MODEL_CONFIG, device_config=_CPU)
+            return self.source.load_model(
+                model_config=_MODEL_CONFIG, device_config=_CPU
+            )
 
     def test_reader_installs_without_post_processing(self):
         model = self._read()
@@ -304,6 +335,32 @@ class TestSnapshotLoader(CustomTestCase):
             self.assertFalse(module.post_processed)
             self.assertFalse(module.proj.quant_method.processed)
         self.assertFalse(self.transport.closed)  # the bytes live as long as the model
+
+    def test_each_load_path_reports_how_the_model_holds_its_weights(self):
+        def shares_published_memory(model):
+            published = self.transport.published["proj"]
+            return model.proj.weight.data_ptr() == published.data_ptr()
+
+        model = self._read()
+        self.assertIs(self.source.origin, WeightsOrigin.SNAPSHOT)
+        self.assertFalse(shares_published_memory(model))
+        model = self._read(transport_cls=_MappedTransport)
+        self.assertIs(self.source.origin, WeightsOrigin.ZERO_COPY)
+        self.assertTrue(shares_published_memory(model))
+
+        raw = _Source(LoadConfig())
+        self.assertIsNone(raw.lookup(spec=_spec(0), device_config=_CPU))
+        with self._owner_parts():
+            raw.load_model(model_config=_MODEL_CONFIG, device_config=_CPU)
+        self.assertIs(raw.origin, WeightsOrigin.RAW)
+
+        # A load that fails after it mapped the storages is not a zero-copy model.
+        with self.assertRaisesRegex(RuntimeError, "validate"):
+            self._read(
+                transport_cls=_MappedTransport, validate_error=RuntimeError("validate")
+            )
+        self.assertIs(self.source.origin, WeightsOrigin.RAW)
+        self.assertTrue(self.transport.closed)
 
     def test_reader_failure_after_lookup_unmaps(self):
         # vmm_fd maps the whole snapshot in fetch, and nothing falls back after it.
@@ -349,6 +406,14 @@ class TestSnapshotLoader(CustomTestCase):
                     loader=rejected, spec=_spec(0), device_config=_CPU, group=None
                 )
         self.assertTrue(transport.closed)
+
+    def test_a_transport_must_say_whether_it_is_zero_copy(self):
+        class Unsaid(WeightTransport):
+            publish = fetch = close = None
+
+        # A default would let writers into memory that a new transport maps.
+        with self.assertRaisesRegex(TypeError, "zero_copy"):
+            Unsaid()
 
     def test_load_diff_and_validator_share_only_the_schema(self):
         # A validator built on load-diff's logic would only check what load-diff did.

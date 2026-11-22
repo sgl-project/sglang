@@ -34,6 +34,7 @@ from sglang.srt.weight_cache.schema import (
     LoadSpec,
     SnapshotManifest,
     StorageMeta,
+    WeightsOrigin,
 )
 from sglang.srt.weight_cache.transport import WeightTransport
 
@@ -88,11 +89,16 @@ class SnapshotLoader(BaseModelLoader):
     steps is fixed here. A snapshot is installed and never post-processed; without
     one, load_model loads raw. An owner (owner=True) records each raw-loaded
     model's construction so that it can publish it. One object serves one load.
+
+    ``origin`` says how the model that load_model returned holds its weights on
+    this rank; the ranks of one load may differ. A write guard must answer alike
+    on every rank, so it must not go by its own rank's origin alone.
     """
 
     def __init__(self, load_config: LoadConfig, *, owner: bool = False):
         super().__init__(load_config)
         self._owner = owner
+        self.origin = WeightsOrigin.RAW
         self._manifest: Optional[SnapshotManifest] = None
         self._transport: Optional[WeightTransport] = None
         self._storages: dict[str, torch.Tensor] = {}
@@ -237,11 +243,13 @@ class SnapshotLoader(BaseModelLoader):
                 attestation=self._manifest.attestation,
                 constructed=constructed,
             )
+            zero_copy = self._transport.zero_copy
         except BaseException:
             # Nothing falls back once bytes moved; unmap now, vmm_fd maps them all.
             self.close()
             raise
         self._storages = storages
+        self.origin = WeightsOrigin.ZERO_COPY if zero_copy else WeightsOrigin.SNAPSHOT
         return model
 
     def _build_skeleton(self, model_config: ModelConfig) -> nn.Module:
