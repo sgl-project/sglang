@@ -1,0 +1,307 @@
+name: c211-127419-nvq
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-nvq-01:
+    name: probe-job-nvq-01
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-01 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-01 nonce=$NONCE"
+          exit 0
+
+  job-nvq-02:
+    name: probe-job-nvq-02
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-02 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-02 nonce=$NONCE"
+          exit 0
+
+  job-nvq-03:
+    name: probe-job-nvq-03
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-03 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-03 nonce=$NONCE"
+          exit 0
+
+  job-nvq-04:
+    name: probe-job-nvq-04
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-04 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-04 nonce=$NONCE"
+          exit 0
+
+  job-nvq-05:
+    name: probe-job-nvq-05
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-05 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-05 nonce=$NONCE"
+          exit 0
+
+  job-nvq-06:
+    name: probe-job-nvq-06
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-06 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-06 nonce=$NONCE"
+          exit 0
+
+  job-nvq-07:
+    name: probe-job-nvq-07
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-07 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-07 nonce=$NONCE"
+          exit 0
+
+  job-nvq-08:
+    name: probe-job-nvq-08
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-08 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-08 nonce=$NONCE"
+          exit 0
+
+  job-nvq-09:
+    name: probe-job-nvq-09
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-09 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-09 nonce=$NONCE"
+          exit 0
+
+  job-nvq-10:
+    name: probe-job-nvq-10
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127419-340aa0dc907e6e04'
+          echo "C211_JOB=job-nvq-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-nvq-10 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -srm 2>&1 || true
+          echo "DRIVER_FILE=$(tr '\n' ' ' < /proc/driver/nvidia/version 2>/dev/null | head -c 200)"
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "--- nvidia-smi -L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- nvidia-smi --query-gpu=uuid,name,driver_version ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_Q_FAILED
+            echo "--- nvidia-smi --query-gpu=count ---"
+            nvidia-smi --query-gpu=count --format=csv,noheader 2>&1 | head -5 || true
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "C211_PROBE_END job=job-nvq-10 nonce=$NONCE"
+          exit 0
+
