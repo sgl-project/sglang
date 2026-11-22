@@ -299,3 +299,16 @@ Average estimated memory bandwidth in GB/s:
 - These metrics are estimates intended for observability and trend analysis.
 - Estimated memory bytes reflect modeled traffic and are not a direct hardware
   counter from GPU profilers.
+
+
+## Scheduler queue time
+
+`sglang:queue_time_seconds` records the time a request spends in the scheduler's waiting queue before its first forward pass. Each request contributes one sample when it first reaches the forward pass.
+
+Mean queue time in seconds per model over the last five minutes:
+
+```promql
+sum by (model_name) (rate(sglang:queue_time_seconds_sum[5m]))
+/
+sum by (model_name) (rate(sglang:queue_time_seconds_count[5m]))
+```
