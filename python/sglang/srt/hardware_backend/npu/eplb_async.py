@@ -104,6 +104,21 @@ def _make_weight_writeback(weights, buffers, rows) -> WeightWriteback:
         for weight, buffer in zip(weights, buffers, strict=True)
     ]
 
+    # Batched copy helps fragmented writeback. Reused staging rows can be
+    # faster as separate copies, especially when each row is large.
+    if (
+        len(ranges) >= 8
+        and weights[0].device.type == "npu"
+        and hasattr(torch, "_foreach_copy_")
+        and len({source for source, _ in rows}) == len(rows)
+    ):
+        destinations, sources = zip(*copies, strict=True)
+
+        def batch_writeback():
+            torch._foreach_copy_(destinations, sources, non_blocking=True)
+
+        return batch_writeback
+
     def writeback():
         for destination, source in copies:
             destination.copy_(source)
