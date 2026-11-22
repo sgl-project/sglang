@@ -590,9 +590,16 @@ class TestMxfp4PrepareCoreHandoff(_Gfx1250Case):
 
         def kernel(q_nope, w_kc, w_scale, q_pe, k_nope, k_pe, *args, **kwargs):
             calls.append((q_nope, w_scale))
-            return torch.cat([q_pe.new_zeros(*q_pe.shape[:-1], 512), q_pe], -1), None, None, k_nope
+            return (
+                torch.cat([q_pe.new_zeros(*q_pe.shape[:-1], 512), q_pe], -1),
+                None,
+                None,
+                k_nope,
+            )
 
-        self.patch_attr(forward_mla_rocm, "fused_fp4_bmm_rope_cat_and_cache_mla", kernel)
+        self.patch_attr(
+            forward_mla_rocm, "fused_fp4_bmm_rope_cat_and_cache_mla", kernel
+        )
         self.patch_attr(forward_mla_rocm, "_use_gfx1250_fused_mla_rope", False)
         self.use_pool(torch.zeros(8, 1, 576, dtype=torch.bfloat16))
         attn = _RocmAttn(
