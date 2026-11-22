@@ -1873,6 +1873,43 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 
+    def l3vt_touch(self, kv_keys: List[str], transfers: List[PoolTransfer]) -> dict:
+        """L3 victim tier lease touch: one batch existence check over the objects
+        a victim put just wrote, named as ``batch_exists`` names the KV objects
+        of ``kv_keys`` and as ``_batch_io_v2`` names each transfer's component
+        objects. Mooncake grants a lease to every object found; nothing is read
+        or written. Counts only."""
+        names: List[str] = []
+        if kv_keys and self.mem_pool_host.kv_buffer is not None:
+            tagged = self._tag_keys(kv_keys)
+            if self.unified_suffixes is not None:
+                names.extend(self._unified_object_keys(tagged))
+            elif self.is_mla_backend:
+                names.extend(f"{key}_{self.mla_suffix}_k" for key in tagged)
+            elif self.should_split_heads:
+                for key in tagged:
+                    for suffix in self.mha_suffix:
+                        names.append(f"{key}_{suffix}_k")
+                        names.append(f"{key}_{suffix}_v")
+            else:
+                for key in tagged:
+                    names.append(f"{key}_{self.mha_suffix}_k")
+                    names.append(f"{key}_{self.mha_suffix}_v")
+        for transfer in transfers or []:
+            if not transfer.keys:
+                continue
+            component_keys, _ = self._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            names.extend(self._tag_keys(component_keys))
+        if not names:
+            return {"objects": 0, "present": 0}
+        result = self._batch_exist(names)
+        return {
+            "objects": len(names),
+            "present": sum(1 for r in result if r == 1),
+        }
+
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.

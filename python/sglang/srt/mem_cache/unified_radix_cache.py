@@ -77,6 +77,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.hybrid_cache.l3_victim_tier import (
+    ChainCloser,
+    HeldVictim,
+    L3VictimTierConfig,
+    PinEntry,
+    PinLedger,
+    VictimTier,
+    WaitBound,
+)
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import (
@@ -227,6 +236,14 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # L3 victim tier (hybrid_cache/l3_victim_tier.py), off at class level too, so
+    # a cache built without __init__ (a test double) sees every part off.
+    _l3vt_cfg: L3VictimTierConfig = L3VictimTierConfig()
+    _l3vt: Optional[VictimTier] = None
+    _l3pin: Optional[PinLedger] = None
+    _l3wb: Optional[WaitBound] = None
+    _l3vt_touch: bool = False
+    _l3cc: Optional[ChainCloser] = None
 
     def __init__(
         self,
@@ -417,6 +434,20 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
         }
+        # L3 victim tier; all off until init_l3_victim_tier resolves the switch
+        # at the storage-enable point.
+        self._l3vt_cfg = L3VictimTierConfig()
+        self._l3vt: Optional[VictimTier] = None
+        self._l3pin: Optional[PinLedger] = None
+        self._l3wb: Optional[WaitBound] = None
+        self.l3vt_pin_active = False
+        self._l3vt_stats: dict[str, int] = {
+            "budget_recharges": 0,
+            "budget_released_tokens": 0,
+            "assume_stored_off": 0,
+        }
+        self._l3vt_touch = False
+        self._l3cc: Optional[ChainCloser] = None
 
         self.reset()
         logger.info(
@@ -535,6 +566,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # ongoing_backup: the ack drain settles every write at a rank-agreed
         # written prefix of this span (buffer mode reads it from its entry).
         self._backup_requested_tokens: dict[int, int] = {}
+        # The pools are cleared below: held victim pages and pins go with them.
+        if self._l3vt is not None:
+            self._l3vt.reset()
+        if self._l3cc is not None:
+            self._l3cc.reset()
+        if self._l3pin is not None:
+            self._l3pin.reset()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -1960,7 +1998,10 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         # Free per component host-pool slots, consuming each entry as it frees.
         for ct in list(host_frees):
-            self.components[ct].free_host_values(host_frees.pop(ct))
+            values = host_frees.pop(ct)
+            if self._l3vt is not None:
+                self._l3vt_forget(ct, values)
+            self.components[ct].free_host_values(values)
 
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
@@ -2409,8 +2450,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
-            for node_id in publish_node_ids:
-                self.write_backup_storage(node_id)
+            if self._l3vt is not None:
+                # Victim tier: note the keys now, put on host eviction.
+                for node_id in publish_node_ids:
+                    self._l3vt_record_node(node_id)
+            else:
+                for node_id in publish_node_ids:
+                    self.write_backup_storage(node_id)
 
     def load_back(
         self,
@@ -2618,14 +2664,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return transfers
 
     @rank_consensus
-    def write_backup_storage(self, node_id: NodeId) -> None:
+    def write_backup_storage(
+        self, node_id: NodeId, *, lease_touch: bool = False
+    ) -> Optional[int]:
+        """Put a host-backed node's pages (and its host state, sidecars) to
+        storage, host-locked until the ack; returns the op id. ``lease_touch``:
+        the L3 victim tier's post-put lease touch (chain close only)."""
         if not self.enable_storage or self.cache_controller is None:
-            return
+            return None
         spec = self.tree_core.build_storage_backup_spec(
             node_id, self.hicache_storage_pass_prefix_keys
         )
         if spec is None:
-            return
+            return None
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2644,6 +2695,7 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            **({"lease_touch": True} if lease_touch else {}),
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -2652,6 +2704,669 @@ class UnifiedRadixCache(BasePrefixCache):
         self._backup_requested_tokens[operation_id] = (
             len(spec.hash_value) * self.page_size
         )
+        return operation_id
+
+    # ---- HiCache L3 victim tier (hybrid_cache/l3_victim_tier.py) ----
+
+    def init_l3_victim_tier(self) -> None:
+        """Resolve SGLANG_OPT_HICACHE_L3_VICTIM_TIER at the storage-enable point
+        (StorageAttachment.apply_runtime_config). Everything stays off (None /
+        False) unless the switch is on and the tier's preconditions hold."""
+        self._l3vt = None
+        self._l3pin = None
+        self._l3wb = None
+        self._l3vt_touch = False
+        self._l3cc = None
+        self.l3vt_pin_active = False
+        cfg = self._l3vt_resolve()
+        self._l3vt_cfg = cfg
+        switch = envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER
+        if not cfg.victim:
+            if cfg.decline is not None:
+                logger.info("%s declined: %s", switch.name, cfg.decline)
+            elif switch.is_set():
+                logger.info("%s declined: %s=0", switch.name, switch.name)
+            return
+        cc = self.cache_controller
+        host_group = cc.mem_pool_host
+        anchor_pool = host_group.anchor_entry.host_pool
+        state_pool = (
+            self.host_pool_group.get_pool(PoolName.MAMBA)
+            if self.slot_id(TREE_STATE) is not None
+            else None
+        )
+        self._l3vt = VictimTier(
+            page_size=cc.page_size,
+            kv_capacity_tokens=int(host_group.size),
+            state_capacity_slots=int(state_pool.size) if state_pool else 0,
+            margin=cfg.victim_margin,
+            state_margin=cfg.state_margin,
+        )
+        self._l3vt_touch = cfg.lease_touch
+        if cfg.chain_close:
+            self._l3cc = self._l3cc_build(cfg, anchor_pool, state_pool)
+        if cfg.pin:
+            self._l3pin = PinLedger(int(cfg.pin_frac * host_group.logical_size))
+            self.l3vt_pin_active = True
+        if cfg.wait_bound:
+            self._l3wb = WaitBound(cfg.wait_slack)
+        if cfg.budget and cfg.budget_tokens > 0:
+            cc.prefetch_capacity_limit = int(cfg.budget_tokens)
+        logger.info(
+            "%s engaged: storage is a victim tier of the host tier "
+            "(lease_touch=%s chain_close=%s pin=%s budget=%s wait_bound=%s "
+            "kv_margin=%s state_margin=%s kv_target=%s state_target=%s pin_cap=%s "
+            "prefetch_cap=%s cc_cap_pages=%s cc_refresh_pages=%s cc_max_pending=%s)%s",
+            switch.name,
+            cfg.lease_touch,
+            cfg.chain_close,
+            cfg.pin,
+            cfg.budget,
+            cfg.wait_bound,
+            cfg.victim_margin,
+            cfg.state_margin,
+            self._l3vt.kv_target,
+            self._l3vt.state_target,
+            self._l3pin.cap_tokens if self._l3pin else None,
+            cc.prefetch_capacity_limit,
+            self._l3cc.cap_pages if self._l3cc else None,
+            self._l3cc.refresh_pages if self._l3cc else None,
+            self._l3cc.max_pending if self._l3cc else None,
+            "".join(f"; {k} off: {v}" for k, v in cfg.ignored.items()),
+        )
+
+    def _l3vt_unsupported(self) -> Optional[str]:
+        """Why this cache's layout cannot carry the victim tier, which reads keys
+        per host page and per state slot, and writes Full KV, Mamba state and the
+        sidecars derived from KV (a victim put builds sidecars from its KV pages
+        only, so a sidecar indexed by another pool would be left out)."""
+        cc = self.cache_controller
+        anchor_pool = (
+            cc.mem_pool_host.anchor_entry.host_pool if cc is not None else None
+        )
+        # A DeepSeek V4 anchor (LogicalHostPool) carries no DCP width.
+        if anchor_pool is not None and (
+            anchor_pool.shared_allocation_domain is not None
+            or getattr(anchor_pool, "dcp_size", 1) != 1
+        ):
+            return "shared or DCP host layout"
+        if not set(self.tree_components) <= {
+            BASE_COMPONENT_TYPE,
+            self.slot_id(TREE_STATE),
+        }:
+            return f"components {sorted(c.name for c in self.tree_components)}"
+        if any(
+            spec.indices_from_pool != PoolName.KV for spec in self.sidecar_pool_specs
+        ):
+            return "a sidecar not derived from KV"
+        return None
+
+    def _l3vt_resolve(self) -> L3VictimTierConfig:
+        """The switch resolved on this rank; with the switch on, agreed over the
+        ranks that move in lockstep, so a part any of them leaves off is off on
+        every one (every rank reaches the storage-enable point together)."""
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
+        switch_on = bool(envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get())
+        disagg = get_disagg() if switch_on else None
+        cfg = L3VictimTierConfig.resolve(
+            envs,
+            enable_storage=bool(self.enable_storage and cc is not None),
+            disaggregation_mode=(
+                disagg.disaggregation_mode if disagg is not None else "null"
+            ),
+            pd_role_switch=disagg is not None and bool(disagg.enable_pd_role_switch),
+            host_memory_mode=self.host_memory_mode,
+            has_linker=self.linker is not None,
+            is_write_back=bool(self.is_write_back),
+            tree_core_backend=self._tree_core_backend,
+            # Off, the tier reads nothing of the cache's layout.
+            victim_unsupported=self._l3vt_unsupported() if switch_on else None,
+            prefetch_stop_policy=self.prefetch_stop_policy,
+            has_storage_v2=hasattr(backend, "batch_set_v2"),
+            pass_prefix_keys=bool(self.hicache_storage_pass_prefix_keys),
+            has_lease_touch=hasattr(backend, "l3vt_touch"),
+        )
+        if not switch_on:
+            return cfg
+        return cfg.agreed(self._l3vt_min_over_ranks(cfg.parts()))
+
+    def _l3vt_min_over_ranks(self, values: list[int]) -> list[int]:
+        """MIN over the attention TP / CP group (as the storage hit query) and then
+        the PP group: the ranks whose trees and storage drains move in lockstep."""
+        data = torch.tensor(values, dtype=torch.int32)
+        self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                data, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
+        return [int(v) for v in data.tolist()]
+
+    def release_l3_victim_tier(self) -> None:
+        """Storage detach: free the pages / slots held for victim puts that will
+        not be acked, drop the pins, and turn the tier off until the next attach."""
+        if self._l3vt is not None:
+            for op_id in list(self._l3vt.held):
+                held = self._l3vt.release(op_id)
+                self._l3vt_free_held(held)
+        if self._l3pin is not None:
+            for handle in list(self._l3pin.pins):
+                self._l3pin_release(handle, "abandon")
+        self._l3vt = None
+        self._l3cc = None
+        self._l3pin = None
+        self._l3wb = None
+        self._l3vt_touch = False
+        self.l3vt_pin_active = False
+        self._l3vt_cfg = L3VictimTierConfig()
+
+    def _l3cc_build(self, cfg: L3VictimTierConfig, kv_pool, state_pool) -> ChainCloser:
+        """Chain close: pages in flight capped at the KV victim margin (or CAP x
+        the host pool), re-close after REFRESH x the host pool of storage writes,
+        at most one queued anchor a host state slot (>= 64)."""
+        vt = self._l3vt
+        ps = vt.page_size
+        host_tokens = len(vt.keymap._kv) * ps
+        cap_tokens = (
+            int(cfg.chain_close_cap * host_tokens)
+            if cfg.chain_close_cap > 0
+            else vt.kv_target
+        )
+
+        def _bytes(pool) -> int:
+            try:
+                return int(pool.get_size_per_token()) if pool is not None else 0
+            except Exception:  # noqa: BLE001 - counters only
+                return 0
+
+        return ChainCloser(
+            page_size=ps,
+            num_kv_pages=len(vt.keymap._kv),
+            num_state_slots=len(vt.keymap._st),
+            cap_pages=max(1, cap_tokens // ps),
+            refresh_pages=max(1, int(cfg.chain_close_refresh * len(vt.keymap._kv))),
+            max_pending=max(64, len(vt.keymap._st)),
+            kv_page_bytes=_bytes(kv_pool) * ps,
+            state_bytes=_bytes(state_pool),
+        )
+
+    def _l3vt_pages(self, host_value: torch.Tensor) -> Optional[list[int]]:
+        """Host page numbers of a page-aligned run of host token indices, or
+        None if the run is not whole aligned pages."""
+        ps = self._l3vt.page_size
+        n = host_value.numel()
+        if n == 0:
+            return []
+        if n % ps:
+            return None
+        v = host_value.reshape(-1, ps)
+        starts = v[:, 0]
+        if ps > 1:
+            ar = torch.arange(ps, dtype=v.dtype, device=v.device)
+            if not bool((starts % ps == 0).all()) or not bool(
+                (v == starts.unsqueeze(1) + ar).all()
+            ):
+                return None
+        return (starts // ps).tolist()
+
+    def _l3vt_record_node(self, node_id: NodeId, promoted: bool = False) -> None:
+        """Note the storage keys of a node's host pages and host state slots,
+        taken from its storage backup spec (what write_backup_storage would put
+        under those keys). ``promoted``: the node was just read from storage."""
+        vt = self._l3vt
+        spec = self.tree_core.build_storage_backup_spec(
+            node_id, self.hicache_storage_pass_prefix_keys
+        )
+        if spec is None:
+            vt.stats["record_skipped"] += 1
+            return
+        pages = self._l3vt_pages(spec.host_value)
+        keys = spec.hash_value
+        if pages is None or keys is None or len(keys) != len(pages):
+            vt.stats["record_skipped"] += 1
+            return
+        vt.keymap.record_kv(pages, keys)
+        vt.stats["recorded_nodes"] += 1
+        vt.stats["recorded_pages"] += len(pages)
+        recorded_slots: list[int] = []
+        for transfers in spec.comp_xfers.values():
+            for transfer in transfers:
+                if (
+                    transfer.name != PoolName.MAMBA
+                    or transfer.indices_from_pool is not None
+                    or transfer.host_indices is None
+                    or not transfer.keys
+                ):
+                    continue
+                slots = transfer.host_indices.reshape(-1).tolist()
+                if len(slots) != len(transfer.keys):
+                    vt.stats["record_skipped"] += 1
+                    continue
+                vt.keymap.record_states(slots, list(transfer.keys))
+                vt.stats["recorded_states"] += len(slots)
+                recorded_slots.extend(slots)
+        if self._l3cc is not None:
+            self._l3cc_note_record(node_id, pages, keys, recorded_slots, promoted)
+
+    # -- chain close (l3_victim_tier.ChainCloser) --
+
+    def _l3cc_alive(self, node_id: NodeId) -> Optional[bool]:
+        """None if the node left the tree, else whether it is host-backed."""
+        try:
+            return bool(self.tree_core.is_backuped(node_id))
+        except KeyError:
+            return None
+
+    def _l3cc_note_record(
+        self,
+        node_id: NodeId,
+        pages: list[int],
+        keys: list[str],
+        slots: list[int],
+        promoted: bool,
+    ) -> None:
+        """Per page / slot: the recorded node; per node on its root path: the
+        parent. A node first seen here that is not the recorded one (a split
+        fragment of a recorded node) gets its host pages mapped to it."""
+        cc = self._l3cc
+        cc.note_pages(node_id, pages, keys)
+        cc.note_states(node_id, slots)
+        try:
+            path = self.tree_core.collect_path_info([node_id])[0]
+        except KeyError:
+            return
+        for info in path:
+            if cc.note_node(info.node_id, info.parent_id) and info.node_id != node_id:
+                self._l3cc_refresh_pages(info.node_id)
+        if promoted:
+            # Its pages and state were just read from storage.
+            cc.mark_closed(node_id)
+
+    def _l3cc_refresh_pages(self, node_id: NodeId) -> None:
+        cc = self._l3cc
+        spec = self.tree_core.build_storage_backup_spec(
+            node_id, self.hicache_storage_pass_prefix_keys
+        )
+        if spec is None:
+            return
+        pages = self._l3vt_pages(spec.host_value)
+        keys = spec.hash_value
+        if not pages or keys is None or len(keys) != len(pages):
+            return
+        kv_key = self._l3vt.keymap.kv_key
+        if all(kv_key(p) == k for p, k in zip(pages, keys)):
+            cc.note_pages(node_id, pages, keys)
+            cc.stats["cc_refreshed_nodes"] += 1
+
+    def _l3cc_after_victims(self, kv_pages: list[int], slots: list[int]) -> None:
+        """Queue the chain closes a victim op triggers (before its keys clear)."""
+        vt = self._l3vt
+        held_pages: list[set] = []
+
+        def held(page: int) -> bool:
+            if not held_pages:
+                held_pages.append({p for h in vt.held.values() for p in h.kv_pages})
+            return page in held_pages[0]
+
+        self._l3cc.enqueue(
+            self._l3cc.triggers(
+                kv_pages, slots, vt.keymap.kv_key, self._l3cc_alive, held
+            )
+        )
+
+    def _l3cc_close(self, anchor: NodeId) -> bool:
+        """Write every host-backed node on the anchor's root path, root first,
+        through write_backup_storage (host-locked until acked; stored objects
+        skipped by the backend). False: stopped at the in-flight cap."""
+        cc = self._l3cc
+        st = cc.stats
+        vt = self._l3vt
+        if self._l3cc_alive(anchor) is None:
+            anchor = cc.resolve(
+                anchor, None, (), vt.keymap.kv_key, self._l3cc_alive, lambda p: False
+            )
+            if anchor is None:
+                return True
+        path = self.tree_core.collect_path_info([anchor])[0]
+        if not path:
+            st["cc_close_empty"] += 1
+            return True
+        ps = vt.page_size
+        write_through = None
+        for info in path:
+            node_id = info.node_id
+            cc.note_node(node_id, info.parent_id)
+            st["cc_path_nodes"] += 1
+            pages = (info.path_end - info.path_start) // ps
+            why = cc.needs_close(node_id)
+            if why is not None:
+                st["cc_skip_" + why] += 1
+                continue
+            if not self._l3cc_alive(node_id):
+                # Device-only (never landed in host, or its host copy reclaimed).
+                st["cc_skip_not_host"] += 1
+                st["cc_skip_not_host_pages"] += pages
+                continue
+            if write_through is None:
+                write_through = {
+                    n
+                    for entry in self.ongoing_write_through.values()
+                    for n in entry.publish_node_ids
+                }
+            if node_id in write_through:
+                # Host copy not acked yet: its bytes may still be in flight.
+                st["cc_skip_write_through"] += 1
+                continue
+            if not cc.can_issue(pages):
+                return False
+            op_id = self.write_backup_storage(node_id, lease_touch=self._l3vt_touch)
+            if op_id is None:
+                st["cc_skip_no_spec"] += 1
+                continue
+            cc.issued(op_id, node_id, pages)
+        return True
+
+    def _l3cc_note_ack(self, operation, agreed_tokens: int) -> None:
+        states = states_ok = 0
+        for transfer in operation.pool_transfers or ():
+            if transfer.name == PoolName.MAMBA and transfer.host_indices is not None:
+                states += int(transfer.host_indices.numel())
+        if states:
+            states_ok = int(
+                operation.pool_storage_result.extra_pool_hit_pages.get(
+                    PoolName.MAMBA, 0
+                )
+            )
+        self._l3cc.note_ack(
+            operation.id,
+            agreed_tokens // self._l3vt.page_size,
+            states,
+            states_ok,
+            operation.l3vt_touch_result,
+        )
+
+    def _l3vt_forget(
+        self, component_type: ComponentType, values: list[torch.Tensor]
+    ) -> None:
+        """The tree freed these host values: drop their keys (every page /
+        slot touched, so a misaligned value can only lose a put)."""
+        vt = self._l3vt
+        if component_type == BASE_COMPONENT_TYPE:
+            ps = vt.page_size
+            for value in values:
+                if value is not None and value.numel():
+                    pages = torch.unique(value.reshape(-1) // ps).tolist()
+                    vt.stats["freed_keyed_kv_pages"] += vt.keymap.clear_kv(pages)
+        elif component_type == self.slot_id(TREE_STATE):
+            for value in values:
+                if value is not None and value.numel():
+                    slots = value.reshape(-1).tolist()
+                    vt.stats["freed_keyed_states"] += vt.keymap.clear_states(slots)
+
+    @rank_consensus(same_results=True)
+    def _l3vt_deficits(self) -> tuple[int, int]:
+        """(host KV tokens, host state slots) the victim pass evicts now."""
+        vt = self._l3vt
+        kv = vt.kv_deficit(self.cache_controller.mem_pool_host.available_size())
+        st = 0
+        if vt.state_target > 0:
+            st = vt.state_deficit(
+                self.host_pool_group.get_pool(PoolName.MAMBA).available_size()
+            )
+        return kv, st
+
+    def _l3vt_maintain(self) -> None:
+        """Victim pass: evict the margin deficit through the tree core's host
+        LRU and put the evicted, keyed pages / slots to storage."""
+        vt = self._l3vt
+        # Victim puts of earlier passes not acked yet (rank-identical: the
+        # held set changes only here and at the MIN-synced ack drain).
+        victim_backlog = vt.held_kv_tokens > 0 or vt.held_states > 0
+        kv_deficit, state_deficit = self._l3vt_deficits()
+        if kv_deficit > 0 or state_deficit > 0:
+            vt.stats["passes"] += 1
+            mamba_ct = self.slot_id(TREE_STATE)
+            kv_values: list[torch.Tensor] = []
+            state_values: list[torch.Tensor] = []
+            steps = []
+            if kv_deficit > 0:
+                steps.append((BASE_COMPONENT_TYPE, kv_deficit))
+            if state_deficit > 0 and mamba_ct is not None:
+                steps.append((mamba_ct, state_deficit))
+            for component_type, amount in steps:
+                result = self.tree_core.drive_host_eviction(component_type, amount)
+                kv_values.extend(result.host_frees.pop(BASE_COMPONENT_TYPE, ()))
+                if mamba_ct is not None:
+                    state_values.extend(result.host_frees.pop(mamba_ct, ()))
+                # Other components' frees, device frees and actions as usual.
+                self._apply_eviction_result(result)
+            self._l3vt_put_victims(kv_values, state_values)
+        if self._l3cc is not None:
+            # Every step: closes deferred at the cap go out as acks free it,
+            # unless an earlier victim put is still in flight (close ops share
+            # the backup queue; a victim put waiting behind them keeps its
+            # pages out of the host margin).
+            self._l3cc.run(self._l3cc_close, victim_backlog=victim_backlog)
+            self._l3cc.sweep(self._l3cc_alive)
+        vt.maybe_log(self._l3vt_stats_suffix())
+
+    def _l3vt_put_victims(
+        self, kv_values: list[torch.Tensor], state_values: list[torch.Tensor]
+    ) -> None:
+        vt = self._l3vt
+        ps = vt.page_size
+        mamba_ct = self.slot_id(TREE_STATE)
+        kv = torch.cat([v.reshape(-1) for v in kv_values]) if kv_values else None
+        st = torch.cat([v.reshape(-1) for v in state_values]) if state_values else None
+        room_kv, room_st = vt.held_room()
+        keep_kv = keep_st = None
+        kv_keys: list[str] = []
+        st_keys: list[str] = []
+        kv_pages_keyed: list[int] = []
+        slots_keyed: list[int] = []
+        free_kv: list[torch.Tensor] = []
+        free_st: list[torch.Tensor] = []
+        if kv is not None and kv.numel():
+            vt.stats["evicted_kv_tokens"] += kv.numel()
+            pages = self._l3vt_pages(kv)
+            if pages is None:
+                # Not whole aligned pages: put nothing from it.
+                vt.keymap.clear_kv(torch.unique(kv // ps).tolist())
+                free_kv.append(kv)
+            else:
+                keyed, kv_keys, unkeyed = vt.keymap.split_kv(pages)
+                cap = room_kv // ps
+                if len(keyed) > cap:
+                    vt.stats["dropped_held_cap_kv_pages"] += len(keyed) - cap
+                    unkeyed = unkeyed + keyed[cap:]
+                    keyed, kv_keys = keyed[:cap], kv_keys[:cap]
+                rows = kv.reshape(-1, ps)
+                if unkeyed:
+                    vt.stats["unkeyed_kv_pages"] += len(unkeyed)
+                    vt.keymap.clear_kv([pages[i] for i in unkeyed])
+                    free_kv.append(rows[unkeyed].reshape(-1))
+                if keyed:
+                    keep_kv = rows[keyed].reshape(-1)
+                    kv_pages_keyed = [pages[i] for i in keyed]
+        if st is not None and st.numel():
+            vt.stats["evicted_states"] += st.numel()
+            slots = st.tolist()
+            keyed, st_keys, unkeyed = vt.keymap.split_states(slots)
+            if len(keyed) > room_st:
+                vt.stats["dropped_held_cap_states"] += len(keyed) - room_st
+                unkeyed = unkeyed + keyed[room_st:]
+                keyed, st_keys = keyed[:room_st], st_keys[:room_st]
+            if unkeyed:
+                vt.stats["unkeyed_states"] += len(unkeyed)
+                vt.keymap.clear_states([slots[i] for i in unkeyed])
+                free_st.append(st[unkeyed])
+            if keyed:
+                keep_st = st[keyed]
+                slots_keyed = [slots[i] for i in keyed]
+        # Pages / slots with nothing to put go back now.
+        if free_kv:
+            self.components[BASE_COMPONENT_TYPE].free_host_values(free_kv)
+        if free_st:
+            self.components[mamba_ct].free_host_values(free_st)
+        if keep_kv is None and keep_st is None:
+            return
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        if keep_st is not None:
+            comp_xfers[mamba_ct] = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=keep_st,
+                    keys=st_keys,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ]
+        kv_host = (
+            keep_kv
+            if keep_kv is not None
+            else torch.empty(0, dtype=torch.int64, device=st.device)
+        )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        if keep_kv is not None:
+            # KV-derived sidecars (e.g. the draft pool) ride with the KV pages,
+            # exactly as write_backup_storage builds them.
+            kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=kv_host, keys=kv_keys)
+            aux_xfers.extend(
+                self._build_sidecar_transfers(
+                    CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers
+                )
+            )
+        if st_keys:
+            # A state whose stop-point page is not in this op left the host
+            # state pool while its node's KV stayed in host.
+            kv_key_set = set(kv_keys)
+            vt.stats["put_states_detached"] += sum(
+                1 for k in st_keys if k not in kv_key_set
+            )
+        op_id = self.cache_controller.write_storage(
+            kv_host,
+            [],
+            hash_value=kv_keys,
+            # The pages come from several nodes; the tier declines on a backend
+            # that is passed prefix keys.
+            prefix_keys=None,
+            extra_pools=aux_xfers or None,
+            **({"lease_touch": True} if self._l3vt_touch else {}),
+        )
+        # The ack drain settles the op at its rank-agreed written prefix.
+        self._backup_requested_tokens[op_id] = len(kv_pages_keyed) * ps
+        vt.hold(
+            op_id,
+            HeldVictim(
+                kv_tokens=keep_kv,
+                state_slots=keep_st,
+                kv_pages=kv_pages_keyed,
+                slots=slots_keyed,
+                num_kv_tokens=len(kv_pages_keyed) * ps,
+                issued_at=time.monotonic(),
+            ),
+        )
+        vt.stats["put_ops"] += 1
+        vt.stats["put_kv_pages"] += len(kv_pages_keyed)
+        vt.stats["put_states"] += len(slots_keyed)
+        if self._l3cc is not None:
+            self._l3cc_after_victims(kv_pages_keyed, slots_keyed)
+
+    def _l3vt_release(self, operation, agreed_tokens: int) -> bool:
+        """A victim put was acked (landed or not): free its pages / slots. False:
+        the op is not a victim put."""
+        vt = self._l3vt
+        held = vt.release(operation.id)
+        if held is None:
+            return False
+        vt.stats["acked_ops"] += 1
+        vt.note_touch(operation.l3vt_touch_result)
+        ok_pages = min(len(held.kv_pages), agreed_tokens // vt.page_size)
+        vt.stats["acked_kv_pages_ok"] += ok_pages
+        vt.stats["put_kv_pages_failed"] += len(held.kv_pages) - ok_pages
+        if held.slots:
+            hits = operation.pool_storage_result.extra_pool_hit_pages
+            ok_states = min(len(held.slots), int(hits.get(PoolName.MAMBA, 0)))
+            vt.stats["acked_states_ok"] += ok_states
+            vt.stats["put_states_failed"] += len(held.slots) - ok_states
+        self._l3vt_free_held(held)
+        return True
+
+    def _l3vt_free_held(self, held: Optional[HeldVictim]) -> None:
+        if held is None:
+            return
+        if held.kv_tokens is not None:
+            self.components[BASE_COMPONENT_TYPE].free_host_values([held.kv_tokens])
+        if held.state_slots is not None:
+            self.components[self.slot_id(TREE_STATE)].free_host_values(
+                [held.state_slots]
+            )
+
+    def _l3pin_hold(
+        self, request: CacheRequestHandle, node_id: NodeId, tokens: int
+    ) -> None:
+        """Host-lock a storage hit inserted for ``request`` until admission."""
+        ledger = self._l3pin
+        self._l3pin_release(request, "replaced")
+        if not ledger.can_pin(tokens):
+            ledger.stats["declined_cap"] += 1
+            return
+        params = self.inc_host_lock_ref(node_id).to_dec_params()
+        ledger.add(request, PinEntry(node_id, params, int(tokens)))
+
+    def _l3pin_release(self, request: CacheRequestHandle, reason: str) -> None:
+        entry = self._l3pin.pop(request, reason)
+        if entry is not None:
+            self.dec_host_lock_ref(entry.node_id, entry.lock_params)
+
+    @rank_consensus(same_params=["len(reqs)"])
+    def release_l3_pins(self, reqs) -> None:
+        """Admitted requests no longer need their storage hit pinned in host
+        (admission has locked their prefix and queued its load-back)."""
+        if self._l3pin is None or not self._l3pin.pins:
+            return
+        for req in reqs:
+            self._l3pin_release(req.cache_request_handle, "admit")
+
+    def l3vt_note_refetch(self) -> None:
+        if self._l3pin is not None:
+            self._l3pin.stats["refetch_on_loss"] += 1
+
+    def l3vt_puts_in_flight(self) -> int:
+        return len(self._l3vt.held) if self._l3vt is not None else 0
+
+    def _l3vt_recharge_hit(self, info, operation, hit_tokens: int) -> None:
+        """Budget: once the hit is known, a lookup holds its hit span of the
+        prefetch budget, not the whole unmatched tail."""
+        charged = self._prefetch_occupied_span(
+            info.prefetch_key, info.host_indices, operation=operation
+        )
+        new_charge = min(charged, max(0, int(hit_tokens)))
+        if new_charge < charged:
+            self.cache_controller.prefetch_tokens_occupied -= charged - new_charge
+            self._l3vt_stats["budget_released_tokens"] += charged - new_charge
+        operation.l3vt_charged = new_charge
+        self._l3vt_stats["budget_recharges"] += 1
+
+    def _l3vt_charge(self, operation, default: int) -> int:
+        """A cache-mode lookup's prefetch-budget charge: ``default`` (the
+        requested span) unless the victim tier's budget re-charged it."""
+        if not self._l3vt_cfg.budget or operation is None:
+            return default
+        charged = operation.l3vt_charged
+        return default if charged is None else charged
+
+    def _l3vt_stats_suffix(self) -> str:
+        parts = [f"{k}={v}" for k, v in self._l3vt_stats.items()]
+        if self._l3cc is not None:
+            parts.extend(f"{k}={v}" for k, v in self._l3cc.log_items())
+        if self._l3pin is not None:
+            parts.append(f"pinned_tokens={self._l3pin.pinned_tokens}")
+            parts.extend(f"pin_{k}={v}" for k, v in self._l3pin.stats.items())
+        if self._l3wb is not None:
+            rate = self._l3wb.rate
+            parts.append(f"wb_rate={0 if rate is None else int(rate)}")
+            parts.extend(f"wb_{k}={v}" for k, v in self._l3wb.stats.items())
+        return " | " + " ".join(parts)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2783,6 +3498,13 @@ class UnifiedRadixCache(BasePrefixCache):
             < storage_hit_end
             <= storage_start + len(new_input_tokens) - boundary_tokens
         )
+        if assume_stored and self._l3vt is not None:
+            # Victim tier: storage holds what left the host tier, one node per
+            # put, and a put can be dropped (held-page cap, a sync-path free) or
+            # a state evicted apart from its KV; so a stored deeper page no
+            # longer proves the shallower ones stored. Query the span instead.
+            assume_stored = False
+            self._l3vt_stats["assume_stored_off"] += 1
         if assume_stored:
             new_input_tokens = new_input_tokens[
                 : storage_hit_end - storage_start + boundary_tokens
@@ -2931,10 +3653,15 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # Start at the first blocked admission poll; refetches keep this budget.
             pages = operation.stats_requested_tokens // self.page_size
-            wait = _StoragePrefetchWait(
-                timeout_s=self.prefetch_timeout_base
-                + pages * self.prefetch_timeout_per_page,
+            timeout_s = (
+                self.prefetch_timeout_base + pages * self.prefetch_timeout_per_page
             )
+            if self._l3wb is not None:
+                span = operation.storage_hit_count or operation.stats_requested_tokens
+                timeout_s = self._l3wb.timeout(
+                    span, self.prefetch_timeout_base, timeout_s
+                )
+            wait = _StoragePrefetchWait(timeout_s=timeout_s)
             wait.timer.observe(ready=False)
             self._storage_prefetch_wait[operation.handle] = wait
 
@@ -3262,10 +3989,21 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request, insert_result.prefix_len, reason="already_cached"
             )
+            inserted_node = insert_result.inserted_host_node
+            if loaded_from_storage > 0 and inserted_node is not None:
+                if self._l3vt is not None:
+                    # A promoted copy: put back on host eviction if storage
+                    # has dropped it meanwhile (the put skips stored keys).
+                    self._l3vt_record_node(inserted_node, promoted=True)
+                if self._l3pin is not None:
+                    # Taken before the anchor lock is released below.
+                    self._l3pin_hold(request, inserted_node, loaded_from_storage)
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self.cache_controller.prefetch_tokens_occupied -= self._l3vt_charge(
+            operation, len(prefetch_key)
+        )
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
         if loaded_from_storage > 0:
@@ -3529,6 +4267,8 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        if self._l3pin is not None:
+            self._l3pin_release(request, "abandon")
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(request)
@@ -3670,7 +4410,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 return operation.buffer_host_occupied_units
             return len(host_indices) if host_indices is not None else 0
-        return len(prefetch_key)
+        return self._l3vt_charge(operation, len(prefetch_key))
 
     def _alloc_prefetch_aux_staging(
         self, info: _OngoingPrefetch, hit_tokens: int
@@ -3919,6 +4659,8 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
+            if self._l3wb is not None:
+                operation.l3vt_io_t0 = time.monotonic()
             cc.prefetch_buffer.put(operation)
             return True
 
@@ -3969,6 +4711,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(request)
                     continue
                 self._account_prefetch_outcome(operation, revoked=False)
+                if self._l3vt_cfg.budget and not buffer_mode:
+                    self._l3vt_recharge_hit(info, operation, hit_tokens)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
                 parked_ahead = buffer_mode and bool(
@@ -3996,6 +4740,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         operation.pool_transfers_done = True
                 if ack.completed_req:
                     if is_current:
+                        if self._l3wb is not None and operation.l3vt_io_t0 is not None:
+                            self._l3wb.observe(
+                                operation.completed_tokens,
+                                time.monotonic() - operation.l3vt_io_t0,
+                            )
                         # check_prefetch_progress() is not called for this rid yet.
                         # Let us insert the prefetch result into the radix tree.
                         self._handle_prefetch_result(operation)
@@ -4131,6 +4880,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         page_size = self.page_size
         short = requested_tokens is not None and agreed_tokens < requested_tokens
+        victim_put = False
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.finish_storage_write_ack(
                 operation.id,
@@ -4144,7 +4894,20 @@ class UnifiedRadixCache(BasePrefixCache):
             if entry is not None:
                 node_id, lock_params = entry
                 self.dec_host_lock_ref(node_id, lock_params)
-        if short:
+                if self._l3cc is not None:
+                    self._l3cc_note_ack(operation, agreed_tokens)
+            elif self._l3vt is not None:
+                victim_put = self._l3vt_release(operation, agreed_tokens)
+        if short and victim_put:
+            # Its pages were freed with the ack: nothing writes the tail later.
+            logger.warning(
+                "HiCache L3 victim tier: put %d wrote %d of %d tokens; the "
+                "unwritten pages left the host tier without a storage copy.",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+            )
+        elif short:
             logger.warning(
                 "HiCache storage backup operation %d wrote %d of %d tokens; the "
                 "tail stays un-backed until a later write-through covers it.",
@@ -4694,6 +5457,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self._vote_prefetch_deadlines()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
+        if self._l3vt is not None and self.enable_storage:
+            # After the drains: acked victims have freed their pages.
+            self._l3vt_maintain()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:

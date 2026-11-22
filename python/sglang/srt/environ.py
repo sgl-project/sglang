@@ -925,6 +925,30 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Cache-mode HiCache with an L3 backend under write_back, on a PD prefill or an
+    # aggregated server: storage is a victim tier of the host tier (a node's KV pages
+    # and Mamba state are put when they leave the host tier, with the root path's
+    # host-resident nodes closed into storage), plus pinned restores, a hit-span
+    # prefetch budget and a measured wait bound; same keys and bytes
+    # (hybrid_cache/l3_victim_tier.py). The constants below size it. Opt-in, not a
+    # child of SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: it pays only where the
+    # usable storage pool is smaller than the summed host tiers of the servers that
+    # write to it, which one worker cannot see (nv_mega_runtime_opt_ins).
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(False)
+    # Host KV pool share (tokens) and host state pool share (slots) kept free or in
+    # flight to storage; they also cap the pages / slots held for puts.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_KV_MARGIN = EnvFloat(0.05)
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_STATE_MARGIN = EnvFloat(0.05)
+    # Chain-close pages in flight as a share of the host pool (0: the KV margin), and
+    # the share of the host pool the tier writes before a closed node is re-closed.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_CLOSE_CAP = EnvFloat(0.0)
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_CLOSE_REFRESH = EnvFloat(0.25)
+    # Host pool share pinned storage hits may hold at once.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_PIN_FRAC = EnvFloat(0.25)
+    # Prefetch budget cap in tokens once a lookup holds its hit span (0: stock cap).
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_BUDGET_TOKENS = EnvInt(0)
+    # Timeout policy: admission wait <= base + SLACK x span / measured read rate.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_WAIT_SLACK = EnvFloat(3.0)
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
@@ -2735,6 +2759,13 @@ def nv_mega_runtime_switches() -> tuple[EnvField, ...]:
         if isinstance(field, EnvField) and field.default == master.get
     )
     return (master,) + children
+
+
+def nv_mega_runtime_opt_ins() -> tuple[EnvField, ...]:
+    """Opt-in NVIDIA runtime pieces: off unless set, whatever the master says. Each
+    runs a collective across ranks when on, so the startup agreement check of a
+    megakernel server covers them with the master and its children."""
+    return (envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER,)
 
 
 class _DeprecatedEnv:

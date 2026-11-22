@@ -1,12 +1,13 @@
 """Startup check that every rank of a megakernel server resolves the NVIDIA runtime
 switches the same way.
 
-The switches are SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION and every child that
-follows it. Each process resolves them from its own environment, so one rank
-launched with a different environment would run different code around the same
-collectives; the check turns that into a startup error that names the switch.
-It runs only on servers started with --enable-nvidia-megakernel; switches set
-without that flag are not cross-checked.
+The switches are SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, every child that
+follows it, and the opt-in pieces kept off it (nv_mega_runtime_opt_ins). Each
+process resolves them from its own environment, so one rank launched with a
+different environment would run different code around the same collectives; the
+check turns that into a startup error that names the switch. It runs only on
+servers started with --enable-nvidia-megakernel; switches set without that flag
+are not cross-checked.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.environ import nv_mega_runtime_switches
+from sglang.srt.environ import nv_mega_runtime_opt_ins, nv_mega_runtime_switches
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -22,9 +23,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _agreed_switches():
+    return nv_mega_runtime_switches() + nv_mega_runtime_opt_ins()
+
+
 def resolved_runtime_switches() -> tuple[str, ...]:
     """Names of the switches that resolve on in this process, in registry order."""
-    return tuple(field.name for field in nv_mega_runtime_switches() if field.get())
+    return tuple(field.name for field in _agreed_switches() if field.get())
 
 
 def agree_runtime_switches(*, group: GroupCoordinator, megakernel: bool) -> None:
@@ -52,7 +57,7 @@ def agree_runtime_switches(*, group: GroupCoordinator, megakernel: bool) -> None
 
 
 def _differences(gathered: list[tuple[str, ...]]) -> list[str]:
-    order = {field.name: i for i, field in enumerate(nv_mega_runtime_switches())}
+    order = {field.name: i for i, field in enumerate(_agreed_switches())}
     # A name this rank does not register sorts last, so the master is named first.
     names = sorted(set().union(*gathered), key=lambda n: (order.get(n, len(order)), n))
     lines = []
