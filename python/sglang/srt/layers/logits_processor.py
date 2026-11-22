@@ -14,6 +14,7 @@
 """Logits processing."""
 
 import dataclasses
+import functools
 import logging
 import os
 from contextlib import contextmanager
@@ -40,6 +41,7 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
@@ -518,10 +520,17 @@ class LogitsMetadata:
         )
 
 
+@functools.cache
+def row_gather(group):
+    return make_vocab_gather(group, local_width=4, symm_rows=0)
+
+
 class LogitsProcessor(nn.Module):
     # Override point: a subclass serving input candidate selectors names its
     # InputLogprobProcessor subclass here.
     input_logprob_processor_cls = InputLogprobProcessor
+    # deferred_argmax via row_gather (Muse Spark, Hopper)
+    use_row_gather = False
 
     def __init__(
         self,
@@ -1385,10 +1394,19 @@ class LogitsProcessor(nn.Module):
         group = get_parallel().tp_group
         num_tokens = logits.shape[0]
         local = self.deferred_local_argmax(logits)
-        gathered = torch.empty(
-            (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
-        )
-        group.all_gather_into_tensor(gathered.view(-1, 2), local)
+        if self.use_row_gather and num_tokens % 2 == 0 and local.is_contiguous():
+            gathered = (
+                row_gather(group)
+                .gather_stacked(local.view(-1, 4))
+                .view(group.world_size, num_tokens, 2)
+            )
+        else:
+            gathered = torch.empty(
+                (group.world_size, num_tokens, 2),
+                dtype=local.dtype,
+                device=local.device,
+            )
+            group.all_gather_into_tensor(gathered.view(-1, 2), local)
         if is_hip():
             return merge_row_argmax_shards(gathered)
         best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)

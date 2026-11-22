@@ -17,6 +17,8 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
@@ -104,8 +106,19 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_memory,
+    get_parallel,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -124,14 +137,19 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.use_fp32_output = True
+        self.lm_scale = None
+        if _hopper_kernels_enabled():
+            self.lm_scale = 1.0 if self.logit_scale is None else self.logit_scale
+            self.logit_scale, self.use_row_gather = None, True
 
     def _compute_lm_head(
         self, hidden_states, lm_head, embedding_bias=None, *, out=None
     ):
         if not hasattr(lm_head, "weight"):
-            return super()._compute_lm_head(
+            logits = super()._compute_lm_head(
                 hidden_states, lm_head, embedding_bias, out=out
             )
+            return logits if self.lm_scale is None else logits.mul_(self.lm_scale)
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
         if use_intel_amx_backend(lm_head):
             # ParallelLMHead swaps in PackWeightMethod on CPU+AMX, which repacks
@@ -149,6 +167,22 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 lm_head.weight.shape[0],
             ):
                 out = None
+            if (
+                self.lm_scale is not None
+                and output_dtype == torch.float32
+                and embedding_bias is None
+            ):  # the scale as the GEMM alpha (beta 0: input unread)
+                return torch.addmm(
+                    hidden_states.new_empty((), dtype=output_dtype)
+                    if out is None
+                    else out,
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight.T,
+                    out_dtype=output_dtype,
+                    beta=0,
+                    alpha=self.lm_scale,
+                    out=out,
+                )
             logits = torch.mm(
                 hidden_states.to(lm_head.weight.dtype),
                 lm_head.weight.T,
@@ -157,7 +191,7 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
             )
         if embedding_bias is not None:
             logits = logits + embedding_bias
-        return logits
+        return logits if self.lm_scale is None else logits.mul_(self.lm_scale)
 
 
 def _quantization_name(quant_config: Optional[QuantizationConfig]) -> Optional[str]:
@@ -276,6 +310,103 @@ def _sp_gathered_experts(
     return layernorm_sp.sp_reduce_scatter(
         run_experts(experts_input, topk_scores, topk_ids)
     )
+
+
+@functools.cache
+def _rows_all_gather():
+    """Last layer: the logits rows of attention output, gathered along the hidden dim."""
+    from sglang.srt.distributed.device_communicators import triton_symm_mem_ag as ag
+
+    return ag.MultimemAllGatherer(ag.recommended_max_tokens(include_prefill=False))
+
+
+def _sp_rows(shard: torch.Tensor, rows: torch.Tensor, buffers=None) -> torch.Tensor:
+    g, n = get_parallel().tp_group, shard.shape[0]
+    # attention's collective fenced earlier reads of recv
+    if buffers is not None and rows.dtype == torch.int64 and shard.is_contiguous():
+        x = buffers.push_embed(
+            rows,
+            shard.view(torch.bfloat16),
+            n * g.rank_in_group,
+            n * g.rank_in_group + n,
+        )
+        if x is not None and (y := buffers.push_all_gather(x)) is not None:
+            return y[: len(rows)].view(shard.dtype).clone()
+    local = shard[(rows - g.rank_in_group * n).clamp(0, n - 1)]
+    out = local.new_empty((g.world_size * len(rows), local.shape[1]))
+    g.all_gather_into_tensor(out, local)
+    return out.view(g.world_size, len(rows), -1)[
+        rows // n, torch.arange(len(rows), device=rows.device)
+    ]
+
+
+# eager in prefill graphs: kept rows vary per replay (capture records the call only)
+@eager_on_graph
+def _last_layer(
+    model,
+    positions,
+    stream,
+    attn_input,
+    forward_batch,
+    out,
+    sp_active: bool,
+    sp_tokens: int,
+) -> None:
+    """Last layer and final norm into ``out``, or only the logits rows into model.rows_out."""
+    with contextlib.suppress(RuntimeError):
+        forward_batch = get_forward_batch()
+    get_forward().set("sp_active", sp_active)
+    if sp_active:
+        layernorm_sp.set_sp_num_tokens(sp_tokens)
+    rows = model._logits_rows(forward_batch)
+    _, hidden_states = model.layers[-1](
+        positions, stream, attn_input, forward_batch, rows
+    )
+    if rows is None:
+        out.copy_(hidden_states)
+    model.rows_out = None if rows is None else (rows, hidden_states)
+
+
+@triton.jit
+def _pack_taps_kernel(t0, t1, t2, t3, t4, out, H: tl.constexpr, BLOCK: tl.constexpr):
+    """out[row, tap * H + col] = bf16(taps[tap][row, col])."""
+    row, tap = tl.program_id(0).to(tl.int64), tl.program_id(2)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    if tap == 0:
+        x = tl.load(t0 + row * H + col)
+    elif tap == 1:
+        x = tl.load(t1 + row * H + col)
+    elif tap == 2:
+        x = tl.load(t2 + row * H + col)
+    elif tap == 3:
+        x = tl.load(t3 + row * H + col)
+    else:
+        x = tl.load(t4 + row * H + col)
+    tl.store(out + (row * 5 + tap) * H + col, x.to(tl.bfloat16))
+
+
+def _pack_taps_supported(taps, dtype) -> bool:
+    t = taps[0]
+    return (
+        len(taps) == 5
+        and dtype == torch.bfloat16
+        and t.is_cuda
+        and t.dim() == 2
+        and t.shape[1] % 1024 == 0
+        and all(
+            a.dtype == torch.float32 and a.shape == t.shape and a.is_contiguous()
+            for a in taps
+        )
+    )
+
+
+def _pack_taps(taps):
+    """``torch.cat([t.to(bfloat16) for t in taps], -1)`` in one pass."""
+    m, h = taps[0].shape
+    out = taps[0].new_empty((m, 5 * h), dtype=torch.bfloat16)
+    if m:
+        _pack_taps_kernel[(m, h // 1024, 5)](*taps, out, H=h, BLOCK=1024)
+    return out
 
 
 def _fused_norm_boundary(
@@ -517,12 +648,17 @@ class MuseSpark1xAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
+        if rows is not None:
+            get_forward().set("sp_active", False)
         push = glue.sp_o_proj_push_plan(self, qkv.shape[0])
-        attn_out = glue.run_attention(self, qkv, positions, forward_batch, push)
+        attn_out = glue.run_attention(
+            self, qkv, positions, forward_batch, push, rows is not None
+        )
         if attn_out is not None:
             if push:
                 return bf16_gemm_dispatch(
@@ -530,6 +666,12 @@ class MuseSpark1xAttention(nn.Module):
                     self.o_proj._sp_full_weight,
                     None,
                 )
+            if (
+                rows is not None
+                and (full_w := getattr(self.o_proj, "_sp_full_weight", None))
+                is not None
+            ):
+                return torch.mm(_rows_all_gather()(attn_out), full_w.t())
             return self.o_proj(attn_out)[0]
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
@@ -553,6 +695,8 @@ class MuseSpark1xAttention(nn.Module):
         if self.rotary_emb is not None and not fuse_rope:
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
+        if rows is not None:
+            output, o_gate = output[rows], o_gate[rows]
         output = self._fused_o_norm_gate(output, o_gate)
         output, _ = self.o_proj(output)
         return output
@@ -669,7 +813,7 @@ class MuseSpark1xMoE(nn.Module):
             and self.tp_size in (4, 8)
             and torch.cuda.is_available()
             and (
-                torch.cuda.get_device_capability() == (10, 3)
+                torch.cuda.get_device_capability() in glue.SLICED_PROJECTION_CAPS
                 or (self.tp_size == 8 and torch.cuda.get_device_capability() == (10, 0))
             )
         ):
@@ -844,6 +988,12 @@ class MuseSpark1xMoE(nn.Module):
             and not getattr(get_forward(), "sp_active", False)
             and not already_reduced
         ):
+            if self.post_expert_proj is not None and not _is_cpu:
+                unpooled = glue.reduce_scatter_projection(
+                    output, self.post_expert_proj.weight
+                )
+                if unpooled is not None:
+                    return unpooled
             output = tensor_model_parallel_all_reduce(output)
         if self.post_expert_proj is not None:
             if _is_cpu:
@@ -857,6 +1007,11 @@ class MuseSpark1xMoE(nn.Module):
                 if self._defers_unpool_gather(comm, output.shape[0]):
                     return gemm_local(comm, output, self.post_expert_proj.weight)
                 return gemm_ag(comm, output, self.post_expert_proj.weight)
+            unpooled = glue.sliced_prefill_projection(
+                output, self.post_expert_proj.weight
+            )
+            if unpooled is not None:
+                return unpooled
             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
         return output
 
@@ -943,7 +1098,8 @@ class MuseSpark1xMoE(nn.Module):
                 self.tp_size in (4, 8)
                 and not sp_active
                 and (
-                    torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                    torch.cuda.get_device_capability(hidden_states.device)
+                    in glue.SLICED_PROJECTION_CAPS
                     or (
                         self.tp_size == 8
                         and torch.cuda.get_device_capability(hidden_states.device)
@@ -954,6 +1110,10 @@ class MuseSpark1xMoE(nn.Module):
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
             else:
+                expert_input = glue.sliced_prefill_projection(
+                    hidden_states, self.pre_expert_proj.weight
+                )
+            if expert_input is None:
                 expert_input = bf16_gemm_dispatch(
                     hidden_states, self.pre_expert_proj.weight, None
                 )
@@ -961,6 +1121,18 @@ class MuseSpark1xMoE(nn.Module):
             prepared_input = self.experts.prepare_input(
                 expert_input, self.pre_expert_norm
             )
+        early_norm = (
+            not sp_active
+            and self.pre_expert_norm is not None
+            and _hopper_kernels_enabled()
+            and (
+                getattr(self.experts, "use_marlin", False)
+                if self.nvfp4_checkpoint
+                else is_cuda()
+            )
+        )
+        if early_norm:
+            expert_input = _pre_expert_rms_norm(self.pre_expert_norm, expert_input)
         with (
             torch.cuda.stream(side_stream)
             if use_side_stream
@@ -1061,6 +1233,7 @@ class MuseSpark1xMoE(nn.Module):
             prepared_input=prepared_input,
             packed_topk_ids=packed_topk_ids,
             ar_workspace=ar_workspace,
+            pre_normed=early_norm,
         )
 
     def _run_local_experts(
@@ -1225,9 +1398,17 @@ class MuseSpark1xDecoderLayer(nn.Module):
         stream: torch.Tensor,
         attn_input: torch.Tensor,
         forward_batch: ForwardBatch,
+        rows: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        sp = get_forward().sp_active
+        attn_output = self.self_attn(positions, attn_input, forward_batch, rows)
+        if rows is not None:
+            stream = (
+                _sp_rows(stream, rows, getattr(self.mlp, "sp_buffers", None))
+                if sp
+                else stream[rows]
+            )
         router_dtype = self._router_dtype
         if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
             router_dtype = None
@@ -1459,9 +1640,20 @@ class MuseSpark1xModel(nn.Module):
         )
         # Layer indices whose output residual stream feeds the DFLASH draft context.
         self.layers_to_capture: List[int] = []
+        self.rows_out = None
         if self.hopper_kernels:
-            # the last layer has no next attention input to stage
-            self.layers[-1]._sp_ag_next = None
+            last = self.layers[-1]
+            last._sp_ag_next, last._fused_ffn_boundary = (
+                None,
+                functools.partial(
+                    _fused_norm_boundary(
+                        last.post_feedforward_layernorm,
+                        last.post_feedforward_residual_gate,
+                        self.norm,
+                    ),
+                    pre_norm_dtype=self.operator_dtype,
+                ),
+            )
 
     def forward(
         self,
@@ -1484,18 +1676,85 @@ class MuseSpark1xModel(nn.Module):
         if sp_active:
             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
         stream = hidden_states.to(self.residual_dtype)
-        attn_input = self.layers[0].self_attn_input_norm(stream)
+        hopper = self.hopper_kernels
+        attn_input = (
+            _pre_expert_rms_norm(self.layers[0].input_layernorm, hidden_states).to(
+                self.operator_dtype
+            )
+            if hopper
+            else self.layers[0].self_attn_input_norm(stream)
+        )
         aux_hidden_states = []
+        last = len(self.layers) - 1
+        tail = (
+            hopper
+            and forward_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and last not in self.layers_to_capture
+        )
         for layer_idx, layer in enumerate(self.layers):
+            if tail and layer_idx == last:
+                break
             stream, attn_input = layer(positions, stream, attn_input, forward_batch)
             if layer_idx in self.layers_to_capture:
                 # Draft context projection reads operator dtype, not residual_dtype.
-                aux_hidden_states.append(stream.to(self.operator_dtype))
-        norm_input = stream.to(self.operator_dtype)
-        hidden_states = self.norm(norm_input).to(self.operator_dtype)
+                aux_hidden_states.append(
+                    stream  # cast by _pack_taps
+                    if hopper and forward_batch.forward_mode.is_cuda_graph()
+                    else stream.to(self.operator_dtype)
+                )
+        if tail:
+            hidden_states = stream.new_empty(stream.shape, dtype=self.operator_dtype)
+            _last_layer(
+                self,
+                positions,
+                stream,
+                attn_input,
+                forward_batch,
+                hidden_states,
+                sp_active,
+                layernorm_sp.sp_num_tokens(),
+            )
+        elif hopper:
+            hidden_states = attn_input  # final norm applied by the last layer
+        else:
+            norm_input = stream.to(self.operator_dtype)
+            hidden_states = self.norm(norm_input).to(self.operator_dtype)
         if aux_hidden_states:
-            return hidden_states, aux_hidden_states
+            if _pack_taps_supported(aux_hidden_states, self.operator_dtype):
+                return hidden_states, _pack_taps(aux_hidden_states)
+            return hidden_states, [a.to(self.operator_dtype) for a in aux_hidden_states]
         return hidden_states
+
+    def _logits_rows(self, fb: ForwardBatch) -> Optional[torch.Tensor]:
+        """Rows LogitsProcessor keeps, if nothing else reads the last layer's other rows."""
+        if (
+            fb.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or is_dp_attention_enabled()
+            or is_cp_active(fb)
+            or glue._capturing()
+            or get_flags().dp.capturing_prefill_graph
+            or len(self.layers) - 1 in self.layers_to_capture
+            or get_global_experts_capturer() is not None
+            or fb.capture_hidden_mode.is_full()
+            and not self.layers_to_capture
+            or fb.capture_hidden_mode.is_last()
+            or get_exec().features.aux_hidden_state_capture is not None
+            or fb.token_indices_to_pool is not None
+            or fb.multi_item_delimiter_indices is not None
+            or fb.return_logprob
+            and any(
+                e > s
+                for e, s in zip(
+                    fb.extend_seq_lens_cpu, fb.extend_logprob_start_lens_cpu
+                )
+            )
+        ):
+            return None
+        return (
+            fb.extend_logits_row_index
+            if fb.extend_logits_row_index is not None
+            else torch.cumsum(fb.extend_seq_lens, dim=0) - 1
+        )
 
 
 class MuseSparkModel(nn.Module):
@@ -1596,6 +1855,22 @@ class MuseSparkTextForCausalLM(nn.Module):
         ):
             hidden_states = layernorm_sp.sp_exit_gather(
                 hidden_states, num_tokens=input_embeds.shape[0]
+            )
+            get_forward().set("sp_active", False)
+        lm = self.model.language_model
+        if lm.rows_out is not None and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            (rows, kept), lm.rows_out = lm.rows_out, None
+            hidden_states, input_ids = (
+                kept.new_empty(
+                    (
+                        (input_ids if input_ids is not None else input_embeds).shape[0],
+                        kept.shape[1],
+                    )
+                ).index_copy_(0, rows, kept),
+                None,
             )
             get_forward().set("sp_active", False)
         return self.logits_processor(

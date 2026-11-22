@@ -1,5 +1,5 @@
-"""Hopper-only Muse Spark paths: the gate shared by every one of them and the fused
-attention (attn_srv verify, pfa extend / mixed, the SP o_proj push)."""
+"""Hopper-only Muse Spark paths: the gate shared by every one of them, the fused attention
+(attn_srv verify, pfa extend / mixed, the SP o_proj push) and TP row-split pooler projections."""
 
 import functools
 from typing import Optional
@@ -19,6 +19,10 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 from sglang.srt.runtime_context import get_forward, get_memory
 
 _HOPPER = (9, 0)
+# pooler / unpooler gemm_ag GPUs; must match gemm_ag_supported
+SLICED_PROJECTION_CAPS = ((10, 3), _HOPPER)
+# prefill sizes split pooler / unpooler rows over TP (GEMM cost > all-gather)
+PREFILL_SLICE_MIN_TOKENS = 1024
 # pfa packs each key read; below this kv-weighted mean extend (measured break-even) FA3 wins
 PREFILL_MIN_MEAN_EXTEND = 32
 
@@ -35,6 +39,68 @@ def _on_hopper(device=None) -> bool:
 def hopper_kernels_enabled(device=None) -> bool:
     """Gate of every Muse Spark Hopper path; other GPUs keep the stock code."""
     return envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.get() and _on_hopper(device)
+
+
+def _row_split_group(x: torch.Tensor):
+    if (
+        x.dim() != 2
+        or x.shape[0] < PREFILL_SLICE_MIN_TOKENS
+        or not x.is_cuda
+        or not hopper_kernels_enabled(x.device)
+    ):
+        return None
+    from sglang.srt.runtime_context import get_parallel
+
+    group = get_parallel().tp_group
+    return None if get_forward().sp_active or group.world_size <= 1 else group
+
+
+def _gather_rows(group, local: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    out = local.new_empty((local.shape[0] * group.world_size, local.shape[1]))
+    group.all_gather_into_tensor(out, local)
+    return out[:num_tokens]
+
+
+def row_split(group, x: torch.Tensor, fn) -> torch.Tensor:
+    """``fn`` over this rank's block of ``x``'s rows, all-gathered back into ``x``'s rows."""
+    t = x.shape[0]
+    rows = -(-t // group.world_size)
+    local = fn(x[min(group.rank_in_group * rows, t) :][:rows])
+    if local.shape[0] < rows:
+        local = torch.cat(
+            [local, local.new_zeros((rows - local.shape[0], local.shape[1]))]
+        )
+    return _gather_rows(group, local, t)
+
+
+def sliced_prefill_projection(
+    x: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    group = _row_split_group(x)
+    if group is None:
+        return None
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+
+    return row_split(
+        group, x.contiguous(), lambda rows: bf16_gemm_dispatch(rows, weight, None)
+    )
+
+
+def reduce_scatter_projection(
+    partial: torch.Tensor, weight: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """(sum of ``partial`` over TP ranks) @ weight.T."""
+    group = _row_split_group(partial)
+    if group is None:
+        return None
+    from sglang.srt.layers.layernorm_sp import sp_reduce_scatter
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+
+    return _gather_rows(
+        group,
+        bf16_gemm_dispatch(sp_reduce_scatter(partial), weight, None),
+        partial.shape[0],
+    )
 
 
 def prepare_attention(module) -> None:

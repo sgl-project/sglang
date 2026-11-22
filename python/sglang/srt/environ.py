@@ -2406,6 +2406,11 @@ class Envs:
     # on the (N, K) shapes in hopper_bf16_small_m_gemv's tables.
     SGLANG_HOPPER_SMALL_M_GEMV = EnvBool(False)
 
+    # Chunk cap for requests returning input logprobs (0: none).
+    SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS = EnvInt(0)
+    # Opt-in: finer prefill CUDA-graph buckets below 2048 tokens.
+    SGLANG_ENABLE_FINE_PREFILL_GRAPH_BUCKETS = EnvBool(False)
+
     # ===================================================================
     # Muse Spark
     # ===================================================================

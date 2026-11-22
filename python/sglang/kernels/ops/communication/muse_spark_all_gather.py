@@ -68,6 +68,11 @@ def gemm_ag_supported(
                 and current_arch().is_sm(10, 3)
             )
             or (
+                comm.world_size in (4, 8)
+                and n in (2048, 4096, 8192)
+                and current_arch().is_sm(9, 0)
+            )
+            or (
                 comm.world_size == 8
                 and n in (4096, 8192)
                 and m <= B200_PROJECTION_MAX_TOKENS

@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -587,6 +588,12 @@ def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
         + list(range(1280, 4096 + 1, 256))
         + list(range(4608, max_bs + 1, 512))
     )
+    if envs.SGLANG_ENABLE_FINE_PREFILL_GRAPH_BUCKETS.get():
+        # Finer buckets below 2048 tokens: less padding for mid-size extends,
+        # at the cost of more captured prefill graphs.
+        capture_sizes = sorted(
+            {*capture_sizes, *range(528, 1280, 16), *range(1280, 2048, 64)}
+        )
 
     capture_sizes = [s for s in capture_sizes if s <= max_bs]
 
