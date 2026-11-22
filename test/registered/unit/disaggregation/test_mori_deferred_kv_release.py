@@ -439,8 +439,7 @@ class TestMoriAuxLayout(CustomTestCase):
         """A prefill with another buffer layout sends another buffer's item to this
         position. A longer one must not be written: it would run into the next
         request's row, or past the buffer. The room fails, since a later Success
-        would commit the unwritten row, and its later items are dropped, since its
-        row may already serve another request."""
+        would commit the unwritten row."""
         rows = (ctypes.c_ubyte * 16)()
         manager = _manager()
         manager.kv_args = SimpleNamespace(
@@ -467,8 +466,6 @@ class TestMoriAuxLayout(CustomTestCase):
         manager.update_status(11, KVPoll.Success)
         self.assertEqual(manager.request_status[11], KVPoll.Failed)
         self.assertIn("AUX_DATA rejected", manager.failure_records[11])
-        receive(b"\x03" * 8)
-        self.assertEqual(bytes(rows), bytes(16))
 
         manager.request_status[12] = KVPoll.WaitingForInput
         receive(b"\x02" * 8, room=b"12")

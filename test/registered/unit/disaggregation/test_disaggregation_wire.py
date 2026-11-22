@@ -1385,11 +1385,20 @@ class TestPollCollectives(CustomTestCase):
     def test_a_room_failed_while_its_metadata_arrived_is_not_committed(self):
         """The receive thread can drop a metadata item, fail the room, and write
         the room marker between this round's poll and the gate's marker read."""
-        poller = Mock(poll=Mock(side_effect=[KVPoll.Success, KVPoll.Failed]))
+        failed = []
+
+        class MarkerWrittenAfterTheFailure:
+            def __getitem__(self, index):
+                failed.append(True)
+                return torch.tensor(42)
+
+        poller = Mock(
+            poll=Mock(side_effect=lambda: KVPoll.Failed if failed else KVPoll.Success)
+        )
         request = SimpleNamespace(
             req=SimpleNamespace(bootstrap_host="127.0.0.1"), metadata_buffer_index=0
         )
-        metadata = SimpleNamespace(bootstrap_room=torch.tensor([[42]]))
+        metadata = SimpleNamespace(bootstrap_room=MarkerWrittenAfterTheFailure())
         with patch.object(dist, "get_world_size", return_value=1):
             result = poll_and_all_reduce([poller], object(), [request], metadata)
         self.assertEqual(result, [KVPoll.Failed])
