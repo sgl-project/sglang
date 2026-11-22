@@ -23,7 +23,7 @@ import time
 import torch
 
 from .cuda_graph import GraphSessionPool
-from .fastpath import MAX_GRAPH_TOPK, BatchedGraphSampler
+from .fastpath import MAX_GRAPH_TOPK, BatchedGraphSampler, deepselect_runnable
 from .protocol import ABC_END, MUSIC_END, Sampling, token_prefixes
 from .sampling import generate_tokens, synchronize
 
@@ -36,7 +36,12 @@ default_batched_pool = GraphSessionPool(max_sessions_per_key=int(
 
 
 def batched_ar_enabled() -> bool:
-    return os.environ.get("SGLANG_YUE2_BATCHED_AR", "1") == "1"
+    if os.environ.get("SGLANG_YUE2_BATCHED_AR", "1") != "1":
+        return False
+    # BatchedGraphSampler captures the CUDA-only DeepSelect kernel inside the
+    # pooled decode graphs; gate on the same capability probe so unsupported
+    # devices never construct those sessions and stay on the per-request path.
+    return deepselect_runnable()
 
 
 class BatchedUnsupported(Exception):

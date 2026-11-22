@@ -18,7 +18,7 @@ from .protocol import ABC_END, MUSIC_END, Sampling, SongRequest, token_prefixes
 from .sampling import _decode_loop, synchronize
 
 from .fastpath import FastSampler, fast_sampler_available
-from .fastpath import GraphSampler, _load_topk_backend
+from .fastpath import GraphSampler, _load_topk_backend, deepselect_runnable
 
 from .protocol import ABC_END, MUSIC_END
 
@@ -79,6 +79,12 @@ def _generate_song_tokens_step_graph(model, session, tokenizer, request: SongReq
     """
     if _load_topk_backend() is None:
         raise _StepGraphUnavailable("DeepSelect backend missing")
+    if not deepselect_runnable():
+        # The wrapper imports on any platform, but the JIT kernel only runs on
+        # its target SM capabilities (ROCm included: torch.cuda.is_available()
+        # is true there, yet the kernel raises inside graph capture). Route
+        # this request to the looped reference path.
+        raise _StepGraphUnavailable("DeepSelect kernel unsupported on this device")
 
     device = session.device
     

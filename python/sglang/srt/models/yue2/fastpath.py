@@ -47,16 +47,32 @@ def _load_topk_backend():
     return _IN_TREE or _PIP
 
 
-def fast_sampler_available() -> bool:
-    if os.environ.get("SGLANG_YUE2_FAST_SAMPLER", "1") != "1":
-        return False
+def deepselect_runnable() -> bool:
+    """True when the loaded top-k backend can run on the current device.
+
+    Importability says nothing about runnability: the in-tree DeepSelect JIT
+    builds only for SM 9.0/10.0/10.3, and ``torch.cuda.is_available()`` is
+    also true on ROCm, where calling the kernel raises at decode time. The
+    in-tree wrapper therefore exposes ``is_deepselect_supported()``; backends
+    without the probe (pip ``deep_select``) keep the original availability
+    check. Capability-detection errors fail safe to the reference path.
+    """
     backend = _load_topk_backend()
     if not backend:
         return False
+    probe = getattr(backend, "is_deepselect_supported", None)
     try:
-        return torch.cuda.is_available()
+        if probe is None:
+            return torch.cuda.is_available()
+        return bool(probe())
     except Exception:
         return False
+
+
+def fast_sampler_available() -> bool:
+    if os.environ.get("SGLANG_YUE2_FAST_SAMPLER", "1") != "1":
+        return False
+    return deepselect_runnable()
 
 
 STRIDE_FLOATS = 256  # DeepSelect row alignment: 1024B = 256 fp32

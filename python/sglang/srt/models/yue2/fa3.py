@@ -8,7 +8,10 @@ custom mask.
 
 ``SGLANG_YUE2_FA3=1`` (default) uses the shared op; otherwise it falls back to
 PyTorch's native variable-length FlashAttention. Imports stay lazy so importing
-this never requires ``flash_attn_3``/``sgl_kernel``.
+this never requires ``flash_attn_3``/``sgl_kernel``. On ROCm the shared op is
+skipped entirely: it imports fine but dispatches to CUDA-only FA kernels that
+fail at call time (e.g. ``ModuleNotFoundError: flash_attn``), while the native
+ATen varlen path is the validated Radeon route (honours ``seqused_k``/GQA).
 """
 from __future__ import annotations
 
@@ -25,7 +28,8 @@ def _load_varlen():
     global _VARLEN, _LOADED
     if not _LOADED:
         _LOADED = True
-        if os.environ.get("SGLANG_YUE2_FA3", "1") == "1":
+        if (os.environ.get("SGLANG_YUE2_FA3", "1") == "1"
+                and torch.version.hip is None):
             try:
                 from sglang.kernels.ops.attention.flash_attention import (
                     flash_attn_varlen_func,
