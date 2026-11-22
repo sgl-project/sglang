@@ -97,6 +97,47 @@ SGLang supports parsing reasoning content out from "normal" content for reasonin
 - GPT OSS: Uses special `<|channel|>analysis<|message|>` and `<|end|>` tags
 
 
+## Custom reasoning delimiters
+
+For a fine-tuned model that uses a different pair of reasoning delimiters,
+pass the literal strings at startup. You do not need to edit the checkpoint's
+tokenizer configuration or register special tokens:
+
+```bash
+python -m sglang.launch_server \
+  --model-path /path/to/checkpoint \
+  --reasoning-parser custom \
+  --reasoning-start-str '<reason>' \
+  --reasoning-end-str '</reason>'
+```
+
+For output such as `<reason>Check the facts.</reason>The answer is 42.`,
+the parser returns `Check the facts.` in `reasoning_content` and
+`The answer is 42.` in `content`. The parser handles streaming chunks that
+split a delimiter, and an opening delimiter prefilled at the end of the prompt.
+Output without an opening delimiter remains normal content.
+
+Both strings must be non-empty and different. They are literal delimiters,
+not regular expressions. Supplying the pair also selects the `custom` parser
+when `--reasoning-parser` is omitted or set to `auto`; combining the pair with
+another parser is rejected. The values travel with the server configuration to
+the tokenizer and scheduler processes, so later checkpoints can use the same
+launch command without carrying a separate tokenizer directory.
+
+For tool use, select the tool parser matching the model's protocol separately,
+for example `--tool-call-parser qwen`. To enable the existing strict-thinking
+path, add `--enable-strict-thinking`. On supported XGrammar byte vocabularies,
+ordinary multi-token closing delimiters are recognized even when the closing
+token also contains trailing newlines, allowing the deferred output grammar
+to become active. This does not guarantee that a model emits a complete
+reasoning block or prevent every malformed tool call.
+
+The custom parser defaults to reasoning enabled; requests may disable it with
+`"chat_template_kwargs": {"enable_thinking": false}` when the model's chat
+template has no detected reasoning toggle. Delimiter configuration controls
+parsing; it does not train the model to emit a new protocol or replace its
+chat template.
+
 ## Usage
 
 ### Launching the Server

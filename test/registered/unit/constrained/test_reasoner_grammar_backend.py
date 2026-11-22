@@ -36,10 +36,16 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.reasoning_parser import InklingDetector
+from sglang.srt.parser.reasoning_parser import (
+    InklingDetector,
+)
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
-from sglang.srt.parser.reasoning_parser import Qwen3Detector
+from sglang.srt.parser.reasoning_parser import (
+    Qwen3Detector,
+    ReasoningParser,
+)
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1690,6 +1696,33 @@ class TestTextReasoningBoundary(CustomTestCase):
                 self._accept(obj, ending)
                 self.assertTrue(obj._is_generation())
                 self.assertEqual(self._allowed(obj, [ord("{"), ord("x")]), [ord("{")])
+
+    def test_custom_cli_parser_uses_text_boundary_without_tokenizer_metadata(self):
+        """CLI delimiters must drive the same gate as checkpoint-defined delimiters."""
+        tokenizer = SimpleNamespace(
+            init_xgrammar=self.tokenizer.init_xgrammar,
+            encode=self.tokenizer.encode,
+            decode=self.tokenizer.decode,
+        )
+        with get_context().override_server_args(
+            reasoning_parser="custom",
+            reasoning_start_str="<reason>",
+            reasoning_end_str="</reason>",
+        ):
+            backend = ReasonerGrammarBackend(
+                self.inner,
+                ReasoningParser("custom"),
+                tokenizer,
+                enable_strict_thinking=True,
+            )
+            for ending in (self.end_ids, [256, 257, 258], [256, 257, 259]):
+                with self.subTest(ending=ending):
+                    obj = backend._init_value_dispatch(("regex", r"\n*\{\}"), True)
+                    self._accept(obj, ending)
+                    self.assertTrue(obj._is_generation())
+                    self.assertEqual(
+                        self._allowed(obj, [ord("{"), ord("x")]), [ord("{")]
+                    )
 
     def test_suffix_is_consumed_not_discarded(self):
         obj = self._make(r"\n{2}\{\}")

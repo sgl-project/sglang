@@ -49,6 +49,7 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     grammar_holds_calls,
 )
+from sglang.srt.runtime_context import get_serving
 
 
 class StreamingParseResult:
@@ -368,6 +369,37 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult(reasoning_text=buffer)
 
         return StreamingParseResult()
+
+
+class CustomReasoningDetector(BaseReasoningFormatDetector):
+    """Parse a literal delimiter pair supplied at server startup."""
+
+    def __init__(
+        self,
+        think_start_token: str,
+        think_end_token: str,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+        prefix: str = "",
+    ):
+        super().__init__(
+            think_start_token,
+            think_end_token,
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning
+            or prefix.endswith(think_start_token)
+            or prefix.rstrip().endswith(think_start_token),
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+            reasoning_default="enable_thinking",
+        )
+
+    def get_self_opened_think_start_token_ids(self, tokenizer):
+        return tokenizer.encode(self.think_start_token, add_special_tokens=False)
 
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
@@ -2395,6 +2427,7 @@ class ReasoningParser:
         "flint": _FlintDetector,
         "cohere_command4": CohereCommand4Detector,
         "response_template": ResponseTemplateReasoningDetector,
+        "custom": CustomReasoningDetector,
         "xing4_0": Xing4_0Detector,
     }
 
@@ -2486,6 +2519,11 @@ class ReasoningParser:
 
         if prefix is None:
             prefix = getattr(request, "_response_parser_prefix", "")
+        if detector_class is CustomReasoningDetector:
+            cfg = get_serving()
+            kwargs["think_start_token"] = cfg.reasoning_start_str
+            kwargs["think_end_token"] = cfg.reasoning_end_str
+            kwargs["prefix"] = prefix or ""
         if issubclass(detector_class, ResponseTemplateReasoningDetector):
             if prefix:
                 kwargs["prefix"] = prefix

@@ -145,6 +145,8 @@ POSITIONAL_FIELD_ORDER = (
     "return_input_ids",
     "return_output_ids",
     "reasoning_parser",
+    "reasoning_start_str",
+    "reasoning_end_str",
     "default_chat_template_kwargs",
     "strip_thinking_cache",
     "enable_strict_thinking",
