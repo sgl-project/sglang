@@ -1,0 +1,747 @@
+name: c211-127537-5090q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-5090-01:
+    name: probe-job-5090-01
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-01 nonce=$NONCE"
+          exit 0
+  job-5090-02:
+    name: probe-job-5090-02
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-02 nonce=$NONCE"
+          exit 0
+  job-5090-03:
+    name: probe-job-5090-03
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-03 nonce=$NONCE"
+          exit 0
+  job-5090-04:
+    name: probe-job-5090-04
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-04 nonce=$NONCE"
+          exit 0
+  job-5090-05:
+    name: probe-job-5090-05
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-05 nonce=$NONCE"
+          exit 0
+  job-5090-06:
+    name: probe-job-5090-06
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-06 nonce=$NONCE"
+          exit 0
+  job-5090-07:
+    name: probe-job-5090-07
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-07 nonce=$NONCE"
+          exit 0
+  job-5090-08:
+    name: probe-job-5090-08
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-08 nonce=$NONCE"
+          exit 0
+  job-5090-09:
+    name: probe-job-5090-09
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-09 nonce=$NONCE"
+          exit 0
+  job-5090-10:
+    name: probe-job-5090-10
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-10 nonce=$NONCE"
+          exit 0
+  job-5090-11:
+    name: probe-job-5090-11
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-11 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-11 nonce=$NONCE"
+          exit 0
+  job-5090-12:
+    name: probe-job-5090-12
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-12 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-12 nonce=$NONCE"
+          exit 0
+  job-5090-13:
+    name: probe-job-5090-13
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-13 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-13 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-13 nonce=$NONCE"
+          exit 0
+  job-5090-14:
+    name: probe-job-5090-14
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-14 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-14 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-14 nonce=$NONCE"
+          exit 0
+  job-5090-15:
+    name: probe-job-5090-15
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-15 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-15 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-15 nonce=$NONCE"
+          exit 0
+  job-5090-16:
+    name: probe-job-5090-16
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-16 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-16 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-16 nonce=$NONCE"
+          exit 0
+  job-5090-17:
+    name: probe-job-5090-17
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-17 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-17 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-17 nonce=$NONCE"
+          exit 0
+  job-5090-18:
+    name: probe-job-5090-18
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-18 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-18 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-18 nonce=$NONCE"
+          exit 0
+  job-5090-19:
+    name: probe-job-5090-19
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-19 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-19 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-19 nonce=$NONCE"
+          exit 0
+  job-5090-20:
+    name: probe-job-5090-20
+    runs-on: [1-gpu-5090]
+    timeout-minutes: 15
+    steps:
+      - name: device
+        shell: bash
+        env:
+          NONCE: c211-127537-b8ee50e2acbf494f
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127537-b8ee50e2acbf494f'
+          echo "C211_JOB=job-5090-20 NONCE=$NONCE"
+          echo "C211_MARKER job=job-5090-20 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- NVIDIA DRIVER VERSION (read-only) ---"
+          cat /proc/driver/nvidia/version 2>&1 | head -5 || echo NVIDIA_PROC_VERSION_ABSENT
+          echo "--- NVIDIA DEVICES (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo NVIDIA_SMI_PRESENT
+            echo "--- NVIDIA_SMI_L ---"
+            nvidia-smi -L 2>&1 | head -40 || echo NVIDIA_SMI_L_FAILED
+            echo "--- NVIDIA_SMI_QUERY ---"
+            nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -40 || echo NVIDIA_SMI_QUERY_FAILED
+            echo "--- NVIDIA_SMI_COUNT ---"
+            nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          if [ -e /dev/nvidiactl ]; then echo NVIDIA_DEV=PRESENT; else echo NVIDIA_DEV=ABSENT; fi
+          ls -l /dev/nvidiactl /dev/nvidia0 2>/dev/null | head -20 || true
+          echo "C211_PROBE_END job=job-5090-20 nonce=$NONCE"
+          exit 0
