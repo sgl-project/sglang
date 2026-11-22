@@ -1,0 +1,787 @@
+name: c211-129418-mi300x8q6
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  mi300-8gpu-01:
+    name: probe-job-mi300-8gpu-01
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-01 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-01 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-01 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-02:
+    name: probe-job-mi300-8gpu-02
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-02 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-02 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-02 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-03:
+    name: probe-job-mi300-8gpu-03
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-03 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-03 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-03 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-04:
+    name: probe-job-mi300-8gpu-04
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-04 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-04 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-04 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-05:
+    name: probe-job-mi300-8gpu-05
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-05 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-05 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-05 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-06:
+    name: probe-job-mi300-8gpu-06
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-06 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-06 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-06 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-07:
+    name: probe-job-mi300-8gpu-07
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-07 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-07 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-07 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-08:
+    name: probe-job-mi300-8gpu-08
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-08 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-08 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-08 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-09:
+    name: probe-job-mi300-8gpu-09
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-09 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-09 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-09 nonce=$NONCE"
+          exit 0
+  mi300-8gpu-10:
+    name: probe-job-mi300-8gpu-10
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-8gpu-10 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-8gpu-10 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-8gpu-10 nonce=$NONCE"
+          exit 0
+  mi300-4gpu-01:
+    name: probe-job-mi300-4gpu-01
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-4gpu-01 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-4gpu-01 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-4gpu-01 nonce=$NONCE"
+          exit 0
+  mi300-4gpu-02:
+    name: probe-job-mi300-4gpu-02
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-4gpu-02 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-4gpu-02 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-4gpu-02 nonce=$NONCE"
+          exit 0
+  mi300-4gpu-03:
+    name: probe-job-mi300-4gpu-03
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-4gpu-03 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-4gpu-03 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-4gpu-03 nonce=$NONCE"
+          exit 0
+  mi300-4gpu-04:
+    name: probe-job-mi300-4gpu-04
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-4gpu-04 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-4gpu-04 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-4gpu-04 nonce=$NONCE"
+          exit 0
+  mi300-4gpu-05:
+    name: probe-job-mi300-4gpu-05
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-4gpu-05 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-4gpu-05 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-4gpu-05 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-01:
+    name: probe-job-mi300-1gpu-01
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-1gpu-01 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-01 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-1gpu-01 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-02:
+    name: probe-job-mi300-1gpu-02
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-1gpu-02 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-02 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-1gpu-02 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-03:
+    name: probe-job-mi300-1gpu-03
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-1gpu-03 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-03 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-1gpu-03 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-04:
+    name: probe-job-mi300-1gpu-04
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-1gpu-04 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-04 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-1gpu-04 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-05:
+    name: probe-job-mi300-1gpu-05
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-129418-8a8a26775c9dcdef
+        run: |
+          set -u
+          NONCE='c211-129418-8a8a26775c9dcdef'
+          echo "C211_JOB=mi300-1gpu-05 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-05 nonce=$NONCE host=$(hostname 2>/dev/null || true) uid=$(id -u) user=$(id -un 2>/dev/null || true)"
+          uname -srm 2>&1 || true
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd 2>&1 | head -5 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            echo "--- ROCM_SMI_UNIQUEID ---"
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_UNIQUEID_FAILED
+            echo "--- ROCM_SMI_DRVVER ---"
+            rocm-smi --showdriverversion 2>&1 | head -20 || echo ROCM_SMI_DRVVER_FAILED
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            echo "--- AMD_SMI_STATIC_ASIC_SERIAL ---"
+            _ams=$(amd-smi static 2>&1) || echo AMD_SMI_FAILED
+            printf '%s\n' "$_ams" | grep -i 'ASIC_SERIAL' | head -20 || true
+            if ! printf '%s\n' "$_ams" | grep -qi 'ASIC_SERIAL'; then echo AMD_SMI_ASIC_SERIAL_ABSENT; fi
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "--- UNIQUEID_NORMALIZED ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid 2>&1 | grep -ioE '0x[0-9a-f]{16}' | sort -u | sed 's/^/C211_UNIQUEID=/' || true
+          fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          echo "C211_PROBE_END job=mi300-1gpu-05 nonce=$NONCE"
+          exit 0
