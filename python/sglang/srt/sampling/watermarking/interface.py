@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 class WatermarkRows(Protocol):
@@ -83,9 +84,8 @@ class VerifyWatermark(Protocol):
         """
         ...
 
-    def record(self, accept_index: Optional[Tensor], accept_lens: Tensor) -> None:
-        """Record the accepted positions; ``accept_index`` None after a chain
-        apply, where each row accepts a prefix of its draft positions."""
+    def commit(self, accept: VerifyAccept) -> None:
+        """Commit the applied verify's accepted tokens to the watermark state."""
         ...
 
 
@@ -105,14 +105,6 @@ class WatermarkEngine(Protocol):
     ) -> Optional[VerifyWatermark]:
         """The verify's watermark, or None when the batch has no watermark rows."""
         ...
-
-    def append_accept_tokens(
-        self,
-        rows: WatermarkRows,
-        req_pool_indices: Tensor,
-        accept_tokens: Tensor,
-        accept_lens: Tensor,
-    ) -> None: ...
 
 
 # Provider ABI v2 (``VerifySamplingView.watermark_*``) fields of a batch without
