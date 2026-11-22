@@ -39,7 +39,7 @@ from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_e
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.hybrid_cache import l3_victim_tier
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_post_verify_graphs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -67,6 +67,9 @@ class Shape(msgspec.Struct, frozen=True):
     megakernel: bool = False  # --enable-nvidia-megakernel with a built plugin
     target_class: str = ""  # the target model's class name
     envs: Dict[str, str] = {}
+    # The unified radix cache's TreeCore: the Rust default, or Python where the
+    # installation ships neither the Rust extension nor its sources.
+    tree_core: str = "rust"
 
 
 _EAGLE_CHAIN = dict(
@@ -142,6 +145,7 @@ SHAPES = {
             "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
             "SGLANG_PP_COMM_OVERLAP": "1",
         },
+        tree_core="python",
     ),
     # Other shapes that set the master (Qwen3.5 GB300, Qwen3.8-Flash-Next,
     # DeepSeek-V4.1-Flash); arguments not listed are at their defaults.
@@ -348,8 +352,9 @@ def _settled_state_victim(shape: Shape) -> bool:
 
 
 def _l3_victim_tier(shape: Shape) -> bool:
-    # The unified radix cache of the Qwen3.5 target (FULL + Mamba) on the Python
-    # TreeCore, with a Mooncake storage backend (batch_set_v2) and no linker.
+    # The unified radix cache of the Qwen3.5 target (FULL + Mamba, the draft pool
+    # derived from KV) on an unshared, non-DCP host layout, with a Mooncake
+    # storage backend (batch_set_v2, no prefix keys) and no linker.
     args = shape.args
     if not (
         envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get()
@@ -357,13 +362,18 @@ def _l3_victim_tier(shape: Shape) -> bool:
         and args.get("hicache_storage_backend") is not None
     ):
         return False
+    disagg = get_disagg()
     decline = l3_victim_tier.victim_tier_decline(
         enable_storage=True,
+        disaggregation_mode=disagg.disaggregation_mode,
+        pd_role_switch=bool(disagg.enable_pd_role_switch),
         host_memory_mode=args.get("hicache_host_memory_mode", "cache"),
         has_linker=False,
         is_write_back=args.get("hicache_write_policy") == "write_back",
+        tree_core_backend=shape.tree_core,
         unsupported=None,
         has_storage_v2=True,
+        pass_prefix_keys=False,
         victim_margin=envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_KV_MARGIN.get(),
         state_margin=envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_STATE_MARGIN.get(),
     )
@@ -589,6 +599,52 @@ class TestRuntimeChildEngagement(CustomTestCase):
         children = {field.name for field in nv_mega_runtime_switches()[1:]}
         self.assertEqual(set(RESOLVERS) | _UNTABLED, children)
         self.assertFalse(set(RESOLVERS) & _UNTABLED)
+
+    def test_l3_victim_tier_needs_python_tree_core_and_prefill_admission(self):
+        """The L3 victim tier engages only where the prefill admission loop
+        releases its pins: never on a PD decode with HiCache storage, on a server
+        that can switch roles, or on the Rust TreeCore."""
+        name = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
+        prefill = SHAPES["prefill-tp1-pp2"]
+        self.assertIn(name, engaged(prefill))
+        storage = {
+            k: prefill.args[k]
+            for k in (
+                "enable_hierarchical_cache",
+                "hicache_write_policy",
+                "hicache_storage_backend",
+                "hicache_storage_prefetch_policy",
+            )
+        }
+        decode_args = {
+            k: v
+            for k, v in SHAPES["decode-tep8"].args.items()
+            if k != "disable_radix_cache"
+        }
+        variants = {
+            "rust TreeCore": msgspec.structs.replace(prefill, tree_core="rust"),
+            "PD decode with storage": msgspec.structs.replace(
+                SHAPES["decode-tep8"],
+                args=dict(
+                    decode_args,
+                    disaggregation_decode_enable_radix_cache=True,
+                    **storage,
+                ),
+                tree_core="python",
+            ),
+            "PD role switch": msgspec.structs.replace(
+                prefill,
+                args=dict(prefill.args, enable_pd_role_switch=True),
+                envs={
+                    k: v
+                    for k, v in prefill.envs.items()
+                    if k != "SGLANG_DISAGG_STAGING_BUFFER"
+                },
+            ),
+        }
+        for label, shape in variants.items():
+            with self.subTest(variant=label):
+                self.assertNotIn(name, engaged(shape))
 
     def test_nothing_engages_with_the_master_off(self):
         for name, shape in SHAPES.items():

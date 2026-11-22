@@ -9,7 +9,8 @@ unit fixtures; test_l3_victim_tier.py drives it through the served hook code):
   producer wrote; the producer itself restores it and records the promoted copy;
 * stock path with the switch off: the landing is put (inclusive), unchanged;
 * pin: a span restored from storage survives host pressure until released;
-* detach: held victim pages are freed and the tier turns off.
+* detach: held victim pages are freed and the tier turns off;
+* a PD decode: the tier declines.
 """
 
 import itertools
@@ -17,6 +18,7 @@ import time
 import unittest
 from array import array
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -225,11 +227,30 @@ class TestL3VictimTierReal(UnifiedRadixCacheStorageFixtures, CustomTestCase):
         ):
             prod.check_hicache_events()
         self.assertTrue(vt.held)
+        # What keeps the scheduler from calling a flush or detach idle.
+        self.assertEqual(prod.l3vt_puts_in_flight(), len(vt.held))
         ok, msg = prod.detach_storage_backend()
         self.assertTrue(ok, msg)
         self.assertIsNone(prod._l3vt)
         self.assertFalse(prod.l3vt_pin_active)
+        self.assertEqual(prod.l3vt_puts_in_flight(), 0)
         self.assertEqual(host.available_size(), free0)
+
+    def test_pd_decode_declines(self):
+        """A PD decode restores its storage hits from the transfer queue, which
+        never releases a pin: the tier, and with it the pins, stay off there."""
+        d = self._make_storage_dir()
+        decode = SimpleNamespace(
+            disaggregation_mode="decode", enable_pd_role_switch=False
+        )
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_radix_cache.get_disagg", return_value=decode
+        ):
+            cache, _, _ = self._cache(d, SGLANG_OPT_HICACHE_L3_VICTIM_TIER=True)
+        self.assertIsNone(cache._l3vt)
+        self.assertIsNone(cache._l3pin)
+        self.assertFalse(cache.l3vt_pin_active)
+        self.assertIn("PD decode", cache._l3vt_cfg.decline)
 
 
 if __name__ == "__main__":

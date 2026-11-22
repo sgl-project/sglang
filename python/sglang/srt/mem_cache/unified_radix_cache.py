@@ -2701,45 +2701,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._l3vt_touch = False
         self._l3cc = None
         self.l3vt_pin_active = False
-        cc = self.cache_controller
-        host_group = cc.mem_pool_host if cc is not None else None
-        anchor_pool = (
-            host_group.anchor_entry.host_pool if host_group is not None else None
-        )
-        # The victim tier reads keys per host page and per state slot, and
-        # writes Full KV, Mamba state and the sidecars derived from them.
-        victim_unsupported = None
-        if self._tree_core_backend != "python":
-            victim_unsupported = f"the {self._tree_core_backend} TreeCore"
-        elif anchor_pool is not None and (
-            anchor_pool.shared_allocation_domain is not None
-            or anchor_pool.dcp_size != 1
-        ):
-            victim_unsupported = "shared or DCP host layout"
-        elif not set(self.tree_components) <= {
-            BASE_COMPONENT_TYPE,
-            self.slot_id(TREE_STATE),
-        }:
-            victim_unsupported = (
-                f"components {sorted(c.name for c in self.tree_components)}"
-            )
-        elif any(
-            spec.indices_from_pool not in (PoolName.KV, PoolName.MAMBA)
-            for spec in self.sidecar_pool_specs
-        ):
-            victim_unsupported = "a sidecar not derived from KV or Mamba"
-        backend = cc.storage_backend if cc is not None else None
-        cfg = L3VictimTierConfig.resolve(
-            envs,
-            enable_storage=bool(self.enable_storage and cc is not None),
-            host_memory_mode=self.host_memory_mode,
-            has_linker=self.linker is not None,
-            is_write_back=bool(self.is_write_back),
-            victim_unsupported=victim_unsupported,
-            prefetch_stop_policy=self.prefetch_stop_policy,
-            has_storage_v2=hasattr(backend, "batch_set_v2"),
-            has_lease_touch=hasattr(backend, "l3vt_touch"),
-        )
+        cfg = self._l3vt_resolve()
         self._l3vt_cfg = cfg
         switch = envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER
         if not cfg.victim:
@@ -2748,6 +2710,9 @@ class UnifiedRadixCache(BasePrefixCache):
             elif switch.is_set():
                 logger.info("%s declined: %s=0", switch.name, switch.name)
             return
+        cc = self.cache_controller
+        host_group = cc.mem_pool_host
+        anchor_pool = host_group.anchor_entry.host_pool
         state_pool = (
             self.host_pool_group.get_pool(PoolName.MAMBA)
             if self.slot_id(TREE_STATE) is not None
@@ -2792,6 +2757,71 @@ class UnifiedRadixCache(BasePrefixCache):
             self._l3cc.max_pending if self._l3cc else None,
             "".join(f"; {k} off: {v}" for k, v in cfg.ignored.items()),
         )
+
+    def _l3vt_unsupported(self) -> Optional[str]:
+        """Why this cache's layout cannot carry the victim tier, which reads keys
+        per host page and per state slot, and writes Full KV, Mamba state and the
+        sidecars derived from them."""
+        cc = self.cache_controller
+        anchor_pool = (
+            cc.mem_pool_host.anchor_entry.host_pool if cc is not None else None
+        )
+        if anchor_pool is not None and (
+            anchor_pool.shared_allocation_domain is not None
+            or anchor_pool.dcp_size != 1
+        ):
+            return "shared or DCP host layout"
+        if not set(self.tree_components) <= {
+            BASE_COMPONENT_TYPE,
+            self.slot_id(TREE_STATE),
+        }:
+            return f"components {sorted(c.name for c in self.tree_components)}"
+        if any(
+            spec.indices_from_pool not in (PoolName.KV, PoolName.MAMBA)
+            for spec in self.sidecar_pool_specs
+        ):
+            return "a sidecar not derived from KV or Mamba"
+        return None
+
+    def _l3vt_resolve(self) -> L3VictimTierConfig:
+        """The switch resolved on this rank; with the switch on, agreed over the
+        ranks that move in lockstep, so a part any of them leaves off is off on
+        every one (every rank reaches the storage-enable point together)."""
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
+        switch_on = bool(envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get())
+        disagg = get_disagg() if switch_on else None
+        cfg = L3VictimTierConfig.resolve(
+            envs,
+            enable_storage=bool(self.enable_storage and cc is not None),
+            disaggregation_mode=(
+                disagg.disaggregation_mode if disagg is not None else "null"
+            ),
+            pd_role_switch=disagg is not None and bool(disagg.enable_pd_role_switch),
+            host_memory_mode=self.host_memory_mode,
+            has_linker=self.linker is not None,
+            is_write_back=bool(self.is_write_back),
+            tree_core_backend=self._tree_core_backend,
+            victim_unsupported=self._l3vt_unsupported(),
+            prefetch_stop_policy=self.prefetch_stop_policy,
+            has_storage_v2=hasattr(backend, "batch_set_v2"),
+            pass_prefix_keys=bool(self.hicache_storage_pass_prefix_keys),
+            has_lease_touch=hasattr(backend, "l3vt_touch"),
+        )
+        if not switch_on:
+            return cfg
+        return cfg.agreed(self._l3vt_min_over_ranks(cfg.parts()))
+
+    def _l3vt_min_over_ranks(self, values: list[int]) -> list[int]:
+        """MIN over the attention TP / CP group (as the storage hit query) and then
+        the PP group: the ranks whose trees and storage drains move in lockstep."""
+        data = torch.tensor(values, dtype=torch.int32)
+        self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        if self.pp_size > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(
+                data, op=torch.distributed.ReduceOp.MIN, group=self.pp_group
+            )
+        return [int(v) for v in data.tolist()]
 
     def release_l3_victim_tier(self) -> None:
         """Storage detach: free the pages / slots held for victim puts that will
@@ -3196,8 +3226,10 @@ class UnifiedRadixCache(BasePrefixCache):
         op_id = self.cache_controller.write_storage(
             kv_host,
             [],
-            kv_keys,
-            None,
+            hash_value=kv_keys,
+            # The pages come from several nodes; the tier declines on a backend
+            # that is passed prefix keys.
+            prefix_keys=None,
             extra_pools=aux_xfers or None,
             **({"lease_touch": True} if self._l3vt_touch else {}),
         )
@@ -3220,12 +3252,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self._l3cc is not None:
             self._l3cc_after_victims(kv_pages_keyed, slots_keyed)
 
-    def _l3vt_release(self, operation, agreed_tokens: int) -> None:
-        """A victim put was acked (landed or not): free its pages / slots."""
+    def _l3vt_release(self, operation, agreed_tokens: int) -> bool:
+        """A victim put was acked (landed or not): free its pages / slots. False:
+        the op is not a victim put."""
         vt = self._l3vt
         held = vt.release(operation.id)
         if held is None:
-            return
+            return False
         vt.stats["acked_ops"] += 1
         vt.note_touch(operation.l3vt_touch_result)
         ok_pages = min(len(held.kv_pages), agreed_tokens // vt.page_size)
@@ -3237,6 +3270,7 @@ class UnifiedRadixCache(BasePrefixCache):
             vt.stats["acked_states_ok"] += ok_states
             vt.stats["put_states_failed"] += len(held.slots) - ok_states
         self._l3vt_free_held(held)
+        return True
 
     def _l3vt_free_held(self, held: Optional[HeldVictim]) -> None:
         if held is None:
@@ -3277,6 +3311,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def l3vt_note_refetch(self) -> None:
         if self._l3pin is not None:
             self._l3pin.stats["refetch_on_loss"] += 1
+
+    def l3vt_puts_in_flight(self) -> int:
+        return len(self._l3vt.held) if self._l3vt is not None else 0
 
     def _l3vt_recharge_hit(self, info, operation, hit_tokens: int) -> None:
         """Budget: once the hit is known, a lookup holds its hit span of the
@@ -4790,6 +4827,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         page_size = self.page_size
         short = requested_tokens is not None and agreed_tokens < requested_tokens
+        victim_put = False
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.finish_storage_write_ack(
                 operation.id,
@@ -4806,8 +4844,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 if self._l3cc is not None:
                     self._l3cc_note_ack(operation, agreed_tokens)
             elif self._l3vt is not None:
-                self._l3vt_release(operation, agreed_tokens)
-        if short:
+                victim_put = self._l3vt_release(operation, agreed_tokens)
+        if short and victim_put:
+            # Its pages were freed with the ack: nothing writes the tail later.
+            logger.warning(
+                "HiCache L3 victim tier: put %d wrote %d of %d tokens; the "
+                "unwritten pages left the host tier without a storage copy.",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+            )
+        elif short:
             logger.warning(
                 "HiCache storage backup operation %d wrote %d of %d tokens; the "
                 "tail stays un-backed until a later write-through covers it.",

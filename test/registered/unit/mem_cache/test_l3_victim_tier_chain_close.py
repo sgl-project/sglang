@@ -527,12 +527,16 @@ class TestInertAndConfig(unittest.TestCase):
 
         BASE = dict(
             enable_storage=True,
+            disaggregation_mode="prefill",
+            pd_role_switch=False,
             host_memory_mode="cache",
             has_linker=False,
             is_write_back=True,
+            tree_core_backend="python",
             victim_unsupported=None,
             prefetch_stop_policy="timeout",
             has_storage_v2=True,
+            pass_prefix_keys=False,
             has_lease_touch=True,
         )
         on = R(E(**{"": True}), **BASE)

@@ -831,12 +831,16 @@ class TestL3VictimTierUnits(unittest.TestCase):
 
         base = dict(
             enable_storage=True,
+            disaggregation_mode="prefill",
+            pd_role_switch=False,
             host_memory_mode="cache",
             has_linker=False,
             is_write_back=True,
+            tree_core_backend="python",
             victim_unsupported=None,
             prefetch_stop_policy="timeout",
             has_storage_v2=True,
+            pass_prefix_keys=False,
             has_lease_touch=True,
         )
         resolve = l3vt.L3VictimTierConfig.resolve
@@ -878,6 +882,19 @@ class TestL3VictimTierUnits(unittest.TestCase):
                 "shared or DCP host layout",
             ),
             ({"has_storage_v2": False}, "backend has no batch_set_v2"),
+            (
+                {"disaggregation_mode": "decode"},
+                "PD decode role (storage hits restore outside prefill admission)",
+            ),
+            (
+                {"pd_role_switch": True},
+                "PD role switch enabled (the role can change after this check)",
+            ),
+            ({"tree_core_backend": "rust"}, "the rust TreeCore"),
+            (
+                {"pass_prefix_keys": True},
+                "backend takes prefix keys, which a victim put does not carry",
+            ),
         ):
             cfg = resolve(E(**{"": True}), **{**base, **override})
             self.assertFalse(
@@ -897,6 +914,70 @@ class TestL3VictimTierUnits(unittest.TestCase):
         self.assertTrue(cc.victim and not cc.chain_close)
         pn = resolve(E(**{"": True, "pin_frac": 0.9}), **base)
         self.assertTrue(pn.victim and not pn.pin)
+        # An aggregated server engages like a PD prefill.
+        self.assertTrue(
+            resolve(E(**{"": True}), **{**base, "disaggregation_mode": "null"}).victim
+        )
+
+    def test_ranks_agree_on_the_parts(self):
+        """Every part changes which storage writes and host evictions a rank
+        makes, so the ranks of the lockstep groups take the MIN of their parts:
+        a rank that declines (here a sidecar on one PP stage) turns the tier off
+        on every rank, and a part off on one rank is off on all of them."""
+        resolve = l3vt.L3VictimTierConfig.resolve
+
+        served = {
+            "": True,
+            "_KV_MARGIN": 0.05,
+            "_STATE_MARGIN": 0.05,
+            "_CLOSE_CAP": 0.0,
+            "_CLOSE_REFRESH": 0.25,
+            "_PIN_FRAC": 0.25,
+            "_BUDGET_TOKENS": 0,
+            "_WAIT_SLACK": 3.0,
+        }
+
+        class E:
+            def __getattr__(self, name):
+                value = served[name.replace("SGLANG_OPT_HICACHE_L3_VICTIM_TIER", "")]
+                return SimpleNamespace(get=lambda: value)
+
+        base = dict(
+            enable_storage=True,
+            disaggregation_mode="prefill",
+            pd_role_switch=False,
+            host_memory_mode="cache",
+            has_linker=False,
+            is_write_back=True,
+            tree_core_backend="python",
+            victim_unsupported=None,
+            prefetch_stop_policy="timeout",
+            has_storage_v2=True,
+            pass_prefix_keys=False,
+            has_lease_touch=True,
+        )
+
+        def agree(*cfgs):
+            parts = [min(col) for col in zip(*(c.parts() for c in cfgs))]
+            return [c.agreed(parts) for c in cfgs]
+
+        engaged = resolve(E(), **base)
+        self.assertTrue(engaged.victim and engaged.pin and engaged.chain_close)
+        self.assertIs(agree(engaged, engaged)[0], engaged)
+        pp1 = resolve(
+            E(), **{**base, "victim_unsupported": "a sidecar not derived from KV"}
+        )
+        a, b = agree(engaged, pp1)
+        self.assertEqual(a.parts(), [0] * 6)
+        self.assertEqual(b.parts(), [0] * 6)
+        self.assertEqual(a.decline, "declined on another rank")
+        self.assertEqual(b.decline, "a sidecar not derived from KV")
+        no_touch = resolve(E(), **{**base, "has_lease_touch": False})
+        a, b = agree(engaged, no_touch)
+        self.assertEqual(a.parts(), b.parts())
+        self.assertTrue(a.victim and not a.lease_touch)
+        self.assertEqual(a.ignored, {"lease_touch": "off on another rank"})
+        self.assertTrue(engaged.lease_touch, "agreed() must not mutate the input")
 
     def test_env_switch_follows_the_runtime_master(self):
         with open(os.path.join(_SRT, "environ.py")) as f:
@@ -1197,12 +1278,20 @@ class TestVictimTierEndToEnd(unittest.TestCase):
         cache = make_cache(
             self, victim=True, kv_tokens=1024, state_slots=24, store=store
         )
-        self._workload(cache, rng, steps=160)
+        with self.assertLogs("l3vt-test", level="WARNING") as logs:
+            self._workload(cache, rng, steps=160)
         vt = cache._l3vt
         self.assertGreater(
             vt.stats["put_kv_pages_failed"] + vt.stats["put_states_failed"], 0
         )
         self._check_store_bytes(store)
+        # A short victim put's pages are freed at its ack: its warning must not
+        # promise a later write of the tail, as the stock backup's does.
+        short = [m for m in logs.output if " wrote " in m]
+        self.assertTrue(short)
+        for message in short:
+            self.assertIn("HiCache L3 victim tier: put", message)
+            self.assertNotIn("later write-through", message)
 
     def test_two_ranks_same_decisions(self):
         """Two ranks: same tree ops, different put timing; acks drained at the

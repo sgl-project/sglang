@@ -958,11 +958,12 @@ class Envs:
     SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Cache-mode HiCache with an L3 backend under write_back: storage is a victim tier
-    # of the host tier (a node's KV pages and Mamba state are put when they leave the
-    # host tier, with the root path's host-resident nodes closed into storage), plus
-    # pinned restores, a hit-span prefetch budget and a measured wait bound; same
-    # keys and bytes (hybrid_cache/l3_victim_tier.py). The constants below size it.
+    # Cache-mode HiCache with an L3 backend under write_back, on a PD prefill or an
+    # aggregated server: storage is a victim tier of the host tier (a node's KV pages
+    # and Mamba state are put when they leave the host tier, with the root path's
+    # host-resident nodes closed into storage), plus pinned restores, a hit-span
+    # prefetch budget and a measured wait bound; same keys and bytes
+    # (hybrid_cache/l3_victim_tier.py). The constants below size it.
     SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )

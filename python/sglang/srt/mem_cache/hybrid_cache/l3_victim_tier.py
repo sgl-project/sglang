@@ -5,7 +5,9 @@ Switch (environ.py): ``SGLANG_OPT_HICACHE_L3_VICTIM_TIER``, a child of
 explicit 0 or 1 wins). Cache policy only: every key and byte written or read is
 the one the stock path writes for that node. All parts below engage together,
 each only where its own precondition holds; a part that does not is named in
-the engaged line with its reason.
+the engaged line with its reason. The tier runs on a PD prefill or an
+aggregated server (``victim_tier_decline``), and every rank of the attention
+TP / CP and PP groups takes the same parts (``L3VictimTierConfig.agreed``).
 
 * Victim tier. Under write_back the host tier is backed up to storage when data
   *leaves* it, not when it lands. The stock path backs up every host landing,
@@ -60,6 +62,9 @@ import msgspec
 logger = logging.getLogger(__name__)
 
 SWITCH = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
+# The parts of L3VictimTierConfig, the tier first; every rank of the lockstep
+# groups must take the same ones (L3VictimTierConfig.agreed).
+_PARTS = ("victim", "lease_touch", "chain_close", "pin", "budget", "wait_bound")
 
 
 # ---------------------------------------------------------------------------
@@ -70,27 +75,46 @@ SWITCH = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
 def victim_tier_decline(
     *,
     enable_storage: bool,
+    disaggregation_mode: str,
+    pd_role_switch: bool,
     host_memory_mode: str,
     has_linker: bool,
     is_write_back: bool,
+    tree_core_backend: str,
     unsupported: Optional[str],
     has_storage_v2: bool,
+    pass_prefix_keys: bool,
     victim_margin: float,
     state_margin: float,
 ) -> Optional[str]:
-    """Why the victim tier cannot run on this cache, or None when it can."""
+    """Why the victim tier cannot run on this cache, or None when it can.
+
+    It runs where storage hits are admitted through the prefill scheduler's
+    admission loop, which releases the pins and looks a lost hit up again: a PD
+    prefill or an aggregated server, whose role cannot change at runtime. A PD
+    decode restores its storage hits from its transfer queue instead.
+    """
     if not enable_storage:
         return "storage off"
+    if disaggregation_mode == "decode":
+        return "PD decode role (storage hits restore outside prefill admission)"
+    if pd_role_switch:
+        return "PD role switch enabled (the role can change after this check)"
     if host_memory_mode != "cache":
         return f"host memory mode {host_memory_mode}"
     if has_linker:
         return "external cache linker"
     if not is_write_back:
         return "write policy is not write_back"
+    if tree_core_backend != "python":
+        return f"the {tree_core_backend} TreeCore"
     if unsupported:
         return unsupported
     if not has_storage_v2:
         return "backend has no batch_set_v2"
+    if pass_prefix_keys:
+        # A victim put batches the pages of several nodes under one op.
+        return "backend takes prefix keys, which a victim put does not carry"
     if not 0.0 < victim_margin < 0.5:
         return f"KV margin {victim_margin} outside (0, 0.5)"
     if not 0.0 < state_margin < 0.5:
@@ -123,18 +147,47 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
     def any_on(self) -> bool:
         return self.victim
 
+    def parts(self) -> List[int]:
+        """The engaged parts as 0 / 1, in ``_PARTS`` order (for a MIN over ranks)."""
+        return [int(getattr(self, part)) for part in _PARTS]
+
+    def agreed(self, parts: Sequence[int]) -> L3VictimTierConfig:
+        """This rank's config under the MIN of ``parts()`` over the ranks that move
+        in lockstep: every part another rank left off is off here too, and the
+        whole tier declines when another rank declined it."""
+        if [int(on) for on in parts] == self.parts():
+            return self
+        if not parts[0]:
+            # Declined here (decline set) or on another rank: every part is off.
+            return msgspec.structs.replace(
+                self,
+                **{part: False for part in _PARTS},
+                decline=self.decline or "declined on another rank",
+                ignored={},
+            )
+        cfg = msgspec.structs.replace(self, ignored=dict(self.ignored))
+        for part, on in zip(_PARTS[1:], parts[1:]):
+            if getattr(cfg, part) and not on:
+                setattr(cfg, part, False)
+                cfg.ignored[part] = "off on another rank"
+        return cfg
+
     @classmethod
     def resolve(
         cls,
         envs: Any,
         *,
         enable_storage: bool,
+        disaggregation_mode: str,
+        pd_role_switch: bool,
         host_memory_mode: str,
         has_linker: bool,
         is_write_back: bool,
+        tree_core_backend: str,
         victim_unsupported: Optional[str],
         prefetch_stop_policy: str,
         has_storage_v2: bool,
+        pass_prefix_keys: bool,
         has_lease_touch: bool = False,
     ) -> L3VictimTierConfig:
         """Resolve the switch against the cache's mode; the parts follow the tier."""
@@ -159,11 +212,15 @@ class L3VictimTierConfig(msgspec.Struct, kw_only=True):
             return cfg
         cfg.decline = victim_tier_decline(
             enable_storage=enable_storage,
+            disaggregation_mode=disaggregation_mode,
+            pd_role_switch=pd_role_switch,
             host_memory_mode=host_memory_mode,
             has_linker=has_linker,
             is_write_back=is_write_back,
+            tree_core_backend=tree_core_backend,
             unsupported=victim_unsupported,
             has_storage_v2=has_storage_v2,
+            pass_prefix_keys=pass_prefix_keys,
             victim_margin=cfg.victim_margin,
             state_margin=cfg.state_margin,
         )
