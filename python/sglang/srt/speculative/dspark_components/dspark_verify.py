@@ -45,6 +45,10 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_batch_info import (
+    adjusts_logits,
+    need_truncated_sampling,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -108,18 +112,10 @@ def draft_folds_static_commit(
     )
 
 
-def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+def verify_logits_adjustments_are_noop(sampling_info, *, has_grammar: bool) -> bool:
     if sampling_info is None:
-        return True
-    if sampling_info.has_custom_logit_processor:
-        return False
-    if sampling_info.step_penalties is not None:
-        return False
-    if getattr(sampling_info, "grammar_mask", None) is not None:
-        return False
-    if getattr(sampling_info, "logit_bias", None) is not None:
-        return False
-    return True
+        return not has_grammar
+    return not adjusts_logits(sampling_info, has_grammar=has_grammar)
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -369,6 +365,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                verify_tokens=verify_ids_2d,
             )
 
         return result
@@ -507,14 +504,19 @@ class TargetVerifyExecutor:
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
+        # [bs, stride] block input tokens, the anchor then the drafts; built only
+        # where read: a full block's verify ids, or the penalties.
+        verify_ids_2d = None
+        if full_block or (
+            sampling_info is not None and sampling_info.step_penalties is not None
+        ):
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
         if full_block:
             # Nothing to pack: the verify rows are the verify window.
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
                 verify_cache_loc=verify_window.verify_cache_loc,
-                verify_ids=torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
-                .reshape(-1)
-                .to(torch.int64),
+                verify_ids=verify_ids_2d.reshape(-1).to(torch.int64),
                 window_index=None,
             )
         else:
@@ -575,6 +577,7 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            verify_tokens=verify_ids_2d,
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
@@ -1304,15 +1307,14 @@ def _accepts_on_shards(
     draft_block: DraftBlockResult, sampling_info, block_verification: bool
 ) -> bool:
     # The sharded accept is a Triton chain rule on temperature-only target
-    # probabilities; block verification and top-k/top-p need the whole vocab.
+    # probabilities; block verification and truncated sampling need the whole vocab.
     # A SimpleNamespace stand-in (unit tests) has no vocab_shard.
     shard = getattr(draft_block, "vocab_shard", None)
     return (
         shard is not None
         and not getattr(draft_block, "greedy_draft", False)
         and not block_verification
-        and not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
+        and not need_truncated_sampling(sampling_info)
     )
 
 
@@ -1346,8 +1348,7 @@ def _blockwise_rejection_applies(
     return (
         rejection_noise is not None
         and not block_verification
-        and not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
+        and not need_truncated_sampling(sampling_info)
     )
 
 

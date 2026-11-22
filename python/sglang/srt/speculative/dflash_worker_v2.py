@@ -67,7 +67,8 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -87,7 +88,6 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
-    commit_block_accept_tokens_to_penalties,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
@@ -301,16 +301,6 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
-
-
-def _verify_logits_unadjusted(sampling_info) -> bool:
-    return not (
-        sampling_info.has_custom_logit_processor
-        or sampling_info.step_penalties is not None
-        or sampling_info.grammar_mask is not None
-        or sampling_info.logit_bias is not None
-        or sampling_info.sampling_mask_batch_indices is not None
-    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -923,11 +913,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.has_grammar or batch.return_logprob:
+        if batch.return_logprob:
             return False
         if sampling_info is None:
-            return self._selector_sample is None
-        if not _verify_logits_unadjusted(sampling_info):
+            return not batch.has_grammar and self._selector_sample is None
+        if (
+            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
+            # A sampling mask is captured from the full target distribution.
+            or sampling_info.sampling_mask_batch_indices is not None
+        ):
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -3671,6 +3665,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+                verify_tokens=draft_tokens,
             )
 
         # Constrain every chain position before accept picks from it.
@@ -3695,8 +3690,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
-        commit_block_accept_tokens_to_penalties(
-            batch.sampling_info, out_tokens, commit_lens
+        commit_verify_accept(
+            batch.sampling_info,
+            VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+            watermark=None,
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(

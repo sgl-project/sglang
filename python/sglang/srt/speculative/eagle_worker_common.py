@@ -18,28 +18,27 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
-    commit_accept_tokens_to_penalties,
     eagle_prepare_for_verify,
     eagle_sample,
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
-    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
 )
+from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -230,8 +229,7 @@ def make_post_verify_io(
             top_ks=sampling_info.top_ks,
             top_ps=sampling_info.top_ps,
             min_ps=sampling_info.min_ps,
-            additive_penalties=sampling_info.acc_additive_penalties,
-            scaling_penalties=sampling_info.acc_scaling_penalties,
+            step_penalties=sampling_info.step_penalties,
             logit_bias=sampling_info.logit_bias,
             sampling_seed=sampling_info.sampling_seed,
             is_all_greedy=bool(sampling_info.is_all_greedy),
@@ -252,6 +250,69 @@ def make_post_verify_io(
         simulated_accept_length_rng=simulated_accept_length_rng,
         sparse_target_max_top_k=sparse_target_max_top_k,
         sparse_bonus_argmax=sparse_bonus_argmax,
+    )
+
+
+def accept_draft_tree(
+    batch: ScheduleBatch,
+    *,
+    verify: TargetVerify,
+    verify_input: Any,
+    logits_output: Any,
+    speculative_runtime_hooks: Any,
+    post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
+    uno_target_max_top_k: Optional[int] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
+) -> VerifyAccept:
+    """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
+    under the NV mega runtime, eagle_sample otherwise."""
+    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        # Without its forced length on the device, eagle_sample would leave the fused
+        # chain for the tree kernels and draw the length on the host instead.
+        simulated_accept_length = None
+        if post_verify_graphs is not None and not batch.forward_mode.is_idle():
+            simulated_accept_length = post_verify_graphs.eager_simulated_accept_length(
+                max_tree_depth=verify_input.max_tree_depth, device=batch.device
+            )
+        post_verify_output = speculative_runtime_hooks.post_verify(
+            make_post_verify_io(
+                verify_input=verify_input,
+                sampling_info=batch.sampling_info,
+                sequence_lengths=batch.seq_lens,
+                request_pool_indices=batch.req_pool_indices,
+                device=batch.device,
+                logits_output=logits_output,
+                grammar_mask=verify.grammar_mask,
+                watermark=verify.watermark,
+                watermark_full_mask=verify.watermark_full_mask,
+                return_logprob=batch.return_logprob,
+                is_idle=batch.forward_mode.is_idle(),
+                simulated_accept_length=simulated_accept_length,
+                simulated_accept_length_rng=simulated_acc_len_rng,
+                sparse_target_max_top_k=uno_target_max_top_k,
+                sparse_bonus_argmax=sparse_bonus_argmax,
+            )
+        )
+        return VerifyAccept(
+            tokens=post_verify_output.token_ids,
+            accept_lens=post_verify_output.accepted_lengths,
+            accept_index=post_verify_output.accepted_indices,
+        )
+    predict, accept_lens, accept_index = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        verify.grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
+        watermark=verify.watermark,
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
+    )
+    return VerifyAccept(
+        tokens=predict, accept_lens=accept_lens, accept_index=accept_index
     )
 
 
@@ -881,6 +942,17 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
+    attn_verify_mask = target_worker.model_runner.attn_backend.verify_mask
+    verify = TargetVerify.prepare(
+        batch,
+        logits_output=logits_output,
+        grammar_tree=grammar_tree,
+        grammar_barrier=grammar_barrier,
+        watermark_engine=target_worker.model_runner.watermark,
+        watermark_full_mask=(
+            attn_verify_mask is None or attn_verify_mask.mode == TreeMaskMode.FULL_MASK
+        ),
+    )
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
     # SGLang's post-verify graphs when they are on, for a batch they can replay;
@@ -906,10 +978,13 @@ def run_eagle_verify(
                 accept_lens=accept_lens,
                 num_draft_tokens=num_draft_tokens,
             )
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch, logits_output, predict, accept_index=accept_index
-            )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(
+                tokens=predict, accept_lens=accept_lens, accept_index=accept_index
+            ),
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -926,79 +1001,23 @@ def run_eagle_verify(
             prepared_draft_extend_inputs=post[5],
         )
 
-    # Generate vocab mask for constrained decoding
-    grammar_mask = None
-    if batch.has_grammar:
-        grammar_mask = build_grammar_vocab_mask(
-            reqs=batch.reqs,
-            tree=grammar_tree,
-            sampling_info=batch.sampling_info,
-            device=verify_input.retrieve_next_token.device,
-            barrier=grammar_barrier,
-        )
-
-    # Sample
-    maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-    maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    watermark_full_mask = (
-        target_worker.model_runner.attn_backend.verify_mask is None
-        or target_worker.model_runner.attn_backend.verify_mask.mode
-        == TreeMaskMode.FULL_MASK
+    accept = accept_draft_tree(
+        batch,
+        verify=verify,
+        verify_input=verify_input,
+        logits_output=logits_output,
+        speculative_runtime_hooks=speculative_runtime_hooks,
+        post_verify_graphs=post_verify_graphs,
+        uno_target_max_top_k=uno_target_max_top_k,
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
     )
-    watermark_engine = target_worker.model_runner.watermark
-    watermark = (
-        watermark_engine.bind_verify(
-            batch.sampling_info.watermark, full_mask=watermark_full_mask
-        )
-        if watermark_engine is not None
-        else None
+    verify.commit(batch, logits_output=logits_output, accept=accept)
+    predict, accept_lens, accept_index = (
+        accept.tokens,
+        accept.accept_lens,
+        accept.accept_index,
     )
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
-        # Without its forced length on the device, eagle_sample would leave the fused
-        # chain for the tree kernels and draw the length on the host instead.
-        simulated_accept_length = None
-        if post_verify_graphs is not None and not batch.forward_mode.is_idle():
-            simulated_accept_length = post_verify_graphs.eager_simulated_accept_length(
-                max_tree_depth=verify_input.max_tree_depth, device=batch.device
-            )
-        post_verify_output = speculative_runtime_hooks.post_verify(
-            make_post_verify_io(
-                verify_input=verify_input,
-                sampling_info=batch.sampling_info,
-                sequence_lengths=batch.seq_lens,
-                request_pool_indices=batch.req_pool_indices,
-                device=batch.device,
-                logits_output=logits_output,
-                grammar_mask=grammar_mask,
-                watermark=watermark,
-                watermark_full_mask=watermark_full_mask,
-                return_logprob=batch.return_logprob,
-                is_idle=batch.forward_mode.is_idle(),
-                simulated_accept_length=simulated_accept_length,
-                simulated_accept_length_rng=simulated_acc_len_rng,
-                sparse_target_max_top_k=uno_target_max_top_k,
-                sparse_bonus_argmax=sparse_bonus_argmax,
-            )
-        )
-        predict = post_verify_output.token_ids
-        accept_lens = post_verify_output.accepted_lengths
-        accept_index = post_verify_output.accepted_indices
-    else:
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(
-            verify_input,
-            batch,
-            logits_output,
-            grammar_mask,
-            uno_target_max_top_k=uno_target_max_top_k,
-            watermark=watermark,
-            simulated_acc_len_rng=simulated_acc_len_rng,
-            sparse_bonus_argmax=sparse_bonus_argmax,
-        )
-    commit_accept_tokens_to_penalties(batch.sampling_info, predict, accept_index)
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:
@@ -1046,14 +1065,6 @@ def run_eagle_verify(
         prepared_step_indices=prepared_commit_steps,
     )
 
-    if not batch.forward_mode.is_idle() and watermark is not None:
-        target_worker.model_runner.watermark.append_accept_tokens(
-            batch.sampling_info.watermark,
-            batch.req_pool_indices,
-            predict[accept_index],
-            accept_lens,
-        )
-
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -1068,9 +1079,6 @@ def run_eagle_verify(
         )
     elif batch.forward_mode.is_idle():
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
-
-    if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front
