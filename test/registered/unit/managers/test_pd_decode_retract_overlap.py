@@ -1,5 +1,6 @@
 """A PD decode retraction must back up state at the same step as output_ids."""
 
+import sys
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -174,3 +175,7 @@ def test_other_steps_keep_the_result_in_flight(mode, overlap, has_room):
     assert "settle" not in events
     assert len(s.result_queue) == 1
     assert s.last_batch is not None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

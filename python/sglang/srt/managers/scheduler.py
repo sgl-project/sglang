@@ -4608,7 +4608,10 @@ class Scheduler(
         previous step is still in flight: it may advance recurrent state in
         place and commit a speculative verify's accepted block into KV and
         draft state, while result processing skips retracted requests, so
-        output_ids stay a step behind. Returns whether anything was settled.
+        output_ids stay a step behind. PP decode needs no settle here because
+        event_loop_pp_disagg_decode post-processes mbs[mb_id] at the end of
+        mb_id - 1 before update_running_batch runs on running_mbs[mb_id].
+        Returns whether anything was settled.
         """
         if (
             self.disaggregation_mode != DisaggregationMode.DECODE
