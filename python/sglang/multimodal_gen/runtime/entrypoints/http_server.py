@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.scheduler_client import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
+    maybe_apply_auto_residency,
     run_async_client_warmup,
     should_run_synthetic_server_warmup,
 )
@@ -136,6 +137,9 @@ async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
             fail_open=server_args.warmup_resolutions is None,
             check_backend=check_backend,
         )
+        # Freeze the auto residency decision before the server reports ready.
+        # Raises only when a rollback failed, which aborts startup below.
+        await maybe_apply_auto_residency(server_args, async_scheduler_client.forward)
         # A worker can exit after replying, before the periodic monitor runs.
         check_backend()
         logger.info("The server is fired up and ready to roll!")

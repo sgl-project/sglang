@@ -11,6 +11,7 @@ import json
 import math
 import os
 import queue
+import shlex
 import threading
 import time
 from dataclasses import replace
@@ -23,6 +24,7 @@ import pytest
 import requests
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import DEFAULT_FPS
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
@@ -51,6 +53,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     get_model_task_type_for_server_args,
     get_perf_baseline_update_path,
+    get_sampling_param_field_names_for_server_args,
+    supports_auto_residency_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -120,6 +124,40 @@ def _print_case_log_separator(case_id: str, state: str) -> None:
         f"{_CASE_LOG_SEPARATOR}",
         flush=True,
     )
+
+
+def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
+    """Representative workload passed to startup residency calibration."""
+    sampling = case.sampling_params
+    if sampling is None:
+        return {}
+    sampling_field_names = get_sampling_param_field_names_for_server_args(
+        case.server_args
+    )
+    overrides = {
+        name: value
+        for name, value in sampling.extras.items()
+        if name in sampling_field_names
+    }
+    if sampling.output_size:
+        width, height = sampling.output_size.lower().split("x", 1)
+        overrides.update(width=int(width), height=int(height))
+    if sampling.num_frames is not None:
+        overrides["num_frames"] = sampling.num_frames
+    elif case.server_args.modality == "image":
+        # Omni pipelines can expose a video-oriented model default even when
+        # this case calls /v1/images, whose implicit temporal extent is one.
+        overrides["num_frames"] = 1
+    else:
+        # /v1/videos resolves an omitted num_frames from seconds * fps.
+        overrides["num_frames"] = sampling.seconds * (sampling.fps or DEFAULT_FPS)
+    if sampling.fps is not None:
+        overrides["fps"] = sampling.fps
+    if sampling.num_outputs_per_prompt > 1:
+        overrides["num_outputs_per_prompt"] = sampling.num_outputs_per_prompt
+    if isinstance(sampling.image_path, (list, tuple)):
+        overrides["image_path"] = ["warmup"] * len(sampling.image_path)
+    return overrides
 
 
 def _key_frame_distances(
@@ -197,6 +235,32 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
+
+    if supports_auto_residency_for_server_args(server_args):
+        warmup_params = _case_warmup_sampling_params(case)
+        if warmup_params:
+            tokens = shlex.split(extra_args)
+            option = "--warmup-sampling-params"
+            remaining = []
+            existing = {}
+            index = 0
+            while index < len(tokens):
+                token = tokens[index]
+                name, separator, value = token.partition("=")
+                if name == option:
+                    if not separator:
+                        index += 1
+                        value = tokens[index]
+                    existing.update(json.loads(value))
+                else:
+                    remaining.append(token)
+                index += 1
+            # quality is also injected by the shared testcase defaults;
+            # it must not suppress the actual request's calibration shape
+            if set(existing) <= {"quality"}:
+                existing = warmup_params | existing
+            remaining.extend([option, json.dumps(existing, separators=(",", ":"))])
+            extra_args = shlex.join(remaining)
 
     # Build custom environment variables
     env_vars = {}

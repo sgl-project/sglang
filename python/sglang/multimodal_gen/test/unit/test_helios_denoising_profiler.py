@@ -107,6 +107,7 @@ class TestHeliosStepHostOverhead(unittest.TestCase):
         }
         for device in ("cpu", "meta"):
             batch = SimpleNamespace(
+                is_warmup=False,
                 latents=torch.zeros(1, device=device),
                 scheduler=None,
                 guidance_scale=1.0,
