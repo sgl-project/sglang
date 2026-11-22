@@ -156,7 +156,8 @@ class SchedulerMlxOverlapMixin:
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             self._prepare_mlx_launch(batch)
             # Build logit_bias and the custom processors, as Scheduler.run_batch does.
-            batch.sampling_info.set_plugin_state(batch.reqs)
+            if self.is_generation:
+                batch.sampling_info.set_plugin_state(batch.reqs)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
