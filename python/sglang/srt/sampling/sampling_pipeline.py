@@ -1,15 +1,16 @@
-"""The order of one sampling step, written in one place:
+"""The order of one sampling step, written in one place and run by sampling
+and by every speculative target verify:
 
     penalty -> grammar mask -> logit_bias -> watermark -> custom logit processor
-    -> sanitize -> sampler (logprobs, TP token sync) -> commit
+    -> sanitize (sampling only) -> sampler or accept core -> commit
 
-A `SamplingObserver` sees the logits between the penalty and the grammar mask.
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
-builds at each launch from the step's requests. The grammar mask, logit_bias,
-and the custom logit processor are plugins: stateless `(logits, sampling_info)`
-functions; speculative verify calls the last two with several rows per request
-(`rows_per_request`) and builds its own grammar mask. Penalty and watermark are
-adapters over their existing code.
+builds at each launch (`set_step_state`). A verify (`VerifyStep`) differs only
+in what each stage gets: several rows per request, the penalty along the draft
+tree or chain, and a grammar mask built over the draft tree. Penalty and
+watermark keep per-request state, so each also commits the sampled tokens
+or a verify's `VerifyAccept`. A `SamplingObserver` sees the sampling logits
+between the penalty and the grammar mask.
 """
 
 from __future__ import annotations

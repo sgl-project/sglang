@@ -5496,8 +5496,7 @@ class Scheduler(
             batch.sampling_info.watermark = build_watermark_rows(
                 batch.reqs, batch.device
             )
-            batch.sampling_info.set_plugin_state(batch.reqs)
-            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
+            batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

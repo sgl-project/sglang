@@ -297,7 +297,7 @@ class TestCopyForForward(CustomTestCase):
                 self.assertIs(copied.__dict__[name], value, name)
 
 
-# set_plugin_state and set_seeds_and_mask_rows
+# set_step_state
 class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -357,25 +357,25 @@ class TestStepBuilds(CustomTestCase):
         self._exec_ns.deterministic.enable_deterministic_inference = True
 
         info = _make_info()
-        info.set_seeds_and_mask_rows([self._make_req(seed=123), self._make_req()])
+        info.set_step_state([self._make_req(seed=123), self._make_req()])
         self.assertEqual(info.sampling_seed.tolist(), [123, 42])
 
         # An idle batch still seeds, with no rows.
-        info.set_seeds_and_mask_rows([])
+        info.set_step_state([])
         self.assertEqual(info.sampling_seed.tolist(), [])
 
     def test_seed_without_deterministic_inference(self):
         """A non-greedy request's seed applies; a greedy seed, or speculative
         decoding, leaves the batch unseeded."""
         info = _make_info()
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
+        info.set_step_state([self._make_req(seed=123, top_k=50)])
         self.assertEqual(info.sampling_seed.tolist(), [123])
 
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=1)])
+        info.set_step_state([self._make_req(seed=123, top_k=1)])
         self.assertIsNone(info.sampling_seed)
 
         self._spec_ns.speculative_algorithm = "EAGLE"
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
+        info.set_step_state([self._make_req(seed=123, top_k=50)])
         self.assertIsNone(info.sampling_seed)
 
     def test_unseeded_row_samples_with_its_filler_seed(self):
@@ -387,13 +387,13 @@ class TestStepBuilds(CustomTestCase):
             self._make_req(filler_seed=789),
         )
         info = _make_info()
-        info.set_seeds_and_mask_rows([seeded, a])
+        info.set_step_state([seeded, a])
         self.assertEqual(info.sampling_seed.tolist(), [123, 456])
 
-        info.set_seeds_and_mask_rows([b, a, seeded])
+        info.set_step_state([b, a, seeded])
         self.assertEqual(info.sampling_seed.tolist(), [789, 456, 123])
 
-        info.set_seeds_and_mask_rows([b, a])
+        info.set_step_state([b, a])
         self.assertIsNone(info.sampling_seed)
 
     def test_mask_rows(self):
@@ -405,7 +405,7 @@ class TestStepBuilds(CustomTestCase):
             self._make_req(top_k=3, mask_mode="support"),
         ]
         info = _make_info()
-        info.set_seeds_and_mask_rows(reqs)
+        info.set_step_state(reqs)
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1, 2, 3])
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
@@ -413,12 +413,12 @@ class TestStepBuilds(CustomTestCase):
         self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
         self.assertEqual(info.sampling_seed[2].item(), 9)
 
-        info.set_seeds_and_mask_rows(reqs[:2])
+        info.set_step_state(reqs[:2])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
         self.assertIsNone(info.sampling_support_logprobs_capture_indices)
         self.assertIsNone(info.sampling_seed)
 
-        info.set_seeds_and_mask_rows(reqs[:1])
+        info.set_step_state(reqs[:1])
         self.assertIsNone(info.sampling_mask_batch_indices)
         self.assertIsNone(info.sampling_mask_top_ks)
 
@@ -442,7 +442,7 @@ class TestStepBuilds(CustomTestCase):
             max_page_tokens=3,
         )
         info = _make_info()
-        info.set_plugin_state([req])
+        info.set_step_state([req])
         self.assertTrue(info.has_custom_logit_processor)
         logits = torch.zeros(1, VOCAB_SIZE)
         apply_custom_logit_processor(logits, info)
@@ -452,19 +452,19 @@ class TestStepBuilds(CustomTestCase):
     def test_grammars_are_set_only_when_a_request_has_one(self):
         reqs = [self._make_req(), self._make_req()]
         info = _make_info()
-        info.set_plugin_state(reqs)
+        info.set_step_state(reqs)
         self.assertIsNone(info.grammars)
 
         grammar = object()
         reqs[1].grammar = grammar
-        info.set_plugin_state(reqs)
+        info.set_step_state(reqs)
         self.assertEqual(info.grammars, [None, grammar])
 
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()
         req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
         info = _make_info()
-        info.set_plugin_state([req])
+        info.set_step_state([req])
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
@@ -481,7 +481,7 @@ class TestStepBuilds(CustomTestCase):
         req2.sampling_params.custom_params = None
 
         info = _make_info()
-        info.set_plugin_state([req1, req2])
+        info.set_step_state([req1, req2])
 
         self.assertTrue(info.has_custom_logit_processor)
         self.assertIsNotNone(info.custom_logit_processor)
