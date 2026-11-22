@@ -20,7 +20,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -431,7 +434,11 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
 
         # The SAME prepared target-canvas images feed
         # Qwen and the visual-condition tokenizer; preparation is cached per request.
-        prepared = minimax_h3_prepared_keyframes(batch, plan)
+        prepared = minimax_h3_prepared_keyframes(
+            batch,
+            plan,
+            keyframe_fit=get_global_server_args().pipeline_config.keyframe_fit,
+        )
         images = [item["image"] for item in prepared["images"]]
         frame_indices = tuple(prepared.get("semantic_frame_indices") or ())
         if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES or len(
