@@ -180,16 +180,17 @@ class TestReceiverControlMessages(CustomTestCase):
             draft_rows_dcp_collapsed=True,
             num_draft_entries=0,
         )
-        manager.agent = SimpleNamespace(
-            name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
-        )
         manager.engine_desc = SimpleNamespace(
             key="mori-peer", pack=lambda: b"engine-desc"
         )
         manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
         manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
         manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
-        manager.transport = SimpleNamespace(session_id="mooncake-peer")
+        manager.transport = SimpleNamespace(
+            session_id="mooncake-peer",
+            agent_name="nixl-peer",
+            agent_metadata=b"agent-desc",
+        )
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
