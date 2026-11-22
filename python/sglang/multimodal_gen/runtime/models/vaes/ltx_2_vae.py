@@ -638,8 +638,6 @@ class LTX2VideoDownBlock3D(nn.Module):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(
         self,
         in_channels: int,
@@ -712,8 +710,6 @@ class LTX2VideoDownBlock3D(nn.Module):
                     )
                 )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -724,12 +720,7 @@ class LTX2VideoDownBlock3D(nn.Module):
         r"""Forward method of the `LTXDownBlock3D` class."""
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(hidden_states, temb, generator, causal=causal)
+            hidden_states = resnet(hidden_states, temb, generator, causal=causal)
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
@@ -758,8 +749,6 @@ class LTX2VideoMidBlock3d(nn.Module):
         is_causal (`bool`, defaults to `True`):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
-
-    _supports_gradient_checkpointing = True
 
     def __init__(
         self,
@@ -796,8 +785,6 @@ class LTX2VideoMidBlock3d(nn.Module):
             )
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -820,19 +807,14 @@ class LTX2VideoMidBlock3d(nn.Module):
             temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(
-                    hidden_states,
-                    temb,
-                    generator,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
-                )
+            hidden_states = resnet(
+                hidden_states,
+                temb,
+                generator,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+            )
 
         return hidden_states
 
@@ -929,8 +911,6 @@ class LTX2VideoUpBlock3d(nn.Module):
             Whether this layer behaves causally (future frames depend only on past frames) or not.
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(
         self,
         in_channels: int,
@@ -1000,8 +980,6 @@ class LTX2VideoUpBlock3d(nn.Module):
             )
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1043,19 +1021,14 @@ class LTX2VideoUpBlock3d(nn.Module):
                 )
 
         for i, resnet in enumerate(self.resnets):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    resnet, hidden_states, temb, generator, causal
-                )
-            else:
-                hidden_states = resnet(
-                    hidden_states,
-                    temb,
-                    generator,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
-                )
+            hidden_states = resnet(
+                hidden_states,
+                temb,
+                generator,
+                causal=causal,
+                conv_cache=conv_cache,
+                cache_key=None if cache_key is None else f"{cache_key}.resnets.{i}",
+            )
 
         return hidden_states
 
@@ -1176,8 +1149,6 @@ class LTX2VideoEncoder3d(nn.Module):
             spatial_padding_mode=spatial_padding_mode,
         )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self, hidden_states: torch.Tensor, causal: Optional[bool] = None
     ) -> torch.Tensor:
@@ -1206,20 +1177,10 @@ class LTX2VideoEncoder3d(nn.Module):
         hidden_states = hidden_states.permute(0, 1, 3, 7, 5, 2, 4, 6).flatten(1, 4)
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for down_block in self.down_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    down_block, hidden_states, None, None, causal
-                )
+        for down_block in self.down_blocks:
+            hidden_states = down_block(hidden_states, causal=causal)
 
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states, None, None, causal
-            )
-        else:
-            for down_block in self.down_blocks:
-                hidden_states = down_block(hidden_states, causal=causal)
-
-            hidden_states = self.mid_block(hidden_states, causal=causal)
+        hidden_states = self.mid_block(hidden_states, causal=causal)
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = self.conv_act(hidden_states)
@@ -1365,8 +1326,6 @@ class LTX2VideoDecoder3d(nn.Module):
                 torch.randn(2, output_channel) / output_channel**0.5
             )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1387,32 +1346,22 @@ class LTX2VideoDecoder3d(nn.Module):
         if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states, temb, None, causal
-            )
+        hidden_states = self.mid_block(
+            hidden_states,
+            temb,
+            causal=causal,
+            conv_cache=conv_cache,
+            cache_key=_ck("mid_block"),
+        )
 
-            for up_block in self.up_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    up_block, hidden_states, temb, None, causal
-                )
-        else:
-            hidden_states = self.mid_block(
+        for i, up_block in enumerate(self.up_blocks):
+            hidden_states = up_block(
                 hidden_states,
                 temb,
                 causal=causal,
                 conv_cache=conv_cache,
-                cache_key=_ck("mid_block"),
+                cache_key=_ck(f"up_blocks.{i}"),
             )
-
-            for i, up_block in enumerate(self.up_blocks):
-                hidden_states = up_block(
-                    hidden_states,
-                    temb,
-                    causal=causal,
-                    conv_cache=conv_cache,
-                    cache_key=_ck(f"up_blocks.{i}"),
-                )
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -1648,7 +1597,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
     for all models (such as downloading or saving).
     """
 
-    _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
 
     def __init__(self, config: LTXVideoVAEConfig):
@@ -1869,7 +1817,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         batch_size, num_channels, num_frames, height, width = x.shape
 
-        if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
+        if self.use_framewise_encoding and num_frames > self.tile_sample_min_num_frames:
             return self._temporal_tiled_encode(x, causal=causal)
 
         if self.use_tiling and (

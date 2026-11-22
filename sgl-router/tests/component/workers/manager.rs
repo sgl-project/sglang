@@ -6,12 +6,15 @@ use clap::Parser;
 use serde_json::{json, Value};
 use sgl_router::config::Cli;
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::workers::control::{
+    ExternalWorkerSource, OperationState, WorkerControlService, WorkerInput,
+};
 use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, Barrier};
+use tokio::sync::{mpsc, oneshot, watch, Barrier, Notify};
 
 /// Spin up a tiny fake worker that returns `body` on both introspection
 /// endpoints. Returns the worker base URL and a shutdown channel.
@@ -78,6 +81,340 @@ async fn wait_until(condition: impl Fn() -> bool, description: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+}
+
+fn control_input(url: &str, mode: WorkerMode) -> WorkerInput {
+    WorkerInput {
+        url: url.into(),
+        mode,
+        model_ids: Vec::new(),
+        bootstrap_port: None,
+        version_group: None,
+        services: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn manager_processes_control_create_replace_and_remove() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (discovery_tx, discovery_rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let (control, control_rx) =
+        WorkerControlService::new(registry.clone(), ExternalWorkerSource::Static);
+    let metrics = sgl_router::server::metrics::MetricsRegistry::new();
+    let manager = tokio::spawn(manager::run_with_config_and_control(
+        discovery_rx,
+        control_rx,
+        control.clone(),
+        None,
+        None,
+        None,
+        Some(metrics.clone()),
+    ));
+
+    let created = control
+        .create(control_input(&url, WorkerMode::Plain))
+        .expect("create accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Succeeded)
+                    && view.runtime.is_some()
+            })
+        },
+        "control create to complete",
+    )
+    .await;
+
+    let mut replacement = control_input(&url, WorkerMode::Plain);
+    replacement.version_group = Some("v2".into());
+    let replaced = control
+        .replace(&created.worker_id, replacement, created.revision)
+        .expect("replace accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.revision == Some(replaced.revision)
+                    && view.version_group.as_deref() == Some("v2")
+                    && view
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Succeeded)
+            })
+        },
+        "control replace to complete",
+    )
+    .await;
+
+    let removed = control
+        .remove(&created.worker_id, replaced.revision)
+        .expect("remove accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.revision == Some(removed.revision)
+                    && view.deleted
+                    && view
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Succeeded)
+            })
+        },
+        "control remove to complete",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_none());
+    let rendered = metrics.render();
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="create",outcome="succeeded"} 1"#
+    ));
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="replace",outcome="succeeded"} 1"#
+    ));
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="remove",outcome="succeeded"} 1"#
+    ));
+
+    drop(discovery_tx);
+    manager.abort();
+}
+
+#[tokio::test]
+async fn manager_records_control_registration_failure() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (discovery_tx, discovery_rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    registry
+        .add(WorkerSpec {
+            id: WorkerId("plain".into()),
+            url: "http://plain:30000".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+            ..Default::default()
+        })
+        .expect("plain worker");
+    let (control, control_rx) =
+        WorkerControlService::new(registry.clone(), ExternalWorkerSource::Static);
+    let manager = tokio::spawn(manager::run_with_config_and_control(
+        discovery_rx,
+        control_rx,
+        control.clone(),
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    let created = control
+        .create(control_input(&url, WorkerMode::Prefill))
+        .expect("create accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Failed)
+            })
+        },
+        "failed control create to be recorded",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_none());
+    assert!(registry.get(&WorkerId("plain".into())).is_some());
+
+    drop(discovery_tx);
+    manager.abort();
+}
+
+/// A worker whose introspection signals `started` and then holds until
+/// `release` is set, so a test can park the manager at a known point.
+async fn spawn_held_worker(
+    body: Value,
+) -> (
+    String,
+    Arc<Notify>,
+    watch::Sender<bool>,
+    oneshot::Sender<()>,
+) {
+    let body = Arc::new(body);
+    let started = Arc::new(Notify::new());
+    let (release, released) = watch::channel(false);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serve = {
+        let started = Arc::clone(&started);
+        move || {
+            let body = Arc::clone(&body);
+            let started = Arc::clone(&started);
+            let mut released = released.clone();
+            async move {
+                started.notify_one();
+                let _ = released.wait_for(|open| *open).await;
+                Json((*body).clone())
+            }
+        }
+    };
+    let app = Router::new()
+        .route("/server_info", get(serve.clone()))
+        .route("/model_info", get(serve));
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), started, release, tx)
+}
+
+/// A failed create queues a discovery restore for its URL. If the operator's
+/// retry for the same URL is accepted before that restore is dequeued, the
+/// restore must stay deferred: registering the discovery spec alongside the
+/// retry would put one URL under two ids.
+#[tokio::test]
+async fn restore_after_failed_create_defers_to_accepted_retry() {
+    let (prefill_url, _prefill) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (url, url_started, url_release, _url_worker) =
+        spawn_held_worker(json!({"served_model_name": "m"})).await;
+    let (blocker_url, blocker_started, blocker_release, _blocker) =
+        spawn_held_worker(json!({"served_model_name": "m"})).await;
+    let (discovery_tx, discovery_rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let (control, control_rx) =
+        WorkerControlService::new(registry.clone(), ExternalWorkerSource::Kubernetes);
+    let manager = tokio::spawn(manager::run_with_config_and_control(
+        discovery_rx,
+        control_rx,
+        control.clone(),
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    let prefill_id = WorkerId("prefill".into());
+    discovery_tx
+        .send(DiscoveryEvent::Added(WorkerSpec {
+            bootstrap_port: Some(8998),
+            ..spec_for(&prefill_id.0, &prefill_url, WorkerMode::Prefill)
+        }))
+        .await
+        .unwrap();
+    wait_until(
+        || registry.get(&prefill_id).is_some(),
+        "prefill registration",
+    )
+    .await;
+
+    // A plain create against a prefill fleet fails on the registry's mixed-mode
+    // check, but only after introspection, which the held worker parks.
+    let created = control
+        .create(control_input(&url, WorkerMode::Plain))
+        .expect("create accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Processing)
+            })
+        },
+        "create to start processing",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), url_started.notified())
+        .await
+        .expect("create introspection to start");
+
+    // Discovery learns the same URL while the create is in flight: suppressed.
+    let discovered_id = WorkerId("discovered".into());
+    discovery_tx
+        .send(DiscoveryEvent::Added(WorkerSpec {
+            bootstrap_port: Some(8998),
+            ..spec_for(&discovered_id.0, &url, WorkerMode::Prefill)
+        }))
+        .await
+        .unwrap();
+
+    // Park the manager loop: a Removed for an in-flight Added awaits it.
+    let blocker_id = WorkerId("blocker".into());
+    discovery_tx
+        .send(DiscoveryEvent::Added(spec_for(
+            &blocker_id.0,
+            &blocker_url,
+            WorkerMode::Prefill,
+        )))
+        .await
+        .unwrap();
+    discovery_tx
+        .send(DiscoveryEvent::Removed {
+            id: blocker_id.clone(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), blocker_started.notified())
+        .await
+        .expect("blocker introspection to start");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Let the create fail while the loop is parked: its restore is now queued.
+    url_release.send(true).unwrap();
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Failed)
+            })
+        },
+        "create to fail",
+    )
+    .await;
+
+    // The operator retries as a prefill before the restore is dequeued.
+    let mut retry = control_input(&url, WorkerMode::Prefill);
+    retry.bootstrap_port = Some(8998);
+    let retried = control
+        .replace(&created.worker_id, retry, created.revision)
+        .expect("retry accepted");
+
+    blocker_release.send(true).unwrap();
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation.is_some_and(|operation| {
+                    operation.state == OperationState::Succeeded
+                        && view.revision == Some(retried.revision)
+                })
+            })
+        },
+        "retry to succeed",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_some());
+    assert!(
+        registry.get(&discovered_id).is_none(),
+        "discovery restore must stay deferred while the retry owns the URL"
+    );
+    assert_eq!(
+        registry
+            .all()
+            .iter()
+            .filter(|worker| worker.url == url)
+            .count(),
+        1
+    );
+
+    // Deleting the API worker releases the URL and restores the discovery spec.
+    control
+        .remove(&created.worker_id, retried.revision)
+        .expect("remove accepted");
+    wait_until(
+        || registry.get(&discovered_id).is_some(),
+        "deferred discovery restore after delete",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_none());
+
+    drop(discovery_tx);
+    manager.abort();
 }
 
 #[tokio::test]
@@ -416,7 +753,11 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || registry.get(&WorkerId("w1".into())).is_some(),
+        "worker to register before mutating live state",
+    )
+    .await;
 
     // Grab a handle, bump active_requests, and open the breaker.
     let w = registry.get(&WorkerId("w1".into())).unwrap();
@@ -562,6 +903,49 @@ async fn manager_handles_duplicate_added_as_upsert() {
         "w1 still serves m1 after the second Added",
     );
 
+    drop(tx);
+    h.await.unwrap();
+}
+
+#[tokio::test]
+async fn manager_preserves_same_url_identity_rollover() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, Arc::clone(&registry)));
+    let old_id = WorkerId("old".into());
+    let new_id = WorkerId("new".into());
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        &old_id.0,
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    wait_until(
+        || registry.get(&old_id).is_some(),
+        "original discovery identity",
+    )
+    .await;
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        &new_id.0,
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tx.send(DiscoveryEvent::Removed { id: old_id.clone() })
+        .await
+        .unwrap();
+    wait_until(
+        || registry.get(&old_id).is_none() && registry.get(&new_id).is_some(),
+        "replacement discovery identity",
+    )
+    .await;
+
+    assert_eq!(registry.all().len(), 1);
     drop(tx);
     h.await.unwrap();
 }

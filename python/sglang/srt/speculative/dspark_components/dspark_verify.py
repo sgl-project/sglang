@@ -43,6 +43,7 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -88,15 +89,31 @@ def target_model_type(target_worker) -> Optional[str]:
     )
 
 
+def draft_folds_static_commit(
+    *, draft_model, kv_injector: Optional[TargetHiddenKvInjector]
+) -> bool:
+    """The draft opts in and its FULL slots are the target's, unremapped, so it
+    can store the verify commit at the target's cache locations."""
+    if kv_injector is None or not getattr(
+        draft_model, "folds_static_verify_commit", False
+    ):
+        return False
+    target = kv_injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
+    draft = kv_injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
+    return (
+        target is not None
+        and draft is not None
+        and draft.key == target.key
+        and target.write is None
+    )
+
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    if penalizer is not None and penalizer.is_required:
+    if sampling_info.step_penalties is not None:
         return False
     if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
@@ -352,6 +369,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                verify_tokens=verify_ids_2d,
             )
 
         return result
@@ -490,14 +508,19 @@ class TargetVerifyExecutor:
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
+        # [bs, stride] block input tokens, the anchor then the drafts; built only
+        # where read: a full block's verify ids, or the penalties.
+        verify_ids_2d = None
+        if full_block or (
+            sampling_info is not None and sampling_info.step_penalties is not None
+        ):
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
         if full_block:
             # Nothing to pack: the verify rows are the verify window.
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
                 verify_cache_loc=verify_window.verify_cache_loc,
-                verify_ids=torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
-                .reshape(-1)
-                .to(torch.int64),
+                verify_ids=verify_ids_2d.reshape(-1).to(torch.int64),
                 window_index=None,
             )
         else:
@@ -558,6 +581,7 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            verify_tokens=verify_ids_2d,
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
@@ -641,6 +665,8 @@ class DsparkVerifyEpilogue:
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self._draft_folds_static_commit_cache: Optional[bool] = None
+        self._folds_static_commit_cache: Optional[bool] = None
         self._tp_sync = tp_sync
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
@@ -777,7 +803,7 @@ class DsparkVerifyEpilogue:
         returns whether the engram history was committed."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
-        folds = self.folds_commit
+        folds = self.folds_static_commit
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
@@ -791,6 +817,14 @@ class DsparkVerifyEpilogue:
             self._scatter_future_relay(io.req_pool_indices, bs)
         if not folds:
             return committed_engram
+        if self._draft_folds_static_commit:
+            self.commit_ctx.draft_model.store_verify_commit(
+                req_pool_indices=io.req_pool_indices,
+                verify_hidden=io.hidden,
+                commit_lens=self.commit_lens_buf[:bs],
+                stride=self.stride,
+                valid=gated_commit_lens > 0,
+            )
         cache_loc = io.out_cache_loc
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
@@ -983,6 +1017,28 @@ class DsparkVerifyEpilogue:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+
+    @property
+    def _draft_folds_static_commit(self) -> bool:
+        if self._draft_folds_static_commit_cache is None:
+            self._draft_folds_static_commit_cache = (
+                self._resolve_draft_folds_static_commit()
+            )
+        return self._draft_folds_static_commit_cache
+
+    def _resolve_draft_folds_static_commit(self) -> bool:
+        return self.commit_ctx is not None and draft_folds_static_commit(
+            draft_model=self.commit_ctx.draft_model,
+            kv_injector=self.commit_ctx.kv_injector,
+        )
+
+    @property
+    def folds_static_commit(self) -> bool:
+        if self._folds_static_commit_cache is None:
+            self._folds_static_commit_cache = (
+                self.folds_commit or self._draft_folds_static_commit
+            )
+        return self._folds_static_commit_cache
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor

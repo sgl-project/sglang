@@ -948,7 +948,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum_macros 0.28.0",
- "tokenizers 0.23.2",
+ "tokenizers",
  "tokio-stream",
  "xxhash-rust",
 ]
@@ -975,7 +975,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "tokenizers 0.23.2",
+ "tokenizers",
  "tracing",
 ]
 
@@ -1098,13 +1098,14 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-protocols"
-version = "7.0.0"
+version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45ca7eba9c7e08c01b523fa8dc3d2287a7dabe53b1f9249827d329a91ad8f925"
+checksum = "b5b09675775fb8bcc5a4dc03ae5cd44724693ec00121309351000eb72d66668a"
 dependencies = [
  "async-openai",
  "derive_builder",
  "futures",
+ "indexmap",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1115,15 +1116,17 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "7.1.1"
+version = "10.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8a2960657bf5e8ddcf24aedfe97cb6d9b1541ad658e07d8a2f5df0e699ee977"
+checksum = "f19978746d8472c58fb380960e51c72aa963d30e0b441227f9d8d15961854eb7"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "chrono",
  "dynamo-protocols",
  "dynamo-tokenizers",
  "either",
+ "memchr",
  "minijinja",
  "minijinja-contrib",
  "serde",
@@ -1133,15 +1136,16 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "3.1.0"
+version = "4.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bee9c4bcbcb9c498d03199d4ec6738cc0a9f861463074369fc3f7352539e44"
+checksum = "3a733cf7d77e9ce3c12e38b514ef50ffdcb68f0e7c54b2ea6d384a88338e8b14"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "basetenkenizer",
  "blake3",
+ "fancy-regex 0.13.0",
  "fastokens",
  "moka",
  "rayon",
@@ -1150,7 +1154,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "tiktoken-rs",
- "tokenizers 0.21.4",
+ "tokenizers",
  "tracing",
 ]
 
@@ -1290,12 +1294,14 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.3.1"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
+checksum = "d915324fcf00aa9cade45192ffb7eb49f44a66eb9e7059914d87a2a34b58d88d"
 dependencies = [
+ "aho-corasick",
  "daachorse 1.0.1",
  "fancy-regex 0.17.0",
+ "fastrand",
  "hf-hub",
  "icu_normalizer",
  "libc",
@@ -1307,6 +1313,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "thiserror 2.0.20",
+ "unicode-normalization-alignments",
  "ureq",
 ]
 
@@ -3796,7 +3803,7 @@ dependencies = [
 
 [[package]]
 name = "sglang-api-types"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "prost",
@@ -3810,6 +3817,7 @@ dependencies = [
 name = "sglang-processor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "deepseek-recipe",
  "deepseek-recipe-core",
@@ -3824,7 +3832,7 @@ dependencies = [
  "serde_json",
  "sglang-api-types",
  "thiserror 2.0.20",
- "tokenizers 0.23.2",
+ "tokenizers",
  "tracing",
  "uuid",
 ]
@@ -4064,7 +4072,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4168,40 +4176,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tokenizers"
-version = "0.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a620b996116a59e184c2fa2dfd8251ea34a36d0a514758c6f966386bd2e03476"
-dependencies = [
- "ahash",
- "aho-corasick",
- "compact_str",
- "dary_heap",
- "derive_builder",
- "esaxx-rs",
- "getrandom 0.3.4",
- "hf-hub",
- "itertools 0.14.0",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand 0.9.5",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 2.0.20",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
 
 [[package]]
 name = "tokenizers"
