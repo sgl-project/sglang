@@ -31,7 +31,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-
 Pick your hardware and strategy to generate the launch command. Both strategies serve the FP8 checkpoint at TP8 on 8× H200/B200 or TP4 on 4× B300/GB300 and use automatic memory sizing:
 
 - **Low-Latency** — DFly2 speculative decoding with the draft layers bundled in the checkpoint. Pick it for interactive traffic such as single-user chat and agents that decode greedily; see [DFly2 requirements](#dfly2-requirements) for the request restrictions.
-- **High-Throughput** — no speculative decoding. Pick it for multi-user and batch traffic, for sampled decoding and grammar-constrained tool calls, and as the base for DP-Attention, context parallelism and the FP8 KV cache.
+- **High-Throughput** — no speculative decoding. Pick it for multi-user and batch traffic, for sampled decoding and grammar-constrained tool calls, and as the base for DP-Attention, context parallelism and the FP8 KV cache. On H200 and GB300 the recipe adds `--max-running-requests 512`. Capping at 512 instead of the server's default of 2,048 shrinks the request table and leaves more memory for the KV pool: at 64 concurrent 8k/1k requests, throughput rises by 18% on H200 and 10% on GB300, and median TPOT rises from 30 to 38 ms and from 59 to 65 ms. Requests above the cap wait in the queue and start as running requests finish. The B200 and B300 recipes keep the server default.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/tencent/hy4.jsx";
