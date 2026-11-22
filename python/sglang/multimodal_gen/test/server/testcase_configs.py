@@ -199,6 +199,7 @@ class BaselineConfig:
         scenarios = {
             name: ScenarioConfig.from_dict(cfg)
             for name, cfg in data["scenarios"].items()
+            if set(cfg) != {"estimated_full_test_time_s"}
         }
 
         return cls(
@@ -216,6 +217,7 @@ class BaselineConfig:
             {
                 name: ScenarioConfig.from_dict(cfg)
                 for name, cfg in data["scenarios"].items()
+                if set(cfg) != {"estimated_full_test_time_s"}
             }
         )
         return self
