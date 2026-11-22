@@ -7,7 +7,7 @@ results through Futures; an error is voted on by all ranks before any install.
 from __future__ import annotations
 
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from enum import IntEnum
 from typing import Any, Callable, Protocol
 
@@ -40,7 +40,7 @@ WeightWriteback = Callable[[], None]
 class Runtime(Protocol):
     def prepare(self, placement: Any) -> tuple[int, ...]: ...
 
-    def record_source_ready(self) -> None: ...
+    def record_source_ready(self) -> Future[None] | None: ...
 
     def stage(self, layer: int, slot: int = 0) -> WeightWriteback: ...
 
@@ -166,7 +166,7 @@ class AsyncEplbCoordinator:
         self.phase = Phase.STAGING
         self._deadline = time.monotonic() + self.timeout
         try:
-            self.runtime.record_source_ready()
+            submitted = self.runtime.record_source_ready()
             next_layers = self._layers[
                 self.layers_installed : self.layers_installed + self.layers_per_chunk
             ]
@@ -174,6 +174,22 @@ class AsyncEplbCoordinator:
         except Exception as error:
             self._error = error
             self._future = None
+            return False
+        if submitted is not None:
+            # Decode can queue its next forward once this rank has submitted P2P.
+            # Device completion still runs on the worker and gates publication.
+            try:
+                done, _ = wait(
+                    (submitted, self._future),
+                    timeout=max(0.0, self._deadline - time.monotonic()),
+                    return_when=FIRST_COMPLETED,
+                )
+                if self._future in done:
+                    self._future.result()
+                if submitted not in done:
+                    raise TimeoutError("EPLB did not submit the layer transfers")
+            except Exception as error:
+                self._fatal("EPLB could not order P2P before decode", error)
         return False
 
     def _stage_chunk(self, layers: tuple[int, ...]):

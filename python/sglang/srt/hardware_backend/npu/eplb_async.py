@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -263,7 +264,10 @@ class NpuEplbRuntime:
         *,
         owns_p2p_group: bool = True,
         layers_per_chunk: int = 1,
+        order_submissions: bool = False,
     ):
+        if order_submissions and layers_per_chunk != 1:
+            raise ValueError("Ordering EPLB submissions requires single-layer staging")
         self.metadata = metadata
         self.spec = spec
         self.rank = rank
@@ -302,6 +306,8 @@ class NpuEplbRuntime:
         self._p2p_stream = self.device_module.Stream(device=self.device)
         self._owner_stream = self.device_module.current_stream()
         self._owner_ready = self.device_module.Event()
+        self._order_submissions = order_submissions
+        self._submitted: Future[None] | None = None
         self._planned_rows = None
         self.stage_seconds = self.install_enqueue_seconds = 0.0
         self.interleaved_layers = 0
@@ -400,11 +406,14 @@ class NpuEplbRuntime:
         if self.device_module.current_stream() != self._owner_stream:
             raise RuntimeError("EPLB target forwards changed their owning stream")
 
-    def record_source_ready(self) -> None:
+    def record_source_ready(self) -> Future[None] | None:
         self._check_stream()
         # Reuse the event after the previous transfers finish and their writes
         # are on the owner stream.
         self._owner_ready.record(self._owner_stream)
+        if self._order_submissions:
+            self._submitted = Future()
+        return self._submitted
 
     def stage(self, layer: int, slot: int = 0) -> WeightWriteback:
         """Run on the migration worker. The forward thread owns the writeback."""
@@ -454,6 +463,8 @@ class NpuEplbRuntime:
             writeback = _make_weight_writeback(
                 self.weights[layer], self.staging[slot], staged_rows
             )
+            if self._submitted is not None:
+                self._submitted.set_result(None)
             self._p2p_stream.synchronize()
         self.stage_seconds += time.perf_counter() - start
         return writeback
@@ -486,7 +497,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
         npu_eplb_reuses_world_group,
     )
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
-    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 
     parallel = get_parallel()
     world_size = dist.get_world_size()
@@ -496,6 +507,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
     moe = get_exec().moe
     algorithm = compute_algorithm(moe.eplb_algorithm, groups, parallel.nnodes)
     layers_per_chunk = moe.eplb_rebalance_layers_per_chunk or 1
+    order_submissions = get_disagg().disaggregation_mode == "decode"
     if algorithm.name.startswith("elasticity"):
         raise ValueError("Async EPLB requires a non-elastic CPU placement algorithm")
     spec = PlanningSpec(
@@ -532,6 +544,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             p2p_group,
             owns_p2p_group=not borrow_world_group,
             layers_per_chunk=layers_per_chunk,
+            order_submissions=order_submissions,
         )
         batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         if batch_size <= 0:
@@ -545,6 +558,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             runtime.layer_ids,
             tuple(tuple(t.shape) for t in runtime.staging[0]),
             layers_per_chunk,
+            order_submissions,
             batch_size,
             p2p_buffer_mib,
             spec,
