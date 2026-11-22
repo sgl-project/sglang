@@ -471,6 +471,44 @@ class TestPrefillAdder(CustomTestCase):
                 else:
                     self.assertEqual(req.prefix_len + req.extend_len, expected)
 
+    def test_capped_continuation_reaches_the_next_grid_point(self):
+        # A per-pass cap (shortest-prefill-first reserving room for shorter
+        # requests) below the next grid point must not make the chunk wait: the
+        # cap is the same next pass, so it would wait, and block the rest, forever.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=1, rem_chunk_tokens=4096
+        )
+        adder.chunked_req_limit = 20
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(8192))
+        req.prefix_len = 1000
+        self.assertIs(adder.add_chunked_req(req, truncation_align_size=64), req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertFalse(adder.chunked_req_waits)
+        self.assertEqual(req.prefix_len + req.extend_len, 1024)
+
+    def test_ignore_eos_first_chunk_ends_on_the_alignment_grid(self):
+        # Without a radix cache, ignore_eos requests take their own admission path;
+        # their first chunk must end on the grid too.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 32768
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=1, rem_chunk_tokens=200
+        )
+        req = self.create_shared_req("ignore-eos", max_new_tokens=4)
+        req.sampling_params.ignore_eos = True
+        req.full_untruncated_fill_ids = list(range(1000))
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        req.prefix_len = 0
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=64)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_len, 192)
+
     def test_new_request_chunk_ends_on_the_alignment_grid(self):
         # A cached prefix can end off the alignment grid; the first chunk must
         # still end on it (aligning only the chunk length would end at 292).

@@ -1708,7 +1708,16 @@ class PrefillAdder:
 
         if self.chunked_req_limit is not None:
             assert self.chunked_req_limit > 0
-            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
+            limit = self.chunked_req_limit
+            if truncation_align_size is not None:
+                # The cap is recomputed to the same value each pass: below the next
+                # grid point the chunk would wait every pass and hold back the
+                # requests the cap reserves room for, so it may reach that point.
+                limit = max(
+                    limit,
+                    truncation_align_size - req.prefix_len % truncation_align_size,
+                )
+            _rem_tokens = min(_rem_tokens, limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
@@ -1981,6 +1990,12 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
+            if truncation_align_size is not None:
+                # The first chunk ends on the alignment grid, as in add_one_req; the
+                # chunk budget left this pass depends on the other requests in it.
+                trunc_len = trunc_len // truncation_align_size * truncation_align_size
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
