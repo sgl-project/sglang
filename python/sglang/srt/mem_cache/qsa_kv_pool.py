@@ -8,6 +8,7 @@ full/linear KV pool.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -85,6 +86,8 @@ def assert_qsa_indices_in_bounds(
         raise TypeError(f"{label} must have integer dtype")
     if upper_bound < 0:
         raise ValueError(f"{label} upper bound must be non-negative")
+    if os.environ.get("SGLANG_QSA_DEBUG_BOUNDS") != "1":
+        return
     if valid_mask is None:
         valid_mask = indices >= 0
     elif valid_mask.shape != indices.shape:

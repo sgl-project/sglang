@@ -341,6 +341,10 @@ def handle_decode_context_parallelism(server_args: Any):
 
     if cfg.qsa_cache_sharding_size == 1:
         return
+    if cfg.speculative_algorithm == "NEXTN":
+        raise ValueError("QSA cache sharding does not support NEXTN")
+    if cfg.enable_hierarchical_cache:
+        raise ValueError("QSA cache sharding does not support hierarchical cache")
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError("QSA cache sharding requires a local model configuration")
     model_config = model_config_of(server_args)

@@ -394,8 +394,8 @@ class StaticKVStorage:
         if req_to_token_write is not None:
             extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if page_interleave_shard_size(allocator) > 1:
-            assert self._batch is not None
-            rotation_bases = [req.kv_rotation_base for req in self._batch.reqs]
+            assert batch is not None
+            rotation_bases = [req.kv_rotation_base for req in batch.reqs]
             assert all(base is not None for base in rotation_bases), (
                 "sharded decode requires the rotation base recorded during prefill"
             )
