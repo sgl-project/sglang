@@ -334,6 +334,12 @@ class NpuEplbRuntime:
                     logical, self.metadata.ep_size, physical.size(1), self.rank
                 )
             )
+        # Pageable H2D blocks the worker on the current stream. Keep the plan
+        # pinned until the asynchronous routing copies have drained.
+        self.device_module.set_device(self.device)
+        self._planned_rows = {
+            name: rows.pin_memory() for name, rows in self._planned_rows.items()
+        }
         return changed
 
     def _check_stream(self):
