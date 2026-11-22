@@ -132,7 +132,6 @@ def _load_batch_runner(backend):
     )
     runner.enable_cp_bcg_capture = False
     runner._is_full_backend = False
-    # __init__ derives this from the configured backend name (#50150).
     runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
     runner.backend = backend
     runner.has_mha_companion_layers = False
