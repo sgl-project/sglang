@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.test.ci.ci_register import register_amd_ci
