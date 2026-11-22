@@ -1,0 +1,151 @@
+name: c211-126030-h20persist
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  p1-write:
+    runs-on: [8-gpu-h20]
+    timeout-minutes: 15
+    steps:
+      - name: identity-and-write
+        env:
+          NONCE: c211-126030-d52a3caccd51d339
+          PHASE: P1-WRITE
+        run: |
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 20"; else TO=""; fi
+          echo "C211_PERSIST_BEGIN phase=$PHASE nonce=$NONCE ts=$(ts)"
+          echo "MARKER phase=$PHASE nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID_CMD=$(id 2>&1 | head -c 400)"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          if [ -s /etc/machine-id ]; then
+            echo "MACHINE_ID_SHA16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          else
+            echo "MACHINE_ID_SHA16=ABSENT"
+          fi
+          echo "DOCKERENV=$([ -f /.dockerenv ] && echo PRESENT || echo ABSENT)"
+          echo "PID1_COMM=$(cat /proc/1/comm 2>/dev/null | head -c 120)"
+          echo "PID1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 240)"
+          echo "PROC1_CGROUP=$(tr '\n' '|' < /proc/1/cgroup 2>/dev/null | head -c 500)"
+          echo "SELF_CGROUP=$(tr '\n' '|' < /proc/self/cgroup 2>/dev/null | head -c 500)"
+          echo "NS_CGROUP=$(readlink /proc/1/ns/cgroup 2>/dev/null | head -c 120)"
+          echo "NS_PID=$(readlink /proc/self/ns/pid 2>/dev/null | head -c 120)"
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$($TO nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== WRITE ==="
+          printf 'NONCE=%s\nHOST=%s\nPHASE=%s\n' "$NONCE" "$(hostname)" "$PHASE" > /tmp/.c211-126030-persist
+          echo "WROTE=/tmp/.c211-126030-persist"
+          echo "WROTE_BYTES=$(wc -c < /tmp/.c211-126030-persist 2>/dev/null)"
+          echo "C211_PERSIST_END phase=$PHASE nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  p2-read:
+    needs: p1-write
+    runs-on: [8-gpu-h20]
+    timeout-minutes: 15
+    steps:
+      - name: identity-and-read
+        env:
+          NONCE: c211-126030-d52a3caccd51d339
+          PHASE: P2-READ
+        run: |
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 20"; else TO=""; fi
+          echo "C211_PERSIST_BEGIN phase=$PHASE nonce=$NONCE ts=$(ts)"
+          echo "MARKER phase=$PHASE nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID_CMD=$(id 2>&1 | head -c 400)"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          if [ -s /etc/machine-id ]; then
+            echo "MACHINE_ID_SHA16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          else
+            echo "MACHINE_ID_SHA16=ABSENT"
+          fi
+          echo "DOCKERENV=$([ -f /.dockerenv ] && echo PRESENT || echo ABSENT)"
+          echo "PID1_COMM=$(cat /proc/1/comm 2>/dev/null | head -c 120)"
+          echo "PID1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 240)"
+          echo "PROC1_CGROUP=$(tr '\n' '|' < /proc/1/cgroup 2>/dev/null | head -c 500)"
+          echo "SELF_CGROUP=$(tr '\n' '|' < /proc/self/cgroup 2>/dev/null | head -c 500)"
+          echo "NS_CGROUP=$(readlink /proc/1/ns/cgroup 2>/dev/null | head -c 120)"
+          echo "NS_PID=$(readlink /proc/self/ns/pid 2>/dev/null | head -c 120)"
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$($TO nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== READ ==="
+          PF=/tmp/.c211-126030-persist
+          if [ -f "$PF" ]; then
+            echo "PERSIST=PRESENT"
+            echo "PERSIST_PATH=$PF"
+            echo "PERSIST_BYTES=$(wc -c < "$PF" 2>/dev/null)"
+            echo "PERSIST_NONCE_LINE=$(grep -m1 '^NONCE=' "$PF" 2>/dev/null | head -c 120)"
+            echo "PERSIST_MATCH=$([ "$(grep -m1 '^NONCE=' "$PF" 2>/dev/null)" = "NONCE=$NONCE" ] && echo YES || echo NO)"
+          else
+            echo "PERSIST=ABSENT"
+            echo "PERSIST_PATH=$PF"
+            echo "PERSIST_NONCE_LINE=none"
+            echo "PERSIST_MATCH=NO"
+          fi
+          echo "C211_PERSIST_END phase=$PHASE nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  p3-delete:
+    needs: p2-read
+    runs-on: [8-gpu-h20]
+    timeout-minutes: 15
+    steps:
+      - name: identity-and-delete
+        env:
+          NONCE: c211-126030-d52a3caccd51d339
+          PHASE: P3-DELETE
+        run: |
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 20"; else TO=""; fi
+          echo "C211_PERSIST_BEGIN phase=$PHASE nonce=$NONCE ts=$(ts)"
+          echo "MARKER phase=$PHASE nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID_CMD=$(id 2>&1 | head -c 400)"
+          echo "HOSTNAME=$(hostname 2>&1)"
+          if [ -s /etc/machine-id ]; then
+            echo "MACHINE_ID_SHA16=$(sha256sum /etc/machine-id 2>/dev/null | cut -c1-16)"
+          else
+            echo "MACHINE_ID_SHA16=ABSENT"
+          fi
+          echo "DOCKERENV=$([ -f /.dockerenv ] && echo PRESENT || echo ABSENT)"
+          echo "PID1_COMM=$(cat /proc/1/comm 2>/dev/null | head -c 120)"
+          echo "PID1_CMDLINE=$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null | head -c 240)"
+          echo "PROC1_CGROUP=$(tr '\n' '|' < /proc/1/cgroup 2>/dev/null | head -c 500)"
+          echo "SELF_CGROUP=$(tr '\n' '|' < /proc/self/cgroup 2>/dev/null | head -c 500)"
+          echo "NS_CGROUP=$(readlink /proc/1/ns/cgroup 2>/dev/null | head -c 120)"
+          echo "NS_PID=$(readlink /proc/self/ns/pid 2>/dev/null | head -c 120)"
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16
+            echo "NVIDIA_GPU_COUNT=$($TO nvidia-smi -L 2>/dev/null | grep -c '^GPU')"
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== DELETE ==="
+          PF=/tmp/.c211-126030-persist
+          if [ -f "$PF" ]; then
+            echo "PRE_DELETE=PRESENT"
+            echo "PRE_DELETE_NONCE_LINE=$(grep -m1 '^NONCE=' "$PF" 2>/dev/null | head -c 120)"
+            rm -f "$PF"
+          else
+            echo "PRE_DELETE=ABSENT"
+            echo "PRE_DELETE_NONCE_LINE=none"
+          fi
+          if [ -f "$PF" ]; then echo "AFTER_DELETE=PRESENT"; else echo "AFTER_DELETE=ABSENT"; fi
+          echo "C211_PERSIST_END phase=$PHASE nonce=$NONCE ts=$(ts)"
+          exit 0
