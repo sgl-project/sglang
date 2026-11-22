@@ -26,7 +26,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
     DSV4_PAGE_SIZE,
 )
-from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH, check_megamoe_situ_betas
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported
 
@@ -38,9 +38,6 @@ _SUPPORTED_KV_CACHE_DTYPES = ("auto", "fp8_e4m3", "bfloat16")
 
 # DSpark with DP attention is validated on DeepEP and MegaMoE here.
 register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep", "megamoe"))
-
-# The SiTU constants DeepGEMM's MegaMoE kernel computes with.
-_MEGAMOE_SITU_BETAS = (4.0, 25.0)
 
 
 def _validate_features(cfg: Any) -> None:
@@ -149,14 +146,9 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
     _validate_features(cfg)
     _validate_speculative(cfg)
     if cfg.moe_a2a_backend == "megamoe" and hf_config is not None:
-        betas = (hf_config.activation_situ_beta, hf_config.activation_situ_linear_beta)
-        if betas != _MEGAMOE_SITU_BETAS:
-            # The routed experts would run the kernel's constants while the shared
-            # expert runs the checkpoint's.
-            raise ValueError(
-                "--moe-a2a-backend megamoe bakes SiTU beta/linear_beta "
-                f"{_MEGAMOE_SITU_BETAS}; this checkpoint uses {betas}"
-            )
+        # Fail before weights load; the MoE layer checks again where it builds
+        # the kernel.
+        check_megamoe_situ_betas(hf_config)
     overrides: Dict[str, Any] = {
         "attention_backend": "ernie55",
         "page_size": DSV4_PAGE_SIZE,

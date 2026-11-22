@@ -530,12 +530,14 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+def find_local_repo_dir(
+    repo_id: str, revision: Optional[str] = None, cache_dir: Optional[str] = None
+) -> Optional[str]:
     import huggingface_hub as hf
 
     # Build cache path
     cache_path = os.path.join(
-        hf.constants.HF_HUB_CACHE,
+        cache_dir or hf.constants.HF_HUB_CACHE,
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 

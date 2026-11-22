@@ -237,6 +237,11 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
 
 
 class TestErnie5_5Fp4ExpertDetection(CustomTestCase):
+    _EXPERT = "model.layers.0.block_sparse_moe.experts.0.w1.weight"
+
+    def _header(self, dtype):
+        return SimpleNamespace(tensors={self._EXPERT: SimpleNamespace(dtype=dtype)})
+
     def test_uncached_expert_shard_is_read_from_the_requested_revision(self):
         """On a first load from a hub ID the expert shard was not downloaded yet,
         so detection fell back to FP8 experts and allocated full-width weights
@@ -247,25 +252,60 @@ class TestErnie5_5Fp4ExpertDetection(CustomTestCase):
 
         from sglang.srt.configs import ernie55 as cfg
 
-        expert = "model.layers.0.block_sparse_moe.experts.0.w1.weight"
-        with tempfile.TemporaryDirectory() as snapshot:
-            index = os.path.join(snapshot, "model.safetensors.index.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "model.safetensors.index.json")
             with open(index, "w") as f:
-                json.dump({"weight_map": {expert: "model-00002.safetensors"}}, f)
-            header = SimpleNamespace(tensors={expert: SimpleNamespace(dtype="U8")})
+                json.dump({"weight_map": {self._EXPERT: "model-00002.safetensors"}}, f)
             with (
-                patch(
-                    "sglang.srt.utils.find_local_repo_dir", return_value=snapshot
-                ) as local,
+                patch("sglang.srt.utils.find_local_repo_dir", return_value=None),
                 patch("huggingface_hub.hf_hub_download", return_value=index) as dl,
                 patch("huggingface_hub.HfApi") as api,
             ):
-                api.return_value.parse_safetensors_file_metadata.return_value = header
-                self.assertTrue(cfg.detect_fp4_routed_experts("org/ernie", "v1"))
-            local.assert_called_once_with("org/ernie", "v1")
+                meta = api.return_value.parse_safetensors_file_metadata
+                meta.return_value = self._header("U8")
+                self.assertTrue(cfg.detect_fp4_routed_experts("org/ernie", "v1", None))
             self.assertEqual(dl.call_args.kwargs["revision"], "v1")
-            meta = api.return_value.parse_safetensors_file_metadata
+            self.assertEqual(meta.call_args.args[1], "model-00002.safetensors")
             self.assertEqual(meta.call_args.kwargs["revision"], "v1")
+
+    def test_offline_restart_reads_the_download_dir_snapshot(self):
+        """Weights downloaded into --download-dir sat outside the default HF
+        cache, so an offline restart went to the hub and failed."""
+        from sglang.srt.configs import ernie55 as cfg
+
+        def local(repo_id, revision, cache_dir=None):
+            return "/dl/snapshot" if cache_dir == "/dl" else None
+
+        with (
+            patch("sglang.srt.utils.find_local_repo_dir", side_effect=local),
+            patch(
+                "sglang.srt.configs.deepseek_v4.try_detect_fp4_experts",
+                side_effect=lambda path: path == "/dl/snapshot",
+            ),
+            patch.object(cfg, "_remote_fp4_routed_experts") as remote,
+        ):
+            self.assertTrue(cfg.detect_fp4_routed_experts("org/ernie", None, "/dl"))
+        remote.assert_not_called()
+
+    def test_single_file_hub_checkpoint_reads_its_only_header(self):
+        """A single-file checkpoint has no shard index; detection failed on the
+        missing index before reading model.safetensors."""
+        from huggingface_hub.errors import EntryNotFoundError
+
+        from sglang.srt.configs import ernie55 as cfg
+
+        with (
+            patch("sglang.srt.utils.find_local_repo_dir", return_value=None),
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=EntryNotFoundError("no index"),
+            ),
+            patch("huggingface_hub.HfApi") as api,
+        ):
+            meta = api.return_value.parse_safetensors_file_metadata
+            meta.return_value = self._header("F8_E4M3")
+            self.assertFalse(cfg.detect_fp4_routed_experts("org/ernie", None, None))
+        self.assertEqual(meta.call_args.args[1], "model.safetensors")
 
     def test_unreadable_layout_fails_instead_of_guessing(self):
         from sglang.srt.configs import ernie55 as cfg
@@ -275,7 +315,7 @@ class TestErnie5_5Fp4ExpertDetection(CustomTestCase):
             patch.object(cfg, "_remote_fp4_routed_experts", return_value=None),
         ):
             with self.assertRaisesRegex(ValueError, "routed_experts_quant_method"):
-                cfg.detect_fp4_routed_experts("org/ernie", None)
+                cfg.detect_fp4_routed_experts("org/ernie", None, None)
 
 
 if __name__ == "__main__":

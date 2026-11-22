@@ -40,7 +40,7 @@ from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.mhc import mhc_post, mhc_pre
 from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.moe.multi_router import multi_router_topk
-from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
+from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig, check_megamoe_situ_betas
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SituAndMul
@@ -562,6 +562,8 @@ class Ernie5_5Moe(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.intermediate_size = config.moe_intermediate_size
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self._use_mega_moe:
+            check_megamoe_situ_betas(config)
 
     def _route(self, hidden_states, gating_output, topk, renormalize):
         # gating_output is the raw [T, 2E] gate|gate_1 GEMM output.
@@ -616,7 +618,7 @@ class Ernie5_5Moe(nn.Module):
             intermediate_size=self.intermediate_size,
             top_k=self.top_k,
             num_tokens=latent.shape[0],
-            # The kernel bakes SiTU beta=4.0/linear_beta=25.0; checked at startup.
+            # The kernel bakes SiTU beta=4.0/linear_beta=25.0, checked in __init__.
             activation="situ",
             buf=self.mega_moe_buffer(),
         )

@@ -754,6 +754,40 @@ class TestPrepareServerArgs(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "decode / verify"):
                     validate_mega_moe_token_budget(args, "Ernie5_5_MoeForCausalLM")
 
+    def test_megamoe_token_budget_counts_ernie_attn_tp_slice(self):
+        """Under attention TP 2 each ERNIE rank routes half of a 256-request eager
+        decode, so a 128-row MegaMoE buffer must be accepted, not rejected."""
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                tp_size=2,
+                chunked_prefill_size=128,
+                max_running_requests=256,
+                cuda_graph_max_bs_decode=64,
+                disaggregation_mode="decode",
+            )
+            args.resolve_once()
+            for buffer, ok in ((128, True), (127, False)):
+                with self.subTest(buffer=buffer):
+                    with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                        buffer
+                    ):
+                        if ok:
+                            validate_mega_moe_token_budget(
+                                args, "Ernie5_5_MoeForCausalLM"
+                            )
+                        else:
+                            with self.assertRaisesRegex(ValueError, "decode / verify"):
+                                validate_mega_moe_token_budget(
+                                    args, "Ernie5_5_MoeForCausalLM"
+                                )
+
     def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
         from sglang.srt.environ import envs

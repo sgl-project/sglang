@@ -719,10 +719,12 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
+        download_dir: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
+        self.download_dir = download_dir
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
@@ -927,7 +929,7 @@ class ModelConfig:
             from sglang.srt.configs.ernie55 import detect_fp4_routed_experts
 
             self.is_fp4_experts = detect_fp4_routed_experts(
-                self.model_path, self.revision
+                self.model_path, self.revision, self.download_dir
             )
             logger.info(
                 "Detected ERNIE 5.5 routed-expert layout: is_fp4_experts=%s",
@@ -1153,6 +1155,7 @@ class ModelConfig:
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
+            download_dir=cfg.download_dir,
             **kwargs,
         )
 

@@ -157,6 +157,15 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
         )
 
 
+def _ernie_moe_rows_per_rank(cfg, rows: int) -> int:
+    # Under split heads ERNIE routes only its rows / attn_tp_size slice of a
+    # sequence-sharded batch (Ernie5_5DecoderLayer._forward_moe_attn_tp_shard).
+    attn_tp_size = cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size
+    if attn_tp_size <= 1 or cfg.disable_attn_tp_gather:
+        return rows
+    return -(-rows // attn_tp_size)
+
+
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
@@ -186,6 +195,8 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
                 else 1
             )
             decode_tokens = max(decode_tokens, eager_requests * tokens_per_request)
+        if model_label == "Ernie5_5_MoeForCausalLM":
+            decode_tokens = _ernie_moe_rows_per_rank(cfg, decode_tokens)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "
