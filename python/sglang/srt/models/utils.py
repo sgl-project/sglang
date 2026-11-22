@@ -664,6 +664,9 @@ def apply_qk_norm(
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and get_exec().graph.cuda_graph_config.prefill.tc_compiler
         != "inductor"  # let inductor fuse QK norm
+        # The kernel takes its weights in the activation dtype; fp32 norms fall back.
+        and q_norm.weight.dtype == q.dtype
+        and k_norm.weight.dtype == q.dtype
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
