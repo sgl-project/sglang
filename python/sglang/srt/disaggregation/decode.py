@@ -2228,14 +2228,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
-        if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
-            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
-        ):
-            # TODO(ch-wan): this C128 ring and pending-pair reset races the row's
-            # previous forward; order it after that forward, before the transfer.
-            self.token_to_kv_pool.clear_request_scoped_state(
-                int(decode_req.req.kv.req_pool_idx)
-            )
         payloads = {
             StateType.MAMBA: _mamba_payload,
             StateType.QSA_PENDING: _qsa_pending_payload,
@@ -2314,6 +2306,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.kv_manager.kv_args, state_types, payloads, _swa_payload
             )
 
+        if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            self._clear_request_state(
+                int(decode_req.req.kv.req_pool_idx),
+                send_waits_for_forward=self._send_waits_for_forward(
+                    non_blocking=non_blocking_metadata,
+                    to_device=metadata_kwargs.get("destination")
+                    != KVTransferDestination.HOST,
+                ),
+            )
         self._send_kv_metadata(
             decode_req,
             kv_indices,
@@ -2359,6 +2362,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._record_receive(decode_req, page_indices, receive.page_size, state_indices)
         storage.end_receive_hold(decode_req.req)
         return page_indices, metadata_index, state_indices
+
+    def _send_waits_for_forward(self, *, non_blocking: bool, to_device: bool) -> bool:
+        """Whether a destination's send is held until the forward in flight is
+        done (`_send_kv_metadata`): under overlap, a device destination with
+        neither a pinned readback nor a deferred publish fencing that forward."""
+        return (
+            self.scheduler.enable_overlap
+            and not self._defer_publish
+            and to_device
+            and not non_blocking
+        )
+
+    def _clear_request_state(
+        self, req_pool_idx: int, *, send_waits_for_forward: bool
+    ) -> None:
+        """Reset a receive row's DeepSeek-V4 C128 ring and pending pairs before
+        the peer writes the transferred part of them.
+
+        Under overlap the row's previous owner can still have one redundant
+        forward in flight, and it writes this state. A send held behind that
+        forward clears on the forward stream: after its writes, and before the
+        event the send waits for. A deferred publish runs an iteration after its
+        allocation, once that forward's result was processed, and without
+        overlap or PP the forwards run on this stream; both clear here."""
+        # TODO(ch-wan): under PP without overlap the forwards run on the forward
+        # stream and the send is not held, so this clear is not ordered after a
+        # microbatch still writing the row.
+        if not send_waits_for_forward:
+            self.token_to_kv_pool.clear_request_scoped_state(req_pool_idx)
+            return
+        with self.scheduler.device_module.stream(self.scheduler.forward_stream):
+            self.token_to_kv_pool.clear_request_scoped_state(req_pool_idx)
 
     def _send_kv_metadata(
         self,
@@ -2409,11 +2444,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             device_pages, device_state_indices = page_indices, state_indices
         to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
-        held = (
-            readback_ready is None
-            and self.scheduler.enable_overlap
-            and not self._defer_publish
-            and to_device
+        held = self._send_waits_for_forward(
+            non_blocking=non_blocking, to_device=to_device
         )
         ready = readback_ready
         if held:
