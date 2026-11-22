@@ -335,6 +335,11 @@ def _init_parallel_groups(
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
 
+    if backend == "nccl" and server_args.enable_hi_engram:
+        from sglang.srt.mem_cache.engram.remote import configure_nccl
+
+        configure_nccl(server_args.hi_engram_config, gpu_id)
+
     init_distributed_environment(
         backend=backend,
         world_size=world_size,

@@ -11,9 +11,8 @@ The current backend, `MooncakeEngramStorage`, uses Mooncake EngramStore to own
 local host snapshots and read rows on the caller's CUDA stream. Enable it with
 `--enable-hi-engram`. This boolean flag defaults to disabled. Select the backend
 through `--hi-engram-config`; `backend` defaults to `local`. Omitting the flag
-preserves each model's native implementation. `backend: "remote"` is reserved
-and fails when the Engram component is constructed:
-Mooncake's remote table API does not yet support CUDA stream/graph lookup.
+preserves each model's native implementation. Use `deepep_rdma` for remote
+storage; the generic name `remote` remains reserved and is rejected.
 
 ## Model integration
 
@@ -59,7 +58,8 @@ is constructed, before allocating or loading its embedding weights.
 
 ## Ownership and ordering
 
-The first eager lookup publishes an immutable copy of the loaded CPU weights.
+For local storage, the first eager lookup publishes an immutable copy of the
+loaded CPU weights.
 Each table and TP rank owns an anonymous snapshot (`persistent=False`), so
 worker exit leaves no named table files and instances cannot reuse stale weights.
 After successful publication, the adapter releases the checkpoint parameter's
@@ -83,5 +83,56 @@ benchmark and integration-check scripts are maintained with the experiment
 artifacts outside the SGLang source tree.
 
 Compare native and HiCache execution in fresh processes with identical inputs,
-TP/EP, host offloading, KV capacity and graph settings. Check output tokens and
-logprobs under controlled scheduling; measure latency and throughput separately.
+TP/EP, per-worker NIC mapping, host offloading, KV capacity and graph settings.
+Check output tokens and logprobs under controlled scheduling; measure latency
+and throughput separately.
+
+## DeepEP RDMA backend
+
+Use the matching Mooncake Engram Config branch and its rebuilt Master/Python
+extension. `--enable-hi-engram` remains a boolean flag; select the backend in
+JSON. Reuse the existing `MOONCAKE_MASTER=host:port` or Mooncake configuration.
+Enable `NCCL_CUMEM_ENABLE=1` before launch, as required by NCCL GIN windows.
+An Engram-only bootstrap hook selects an explicitly configured NIC before the
+first NCCL process group; Engine and ModelRunner are unchanged.
+
+```bash
+export MOONCAKE_MASTER=master-host:50051
+export NCCL_CUMEM_ENABLE=1
+# Identical configuration on every participating storage node:
+--enable-hi-engram \
+--hi-engram-config '{"backend":"deepep_rdma","assignment":"auto","group_size":2}'
+```
+
+Manual mode uses `assignment: "manual"` with matching `group_id` and a unique
+`shard_id` in `[0,group_size)` on each node. `group_size` counts storage nodes,
+not GPUs. Auto admission forms successive complete groups in registration
+order, with no topology optimization or total-node-count setting.
+
+SGLang automatically supplies the node/model identity, dense `caller_id`,
+`num_callers`, and a conservative `max_lookup_rows` bound including graph
+padding and speculative/attention-DP expansion. User JSON rejects caller,
+identity, Master-address and session fields. Optional user overrides are
+`rdma_device` (a string accepting `{local_rank}`, or a list indexed by the
+CUDA-visible device ordinal), `timeout` and a sufficiently large
+`max_lookup_rows`. Remote JSON does not use `local_dir` or `persistent`.
+
+For example, `"rdma_device": ["mlx5_0", "mlx5_0", "mlx5_1", "mlx5_1"]`
+maps four visible GPUs onto two NICs. The selected NIC becomes the worker's
+`NCCL_IB_HCA` before model communication initializes and is also passed to
+Mooncake. This explicitly restricts both model and Engram NCCL communication
+in that worker; when omitted, NCCL keeps its existing device selection.
+The list uses CUDA-visible ordinals, not physical GPU numbers or TP ranks.
+
+The Engram adapter constructs `EngramStoreConfig` and `EngramStore`, obtains
+placement before allocating the local weight buffer, then translates Qwen head
+boundaries/byte rows into `populate_and_sync(local_tables, table_owners=...)`.
+Head placement remains contiguous by head count. Hashing, scaling, masking,
+collectives and prefetch stay in the model. Same-node callers share the final
+CPU allocation; checkpoint staging can still temporarily hold extra copies.
+
+Current scope is PP1 with one model replica per engine, uniform caller counts
+and identical table layouts. Attention-DP within a TP group remains supported.
+Restarted nodes recover their original shard while Master remains alive, but
+every group member must rebuild its Store/communication state before reuse.
+Live resharding and transparent single-node recovery are not supported.

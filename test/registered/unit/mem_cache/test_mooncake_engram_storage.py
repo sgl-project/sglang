@@ -2,7 +2,7 @@
 
 import sys
 import unittest
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -19,7 +19,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _CpuEngramStore:
     """Replace only the external byte-table API, including its -1 sentinel."""
 
-    def __init__(self, *, tables, namespace, local_dir, persistent):
+    def __init__(self, *, tables, namespace, config):
         self.tables = tables
         self.rows = None
         self.close_count = 0
@@ -84,6 +84,7 @@ class TestMooncakeEngramStorage(CustomTestCase):
         self.stores = []
         module = ModuleType("mooncake.engram")
         module.EngramStore = self._new_store
+        module.EngramStoreConfig = SimpleNamespace
         self.enterContext(
             mock.patch.dict(
                 sys.modules,
