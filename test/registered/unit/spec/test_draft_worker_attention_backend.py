@@ -132,12 +132,17 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
 
     def test_compressed_kv_draft_keeps_its_override_for_a_named_aiter(self):
         """A compressed-KV draft skips the aiter checks and keeps main's fallback, not a raise."""
-        with patch(
-            "sglang.srt.speculative.dspark_components.dspark_config."
-            "draft_uses_compressed_kv_attention",
-            return_value=True,
-        ):
-            self.assertEqual(self._resolve(draft_is_mla=True), "triton")
+        for hip_version, fallback in (("7.2", "triton"), (None, "flashinfer")):
+            with (
+                self.subTest(hip=hip_version),
+                patch.object(torch.version, "hip", hip_version),
+                patch(
+                    "sglang.srt.speculative.dspark_components.dspark_config."
+                    "draft_uses_compressed_kv_attention",
+                    return_value=True,
+                ),
+            ):
+                self.assertEqual(self._resolve(draft_is_mla=True), fallback)
 
     def test_aiter_is_taken_only_when_named_for_a_dspark_draft(self):
         """An inherited aiter, or aiter named for another algorithm's draft,
