@@ -1,10 +1,13 @@
 """ROCm tests for Triton sparse MLA launch tuning."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 as mla_gfx950
+from sglang.kernels.ops.attention.dsa import sparse_mla_prefill_gfx950
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
@@ -24,12 +27,13 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     triton_sparse_mla_decode_splitk,
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.attention.dsa import dsa_backend_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=35, stage="base-a-jit-kernel-unit", runner_config="amd")
 # backend-specific: the topk_length prefill path is gfx950-only.
-register_amd_ci(est_time=35, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=35, suite="base-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
@@ -310,6 +314,147 @@ def test_scaled_kv_decode_matches_reference(bs, kv_splits):
 
     ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
     assert _rel_err(out[0], ref) < 4e-3
+
+
+_DEVICE = "cuda"
+_DV, _DR, _TOPK, _N = 512, 64, 2048, 16384
+_PREFILL_POOL = 8192
+
+
+def _keys_reference(q, keys, idx, sm_scale):
+    """fp32 (out, natural-log lse) over each row's keys; -1 selects nothing, and a
+    row with no key gives 0 and -inf."""
+    gathered = keys[idx.clamp(min=0).long()]
+    scores = torch.einsum("thd,tkd->thk", q, gathered) * sm_scale
+    scores = scores.masked_fill((idx < 0)[:, None, :], float("-inf"))
+    lse = torch.logsumexp(scores, -1)
+    out = torch.einsum(
+        "thk,tkd->thd", torch.softmax(scores, -1).nan_to_num(0.0), gathered[..., :512]
+    )
+    return out, lse
+
+
+def _decode_reference(qn, qr, idx, kd, sm, mxfp8_q=True):
+    """FP32 attention using the production MXFP8 Q quantizer and dequantized KV."""
+    R, H, _ = qn.shape
+    if not mxfp8_q:
+        return _keys_reference(torch.cat([qn.float(), qr.float()], -1), kd, idx, sm)
+    q8 = torch.empty(R, H, 512, device=_DEVICE, dtype=torch.float8_e4m3fn)
+    qs = torch.empty(R, H, 16, device=_DEVICE, dtype=torch.uint8)
+    qrc = torch.empty(R, H, 64, device=_DEVICE, dtype=torch.bfloat16)
+    mla_gfx950._mxfp8_quant_kernel[(R, H // 16)](
+        qn,
+        q8,
+        qs,
+        qr,
+        qrc,
+        qn.stride(0),
+        qn.stride(1),
+        qr.stride(0),
+        qr.stride(1),
+        H,
+        HB=16,
+    )
+    scale = torch.exp2(qs.float() - 127).view(R, H, 16, 1)
+    qd = torch.cat(
+        [(q8.float().view(R, H, 16, 32) * scale).view(R, H, 512), qr.float()], -1
+    )
+    return _keys_reference(qd, kd, idx, sm)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+@pytest.mark.parametrize("num_splits", [1, 8])
+def test_sparse_mla_decode_gfx950_reads_counted_slots(num_splits):
+    """Row r attends to its first topk_length[r] slots, whole or split over the KV and
+    merged; a row with no key returns -inf LSE."""
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=1)
+    kv = kv.view(torch.float8_e4m3fn)
+    lens = [_TOPK, 1, 0, 1000]
+    R, H = len(lens), 16
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    sm = (_DV + _DR) ** -0.5
+    assert mla_gfx950.supports_sparse_mla_decode_gfx950(qn, kv, _DV)
+    o, lse = mla_gfx950.sparse_mla_decode_gfx950(
+        qn, qr, kv, idx.unsqueeze(1), sm, lengths, num_splits=num_splits
+    )
+    o_ref, lse_ref = _decode_reference(qn, qr, idx, kd, sm)
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
+    torch.testing.assert_close(o[0].float(), o_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 only")
+def test_sparse_mla_prefill_gfx950():
+    """Kimi-K3.1's TP8 shard (12 heads, head-major q) with large scores, a top-k that
+    ends inside a key tile, -1 padding and a row with no key."""
+    T, H, topk = 96, 12, 1000
+    kv, k = _scaled_fp8_ds_mla_kv(_PREFILL_POOL, seed=H + topk)
+    torch.manual_seed(topk + H)
+    q_nope = torch.randn(T, H, _DV, device=_DEVICE, dtype=torch.bfloat16) * 3.0
+    q_rope = torch.randn(T, H, _DR, device=_DEVICE, dtype=torch.bfloat16) * 3.0
+    # [H, T, D] storage viewed as [T, H, D]
+    q_nope = q_nope.transpose(0, 1).contiguous().transpose(0, 1)
+    q_rope = q_rope.transpose(0, 1).contiguous().transpose(0, 1)
+    idx = torch.randint(0, _PREFILL_POOL, (T, topk), device=_DEVICE, dtype=torch.int32)
+    idx[:8, -300:] = -1
+    idx[8] = -1
+    sm_scale = (_DV + _DR) ** -0.5
+    assert sparse_mla_prefill_gfx950.supports_sparse_mla_prefill_gfx950(
+        q_nope, q_rope, kv, _DV
+    )
+
+    out, lse = sparse_mla_prefill_gfx950.sparse_mla_prefill_gfx950(
+        q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale, _DV, return_lse=True
+    )
+    ref_out, ref_lse = _keys_reference(
+        torch.cat([q_nope.float(), q_rope.float()], -1), k, idx, sm_scale
+    )
+
+    assert out.shape == (1, T, H, _DV) and lse.shape == (T, H)
+    assert torch.all(out[0, 8] == 0) and torch.all(torch.isneginf(lse[8]))
+    keep = torch.arange(T, device=_DEVICE) != 8
+    o, r = out[0, keep].float(), ref_out[keep]
+    assert ((o - r).norm() / r.norm()).item() < 4e-3
+    torch.testing.assert_close(lse[keep], ref_lse[keep], rtol=0, atol=1e-4)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+def test_dcp_partial_reads_the_indexer_local_slots():
+    """Sharded index-K hands the backend this rank's compact slots and their counts
+    (dcp_local_topk); localizing them again reads other requests' KV. DCP8 decode
+    attends with the group's 96 gathered heads on the gfx950 split-K kernel."""
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=0)
+    kv = kv.view(torch.float8_e4m3fn)
+    lens = [256, 0, 1, 255]  # this rank's share of a 2048 top-k under DCP8
+    R, H = len(lens) + 2, 96  # two graph-padding rows select nothing
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    sm = (_DV + _DR) ** -0.5
+    backend = SimpleNamespace(
+        _triton_sparse_mla_workspaces={},
+        attn_dcp_size=8,
+        forward_metadata=SimpleNamespace(dcp_topk_length=lengths),
+    )
+    layer = SimpleNamespace(scaling=sm, v_head_dim=_DV)
+    o, lse = dsa_backend_hip.forward_triton_dcp_partial(backend, qn, qr, kv, idx, layer)
+    # the slots past each row's count hold -1, so the reference reads only its keys
+    o_ref, lse_ref = _decode_reference(
+        qn, qr, idx, kd, sm, mxfp8_q=dsa_backend_hip._is_gfx95
+    )
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
+    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
 
 
 if __name__ == "__main__":

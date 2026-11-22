@@ -60,6 +60,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.cache.spectrum import (
     SpectrumMixin,
     blend_h3_spectrum_prediction,
@@ -74,14 +75,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
-    vsa_h3_fold_gate,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     PIPELINED_ATTENTION_BACKENDS,
@@ -94,11 +93,14 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
+    LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -117,6 +119,7 @@ from sglang.multimodal_gen.runtime.layers.usp import (
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -262,6 +265,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "rope_cache",
         "unique_timesteps",
         "adaln_cache_slot",
+        "adaln_timestep_bits",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -413,10 +417,11 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
-    # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
-    # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
-    # reduction, matching that accumulation semantic.
+def _norm(
+    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
+) -> nn.RMSNorm | RMSNorm:
+    if current_platform.is_npu():
+        return RMSNorm(size, eps=eps).to(dtype=dtype)
     return nn.RMSNorm(size, eps=eps, dtype=dtype)
 
 
@@ -427,7 +432,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: nn.RMSNorm | RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -443,6 +448,7 @@ def _modulate_rmsnorm_scale_shift(
     """
     if (
         fused
+        and not current_platform.is_npu()
         and x.dtype == dtype == _BF16_DTYPE
         and norm.weight is not None
         and can_use_rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices)
@@ -456,6 +462,7 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
     return (
         isinstance(linear, LinearBase)
         and linear.quant_method is not None
+        and isinstance(linear.quant_method, LinearMethodBase)
         and linear.quant_method.accepts_mxfp8_input(linear)
     )
 
@@ -542,10 +549,12 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_platform.is_npu():
+        return q_norm(q), k_norm(k)
     if (
         q.is_cuda
         and q.dtype == _BF16_DTYPE
@@ -673,8 +682,8 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -687,7 +696,8 @@ def _apply_qk_norm_rope(
         )
 
     if (
-        q_norm.eps is not None
+        not current_platform.is_npu()
+        and q_norm.eps is not None
         and k_norm.eps is not None
         and not torch.compiler.is_compiling()
         and can_use_aten_head_rmsnorm(q, q_norm.weight)
@@ -857,7 +867,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -958,7 +972,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1003,7 +1018,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -1112,6 +1128,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -1137,6 +1157,10 @@ def _minimax_h3_attention_core_impl(
         if ulysses_active:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
         if fold_after_exchange:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+                vsa_h3_fold_gate,
+            )
+
             _, ulysses_rank = get_ulysses_ctx()
             vsa_h3_fold_gate(
                 out,
@@ -1195,6 +1219,24 @@ def _minimax_h3_attention_core_impl(
                 ),
             )
         else:
+            extra_kwargs = {}
+            if (
+                current_platform.is_npu()
+                and attention._attention_backend_enum is AttentionBackendEnum.FA
+                and not attention.prefix.startswith("blocks.")
+            ):
+                from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                    AscendFAMetadata,
+                )
+
+                context = get_forward_context_or_none()
+                metadata = context.attn_metadata if context is not None else None
+                if (
+                    isinstance(metadata, AscendFAMetadata)
+                    and metadata.precision is not None
+                ):
+                    # Keep the refiner native when the DiT selects SD precision.
+                    extra_kwargs["attn_metadata"] = AscendFAMetadata(precision="bf16")
             out = attention._attention_impl.forward_varlen(
                 q,
                 k,
@@ -1202,6 +1244,7 @@ def _minimax_h3_attention_core_impl(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
+                **extra_kwargs,
             )
     if ulysses_active:
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
@@ -1239,6 +1282,7 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
+        self._quant_config = quant_config
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # attention initializes on the first real QKV tensors, after the
@@ -1333,7 +1377,12 @@ class MiniMaxH3Attention(nn.Module):
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.ASCEND_SPARSE_ATTN
+            and "token_refiner" in self.prefix.split(".")
         ):
+            # The text-only refiner has its own packed sequence and stays on
+            # dense FA; Ascend sparse attention applies to multimodal DiT blocks.
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,
@@ -1348,6 +1397,7 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
+            quant_config=self._quant_config,
         )
         # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
         # alongside the impl instance instead of a second get_attn_backend()
@@ -1398,6 +1448,21 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+
+        if isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod):
+            # Heads are contiguous in the grouped checkpoint. Read only this
+            # TP rank's heads, then pack its local Q/K/V on CPU before H2D.
+            # This differs from FSDP, which slices the globally reordered tensor.
+            def _reorder_tp_slice(local_weight: torch.Tensor) -> torch.Tensor:
+                return _reorder_grouped_qkv_to_qkv(
+                    local_weight,
+                    num_query_groups=arch.num_attention_heads // self.tp_size,
+                    heads_per_group=1,
+                    head_dim=arch.attention_head_dim,
+                )
+
+            weight.rank_local_tp_shard_dim = 0
+            weight.rank_local_tp_weight_transform = _reorder_tp_slice
 
         # A quantized checkpoint stores metadata indexed by output row next to the
         # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
@@ -1727,6 +1792,7 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        self._npu_swiglu = SiluAndMul() if current_platform.is_npu() else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1745,7 +1811,14 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if (
+            self._npu_swiglu is not None
+            and hidden.device.type == "npu"
+            and hidden.dtype in (torch.float16, torch.bfloat16)
+        ):
+            hidden = self._npu_swiglu(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
@@ -2373,10 +2446,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             b = adapter[b_key]
             a64 = a.to(torch.float64)
             b64 = b.to(device=work_device, dtype=torch.float64)
-            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            # Keep the adapter dtype: the folded linear runs the LoRA delta with
+            # the raw activation dtype and rejects a float32 operand.
+            projected[a_key] = (a64 @ work_basis.T).to(a.dtype)
             projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
                 b64 @ (a64 @ work_mean)
-            ).to(torch.float32)
+            ).to(b.dtype)
 
         logger.info(
             "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",
@@ -2474,6 +2549,73 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self.validate_weight_update_source(weights_path=weights_path)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
+
+    def _adaln_memo_params(
+        self, adaln_input: torch.Tensor, timestep_bits: tuple[int, ...] | None
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Per-block AdaLN parameters memoized by the step's exact timesteps.
+
+        A block's AdaLN projection depends only on the step's unique timesteps
+        (the time embedding feeds a fixed weight), and a few-step release
+        reuses the same timestep schedule for every request. Each block's
+        projection is a weight-bandwidth-bound GEMV (2688 x 96768 BF16 =
+        520 MB read per block per step), so serving it from a small memo keyed
+        by the timesteps' bit patterns removes it after the first request with
+        the same schedule. The memo holds exactly what the same projection
+        computed for the same input, so outputs are bit-identical.
+        The memo is dropped when an AdaLN weight is rebound and whenever the
+        conditioning weights epoch advances: weight updates and LoRA merges
+        write in place, and an unmerged LoRA changes the projection without
+        touching its weight.
+        """
+        max_entries = 32
+        if (
+            timestep_bits is None
+            or self.adaln_cache is not None
+            or get_tp_world_size() > 1
+            or torch.compiler.is_compiling()
+            # CUDA only: torch.cuda's capture query is a stub on other builds
+            or adaln_input.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+            or any(block.adaln_proj is None for block in self.blocks)
+        ):
+            return None
+        weights = [block.adaln_proj.linear.weight for block in self.blocks]
+        version = (
+            conditioning_weights_epoch(),
+            # inference tensors track no version counter
+            *(
+                (w.data_ptr(), None if w.is_inference() else w._version)
+                for w in weights
+            ),
+        )
+        memo = self.__dict__.get("_adaln_memo")
+        if memo is None or memo[0] != version:
+            memo = (version, {})
+            self.__dict__["_adaln_memo"] = memo
+        entries = memo[1]
+        key = (
+            timestep_bits,
+            tuple(adaln_input.shape),
+            adaln_input.dtype,
+            adaln_input.device,
+        )
+        outputs = entries.pop(key, None)
+        if outputs is None:
+            outputs = [
+                block.adaln_proj.project_local(adaln_input) for block in self.blocks
+            ]
+            while len(entries) >= max_entries:
+                entries.pop(next(iter(entries)))
+        entries[key] = outputs
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, outputs)
+        )
 
     def _can_batch_block_adaln(self) -> bool:
         return (
@@ -3421,6 +3563,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )
+            elif (
+                memo := self._adaln_memo_params(
+                    adaln_input, kwargs.get("adaln_timestep_bits")
+                )
+            ) is not None:
+                block_adaln_params = memo
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(
                     [

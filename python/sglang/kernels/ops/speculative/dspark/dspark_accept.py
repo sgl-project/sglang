@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -36,7 +37,9 @@ _SPLIT_ACCEPT = (
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
+    from sgl_kernel_npu.operators.speculative import (
+        chain_speculative_sampling as chain_speculative_sampling_triton,
+    )
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
@@ -119,9 +122,7 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    plain = (
-        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
-    )
+    plain = not need_truncated_sampling(sampling_info)
     if (
         _SPLIT_ACCEPT
         and plain

@@ -35,11 +35,16 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 import torch
 import tqdm
 
+from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_can_run_graph,
+    megakernel_tensor_graph_variants,
+    megakernel_verify_variants,
+)
 from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
@@ -93,12 +98,13 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
-    BreakableCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.capture_profile import (
     CaptureProfileOptions,
@@ -129,6 +135,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecod
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -276,6 +283,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     uocr_graph_io: Optional[UOCRDecodeGraphIO] = None
 
     _draft_glue_logged = 0
+    _batched_small_copy = False
 
     dllm_input_preparation = None
     dllm_attention = None
@@ -409,6 +417,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or self.attn_backend.get_decode_graph_variants(
                 self.capture_forward_mode, self.captured_req_width
             )
+        )
+
+        self.attention_graph_variants = megakernel_tensor_graph_variants(
+            self.model_runner.model, self.attention_graph_variants
         )
 
         if (
@@ -630,6 +642,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: a pre-planned replay skips copying input_ids and
         # positions again when the full load_batch copied them (_restage_is_redundant)
         self._restage_skip = envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+        self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
         self._staged_inputs: Optional[tuple] = None
         # The DSpark draft runner's prep has no host-fed plan, so the guard above does
         # not apply where its backend says so.
@@ -864,12 +877,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
+        """Drafts that run attn-TP-local (draft_tp_context) build batches with no
+        dp-global metadata, so their graphs key by local batch size."""
         if not model_runner.is_draft_worker:
             return False
+        if model_runner.spec_algorithm.is_dflash():
+            return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -965,6 +978,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not megakernel_can_run_graph(self.model_runner.model, forward_batch):
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -986,6 +1001,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and spec_info.num_tokens_per_req > 0
             and spec_info.num_tokens_per_req != self.captured_req_width
         ):
+            return False
+
+        # Compact-trie logits and shared-context attention run eagerly.
+        if forward_batch.beam is not None:
             return False
 
         if self.require_mlp_tp_gather:
@@ -1212,6 +1231,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.capture_hidden_mode,
             spec_info,
         )
+        self._capture_custom_mask = (
+            spec_info.custom_mask if spec_info is not None else None
+        )
 
         if self.model_runner.lora_manager is not None:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -1288,7 +1310,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        with self.model_context():
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with (
+            self.model_context(),
+            get_foundry_adapter().capture_scope(
+                phase="decode",
+                model=self.model_runner.model,
+                # Read only when active: a test may drive capture() on a stand-in.
+                kind=self._foundry_graph_kind()
+                if get_foundry_adapter().enabled
+                else None,
+                flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                    self.model_runner
+                ),
+            ),
+        ):
             self._capture()
 
     def _capture_profile_options(self) -> CaptureProfileOptions:
@@ -1300,6 +1336,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             per_shape=per_shape,
             get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
         )
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive, EAGLE subclasses included:
+        # target_decode, target_verify, draft_decode, draft_extend, draft_verify.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        if mode.is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
 
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1426,7 +1473,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+            assert isinstance(self.backend, BaseBreakableGraphBackend), (
                 "Breakable CUDA graph is required for --debug-cuda-graph"
             )
 
@@ -1735,7 +1782,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            # Idle replay uses the same mask mode as capture.
+            forward_batch.spec_info.custom_mask = self._capture_custom_mask
 
         self._init_replay_attn_metadata(
             forward_batch,
@@ -2028,6 +2076,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         # The plan-time load (or the early stage it took) filled these from the very
         # same tensors.
+        if (
+            prefilled is None
+            and self._batched_small_copy
+            and try_small_copy(
+                [
+                    self.buffers.input_ids[: self.raw_num_token],
+                    self.buffers.positions[: self.raw_num_token],
+                ],
+                [forward_batch.input_ids, forward_batch.positions],
+            )
+        ):
+            return
         if prefilled is None or forward_batch.input_ids is not prefilled[0]:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
         if prefilled is None or forward_batch.positions is not prefilled[1]:
