@@ -950,6 +950,12 @@ Warm `t2va` requests at 1344×768 and 5 seconds through `sglang serve` on H200:
 | `2step` | 11.9 s | 6.8 s | 7.0 s |
 | `4step` | 22.6 s | 12.3 s | 12.7 s |
 
+With the base H3 two-GPU offload flags (`--performance-mode memory
+--layerwise-offload-components dit,text_encoder,vae
+--layerwise-resident-layers video_vae=36 --dit-offload-prefetch-size 1
+--dit-layerwise-resident-layers 20`), `2step` on Ulysses 2 peaked at 50 GiB per
+H200 and took 7.2 to 7.9 s per request.
+
 Precision and attention options on 1× H200 (same workload, offline generation;
 FP8 and Sol are approximate):
 
