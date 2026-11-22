@@ -215,7 +215,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=SimpleNamespace(watermark=None),
+        sampling_info=SimpleNamespace(watermark=None, has_custom_logit_processor=False),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(
@@ -306,7 +306,8 @@ class TestPostVerifyGraphs(CustomTestCase):
 
     def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
         """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,
-        seeds, ...) or whose verify ran eagerly must take SGLang's eager path."""
+        a custom logit processor, seeds, ...) or whose verify ran eagerly must take
+        SGLang's eager path."""
         graphs = EaglePostVerifyGraphs(
             target_worker=_target_worker(),
             simulated_acc_len_rng=simulated_acc_len_generator(0),

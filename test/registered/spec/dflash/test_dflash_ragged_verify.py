@@ -48,6 +48,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
             temperatures=torch.ones(bs, 1, device=DEVICE),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
         ),
         draft_input=None,
         prefix_lens=torch.zeros(bs, dtype=torch.int64, device=DEVICE),
