@@ -87,6 +87,23 @@ class TestSamplerTokenIdSync(CustomTestCase):
         _, all_reduce = self._sync(_PLAIN_BATCH)
         all_reduce.assert_not_called()
 
+    def test_grammar_sync_uses_pynccl_with_outside_graphs_flag(self):
+        pynccl_comm = mock.Mock()
+        group = mock.Mock()
+        ids = torch.tensor([5, 1, 7])
+        with (
+            mock.patch.object(
+                sampler_module,
+                "pynccl_comm_for_device_group",
+                side_effect=lambda g: pynccl_comm if g is group else None,
+            ),
+            mock.patch.object(dist, "get_world_size", return_value=2),
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+        ):
+            _sampler(group)._sync_token_ids_across_tp(ids, _GRAMMAR_BATCH)
+        all_reduce.assert_not_called()
+        pynccl_comm.all_reduce.assert_called_once_with(ids, op=dist.ReduceOp.MIN)
+
     def test_two_rank_group_still_reduces_with_min(self):
         ctx = mp.get_context("spawn")
         with ctx.Manager() as manager:

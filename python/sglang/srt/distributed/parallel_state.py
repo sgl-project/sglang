@@ -188,6 +188,50 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def pynccl_comm_for_device_group(device_group: ProcessGroup) -> Optional[Any]:
+    """With SGLANG_PYNCCL_OUTSIDE_GRAPHS, the PyNccl communicator to call
+    instead of torch.distributed on `device_group`, so the device group never
+    builds a second NCCL communicator. None otherwise."""
+    if not envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get():
+        return None
+    for ref in _groups.values():
+        group = ref()
+        if group is not None and group.device_group is device_group:
+            pynccl_comm = group.get_available_pynccl_comm()
+            if pynccl_comm is not None and not pynccl_comm.disabled:
+                return pynccl_comm
+            return None
+    return None
+
+
+def warn_on_device_group_nccl_comms(stage: str) -> None:
+    """With SGLANG_PYNCCL_OUTSIDE_GRAPHS, name the groups whose device group
+    built its own NCCL communicator anyway: some caller used
+    torch.distributed on it directly, so the group holds two sets of NCCL
+    buffers on the same ranks."""
+    if not envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get():
+        return
+    names = []
+    for name, ref in _groups.items():
+        group = ref()
+        if group is None or group.get_available_pynccl_comm() is None:
+            continue
+        try:
+            backend = group.device_group._get_backend(group.device)
+        except (RuntimeError, AttributeError):
+            continue
+        if getattr(backend, "_is_initialized", lambda: False)():
+            names.append(name)
+    if names:
+        logger.warning(
+            "SGLANG_PYNCCL_OUTSIDE_GRAPHS: %s already has a device-group NCCL "
+            "communicator %s; a direct torch.distributed call on device_group "
+            "allocated it next to PyNccl's.",
+            ", ".join(names),
+            stage,
+        )
+
+
 def _aiter_capture_registered(ca_comm) -> bool:
     # Copy-in whenever the communicator was built for it: ranks may replay
     # different graphs (see custom_all_reduce._enable_register_for_capturing).
@@ -487,6 +531,8 @@ class GroupCoordinator:
                 device=self.device,
                 is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
+            if envs.SGLANG_PYNCCL_OUTSIDE_GRAPHS.get() and self.pynccl_comm.available:
+                self.pynccl_comm.disabled = False
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_mscclpp and self.world_size > 1:
@@ -674,10 +720,11 @@ class GroupCoordinator:
             # --------------------------------------------
             # quick allreduce        | enabled | enabled |
             # custom allreduce       | enabled | enabled |
-            # PyNccl                 | disabled| enabled |
+            # PyNccl                 | disabled*| enabled |
             # PyMscclpp              | disabled| enabled |
             # TorchSymmMem           | disabled| enabled |
             # torch.distributed      | enabled | disabled|
+            # * enabled with SGLANG_PYNCCL_OUTSIDE_GRAPHS
             #
             # Note: When custom quick allreduce is enabled, a runtime check
             #  will be performed. If the tensor size is too small, it will

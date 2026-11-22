@@ -615,5 +615,44 @@ def test_fused_allreduce_rmsnorm_quant_per_group_runs_on_gfx942_and_gfx95(
     assert len(calls) == int(expect_fused)
 
 
+def _register_fake_group(monkeypatch, *, pynccl_disabled=False, nccl_built=False):
+    device_group = Mock()
+    device_group._get_backend.return_value = Mock(
+        _is_initialized=Mock(return_value=nccl_built)
+    )
+    pynccl_comm = Mock(disabled=pynccl_disabled)
+    group = Mock(device_group=device_group)
+    group.get_available_pynccl_comm.return_value = pynccl_comm
+    monkeypatch.setattr(parallel_state, "_groups", {"tp": lambda: group})
+    return device_group, pynccl_comm
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_pynccl_comm_for_device_group_only_with_flag(monkeypatch, flag):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1" if flag else "0")
+    device_group, pynccl_comm = _register_fake_group(monkeypatch)
+
+    found = parallel_state.pynccl_comm_for_device_group(device_group)
+    assert found is (pynccl_comm if flag else None)
+    assert parallel_state.pynccl_comm_for_device_group(Mock()) is None
+
+
+def test_pynccl_comm_for_device_group_skips_disabled_comm(monkeypatch):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    device_group, _ = _register_fake_group(monkeypatch, pynccl_disabled=True)
+    assert parallel_state.pynccl_comm_for_device_group(device_group) is None
+
+
+@pytest.mark.parametrize("nccl_built", [False, True])
+def test_warn_on_device_group_nccl_comms(monkeypatch, nccl_built):
+    monkeypatch.setenv("SGLANG_PYNCCL_OUTSIDE_GRAPHS", "1")
+    _register_fake_group(monkeypatch, nccl_built=nccl_built)
+    with patch.object(parallel_state.logger, "warning") as warning:
+        parallel_state.warn_on_device_group_nccl_comms("at test")
+    assert warning.called is nccl_built
+    if nccl_built:
+        assert "tp" in warning.call_args.args
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
