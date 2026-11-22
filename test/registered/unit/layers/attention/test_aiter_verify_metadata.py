@@ -340,13 +340,13 @@ class TestAiterCprrKernelHeads(CustomTestCase):
                 self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
                 self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
 
-    def test_unconfirmed_kernel_off_gfx950_keeps_the_table_verdict(self):
-        # Off gfx950, aiter's None falls back to the table verdict alone,
-        # so gfx1250 is not sent to a Gluon fallback that asserts gfx950.
-        unknown = _ShapeSupport({(128, 6), (128, 8)}, supported=None, arch="gfx1250")
+    def test_unconfirmed_kernel_off_gfx950_follows_aiter_native(self):
+        # Off gfx950 the copied table is not consulted; aiter's fold veto still applies,
+        # so a folded (96, 6) pads to 128 and a native (96, 8) stays at 96.
+        unknown = _ShapeSupport({(96, 8), (128, 6)}, supported=None, arch="gfx1250")
         with patch.object(aiter_backend, "get_mla_decode_shape_support", unknown):
-            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
-            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 128)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 96)
 
     def test_persist_disabled_by_the_operator_does_not_ask_aiter(self):
         # SGLANG_AITER_MLA_PERSIST=0 keeps the verify on Gluon; the query (which can

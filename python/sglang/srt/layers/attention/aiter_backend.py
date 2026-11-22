@@ -190,7 +190,7 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
-_use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
+_use_mla_ps_kernel = envs.SGLANG_AITER_MLA_PERSIST.get()
 
 
 # Use fp8 prefill only on gfx95
@@ -257,8 +257,8 @@ def _asm_cprr_shape_verdict(
             intra_batch_mode=intra_batch_mode,
         )
     except (TypeError, ValueError) as e:
-        # What get_mla_decode_shape_support raises for arguments it cannot
-        # describe (e.g. a dtype or keyword this aiter does not know).
+        # Raised for arguments aiter cannot describe,
+        # e.g. a dtype or keyword this aiter does not know.
         logger.warning(
             "aiter cannot describe the DCP verify at %d heads and q_len %d; "
             "the copied table decides: %r",
@@ -276,12 +276,9 @@ def _asm_cprr_shape_verdict(
         )
     supported = support.supported
     if supported is None:
-        # aiter cannot confirm a kernel (a failed asm query, or a backend it has no
-        # table for). Only gfx950 takes the copied table together with the fold
-        # veto; other archs keep the table's verdict alone.
-        if support.arch != "gfx950":
-            return table_verdict
-        supported = in_table
+        # aiter cannot confirm a kernel (a failed asm query, or a backend it has no table
+        # for); the copied table is gfx950 data, so only gfx950 consults it.
+        supported = in_table if support.arch == "gfx950" else True
         if not supported:
             reasons.append(
                 "aiter cannot confirm a kernel and the copied gfx950 table "
