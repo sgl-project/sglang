@@ -13,7 +13,10 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    MiniMaxH3SamplingParams,
+    PikaH3FlexSamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -394,6 +397,15 @@ def test_video_adapter_does_not_override_default_reference_resize_mode():
     assert "reference_resize_mode" not in lowered
 
 
+def test_pika_h3_flex_defaults_to_pika_reference_resize():
+    assert MiniMaxH3SamplingParams().reference_resize_mode == "max"
+    assert PikaH3FlexSamplingParams().reference_resize_mode == "diffusers"
+    assert (
+        PikaH3FlexSamplingParams(reference_resize_mode="max").reference_resize_mode
+        == "max"
+    )
+
+
 def test_sampling_params_normalizes_reference_resize_mode():
     assert (
         MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
@@ -637,6 +649,20 @@ def test_lossless_quality_does_not_enable_h3_cache_dit():
     assert not stage._cache_dit_enabled
 
 
+def test_high_quality_cache_schedule_is_the_audited_static_mask():
+    """quality="high" runs exactly the step schedule the 4xH200 audit measured;
+    reusing the stack before step 15 changes the layout of the sample."""
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage._minimax_h3_quality = "high"
+
+    _, policy, mask, _ = stage._cache_dit_scm_masks(50)
+
+    assert policy == "static"
+    assert "".join(map(str, mask)) == (
+        "11111111111111101010101010000000100000001000000011"
+    )
+
+
 def test_quality_admission_fails_closed_outside_validated_request():
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
@@ -759,6 +785,22 @@ def test_validate_server_args_requires_packed_varlen_backend():
     )
     server_args.ring_degree = 2
     with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+@pytest.mark.parametrize("backend", ["fa", "aiter"])
+def test_validate_server_args_accepts_ring_on_lse_backends(backend):
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=backend,
+        ring_degree=2,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ):
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 

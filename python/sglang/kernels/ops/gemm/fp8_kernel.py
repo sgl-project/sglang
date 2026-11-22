@@ -80,6 +80,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -97,6 +98,9 @@ def _w8a8_block_fp8_matmul(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -134,6 +138,8 @@ def _w8a8_block_fp8_matmul(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -174,6 +180,7 @@ def _w8a8_block_fp8_matmul_hopper(
     needs_masking: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
     SPLIT_K: tl.constexpr = 1,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     split = tl.program_id(axis=1)
@@ -190,6 +197,9 @@ def _w8a8_block_fp8_matmul_hopper(
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -246,6 +256,8 @@ def _w8a8_block_fp8_matmul_hopper(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -298,6 +310,7 @@ def _w8a8_block_fp8_matmul_gfx1250(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr = False,
 ):
     """
     gfx1250 (RDNA4) block-fp8 matmul.
@@ -320,6 +333,9 @@ def _w8a8_block_fp8_matmul_gfx1250(
 
     # No modulo-wrap on gfx1250; use explicit masks instead.
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # int64 only when A or C has >= 2^31 elements; other shapes keep int32 offsets
+    if USE_INT64_OFFSETS:
+        offs_am = offs_am.to(tl.int64)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     m_mask = offs_am < M
     n_mask = offs_bn < N
@@ -363,6 +379,8 @@ def _w8a8_block_fp8_matmul_gfx1250(
         c = accumulator.to(tl.float32)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if USE_INT64_OFFSETS:
+        offs_cm = offs_cm.to(tl.int64)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -493,7 +511,8 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
+    output: Optional[torch.Tensor] = None,
+) -> Tuple[int, int, int, torch.Tensor]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -529,7 +548,13 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    if output is None:
+        C = A.new_empty(C_shape, dtype=output_dtype)
+    else:
+        # caller-owned storage (e.g. a fused collective's symmetric buffer)
+        assert output.shape == C_shape and output.dtype == output_dtype
+        assert output.is_contiguous()
+        C = output
 
     return M, N, K, C
 
@@ -541,8 +566,11 @@ def w8a8_block_fp8_matmul_deepgemm(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, output
+    )
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -562,8 +590,7 @@ def w8a8_mxfp8_matmul_deepgemm(
     assert A.is_contiguous() and B.is_contiguous()
     assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    M = A.numel() // A.shape[-1]
-    N, K = B.shape
+    N = B.shape[0]
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
     deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
@@ -684,6 +711,7 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(0),
         **config,
         needs_masking=needs_masking,
+        USE_INT64_OFFSETS=max(A.numel(), partials.numel()) >= 2**31,
     )
 
     if split_k > 1:
@@ -786,10 +814,10 @@ def scaled_mm_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
 
         masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
+        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
 
         # Accumulate results.
         accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)

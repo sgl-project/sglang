@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
@@ -118,10 +119,6 @@ class KvEventLoraNames(LoRANameTable):
         return self._names.get(extra_key) or self._adapter_names.get(
             extra_key[-_LORA_ID_LEN:]
         )
-
-
-# Matches the multimodal pad-value offset in req_types.MM_PAD_SHIFT_VALUE.
-_MM_PAD_SHIFT_VALUE = 1_000_000
 
 
 class MmRoutingLabels:
@@ -231,7 +228,7 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
     # Text holds no value at or above the pad shift, and max() runs in C, so
     # text skips the per-token loop: whole events here, blocks of mixed
     # events below.
-    if max(token_ids) < _MM_PAD_SHIFT_VALUE:
+    if max(token_ids) < MM_PAD_SHIFT_VALUE:
         return None
     per_block = []
     any_span = False
@@ -239,12 +236,12 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
         block = token_ids[block_index * block_size : (block_index + 1) * block_size]
         spans = []
         per_block.append(spans)
-        if not block or max(block) < _MM_PAD_SHIFT_VALUE:
+        if not block or max(block) < MM_PAD_SHIFT_VALUE:
             continue
         run_start, run_label = 0, None
         for position, token in enumerate(block):
             label = (
-                MM_ROUTING_LABELS.get(token) if token >= _MM_PAD_SHIFT_VALUE else None
+                MM_ROUTING_LABELS.get(token) if token >= MM_PAD_SHIFT_VALUE else None
             )
             if label != run_label:
                 if run_label is not None:
@@ -254,6 +251,20 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
             spans.append((run_start, len(block) - run_start, run_label))
         any_span = any_span or bool(spans)
     return per_block if any_span else None
+
+
+def event_namespace_seed(
+    extra_key: Optional[str],
+    cache_salt: Optional[str],
+    dynamo_format: bool,
+    lora_names: KvEventLoraNames,
+) -> Optional[bytes]:
+    if dynamo_format:
+        return kv_event_namespace_seed(extra_key=extra_key, cache_salt=cache_salt)
+    return kv_event_namespace_seed(
+        extra_key=extra_key if lora_names.get(extra_key) is not None else None,
+        cache_salt=None,
+    )
 
 
 class KVCacheEventRecorder:
@@ -346,19 +357,15 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def _namespace_seed(self, node: Any) -> Optional[bytes]:
-        if not self.dynamo_format:
-            return kv_event_namespace_seed(
-                extra_key=(
-                    node.key.extra_key
-                    if self.lora_names.get(node.key.extra_key) is not None
-                    else None
-                ),
-                cache_salt=None,
-            )
-        return kv_event_namespace_seed(
-            extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
+    def namespace_seed(
+        self, extra_key: Optional[str], cache_salt: Optional[str]
+    ) -> Optional[bytes]:
+        return event_namespace_seed(
+            extra_key, cache_salt, self.dynamo_format, self.lora_names
         )
+
+    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+        return self.namespace_seed(node.key.extra_key, node.key.cache_salt)
 
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None
