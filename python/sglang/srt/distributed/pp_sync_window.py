@@ -1,9 +1,14 @@
-"""Bounded window of un-waited sends on a PP-sync channel."""
+"""Bounded window of un-waited sends on a PP-sync channel, and an in-order
+receiver that posts a PP host channel's receives ahead on a thread."""
 
 from __future__ import annotations
 
+import queue
+import threading
 from collections import deque
-from typing import Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
+
+import msgspec
 
 
 class _Waitable(Protocol):
@@ -44,3 +49,47 @@ class PPSyncSendWindow:
     def __len__(self) -> int:
         """Rounds currently held un-waited, the opened one included."""
         return len(self._outstanding)
+
+
+class _ReceiveFailure(msgspec.Struct, frozen=True):
+    exc: BaseException
+
+
+class PPReceiveAhead:
+    """In-order receiver for one PP host (gloo) channel.
+
+    A daemon thread runs the channel's blocking ``recv_one`` back to back and
+    queues what it receives, at most ``depth`` messages ahead of ``pop``. A gloo
+    send completes only once its receive is posted, so the sender's window
+    drains while the receiving rank's scheduler is busy elsewhere. Gloo matches
+    receives in posting order, so once this runs every receive of the channel
+    must go through ``pop``. A receive that raises fails that pop and every
+    later one: the channel's stream is lost.
+    """
+
+    def __init__(self, recv_one: Callable[[], Any], depth: int, name: str) -> None:
+        assert depth >= 1, depth
+        self._recv_one = recv_one
+        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def ready(self) -> bool:
+        """Whether ``pop`` would return without blocking."""
+        return not self._queue.empty()
+
+    def pop(self) -> Any:
+        item = self._queue.get()
+        if isinstance(item, _ReceiveFailure):
+            self._queue.put(item)
+            raise RuntimeError(
+                f"PP receive thread {self._thread.name} failed"
+            ) from item.exc
+        return item
+
+    def _run(self) -> None:
+        try:
+            while True:
+                self._queue.put(self._recv_one())
+        except BaseException as exc:
+            self._queue.put(_ReceiveFailure(exc=exc))

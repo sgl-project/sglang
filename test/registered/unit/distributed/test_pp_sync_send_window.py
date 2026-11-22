@@ -1,8 +1,10 @@
 """Unit tests for srt/distributed/pp_sync_window."""
 
+import threading
+import time
 import unittest
 
-from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.distributed.pp_sync_window import PPReceiveAhead, PPSyncSendWindow
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,6 +61,52 @@ class TestPPSyncSendWindow(CustomTestCase):
         self.assertFalse(first[0].waited)
         _round(window, sends=1)
         self.assertTrue(first[0].waited)
+
+
+def _wait_until(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        time.sleep(0.001)
+
+
+class TestPPReceiveAhead(CustomTestCase):
+    """The thread posts the channel's receives ahead of the scheduler, in order
+    and at most ``depth`` messages ahead; a failed receive fails every pop after
+    the messages received before it."""
+
+    def test_pops_in_receive_order_and_reads_at_most_depth_ahead(self):
+        calls = []
+        gate = threading.Event()
+
+        def recv_one():
+            gate.wait()
+            calls.append(len(calls))
+            return calls[-1]
+
+        receiver = PPReceiveAhead(recv_one=recv_one, depth=2, name="t-recv")
+        self.assertFalse(receiver.ready())
+        gate.set()
+        _wait_until(lambda: len(calls) == 3)
+        time.sleep(0.05)
+        # Two queued, a third received and waiting for room.
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(receiver.ready())
+        self.assertEqual([receiver.pop() for _ in range(5)], [0, 1, 2, 3, 4])
+
+    def test_a_failed_receive_fails_this_and_every_later_pop(self):
+        messages = iter([0])
+
+        def recv_one():
+            return next(messages)
+
+        receiver = PPReceiveAhead(recv_one=recv_one, depth=4, name="t-recv-fail")
+        self.assertEqual(receiver.pop(), 0)
+        for _ in range(2):
+            with self.assertRaises(RuntimeError) as ctx:
+                receiver.pop()
+            self.assertIsInstance(ctx.exception.__cause__, StopIteration)
 
 
 if __name__ == "__main__":

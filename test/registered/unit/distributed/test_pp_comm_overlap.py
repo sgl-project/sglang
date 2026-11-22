@@ -241,6 +241,97 @@ class TestPPCommOverlap(CustomTestCase):
             torch.testing.assert_close(proxy.tensors["hidden_states"], expected_gather)
             self.assertTrue(all(not queue for queue in mailboxes.values()))
 
+    def test_recv_tensor_dict_host_part_matches_a_plain_receive(self):
+        """The host half takes only the CPU-group messages (metadata, CPU tensors);
+        the device half then receives the device tensors and returns the same dict
+        a single recv_tensor_dict would."""
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                self._check_host_part(tp_size)
+
+    def _check_host_part(self, tp_size):
+        mailboxes = defaultdict(deque)
+        work = SimpleNamespace(wait=lambda: None)
+        cpu_group, device_group = object(), object()
+        active = {"rank": 0}
+
+        def send(tensor, dst, group=None, tag=0):
+            mailboxes[active["rank"], dst, group].append(tensor.clone())
+            return work
+
+        def recv(tensor, src, group=None, tag=0):
+            sent = mailboxes[src, active["rank"], group].popleft()
+            self.assertEqual((tensor.shape, tensor.dtype), (sent.shape, sent.dtype))
+            tensor.copy_(sent)
+            return work
+
+        groups = []
+        for rank in (0, 1):
+            group = object.__new__(GroupCoordinator)
+            group.__dict__.update(
+                rank=rank,
+                rank_in_group=rank,
+                ranks=[0, 1],
+                world_size=2,
+                cpu_group=cpu_group,
+                device_group=device_group,
+            )
+            groups.append(group)
+        all_gather_group = SimpleNamespace(
+            world_size=tp_size,
+            rank_in_group=0,
+            all_gather=lambda tensor, dim=0: tensor.repeat(tp_size),
+        )
+        message = {
+            "__msg_type__": "proxy",
+            "seq_lens": torch.arange(4),
+            "empty": torch.empty(0, dtype=torch.int32),
+            "hidden_states": torch.empty(4, 8, device="meta"),
+            "flag": True,
+        }
+        with patch.multiple(
+            torch.distributed, is_initialized=lambda: True, isend=send, irecv=recv
+        ):
+            received = []
+            for split in (False, True):
+                active["rank"] = 0
+                groups[0].send_tensor_dict(
+                    dict(message), all_gather_group=all_gather_group, async_send=True
+                )
+                active["rank"] = 1
+                host_part = None
+                if split:
+                    host_part = groups[1].recv_tensor_dict_host_part(
+                        all_gather_group=all_gather_group
+                    )
+                    self.assertEqual(list(host_part.cpu_tensors), ["seq_lens"])
+                    # Only the device tensor is left, on the device group.
+                    pending = {k[2] for k, q in mailboxes.items() if q}
+                    self.assertEqual(pending, {device_group})
+                received.append(
+                    groups[1].recv_tensor_dict(
+                        all_gather_group=all_gather_group, host_part=host_part
+                    )
+                )
+                self.assertTrue(all(not q for q in mailboxes.values()))
+
+        plain, split = received
+        self.assertEqual(list(plain), list(split))
+        for key, value in plain.items():
+            if isinstance(value, torch.Tensor):
+                self.assertEqual(
+                    (value.shape, value.dtype, value.device),
+                    (split[key].shape, split[key].dtype, split[key].device),
+                )
+                if value.device.type == "cpu":
+                    torch.testing.assert_close(value, split[key])
+            else:
+                self.assertEqual(value, split[key])
+        # This rank's slice gathered with the fake's copy of it.
+        torch.testing.assert_close(
+            split["seq_lens"], torch.arange(4 // tp_size).repeat(tp_size)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
