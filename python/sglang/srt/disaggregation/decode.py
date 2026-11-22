@@ -2385,12 +2385,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         forward clears on the forward stream: after its writes, and before the
         event the send waits for. A deferred publish runs an iteration after its
         allocation, once that forward's result was processed, and without
-        overlap or PP the forwards run on this stream; both clear here."""
+        overlap or PP the forwards run on this stream; both clear here, and wait
+        for the clear before the send: nothing else orders the peer's writes
+        after it (a readback of empty indices, as for a HiSparse request too
+        short to hold a compressed host entry, does not wait)."""
         # TODO(ch-wan): under PP without overlap the forwards run on the forward
         # stream and the send is not held, so this clear is not ordered after a
         # microbatch still writing the row.
         if not send_waits_for_forward:
             self.token_to_kv_pool.clear_request_scoped_state(req_pool_idx)
+            cleared = self.scheduler.device_module.Event()
+            cleared.record()
+            cleared.synchronize()
             return
         with self.scheduler.device_module.stream(self.scheduler.forward_stream):
             self.token_to_kv_pool.clear_request_scoped_state(req_pool_idx)

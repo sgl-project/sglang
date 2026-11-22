@@ -1,7 +1,8 @@
 """A PD decode row's DeepSeek-V4 request-scoped state (C128 ring, pending pairs)
 is reset before the peer writes the transferred part of it. Under overlap the
 row's previous owner can still have a redundant forward in flight that writes
-this state, so a send held behind that forward must reset after it."""
+this state, so a send held behind that forward must reset after it; a send not
+held must not go out while the reset is still queued on the device."""
 
 import unittest
 from contextlib import contextmanager
@@ -12,6 +13,7 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -22,13 +24,20 @@ ROW = 3
 
 
 class _Streams:
-    """Stand-in device module: logs each stream's work in issue order."""
+    """Stand-in device module. Work issued on a stream stays queued until an
+    event recorded after it is synchronized; an event recorded on a stream is
+    what a held send waits for."""
 
     def __init__(self):
         self.schedule = "schedule"
         self.forward = "forward"
         self.current = self.schedule
-        self.log = []
+        self.queued = []  # (stream, work) not yet known complete on the host
+        self.log = []  # (stream, work) in issue order
+
+    def issue(self, work):
+        self.queued.append((self.current, work))
+        self.log.append((self.current, work))
 
     @contextmanager
     def stream(self, stream):
@@ -43,20 +52,29 @@ class _Streams:
 
         class _Event:
             def record(self, stream=None):
-                streams.log.append((stream or streams.current, "event"))
+                self.stream = stream or streams.current
+                self.upto = [w for w in streams.queued if w[0] == self.stream]
+                streams.log.append((self.stream, "event"))
+
+            def synchronize(self):
+                for work in self.upto:
+                    if work in streams.queued:
+                        streams.queued.remove(work)
 
         return _Event()
 
 
-def _queue(streams, *, enable_overlap, defer_publish):
+def _queue(streams, *, enable_overlap, defer_publish, hisparse=False):
     queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
     queue.scheduler = SimpleNamespace(
         enable_overlap=enable_overlap,
-        enable_hisparse=False,
+        enable_hisparse=hisparse,
         forward_stream=streams.forward,
         device_module=streams,
     )
     queue._defer_publish = defer_publish
+    queue.transfer_backend = TransferBackend.MOONCAKE
+    queue.draft_token_to_kv_pool = None
     queue.token_to_kv_pool_allocator = SimpleNamespace(
         page_size=1, translate_kv_indices_for_transfer=lambda ids: ids
     )
@@ -72,26 +90,36 @@ def _queue(streams, *, enable_overlap, defer_publish):
     pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
     pool.request_state_transfer_indices = Mock(return_value=[0, 1])
     pool.clear_request_scoped_state = Mock(
-        side_effect=lambda row: streams.log.append((streams.current, "clear"))
+        side_effect=lambda row: streams.issue("clear")
     )
     queue.token_to_kv_pool = pool
     queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(alloc=lambda: 0)
-    queue._transfer_page_indices = Mock(return_value=[0])
     queue._storage = Mock(return_value=Mock(move_epoch=Mock(return_value=0)))
     queue._record_receive = Mock()
     queue._num_published_destinations = 0
     return queue
 
 
-def _publish(queue):
-    req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=ROW), time_stats=Mock())
-    entry = DecodeRequest(req=req, kv_receiver=Mock())
+def _publish(queue, streams, *, fill_len=8, dst_kv_indices=None):
+    req = SimpleNamespace(
+        kv=SimpleNamespace(req_pool_idx=ROW),
+        time_stats=Mock(),
+        bootstrap_host="prefill",
+    )
+    receiver = Mock()
+    # What a send not held finds queued on the device when it goes out.
+    receiver.send_metadata.side_effect = lambda *a, **k: streams.log.append(
+        ("host", "send", tuple(streams.queued))
+    )
+    entry = DecodeRequest(req=req, kv_receiver=receiver)
     queue._publish_destination(
         entry,
-        dst_kv_indices=torch.arange(8),
+        dst_kv_indices=(
+            torch.arange(fill_len) if dst_kv_indices is None else dst_kv_indices
+        ),
         prefix_len=0,
         total_prefix_len=0,
-        fill_len=8,
+        fill_len=fill_len,
     )
     return entry
 
@@ -103,16 +131,17 @@ class TestRequestStateClearOrder(CustomTestCase):
         streams = _Streams()
         queue = _queue(streams, enable_overlap=True, defer_publish=False)
 
-        entry = _publish(queue)
+        entry = _publish(queue, streams)
 
         self.assertIsNotNone(entry.pending_metadata)
-        forward_work = [event for stream, event in streams.log if stream == "forward"]
+        forward_work = [w for s, w, *_ in streams.log if s == "forward"]
         self.assertEqual(forward_work, ["clear", "event"])
         queue.token_to_kv_pool.clear_request_scoped_state.assert_called_once_with(ROW)
 
-    def test_a_send_not_held_clears_on_the_publishing_stream(self):
+    def test_a_send_not_held_goes_out_after_the_clear_completed(self):
         """A deferred publish (one iteration later) and a scheduler without
-        overlap send once the current stream is done: the clear stays on it."""
+        overlap send at once: the clear stays on the current stream, and the
+        send waits until it has run, whatever readbacks precede the send."""
         for enable_overlap, defer_publish in ((True, True), (False, False)):
             with self.subTest(overlap=enable_overlap, deferred=defer_publish):
                 streams = _Streams()
@@ -120,11 +149,32 @@ class TestRequestStateClearOrder(CustomTestCase):
                     streams, enable_overlap=enable_overlap, defer_publish=defer_publish
                 )
 
-                entry = _publish(queue)
+                entry = _publish(queue, streams)
 
                 self.assertIsNone(entry.pending_metadata)
-                self.assertEqual(streams.log, [("schedule", "clear")])
-                entry.kv_receiver.send_metadata.assert_called_once()
+                self.assertIn(("schedule", "clear"), streams.log)
+                self.assertEqual(streams.log[-1], ("host", "send", ()))
+
+    def test_a_short_hisparse_request_without_overlap_sends_after_the_clear(self):
+        """A HiSparse request of 1-3 tokens holds no compressed host entry, so
+        the destination's page readback is empty and does not wait on the
+        device; its C128 state still transfers, so the clear must be done."""
+        for fill_len in (1, 2, 3):
+            with self.subTest(fill_len=fill_len):
+                streams = _Streams()
+                queue = _queue(
+                    streams, enable_overlap=False, defer_publish=False, hisparse=True
+                )
+
+                entry = _publish(
+                    queue,
+                    streams,
+                    fill_len=fill_len,
+                    dst_kv_indices=torch.empty(0, dtype=torch.int64),
+                )
+
+                self.assertIsNone(entry.pending_metadata)
+                self.assertEqual(streams.log[-1], ("host", "send", ()))
 
 
 if __name__ == "__main__":
