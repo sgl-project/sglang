@@ -2336,7 +2336,11 @@ class Scheduler(
         # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
         # synced, so all ranks decide the same (no deadlock).
         early_prefill = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
-        npu_async_eplb = _is_npu and get_exec().moe.eplb_async_rebalance
+        npu_async_eplb = (
+            _is_npu
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and get_exec().moe.eplb_async_rebalance
+        )
         if early_prefill or npu_async_eplb:
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
