@@ -2335,7 +2335,13 @@ class Scheduler(
 
         # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
         # synced, so all ranks decide the same (no deadlock).
-        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get():
+        early_prefill = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get()
+        if not early_prefill and _is_npu and get_exec().moe.eplb_async_rebalance:
+            manager = self.tp_worker.model_runner.eplb_manager
+            # Avoid holding first tokens behind the next forward during the
+            # initial expert migration. Keep steady-state batch overlap.
+            early_prefill = manager is not None and manager.first_rebalance_active
+        if early_prefill:
             if self.require_mlp_sync:
                 last_batch_is_extend = last_batch.is_extend_in_batch
             else:

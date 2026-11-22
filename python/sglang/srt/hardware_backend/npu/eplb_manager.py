@@ -64,6 +64,11 @@ class NpuAsyncEPLBManager(EPLBManager):
             get_global_expert_distribution_recorder()._reset()
         super().reset_generator()
 
+    @property
+    def first_rebalance_active(self) -> bool:
+        coordinator = self._async_coordinator
+        return coordinator is not None and coordinator.epoch == 1 and coordinator.active
+
     def rebalance(self):
         if self._rebalance_disabled_reason is not None:
             yield from super().rebalance()
