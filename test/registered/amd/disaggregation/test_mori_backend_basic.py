@@ -72,8 +72,13 @@ class TestMoriDCP(unittest.TestCase):
                 )
             }
         }
+        manager.exchange_aux_item_lens = False
         manager.decode_kv_args_table = {
-            "peer": SimpleNamespace(requires_dcp_relayout=True)
+            "peer": SimpleNamespace(
+                requires_dcp_relayout=True,
+                dst_aux_mem_descs=[],
+                dst_aux_item_lens=None,
+            )
         }
         manager.update_status = Mock()
         manager.send_kvcache_dcp = Mock(return_value=[])

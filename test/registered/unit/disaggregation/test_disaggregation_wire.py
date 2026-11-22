@@ -1382,6 +1382,18 @@ class TestPollCollectives(CustomTestCase):
         self.assertEqual(result, [KVPoll.Transferring, KVPoll.Success])
         all_reduce.assert_not_called()
 
+    def test_a_room_failed_while_its_metadata_arrived_is_not_committed(self):
+        """The receive thread can drop a metadata item, fail the room, and write
+        the room marker between this round's poll and the gate's marker read."""
+        poller = Mock(poll=Mock(side_effect=[KVPoll.Success, KVPoll.Failed]))
+        request = SimpleNamespace(
+            req=SimpleNamespace(bootstrap_host="127.0.0.1"), metadata_buffer_index=0
+        )
+        metadata = SimpleNamespace(bootstrap_room=torch.tensor([[42]]))
+        with patch.object(dist, "get_world_size", return_value=1):
+            result = poll_and_all_reduce([poller], object(), [request], metadata)
+        self.assertEqual(result, [KVPoll.Failed])
+
     def test_singleton_still_advances_and_waits_for_staging(self):
         request = SimpleNamespace(
             kv_receiver=Mock(
