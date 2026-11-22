@@ -80,7 +80,9 @@ class TestPlannerPrefixSelection(CustomTestCase):
             patch.object(planner, "get_device", lambda: SimpleNamespace(device="cpu")),
             patch.object(planner, "create_dcp_kv_indices", _FakeKernel()),
             patch.object(
-                planner, "get_attn_backend", lambda: SimpleNamespace(runner_ids=runner_ids)
+                planner,
+                "get_attn_backend",
+                lambda: SimpleNamespace(runner_ids=runner_ids),
             ),
         ):
             metadata = planner.prepare_decode_context_parallel_metadata(
@@ -115,9 +117,9 @@ class TestPlannerPrefixSelection(CustomTestCase):
             for dcp_rank in range(dcp_size):
                 for prefix_lens in cases:
                     rows, got = self._plan(prefix_lens, dcp_size, dcp_rank)
-                    expected = torch.cat(
-                        [row[dcp_rank::dcp_size] for row in rows]
-                    ).to(got.dtype)
+                    expected = torch.cat([row[dcp_rank::dcp_size] for row in rows]).to(
+                        got.dtype
+                    )
                     torch.testing.assert_close(
                         got,
                         expected,
