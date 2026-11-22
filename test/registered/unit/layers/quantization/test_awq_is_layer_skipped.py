@@ -41,9 +41,7 @@ class TestIsLayerSkippedAwq(CustomTestCase):
     def test_direct_fused_name_entry_still_matches(self):
         # Workaround configs list the fused name itself; keep it working.
         prefix = "model.layers.11.self_attn.qkv_proj"
-        self.assertTrue(
-            is_layer_skipped_awq(prefix, ["self_attn.qkv_proj", "mtp"])
-        )
+        self.assertTrue(is_layer_skipped_awq(prefix, ["self_attn.qkv_proj", "mtp"]))
 
     def test_unfused_layer_uses_substring_match(self):
         # Unified GDN tensors are listed directly; behavior must not change.
@@ -53,7 +51,9 @@ class TestIsLayerSkippedAwq(CustomTestCase):
             )
         )
         self.assertTrue(
-            is_layer_skipped_awq("model.visual.blocks.0.attn.qkv", QWEN36_MODULES_TO_NOT_CONVERT)
+            is_layer_skipped_awq(
+                "model.visual.blocks.0.attn.qkv", QWEN36_MODULES_TO_NOT_CONVERT
+            )
         )
         self.assertTrue(
             is_layer_skipped_awq(
@@ -65,19 +65,17 @@ class TestIsLayerSkippedAwq(CustomTestCase):
     def test_quantized_fused_layer_is_not_skipped(self):
         prefix = "model.layers.0.mlp.gate_up_proj"
         self.assertFalse(is_layer_skipped_awq(prefix, ["visual", "mtp"]))
+        self.assertFalse(is_layer_skipped_awq("model.layers.0.self_attn.qkv_proj", []))
         self.assertFalse(
-            is_layer_skipped_awq("model.layers.0.self_attn.qkv_proj", [])
+            is_layer_skipped_awq("model.layers.0.self_attn.qkv_proj", None)
         )
-        self.assertFalse(is_layer_skipped_awq("model.layers.0.self_attn.qkv_proj", None))
 
     def test_partial_shard_skip_is_rejected(self):
         # Only some shards of the fused layer are dense: the checkpoint is
         # unloadable into a homogeneous fused module either way, so fail
         # loudly instead of building an incompatible quantized layer.
         with self.assertRaises(ValueError):
-            is_layer_skipped_awq(
-                "model.layers.1.mlp.gate_up_proj", ["mlp.gate_proj"]
-            )
+            is_layer_skipped_awq("model.layers.1.mlp.gate_up_proj", ["mlp.gate_proj"])
 
 
 if __name__ == "__main__":
