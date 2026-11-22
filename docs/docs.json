@@ -1004,6 +1004,7 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/cuda_graph_persistence",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
@@ -1561,6 +1562,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
