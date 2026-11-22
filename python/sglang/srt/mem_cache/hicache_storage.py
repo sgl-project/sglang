@@ -867,6 +867,17 @@ class HiCacheFile(HiCacheStorage):
         shard_suffix = ""
         if storage_config.pp_size > 1:
             shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+        # The controller already folds the logical KV dtype and any
+        # storage_format_tag into model_name. The remaining layout differences
+        # belong in the suffix alongside the sharding markers:
+        # - is_page_first_layout changes the byte order within a page
+        # - extra_backend_tag lets a deployment isolate a directory across any
+        #   other backend-specific format change
+        if storage_config.is_page_first_layout:
+            shard_suffix += "_page1st"
+        extra_backend_tag = (storage_config.extra_config or {}).get("extra_backend_tag")
+        if extra_backend_tag is not None:
+            shard_suffix += f"_bkt{extra_backend_tag}"
         # Under NSA context parallel each CP rank holds a disjoint slice of
         # every page, so give each rank its own file key to avoid a cross-rank
         # write race.
@@ -885,8 +896,6 @@ class HiCacheFile(HiCacheStorage):
             if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
-        # The controller includes the logical KV dtype and any storage_format_tag
-        # in model_name. Other layout differences still need extra_backend_tag.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (
