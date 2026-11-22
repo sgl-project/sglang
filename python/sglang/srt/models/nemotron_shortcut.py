@@ -886,7 +886,7 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         return (
             (is_vision and not self.has_vision)
             or ".mtp." in name
-            # NVFP4 KV-cache scales; the KV cache is served unquantized.
+            # NVFP4 KV-cache global scales; an FP8 KV cache runs at scale 1.
             or name.endswith(".k_scale")
             or name.endswith(".v_scale")
         )

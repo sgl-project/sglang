@@ -182,7 +182,7 @@ class NemotronShortcutForCausalLMMTP(nn.Module):
         loaded: set[str] = set()
         for name, loaded_weight in weights:
             # The draft attention is dense: the MTP indexer is not served. NVFP4
-            # KV-cache scales: the KV cache is served unquantized.
+            # KV-cache global scales: an FP8 KV cache runs at scale 1.
             if (
                 not name.startswith(_MTP_PREFIX)
                 or ".indexer." in name

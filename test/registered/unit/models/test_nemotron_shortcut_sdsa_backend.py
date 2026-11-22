@@ -15,6 +15,7 @@ from sglang.srt.layers.attention import sdsa_backend  # noqa: E402
 from sglang.srt.layers.attention.trtllm_mha_backend import (  # noqa: E402
     TRTLLMHAAttnBackend,
 )
+from sglang.srt.mem_cache.sdsa_kv_pool import SdsaTokenToKVPool  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,7 +29,12 @@ def _runner(*, kv_dtype=torch.bfloat16, num_kv_heads=1):
         hf_text_config=SimpleNamespace(index_topk=2048),
         get_num_kv_heads=lambda tp: num_kv_heads,
     )
-    return SimpleNamespace(model_config=model_config, kv_cache_dtype=kv_dtype)
+    return SimpleNamespace(
+        model_config=model_config,
+        kv_cache_dtype=kv_dtype,
+        token_to_kv_pool=SdsaTokenToKVPool.__new__(SdsaTokenToKVPool),
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(1, 4096)),
+    )
 
 
 def _create(*, disagg="null", hicache=False, full_backend=None, index_head_dim=128):
@@ -83,10 +89,12 @@ class TestSdsaAttnBackendInit(CustomTestCase):
         ):
             sdsa_backend.SdsaAttnBackend(runner)
 
-    def test_quantized_kv_cache_is_rejected(self):
-        # The sparse path reads the cache as unscaled model-dtype pages.
-        with self.assertRaises(NotImplementedError):
-            self._init(_runner(kv_dtype=torch.float8_e4m3fn))
+    def test_kv_cache_dtypes(self):
+        self._init(_runner(kv_dtype=torch.float8_e4m3fn))
+        # The sparse path casts the query to E4M3 only.
+        for kv_dtype in (torch.float8_e5m2, torch.uint8):
+            with self.assertRaises(NotImplementedError):
+                self._init(_runner(kv_dtype=kv_dtype))
 
     def test_more_than_one_kv_head_per_rank_is_rejected(self):
         # Top-k slots index one-token pages of a single KV head.

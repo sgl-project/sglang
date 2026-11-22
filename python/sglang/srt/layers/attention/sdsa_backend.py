@@ -21,7 +21,7 @@ core attends to them:
 2. ``flashinfer.top_k_page_table_transform``: top-k positions mapped through
    ``req_to_token`` to KV slots (-1 padded).
 3. ``trtllm_batch_decode_with_kv_cache(sparse_top_k=...)``: token-sparse MQA,
-   one query row per request over one-token KV pages.
+   one query row per request over one-token KV pages, in BF16 or FP8.
 
 With at most ``index_topk`` causal keys every key is kept, so this is exact for
 short contexts too. Decode always takes the sparse path (one graph-safe
@@ -83,10 +83,10 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         model_config = model_runner.model_config
-        # The sparse path reads the cache as unscaled model-dtype pages.
-        if self.data_type != model_config.dtype:
+        if self.data_type not in (model_config.dtype, torch.float8_e4m3fn):
             raise NotImplementedError(
-                f"SDSA needs a {model_config.dtype} KV cache, got {self.data_type}."
+                f"SDSA needs a {model_config.dtype} or fp8_e4m3 KV cache, "
+                f"got {self.data_type}."
             )
         # Top-k slots index one-token pages of a single KV head.
         num_kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
@@ -257,7 +257,11 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
 
         num_rows = q.shape[0]
         num_heads, head_dim = layer.tp_q_head_num, layer.head_dim
+        out_dtype = q.dtype
         q = q.reshape(num_rows, num_heads, head_dim)
+        if self.data_type == torch.float8_e4m3fn:
+            # trtllm-gen takes the query in the cache's FP8.
+            q = q.to(torch.float8_e4m3fn)
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         # One-token HND pages of the single KV head.
         kv_cache = (
@@ -272,7 +276,9 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
         topk = self.index_topk
         bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, 1.0)
 
-        out = q.new_empty(num_rows, num_heads * head_dim)
+        out = torch.empty(
+            num_rows, num_heads * head_dim, dtype=out_dtype, device=q.device
+        )
         chunk = max(1, min(num_rows, _SCORE_CHUNK_BYTES // (4 * self.score_width)))
         for start in range(0, num_rows, chunk):
             end = min(num_rows, start + chunk)
@@ -306,7 +312,7 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
                 max_seq_len=topk,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
-                out_dtype=q.dtype,
+                out_dtype=out_dtype,
                 kv_layout="HND",
                 backend="trtllm-gen",
                 uses_shared_paged_kv_idx=False,

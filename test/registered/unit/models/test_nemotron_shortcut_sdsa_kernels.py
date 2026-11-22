@@ -83,12 +83,19 @@ class TestSdsaSparseAttention(CustomTestCase):
         slots = self.req_to_token[request, :context_len].long()
         scores = index_q.float() @ self.index_k[slots].float().T
         keep = slots[scores.topk(min(TOPK, context_len)).indices]
+        if self.backend.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
         attn = torch.softmax(
             q.float() @ self.k[keep].float().T / math.sqrt(HEAD_DIM), dim=-1
         )
         return attn @ self.v[keep].float()
 
-    def _check(self, requests, context_lens):
+    def _use_fp8_cache(self):
+        self.k = self.k.to(torch.float8_e4m3fn)
+        self.v = self.v.to(torch.float8_e4m3fn)
+        self.backend.data_type = torch.float8_e4m3fn
+
+    def _check(self, requests, context_lens, tol=2e-2):
         rows = len(requests)
         q = torch.randn(rows, HEADS * HEAD_DIM, device="cuda", dtype=torch.bfloat16)
         index_q = torch.randn(rows, INDEX_DIM, device="cuda", dtype=torch.bfloat16)
@@ -100,10 +107,11 @@ class TestSdsaSparseAttention(CustomTestCase):
             req_pool_indices=torch.arange(len(self.lens), device="cuda")
         )
         out = self.backend._sparse_attention(q, self.layer, batch, index_q, sdsa_rows)
+        self.assertEqual(out.dtype, torch.bfloat16)
         for i, (r, n) in enumerate(zip(requests, context_lens)):
             ref = self._reference(q[i].view(HEADS, HEAD_DIM), index_q[i], r, n)
             err = (out[i].float().view(HEADS, HEAD_DIM) - ref).norm() / ref.norm()
-            self.assertLess(err.item(), 2e-2, f"row {i} (request {r}, {n} keys)")
+            self.assertLess(err.item(), tol, f"row {i} (request {r}, {n} keys)")
 
     def test_decode_rows(self):
         self._check(list(range(len(self.lens))), self.lens)
@@ -115,6 +123,12 @@ class TestSdsaSparseAttention(CustomTestCase):
         context_lens = [1, 2047, 2048, 2048, 2049, 1, 2500, 3000]
         with patch("sglang.srt.layers.attention.sdsa_backend._SCORE_CHUNK_BYTES", 1):
             self._check(requests, context_lens)
+
+    def test_fp8_kv_cache(self):
+        # The query is cast to the cache's E4M3; the output stays BF16. The
+        # kernel also rounds the probabilities to E4M3, hence the wider bound.
+        self._use_fp8_cache()
+        self._check(list(range(len(self.lens))), self.lens, tol=5e-2)
 
 
 if __name__ == "__main__":
