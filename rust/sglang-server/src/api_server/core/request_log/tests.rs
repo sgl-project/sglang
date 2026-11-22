@@ -853,3 +853,96 @@ fn rollover_keeps_archives_and_survives_a_deleted_file() {
     assert_eq!(file.rollover_at, later + ROTATE_INTERVAL);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A writer output that takes no line until it is released.
+struct StuckSink {
+    released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    written: Arc<Mutex<Vec<String>>>,
+}
+
+impl std::io::Write for StuckSink {
+    fn write(&mut self, line: &[u8]) -> std::io::Result<usize> {
+        let (released, wake) = &*self.released;
+        drop(wake.wait_while(lock(released), |released| !*released));
+        lock(&self.written).push(String::from_utf8(line.to_vec()).unwrap());
+        Ok(line.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes `count` numbered lines from another thread to a writer whose output
+/// is stuck, then releases it and stops the writer. Returns whether every
+/// write returned while the output was stuck, the lines written out in the
+/// end, and the lines dropped.
+fn write_past_a_stuck_sink(full_buffer: FullBuffer, count: usize) -> (bool, Vec<String>, usize) {
+    let released = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let targets = Arc::new(Targets {
+        stdout: false,
+        paths: Vec::new(),
+        files: Mutex::default(),
+    });
+    let sink = StuckSink {
+        released: released.clone(),
+        written: written.clone(),
+    };
+    let writer = Writer::with_output(targets, full_buffer, sink);
+    let mut lines = writer.writer.clone();
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        for i in 0..count {
+            lines.write_all(format!("{i}\n").as_bytes()).unwrap();
+        }
+        done.send(()).unwrap();
+    });
+    let returned_while_stuck = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+    *lock(&released.0) = true;
+    released.1.notify_all();
+    if !returned_while_stuck {
+        finished.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+    let dropped = writer.writer.error_counter().dropped_lines();
+    drop(writer);
+    let written = std::mem::take(&mut *lock(&written));
+    (returned_while_stuck, written, dropped)
+}
+
+/// Under `drop`, a stuck sink holds up no write: a line that does not fit is
+/// dropped whole, and the drops reach the metric when the writer stops. The
+/// lines kept are written out in order.
+#[test]
+fn a_full_buffer_drops_lines_without_waiting() {
+    let before = dropped_lines_metric().value(&[]).unwrap_or(0);
+    let count = BUFFERED_LINES + 100;
+    let (returned_while_stuck, written, dropped) = write_past_a_stuck_sink(FullBuffer::Drop, count);
+    assert!(returned_while_stuck);
+    // The writer thread holds one line; the buffer holds the rest it keeps.
+    assert!(dropped >= count - BUFFERED_LINES - 1, "{dropped} dropped");
+    assert_eq!(written.len() + dropped, count);
+    let numbers: Vec<usize> = written
+        .iter()
+        .map(|line| line.strip_suffix('\n').unwrap().parse().unwrap())
+        .collect();
+    assert!(numbers.is_sorted());
+    // The reporter reports the last drops from its own thread.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dropped_lines_metric().value(&[]) != Some(before + dropped as u64) {
+        assert!(Instant::now() < deadline, "drops not reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Under `wait`, a write waits for room while the sink is stuck, and no line
+/// is lost.
+#[test]
+fn a_full_buffer_waits_until_the_sink_drains() {
+    let count = BUFFERED_LINES + 2;
+    let (returned_while_stuck, written, dropped) = write_past_a_stuck_sink(FullBuffer::Wait, count);
+    assert!(!returned_while_stuck);
+    assert_eq!(dropped, 0);
+    let expected: Vec<String> = (0..count).map(|i| format!("{i}\n")).collect();
+    assert_eq!(written, expected);
+}

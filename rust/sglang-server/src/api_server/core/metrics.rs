@@ -221,7 +221,12 @@ impl ExtensionCounter {
 
     /// Add one to the series with these labels.
     pub fn inc(&self, labels: &[(&str, &str)]) {
-        self.0.extension_series(labels).inc(1);
+        self.inc_by(labels, 1);
+    }
+
+    /// Add `amount` to the series with these labels.
+    pub(crate) fn inc_by(&self, labels: &[(&str, &str)], amount: u64) {
+        self.0.extension_series(labels).inc(amount);
     }
 
     /// Create the series with these labels at zero, as prometheus_client's
