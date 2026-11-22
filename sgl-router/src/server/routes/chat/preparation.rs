@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
+    ROUTING_KEY_HEADER,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -669,7 +670,7 @@ fn lower_openai(
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.
-        routing_key: header_str(headers, "x-smg-routing-key"),
+        routing_key: header_str(headers, ROUTING_KEY_HEADER),
         custom_labels: settings
             .tokenizer_metrics_custom_labels_header
             .as_deref()

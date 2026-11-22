@@ -348,6 +348,7 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.decode_kv_args_table = {
             "agent": SimpleNamespace(
+                unified_layout_error=None,
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
@@ -426,6 +427,69 @@ class TestNixlTransferWorker(CustomTestCase):
                 return_value=device_module,
             ),
         )
+
+    def test_cached_layout_rejection_blocks_aux_only_transfer(self):
+        mgr = self._make_manager(34)
+        mgr.decode_kv_args_table["agent"].unified_layout_error = "layout mismatch"
+        mgr.agent.check_remote_metadata = MagicMock(return_value=False)
+        mgr.agent.add_remote_agent = MagicMock()
+        mgr.send_kvcache = MagicMock()
+        mgr.maybe_send_extra = MagicMock()
+        mgr.send_aux = MagicMock()
+        chunk = self._make_chunk(34, [], is_last_chunk=True)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(mgr.check_status(34), KVPoll.Failed)
+        mgr.send_kvcache.assert_not_called()
+        mgr.maybe_send_extra.assert_not_called()
+        mgr.send_aux.assert_not_called()
+        self.assertIn("layout mismatch", mgr.failure_records[34])
+        mgr.agent.check_remote_metadata.assert_not_called()
+        mgr.agent.add_remote_agent.assert_not_called()
+
+    def test_discarded_chunks_complete_without_transfers(self):
+        for status in (KVPoll.Failed, KVPoll.Success):
+            with self.subTest(status=status):
+                mgr = self._make_manager(35)
+                mgr.request_status[35] = status
+                if status == KVPoll.Success:
+                    mgr.transfer_infos.clear()
+                chunk = self._make_chunk(35, [1], is_last_chunk=False)
+                chunk.send_record = mgr.send_record(35)
+                mgr.note_send_enqueued(35)
+                mgr.send_kvcache = MagicMock()
+                if status == KVPoll.Failed:
+                    wait_event = chunk.wait_event = MagicMock()
+                    indices_event = chunk.indices_event = MagicMock()
+                self._run_worker_once(mgr, chunk)
+                self.assertEqual(mgr.send_counts(35), (1, 1))
+                mgr.send_kvcache.assert_not_called()
+                if status == KVPoll.Failed:
+                    wait_event.synchronize.assert_not_called()
+                    indices_event.synchronize.assert_not_called()
+                    mgr.disaggregation_mode = DisaggregationMode.PREFILL
+                    mgr.transfer_queues = [FakeQueue()]
+                    mgr.add_transfer_request(35, np.array([1]), slice(0, 1), False)
+                    self.assertEqual(mgr.transfer_queues[0].items, [])
+                    self.assertEqual(mgr.send_counts(35), (1, 1))
+
+    def test_abort_during_forward_wait_skips_indices_wait(self):
+        mgr = self._make_manager(36)
+        chunk = self._make_chunk(36, [1], is_last_chunk=False)
+        chunk.send_record = mgr.send_record(36)
+        mgr.note_send_enqueued(36)
+        chunk.wait_event = MagicMock(
+            synchronize=lambda: mgr.update_status(36, KVPoll.Failed)
+        )
+        event = chunk.indices_event = MagicMock()
+        mgr.send_kvcache = MagicMock()
+        device, device_module = self._record_device_bind([])
+        with device, device_module:
+            self._run_worker_once(mgr, chunk)
+        event.synchronize.assert_not_called()
+        mgr.send_kvcache.assert_not_called()
+        self.assertEqual(mgr.send_counts(36), (1, 1))
 
     def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
         context = get_context().override_server_args(
@@ -513,6 +577,138 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    @staticmethod
+    def _make_cp_tp_prefill(mgr, room, *, peer_only, n=4):
+        """Prefill TP rank 1 under CP-TP group sharing: attention TP 1, and
+        the CP, KV-shard and GDN widths all ``n``."""
+        mgr.kv_shard_state_peer_only = peer_only
+        mgr.attn_tp_size = 1
+        mgr.attn_cp_size = mgr.kv_shard_size = mgr.state_tp_size = n
+        mgr.kv_args.engine_rank = 1
+        mgr.transfer_infos[room]["agent"].required_dst_info_num = n
+        mgr.decode_kv_args_table["agent"].decode_tp_size = n
+
+    def test_kv_sharded_completion_waits_for_handles(self):
+        for peer_only, decode_tp_rank, is_peer in (
+            (True, 1, True),
+            (True, 2, False),
+            (True, 5, True),
+            (True, 6, False),
+            (False, 2, True),
+        ):
+            # A non-peer sends no state or aux, so it has no handle to fail.
+            for final_state in ("DONE", "ERR") if is_peer else ("DONE",):
+                with self.subTest(
+                    peer_only=peer_only,
+                    decode_tp_rank=decode_tp_rank,
+                    final_state=final_state,
+                ):
+                    room = 24
+                    mgr = self._make_manager(room)
+                    self._make_cp_tp_prefill(mgr, room, peer_only=peer_only)
+                    mgr.transfer_infos[room]["agent"].dst_state_indices = [[2]]
+                    dst_info = mgr.decode_kv_args_table["agent"]
+                    dst_info.decode_tp_rank = decode_tp_rank
+                    dst_info.dst_state_data_ptrs = [[0]]
+                    dst_info.dst_state_item_lens = [[4]]
+                    dst_info.dst_state_dim_per_tensor = [[1]]
+                    dst_info.dst_state_layer_ids = [0]
+                    mgr.maybe_send_extra = MagicMock(return_value=["state_handle"])
+                    mgr.send_aux = MagicMock(return_value="aux_handle")
+                    mgr.conclude_transfer = MagicMock(wraps=mgr.conclude_transfer)
+                    mgr.conclude_failure = MagicMock(wraps=mgr.conclude_failure)
+                    mgr._reload_invalidated_peers = MagicMock()
+                    mgr.agent = MagicMock()
+                    polls = defaultdict(int)
+                    notification_counts_at_poll = []
+
+                    def check_xfer_state(handle):
+                        notification_counts_at_poll.append(
+                            mgr.send_kv_status_message.call_count
+                        )
+                        mgr.conclude_transfer.assert_not_called()
+                        polls[handle] += 1
+                        # State may still be writing after the aux handle fails.
+                        if polls[handle] < (3 if handle == "state_handle" else 2):
+                            return "PROC"
+                        return final_state if handle == "aux_handle" else "DONE"
+
+                    mgr.agent.check_xfer_state.side_effect = check_xfer_state
+                    chunk = self._make_chunk(room, [], is_last_chunk=True)
+                    chunk.state_indices = [[1]]
+
+                    self._run_worker_once(mgr, chunk)
+
+                    # Only the rank-matched peer sends state and aux.
+                    self.assertEqual(mgr.maybe_send_extra.call_count, int(is_peer))
+                    self.assertEqual(mgr.send_aux.call_count, int(is_peer))
+                    self.assertEqual(
+                        set(polls),
+                        {"aux_handle", "state_handle"} if is_peer else set(),
+                    )
+                    self.assertTrue(all(count >= 2 for count in polls.values()))
+                    self.assertEqual(
+                        notification_counts_at_poll, [0] * sum(polls.values())
+                    )
+                    expected_status = (
+                        KVPoll.Success if final_state == "DONE" else KVPoll.Failed
+                    )
+                    mgr.conclude_transfer.assert_called_once()
+                    self.assertEqual(
+                        mgr.conclude_transfer.call_args.kwargs["status"],
+                        expected_status,
+                    )
+                    mgr.send_kv_status_message.assert_called_once_with(
+                        targets=[("127.0.0.1", 5555)],
+                        bootstrap_room=room,
+                        status=expected_status,
+                        failure_reason=None
+                        if final_state == "DONE"
+                        else f"NIXL transfer encountered ERR room={room}",
+                    )
+                    self.assertEqual(mgr.request_status[room], expected_status)
+                    if final_state == "DONE":
+                        mgr.conclude_failure.assert_not_called()
+                    else:
+                        mgr.conclude_failure.assert_called_once()
+
+    def test_kv_sharded_pairing_mismatch_fails_the_room_on_every_rank(self):
+        # Prefill rank 1 is not decode rank 0's peer, so it would send nothing
+        # but KV pages; it must still fail the room.
+        for decode_tp_size, required_dst_info_num, message in (
+            (2, 2, "prefill=4 decode=2"),
+            (4, 1, "1 of 4 decode ranks"),
+        ):
+            with self.subTest(
+                decode_tp_size=decode_tp_size,
+                required_dst_info_num=required_dst_info_num,
+            ):
+                room = 25
+                mgr = self._make_manager(room)
+                self._make_cp_tp_prefill(mgr, room, peer_only=True)
+                info = mgr.transfer_infos[room]["agent"]
+                info.required_dst_info_num = required_dst_info_num
+                dst_info = mgr.decode_kv_args_table["agent"]
+                dst_info.decode_tp_size = decode_tp_size
+                dst_info.decode_tp_rank = 0
+                mgr.send_kvcache = MagicMock(return_value="kv_handle")
+                mgr.send_aux = MagicMock(return_value="aux_handle")
+                mgr.maybe_send_extra = MagicMock(return_value=["state_handle"])
+                mgr._reload_invalidated_peers = MagicMock()
+
+                self._run_worker_once(mgr, self._make_chunk(room, [1], True))
+
+                self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+                self.assertIn(message, mgr.failure_records[room])
+                mgr.send_kv_status_message.assert_called_once()
+                self.assertEqual(
+                    mgr.send_kv_status_message.call_args.kwargs["status"],
+                    KVPoll.Failed,
+                )
+                mgr.send_kvcache.assert_not_called()
+                mgr.send_aux.assert_not_called()
+                mgr.maybe_send_extra.assert_not_called()
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
         room = 23
         mgr = self._make_manager(room)
@@ -533,6 +729,7 @@ class TestNixlTransferWorker(CustomTestCase):
         }
         mgr.decode_kv_args_table = {
             agent: SimpleNamespace(
+                unified_layout_error=None,
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
@@ -741,32 +938,43 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr._staging_outstanding)
 
-    def test_early_send_wait_event_is_synchronized_before_the_pages_are_read(self):
-        """A chunk carrying an early-send event is not read before that event.
+    def test_worker_waits_for_events_before_reading_and_counts_completed_handles(self):
+        import torch
 
-        Early-send issues the KV read before the step's forward is enqueued, so
-        the prior step's prefill forward may still be writing these pages. A read
-        that skips the wait ships partially written KV and still reports success.
-        """
-        room = 24
-        mgr = self._make_manager(room)
-        order = []
+        for event_field in ("wait_event", "indices_event"):
+            with self.subTest(event=event_field):
+                room = 24
+                mgr = self._make_manager(room)
+                order = []
 
-        def record_read(*args, **kwargs):
-            order.append("read")
-            return "kv_handle"
+                def record_read(*args, **kwargs):
+                    order.append("read")
+                    return "kv_handle"
 
-        mgr.send_kvcache = MagicMock(side_effect=record_read)
-        chunk = self._make_chunk(room, [1], is_last_chunk=False)
-        chunk.wait_event = SimpleNamespace(synchronize=lambda: order.append("wait"))
-        get_device, get_device_module = self._record_device_bind(order)
+                def poll(handle):
+                    self.assertEqual(mgr.send_counts(room), (1, 0))
+                    order.append("completed")
+                    return "DONE"
 
-        with get_device, get_device_module:
-            self._run_worker_once(mgr, chunk)
+                mgr.send_kvcache = MagicMock(side_effect=record_read)
+                mgr.agent.check_xfer_state = poll
+                chunk = self._make_chunk(room, [1], is_last_chunk=False)
+                if event_field == "indices_event":
+                    chunk.prefill_kv_indices = torch.tensor([1], dtype=torch.int32)
+                setattr(
+                    chunk,
+                    event_field,
+                    SimpleNamespace(synchronize=lambda: order.append("wait")),
+                )
+                chunk.send_record = mgr.send_record(room)
+                mgr.note_send_enqueued(room)
+                get_device, get_device_module = self._record_device_bind(order)
+                with get_device, get_device_module:
+                    self._run_worker_once(mgr, chunk)
 
-        # The wait is the thread's first device call: bound to the rank's GPU first,
-        # else it opens a context on device 0.
-        self.assertEqual(order, ["bind:3", "wait", "read"])
+                self.assertEqual(order, ["bind:3", "wait", "read", "completed"])
+                self.assertEqual(mgr.send_counts(room), (1, 1))
+                self.assertIsInstance(chunk.prefill_kv_indices, np.ndarray)
 
     def test_early_send_wait_event_is_synchronized_before_the_staging_gather(self):
         """With staging on, the wait precedes the staging strategy build.
@@ -875,7 +1083,14 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         mgr.enable_kv_packing = False
         mgr._kv_packers = []
         mgr.transfer_infos = {room: {"agent": SimpleNamespace(dst_port=5555)}}
-        queue = SimpleNamespace(put=MagicMock())
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        observed = []
+
+        def consume(chunk):
+            observed.append(mgr.send_counts(room))
+            mgr.note_send_finished(room, chunk.send_record)
+
+        queue = SimpleNamespace(put=MagicMock(side_effect=consume))
         mgr.transfer_queues = [queue]
         mgr.prepare_send_state_indices = lambda state_indices: state_indices
         sender = object.__new__(NixlKVSender)
@@ -895,12 +1110,18 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         event = object()
         sender._early_send_wait_event = event
 
-        sender.send(np.array([1], dtype=np.int32))
+        indices_event = object()
+        sender.send(np.array([1], dtype=np.int32), indices_event=indices_event)
         sender.send(np.array([2], dtype=np.int32))
 
         first, second = (c.args[0] for c in queue.put.call_args_list)
         self.assertIs(first.wait_event, event)
         self.assertIsNone(second.wait_event)
+
+        self.assertIs(first.indices_event, indices_event)
+        self.assertIsNone(second.indices_event)
+        self.assertEqual(observed, [(1, 0), (2, 1)])
+        self.assertEqual(mgr.send_counts(room), (2, 2))
 
 
 class TestNixlNodeFailure(CustomTestCase):
@@ -1453,6 +1674,146 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             0,
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
+
+
+class TestNixlUnifiedMemory(CustomTestCase):
+    def _manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.enable_unified_memory = True
+        mgr.agent = StagingFakeAgent()
+        mgr.attn_tp_size = mgr.state_tp_size = mgr.pp_size = 1
+        mgr.is_mla_backend = False
+        mgr.kv_args = SimpleNamespace(
+            gpu_id=0,
+            page_size=16,
+            prefill_start_layer=0,
+            kv_data_ptrs=[0x10000],
+            kv_data_lens=[65536],
+            kv_item_lens=[256],
+            kv_data_mem_kinds=["VRAM"],
+            kv_layer_ids=[],
+            state_types=[StateType.SWA, StateType.MAMBA],
+            state_wire_keys=["window", "state"],
+            state_data_ptrs=[[0x10000], [0x10000]],
+            state_data_lens=[[65536], [65536]],
+            state_item_lens=[[128], [512]],
+            aux_data_ptrs=[0x30000],
+            aux_data_lens=[64],
+        )
+        return mgr
+
+    def _peer(self, mgr):
+        return SimpleNamespace(
+            agent_name="peer",
+            dst_dcp_size=1,
+            dst_dcp_rank=0,
+            unified_layout_error=None,
+            dst_unified_layout=mgr._unified_wire_layout(),
+            decode_tp_size=1,
+            dst_kv_ptrs=[0x40000],
+            dst_kv_item_lens=[256],
+            dst_kv_mem_kinds=["VRAM"],
+            dst_state_item_lens=[[128], [512]],
+            dst_state_data_ptrs=[[0x40000], [0x40000]],
+        )
+
+    def test_registration_roundtrip_and_legacy_marker(self):
+        mgr = self._manager()
+        mgr.enable_staging = mgr.exchange_aux_item_lens = False
+        mgr.local_ip, mgr.rank_port = "127.0.0.1", 5555
+        mgr.dcp_size, mgr.dcp_rank = 1, 0
+        mgr.kv_args.engine_rank = 0
+        mgr.kv_args.state_layer_ids = [[], []]
+        mgr.kv_args.draft_rows_dcp_collapsed = False
+        mgr.agent.name = "decode"
+        mgr.agent.get_agent_metadata = lambda: b"metadata"
+        message = mgr.build_receiver_registration_message()[1:]
+        peer = KVArgsRegisterInfo.from_zmq(message)
+        self.assertEqual(peer.dst_unified_layout, mgr._unified_wire_layout())
+        mgr._validate_unified_peer(peer)
+        legacy = KVArgsRegisterInfo.from_zmq(message[:-1])
+        self.assertIsNone(legacy.dst_unified_layout)
+        with self.assertRaisesRegex(ValueError, "layout mismatch"):
+            mgr._validate_unified_peer(legacy)
+        mgr.enable_unified_memory = False
+        self.assertEqual(mgr.build_receiver_registration_message()[1:], message[:-1])
+        mgr._validate_unified_peer(legacy)
+        with self.assertRaisesRegex(ValueError, "layout mismatch"):
+            mgr._validate_unified_peer(peer)
+
+    def test_shared_arena_is_registered_once(self):
+        mgr = self._manager()
+        mgr.register_buffer_to_engine()
+        self.assertEqual(
+            mgr.agent.register_memory_calls,
+            [
+                ([(0x10000, 65536, 0, "")], "VRAM"),
+                ([(0x30000, 64, 0, "")], "DRAM"),
+            ],
+        )
+
+    def test_peer_checks_all_entry_geometry_before_preparing(self):
+        mgr = self._manager()
+        mgr.requires_dcp_relayout = MagicMock(return_value=False)
+        mgr.agent.add_remote_agent = MagicMock()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.check_peer_aux_buffer_count = MagicMock()
+        mgr._prepare_payload_xfer = MagicMock()
+        mgr._prepare_state_xfer = MagicMock()
+        for field, value in (
+            (None, None),
+            ("dst_unified_layout", None),
+            ("dst_unified_layout", {**mgr._unified_wire_layout(), "page_size": 32}),
+            (
+                "dst_unified_layout",
+                {**mgr._unified_wire_layout(), "state_wire_keys": ["other", "state"]},
+            ),
+            ("decode_tp_size", 2),
+            ("dst_kv_item_lens", [512]),
+            ("dst_kv_ptrs", [0x40000, 0x50000]),
+            ("dst_state_item_lens", [[128], [1024]]),
+            ("dst_state_data_ptrs", [[0x40000]]),
+        ):
+            with self.subTest(field=field, value=value):
+                peer = self._peer(mgr)
+                peer.agent_metadata, peer.dst_aux_ptrs = b"metadata", [0x30000]
+                if field is not None:
+                    setattr(peer, field, value)
+                mgr.decode_kv_args_table = {}
+                mgr.agent.add_remote_agent.reset_mock()
+                mgr._prepare_payload_xfer.reset_mock()
+                mgr._prepare_state_xfer.reset_mock()
+                mgr._add_remote_peer(peer)
+                self.assertIs(mgr.decode_kv_args_table["peer"], peer)
+                if field is None:
+                    self.assertIsNone(peer.unified_layout_error)
+                    mgr.agent.add_remote_agent.assert_called_once_with(b"metadata")
+                    mgr._prepare_payload_xfer.assert_called_once_with(peer)
+                    mgr._prepare_state_xfer.assert_called_once_with(peer)
+                else:
+                    self.assertIn("NIXL unified-memory PD", peer.unified_layout_error)
+                    mgr.agent.add_remote_agent.assert_not_called()
+                    mgr._prepare_payload_xfer.assert_not_called()
+                    mgr._prepare_state_xfer.assert_not_called()
+
+    def test_swa_fallback_copies_one_whole_entry(self):
+        mgr = self._manager()
+        handle = mgr._send_kvcache_generic(
+            peer_name="peer",
+            src_data_ptrs=[0x10000],
+            dst_data_ptrs=[0x40000],
+            item_lens=[128],
+            prefill_data_indices=np.array([2, 3], dtype=np.int32),
+            dst_data_indices=np.array([5, 6], dtype=np.int32),
+            dst_gpu_id=0,
+            state_type=StateType.SWA,
+            dst_item_lens=[128],
+        )
+        self.assertEqual(handle, "handle")
+        src, dst = mgr.agent.get_xfer_descs_calls
+        np.testing.assert_array_equal(src[0], [[0x10100, 256, 0]])
+        np.testing.assert_array_equal(dst[0], [[0x40280, 256, 0]])
+        self.assertEqual(mgr.agent.transfer_calls, ["handle"])
 
 
 if __name__ == "__main__":
