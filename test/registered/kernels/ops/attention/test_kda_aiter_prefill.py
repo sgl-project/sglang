@@ -172,30 +172,9 @@ class TestAiterKDAPrefill(CustomTestCase):
                         )
 
     @torch.inference_mode()
-    def test_padded_slot_starts_from_zeros_and_keeps_pool(self):
-        """A negative cache index must start from a zero state and write no pool row."""
-        inputs = _inputs((64, 96), torch.bfloat16)
-        inputs["cache_indices"][1] = -1
-        actual_inputs, expected_inputs = _clone(inputs), _clone(inputs)
-        expected = _reference(expected_inputs)
-        actual = kda_aiter_prefill.extend(
-            *_args(actual_inputs), **_kwargs(actual_inputs)
-        )
-        self.assertLess(_rms_ratio(actual, expected), RMS_TOL)
-        live_row = inputs["cache_indices"][0].item()
-        untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
-        untouched[live_row] = False
-        self.assertTrue(
-            torch.equal(
-                actual_inputs["ssm_states"][untouched],
-                inputs["ssm_states"][untouched],
-            )
-        )
-
-    @torch.inference_mode()
     def test_padded_slot_does_not_clobber_live_slot_zero(self):
         """Padded rows leave non-live pool rows alone, even beside live slot 0, with no host sync."""
-        for slots in ([0, -1, 6], [-1, 0, 6], [-1, 5, -1], [-1, -1, -1]):
+        for slots in ([0, -1, 6], [-1, 0, 6], [5, -1, 6], [-1, 5, -1], [-1, -1, -1]):
             with self.subTest(slots=slots):
                 inputs = _inputs((64, 96, 33), torch.bfloat16)
                 inputs["cache_indices"] = torch.tensor(
@@ -285,6 +264,14 @@ class TestAiterKDAPrefill(CustomTestCase):
                 self.assertIsNone(
                     kda_aiter_prefill.extend(*args, **_kwargs(inputs, **overrides))
                 )
+        zero_tokens = _inputs((0,), torch.bfloat16)
+        self.assertIsNone(
+            kda_aiter_prefill.extend(*_args(zero_tokens), **_kwargs(zero_tokens))
+        )
+        two_dim_start = _kwargs(
+            inputs, query_start_loc=inputs["query_start_loc"].unsqueeze(0)
+        )
+        self.assertIsNone(kda_aiter_prefill.extend(*args, **two_dim_start))
         kda_aiter_prefill._aiter_chunk_kda_module.cache_clear()
         try:
             with envs.SGLANG_OPT_HIP_KDA_AITER_PREFILL.override(False):

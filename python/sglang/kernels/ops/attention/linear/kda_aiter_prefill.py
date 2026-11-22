@@ -80,8 +80,8 @@ def _covered(
     return (
         # spec-decode extends stay on the reference path, as in kda_gfx950_prefill
         not kwargs.get("is_spec_decode", False)
-        # the kernel has no per-chunk h; aligned-only tracking (empty track_ssm_h_src)
-        # reads the final state instead, so only an interior boundary is uncovered
+        # the kernel has no per-chunk h;
+        # aligned-only tracking (empty track_ssm_h_src) reads the final state instead
         and not (
             return_intermediate_states
             and (track_ssm_h_src is None or track_ssm_h_src.numel() > 0)
@@ -100,6 +100,7 @@ def _covered(
         # an empty batch or zero tokens has no chunk table to walk
         and query_start_loc.ndim == 1
         and cache_indices.numel() > 0
+        and q.ndim == 4
         and q.shape[1] > 0
         # the kernel takes one state row per sequence
         and cache_indices.shape == (query_start_loc.numel() - 1,)
