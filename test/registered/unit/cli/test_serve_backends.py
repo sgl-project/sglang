@@ -488,21 +488,28 @@ def _launch_argv(argv):
     return [sys.executable, "-m", "sglang.cli.main", "serve", *argv]
 
 
-# Cookbook pages whose model runs only in an image built from a branch.
-NOT_IN_MAIN = {
-    "stepfun-ai/Step-5-Preview",
-    "thinkingmachines/Inkling-2-Small",
-    "thinkingmachines/Inkling-2-Small-MXFP8",
+# Recipes with CLI options only available on a model-support branch. A model
+# may have both parseable and branch-only recipes; parsing does not prove it runs.
+BRANCH_ONLY_CLI_MODES = {
+    "stepfun-ai/Step-5-Preview": None,  # every recipe
+    # The Hy4-flash low-latency recipes need the DFly arguments from #51159.
+    "tencent/Hy4-flash": {"low-latency"},
+    "tencent/Hy4-flash-FP8": {"low-latency"},
 }
 
 
-def _launchable():
-    """(model, entry) for every exported command this build can run."""
+def _requires_branch_cli(model, entry):
+    modes = BRANCH_ONLY_CLI_MODES.get(model, ())
+    return modes is None or entry["mode"] in modes
+
+
+def _main_cli_recipes():
+    """(model, entry) for commands expected to parse on main."""
     return [
         (model, entry)
         for model, entries in _exported().items()
-        if model not in NOT_IN_MAIN
         for entry in entries
+        if not _requires_branch_cli(model, entry)
     ]
 
 
@@ -525,10 +532,15 @@ class TestExportedCookbookCommands(CustomTestCase):
             with self.subTest(model):
                 self.assertEqual(len(picks), len(set(picks)))
 
-    def test_models_not_in_main_still_fail_to_parse(self):
-        """Once main runs a NOT_IN_MAIN model, drop it so its commands get checked."""
-        for model in NOT_IN_MAIN:
-            for entry in _exported()[model]:
+    def test_branch_only_commands_still_fail_to_parse(self):
+        """Drop an exception once the branch-specific CLI options land in main."""
+        exported = _exported()
+        for model in BRANCH_ONLY_CLI_MODES:
+            entries = [
+                entry for entry in exported[model] if _requires_branch_cli(model, entry)
+            ]
+            self.assertTrue(entries, model)
+            for entry in entries:
                 with (
                     self.subTest(entry["url"]),
                     contextlib.redirect_stderr(io.StringIO()),
@@ -537,9 +549,9 @@ class TestExportedCookbookCommands(CustomTestCase):
                     prepare_server_args(command_argv(entry["command"]))
 
     def test_every_command_parses_as_server_args(self):
-        launchable = _launchable()
-        self.assertTrue(launchable)
-        for model, entry in launchable:
+        recipes = _main_cli_recipes()
+        self.assertTrue(recipes)
+        for model, entry in recipes:
             with self.subTest(entry["url"]):
                 server_args = prepare_server_args(command_argv(entry["command"]))
                 self.assertEqual(server_args.model_path, model)
@@ -848,7 +860,7 @@ class TestCliGuide(CustomTestCase):
             ("NVIDIA GB10", ("dgx-spark",)),
             (
                 "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                ("rtx6000", "rtx-pro-6000"),
+                ("rtx6000", "rtx-pro-6000", "rtxpro6000"),
             ),
             ("NVIDIA GeForce RTX 5090", ("rtx5090",)),
             ("NVIDIA H20-3e", ("h20-3e",)),
@@ -880,7 +892,7 @@ class TestFlagEdits(unittest.TestCase):
                     edit_flags(argv=self.ARGV, edits=edits)
 
     def test_format_matches_every_cookbook_command(self):
-        for _, entry in _launchable():
+        for _, entry in _main_cli_recipes():
             with self.subTest(entry["url"]):
                 lines = entry["command"].splitlines()
                 command = "\n".join(l for l in lines if not l.startswith("#"))

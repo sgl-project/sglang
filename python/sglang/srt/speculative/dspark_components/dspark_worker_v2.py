@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -26,9 +26,11 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import commit_block_accept_tokens_to_penalties
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -423,16 +425,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
-        static_epilogue_supported = (
-            (
-                (target_is_dsv41 and self._draft_is_moe)
-                or draft_folds_static_commit(
-                    draft_model=self.draft_model, kv_injector=self._kv_injector
-                )
-            )
-            and self._verify_planner.mode_value == "static"
+        static_mode = (
+            self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
             and get_parallel().pp_size == 1
+        )
+        dsv41_static = static_mode and target_is_dsv41 and self._draft_is_moe
+        # The KV pools do not exist yet; alloc_memory_pool checks that the draft
+        # really folds once they do.
+        self._static_epilogue_needs_draft_fold = (
+            static_mode
+            and not dsv41_static
+            and getattr(self.draft_model, "folds_static_verify_commit", False)
+        )
+        static_epilogue_supported = (
+            dsv41_static or self._static_epilogue_needs_draft_fold
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
@@ -634,6 +641,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if self._static_epilogue_needs_draft_fold and not draft_folds_static_commit(
+            draft_model=self.draft_model, kv_injector=self._kv_injector
+        ):
+            raise ValueError(
+                f"{type(self.draft_model).__name__} folds the static verify commit, "
+                "but its FULL KV slots are not the target's unremapped slots"
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft:
@@ -1201,7 +1215,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        target_logits, watermark_rows = self._force_watermark(
+        target_logits, sampling_info, watermark = self._force_watermark(
             batch=batch,
             logits_output=logits_output,
             verify_ids_2d=verify_ids_2d,
@@ -1252,6 +1266,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        commit_block_accept_tokens_to_penalties(
+            batch.sampling_info, accept.out_tokens, accept.commit_lens
+        )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,
@@ -1260,13 +1277,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
-        if watermark_rows is not None:
-            self.target_worker.model_runner.watermark_state.commit_speculative_chain(
-                req_pool_indices=batch.req_pool_indices,
-                context_hashes=watermark_rows[0],
-                selected=watermark_rows[1],
-                accept_tokens=accept.out_tokens,
-                accept_lens=accept.commit_lens,
+        if watermark is not None:
+            watermark.record(None, accept.commit_lens)
+            self.target_worker.model_runner.watermark.append_accept_tokens(
+                sampling_info.watermark,
+                batch.req_pool_indices,
+                accept.out_tokens,
+                accept.commit_lens,
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
@@ -1392,26 +1409,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_ids_2d: torch.Tensor,
         positions_2d: torch.Tensor,
         sampling_info,
-    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
         target_logits = logits_output.next_token_logits
-        watermark_state = self.target_worker.model_runner.watermark_state
-        if (
-            watermark_state is None
-            or sampling_info is None
-            or not sampling_info.has_watermark_candidates
-        ):
-            return target_logits, None
-        if batch.return_logprob:
-            # compute_spec_logprobs reads logits_output after acceptance.
-            target_logits = target_logits.clone()
-        watermark_rows = watermark_state.force_speculative_chain(
-            logits=target_logits,
-            req_pool_indices=batch.req_pool_indices,
-            chain_tokens=verify_ids_2d,
-            positions=positions_2d,
-            sampling_info=sampling_info,
+        engine = self.target_worker.model_runner.watermark
+        watermark = (
+            engine.bind_verify(sampling_info.watermark, full_mask=False)
+            if engine is not None and sampling_info is not None
+            else None
         )
-        return target_logits, watermark_rows
+        if watermark is None:
+            return target_logits, sampling_info, None
+        target_logits, sampling_info = watermark.apply(
+            target_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_ids_2d,
+            positions=positions_2d,
+            draft_token_num=verify_ids_2d.shape[1],
+            custom_mask=None,
+            # compute_spec_logprobs reads logits_output after acceptance.
+            keep_logits=batch.return_logprob,
+        )
+        return target_logits, sampling_info, watermark
 
     def _sampling_graph_eligible(
         self,
