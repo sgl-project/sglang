@@ -16,6 +16,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.distributed.parallel_state import track_host_sends, wait_host_sends
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
@@ -59,6 +60,10 @@ class SchedulerProfilerManager:
 
     def __post_init__(self) -> None:
         self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
+        # PP loops run the step predicate at the end of each iteration
+        # (run_at_boundary): a stop there may wait the stage's sends.
+        self.at_boundary = False
+        self._boundary_batch: Optional[ScheduleBatch] = None
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 cpu_group=self.dp_tp_cpu_group,
@@ -267,6 +272,7 @@ class SchedulerProfilerManager:
             except RuntimeError as e:
                 self.torch_profiler = None
                 return ProfileReqOutput(success=False, message=str(e))
+            track_host_sends()
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -338,6 +344,7 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
+            wait_host_sends()
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
@@ -411,6 +418,20 @@ class SchedulerProfilerManager:
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
+        if self.at_boundary:
+            self._boundary_batch = batch
+            return
+        self._run_profile_predicate(batch)
+
+    def run_at_boundary(self) -> None:
+        """Run the step predicate of the batch this PP loop iteration launched, if any.
+        Every send of the iteration is out by now, so the next stage can receive them
+        all and a stop may wait them (wait_host_sends)."""
+        batch, self._boundary_batch = self._boundary_batch, None
+        if batch is not None:
+            self._run_profile_predicate(batch)
+
+    def _run_profile_predicate(self, batch: ScheduleBatch):
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager.step(forward_mode=batch.forward_mode)
             return

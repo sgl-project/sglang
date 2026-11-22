@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import threading
 import warnings
 import weakref
 from collections import namedtuple
@@ -129,7 +130,7 @@ class GraphCaptureContext:
     stream: torch.Stream
 
 
-@dataclass
+@dataclass(eq=False)
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
@@ -137,6 +138,57 @@ class P2PWork:
     def wait(self) -> None:
         if self.work is not None:
             self.work.wait()
+
+
+class _WaitedHostSend:
+    """Stands in for a gloo send that ``wait_host_sends`` waited: a second wait of a
+    gloo send blocks for a completion that never comes."""
+
+    def wait(self, timeout=None) -> bool:
+        return True
+
+    def is_completed(self) -> bool:
+        return True
+
+
+_WAITED_HOST_SEND = _WaitedHostSend()
+# Async CPU-group sends of the scheduler thread since the torch profiler started.
+_tracked_host_sends: Optional["weakref.WeakSet[P2PWork]"] = None
+
+
+def host_send(work: torch.distributed.Work, payload: torch.Tensor) -> P2PWork:
+    """Wrap an async CPU-group (gloo) send; tracked for ``wait_host_sends`` while a
+    torch profiler runs."""
+    p2p_work = P2PWork(work, payload)
+    if (
+        _tracked_host_sends is not None
+        and threading.current_thread() is threading.main_thread()
+    ):
+        _tracked_host_sends.add(p2p_work)
+    return p2p_work
+
+
+def track_host_sends() -> None:
+    """Call right after the torch profiler starts."""
+    global _tracked_host_sends
+    _tracked_host_sends = weakref.WeakSet()
+
+
+def wait_host_sends() -> int:
+    """Call right before the torch profiler stops: wait every tracked send nobody has
+    waited yet, once, and return how many. A gloo send started under the profiler ends
+    its RecordFunction in ``wait()``; after ``stop()`` that write lands in freed event
+    storage and corrupts the host heap. The caller must be at a point where every
+    receiver can post its receive without this rank's further progress."""
+    global _tracked_host_sends
+    tracked, _tracked_host_sends = _tracked_host_sends, None
+    if not tracked:
+        return 0
+    pending = [w for w in tracked if not w.work.is_completed()]
+    for p2p_work in pending:
+        p2p_work.work.wait()
+        p2p_work.work = _WAITED_HOST_SEND
+    return len(pending)
 
 
 def _split_tensor_dict(
@@ -1684,7 +1736,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(size_work, size_tensor))
+            p2p_work.append(host_send(size_work, size_tensor))
 
         object_work = send_func(
             object_tensor,
@@ -1693,7 +1745,7 @@ class GroupCoordinator:
             tag=tag,
         )
         if async_send:
-            p2p_work.append(P2PWork(object_work, object_tensor))
+            p2p_work.append(host_send(object_work, object_tensor))
 
         return p2p_work
 
@@ -1868,7 +1920,9 @@ class GroupCoordinator:
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+                p2p_works.append(
+                    host_send(work, tensor) if tensor.is_cpu else P2PWork(work, tensor)
+                )
         return p2p_works
 
     def recv_tensor_dict(

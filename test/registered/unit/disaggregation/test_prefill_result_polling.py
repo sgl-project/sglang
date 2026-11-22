@@ -1394,7 +1394,9 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self._sched_idled = False
         self.processed_tokens_counter = 0
         self.scripted_scheduler_hook = None
-        self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
+        self.profiler_manager = SimpleNamespace(
+            _profile_batch_predicate=Mock(), run_at_boundary=Mock()
+        )
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.enable_staging = False

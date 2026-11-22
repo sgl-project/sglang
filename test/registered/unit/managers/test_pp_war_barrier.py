@@ -91,6 +91,7 @@ class _PPStage:
         s._sched_idled = False
         s.increment_scheduler_iterations = mock.Mock()
         s.invariant_checker = mock.Mock()
+        s.profiler_manager = mock.Mock()
         s.on_idle = mock.Mock()
         s._pp_recv_proxy_tensors = mock.Mock(return_value=None)
         s._pp_commit_comm_work = mock.Mock()

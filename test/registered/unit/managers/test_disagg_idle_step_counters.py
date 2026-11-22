@@ -596,7 +596,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
-        scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
+        scheduler.profiler_manager = SimpleNamespace(
+            _profile_batch_predicate=Mock(), run_at_boundary=Mock()
+        )
         scheduler.total_prefill_busy_us = 0
         scheduler.total_prefill_uncached_tokens = 0
         scheduler.decode_moment_totals = [0.0] * 6

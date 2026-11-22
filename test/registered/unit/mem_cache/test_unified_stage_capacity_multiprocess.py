@@ -314,6 +314,7 @@ def _loop_worker(rank, path, level, drift_round):
             self.request_receiver = NS(recv_requests=self._recv_requests)
             self.metrics_reporter = NS(record_scheduler_active=lambda start: None)
             self.invariant_checker = NS(run=lambda *args: None)
+            self.profiler_manager = NS(run_at_boundary=lambda: None)
             self.new_token_ratio_tracker = NS(current=0.5)
             self.chunked_req = None
             self.forward_ct = 0

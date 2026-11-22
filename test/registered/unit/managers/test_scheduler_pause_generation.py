@@ -1018,6 +1018,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             side_effect=lambda batch, result: events.append(("result", batch))
         )
         scheduler.on_idle = MagicMock()
+        scheduler.profiler_manager = MagicMock()
         # Three passes over the two slots, then leave the endless loop.
         scheduler.increment_scheduler_iterations = MagicMock(
             side_effect=[None, None, None, StopLoop]

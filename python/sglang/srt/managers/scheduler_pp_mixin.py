@@ -261,6 +261,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     self._pp_apply_war_barrier()
 
+                self.profiler_manager.run_at_boundary()
                 # `self.last_batch` is the one reloaded for this micro-batch, so
                 # pass the batch this iteration launched.
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
@@ -423,6 +424,7 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
+                self.profiler_manager.run_at_boundary()
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
@@ -628,6 +630,7 @@ class SchedulerPPMixin:
 
                 self.running_batch.batch_is_full = False
 
+                self.profiler_manager.run_at_boundary()
                 self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
@@ -668,6 +671,8 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
+        # Profiler starts and stops wait for the end of the loop iteration.
+        self.profiler_manager.at_boundary = True
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
