@@ -1,0 +1,607 @@
+name: c211-127940-amd1q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  mi300-1gpu-01:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-01 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-01 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-01 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-02:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-02 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-02 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-02 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-03:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-03 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-03 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-03 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-04:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-04 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-04 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-04 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-05:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-05 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-05 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-05 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-06:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-06 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-06 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-06 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-07:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-07 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-07 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-07 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-08:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-08 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-08 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-08 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-09:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-09 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-09 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-09 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-10:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-10 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-10 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-10 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-11:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-11 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-11 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-11 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-12:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-12 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-12 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-12 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-13:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-13 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-13 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-13 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-14:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-14 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-14 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-14 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-15:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-15 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-15 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-15 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-16:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-16 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-16 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-16 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-17:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-17 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-17 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-17 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-18:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-18 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-18 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-18 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-19:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-19 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-19 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-19 nonce=$NONCE"
+          exit 0
+  mi300-1gpu-20:
+    runs-on: linux-mi300-1gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: amd-device-identity
+        env:
+          NONCE: c211-127940-8b3693d095585d5f
+        run: |
+          set -u
+          NONCE='c211-127940-8b3693d095585d5f'
+          echo "C211_JOB=mi300-1gpu-20 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300-1gpu-20 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- AMD DEVICES ---"
+          if [ -e /dev/kfd ]; then echo KFD_PRESENT=PRESENT; else echo KFD_PRESENT=ABSENT; fi
+          ls -l /dev/kfd /dev/dri 2>&1 | head -30 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -200 || echo ROCM_SMI_FAILED
+            rocm-smi --showdriverversion 2>&1 | head -40 || echo ROCM_SMI_DRVVER_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -250 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if [ -r /sys/module/amdgpu/version ]; then echo "AMDGPU_MODULE_VERSION=$(cat /sys/module/amdgpu/version)"; else echo AMDGPU_MODULE_VERSION_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display' | head -20 || true; fi
+          echo "C211_PROBE_END job=mi300-1gpu-20 nonce=$NONCE"
+          exit 0
