@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="quantization.dsv41_grouped_int8_encode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.dsv41_int8:encode_rows",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="quantization.groupwise_int8_dequant",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",

@@ -11,6 +11,87 @@ register_npu_ci(est_time=40, suite="extra-b-test-1-npu-a3")
 
 
 class TestDSV41Int8Pages(CustomTestCase):
+    def test_small_eager_table_keeps_duplicate_logical_slots(self):
+        from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import physical_page_map
+
+        table = torch.tensor([[4, 4, 99], [4, 6, -1]], device="npu", dtype=torch.int32)
+        lengths = torch.tensor([200, 150], device="npu", dtype=torch.int32)
+        physical, logical = physical_page_map(
+            table, 128, lengths, fixed_shape=False, pool_pages=16
+        )
+        self.assertEqual(physical.cpu().tolist(), [0, 4, 4, 0, 4, 6, 0])
+        self.assertEqual(logical.cpu().tolist(), [[1, 2, 0], [4, 5, -1]])
+
+        # Beyond the eager scratch budget, a padded table still deduplicates.
+        padded = torch.cat((table, table.new_full((2, 2), 99)), dim=1)
+        compact, remapped = physical_page_map(
+            padded, 128, lengths, fixed_shape=False, pool_pages=16
+        )
+        self.assertEqual(compact.cpu().tolist(), [0, 4, 6])
+        self.assertEqual(remapped.cpu().tolist(), [[1, 1, 0, 0, 0], [1, 2, -1, 0, 0]])
+
+    def test_logical_decode_at_exact_physical_capacity(self):
+        from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_logical_pages
+        from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import (
+            decode_int8,
+            encode_int8,
+        )
+
+        pool, page_size = 8, 4
+        gen = torch.Generator().manual_seed(19841)
+        for width, group_size, rotary in ((128, 128, 0), (448, 224, 64)):
+            with self.subTest(width=width):
+                src = torch.randn(pool, page_size, 1, width, generator=gen).bfloat16()
+                codes, meta = encode_int8(src, group_size)
+                expected = decode_int8(codes, meta, group_size)
+                rope = None
+                if rotary:
+                    rope = torch.randn(
+                        pool, page_size, 1, rotary, generator=gen
+                    ).bfloat16()
+                    expected = torch.cat((expected, rope), dim=-1)
+                    rope = rope.npu()
+                codes, meta = codes.npu(), meta.npu()
+                # Non-contiguous input views also occur with sliced capture buckets.
+                table = torch.zeros(2, 6, device="npu", dtype=torch.int32)[:, :4]
+                lengths = torch.zeros(2, 2, device="npu", dtype=torch.int32)[:, 0]
+
+                def reconstruct():
+                    return decode_logical_pages(
+                        codes, meta, table, lengths, group_size, 16, rope
+                    )
+
+                reconstruct()
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    output, remapped = reconstruct()
+
+                for ids, counts in (
+                    ([[4, 4, 99, -1], [4, 6, 7, 99]], [7, 11]),
+                    ([[7, 2, -1, 99], [2, 3, 99, -1]], [8, 5]),
+                    ([[1, 2, 3, 99], [0, -1, -1, -1]], [11, 0]),
+                ):
+                    table.copy_(torch.tensor(ids, dtype=torch.int32))
+                    lengths.copy_(torch.tensor(counts, dtype=torch.int32))
+                    graph.replay()
+                    torch.npu.synchronize()
+                    actual, logical = output.cpu(), remapped.cpu()
+                    self.assertEqual(actual.shape[0], pool + 1)
+                    for row, count in enumerate(counts):
+                        for column, physical in enumerate(ids[row]):
+                            if column * page_size < count and physical > 0:
+                                torch.testing.assert_close(
+                                    actual[logical[row, column]],
+                                    expected[physical],
+                                    rtol=0,
+                                    atol=0,
+                                )
+                            else:
+                                self.assertEqual(
+                                    int(logical[row, column]), min(physical, 0)
+                                )
+
     def test_graph_replay_reconstructs_referenced_rows_and_rotary_channels(self):
         from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_pages
         from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8 import (

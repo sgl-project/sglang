@@ -55,7 +55,21 @@ def materialize_kv_pages(
     """
     if cache.dtype != torch.uint8:
         return cache, block_table
-    fused = fixed_shape and cache.device.type == "npu"
+    fused = cache.device.type == "npu"
+    # Logical slots may use one extra scratch page for the shared padding sentinel.
+    # This keeps full-table graph capture bounded while avoiding a physical-pool scan.
+    if fixed_shape and fused and block_table.numel() <= cache.shape[0]:
+        from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_logical_pages
+
+        return decode_logical_pages(
+            cache[..., ROPE_BYTES:SCALE_OFFSET].view(torch.int8),
+            cache[..., SCALE_OFFSET:_METADATA_END],
+            block_table,
+            lengths,
+            GROUP_SIZE,
+            SCALES_PER_GROUP,
+            cache[..., :ROPE_BYTES].view(torch.bfloat16),
+        )
     physical, remapped = physical_page_map(
         block_table,
         cache.shape[1],

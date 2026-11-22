@@ -61,6 +61,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="kvcache.dsv41_int8_decode_logical_pages",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.dsv41_int8_pages:decode_logical_pages",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+
 # Other Triton kernels migrated into this group (from attention/mem_cache
 # triton_ops); registered for inventory. Import them from their modules.
 _TRITON_KERNELS = [

@@ -65,6 +65,13 @@ def encode_int8(
         or width % 2
     ):
         raise ValueError("Expected BF16 rows divisible by the group size and two")
+    if rows.device.type == "npu" and (width, group_size) in ((128, 128), (448, 224)):
+        from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+        if is_ascend_910b():
+            from sglang.kernels.ops.quantization.dsv41_int8 import encode_rows
+
+            return encode_rows(rows, group_size)
     values = rows.new_empty(rows.shape, dtype=torch.int8)
     metadata = rows.new_empty(
         (*rows.shape[:-1], metadata_bytes(width, group_size)), dtype=torch.uint8
@@ -151,7 +158,14 @@ def physical_page_map(block_table, page_size, lengths, *, fixed_shape, pool_page
         physical = torch.where(live != 0, physical, 0)
         table = torch.where(valid, block_table, block_table.clamp_max(0))
         return physical, table.int().contiguous()
-    if fixed_shape:
+    # Sorting small active-page lists on Ascend synchronizes the eager host.
+    # One logical scratch page per table entry needs at most 1,024 rows here.
+    bounded_eager = (
+        pool_pages is not None
+        and ids.numel() <= pool_pages
+        and ids.numel() * page_size <= 1024
+    )
+    if fixed_shape or bounded_eager:
         # Graph replay can change physical page IDs and live sequence lengths.
         # Keep one scratch page per table entry so the allocation shape is static.
         physical = ids
