@@ -24,8 +24,11 @@ def _cuda_arch(major: int, minor: int) -> CudaArch:
 class TestJitActVectorGate(CustomTestCase):
     def _supported(self, capability, hidden_size, dtype):
         out = torch.empty(2, hidden_size, dtype=dtype)
-        with patch.object(
-            activation, "current_arch", return_value=_cuda_arch(*capability)
+        with (
+            patch.object(
+                activation, "current_arch", return_value=_cuda_arch(*capability)
+            ),
+            patch.object(activation, "_jit_act_max_vec_bytes", None),
         ):
             return activation._jit_act_supported(out)
 
