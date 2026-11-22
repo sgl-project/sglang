@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import (
     normalize_watermark_request,
     parse_watermark_key,
@@ -334,7 +335,11 @@ def test_speculative_tree_paths_match_tensor_reference():
         [[0, 1, 3], [4, 5, 7]], dtype=torch.int32, device="cuda"
     )
     accept_lens = torch.tensor([3, 2], dtype=torch.int32, device="cuda")
-    verify.record(accept_index, accept_lens)
+    verify.commit(
+        VerifyAccept(
+            tokens=draft_tokens, accept_lens=accept_lens, accept_index=accept_index
+        )
+    )
     states[0].record_speculative(
         req_pool_indices,
         reference_hashes,
@@ -435,12 +440,13 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     assert bonus.tolist() == [forced[1]]
 
     accept_lens = torch.tensor([2], dtype=torch.int32, device="cuda")
-    verify.record(None, accept_lens)
-    engine.append_accept_tokens(
-        rows,
-        req_pool_indices,
-        torch.tensor([[forced[0], forced[1], 0, 0]], dtype=torch.int64, device="cuda"),
-        accept_lens,
+    verify.commit(
+        VerifyAccept(
+            tokens=torch.tensor(
+                [[forced[0], forced[1], 0, 0]], dtype=torch.int64, device="cuda"
+            ),
+            accept_lens=accept_lens,
+        )
     )
     assert torch.equal(
         state.contexts_tail(req_pool_indices)[0],
@@ -453,7 +459,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     )
 
 
-def test_chain_record_matches_explicit_accept_index():
+def test_chain_commit_matches_explicit_accept_index():
     draft_token_num = 4
     req_pool_indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
     sampling_info = SimpleNamespace(
@@ -494,11 +500,20 @@ def test_chain_record_matches_explicit_accept_index():
             custom_mask=None,
             keep_logits=False,
         )
-        verify.record(
-            accept_index, torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+        verify.commit(
+            VerifyAccept(
+                tokens=draft_tokens if accept_index is None else draft_tokens.view(-1),
+                accept_lens=torch.tensor([3, 2], dtype=torch.int32, device="cuda"),
+                accept_index=accept_index,
+            )
         )
         states.append(state)
 
+    for chain, indexed in zip(
+        states[0].contexts_tail(req_pool_indices),
+        states[1].contexts_tail(req_pool_indices),
+    ):
+        assert torch.equal(chain, indexed)
     counts = states[1].num_watermarked_contexts.tolist()
     assert counts == [2, 0, 3]
     assert states[0].num_watermarked_contexts.tolist() == counts
