@@ -31,15 +31,17 @@ def packed_page_indices(*, num_tensors, dst_pages, dst_num_slots):
 
 class PackedKVSender:
     def __init__(
-        self, *, transport, gpu_id, size_bytes, register_memory, await_handles
+        self, *, transport, layout, gpu_id, size_bytes, register_memory, await_handles
     ):
         self.transport = transport
         self.gpu_id = gpu_id
         self.await_handles = await_handles
         # Transfers are built from cached dlists by index, as the unpacked path does:
         # initialize_xfer over raw descriptors costs tens of ms of CPU per batch.
-        self._src_handles: dict[int, object] = {}
-        self._dst_handles: dict[tuple, object] = {}
+        # The transport keeps them under names prefixed with `layout`, one per worker.
+        self.layout = layout
+        # (side, layout name) of each dlist prepared; side "" is this side.
+        self._prepared: set[tuple[str, str]] = set()
         self.buffer = StagingBuffer(
             size_bytes=size_bytes, device=f"cuda:{gpu_id}", gpu_id=gpu_id
         )
@@ -90,9 +92,9 @@ class PackedKVSender:
             )
         stream.synchronize()
 
-    def _src_handle(self, page_bytes):
-        handle = self._src_handles.get(page_bytes)
-        if handle is None:
+    def _src_layout(self, page_bytes):
+        layout = f"{self.layout}:{page_bytes}"
+        if ("", layout) not in self._prepared:
             slots = self.buffer.get_size() // page_bytes
             run = StridedRun(
                 key=self._buffer_key,
@@ -101,13 +103,13 @@ class PackedKVSender:
                 stride=page_bytes,
                 count=slots,
             )
-            handle = self._src_handles[page_bytes] = self.transport.prepare(None, [run])
-        return handle
+            self.transport.prepare(remote=None, layout=layout, runs=[run])
+            self._prepared.add(("", layout))
+        return layout
 
-    def _dst_handle(self, remote, dst_keys, page_bytes, dst_num_slots):
-        key = (remote.agent_name, tuple(dst_keys), page_bytes, dst_num_slots)
-        handle = self._dst_handles.get(key)
-        if handle is None:
+    def _dst_layout(self, remote, target, dst_keys, page_bytes, dst_num_slots):
+        layout = f"{self.layout}:{target}:{page_bytes}:{dst_num_slots}"
+        if (remote.agent_name, layout) not in self._prepared:
             runs = [
                 StridedRun(
                     key=k,
@@ -118,8 +120,9 @@ class PackedKVSender:
                 )
                 for k in dst_keys
             ]
-            handle = self._dst_handles[key] = self.transport.prepare(remote, runs)
-        return handle
+            self.transport.prepare(remote=remote, layout=layout, runs=runs)
+            self._prepared.add((remote.agent_name, layout))
+        return layout
 
     def _wait(self, *, raise_on_failure=True):
         if self.inflight is None:
@@ -136,6 +139,7 @@ class PackedKVSender:
         self,
         *,
         remote,
+        target,
         src_ptrs,
         dst_keys,
         src_pages,
@@ -159,8 +163,10 @@ class PackedKVSender:
                 "increase SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB"
             )
 
-        src_handle = self._src_handle(dst_page_bytes)
-        dst_handle = self._dst_handle(remote, dst_keys, dst_page_bytes, dst_num_slots)
+        src_layout = self._src_layout(dst_page_bytes)
+        dst_layout = self._dst_layout(
+            remote, target, dst_keys, dst_page_bytes, dst_num_slots
+        )
         # A handle left by an earlier send that failed belongs to that room: wait
         # until it no longer reads the buffer, but do not fail this room for it.
         self._wait(raise_on_failure=False)
@@ -182,7 +188,11 @@ class PackedKVSender:
             )
             # No notification: the transfer worker announces the chunk once its handles settle.
             (handle,) = self.transport.write_prepared(
-                src_handle, src_indices, dst_handle, dst_indices
+                src_layout=src_layout,
+                src_indices=src_indices,
+                remote=remote,
+                dst_layout=dst_layout,
+                dst_indices=dst_indices,
             )
             if handle.result is not None and handle.result.quiescent:
                 _raise_failure(handle, "Failed to create NIXL packed transfer")

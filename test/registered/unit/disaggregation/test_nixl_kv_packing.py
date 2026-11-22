@@ -102,6 +102,7 @@ class _PackAgent:
     def __init__(self, transfer_results):
         self.prepped = []
         self.posted = []
+        self.dst_dlists = []
         self._results = iter(transfer_results)
 
     def register_memory(self, descs, kind):
@@ -112,11 +113,12 @@ class _PackAgent:
 
     def prep_xfer_dlist(self, peer_name, runs, kind):
         self.prepped.append(peer_name)
-        return f"dlist-{peer_name or 'local'}"
+        return f"dlist{len(self.prepped)}"
 
     def make_prepped_xfer(self, op, src_dlist, src_idx, dst_dlist, dst_idx):
         handle = f"h{len(self.posted)}"
         self.posted.append((handle, len(src_idx)))
+        self.dst_dlists.append(dst_dlist)
         return handle
 
     def transfer(self, handle):
@@ -141,6 +143,8 @@ def _packer(buffer_bytes, transfer_results, failed_handles=()):
     )
     packer = object.__new__(PackedKVSender)
     packer.transport = transport
+    packer.layout = "kv_pack:0"
+    packer._prepared = set()
     packer.gpu_id = 0
     packer.inflight = None
     packer.buffer = SimpleNamespace(
@@ -148,7 +152,6 @@ def _packer(buffer_bytes, transfer_results, failed_handles=()):
     )
     packer._buffer_key = _BUFFER_KEY
     packer._gather = Mock()
-    packer._src_handles, packer._dst_handles = {}, {}
     packer.await_handles = Mock(
         side_effect=lambda hs, failure_seen: (True, hs[0].xfer in failed_handles)
     )
@@ -159,6 +162,7 @@ def _send(packer, remote, *, num_pages, handles=None):
     pages = np.arange(num_pages, dtype=np.int64)
     packer.send(
         remote=remote,
+        target="kv",
         src_ptrs=[0, 1],
         dst_keys=_DST_KEYS,
         src_pages=pages,
@@ -189,6 +193,16 @@ class TestPackedKVSender(CustomTestCase):
         _send(packer, remote, num_pages=10)
         _send(packer, remote, num_pages=10)
         self.assertEqual(agent.prepped, ["", "decode-0"])
+
+    def test_a_peer_reload_rebuilds_the_peer_dlist(self):
+        """A dlist prepared over a peer is invalid once NIXL loads the peer again,
+        so a send after the reload must post with the rebuilt one."""
+        packer, remote, agent = _packer(1024, ["DONE"] * 2)
+        _send(packer, remote, num_pages=2)
+        packer.transport.reload(remote)
+        _send(packer, remote, num_pages=2)
+        self.assertEqual(agent.prepped, ["", "decode-0", "decode-0"])
+        self.assertEqual(agent.dst_dlists, ["dlist2", "dlist3"])
 
     def test_a_failed_post_does_not_fail_the_next_room(self):
         packer, remote, agent = _packer(1024, ["ERR", "DONE"], failed_handles={"h0"})
