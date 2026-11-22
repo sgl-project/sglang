@@ -55,6 +55,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                 client = AsyncSchedulerClient()
                 args = SimpleNamespace(
                     pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
+                    performance_mode="manual",
                     warmup_mode="server",
                     warmup_resolutions=None,
                     scheduler_endpoints=["unused"],
