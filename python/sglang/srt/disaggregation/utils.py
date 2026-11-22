@@ -336,8 +336,9 @@ def pre_alloc_fill_len(req: Req) -> int:
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
-def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed.
+def _apply_metadata_gate(polls, pollers, decode_reqs, metadata_buffers) -> None:
+    """Downgrade Success → Transferring for requests whose metadata hasn't landed,
+    and to Failed for requests whose metadata the receive thread rejected.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
     ranks naturally prevents any rank from committing before all ranks are ready.
@@ -352,6 +353,10 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             ].item()
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
+            else:
+                # The room marker follows every variable-width item, so a room
+                # whose item was dropped has failed by now: poll it again.
+                polls[i] = int(pollers[i].poll())
 
 
 def kv_layout_signature(kv_args: KVArgs) -> int:
@@ -548,7 +553,7 @@ def poll_and_all_reduce(
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
-        _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+        _apply_metadata_gate(polls, pollers, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
 
 
@@ -599,7 +604,7 @@ def poll_and_all_reduce_with_staging(
                 raw_polls[i] = int(KVPoll.Transferring)
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
-        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
+        _apply_metadata_gate(raw_polls, pollers, decode_reqs, metadata_buffers)
     return _all_reduce_polls(raw_polls, gloo_group)
 
 
