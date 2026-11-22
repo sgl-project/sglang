@@ -79,6 +79,11 @@ class RWLock:
         async with self._lock:
             return self._writer_active or self._readers > 0
 
+    @property
+    def has_writer(self) -> bool:
+        """Whether a writer holds the lock or waits for it; new readers wait either way."""
+        return self._writer_active or self._waiting_writers > 0
+
 
 class _ReaderLock:
     def __init__(self, rwlock: RWLock):

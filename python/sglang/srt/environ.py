@@ -740,6 +740,14 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # Seconds a server with queued or in-flight requests may go without progress
+    # before it crashes so that a supervisor restarts it; -1 disables. Arms a
+    # scheduler watchdog for requests that are queued but never scheduled, and
+    # a frontend watchdog for a blocked event loop or an unanswered probe.
+    SGLANG_STALL_WATCHDOG_TIMEOUT = EnvFloat(-1)
+    # A busy scheduler acknowledges a skipped health probe only after a forward
+    # step launched since the probe arrived, so a stuck queue fails /health.
+    SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS = EnvBool(False)
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
     # Most per-request states the detokenizer keeps; past it, the oldest is
@@ -1934,6 +1942,12 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
+    # Image preprocessing in the tokenizer process goes to the CPU when the GPU
+    # has less free memory than the estimated need plus this reserve; 0 disables.
+    SGLANG_MM_GPU_PREPROCESS_RESERVE_MB = EnvInt(0)
+    # Run single-worker image preprocessing on a worker thread instead of the
+    # tokenizer's event loop, so a slow request does not block other requests.
+    SGLANG_MM_PROCESSOR_THREAD_FOR_SINGLE_WORKER = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)

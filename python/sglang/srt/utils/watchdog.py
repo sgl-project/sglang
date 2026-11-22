@@ -114,6 +114,8 @@ class WatchdogRaw:
         soft: bool = False,
         dump_info: Optional[Callable[[], str]] = None,
         before_crash: Optional[Callable[[], None]] = None,
+        reset_on_activate: bool = False,
+        poll_interval: Optional[float] = None,
     ):
         self.debug_name = debug_name
         self.get_counter = get_counter
@@ -125,6 +127,12 @@ class WatchdogRaw:
         # process tree; this thread runs even while the stuck main thread is
         # blocked in C with the GIL released.
         self.before_crash = before_crash
+        # Restart the timer when the watchdog turns active, so a long inactive
+        # stretch is not counted as time without progress.
+        self.reset_on_activate = reset_on_activate
+        self.poll_interval = (
+            watchdog_timeout / 2 if poll_interval is None else poll_interval
+        )
 
         self.parent_process = psutil.Process().parent()
         # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
@@ -145,18 +153,24 @@ class WatchdogRaw:
     def _watchdog_once(self):
         watchdog_last_counter = 0
         watchdog_last_time = time.perf_counter()
+        was_active = False
 
         while True:
             current = time.perf_counter()
-            if self.is_active():
+            active = self.is_active()
+            if active:
                 current_counter = self.get_counter()
-                if watchdog_last_counter == current_counter:
+                if self.reset_on_activate and not was_active:
+                    watchdog_last_counter = current_counter
+                    watchdog_last_time = current
+                elif watchdog_last_counter == current_counter:
                     if current > watchdog_last_time + self.watchdog_timeout:
                         break
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
-            time.sleep(self.watchdog_timeout / 2)
+            was_active = active
+            time.sleep(self.poll_interval)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")

@@ -21,6 +21,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.disaggregation.fake.conn import FakeKVSender  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import HealthCheckOutput  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
@@ -40,11 +41,14 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestHealthCheckSignal(CustomTestCase):
-    def _scheduler(self, rust_server, pending) -> Scheduler:
+    def _scheduler(self, rust_server, pending, forward_ct=0) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
         s.rust_server = rust_server
         s.ipc_channels = MagicMock()
+        s.forward_ct = forward_ct
         s.return_health_check_ipcs = deque(pending)
+        # Every pending probe arrived before the current step.
+        s.return_health_check_forward_cts = deque([forward_ct - 1] * len(pending))
         return s
 
     def test_rust_mode_acknowledges_all_skipped_probes_on_the_ring(self):
@@ -67,6 +71,61 @@ class TestHealthCheckSignal(CustomTestCase):
         self.assertIsInstance(output, HealthCheckOutput)
         self.assertEqual(output.http_worker_ipc, "ipc-a")
         self.assertEqual(list(s.return_health_check_ipcs), ["ipc-b"])
+        self.assertEqual(len(s.return_health_check_forward_cts), 1)
+
+
+class TestHealthCheckRequiresProgress(CustomTestCase):
+    """With SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS, a skipped probe is answered
+    only after a forward step launched since it arrived.
+
+    Without it, a scheduler whose waiting queue never yields a batch answers
+    every probe from on_idle, so /health stays 200 while no request is served.
+    """
+
+    def _scheduler(self, rust_server=None) -> Scheduler:
+        s = Scheduler.__new__(Scheduler)
+        s.rust_server = rust_server
+        s.ipc_channels = MagicMock()
+        s.forward_ct = 5
+        s.return_health_check_ipcs = deque()
+        s.return_health_check_forward_cts = deque()
+        s._queue_health_check_ack("ipc-a")
+        return s
+
+    def _sent(self, s):
+        return s.ipc_channels.send_to_tokenizer.send_output.call_count
+
+    def test_held_until_a_step_launches(self):
+        s = self._scheduler()
+        with envs.SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS.override(True):
+            s.maybe_send_health_check_signal()
+            self.assertEqual(self._sent(s), 0)
+            self.assertEqual(list(s.return_health_check_ipcs), ["ipc-a"])
+
+            s.forward_ct += 1
+            s.maybe_send_health_check_signal()
+        self.assertEqual(self._sent(s), 1)
+        self.assertFalse(s.return_health_check_ipcs)
+        self.assertFalse(s.return_health_check_forward_cts)
+
+    def test_answered_without_progress_when_disabled(self):
+        s = self._scheduler()
+        with envs.SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS.override(False):
+            s.maybe_send_health_check_signal()
+        self.assertEqual(self._sent(s), 1)
+        self.assertFalse(s.return_health_check_forward_cts)
+
+    def test_rust_mode_is_held_the_same_way(self):
+        server = MagicMock()
+        s = self._scheduler(RustServer(server, http_port=0))
+        with envs.SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS.override(True):
+            s.maybe_send_health_check_signal()
+            server.push_health_ack.assert_not_called()
+
+            s.forward_ct += 1
+            s.maybe_send_health_check_signal()
+        server.push_health_ack.assert_called_once_with()
+        self.assertFalse(s.return_health_check_forward_cts)
 
 
 class _PriorityPassReached(Exception):
@@ -95,7 +154,9 @@ class TestWaitingHealthCheckAck(CustomTestCase):
         s.disaggregation_mode = disaggregation_mode
         empty_request_lists(s)
         move(waiting, s.waiting_queue)
+        s.forward_ct = 0
         s.return_health_check_ipcs = deque()
+        s.return_health_check_forward_cts = deque()
         s.tree_cache = MagicMock()
         # Releases only: an abort sent to the tokenizer for a probe would raise.
         s.request_retirer = release_only_retirer(tree_cache=s.tree_cache)
@@ -115,6 +176,8 @@ class TestWaitingHealthCheckAck(CustomTestCase):
 
         self.assertEqual(list(s.waiting_queue), [prompt])
         self.assertEqual(list(s.return_health_check_ipcs), [probe.http_worker_ipc])
+        # The arrival step is recorded so the acknowledgement can wait for progress.
+        self.assertEqual(list(s.return_health_check_forward_cts), [s.forward_ct])
         self.assertIsInstance(probe.finished_reason, FINISH_ABORT)
         s.tree_cache.finish.assert_called_once_with(
             probe.cache_request_handle, CacheRequestOutcome.ABORT
