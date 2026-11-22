@@ -12,7 +12,8 @@ from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.test.test_utils import CustomTestCase
 
-# Any prefix outside SpectrumMixin._CFG_SUPPORTED_PREFIXES shares one CFG state.
+# Any prefix outside SpectrumMixin._SPECTRUM_CFG_SUPPORTED_PREFIXES shares
+# one CFG state.
 SHARED = "shared"
 
 

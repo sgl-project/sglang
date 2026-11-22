@@ -312,9 +312,7 @@ class SpectrumForecaster(nn.Module):
 @dataclass
 class SpectrumContext:
     current_step: int
-    num_inference_steps: int
     total_forward_steps: int
-    do_cfg: bool
     is_cfg_negative: bool
     spectrum_params: SpectrumParams
     debug: bool
@@ -334,15 +332,16 @@ class SpectrumMixin:
     - ``spectrum_predict_features()`` — on skipped steps, return forecasted outputs.
 
     Models with separate CFG branches (Wan, Hunyuan, SD3, FLUX) list their model
-    prefix in ``_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain independent
-    counters and forecasters. All other ``CachableDiT`` subclasses share one counter.
+    prefix in ``_SPECTRUM_CFG_SUPPORTED_PREFIXES`` so cond/uncond maintain
+    independent counters and forecasters. All other ``CachableDiT`` subclasses
+    share one counter.
     """
 
     # DiT model prefixes that run separate cond/uncond forwards (see TeaCache).
     # Per-branch state keeps each schedule in denoising steps, so it is unaffected
     # by CFG gating dropping the uncond forward, and never mixes cond/uncond
     # features in one forecaster.
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "sd3", "flux"}
+    _SPECTRUM_CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "sd3", "flux"}
 
     def _init_spectrum_state(self) -> None:
         """Initialize Spectrum state variables. Dual-branch models track separate
@@ -372,7 +371,7 @@ class SpectrumMixin:
         self.spectrum_is_cfg_negative = False
         self._spectrum_ctx: Optional[SpectrumContext] = None
         self._spectrum_supports_cfg_cache = (
-            self.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+            self.prefix.lower() in self._SPECTRUM_CFG_SUPPORTED_PREFIXES
         )
 
     def _reset_spectrum_branch_state(
@@ -480,9 +479,7 @@ class SpectrumMixin:
         return SpectrumContext(
             force_real=forward_context.force_spectrum_real,
             current_step=forward_context.current_timestep,
-            num_inference_steps=num_inference_steps,
             total_forward_steps=total_forward_steps,
-            do_cfg=do_cfg,
             is_cfg_negative=is_cfg_negative,
             spectrum_params=spectrum_params,
             debug=bool(getattr(forward_batch, "debug", False)),

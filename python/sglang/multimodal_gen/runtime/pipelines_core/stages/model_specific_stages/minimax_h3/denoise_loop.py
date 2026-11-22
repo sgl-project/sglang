@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -189,6 +189,13 @@ def _build_local_embedding_layout(
     }
 
 
+class _StepTimesteps(NamedTuple):
+    unique: torch.Tensor
+    inverse_indices: torch.Tensor
+    block_combined_indices: torch.Tensor
+    fp32_bits: tuple[int, ...]
+
+
 class MiniMaxH3DenoiseBranch:
     """Static per-branch state: packed layout + fixed forward kwargs.
 
@@ -354,7 +361,7 @@ class MiniMaxH3DenoiseBranch:
         *,
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
-        step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        step_timesteps: _StepTimesteps,
         adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
@@ -377,14 +384,14 @@ class MiniMaxH3DenoiseBranch:
             audio_x[0].index_copy_(
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
-        unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
         kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
-            "unique_timesteps": unique_timesteps,
-            "inverse_indices": inverse_indices,
-            "block_combined_indices": block_combined_indices,
+            "unique_timesteps": step_timesteps.unique,
+            "adaln_timestep_bits": step_timesteps.fp32_bits,
+            "inverse_indices": step_timesteps.inverse_indices,
+            "block_combined_indices": step_timesteps.block_combined_indices,
         }
         if adaln_slot is not None:
             # Device scalar, never a Python int: an int would key one breakable
@@ -401,7 +408,7 @@ class MiniMaxH3DenoiseBranch:
         audio_ref_cond_timestep: float,
         inverse_indices_by_pattern: dict[tuple[int, ...], torch.Tensor],
         block_combined_by_pattern: dict[tuple[int, ...], torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _StepTimesteps:
         """Build step-local timestep and AdaLN index tensors.
 
         Packed-sequence timestep semantics: non-media rows (text and padding)
@@ -428,7 +435,7 @@ class MiniMaxH3DenoiseBranch:
                 fill_groups.append((seq_idx, len(candidates)))
                 candidates.append(float(value))
         unique_cpu, slot_to_unique = torch.unique(
-            torch.tensor(candidates, dtype=torch.float32),
+            torch.tensor(candidates, dtype=torch.float32, device="cpu"),
             sorted=True,
             return_inverse=True,
         )
@@ -451,7 +458,12 @@ class MiniMaxH3DenoiseBranch:
                 alpha=MINIMAX_H3_ADALN_MODALITY_NUM,
             )
             block_combined_by_pattern[pattern] = block_combined
-        return unique_cpu.to(device), inverse_indices, block_combined
+        return _StepTimesteps(
+            unique_cpu.to(device),
+            inverse_indices,
+            block_combined,
+            tuple(unique_cpu.view(torch.int32).tolist()),
+        )
 
     def prepare_timestep_plan(
         self,
@@ -463,7 +475,7 @@ class MiniMaxH3DenoiseBranch:
         # True: condition rows keep ``imgvid_cond_noise_aug`` on every step
         # instead of ``max(t, imgvid_cond_noise_aug)``.
         pin_imgvid_cond: bool = False,
-    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> list[_StepTimesteps]:
         """Stage every step's packed timestep state before denoising."""
         if len(video_timesteps) != len(audio_timesteps):
             raise ValueError("video/audio timestep plans must have equal length")
