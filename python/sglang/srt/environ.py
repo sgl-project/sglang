@@ -790,8 +790,6 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
-    # Opt-in: retire finished prefill KV transfers while a forward result is pending.
-    SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Opt-in: drain HiCache L3 events while a prefill forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
@@ -2755,7 +2753,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING": _DeprecatedEnv(
+        note="The PD prefill overlap loop always retires finished KV transfers "
+        "while a forward result is pending; unset it."
+    ),
+}
 
 
 def _handle_deprecated_envs():
