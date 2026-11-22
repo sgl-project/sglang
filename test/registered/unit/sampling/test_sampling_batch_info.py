@@ -25,7 +25,7 @@ from sglang.srt.sampling.sampling_pipeline import (
     _adjust_before_watermark,
     adjust_verify_logits,
 )
-from sglang.srt.sampling.watermarking.interface import SampleStep
+from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -86,7 +86,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
         class Watermark:
             def apply(self, logits, *, keep_logits):
                 events.append("watermark")
-                return SampleStep(sampling_info=info, logprob_logits=logprob_logits)
+                return SampleWatermarkOutput(
+                    sampling_info=info, logprob_logits=logprob_logits
+                )
 
             def commit(self, token_ids):
                 events.append("watermark commit")
