@@ -166,22 +166,29 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
+def _is_send_allgather_slice(
+    value: TensorMetadata, all_gather_group: Optional["GroupCoordinator"]
+) -> bool:
+    """Whether the sender split this tensor for a send-allgather and sent only
+    this rank's slice."""
+    numel = value.size.numel()
+    return (
+        all_gather_group is not None
+        and numel > 0
+        and numel % all_gather_group.world_size == 0
+    )
+
+
 def _recv_buffer(
     value: TensorMetadata, all_gather_group: Optional["GroupCoordinator"]
-) -> Tuple[torch.Tensor, bool]:
-    """The buffer one tensor of a tensor dict message is received into, and whether
-    it is this rank's slice of a send-allgather (the sender split the tensor)."""
+) -> torch.Tensor:
+    """The buffer one tensor of a tensor dict message is received into."""
     tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-    split = (
-        all_gather_group is not None
-        and tensor.numel() > 0
-        and tensor.numel() % all_gather_group.world_size == 0
-    )
-    if split:
+    if _is_send_allgather_slice(value, all_gather_group):
         tensor = tensor.reshape(all_gather_group.world_size, -1)[
             all_gather_group.rank_in_group
         ]
-    return tensor, split
+    return tensor
 
 
 class HostTensorDictPart(msgspec.Struct, frozen=True):
@@ -1915,7 +1922,7 @@ class GroupCoordinator:
         cpu_tensors: Dict[str, torch.Tensor] = {}
         for key, value in metadata_list:
             if isinstance(value, TensorMetadata) and value.device == "cpu":
-                tensor, _ = _recv_buffer(value, all_gather_group)
+                tensor = _recv_buffer(value, all_gather_group)
                 if tensor.numel() > 0:
                     torch.distributed.irecv(
                         tensor, src=self.ranks[src], group=self.cpu_group
@@ -1951,15 +1958,15 @@ class GroupCoordinator:
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 # send-allgather: send only a slice, then do allgather.
-                tensor, use_all_gather = _recv_buffer(value, all_gather_group)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
-                    continue
-
-                if host_part is not None and tensor.is_cpu:
+                use_all_gather = _is_send_allgather_slice(value, all_gather_group)
+                if host_part is not None and key in host_part.cpu_tensors:
                     tensor = host_part.cpu_tensors[key]
                 else:
+                    tensor = _recv_buffer(value, all_gather_group)
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
                     # We have to use irecv here to make it work for both isend and send.
                     comm_group = metadata_group if tensor.is_cpu else group
                     work = torch.distributed.irecv(
