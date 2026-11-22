@@ -68,11 +68,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    parse_request_time_limits,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.request_watchdog import parse_request_time_limits
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     PERFORMANCE_MODES,
     ServerArgsAutoTuner,
@@ -570,7 +572,7 @@ class ServerArgs(DisaggServerArgsMixin):
     host: str | None = "127.0.0.1"
     port: int | None = 30000
     http_graceful_shutdown_timeout: int | None = None
-    # Request watchdog (runtime/request_watchdog.py): SECONDS or TASK=SECONDS
+    # Request watchdog (runtime/managers/request_watchdog.py): SECONDS or TASK=SECONDS
     # entries; a request executing longer turns /health unhealthy. Unset: off.
     request_time_limit: list[str] | None = None
     enable_metrics: bool = False

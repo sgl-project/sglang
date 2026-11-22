@@ -17,7 +17,7 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime import request_watchdog
+from sglang.multimodal_gen.runtime.managers import request_watchdog
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )

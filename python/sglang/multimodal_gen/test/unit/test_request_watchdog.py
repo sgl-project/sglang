@@ -19,16 +19,16 @@ import zmq
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime import request_watchdog
 from sglang.multimodal_gen.runtime.entrypoints import http_server
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.request_watchdog import (
+from sglang.multimodal_gen.runtime.managers import request_watchdog
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
     ExecutionReporter,
     RequestWatchdog,
     parse_request_time_limits,
     request_time_limit,
     request_watchdog_endpoint,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
@@ -202,7 +202,7 @@ def test_queued_time_does_not_count() -> None:
 _DUMPER = """
 import sys, time
 from types import SimpleNamespace
-from sglang.multimodal_gen.runtime.request_watchdog import install_stack_dump_handler
+from sglang.multimodal_gen.runtime.managers.request_watchdog import install_stack_dump_handler
 
 def stuck_in_step():
     print("ready", flush=True)

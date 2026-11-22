@@ -49,8 +49,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    start_request_watchdog,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
-from sglang.multimodal_gen.runtime.request_watchdog import start_request_watchdog
 from sglang.multimodal_gen.runtime.scheduler_client import (
     async_scheduler_client,
     run_zeromq_broker,

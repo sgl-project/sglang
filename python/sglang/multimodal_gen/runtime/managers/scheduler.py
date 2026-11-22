@@ -65,6 +65,10 @@ from sglang.multimodal_gen.runtime.managers.request_cancel import (
     poll_cancellations,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    init_execution_reporter,
+    install_stack_dump_handler,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -79,10 +83,6 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
-)
-from sglang.multimodal_gen.runtime.request_watchdog import (
-    init_execution_reporter,
-    install_stack_dump_handler,
 )
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
