@@ -48,13 +48,12 @@ if is_cuda() or is_hip():
         causal_conv1d_update,
     )
 elif is_cpu():
-    import importlib
-
-    _sgl_kernel_mamba = importlib.import_module("sgl_kernel.mamba")
-    causal_conv1d_fn = _sgl_kernel_mamba.causal_conv1d_fn_cpu
-    causal_conv1d_update = _sgl_kernel_mamba.causal_conv1d_update_cpu
-    mamba_chunk_scan_combined_cpu = _sgl_kernel_mamba.mamba_chunk_scan_combined
-    selective_state_update_cpu = _sgl_kernel_mamba.selective_state_update
+    from sgl_kernel.mamba import causal_conv1d_fn_cpu as causal_conv1d_fn
+    from sgl_kernel.mamba import causal_conv1d_update_cpu as causal_conv1d_update
+    from sgl_kernel.mamba import (
+        mamba_chunk_scan_combined_cpu as mamba_chunk_scan_combined,
+    )
+    from sgl_kernel.mamba import selective_state_update_cpu as selective_state_update
 
 elif is_npu():
     from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
@@ -630,7 +629,7 @@ class MambaMixer2(torch.nn.Module):
 
             # NOTE: final output is an in-place update of out tensor
             if is_cpu():
-                cpu_scan_ret = mamba_chunk_scan_combined_cpu(
+                cpu_scan_ret = mamba_chunk_scan_combined(
                     hidden_states_p.view(
                         1, num_prefill_tokens, local_num_heads, self.head_dim
                     ),
@@ -772,11 +771,8 @@ class MambaMixer2(torch.nn.Module):
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
-            selective_state_update_impl = (
-                selective_state_update_cpu if is_cpu() else selective_state_update
-            )
             if is_target_verify:
-                selective_state_update_impl(
+                selective_state_update(
                     ssm_state,
                     hidden_states_d.view(
                         num_decodes,
@@ -811,7 +807,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                selective_state_update_impl(
+                selective_state_update(
                     ssm_state,
                     hidden_states_d,
                     dt_d,

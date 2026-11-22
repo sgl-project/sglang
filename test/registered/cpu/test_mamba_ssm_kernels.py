@@ -6,12 +6,9 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
+from sgl_kernel.mamba import mamba_chunk_scan_combined_cpu as mamba_chunk_scan_combined
+from sgl_kernel.mamba import selective_state_update_cpu as selective_state_update
 
-from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
-from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import (
-    PAD_SLOT_ID,
-    selective_state_update,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="extra-test-cpu-intel")
@@ -344,7 +341,7 @@ def _selective_state_update_reference(
     ngroups = B.shape[2]
     for batch_idx in range(batch):
         slot = int(state_batch_indices[batch_idx])
-        if slot == PAD_SLOT_ID:
+        if slot == -1:
             continue
         working_state = expected_state[slot].float().clone()
         for token in range(time):
@@ -385,7 +382,7 @@ def test_selective_state_update_cpu(dstate, disable_state_update):
     D = torch.randn(nheads, dim, dtype=torch.float32)
     z = torch.randn_like(x)
     dt_bias = torch.randn(nheads, dim, dtype=torch.float32) - 3.0
-    state_batch_indices = torch.tensor([4, PAD_SLOT_ID, 1], dtype=torch.int32)
+    state_batch_indices = torch.tensor([4, -1, 1], dtype=torch.int32)
     out = torch.full_like(x, 17.0)
 
     selective_state_update(
@@ -400,7 +397,7 @@ def test_selective_state_update_cpu(dstate, disable_state_update):
         dt_bias=dt_bias,
         dt_softplus=True,
         state_batch_indices=state_batch_indices,
-        pad_slot_id=PAD_SLOT_ID,
+        pad_slot_id=-1,
         out=out,
         disable_state_update=disable_state_update,
     )
@@ -772,7 +769,7 @@ def test_nemotron_selective_state_update_cpu_decode_pad_slot_model_shape():
 
     state = torch.randn(8, nheads, headdim, dstate, dtype=dtype)
     state_before = state.clone()
-    state_indices = torch.tensor([4, PAD_SLOT_ID, 1], dtype=torch.int32)
+    state_indices = torch.tensor([4, -1, 1], dtype=torch.int32)
     x = torch.randn(batch, nheads, headdim, dtype=dtype)
     dt = torch.randn(batch, nheads, dtype=dtype)[:, :, None].expand(-1, -1, headdim)
     A = _nemotron_make_negative_A(nheads)[:, None, None].expand(-1, headdim, dstate)
@@ -796,15 +793,15 @@ def test_nemotron_selective_state_update_cpu_decode_pad_slot_model_shape():
         dt_bias=dt_bias,
         dt_softplus=True,
         state_batch_indices=state_indices,
-        pad_slot_id=PAD_SLOT_ID,
+        pad_slot_id=-1,
         out=out,
     )
 
-    state_ref = state_before[state_indices[state_indices != PAD_SLOT_ID]].clone()
-    x_ref = x[state_indices != PAD_SLOT_ID]
-    dt_ref = dt[state_indices != PAD_SLOT_ID]
-    B_ref = B[state_indices != PAD_SLOT_ID]
-    C_ref = C[state_indices != PAD_SLOT_ID]
+    state_ref = state_before[state_indices[state_indices != -1]].clone()
+    x_ref = x[state_indices != -1]
+    dt_ref = dt[state_indices != -1]
+    B_ref = B[state_indices != -1]
+    C_ref = C[state_indices != -1]
     out_ref = selective_state_update_ref(
         state_ref,
         x_ref,
