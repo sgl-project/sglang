@@ -63,7 +63,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import has_forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_flags,
     get_memory,
     get_parallel,
@@ -73,7 +72,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import (
     SpecInput,
     SpecInputType,
-    SpeculativeAlgorithm,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -587,17 +585,7 @@ class AscendAttnBackend(AttentionBackend):
         # Hybrid targets and their drafts share the state-bearing request pool.
         if model_runner.req_to_token_pool.holds_state_slots:
             return False
-        if not (
-            model_runner.spec_algorithm.is_none()
-            or model_runner.spec_algorithm is SpeculativeAlgorithm.EAGLE
-        ):
-            return False
-        disagg = get_disagg()
-        # Decode offload copies KV on a stream without a forward fence.
-        return not (
-            disagg.disaggregation_mode == "decode"
-            and disagg.disaggregation_decode_enable_offload_kvcache
-        )
+        return True
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         if not self.shared_read_enabled:

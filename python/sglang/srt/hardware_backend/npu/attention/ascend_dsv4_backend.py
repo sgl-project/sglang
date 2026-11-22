@@ -2655,14 +2655,9 @@ class DeepseekV4AscendAttnBackend(
             return False
         # The target's verify event also covers the draft inject's precomputed addresses.
         # Deferred KV stores carry reads into the next round and keep the old barrier.
-        disagg = get_disagg()
         return not (
             model_runner.req_to_token_pool.holds_state_slots
             or envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get()
-            or (
-                disagg.disaggregation_mode == "decode"
-                and disagg.disaggregation_decode_enable_offload_kvcache
-            )
         )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
