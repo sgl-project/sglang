@@ -1,16 +1,25 @@
-"""The order of one sampling step, written in one place and run by sampling
-and by every speculative target verify:
+"""The stage order of one sampling step, written once for decode and for every
+speculative target verify:
 
     penalty -> grammar mask -> logit_bias -> watermark -> custom logit processor
-    -> sanitize (sampling only) -> sampler or accept core -> commit
+    -> sanitize (decode only) -> sampler or accept core -> commit
+
+Two entries run it:
+
+- decode: `SamplingPipeline.sample`, which binds, applies, samples, and commits
+  in one call;
+- verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
+  target forward launches; its route picks the verify's fast paths, and the
+  verify worker then calls `build_grammar_mask`, the adjust, its accept core,
+  and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
-builds at each launch (`set_step_state`). A verify (`VerifyStep`) differs only
-in what each stage gets: several rows per request, the penalty along the draft
-tree or chain, and a grammar mask built over the draft tree. Penalty and
-watermark keep per-request state, so each also commits the sampled tokens
-or a verify's `VerifyAccept`. A `SamplingObserver` sees the sampling logits
-between the penalty and the grammar mask.
+builds at each launch (`set_step_state`). A verify differs only in what each
+stage gets: several rows per request, the penalty along the draft tree or
+chain, and a grammar mask built over the draft tree. Penalty and watermark keep
+per-request state, so each commits the sampled tokens or the verify's
+`VerifyAccept`. A `SamplingObserver` sees the decode logits between the penalty
+and the grammar mask.
 """
 
 from __future__ import annotations
