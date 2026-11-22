@@ -381,14 +381,12 @@ class TestNormalizeRopeScalingCompat(CustomTestCase):
         self.assertEqual(llm_cfg.rope_scaling["type"], "dynamic")
 
     def test_no_crash_on_non_dict_rope_scaling(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = "not_a_dict"
+        cfg = SimpleNamespace(rope_scaling="not_a_dict")
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling, "not_a_dict")
 
     def test_no_crash_on_dict_without_rope_type(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = {"factor": 4.0}
+        cfg = SimpleNamespace(rope_scaling={"factor": 4.0})
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
 
@@ -1054,13 +1052,21 @@ class TestNormalizeTpStyle(CustomTestCase):
     plan naming an unknown one stops the model loading at all."""
 
     def test_tied_embedding_plan_normalizes(self):
-        from transformers import AutoConfig
+        from transformers import AutoConfig, AutoModel
 
         from sglang.srt.models.transformers import _normalize_tp_style
 
-        plan = AutoConfig.for_model(
-            "llama", tie_word_embeddings=True
-        ).base_model_tp_plan
+        config = AutoConfig.for_model(
+            "llama",
+            tie_word_embeddings=True,
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+        plan = AutoModel.from_config(config).tp_plan
         self.assertIn("embedding_rowwise", plan.values())
         for pattern, style in plan.items():
             with self.subTest(pattern=pattern):

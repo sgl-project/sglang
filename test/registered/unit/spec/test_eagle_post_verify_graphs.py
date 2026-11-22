@@ -154,9 +154,8 @@ def _round(bs, generator, vocab=VOCAB):
             need_top_p_sampling=False,
             need_min_p_sampling=False,
             step_penalties=None,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
             logit_bias=None,
+            has_custom_logit_processor=False,
             sampling_seed=None,
             watermark=None,
             temperatures=None,
@@ -321,6 +320,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             info = dict(
                 step_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
@@ -355,6 +355,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(hisparse_coordinator=object()),
             dict(step_penalties=object()),
             dict(logit_bias=torch.zeros(1)),
+            dict(has_custom_logit_processor=True),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
         ):
@@ -452,9 +453,8 @@ class TestPostVerifyGraphs(CustomTestCase):
             seq_lens=torch.zeros(1),
             sampling_info=SimpleNamespace(
                 step_penalties=None,
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
