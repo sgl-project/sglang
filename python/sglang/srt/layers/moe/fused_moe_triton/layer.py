@@ -475,6 +475,9 @@ class FusedMoE(torch.nn.Module):
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+        self.intermediate_size_per_partition_unpadded = (
+            self.intermediate_size_per_partition
+        )
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
@@ -801,6 +804,72 @@ class FusedMoE(torch.nn.Module):
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
 
+    def _narrow_unaligned_tp_block_scale(
+        self,
+        loaded_weight: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+    ) -> Optional[torch.Tensor]:
+        """Slice overlapping checkpoint block scales [b0, b1) for unaligned TP shards.
+
+        Returns None when block-scale refinement is active, weights are presharded,
+        or the partition width divides the block size.
+        """
+        if self.use_presharded_weights or self.moe_tp_size <= 1:
+            return None
+        if self.quant_config is None:
+            return None
+        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
+        if weight_block_size is None:
+            return None
+        if getattr(self.quant_config, "use_mxfp8", False) or getattr(
+            self.quant_config, "is_fp4_experts", False
+        ):
+            return None
+
+        method = _weight_layout_method(self)
+        if self.scheme is not None:
+            method = self.scheme
+        if isinstance(method, KTEPWrapperMethod):
+            method = method.gpu_method
+        if isinstance(method, Fp8MoEMethod) and (
+            method.w2_weight_block_size is not None
+            or method.weight_block_size != weight_block_size
+        ):
+            return None
+
+        unpadded_n = self.intermediate_size_per_partition_unpadded
+        block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+        block_sz = block_k if shard_id == "w2" else block_n
+        if block_sz <= 1 or unpadded_n % block_sz == 0:
+            return None
+
+        global_inter = unpadded_n * self.moe_tp_size
+        global_blocks = (global_inter + block_sz - 1) // block_sz
+        is_fused_gated_w13 = shard_id == "w13" and self.moe_runner_config.is_gated
+        expected_scale_dim = (
+            (2 * global_blocks) if is_fused_gated_w13 else global_blocks
+        )
+        if (
+            shard_dim >= loaded_weight.dim()
+            or loaded_weight.shape[shard_dim] != expected_scale_dim
+        ):
+            return None
+
+        g0 = self.moe_tp_rank * unpadded_n
+        g1 = g0 + unpadded_n
+        b0 = g0 // block_sz
+        b1 = (g1 + block_sz - 1) // block_sz
+        if is_fused_gated_w13:
+            return torch.cat(
+                [
+                    loaded_weight.narrow(shard_dim, b0, b1 - b0),
+                    loaded_weight.narrow(shard_dim, global_blocks + b0, b1 - b0),
+                ],
+                dim=shard_dim,
+            )
+        return loaded_weight.narrow(shard_dim, b0, b1 - b0)
+
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -910,14 +979,28 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                # When the buffer is padded (e.g., MXFP4 SM100 rounds
-                # intermediate up to 256), shard_size from the buffer may
-                # exceed the checkpoint's per-TP slice.  Derive the actual
-                # shard size from the loaded weight so we index correctly.
-                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
+                narrowed_scale = (
+                    None
+                    if is_bias
+                    else self._narrow_unaligned_tp_block_scale(
+                        loaded_weight, shard_dim, shard_id
+                    )
                 )
+                if narrowed_scale is not None:
+                    loaded_weight = narrowed_scale
+                else:
+                    # When the buffer is padded (e.g., MXFP4 SM100 rounds
+                    # intermediate up to 256), shard_size from the buffer may
+                    # exceed the checkpoint's per-TP slice.  Derive the actual
+                    # shard size from the loaded weight so we index correctly.
+                    loaded_shard_size = (
+                        loaded_weight.shape[shard_dim] // self.moe_tp_size
+                    )
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim,
+                        loaded_shard_size * self.moe_tp_rank,
+                        loaded_shard_size,
+                    )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
 
@@ -1004,12 +1087,22 @@ class FusedMoE(torch.nn.Module):
                     not self.use_presharded_weights,
                 )
             elif not is_bias and not self.use_presharded_weights:
-                # Derive shard size from the loaded weight so padded buffers
-                # do not cause out-of-bounds indexing into the checkpoint.
-                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
+                narrowed_scale = self._narrow_unaligned_tp_block_scale(
+                    loaded_weight, shard_dim, shard_id
                 )
+                if narrowed_scale is not None:
+                    loaded_weight = narrowed_scale
+                else:
+                    # Derive shard size from the loaded weight so padded buffers
+                    # do not cause out-of-bounds indexing into the checkpoint.
+                    loaded_shard_size = (
+                        loaded_weight.shape[shard_dim] // self.moe_tp_size
+                    )
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim,
+                        loaded_shard_size * self.moe_tp_rank,
+                        loaded_shard_size,
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)

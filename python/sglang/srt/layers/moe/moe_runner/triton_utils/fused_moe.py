@@ -523,7 +523,11 @@ def _prepare_fused_moe_run(
             down_config["BLOCK_SIZE_K"], w2_block_shape[1]
         )
     down_tma_requested = down_config is not None and down_config.pop("USE_TMA", False)
-    down_moe_use_tma = _moe_support_tma() and down_tma_requested
+    eff_down_block = w2_block_shape or block_shape
+    down_k_aligned = (
+        eff_down_block is None or (w2.shape[2] - padded_size) % eff_down_block[1] == 0
+    )
+    down_moe_use_tma = _moe_support_tma() and down_tma_requested and down_k_aligned
     if down_moe_use_tma:
         logger.warning_once(
             "Down MoE TMA is enabled (USE_TMA=true in the down-projection config)."
@@ -961,6 +965,7 @@ def _fused_moe_kernel_sequence(
         and down_block_shape is not None
         and a2_scale is None
         and intermediate_cache2.shape[-1] != down_block_shape[1]
+        and intermediate_cache2.shape[-1] % down_block_shape[1] == 0
     ):
         # Same quant the down call would run, restricted to the rows the down
         # GEMM reads; a single whole-row group keeps that call's per-token kernel.
