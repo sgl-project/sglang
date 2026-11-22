@@ -69,26 +69,36 @@ def prepare_indexer_operands(
     if q.shape[0] == 0:
         q8, q_scale = quantize_rows(q)
         return q8, keys, weights.half(), q_scale, None
-    fused = capture and keys.device.type == "npu"
-    physical, table = physical_page_map(
-        kwargs["block_table"],
-        keys.shape[1],
-        kwargs["seqused_k"],
-        fixed_shape=capture,
-        pool_pages=keys.shape[0] if fused else None,
-    )
-    if fused:
-        from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_pages
+    fused = keys.device.type == "npu"
+    table = kwargs["block_table"]
+    # Logical slots may use one extra scratch page for the shared padding sentinel.
+    # This keeps full-table graph capture bounded while avoiding a physical-pool scan.
+    if capture and fused and table.numel() <= keys.shape[0]:
+        from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_logical_pages
 
-        active = decode_pages(
-            keys, metadata, physical, INDEX_HEAD_DIM, SCALES_PER_GROUP
+        active, table = decode_logical_pages(
+            keys, metadata, table, kwargs["seqused_k"], INDEX_HEAD_DIM, SCALES_PER_GROUP
         )
     else:
-        active = decode_int8(
-            keys.index_select(0, physical),
-            metadata.index_select(0, physical),
-            INDEX_HEAD_DIM,
+        physical, table = physical_page_map(
+            kwargs["block_table"],
+            keys.shape[1],
+            kwargs["seqused_k"],
+            fixed_shape=capture,
+            pool_pages=keys.shape[0] if fused else None,
         )
+        if fused:
+            from sglang.kernels.ops.kvcache.dsv41_int8_pages import decode_pages
+
+            active = decode_pages(
+                keys, metadata, physical, INDEX_HEAD_DIM, SCALES_PER_GROUP
+            )
+        else:
+            active = decode_int8(
+                keys.index_select(0, physical),
+                metadata.index_select(0, physical),
+                INDEX_HEAD_DIM,
+            )
     kwargs["block_table"] = table
     lengths = host_lens if host_lens is not None else full_lens
     if (
