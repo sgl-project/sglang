@@ -35,15 +35,9 @@ def _tables_step(additive, scaling=None):
     return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
 
 
-def _make_info(batch_size=2, **overrides):
+def _make_info(**overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
-    defaults = dict(
-        temperatures=torch.ones(batch_size, 1),
-        vocab_size=VOCAB_SIZE,
-        device=DEVICE,
-    )
-    defaults.update(overrides)
-    return SamplingBatchInfo(**defaults)
+    return SamplingBatchInfo(vocab_size=VOCAB_SIZE, device=DEVICE, **overrides)
 
 
 def _serial_batched_fill(entries, vocab_mask):
@@ -67,7 +61,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
         """The stages run in non-speculative sampling's order; the custom
         processor and sanitize also process the watermark's logprob logits."""
         events = []
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.grammars = [
             _grammar(
                 torch.zeros(1, 4),
@@ -161,7 +155,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             torch.ones(1, VOCAB_SIZE),
             lambda logits, vocab_mask: logits.fill_(-4.0),
         )
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammars = [grammar]
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
@@ -185,7 +179,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 torch.linspace(-2.0, 0.0, VOCAB_SIZE).unsqueeze(0),
                 lambda logits, vocab_mask: logits.add_(vocab_mask),
             )
-            info = _make_info(batch_size=1)
+            info = _make_info()
             info.step_penalties = _tables_step(
                 torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
                 torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
@@ -283,7 +277,7 @@ class TestCopyForForward(CustomTestCase):
         """Both copy implementations preserve every field, including fields
         declared with init=False, and leave the step's tables to sampling."""
         for fast_path in (False, True):
-            info = _make_info(batch_size=1)
+            info = _make_info()
             step = MagicMock()
             info.step_penalties = step
             with (
@@ -326,10 +320,7 @@ class TestStepBuilds(CustomTestCase):
 
     def _make_req(
         self,
-        temp=1.0,
-        top_p=1.0,
         top_k=-1,
-        min_p=0.0,
         freq=0.0,
         presence=0.0,
         min_tokens=0,
@@ -339,10 +330,7 @@ class TestStepBuilds(CustomTestCase):
         mask_mode=None,
     ):
         req = MagicMock()
-        req.sampling_params.temperature = temp
-        req.sampling_params.top_p = top_p
         req.sampling_params.top_k = top_k
-        req.sampling_params.min_p = min_p
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
@@ -451,7 +439,7 @@ class TestStepBuilds(CustomTestCase):
             eos_token_id=1,
             max_page_tokens=3,
         )
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.set_plugin_state([req])
         self.assertTrue(info.has_custom_logit_processor)
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -461,7 +449,7 @@ class TestStepBuilds(CustomTestCase):
 
     def test_grammars_are_set_only_when_a_request_has_one(self):
         reqs = [self._make_req(), self._make_req()]
-        info = _make_info(batch_size=2)
+        info = _make_info()
         info.set_plugin_state(reqs)
         self.assertIsNone(info.grammars)
 
@@ -473,7 +461,7 @@ class TestStepBuilds(CustomTestCase):
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()
         req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
-        info = _make_info(batch_size=1)
+        info = _make_info()
         info.set_plugin_state([req])
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
@@ -490,7 +478,7 @@ class TestStepBuilds(CustomTestCase):
         req2.custom_logit_processor = None  # no processor
         req2.sampling_params.custom_params = None
 
-        info = _make_info(batch_size=2)
+        info = _make_info()
         info.set_plugin_state([req1, req2])
 
         self.assertTrue(info.has_custom_logit_processor)

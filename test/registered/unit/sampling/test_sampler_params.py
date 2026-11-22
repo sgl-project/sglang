@@ -53,6 +53,9 @@ class TestSamplerParamsPool(CustomTestCase):
         self.assertEqual(params.top_ps.tolist(), torch.tensor([0.5, 0.9]).tolist())
         self.assertEqual(params.top_ks.tolist(), [1, 20])
         self.assertEqual(params.min_ps.tolist(), torch.tensor([0.0, 0.05]).tolist())
+        # The samplers read each field as a contiguous per-row tensor.
+        for field in (params.temperatures, params.top_ps, params.top_ks, params.min_ps):
+            self.assertTrue(field.is_contiguous())
 
     def test_rewritten_slot_reads_the_new_request(self):
         """A freed slot that a later admission reuses holds the new request's
