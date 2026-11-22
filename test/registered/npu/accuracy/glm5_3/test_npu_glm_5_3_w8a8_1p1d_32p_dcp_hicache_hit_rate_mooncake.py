@@ -40,10 +40,7 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ENVS = {
     "TASK_QUEUE_ENABLE": "2",
     "ENABLE_PROFILING": "0",
     # "DEEPEP_HCCL_BUFFSIZE": "2500",
-    # PP is intentionally disabled on prefill: the Mooncake PD transfer backend
-    # validates the prefill/decode KV entry layout positionally (decode pp=1, so
-    # prefill pp must be 1), and a PP-sliced prefill kv_item_lens list no longer
-    # lines up with decode's uniform one (KVTransferError: DCP geometry differs).
+    "SGLANG_PP_LAYER_PARTITION": "18,20,24,16",
     # "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     # "SGLANG_ENABLE_SPEC_V2": "1",
     # "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
@@ -56,9 +53,9 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ENVS = {
     # the default 120s connect timeout would expire on the early ranks.
     "HCCL_CONNECT_TIMEOUT": "1800",
     "HCCL_EXEC_TIMEOUT": "1800",
-    # Mooncake on the NPU device path: TENT transport for the L3 store and the
-    # PD KV transfer. The store endpoint travels in the extra-config JSON and
-    # MC_TENT_CONF, both built in setUpClass.
+    # L3 store client: MemFabric TENT transport over the NPU device path.
+    # The store endpoint travels in the extra-config JSON and MC_TENT_CONF,
+    # both built in setUpClass.
     "MC_USE_TENT": "1",
     "MF_PROTOCOL": "device_sdma",
     "MF_STORE_PROTOCOL": "device_sdma",
@@ -91,15 +88,8 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "prefill",
     "--nnodes",
     2,
-    # TP 32 without PP: keeps the 32-rank prefill world (2 pods x 16 NPUs)
-    # identical to the decode side, and mirrors the only other NPU mooncake-PD
-    # case (DSV4), which drops prefill PP for the same KV-layout reason.
     "--tp-size",
-    32,
-    # Keep prefill EP at 8 (4 EP replica groups within tp32): the prefill MoE
-    # uses alltoallv, which is only validated at ep8 -- at ep32 its dispatch
-    # hits an AI Core assert (index value 3 exceeds bounds 1). Decode uses
-    # low_latency and is unaffected, so it stays at ep32.
+    8,
     "--ep-size",
     8,
     "--attn-dp-size",
@@ -113,7 +103,7 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--quantization",
     "modelslim",
     "--disaggregation-transfer-backend",
-    "mooncake",
+    "ascend",
     "--max-running-requests",
     64,
     "--served-model-name",
@@ -146,6 +136,8 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--moe-dense-tp",
     1,
+    "--pp-size",
+    4,
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -213,7 +205,7 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "--cuda-graph-max-bs-decode",
     8,
     "--disaggregation-transfer-backend",
-    "mooncake",
+    "ascend",
     "--watchdog-timeout",
     9000,
     "--context-length",
@@ -238,7 +230,7 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
 
 
 # DCP variant with L3 Mooncake store
-# 4-node PD separation, prefill tp32 (pp disabled), decode tp32/dp8/dcp4
+# 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_DCP_HICACHE_HIT_RATE(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
@@ -266,19 +258,6 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_HICACHE_HIT_RATE(
                 "extra_backend_tag": "pd-1p1d-glm5.3-w8a8-dcp",
             }
         )
-        # Mooncake serves both the L3 store (prefill only) and the PD KV
-        # transfer (both roles), so both nodes get the TENT transport config
-        # and the memfabric/mooncake library path of their own pod.
-        mooncake_envs = {
-            "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
-            "MC_USE_TENT": "1",
-            "MF_PROTOCOL": "device_sdma",
-            "MF_TRANSFER_TIMEOUT": "10000",
-            "MC_TENT_CONF": write_memfabric_tent_conf(),
-            "LD_LIBRARY_PATH": append_ld_library_path(
-                ("memfabric_hybrid", "lib"), ("mooncake", None)
-            ),
-        }
         cls.model_config = {
             "model_path": GLM_5_3_W8A8_MODEL_PATH,
             "prefill_args": [
@@ -287,8 +266,12 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_HICACHE_HIT_RATE(
                 l3_config,
             ],
             "decode_args": list(GLM_5_3_DCP_PD_SEP_DECODE_ARGS),
-            "prefill_envs": {**GLM_5_3_DCP_PD_SEP_PREFILL_ENVS, **mooncake_envs},
-            "decode_envs": {**GLM_5_3_DCP_PD_SEP_DECODE_ENVS, **mooncake_envs},
+            "prefill_envs": {
+                **GLM_5_3_DCP_PD_SEP_PREFILL_ENVS,
+                "MC_TENT_CONF": write_memfabric_tent_conf(),
+                "LD_LIBRARY_PATH": append_ld_library_path(("memfabric_hybrid", "lib")),
+            },
+            "decode_envs": dict(GLM_5_3_DCP_PD_SEP_DECODE_ENVS),
             "router_args": [
                 "--policy",
                 "round_robin",

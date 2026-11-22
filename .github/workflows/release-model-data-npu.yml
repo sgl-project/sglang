@@ -103,6 +103,13 @@ jobs:
             decode_size: 2
             router_size: 1
             test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_hicache_hit_rate_mooncake.py
+          - name: test_npu_glm_5_3_w8a8_1p1d_32p_dcp_hicache_hit_rate_mooncake_transfer
+            test_type: perf
+            prefill_decode_deployment: separation
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_hicache_hit_rate_mooncake_transfer.py
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
