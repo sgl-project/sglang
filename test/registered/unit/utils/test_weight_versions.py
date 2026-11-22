@@ -18,7 +18,11 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    empty_request_lists,
+    idle_penalty_status_pool,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -429,6 +433,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with patch(

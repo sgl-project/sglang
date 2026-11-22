@@ -4,6 +4,21 @@ description: "Deploy Inkling-2-Mini with SGLang — verified launch commands, wi
 tag: NEW
 ---
 
+<Callout icon="rocket" color="#d55816">
+SGLang supports Inkling-2-Mini from day 0. See the launch blog post: [SGLang and Miles Add Day-0 Support for Inkling 2](https://www.sglang.io/blog/inkling-2-small-day0-support).
+</Callout>
+
+| Hardware | Supported | Docker image |
+| --- | --- | --- |
+| B300 / GB300 | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| B200 / GB200 | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| H200 | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| RTX PRO 6000 | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| RTX 5090 | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| DGX Spark | Yes | `lmsysorg/sglang:inkling-2-mini` |
+| MI350X / MI355X | Yes | `lmsysorg/sglang:inkling-2-mini-mi35x` |
+| TPU7x | Yes | `lmsysorg/sglang:inkling-2-mini-tpu` |
+
 ## Deployment
 
 <a id="install" />
@@ -31,7 +46,7 @@ Then run the **Python** output of the command panel below.
 
 ```bash Command
 docker pull lmsysorg/sglang:inkling-2-mini       # NVIDIA Hopper / Blackwell
-docker pull radixark/sglang:dev-inkling-2-mini-mi35x # AMD MI350X / MI355X
+docker pull lmsysorg/sglang:inkling-2-mini-mi35x # AMD MI350X / MI355X
 docker pull lmsysorg/sglang:inkling-2-mini-tpu   # Google TPU7x
 ```
 
@@ -61,7 +76,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
 
-{/* §1 Model Introduction: to be added with the model card. */}
+## 1. Model Introduction
+
+**Inkling-2-Mini** is a looped Mixture-of-Experts model from Thinking Machines with **26B total and 5.4B active parameters** per token. It takes text and image input. Its 24 layers each have 128 routed experts (top-8, no shared experts), and layers 6–17 run three passes per token. A 3-layer DSpark draft head is bundled for speculative decoding. The weights take about 18 GB, so SGLang serves it on a single GPU, including desktop and workstation GPUs, or across several GPUs or TPU cores with tensor and expert parallelism.
+
+**Resources:** HuggingFace — [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini).
 
 ## 2. Configuration Tips
 
