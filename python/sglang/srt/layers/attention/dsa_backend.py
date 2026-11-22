@@ -494,6 +494,20 @@ _DSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
+def dsa_mha_one_shot_device_supported(device_sm: int) -> bool:
+    """Whether this device has a dense kernel for DSA MHA_ONE_SHOT prefill.
+
+    ``device_sm`` is ``major * 10 + minor``. SM90 uses FA3, SM100-family uses
+    FlashInfer's TRT-LLM ragged runner, SM12x (SM120 / SM121) uses SGLang's
+    SM12x FlashAttention-4 kernel, and gfx95x uses aiter.
+    """
+    if _IS_GFX95:
+        return True
+    if not _is_cuda:
+        return False
+    return device_sm == 90 or 100 <= device_sm < 110 or 120 <= device_sm < 130
+
+
 def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
     # The raw FP8 MLA cache layout: 576 B/token, no fp8_ds_mla tile scales.
     return backend in ("trtllm", "prims_ts")
@@ -4115,6 +4129,20 @@ class DeepseekSparseAttnBackend(
         )
         return sched_meta
 
+    def _zero_padded_extend_rows(
+        self, out: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Planned padded extend rows: the one-shot MHA metadata covers only
+        the real rows, so zero the MLP-sync padding for the layers after."""
+        real = forward_batch.global_num_token_non_padded_cpu
+        if (
+            self.plans_padded_extend_rows
+            and real is not None
+            and 0 < real < out.shape[0]
+        ):
+            out[real:].zero_()
+        return out
+
     def _forward_standard_mha(
         self,
         q: torch.Tensor,
@@ -4140,6 +4168,29 @@ class DeepseekSparseAttnBackend(
             f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q) - 1} requests, "
             f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
+
+        # SM12x (RTX PRO 6000 / RTX 50xx / GB10): FlashInfer's TRT-LLM ragged
+        # runner is built for the SM100 family only and fails on SM12x, so use
+        # SGLang's SM12x FlashAttention-4 kernel, which covers the dense
+        # one-shot contract (ragged packed Q/K/V, bottom-right causal, BF16,
+        # QK head dim 192 with V head dim 128).
+        if _is_cuda and self.device_sm_major == 12:
+            from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                flash_attn_varlen_func as fa4_sm12x_varlen_func,
+            )
+
+            out = fa4_sm12x_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=metadata.max_seq_len_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=layer.scaling,
+                causal=causal,
+            )
+            return self._zero_padded_extend_rows(out, forward_batch)
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
         # ROCm devices fall through to the aiter flash_attn_varlen_func path below:
@@ -4168,16 +4219,7 @@ class DeepseekSparseAttnBackend(
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
-            # Planned padded extend rows: the one-shot MHA metadata covers only
-            # the real rows, so zero the MLP-sync padding for the layers after.
-            real = forward_batch.global_num_token_non_padded_cpu
-            if (
-                self.plans_padded_extend_rows
-                and real is not None
-                and 0 < real < out.shape[0]
-            ):
-                out[real:].zero_()
-            return out
+            return self._zero_padded_extend_rows(out, forward_batch)
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
@@ -5081,14 +5123,11 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
+            # Requirements: a dense one-shot kernel for this device, short
+            # sequences, supported dtype, fits in chunk
             self.use_mha = (
                 self.supports_mha_one_shot
-                and (
-                    device_sm == 90
-                    or (device_sm >= 100 and device_sm < 110)
-                    or _IS_GFX95
-                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
+                and dsa_mha_one_shot_device_supported(device_sm)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
