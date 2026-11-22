@@ -717,6 +717,10 @@ class VAELoader(WeightOverrideComponentLoader):
             vae_dtype,
             torch.device("meta") if stream_checkpoint else None,
         )
+        if getattr(server_args, "enable_vae_conv3d_winograd", False):
+            enable_winograd = getattr(vae, "enable_conv3d_winograd", None)
+            if enable_winograd is not None:
+                enable_winograd()
         if configure_checkpoint is not None:
             configure_checkpoint(vae)
         if not stream_checkpoint:

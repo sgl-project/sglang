@@ -513,6 +513,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # values so the exact tier's speed is unchanged.
     allow_cudnn_tf32: bool = True
     allow_bf16_reduced_precision_reduction: bool = True
+    enable_vae_conv3d_winograd: bool = False
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
     # stay eager). Mutually exclusive with --enable-torch-compile and
@@ -2668,6 +2669,13 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
             help="Offload components during the torch.compile warmup (the DiT layerwise) so max-autotune fits on tighter-memory GPUs, then restore the configured residency for serving. Skipped when the DiT is already layerwise-offloaded, or under cache-dit / FSDP.",
+        )
+        parser.add_argument(
+            "--enable-vae-conv3d-winograd",
+            action=StoreBoolean,
+            default=ServerArgs.enable_vae_conv3d_winograd,
+            help="Replace eligible Conv3D operations with Winograd convolution in the "
+            "VAE decoder shared by Wan2.2 and Cosmos3.",
         )
         parser.add_argument(
             "--allow-cudnn-tf32",

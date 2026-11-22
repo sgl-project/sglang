@@ -41,7 +41,7 @@ quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
-conv/        convolutions in a library solver's accumulation order (MIOpen replicas)
+conv/        convolutions, including MIOpen replicas and Wan VAE Winograd Conv3D
 common/      platform predicates, non-Triton fallbacks, cached Triton launches (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
@@ -75,6 +75,9 @@ motivated the bit-exact rewrite.
 and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
+
+`--enable-vae-conv3d-winograd` replaces eligible Conv3D operations with Winograd
+convolution in the VAE decoder shared by Wan2.2 and Cosmos3.
 
 Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
 also enables it for default-stream inference, retaining the same per-signature

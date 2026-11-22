@@ -1281,6 +1281,143 @@ def _wan_decode_chunks(dec, chunks):
     return torch.cat(outs, dim=2)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Winograd Conv3D requires CUDA")
+@pytest.mark.parametrize(
+    "cin,depth,height,width,cout,history_len",
+    [
+        pytest.param(1024, 3, 24, 42, 1024, 0, id="wan-F2"),
+        pytest.param(1024, 4, 46, 82, 1024, 2, id="wan-F4"),
+        pytest.param(1024, 6, 90, 162, 512, 2, id="wan-F4-reuse"),
+        pytest.param(3, 3, 3, 4, 1, 1, id="F2-single-row"),
+        pytest.param(48, 4, 9, 13, 19, 1, id="F2-partial-tiles"),
+        pytest.param(24, 6, 8, 11, 7, 1, id="F2-reuse-odd-width"),
+        pytest.param(7, 5, 10, 14, 9, 2, id="F4-odd-channels"),
+        pytest.param(256, 6, 18, 34, 12, 2, id="F4-reuse-small-cout"),
+    ],
+)
+@torch.no_grad()
+def test_winograd_conv3d(cin, depth, height, width, cout, history_len):
+    """Check both inverse transforms and temporal-window offsets against cuDNN."""
+    from sglang.kernels.ops.diffusion import try_winograd_conv3d
+
+    rng = torch.Generator(device="cuda").manual_seed(42)
+    frames = torch.randn(
+        (1, cin, depth, height - 2, width - 2),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=rng,
+    ).contiguous(memory_format=torch.channels_last_3d)
+    x = frames[:, :, 2:]
+    history = frames[:, :, 2 - history_len : 2] if history_len else None
+    frames[:, :, : 2 - history_len].zero_()
+    padded = F.pad(frames, (1, 1, 1, 1)).contiguous(
+        memory_format=torch.channels_last_3d
+    )
+    weight = (
+        torch.randn((cout, cin, 3, 3, 3), device=x.device, dtype=x.dtype, generator=rng)
+        .mul_(1 / (27 * cin) ** 0.5)
+        .contiguous(memory_format=torch.channels_last_3d)
+    )
+    expected = F.conv3d(padded, weight).float()
+    weights = {}
+    actual = try_winograd_conv3d(padded, weight, weights)
+    assert actual is not None and actual.dtype == x.dtype
+    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
+    error = torch.linalg.vector_norm(actual.float() - expected)
+    assert error < 0.005 * torch.linalg.vector_norm(expected)
+
+    fused, next_history = try_winograd_conv3d(
+        x, weight, weights, fuse_cache=True, history=history
+    )
+    assert torch.equal(actual, fused)
+    assert torch.equal(next_history, frames[:, :, -2:])
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Winograd Conv3D requires CUDA")
+@torch.no_grad()
+def test_winograd_conv3d_unsupported_shapes():
+    from sglang.kernels.ops.diffusion import try_winograd_conv3d
+
+    weight = _wan_cl3d((8, 8, 3, 3, 3), torch.bfloat16)
+    for shape in [
+        (2, 8, 3, 6, 6),
+        (1, 8, 2, 6, 6),
+        (1, 4, 3, 6, 6),
+    ]:
+        assert try_winograd_conv3d(_wan_cl3d(shape, weight.dtype), weight, {}) is None
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Winograd Conv3D requires CUDA")
+@torch.inference_mode()
+def test_wan_winograd_conv3d_dispatch():
+    from sglang.kernels.ops import diffusion
+
+    config = wanvae.WanVAEConfig()
+    config.update_model_arch({"base_dim": 8, "is_residual": True})
+    vae = wanvae.AutoencoderKLWan(config)
+    convs = {
+        name: m
+        for name, m in vae.named_modules()
+        if isinstance(m, wanvae.WanCausalConv3d)
+    }
+    assert not any(m._use_winograd for m in convs.values())
+    vae.enable_conv3d_winograd()
+    for name, m in convs.items():
+        targeted = (
+            name.startswith("decoder.")
+            and ".resnets." in name
+            and name.endswith((".conv1", ".conv2"))
+        )
+        assert m._use_winograd == targeted, name
+    layer = vae.decoder.mid_block.resnets[0].conv1.to(
+        device="cuda", dtype=torch.bfloat16, memory_format=torch.channels_last_3d
+    )
+    with patch.object(
+        diffusion, "try_winograd_conv3d", wraps=diffusion.try_winograd_conv3d
+    ) as run:
+        for width, offloaded, expected_paths in [
+            (10, True, []),
+            (10, False, [False, True]),
+            (11, False, [False, True]),
+        ]:
+            layer.weight._sglang_layerwise_offloaded = offloaded
+            x = _wan_cl3d((1, layer.in_channels, 1, 8, width), torch.bfloat16)
+            layer(x, skip_bias=True)
+            wanvae._run_cached_causal_conv(layer, x, [None], 0, skip_bias=True)
+            paths = [c.kwargs.get("fuse_cache", False) for c in run.call_args_list]
+            assert paths == expected_paths
+            run.reset_mock()
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Winograd Conv3D requires CUDA")
+@torch.inference_mode()
+def test_wan_winograd_conv3d_weight_reload():
+    """Requests reuse a packed filter until the resident inference weight is refit."""
+    from sglang.kernels.ops.diffusion.conv import winograd_conv3d_triton as winograd
+    from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanCausalConv3d
+    from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+        _load_weights_into_module,
+    )
+
+    layer = WanCausalConv3d(16, 16, 3, padding=1).to(
+        device="cuda", dtype=torch.bfloat16, memory_format=torch.channels_last_3d
+    )
+    layer._use_winograd = True
+    # A refit can rebind an inference Parameter to normal storage. Warm that
+    # storage first so the subsequent in-place update cannot invalidate by address.
+    with torch.inference_mode(False), torch.no_grad():
+        layer.weight.data = layer.weight.clone()
+    x = torch.randn((1, 16, 1, 8, 12), device="cuda", dtype=torch.bfloat16)
+    with patch.object(winograd, "_pack_weight", wraps=winograd._pack_weight) as pack:
+        before = layer(x, skip_bias=True)
+        assert torch.equal(layer(x, skip_bias=True), before)
+        assert pack.call_count == 1
+        assert before.count_nonzero()
+        _load_weights_into_module(layer, [("weight", torch.zeros_like(layer.weight))])
+        assert not layer(x, skip_bias=True).count_nonzero()
+        assert pack.call_count == 2
+
+
 @torch.no_grad()
 def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
     # The lossless decoder (fused cat+pad, conv bias epilogue, bias+residual

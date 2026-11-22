@@ -25,6 +25,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
@@ -165,6 +166,21 @@ def _run_cached_causal_conv(
     if _fused_conv_cache_supported(conv, x) and (
         payload is None or (payload.device == x.device and payload.dtype == x.dtype)
     ):
+        # The Winograd transform can read the two-frame cache and supply
+        # spatial padding directly. Unsupported layouts take the path below.
+        if conv._padding == (1, 1, 1, 1, 2, 0) and (
+            skip_bias or conv.bias is None or conv_bias_epilogue is not None
+        ):
+            weights = conv._winograd_cache()
+            if weights is not None:
+                from sglang.kernels.ops.diffusion import try_winograd_conv3d
+
+                pair = try_winograd_conv3d(
+                    x, conv.weight, weights, fuse_cache=True, history=payload
+                )
+                if pair is not None:
+                    out, cache_list[idx] = pair
+                    return conv._apply_bias_residual(out, residual, skip_bias)
         # The same kernel pass emits the conv input and the compact
         # next-chunk cache (so the conv-input buffer is freed after the conv
         # instead of being pinned until the next chunk).
@@ -306,6 +322,70 @@ class WanCausalConv3d(nn.Conv3d):
             0,
         )
         self.padding = (0, 0, 0)
+        self._use_winograd = False
+
+    def _apply(self, fn, recurse=True):
+        getattr(self.weight, "_winograd_weights", {}).clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        getattr(self.weight, "_winograd_weights", {}).clear()
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    @staticmethod
+    def _load_winograd_weight(loader, param, loaded_weight, *args, **kwargs):
+        # An in-place refit of an inference tensor can preserve its address and
+        # has no version counter. Invalidate before even a partial write.
+        getattr(param, "_winograd_weights", {}).clear()
+        if callable(loader):
+            return loader(param, loaded_weight, *args, **kwargs)
+        if param.shape != loaded_weight.shape:
+            raise ValueError(
+                f"Shape mismatch for weight: model={param.shape}, loaded={loaded_weight.shape}"
+            )
+        param.data.copy_(loaded_weight)
+
+    def _winograd_cache(self):
+        weight = self.weight
+        if (
+            self._use_winograd
+            and not getattr(weight, "_sglang_layerwise_offloaded", False)
+            and torch.version.cuda is not None
+            and weight.is_cuda
+            and weight.dtype == torch.bfloat16
+            and not isinstance(weight, DTensor)
+            and self.stride == self.dilation == (1, 1, 1)
+            and self.groups == 1
+            and self.padding == (0, 0, 0)
+            and not torch.is_grad_enabled()
+        ):
+            if not hasattr(weight, "_winograd_weights"):
+                weight.weight_loader = partial(
+                    self._load_winograd_weight,
+                    getattr(weight, "weight_loader", None),
+                )
+                weight._winograd_weights = {}
+            return weight._winograd_weights
+        return None
+
+    def _conv_forward(self, x, weight, bias):
+        if bias is None and not torch.compiler.is_compiling():
+            cache = self._winograd_cache()
+            if cache is not None:
+                from sglang.kernels.ops.diffusion import try_winograd_conv3d
+
+                out = try_winograd_conv3d(x, weight, cache)
+                if out is not None:
+                    return out
+        return super()._conv_forward(x, weight, bias)
+
+    def _apply_bias_residual(self, out, residual, skip_bias):
+        bias = self.bias
+        if not skip_bias and bias is not None:
+            if can_use_conv_bias_epilogue(out, bias, residual):
+                return conv_bias_epilogue(out, bias, residual)
+            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+        return out if residual is None else out + residual
 
     def _conv_with_epilogue(self, inp, residual=None, skip_bias=False):
         """Convolution plus its bias epilogue.
@@ -331,11 +411,7 @@ class WanCausalConv3d(nn.Conv3d):
             and inp.is_cuda
         ):
             out = self._conv_forward(inp, self.weight, None)
-            if can_use_conv_bias_epilogue(out, bias, residual):
-                return conv_bias_epilogue(out, bias, residual)
-            # Same ops aten runs inside conv3d: bias cast to the activation
-            # dtype (autocast), fp32 add, one rounding.
-            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+            return self._apply_bias_residual(out, residual, skip_bias)
         else:
             out = self._conv_forward(inp, self.weight, bias)
         return out if residual is None else out + residual
@@ -1749,6 +1825,15 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         self.use_feature_cache = config.use_feature_cache
         self._causal_decode_initialized = False
+
+    def enable_conv3d_winograd(self) -> None:
+        if not self.config.load_decoder or not self.config.is_residual:
+            return
+        for block in self.decoder.modules():
+            if isinstance(block, WanResidualBlock):
+                for conv in (block.conv1, block.conv2):
+                    if isinstance(conv, WanCausalConv3d):
+                        conv._use_winograd = True
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
