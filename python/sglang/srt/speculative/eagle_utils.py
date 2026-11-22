@@ -727,13 +727,17 @@ def _sharded_sampling_applies(
     gathered path before sampling. Anything that reads or edits full logits also
     stays on the stock gathered path.
     """
+    info = batch.sampling_info
     return (
         _is_cuda
         and verify_input.tree_topk == 1
-        and grammar_mask is None
-        and not watermark
         and sampling_allows_vocab_shards(
-            batch.sampling_info,
+            info,
+            # Not adjusts_logits: info may be the provider's VerifySamplingView.
+            adjusts_logits=grammar_mask is not None
+            or watermark
+            or info.step_penalties is not None
+            or info.logit_bias is not None,
             return_logprob=batch.return_logprob,
             has_local_keys=has_local_keys,
         )
