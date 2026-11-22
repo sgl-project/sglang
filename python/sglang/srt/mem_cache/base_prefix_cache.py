@@ -486,6 +486,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     cache_controller: Optional[HiCacheController] = None
     buffer_pipeline: Optional[BufferModePipeline] = None
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
+    # SGLANG_OPT_HICACHE_L3_VICTIM_TIER pins storage hits until admission
+    # (UnifiedRadixCache).
+    l3vt_pin_active: bool = False
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 

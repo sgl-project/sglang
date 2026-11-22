@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler_components import dp_sync_exchange, shm_tag_exchange
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.mem_cache.hybrid_cache import l3_victim_tier
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
@@ -131,6 +132,8 @@ SHAPES = {
             pp_size=2,
             disable_overlap_schedule=True,
             hicache_write_policy="write_back",
+            hicache_storage_backend="mooncake",
+            hicache_storage_prefetch_policy="timeout",
             moe_runner_backend="flashinfer_cutedsl",
         ),
         megakernel=True,
@@ -344,6 +347,29 @@ def _settled_state_victim(shape: Shape) -> bool:
     return controller.write_settle_state_victims
 
 
+def _l3_victim_tier(shape: Shape) -> bool:
+    # The unified radix cache of the Qwen3.5 target (FULL + Mamba) on the Python
+    # TreeCore, with a Mooncake storage backend (batch_set_v2) and no linker.
+    args = shape.args
+    if not (
+        envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get()
+        and args.get("enable_hierarchical_cache")
+        and args.get("hicache_storage_backend") is not None
+    ):
+        return False
+    decline = l3_victim_tier.victim_tier_decline(
+        enable_storage=True,
+        host_memory_mode=args.get("hicache_host_memory_mode", "cache"),
+        has_linker=False,
+        is_write_back=args.get("hicache_write_policy") == "write_back",
+        unsupported=None,
+        has_storage_v2=True,
+        victim_margin=envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_KV_MARGIN.get(),
+        state_margin=envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER_STATE_MARGIN.get(),
+    )
+    return decline is None
+
+
 def _dp_post_verify_graphs(shape: Shape) -> bool:
     # The megakernel plugin binds the gathered verify sampler under the master.
     hooks = SimpleNamespace(
@@ -401,6 +427,7 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
     "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM": _settled_state_victim,
+    "SGLANG_OPT_HICACHE_L3_VICTIM_TIER": _l3_victim_tier,
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
     "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
     "SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32": _tp_lm_head_fp32,
@@ -496,7 +523,8 @@ _TRTLLM_CHAIN = _children()
 _QWEN35_CHAIN = _children()
 _QWEN35_TP_SPEC = _CHAIN | _TRTLLM_CHAIN | _QWEN35_CHAIN
 # A PD prefill with pipeline parallelism; the proxy receive with
-# SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back.
+# SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back, the L3
+# victim tier with write_back and a storage backend.
 _PP_PREFILL = _children("PP_EARLY_RELAY", "PP_PREFILL_EARLY_FINISH")
 
 EXPECTED = {
@@ -512,6 +540,7 @@ EXPECTED = {
         "PP_PROXY_RECV_AFTER_FORWARD",
         "HICACHE_WB_SETTLED_STATE_VICTIM",
         "PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB",
+        "HICACHE_L3_VICTIM_TIER",
     ),
     "aggregated-tp4": _QWEN35_TP_SPEC,
     "aggregated-tp8": _QWEN35_TP_SPEC,

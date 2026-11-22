@@ -958,6 +958,28 @@ class Envs:
     SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Cache-mode HiCache with an L3 backend under write_back: storage is a victim tier
+    # of the host tier (a node's KV pages and Mamba state are put when they leave the
+    # host tier, with the root path's host-resident nodes closed into storage), plus
+    # pinned restores, a hit-span prefetch budget and a measured wait bound; same
+    # keys and bytes (hybrid_cache/l3_victim_tier.py). The constants below size it.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Host KV pool share (tokens) and host state pool share (slots) kept free or in
+    # flight to storage; they also cap the pages / slots held for puts.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_KV_MARGIN = EnvFloat(0.05)
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_STATE_MARGIN = EnvFloat(0.05)
+    # Chain-close pages in flight as a share of the host pool (0: the KV margin), and
+    # the share of the host pool the tier writes before a closed node is re-closed.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_CLOSE_CAP = EnvFloat(0.0)
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_CLOSE_REFRESH = EnvFloat(0.25)
+    # Host pool share pinned storage hits may hold at once.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_PIN_FRAC = EnvFloat(0.25)
+    # Prefetch budget cap in tokens once a lookup holds its hit span (0: stock cap).
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_BUDGET_TOKENS = EnvInt(0)
+    # Timeout policy: admission wait <= base + SLACK x span / measured read rate.
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER_WAIT_SLACK = EnvFloat(3.0)
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
