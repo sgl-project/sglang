@@ -1,14 +1,21 @@
 """Unit tests for srt/distributed/pp_sync_window."""
 
-import threading
+import os
+import tempfile
 import time
 import unittest
+from datetime import timedelta
 
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPReceiveAhead, PPSyncSendWindow
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeWork:
@@ -73,27 +80,23 @@ def _wait_until(predicate, timeout=10.0):
 
 class TestPPReceiveAhead(CustomTestCase):
     """The thread posts the channel's receives ahead of the scheduler, in order
-    and at most ``depth`` messages ahead; a failed receive fails every pop after
-    the messages received before it."""
+    and at most ``depth`` ahead; a failed receive fails every later pop."""
 
-    def test_pops_in_receive_order_and_reads_at_most_depth_ahead(self):
+    def test_pops_in_receive_order_and_receives_at_most_depth_ahead(self):
         calls = []
-        gate = threading.Event()
 
         def recv_one():
-            gate.wait()
             calls.append(len(calls))
             return calls[-1]
 
         receiver = PPReceiveAhead(recv_one=recv_one, depth=2, name="t-recv")
-        self.assertFalse(receiver.ready())
-        gate.set()
+        _wait_until(lambda: receiver._queue.qsize() == 2)
+        # Both permits are taken: a third receive waits for a pop.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(receiver.pop(), 0)
         _wait_until(lambda: len(calls) == 3)
-        time.sleep(0.05)
-        # Two queued, a third received and waiting for room.
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(receiver.ready())
-        self.assertEqual([receiver.pop() for _ in range(5)], [0, 1, 2, 3, 4])
+        self.assertEqual([receiver.pop() for _ in range(4)], [1, 2, 3, 4])
+        receiver.close()
 
     def test_a_failed_receive_fails_this_and_every_later_pop(self):
         messages = iter([0])
@@ -107,6 +110,87 @@ class TestPPReceiveAhead(CustomTestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 receiver.pop()
             self.assertIsInstance(ctx.exception.__cause__, StopIteration)
+
+    def test_close_stops_posting_receives_and_fails_later_pops(self):
+        calls = []
+
+        def recv_one():
+            calls.append(len(calls))
+            return calls[-1]
+
+        receiver = PPReceiveAhead(recv_one=recv_one, depth=1, name="t-recv-close")
+        self.assertEqual(receiver.pop(), 0)
+        # The pop's permit lets the thread receive one more, then it waits.
+        _wait_until(lambda: receiver._queue.qsize() == 1)
+        receiver.close()
+        receiver._thread.join(timeout=10)
+        self.assertFalse(receiver._thread.is_alive())
+        self.assertEqual(len(calls), 2)
+        with self.assertRaises(RuntimeError):
+            receiver.pop()
+
+
+def _receive_ahead_worker(rank, store_path, rounds):
+    store = dist.FileStore(store_path, 2)
+    dist.init_process_group(
+        "gloo", store=store, rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    group = object.__new__(GroupCoordinator)
+    group.__dict__.update(
+        rank=rank,
+        rank_in_group=rank,
+        ranks=[0, 1],
+        world_size=2,
+        cpu_group=dist.group.WORLD,
+        device_group=dist.group.WORLD,
+    )
+
+    def message(i):
+        return {"lens": torch.arange(i, i + 4), "odd": torch.full((3,), i), "seq": i}
+
+    if rank == 0:
+        works = []
+        for i in range(rounds + 1):
+            works += group.send_tensor_dict(message(i), dst=1, async_send=True)
+        assert [group.recv_object(src=1) for _ in range(rounds)] == list(range(rounds))
+        for work in works:
+            work.wait()
+    else:
+        receiver = PPReceiveAhead(
+            recv_one=lambda: group.recv_tensor_dict_host_part(src=0),
+            depth=2,
+            name="t-recv-gloo",
+        )
+        works = []
+        for i in range(rounds):
+            # The scheduler thread sends on the group the receive thread reads.
+            works += group.send_object(i, dst=0, async_send=True)
+            got = group.recv_tensor_dict(src=0, host_part=receiver.pop())
+            want = message(i)
+            assert got.keys() == want.keys() and got["seq"] == i
+            assert torch.equal(got["lens"], want["lens"])
+            assert torch.equal(got["odd"], want["odd"])
+        # The receive posted after the last pop takes the sender's next message.
+        receiver.close()
+        receiver._thread.join(timeout=30)
+        assert not receiver._thread.is_alive()
+        for work in works:
+            work.wait()
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+class TestPPReceiveAheadOnGloo(CustomTestCase):
+    def test_receives_ahead_while_the_scheduler_thread_sends_on_the_group(self):
+        """Rank 1's thread receives tensor dicts on a gloo group while its main
+        thread sends on the same group; messages arrive whole and in order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp.spawn(
+                _receive_ahead_worker,
+                args=(os.path.join(tmp, "store"), 20),
+                nprocs=2,
+                join=True,
+            )
 
 
 if __name__ == "__main__":

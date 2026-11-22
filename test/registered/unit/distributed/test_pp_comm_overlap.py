@@ -287,6 +287,8 @@ class TestPPCommOverlap(CustomTestCase):
             "seq_lens": torch.arange(4),
             "empty": torch.empty(0, dtype=torch.int32),
             "hidden_states": torch.empty(4, 8, device="meta"),
+            # Not divisible by tp_size 2, so it is sent whole.
+            "odd": torch.arange(10, 13),
             "flag": True,
         }
         with patch.multiple(
@@ -304,7 +306,7 @@ class TestPPCommOverlap(CustomTestCase):
                     host_part = groups[1].recv_tensor_dict_host_part(
                         all_gather_group=all_gather_group
                     )
-                    self.assertEqual(list(host_part.cpu_tensors), ["seq_lens"])
+                    self.assertEqual(list(host_part.cpu_tensors), ["seq_lens", "odd"])
                     # Only the device tensor is left, on the device group.
                     pending = {k[2] for k, q in mailboxes.items() if q}
                     self.assertEqual(pending, {device_group})
@@ -331,6 +333,7 @@ class TestPPCommOverlap(CustomTestCase):
         torch.testing.assert_close(
             split["seq_lens"], torch.arange(4 // tp_size).repeat(tp_size)
         )
+        torch.testing.assert_close(split["odd"], torch.arange(10, 13))
 
 
 if __name__ == "__main__":

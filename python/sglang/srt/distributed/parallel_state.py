@@ -166,6 +166,24 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
+def _recv_buffer(
+    value: TensorMetadata, all_gather_group: Optional["GroupCoordinator"]
+) -> Tuple[torch.Tensor, bool]:
+    """The buffer one tensor of a tensor dict message is received into, and whether
+    it is this rank's slice of a send-allgather (the sender split the tensor)."""
+    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+    split = (
+        all_gather_group is not None
+        and tensor.numel() > 0
+        and tensor.numel() % all_gather_group.world_size == 0
+    )
+    if split:
+        tensor = tensor.reshape(all_gather_group.world_size, -1)[
+            all_gather_group.rank_in_group
+        ]
+    return tensor, split
+
+
 class HostTensorDictPart(msgspec.Struct, frozen=True):
     """The CPU-group half of one tensor dict message: its metadata and its CPU
     tensors (already sliced for a send-allgather), from
@@ -1886,30 +1904,23 @@ class GroupCoordinator:
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
     ) -> HostTensorDictPart:
-        """The CPU-group half of ``recv_tensor_dict``: the metadata, then each CPU
-        tensor in key order. It allocates no device memory and posts nothing on
-        the device group, so another thread may run it ahead of the device half.
+        """The CPU-group half of ``recv_tensor_dict`` (a multi-rank group): the
+        metadata, then each non-empty CPU tensor in key order. It allocates no
+        device memory and posts nothing on the device group, so another thread may
+        run it ahead of the device half.
         """
-        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
-        all_gather_rank = (
-            0 if all_gather_group is None else all_gather_group.rank_in_group
-        )
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         metadata_list = self.recv_object(src=src)
         cpu_tensors: Dict[str, torch.Tensor] = {}
         for key, value in metadata_list:
-            if not isinstance(value, TensorMetadata) or value.device != "cpu":
-                continue
-            tensor = torch.empty(value.size, dtype=value.dtype, device="cpu")
-            if tensor.numel() == 0:
-                continue
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-            torch.distributed.irecv(
-                tensor, src=self.ranks[src], group=self.cpu_group
-            ).wait()
-            cpu_tensors[key] = tensor
+            if isinstance(value, TensorMetadata) and value.device == "cpu":
+                tensor, _ = _recv_buffer(value, all_gather_group)
+                if tensor.numel() > 0:
+                    torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=self.cpu_group
+                    ).wait()
+                    cpu_tensors[key] = tensor
         return HostTensorDictPart(metadata_list=metadata_list, cpu_tensors=cpu_tensors)
 
     def recv_tensor_dict(
@@ -1926,11 +1937,6 @@ class GroupCoordinator:
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
 
-        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
-        all_gather_rank = (
-            0 if all_gather_group is None else all_gather_group.rank_in_group
-        )
-
         group = self.device_group
         metadata_group = self.cpu_group
 
@@ -1944,21 +1950,12 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                # send-allgather: send only a slice, then do allgather.
+                tensor, use_all_gather = _recv_buffer(value, all_gather_group)
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor
                     continue
-
-                # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (
-                    all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
-                )
-
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
                 if host_part is not None and tensor.is_cpu:
                     tensor = host_part.cpu_tensors[key]
@@ -1972,7 +1969,7 @@ class GroupCoordinator:
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
+                    tensor = tensor.reshape(value.size)
 
                 tensor_dict[key] = tensor
             else:
