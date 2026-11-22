@@ -31,6 +31,11 @@ DEVICE = "cpu"
 
 
 # Helper: construct a minimal SamplingBatchInfo
+def _tables_step(additive, scaling=None):
+    """A step whose penalty tables are given."""
+    return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+
+
 def _make_info(batch_size=2, **overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
     defaults = dict(
@@ -45,7 +50,6 @@ def _make_info(batch_size=2, **overrides):
         need_min_p_sampling=False,
         vocab_size=VOCAB_SIZE,
         device=DEVICE,
-        penalizer_orchestrator=MagicMock(is_required=False),
     )
     defaults.update(overrides)
     return SamplingBatchInfo(**defaults)
@@ -234,7 +238,7 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
+        info.step_penalties = _tables_step(torch.tensor([[-1.0] * VOCAB_SIZE]))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 0].item(), -1.0, places=5)
@@ -259,32 +263,15 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         grammar.apply_vocab_mask.assert_called_once()
 
-    def test_applies_penalizer_orchestrator(self):
-        """Test that a required orchestrator's apply() is called on logits."""
-        orch = MagicMock(is_required=True)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        logits = torch.zeros(1, VOCAB_SIZE)
-        info.apply_logits_bias(logits)
-        orch.apply.assert_called_once_with(logits)
-
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = None
         info.logit_bias = None
         info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
         original = logits.clone()
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
-
-    def test_apply_logits_bias_without_penalizer_orchestrator(self):
-        info = _make_info(batch_size=1, penalizer_orchestrator=None)
-        logits = torch.zeros(1, VOCAB_SIZE)
-
-        info.apply_logits_bias(logits)
-
-        self.assertTrue(torch.equal(logits, torch.zeros_like(logits)))
 
     def test_observer_sees_production_constraint_boundary(self):
         events = []
@@ -299,7 +286,7 @@ class TestApplyLogitsBias(CustomTestCase):
             -4.0
         )
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.ones(1, VOCAB_SIZE)
+        info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -323,11 +310,9 @@ class TestApplyLogitsBias(CustomTestCase):
                 logits.add_(vocab_mask)
             )
             info = _make_info(batch_size=1)
-            info.acc_additive_penalties = torch.linspace(
-                -0.5, 0.5, VOCAB_SIZE
-            ).unsqueeze(0)
-            info.acc_scaling_penalties = torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(
-                0
+            info.step_penalties = _tables_step(
+                torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
+                torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
             )
             info.grammar_mask = GrammarMask(
                 grammar,
@@ -348,29 +333,6 @@ class TestApplyLogitsBias(CustomTestCase):
         )
 
         self.assertTrue(torch.equal(observed_logits, ordinary_logits))
-
-
-# update_penalties
-class TestUpdatePenalties(CustomTestCase):
-    def test_required_creates_penalties_tensor(self):
-        """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
-        orch = MagicMock(is_required=True)
-        orch.accumulate_scaling_penalties.return_value = None
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNotNone(info.acc_additive_penalties)
-        self.assertEqual(info.acc_additive_penalties.shape, (2, VOCAB_SIZE))
-        orch.accumulate_additive_penalties.assert_called_once_with(
-            info.acc_additive_penalties
-        )
-        orch.accumulate_scaling_penalties.assert_called_once()
-
-    def test_not_required_sets_none(self):
-        """Test that update_penalties sets acc_additive_penalties to None when not required."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=2, penalizer_orchestrator=orch)
-        info.update_penalties()
-        self.assertIsNone(info.acc_additive_penalties)
 
 
 # update_regex_vocab_mask
@@ -726,15 +688,16 @@ class TestMergeBatch(CustomTestCase):
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_copy_matches_dataclasses_replace(self):
-        """The one-dict-update copy holds exactly what dataclasses.replace holds:
-        every field, with the forward-only penalizer removed."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+        """The one-dict-update copy holds exactly what dataclasses.replace holds,
+        and leaves the step's penalty tables to sampling."""
+        info = _make_info(batch_size=1)
+        step = MagicMock()
+        info.step_penalties = step
         copied = info.copy_for_forward()
-        replaced = dataclasses.replace(info, penalizer_orchestrator=None)
+        replaced = dataclasses.replace(info)
+        step.logit_penalties.assert_not_called()
         self.assertIs(type(copied), SamplingBatchInfo)
-        self.assertIsNone(copied.penalizer_orchestrator)
-        self.assertIs(info.penalizer_orchestrator, orch)
+        self.assertIsNot(copied, info)
         self.assertEqual(copied.__dict__.keys(), replaced.__dict__.keys())
         for name, value in replaced.__dict__.items():
             self.assertIs(copied.__dict__[name], value, name)

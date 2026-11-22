@@ -188,6 +188,8 @@ class StaticKVStorage:
         table, was told at startup."""
         self._shape = other._shape
         self._window_retention = other._window_retention
+        # The rows index the same allocator state: a pending reset survives the swap.
+        self._row_resets = other._row_resets
         self.bind_transfer_draft(
             other._draft_token_to_kv_pool, other._num_hidden_layers
         )
