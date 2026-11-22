@@ -885,6 +885,72 @@ the reference video and two 2048-pixel reference images.
 Pika H3 Flex is a Model Derivative of MiniMax H3 by Mellis, Inc., distributed
 under the MiniMax H3 Community License Agreement.
 
+### pi-H3: 2- and 4-step adapters, decoder-free video
+
+[Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3) distills the AdaLN-pruned
+MiniMax-H3 DiT ([multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned))
+into 2- and 4-step samplers with pi-Flow. Its DWD ("Decoding Without a
+Decoder") adapters also predict the video frames directly at the last step,
+with a pixel head built from the last eight Sol-H3-VAE decoder layers, so the
+video skips the VAE decoder. The audio still decodes through the audio VAE.
+
+| `--model-variant` | Steps | Video output |
+| --- | --- | --- |
+| `4step` (default) | 4 | DWD pixel head |
+| `2step` | 2 | DWD pixel head |
+| `4step-vae` | 4 | Video VAE |
+| `2step-vae` | 2 | Video VAE |
+
+Pass the repository directly to `--model-path`. Its registered model overlay
+downloads the four adapters and the pruned DiT, and links the text encoder,
+tokenizer, processor and both VAEs from the MiniMax-H3 `FL2VA/` partition.
+Each adapter replaces some pruned DiT tensors (every block's AdaLN projection,
+the output heads, and in the DWD adapters blocks 46-49 and the pixel head).
+The overlay writes those once per variant next to a shared copy of the pruned
+shards (about 51 GB in total), so keep `SGLANG_DIFFUSION_CACHE_ROOT` on the
+same filesystem as the Hugging Face cache. The adapters' rank-64 LoRA factors
+load at startup through the LoRA path. Do not pass the adapter files to
+`--lora-path`: the replaced tensors, the pixel head and the pruned base would be
+missing, and the LoRA path cannot carry the sampling schedule.
+
+```bash Command
+# 4-step, decoder-free (default)
+sglang serve --model-path Lakonik/pi-H3 --port 30010
+
+# 2-step, decoder-free, FP8 DiT linears and Sol sparse attention after block 1
+sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
+  --quantization fp8 \
+  --component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn \
+  --attention-backend-config '{"dense_steps": 0, "dense_layers": "0,1"}' \
+  --port 30010
+```
+
+Use the requests in [Generate video and audio](#4-generate-video-and-audio)
+with `"model": "Lakonik/pi-H3"` and `task` `t2va` or `fl2va`; `ref2va` was not
+distilled. `num_inference_steps` defaults to the variant's step count, and any
+other value is rejected. The sampler is Euler on the adapters' trained
+unshifted knots (`0.96, 0.693, 0.427, 0.16` for 4 steps, `0.93, 0.349` for
+2 steps) with video shift 12 and audio shift 3; omit `flow_shift` and
+`audio_flow_shift`. The DWD variants run on one GPU (no tensor or sequence
+parallelism), and `quality: "high"` is not supported.
+
+On 1× H200, warm `t2va` requests at 1344×768 and 5 seconds took:
+
+| Variant | BF16, `fa` | FP8 | FP8 + Sol after block 1 |
+| --- | --- | --- | --- |
+| `2step` | 11.9 s | 10.3 s | 6.7 s |
+| `4step` | 22.4 s | 19.1 s | 12.0 s |
+| `2step-vae` | 14.7 s | | |
+| `4step-vae` | 25.3 s | | |
+
+A DiT step takes 5.3 s in BF16, 4.4 s with FP8 linears and 2.7 s with FP8 and
+Sol. The DWD pixel head decodes the 5-second clip in 0.6 s, where the video VAE
+takes 4.2 s. FP8 and Sol are approximate; the Sol kernels compile on the first
+request.
+
+The pi-H3 adapters are Model Derivatives of MiniMax H3, distributed under the
+MiniMax H3 Community License Agreement.
+
 ### PDD acceleration LoRAs
 
 [Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)
