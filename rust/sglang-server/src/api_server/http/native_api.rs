@@ -3238,7 +3238,7 @@ mod tests {
         assert_eq!(value["meta_info"]["completion_tokens"], 2);
         assert_eq!(
             value["meta_info"]["finish_reason"],
-            serde_json::json!({"type": "length", "length": 2})
+            serde_json::json!({"type": "length", "length": 2, "ignored_stop": null})
         );
         assert!(
             value["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.020,

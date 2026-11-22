@@ -132,6 +132,7 @@ def _load_batch_runner(backend):
     )
     runner.enable_cp_bcg_capture = False
     runner._is_full_backend = False
+    runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
     runner.backend = backend
     runner.has_mha_companion_layers = False
     runner._prefill_static_buffers = None
@@ -335,6 +336,45 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
 
         self.assertIs(output.customized_info, customized_info)
+
+    def test_trim_logits_output_preserves_input_logprobs(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        )
+        runner.raw_bs = 1
+        runner._is_full_backend = True
+        # Per request, not per padded token: the scheduler reads each of them
+        # off the replayed output.
+        untrimmed = LogitsProcessorOutput(
+            next_token_logits=torch.zeros((4, 8)),
+            input_token_logprobs=object(),
+            input_top_logprobs_val=object(),
+            input_top_logprobs_idx=object(),
+            input_top_logprobs_weights=object(),
+            input_token_ids_logprobs_val=object(),
+            input_token_ids_logprobs_idx=object(),
+            input_logprobs_copy_done=object(),
+        )
+        output = runner._trim_logits_output(untrimmed)
+
+        self.assertIs(output.input_token_logprobs, untrimmed.input_token_logprobs)
+        self.assertIs(output.input_top_logprobs_val, untrimmed.input_top_logprobs_val)
+        self.assertIs(output.input_top_logprobs_idx, untrimmed.input_top_logprobs_idx)
+        self.assertIs(
+            output.input_top_logprobs_weights, untrimmed.input_top_logprobs_weights
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_val,
+            untrimmed.input_token_ids_logprobs_val,
+        )
+        self.assertIs(
+            output.input_token_ids_logprobs_idx,
+            untrimmed.input_token_ids_logprobs_idx,
+        )
+        self.assertIs(
+            output.input_logprobs_copy_done, untrimmed.input_logprobs_copy_done
+        )
 
     def test_low_free_memory_still_captures_prefill_graph(self):
         eager_runner = object()

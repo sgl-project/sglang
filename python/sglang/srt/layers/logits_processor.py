@@ -277,6 +277,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # Per sequence, the [rows, k] float32 host spans of its input candidate
+    # selector's weights; None when the batch has no such request.
+    input_top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -635,23 +638,21 @@ class LogitsProcessor(nn.Module):
         info = forward_batch.sampling_info
         if info is None:
             return False
+        from sglang.srt.sampling.sampling_batch_info import adjusts_logits
         from sglang.srt.speculative.sharded_verify import (
             sampling_allows_vocab_shards,
             spec_allows_vocab_shards,
         )
 
-        return (
-            not (info.grammars and any(g is not None for g in info.grammars))
-            and info.watermark is None
-            and sampling_allows_vocab_shards(
-                info,
-                return_logprob=forward_batch.return_logprob,
-                # request seeds stay on stock seeded sampling
-                has_local_keys=self._sharded_verify_temperature_keys
-                and info.sampling_seed is None,
-            )
-            and spec_allows_vocab_shards(get_spec())
-        )
+        has_grammar = bool(info.grammars) and any(g is not None for g in info.grammars)
+        return sampling_allows_vocab_shards(
+            info,
+            adjusts_logits=adjusts_logits(info, has_grammar=has_grammar),
+            return_logprob=forward_batch.return_logprob,
+            # request seeds stay on stock seeded sampling
+            has_local_keys=self._sharded_verify_temperature_keys
+            and info.sampling_seed is None,
+        ) and spec_allows_vocab_shards(get_spec())
 
     def _batch_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
         if not self.sharded_verify:

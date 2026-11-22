@@ -157,17 +157,40 @@ impl Runtime {
         self.spawn_mm_pool(workers, ctx);
     }
 
+    /// The workers, and the processor's feature publishers
+    /// (`mm-publisher-{i}`, see `MmProcessor::feature_publishers`), likewise
+    /// unpinned.
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        use crate::multi_modality::worker::{MmPublisher, MmWorker};
         if !self.core.set_mm_processor(ctx.processor.clone()) {
             tracing::warn!("MM workers started again; admission keeps the first processor");
         }
+        let workers = workers.max(1);
         let mut threads = self.threads.lock().unwrap();
-        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::multi_modality::worker::MmWorker::new(
+        let publishers = ctx.processor.feature_publishers();
+        let publish_tx = (publishers > 0).then(|| {
+            // A worker hands a request on without waiting unless each
+            // worker's last one still waits for a publisher.
+            let (publish_tx, publish_rx) = flume::bounded(workers);
+            spawn_pool("mm-publisher", None, publishers, &mut threads, |_| {
+                MmPublisher::new(
+                    publish_rx.clone(),
+                    self.mm_wiring.tm_tx.clone(),
+                    ctx.clone(),
+                )
+            });
+            publish_tx
+        });
+        spawn_pool("mm-worker", None, workers, &mut threads, |_| {
+            let worker = MmWorker::new(
                 self.mm_wiring.mm_rx.clone(),
                 self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
-            )
+            );
+            match &publish_tx {
+                Some(publish_tx) => worker.publishing_to(publish_tx.clone()),
+                None => worker,
+            }
         });
     }
 
@@ -413,6 +436,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // Default: a real tokenizer decodes to text, with byte tables when they pass
+    // their startup check, which is slow too, so it also runs before the ports
+    // are bound. `None` (→ `Skip`, raw `output_ids`) only happens under
+    // `skip_tokenizer_init` — `load_tokenizer` rejects a non-skip server with no
+    // tokenizer.
+    let detokenizer_backend = match &dyn_tokenizer {
+        Some(t) => detokenizer::DetokenizerBackend::for_tokenizer(
+            t.clone(),
+            &cfg.server_args.tokenizer_path,
+            cfg.server_args.revision.as_deref(),
+            crate::tokenizer_manager::byte_tables::enabled(),
+        ),
+        None => detokenizer::DetokenizerBackend::Skip,
+    };
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -432,13 +469,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
-        // `output_ids`) only happens under `skip_tokenizer_init` —
-        // `load_tokenizer` rejects a non-skip server with no tokenizer.
-        let backend = match &dyn_tokenizer {
-            Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
-            None => detokenizer::DetokenizerBackend::Skip,
-        };
+        let backend = detokenizer_backend;
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
@@ -2290,8 +2321,18 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let named = Arc::new(Named::default());
+        let mut server_args = test_server_args();
+        // The listener table names this listener, so its relay route serves
+        // the requests that present its token.
+        server_args.deployment_info.rust_server_endpoints =
+            vec![crate::message::config::RustServerEndpoint {
+                dp_rank: 0,
+                endpoint: format!("http://{http_addr}"),
+                peer_token: Some("own-token".into()),
+            }];
         let cfg = RuntimeConfig {
             abort_hook: Some(named.clone()),
+            server_args: Arc::new(server_args),
             ..test_config(http_addr, Some(grpc_addr))
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -2312,7 +2353,7 @@ mod tests {
             write!(
                 conn,
                 "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n",
+                 x-sglang-peer-token: own-token\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();

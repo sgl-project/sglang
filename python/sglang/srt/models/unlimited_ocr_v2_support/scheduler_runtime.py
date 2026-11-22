@@ -23,6 +23,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
     META_FORCED_TOKENS,
     DocReuse,
     forced_len,
+    validate_reuse_request,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.overlap_release import (
     DeferredOverlapRelease,
@@ -113,6 +114,9 @@ class UocrSchedulerRuntime:
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return self._prefetch.request_lists()
+
+    def validate_request(self, req: Req) -> Optional[str]:
+        return validate_reuse_request(req)
 
     def on_req_dropped(self, req: Req) -> None:
         """Release reuse and prefetch state of a dropped or aborted request."""

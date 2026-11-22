@@ -32,7 +32,6 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -67,7 +66,8 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -85,7 +85,6 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
-    apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
     get_dflash_attention_sliding_window_size,
@@ -146,12 +145,12 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
     GrammarTree,
-    build_grammar_vocab_mask,
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
     simulated_acc_len_generator,
 )
+from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 from sglang.srt.utils import (
     async_h2d,
     is_cuda,
@@ -300,17 +299,6 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
-
-
-def _verify_logits_unadjusted(sampling_info) -> bool:
-    penalizer = sampling_info.penalizer_orchestrator
-    return not (
-        sampling_info.has_custom_logit_processor
-        or (penalizer is not None and penalizer.is_required)
-        or sampling_info.grammar_mask is not None
-        or sampling_info.logit_bias is not None
-        or sampling_info.sampling_mask_batch_indices is not None
-    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -520,6 +508,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
+
+    @property
+    def has_bound_runtime(self) -> bool:
+        return self._runtime is not None
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -919,11 +911,15 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.has_grammar or batch.return_logprob:
+        if batch.return_logprob:
             return False
         if sampling_info is None:
-            return self._selector_sample is None
-        if not _verify_logits_unadjusted(sampling_info):
+            return not batch.has_grammar and self._selector_sample is None
+        if (
+            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
+            # A sampling mask is captured from the full target distribution.
+            or sampling_info.sampling_mask_batch_indices is not None
+        ):
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -3652,26 +3648,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        grammar_mask = None
-        if batch.has_grammar:
-            grammar_mask = build_grammar_vocab_mask(
-                reqs=batch.reqs,
-                tree=grammar_tree,
-                sampling_info=batch.sampling_info,
-                device=logits_output.next_token_logits.device,
-                barrier=grammar_barrier,
-            )
-
+        verify = TargetVerify.prepare(
+            batch,
+            logits_output=logits_output,
+            grammar_tree=grammar_tree,
+            grammar_barrier=grammar_barrier,
+            watermark_engine=None,
+            watermark_full_mask=False,
+        )
         if sampling_info is not None and target_predict is None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+            adjust_verify_logits(
+                logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                grammar_mask=verify.grammar_mask,
+                draft_tokens=draft_tokens,
+                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
             )
-
-        # Constrain every chain position before accept picks from it.
-        if grammar_mask is not None:
-            grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
         (
@@ -3690,6 +3682,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
+        verify.commit(
+            batch,
+            logits_output=logits_output,
+            accept=VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(
@@ -3716,14 +3713,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(
                 out_tokens=out_tokens,
                 commit_lens=commit_lens,
-            )
-
-        if batch.return_logprob:
-            compute_spec_logprobs(
-                batch,
-                logits_output,
-                out_tokens.reshape(-1),
-                chain_stride=block_size,
             )
 
         if self._need_mamba_verify_commit:
@@ -3886,8 +3875,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens[:, 1:],
             bs=int(draft_tokens.shape[0]),
             device=self.device,
-            # Applied by the caller once the logits are gathered.
-            sampling_info=None,
             verify_window=verify_window,
         )
         return target_out

@@ -19,6 +19,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
@@ -50,6 +51,13 @@ class _StridedProcessor(InputLogprobProcessor):
     """A selector is a stride: candidate j of position p is token
     (p * stride + j) % vocab_size, with weight p + j / 16."""
 
+    # True stands for a graph pool with room for the chunks: the results then
+    # leave through pinned host copies.
+    pinned_copy = False
+
+    def _can_borrow_logprob_memory(self, chunk_size, borrow_logits):
+        return self.pinned_copy
+
     def select_input_candidates(
         self, selector, logits, k, first_position, log_normalizer
     ):
@@ -77,6 +85,18 @@ class _SelfNormalizingProcessor(_StridedProcessor):
         return logits.float().log_softmax(-1).gather(1, ids), ids, weights
 
 
+class _UnweightedProcessor(_StridedProcessor):
+    """Its candidates come without weights."""
+
+    def select_input_candidates(
+        self, selector, logits, k, first_position, log_normalizer
+    ):
+        values, ids, _ = super().select_input_candidates(
+            selector, logits, k, first_position, log_normalizer
+        )
+        return values, ids, None
+
+
 class _IdentityHead(LogitsProcessor):
     """The hidden states of a forward are its logits."""
 
@@ -90,6 +110,10 @@ class _StridedLogitsProcessor(_IdentityHead):
 
 class _SelfNormalizingLogitsProcessor(_IdentityHead):
     input_logprob_processor_cls = _SelfNormalizingProcessor
+
+
+class _UnweightedLogitsProcessor(_IdentityHead):
+    input_logprob_processor_cls = _UnweightedProcessor
 
 
 def _schedule_batch(reqs, mode):
@@ -216,7 +240,7 @@ class TestInputCandidateSelector(CustomTestCase):
             normalizer = compute_row_log_normalizer(rows)
         else:
             rows, normalizer = rows.log_softmax(-1), None
-        values, ids, _ = hook.select_input_candidates(
+        values, ids, weights = hook.select_input_candidates(
             selector, rows, k, first, normalizer
         )
         self.assertEqual(
@@ -227,6 +251,13 @@ class TestInputCandidateSelector(CustomTestCase):
             [row for r, n in passes for row in r.input_top_logprobs_val[n]],
             values.tolist(),
         )
+        spans = [span for r, n in passes for span in r.input_top_logprobs_weights[n]]
+        if weights is None:
+            self.assertEqual(spans, [])
+            return
+        got = torch.cat(spans)
+        self.assertEqual(got.dtype, torch.float32)
+        self.assertTrue(torch.equal(got, weights.float().cpu()))
 
     def test_selector_rows_follow_positions_and_leave_other_requests_alone(self):
         generator = torch.Generator().manual_seed(0)
@@ -258,13 +289,15 @@ class TestInputCandidateSelector(CustomTestCase):
                     hook, [(first, 1), (second, 0), (third, 2)], 3, K, a, start + 1
                 )
                 self._check_selected(hook, [(third, 1)], 2, 7, d, max(start, 4) + 1)
-                # B and C get the bits they get without A.
+                # B and C get the bits they get without A, and no weights.
                 self.assertEqual(
                     first.input_top_logprobs_val[::2], alone.input_top_logprobs_val
                 )
                 self.assertEqual(
                     first.input_top_logprobs_idx[::2], alone.input_top_logprobs_idx
                 )
+                self.assertEqual(first.input_top_logprobs_weights[::2], [[], []])
+                self.assertIsNone(alone.input_top_logprobs_weights)
 
     def test_a_selector_request_changes_nothing_else_in_any_batch_order(self):
         generator = torch.Generator().manual_seed(1)
@@ -312,6 +345,10 @@ class TestInputCandidateSelector(CustomTestCase):
                 self.assertEqual(
                     [selected.input_top_logprobs_idx[at] for at in others],
                     alone.input_top_logprobs_idx,
+                )
+                self.assertEqual(
+                    [selected.input_top_logprobs_weights[at] for at in others],
+                    [[], []],
                 )
 
     def test_selectors_are_read_for_prefill_batches_only(self):
@@ -373,6 +410,7 @@ class TestInputCandidateSelector(CustomTestCase):
                 output = _run(processor, *(requests[n] for n in order))
             with self.subTest(fast=fast, chunk_size=chunk_size, order=order):
                 select.assert_not_called()
+                self.assertEqual(output.input_top_logprobs_weights, [[], [], []])
                 self.assertEqual(output.input_top_logprobs_val[order.index(0)], [])
                 self.assertEqual(output.input_top_logprobs_idx[order.index(0)], [])
 
@@ -402,6 +440,18 @@ class TestInputCandidateSelector(CustomTestCase):
                         alone.input_top_logprobs_val[0],
                     )
 
+    def test_a_selector_without_weights_replaces_the_candidates_only(self):
+        generator = torch.Generator().manual_seed(8)
+        a, b = (torch.randn(n, VOCAB, generator=generator) * 3 for n in (9, 6))
+        processor, hook = self._processor(_UnweightedLogitsProcessor)
+        hook.logprobs_chunk_size = 4
+        for fast in (False, True):
+            hook.enable_fast_input_logprobs = fast
+            output = _run(processor, (b, 0, 0, 3, None), (a, 0, 0, K, 3))
+            with self.subTest(fast=fast):
+                self._check_selected(hook, [(output, 1)], 3, K, a, 1)
+                self.assertEqual(output.input_top_logprobs_weights, [[], []])
+
     def test_selector_without_an_implementation_fails(self):
         processor, _ = self._processor(_IdentityHead)
         with self.assertRaisesRegex(
@@ -428,6 +478,29 @@ class TestInputCandidateSelector(CustomTestCase):
                     "Position scoring serves no input candidate selector",
                 ):
                     _run(processor, (rows, 0, 0, K, 3), is_prefill_only=True, **scoring)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_weights_reach_the_host_as_fp32_spans(self):
+        # Confidential computing has no pinned memory to copy through.
+        self.enterContext(envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(False))
+        generator = torch.Generator().manual_seed(6)
+        plain, selected = (
+            (torch.randn(n, VOCAB, generator=generator) * 3).cuda() for n in (10, 23)
+        )
+        processor, hook = self._processor(device="cuda")
+        hook.logprobs_chunk_size = 7
+        for fast, pinned_copy in itertools.product((False, True), repeat=2):
+            hook.enable_fast_input_logprobs, hook.pinned_copy = fast, pinned_copy
+            output = _run(processor, (plain, 0, 0, 3, None), (selected, 0, 0, K, 3))
+            with self.subTest(fast=fast, pinned_copy=pinned_copy):
+                # The scheduler concatenates the spans and reads them as numpy.
+                for span in output.input_top_logprobs_weights[1]:
+                    self.assertEqual(
+                        (span.device.type, span.dtype, span.is_pinned()),
+                        ("cpu", torch.float32, pinned_copy),
+                    )
+                self._check_selected(hook, [(output, 1)], 3, K, selected, 1)
+                self.assertEqual(output.input_top_logprobs_weights[0], [])
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_cuda_a_selector_request_leaves_its_neighbour_on_the_fused_top_k(self):

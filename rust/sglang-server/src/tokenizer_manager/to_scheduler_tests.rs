@@ -1796,3 +1796,20 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     assert!(rx.try_recv().is_err(), "no error frame");
     assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
 }
+
+/// The detok shard learns about stop strings at `Register`, which runs before
+/// `normalize`: both the API aliases and the normalized fields count, and empty
+/// strings do not.
+#[test]
+fn has_stop_strings_reads_aliases_and_normalized_fields() {
+    let parse = |json: &str| serde_json::from_str::<SamplingParams>(json).expect("parses");
+    assert!(!has_stop_strings(&parse("{}")));
+    assert!(!has_stop_strings(&parse(r#"{"stop": [""]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": "STéOP"}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": ["", "x"]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop_regex": "\\d{3}"}"#)));
+    let mut normalized = parse(r#"{"stop": "x"}"#);
+    normalized.normalize(false, 1000).expect("normalizes");
+    assert!(normalized.stop.is_none());
+    assert!(has_stop_strings(&normalized));
+}

@@ -48,6 +48,8 @@ class LogprobResult:
     token_logprobs: Optional[torch.Tensor] = None
     top_logprobs_val: Optional[List] = None
     top_logprobs_idx: Optional[List] = None
+    # See LogitsProcessorOutput.input_top_logprobs_weights.
+    top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     token_ids_logprobs_val: Optional[List] = None
     token_ids_logprobs_idx: Optional[List] = None
     input_copy_done: Optional[torch.cuda.Event] = None
@@ -58,6 +60,7 @@ class LogprobResult:
         if self.top_logprobs_val is not None:
             logits_output.input_top_logprobs_val = self.top_logprobs_val
             logits_output.input_top_logprobs_idx = self.top_logprobs_idx
+            logits_output.input_top_logprobs_weights = self.top_logprobs_weights
         if self.token_ids_logprobs_val is not None:
             logits_output.input_token_ids_logprobs_val = self.token_ids_logprobs_val
             logits_output.input_token_ids_logprobs_idx = self.token_ids_logprobs_idx
@@ -718,10 +721,14 @@ class InputLogprobProcessor:
         plain_max_k: int,
         log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
         precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        weight_spans: List[List[torch.Tensor]],
+        copy_to_pinned_cpu: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """The (values, token ids) of a chunk's rows, as wide as the largest
         top_logprobs_num of the requests of ``chunk_slice``: the
         top-``plain_max_k``, with the rows of each selector request replaced.
+
+        A selector's weights go to its request's entry of ``weight_spans``.
         """
         selectors = logits_metadata.input_candidate_selectors
         top_k_nums = logits_metadata.top_logprobs_nums
@@ -753,7 +760,7 @@ class InputLogprobProcessor:
                 + done
                 + 1
             )
-            row_values, row_indices, _ = self.select_input_candidates(
+            row_values, row_indices, row_weights = self.select_input_candidates(
                 selectors[n],
                 logprobs[lo:hi],
                 k,
@@ -762,6 +769,11 @@ class InputLogprobProcessor:
             )
             values[lo:hi, :k] = row_values
             indices[lo:hi, :k] = row_indices
+            if row_weights is not None:
+                row_weights = row_weights.float()
+                weight_spans[n].append(
+                    async_d2h(row_weights) if copy_to_pinned_cpu else row_weights.cpu()
+                )
         return values, indices
 
     def _forward_by_chunk(
@@ -801,10 +813,12 @@ class InputLogprobProcessor:
         # so every other request computes what it would without them.
         selectors = logits_metadata.input_candidate_selectors
         plain_top_k_nums = logits_metadata.top_logprobs_nums
+        top_logprobs_weights = None
         if selectors is not None:
             plain_top_k_nums = [
                 0 if s is not None else k for k, s in zip(plain_top_k_nums, selectors)
             ]
+            top_logprobs_weights = [[] for _ in selectors]
 
         # If a single sequence is split into multiple chunks, we need to keep track
         # of the pruned length of the sequences in the previous chunks.
@@ -941,6 +955,8 @@ class InputLogprobProcessor:
                             max(plain_top_k_nums[chunk_slice]),
                             chunk_log_normalizer,
                             chunk_precomputed_topk,
+                            top_logprobs_weights,
+                            copy_to_pinned_cpu=borrow_logprob_memory,
                         )
                     split_len_topk = get_top_logprobs_chunk(
                         chunk_logprobs,
@@ -1012,6 +1028,7 @@ class InputLogprobProcessor:
                 token_logprobs=token_logprobs,
                 top_logprobs_val=top_logprobs_val,
                 top_logprobs_idx=top_logprobs_idx,
+                top_logprobs_weights=top_logprobs_weights,
                 token_ids_logprobs_val=token_ids_logprobs_val,
                 token_ids_logprobs_idx=token_ids_logprobs_idx,
                 input_copy_done=input_copy_done,
