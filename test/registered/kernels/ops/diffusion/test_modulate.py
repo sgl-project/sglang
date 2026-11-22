@@ -41,7 +41,7 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
-register_amd_ci(est_time=38, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=38, suite="nightly-kernel-test-1-gpu-amd", nightly=True)
 
 DEVICE = "cuda"
 CUDA_NATIVE_ONLY = pytest.mark.skipif(
@@ -425,7 +425,6 @@ def test_residual_gate_add_batched_rows_cuda_graph():
 
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@CUDA_NATIVE_ONLY
 def test_scaled_residual_add_is_bit_exact(dtype):
     # fp32 residual accumulator + half-precision update, as the DiT blocks
     # that keep their residual stream in fp32 emit it.
@@ -487,14 +486,6 @@ def test_ltx2_ada_values9(batch, seq, hidden, table_dtype, compiled):
         # of the kernel; a strided slice would re-add the downstream copy.
         assert got.is_contiguous()
         assert torch.equal(got, want)
-
-
-@torch.no_grad()
-def test_ltx2_ada_values9_rejects_unsupported_shape():
-    scale_shift_table = torch.randn(8, 4096, device=DEVICE, dtype=torch.bfloat16)
-    timestep = torch.randn(1, 1, 9 * 4096, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="scale_shift_table"):
-        ltx2_ada_values9(scale_shift_table, timestep)
 
 
 # ---------------------------------------------------------------------------

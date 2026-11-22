@@ -81,7 +81,7 @@ Usage:
     python3 bucket_recommended_tests.py \
         --recommended recommended_pytest_paths.txt \
         --changed-files pr_changed_files.txt \
-        --suites base-a-test-npu,base-b-test-1-npu-a3 \
+        --suites extra-a-test-npu,extra-b-test-1-npu-a3 \
         --diffusion-suites multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu \
         --case-map test_case_map.json \
         --precision-mode true \
@@ -479,7 +479,7 @@ def write_github_summary(
         lines.append("")
         lines.append(
             "Recommended but not registered in any suite this workflow runs "
-            "(base-a / CPU / nightly suites belong to other pipelines, or the "
+            "(extra-a / CPU / nightly suites belong to other pipelines, or the "
             "file was deleted). Running the full suites would not run them "
             "either."
         )
@@ -514,7 +514,7 @@ def main():
         "--suites",
         type=str,
         required=True,
-        help="Comma-separated suite names to bucket (e.g. base-a-test-npu,base-b-test-1-npu-a3)",
+        help="Comma-separated suite names to bucket (e.g. extra-a-test-npu,extra-b-test-1-npu-a3)",
     )
     parser.add_argument(
         "--diffusion-suites",
@@ -738,7 +738,7 @@ def main():
     )
 
     total_count = sum(len(b) for b in buckets.values())
-    # Recommendations no suite here contains: base-a / CPU / nightly tests run
+    # Recommendations no suite here contains: extra-a / CPU / nightly tests run
     # by other pipelines, or a deleted file. None of them can be run by this
     # workflow, and a full run would not run them either, so this is reported
     # but never escalates to a full run.

@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False
 

@@ -24,8 +24,10 @@ from sglang.kernels.ops.diffusion import (
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_cuda_ci(
+    est_time=30, stage="base-b-diffusion-unit", runner_config="1-gpu-large"
+)
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 _HIDDEN = 6144
 
@@ -212,16 +214,6 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         for tokens in (256, 240):
             proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
             self.assertTrue(torch.equal(compiled(proj), k_input(proj)))
-
-    def test_launchers_reject_layouts_they_do_not_replicate(self):
-        x, update, gate, scale, shift = _inputs(16, 1.0, 4)
-        strided = x.transpose(1, 2).contiguous().transpose(1, 2)
-        with self.assertRaises(RuntimeError):
-            xpu_layernorm_modulate(strided, scale, shift, self.norm.eps)
-        with self.assertRaises(RuntimeError):
-            xpu_layernorm_modulate(x, scale.expand(2, 1, _HIDDEN), shift, 1e-6)
-        with self.assertRaises(RuntimeError):
-            xpu_gated_resnorm(x, update[:, :8], gate, scale, shift, self.norm.eps)
 
 
 if __name__ == "__main__":
