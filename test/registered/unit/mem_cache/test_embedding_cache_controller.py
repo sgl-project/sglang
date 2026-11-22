@@ -140,7 +140,11 @@ class TestRangePageAllocator(unittest.TestCase):
 
         self.assertEqual(
             runs,
-            [PageRun(start=0, length=1), PageRun(start=2, length=2), PageRun(start=5, length=1)],
+            [
+                PageRun(start=0, length=1),
+                PageRun(start=2, length=2),
+                PageRun(start=5, length=1),
+            ],
         )
         self.assertEqual(allocator.free_ranges, [(6, 1)])
         self.assertEqual(allocator.free_pages, 1)
