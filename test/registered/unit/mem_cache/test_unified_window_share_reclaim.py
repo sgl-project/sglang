@@ -229,13 +229,10 @@ class TestWindowShareTrim(CustomTestCase):
 
 
 def _node_id(cache, key):
-    stack = list(cache.tree_core.root_node.children.values())
-    while stack:
-        node = stack.pop()
-        if list(node.key) == key:
-            return node.id
-        stack.extend(node.children.values())
-    return None
+    matched, node_id, _ = cache.tree_core.match_full_device_prefix(
+        RadixKey(array("q", key))
+    )
+    return node_id if matched == len(key) else None
 
 
 def _cached(cache, key):
