@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 class SynthIDRows(msgspec.Struct, frozen=True):
@@ -186,19 +187,6 @@ class SynthIDEngine:
             return None
         return SynthIDVerify(self.watermark, rows)
 
-    def append_accept_tokens(
-        self,
-        rows: SynthIDRows,
-        req_pool_indices: torch.Tensor,
-        accept_tokens: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        self.watermark.state.commit(
-            rows.take(req_pool_indices),
-            rows.take(accept_tokens),
-            rows.take(accept_lens),
-        )
-
 
 def _request_filter(
     sampling_info: SamplingBatchInfo, rows: SynthIDRows, *, width: int = 1
@@ -323,6 +311,8 @@ class SynthIDVerify:
     def __init__(self, watermark: SynthIDWatermark, rows: SynthIDRows) -> None:
         self.watermark = watermark
         self.rows = rows
+        # Set by apply, read by commit.
+        self._req_pool_indices: Optional[torch.Tensor] = None
 
     def apply(
         self,
@@ -339,6 +329,7 @@ class SynthIDVerify:
         if keep_logits:
             logits = logits.clone()
         rows = self.rows
+        self._req_pool_indices = req_pool_indices
         self.watermark.apply_verify(
             logits,
             rows.take(sampling_info.temperatures),
@@ -349,11 +340,13 @@ class SynthIDVerify:
         )
         return logits, _without_request_filters(sampling_info, rows)
 
-    def record(
-        self, accept_index: Optional[torch.Tensor], accept_lens: torch.Tensor
-    ) -> None:
-        # The state advances only by append_accept_tokens.
-        pass
+    def commit(self, accept: VerifyAccept) -> None:
+        rows = self.rows
+        self.watermark.state.commit(
+            rows.take(self._req_pool_indices),
+            rows.take(accept.accept_tokens()),
+            rows.take(accept.accept_lens),
+        )
 
 
 def watermark_view_fields(rows: SynthIDRows) -> dict[str, Any]:
