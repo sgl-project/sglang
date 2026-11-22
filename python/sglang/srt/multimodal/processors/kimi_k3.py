@@ -9,6 +9,7 @@ at load time.
 """
 
 import asyncio
+import dataclasses
 import functools
 import math
 import re
@@ -25,7 +26,11 @@ from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK31ForConditionalGeneration,
 )
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
+from sglang.srt.multimodal.cache import (
+    MediaSnapshot,
+    resolve_multimodal_item_hash,
+    snapshot_media,
+)
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -734,6 +739,29 @@ class KimiK3ImageProcessor(
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Kimi-K3 artifact batch did not produce every image")
         return [artifact for artifact in artifacts if artifact is not None]
+
+    def complete_featureless_artifact(
+        self,
+        artifact: KimiK3ImagePreprocessArtifact,
+        snapshot: MediaSnapshot,
+    ) -> Optional[KimiK3ImagePreprocessArtifact]:
+        """Ship a cached image's encoded bytes instead of decoding it again.
+
+        The bytes decoded successfully on the miss that cached this artifact, so
+        the encoder can decode them again with the same mode when, and only
+        when, the image falls outside the request's cached prefix.
+        """
+        if (
+            artifact.deferred is None
+            or artifact.deferred.backend != "gpu"
+            or not isinstance(snapshot.data, bytes)
+        ):
+            return None
+        feature = torch.frombuffer(bytearray(snapshot.data), dtype=torch.uint8)
+        deferred = dataclasses.replace(
+            artifact.deferred, encoded_image_decode=self.gpu_image_decode
+        )
+        return dataclasses.replace(artifact, feature=feature, deferred=deferred)
 
     def compose_request(
         self,
