@@ -7,17 +7,58 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.speculative.spec_utils import GrammarTree, build_grammar_vocab_mask
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.watermarking.interface import (
         VerifyWatermark,
         WatermarkEngine,
     )
+
+
+def adjust_verify_logits(
+    logits: torch.Tensor,
+    *,
+    sampling_info: SamplingBatchInfo,
+    grammar_mask: Optional[GrammarMask],
+    draft_tokens: torch.Tensor,
+    next_child: Optional[torch.Tensor] = None,
+    next_sibling: Optional[torch.Tensor] = None,
+    custom_logit_processor: bool,
+) -> None:
+    """Apply the sampler's logit adjustments to the verify logits in place, in
+    decoding's order: penalties, grammar mask, logit bias, custom logit
+    processor. The watermark, if any, applies after.
+
+    ``draft_tokens`` [bs, width]: each request's verify tokens, a tree's nodes
+    linked by ``next_child`` / ``next_sibling``, or a chain without them. Row
+    ``i * width + j`` of ``logits`` is request i's token j, so a custom
+    processor sees ``width`` rows per request, each with that request's params.
+    ``custom_logit_processor``: run the batch's custom logit processors; a
+    provider's sampling view carries none.
+    """
+    width = draft_tokens.shape[1]
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(
+            logits, draft_tokens, next_child=next_child, next_sibling=next_sibling
+        )
+    if grammar_mask is not None:
+        grammar_mask.apply(logits)
+    if sampling_info.logit_bias is not None:
+        # In the bias's own dtype, so the sum rounds once to the logits dtype.
+        logits.view(-1, width, logits.shape[-1]).add_(
+            sampling_info.logit_bias[:, None, :]
+        )
+    if custom_logit_processor:
+        apply_custom_logit_processor(logits, sampling_info, num_tokens_in_batch=width)
 
 
 class TargetVerify(msgspec.Struct, frozen=True):

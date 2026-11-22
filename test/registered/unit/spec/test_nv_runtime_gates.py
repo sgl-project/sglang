@@ -1,3 +1,4 @@
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +14,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestNativeEagerVerify(CustomTestCase):
     def test_master_selects_native_sampling_or_runtime_hooks(self):
+        """A custom logit processor keeps native sampling under the master switch:
+        the runtime hooks' sampling view carries none."""
         # EAGLE passes its sparse and simulated-acceptance options; NGRAM the defaults.
         eagle_options = dict(
             uno_target_max_top_k=17,
@@ -20,10 +23,12 @@ class TestNativeEagerVerify(CustomTestCase):
             sparse_bonus_argmax=True,
         )
         for label, options in (("eagle", eagle_options), ("defaults", {})):
-            for enabled in (False, True):
-                with self.subTest(options=label, enabled=enabled):
+            for enabled, custom in itertools.product((False, True), (False, True)):
+                with self.subTest(options=label, enabled=enabled, custom=custom):
                     batch = SimpleNamespace(
-                        sampling_info=object(),
+                        sampling_info=SimpleNamespace(
+                            has_custom_logit_processor=custom
+                        ),
                         seq_lens=object(),
                         req_pool_indices=object(),
                         device="cpu",
@@ -72,7 +77,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         (accept.tokens, accept.accept_lens, accept.accept_index),
                         outputs,
                     )
-                    if enabled:
+                    if enabled and not custom:
                         sample.assert_not_called()
                         make_io.assert_called_once()
                         hooks.post_verify.assert_called_once_with(make_io.return_value)
@@ -90,6 +95,7 @@ class TestNativeEagerVerify(CustomTestCase):
                             sparse_bonus_argmax=options.get(
                                 "sparse_bonus_argmax", False
                             ),
+                            custom_logit_processor=custom,
                         )
 
 

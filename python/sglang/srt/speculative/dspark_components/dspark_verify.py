@@ -47,10 +47,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    apply_dflash_verify_logits_adjustments,
-    build_speculative_verify_target_probs,
-)
+from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
@@ -58,10 +55,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    VerifyWindow,
-    apply_logits_adjustments_strided,
-)
+from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -326,7 +320,6 @@ class TargetVerifyExecutor:
         draft_input: DFlashDraftInputV2,
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
-        sampling_info,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -357,22 +350,12 @@ class TargetVerifyExecutor:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        result = self._forward_prepared_verify(
+        return self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
-
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_token_num=verify_w,
-                verify_tokens=verify_ids_2d,
-            )
-
-        return result
 
     def _forward_prepared_verify(
         self,
@@ -457,7 +440,6 @@ class TargetVerifyExecutor:
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
-        sampling_info,
         iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
@@ -502,21 +484,15 @@ class TargetVerifyExecutor:
         draft_tokens: torch.Tensor,
         bs: int,
         device: str,
-        sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
-        # [bs, stride] block input tokens, the anchor then the drafts; built only
-        # where read: a full block's verify ids, or the penalties.
-        verify_ids_2d = None
-        if full_block or (
-            sampling_info is not None and sampling_info.step_penalties is not None
-        ):
-            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
         if full_block:
-            # Nothing to pack: the verify rows are the verify window.
+            # Nothing to pack: the verify rows are the verify window, the anchor
+            # then the drafts.
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
                 verify_cache_loc=verify_window.verify_cache_loc,
@@ -540,7 +516,6 @@ class TargetVerifyExecutor:
             batch=batch,
             layout=layout,
             ragged_window=ragged_window,
-            sampling_info=sampling_info,
             iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
@@ -577,12 +552,6 @@ class TargetVerifyExecutor:
                     fill_value=0.0,
                     verify_num_draft_tokens=stride,
                 )
-        apply_logits_adjustments_strided(
-            next_token_logits=strided_logits,
-            sampling_info=sampling_info,
-            verify_num_draft_tokens=stride,
-            verify_tokens=verify_ids_2d,
-        )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
         return target_verify, hidden_strided

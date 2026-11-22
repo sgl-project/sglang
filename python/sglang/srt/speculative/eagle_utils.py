@@ -25,7 +25,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.srt.layers.sampling_renorm import (
+    min_p_renorm_prob,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -718,6 +722,7 @@ def _sharded_sampling_applies(
     batch: ScheduleBatch,
     grammar_mask: Optional[GrammarMask],
     watermark: bool,
+    custom_logit_processor: bool,
     has_local_keys: bool = False,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
@@ -732,6 +737,7 @@ def _sharded_sampling_applies(
         and verify_input.tree_topk == 1
         and grammar_mask is None
         and not watermark
+        and not custom_logit_processor
         and sampling_allows_vocab_shards(
             batch.sampling_info,
             return_logprob=batch.return_logprob,
@@ -753,26 +759,22 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
+    custom_logit_processor: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information). simulated_acc_len: the injected
-    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
-    graph can replay the injection. simulated_acc_len_rng: the generator to draw
-    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
-    injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    (which contains spec decoding information): adjust the verify logits, then
+    run the tree accept core. custom_logit_processor: run the batch's custom
+    logit processors, so its sampling info must be a SamplingBatchInfo.
+    simulated_acc_len: the injected acceptance length already drawn on the host,
+    as a device int64 [1], so a CUDA graph can replay the injection.
+    simulated_acc_len_rng: the generator to draw it from here otherwise (the
+    global CPU RNG when None). sparse_bonus_argmax: an injected acceptance's
+    bonus is the target argmax on the compact top-k branch too, as on the dense
+    one.
     """
-    from sglang.srt.layers.dp_attention import (
-        is_dp_attention_enabled,
-    )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.speculative.spec_utils import (
-        SIMULATE_ACC_LEN,
-        SIMULATE_ACC_TOKEN_MODE,
-        generate_simulated_accept_index,
-        generate_simulated_accept_index_device,
-    )
+    from sglang.srt.speculative.target_verify import adjust_verify_logits
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
     device = batch.device
@@ -794,6 +796,7 @@ def eagle_sample(
         batch=batch,
         grammar_mask=grammar_mask,
         watermark=watermark is not None,
+        custom_logit_processor=custom_logit_processor,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -805,24 +808,15 @@ def eagle_sample(
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    if sampling_info.step_penalties is not None:
-        sampling_info.step_penalties.apply_verify(
-            next_token_logits,
-            candidates,
-            verify_input.retrieve_next_token,
-            verify_input.retrieve_next_sibling,
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
-        )
-
-    # Apply grammar mask if provided
-    if grammar_mask is not None:
-        grammar_mask.apply(next_token_logits)
-
+    adjust_verify_logits(
+        next_token_logits,
+        sampling_info=sampling_info,
+        grammar_mask=grammar_mask,
+        draft_tokens=candidates,
+        next_child=verify_input.retrieve_next_token,
+        next_sibling=verify_input.retrieve_next_sibling,
+        custom_logit_processor=custom_logit_processor,
+    )
     if watermark is not None:
         next_token_logits, sampling_info = watermark.apply(
             next_token_logits,
@@ -836,6 +830,55 @@ def eagle_sample(
             keep_logits=batch.return_logprob,
         )
 
+    return _tree_accept(
+        verify_input=verify_input,
+        batch=batch,
+        logits_output=logits_output,
+        next_token_logits=next_token_logits,
+        vocab_shard=vocab_shard,
+        sampling_info=sampling_info,
+        candidates=candidates,
+        uno_target_max_top_k=uno_target_max_top_k,
+        watermark=watermark is not None,
+        simulated_acc_len=simulated_acc_len,
+        simulated_acc_len_rng=simulated_acc_len_rng,
+        sparse_bonus_argmax=sparse_bonus_argmax,
+        local_keys=local_keys,
+    )
+
+
+def _tree_accept(
+    *,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
+    next_token_logits: torch.Tensor,
+    vocab_shard: Optional[VocabShard],
+    sampling_info: SamplingBatchInfo,
+    candidates: torch.Tensor,
+    uno_target_max_top_k: Optional[int],
+    watermark: bool,
+    simulated_acc_len: Optional[torch.Tensor],
+    simulated_acc_len_rng: Optional[torch.Generator],
+    sparse_bonus_argmax: bool,
+    local_keys: Optional[LocalKeysFn],
+):
+    """The accept half of ``eagle_sample``: sample the target tokens from the
+    adjusted logits and walk the draft tree. A gather it still needs is published
+    to ``logits_output``."""
+    from sglang.srt.layers.dp_attention import (
+        is_dp_attention_enabled,
+    )
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
+        generate_simulated_accept_index,
+        generate_simulated_accept_index_device,
+    )
+
+    device = batch.device
+    bs = len(batch.seq_lens)
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     greedy = _verify_uses_greedy(
@@ -881,7 +924,7 @@ def eagle_sample(
         simulated_acc_len=simulated_acc_len,
         simulate_acc_len=SIMULATE_ACC_LEN,
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-        watermark=watermark is not None,
+        watermark=watermark,
     )
     fused_verify = chain and (greedy or sparse or vocab_shard is not None)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
@@ -1040,6 +1083,13 @@ def eagle_sample(
             top_k_renorm_prob,
             top_p_renorm_prob,
         )
+        if sampling_info.need_min_p_sampling:
+            target_probs = min_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.min_ps, verify_input.draft_token_num, dim=0
+                ),
+            )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs

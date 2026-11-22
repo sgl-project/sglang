@@ -1,6 +1,7 @@
 """Speculative verify target probabilities: selecting the top-k on the raw logits
 and dividing only the selected values by the temperature must give the same
-distribution as dividing the whole vocabulary first and running ``torch.topk``.
+distribution as dividing the whole vocabulary first and running ``torch.topk``;
+min-p filters the result as the sampler does.
 
 When several logits tie at a row's top-k boundary, which of them keep the mass
 is chosen deterministically but may differ from ``torch.topk``; the kept count
@@ -8,13 +9,16 @@ and the probability values are the same."""
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import sglang.kernels.ops.sampling.topk as topk_ops
+from sglang.srt.layers.sampler import top_k_top_p_min_p_filter_sorted_probs_torch
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
     _dflash_top_p_renorm_prob,
@@ -58,6 +62,8 @@ def _case(device, logits, top_ks, *, need_top_p, seed, temperature=None):
         top_ps=0.5 + 0.5 * torch.rand((bs,), generator=g, device=device),
         need_top_k_sampling=True,
         need_top_p_sampling=need_top_p,
+        need_min_p_sampling=False,
+        min_ps=torch.zeros((bs,), device=device),
     )
     uniform = top_ks[0] if len(set(top_ks)) == 1 else None
     return dict(
@@ -217,6 +223,97 @@ def test_torch_fallback(device, monkeypatch):
     kwargs = _case(device, logits, top_ks, need_top_p=need_top_p, seed=12)
     got = build_speculative_verify_target_probs(**kwargs)
     torch.testing.assert_close(got, _reference(**kwargs), rtol=0, atol=0)
+
+
+def _sampler_min_p(probs, min_ps):
+    """The sampler's min-p over already truncated probabilities, renormalized."""
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    top_k_top_p_min_p_filter_sorted_probs_torch(
+        probs_sort,
+        top_ks=torch.full_like(min_ps, probs.shape[-1], dtype=torch.int64),
+        # Above 1: top-p cuts nothing, even where the cumulative sum rounds past 1.
+        top_ps=torch.full_like(min_ps, 2.0),
+        min_ps=min_ps,
+        need_min_p_sampling=True,
+    )
+    filtered = torch.zeros_like(probs).scatter_(1, probs_idx, probs_sort)
+    return filtered / filtered.sum(dim=-1, keepdim=True)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_min_p_filters_as_the_sampler_does(device):
+    """Min-p, which verify used to ignore, keeps what the sampler's min-p keeps of
+    the top-k / top-p distribution, renormalized."""
+    top_ks = [20, 7, 64]
+    rows = len(top_ks) * _DRAFT_TOKEN_NUM
+    logits = _random_logits(device, rows, 1000, seed=21)
+    kwargs = _case(device, logits, top_ks, need_top_p=device != "cpu", seed=22)
+    truncated = build_speculative_verify_target_probs(**kwargs).view(rows, -1)
+    info = kwargs["sampling_info"]
+    info.need_min_p_sampling = True
+    info.min_ps = torch.tensor([0.05, 0.0, 0.3], device=device)
+    got = build_speculative_verify_target_probs(**kwargs).view(rows, -1)
+    want = _sampler_min_p(
+        truncated, torch.repeat_interleave(info.min_ps, _DRAFT_TOKEN_NUM)
+    )
+    assert torch.equal(got > 0, want > 0)
+    torch.testing.assert_close(got, want)
+
+
+def test_eagle_dense_verify_applies_min_p():
+    """EAGLE's sampled tree verify, which used to ignore min-p, verifies against
+    the min-p filtered target distribution."""
+    bs, width, vocab = 2, 3, 16
+    probs = torch.softmax(_random_logits("cpu", bs * width, vocab, seed=31), dim=-1)
+    info = SimpleNamespace(
+        is_all_greedy=False,
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+        need_min_p_sampling=True,
+        min_ps=torch.tensor([0.2, 0.0]),
+        temperatures=torch.ones((bs, 1)),
+        sampling_seed=None,
+        step_penalties=None,
+        logit_bias=None,
+    )
+    verify_input = SimpleNamespace(
+        draft_token_num=width,
+        max_tree_depth=width,
+        tree_topk=1,
+        draft_token=torch.zeros(bs * width, dtype=torch.int64),
+        retrieve_index=torch.arange(bs * width).view(bs, width),
+        retrieve_next_token=torch.tensor([[1, 2, -1]] * bs),
+        retrieve_next_sibling=torch.full((bs, width), -1),
+        draft_probs=None,
+    )
+    batch = SimpleNamespace(
+        device="cpu",
+        seq_lens=torch.tensor([4, 4]),
+        sampling_info=info,
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+    )
+    logits_output = SimpleNamespace(
+        next_token_logits=probs.log(), next_token_logits_vocab_shard=None
+    )
+
+    class _Stop(Exception):
+        pass
+
+    seen = []
+
+    def sample(*, target_probs, **_):
+        seen.append(target_probs.view(bs * width, vocab))
+        raise _Stop
+
+    with (
+        patch.object(eagle_utils, "_is_cpu", False),
+        patch.object(eagle_utils, "tree_speculative_sampling_target_only", sample),
+        pytest.raises(_Stop),
+    ):
+        eagle_utils.eagle_sample(verify_input, batch, logits_output)
+    want = _sampler_min_p(probs, torch.repeat_interleave(info.min_ps, width))
+    assert torch.equal(seen[0] > 0, want > 0)
+    torch.testing.assert_close(seen[0], want)
 
 
 if __name__ == "__main__":

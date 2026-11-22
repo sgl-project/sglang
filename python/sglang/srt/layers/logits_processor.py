@@ -646,6 +646,7 @@ class LogitsProcessor(nn.Module):
         return (
             not (info.grammars and any(g is not None for g in info.grammars))
             and info.watermark is None
+            and not info.has_custom_logit_processor
             and sampling_allows_vocab_shards(
                 info,
                 return_logprob=forward_batch.return_logprob,
