@@ -18,8 +18,17 @@ class TestFlaChunkIndices(CustomTestCase):
     def test_empty_sequences_keep_their_ids(self):
         """A zero-length sequence owns no chunk but keeps its id.
         Later sequences' chunks must not take it over.
-        The row index of chunk i of sequence s must equal chunk_offsets[s] + i."""
-        cases = ([5, 0, 70], [0, 70], [64, 0, 0, 66], [70, 0], [1, 64, 65], [0, 0])
+        The row index of chunk i of sequence s must equal chunk_offsets[s] + i.
+        An empty batch (cu_seqlens == [0]) gives an empty (0, 2) tensor."""
+        cases = (
+            [5, 0, 70],
+            [0, 70],
+            [64, 0, 0, 66],
+            [70, 0],
+            [1, 64, 65],
+            [0, 0],
+            [],
+        )
         for dtype in (torch.int32, torch.int64):
             for seq_lens in cases:
                 with self.subTest(seq_lens=seq_lens, dtype=dtype):

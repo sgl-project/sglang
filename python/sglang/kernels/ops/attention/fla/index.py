@@ -18,6 +18,9 @@ def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
     chunk_counts = triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
+    if not chunk_counts:
+        # An empty batch has no chunks, and torch.cat would reject the empty list.
+        return cu_seqlens.new_empty((0, 2))
     indices = torch.cat([torch.arange(n) for n in chunk_counts])
     # Number chunks by sequence, so zero-length sequences keep their ids.
     seq_ids = torch.repeat_interleave(
