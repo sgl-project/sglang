@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     dispose_tensor,
     get_cuda_version,
@@ -364,6 +364,14 @@ def _sm100_intranode_normal_configs(num_ranks: int) -> Optional[Tuple[Config, Co
     num_sms = _SM100_INTRANODE_NORMAL_NUM_SMS
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     if props.major != 10 or props.multi_processor_count < 2 * num_sms:
+        return None
+    # Eight ranks need not be one node: a TP8 group can straddle a GB200 tray pair.
+    # Conservative -- a TP8 group inside one node of a multi-node job also declines.
+    if get_server_args().nnodes != 1:
+        return None
+    # TBO subtracts DeepEPConfig.num_sms from the prefill DeepGEMM budget; 20 -> 64
+    # would cut it on a configuration we have not measured.
+    if is_tbo_enabled():
         return None
     return Config(num_sms, 12, 80, 6, 128), Config(num_sms, 6, 80, 6, 128)
 
