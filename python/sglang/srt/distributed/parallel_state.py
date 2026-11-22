@@ -58,6 +58,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_disagg,
+    get_exec,
     get_flags,
     get_global_dwdp_manager,
     get_parallel,
@@ -104,9 +106,32 @@ _FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
 _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
 
 
+def npu_eplb_reuses_world_group() -> bool:
+    # Prefill/decode disaggregation can use the WORLD device communicator
+    # for KV transfers. The monolithic scheduler uses TP/EP for its data path.
+    return (
+        _is_npu
+        and get_exec().moe.eplb_async_rebalance
+        and get_disagg().disaggregation_mode == "null"
+    )
+
+
+def npu_eplb_hccl_options():
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {
+        "hccl_buffer_size": min(int(os.environ.get("HCCL_BUFFSIZE") or 64), 64)
+    }
+    return options
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
+
+    if group_name == "world" and npu_eplb_reuses_world_group():
+        return npu_eplb_hccl_options()
 
     # Only create HCCL options for default group or MoE-related groups
     if group_name is not None and "moe" not in group_name:

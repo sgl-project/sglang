@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -218,6 +217,8 @@ class NpuEplbRuntime:
         ranks_per_node,
         plan_group,
         p2p_group,
+        *,
+        owns_p2p_group: bool = True,
     ):
         self.metadata = metadata
         self.spec = spec
@@ -226,6 +227,7 @@ class NpuEplbRuntime:
         self.ranks_per_node = ranks_per_node
         self.plan_group = plan_group
         self.p2p_group = p2p_group
+        self._owns_p2p_group = owns_p2p_group
         self.log_metrics = get_bool_env_var(
             "SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS"
         )
@@ -403,12 +405,15 @@ class NpuEplbRuntime:
         self._planned_rows = None
 
     def close(self):
-        dist.destroy_process_group(self.p2p_group)
+        if self._owns_p2p_group:
+            dist.destroy_process_group(self.p2p_group)
 
 
 def create_npu_async_eplb(model_config, weights, metadata):
-    import torch_npu
-
+    from sglang.srt.distributed.parallel_state import (
+        npu_eplb_hccl_options,
+        npu_eplb_reuses_world_group,
+    )
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
     from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -433,12 +438,15 @@ def create_npu_async_eplb(model_config, weights, metadata):
     timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
-    # Migration uses its own HCCL group. Large inference buffers would reserve
-    # HBM a second time, before sizing the KV cache.
-    p2p_buffer_mib = min(int(os.environ.get("HCCL_BUFFSIZE") or 64), 64)
-    p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
-    p2p_group = dist.new_group(backend="hccl", timeout=timeout, pg_options=p2p_options)
+    p2p_options = npu_eplb_hccl_options()
+    p2p_buffer_mib = p2p_options.hccl_config["hccl_buffer_size"]
+    borrow_world_group = npu_eplb_reuses_world_group()
+    if borrow_world_group:
+        p2p_group = parallel.world_group.device_group
+    else:
+        p2p_group = dist.new_group(
+            backend="hccl", timeout=timeout, pg_options=p2p_options
+        )
     error = None
     signature = None
     try:
@@ -451,6 +459,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             world_size // parallel.nnodes,
             plan_group,
             p2p_group,
+            owns_p2p_group=not borrow_world_group,
         )
         batch_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
         if batch_size <= 0:
@@ -482,9 +491,10 @@ def create_npu_async_eplb(model_config, weights, metadata):
     prewarm_eplb_communication(p2p_group)
     logger.info(
         "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
-        "hccl_buffer_mib=%d",
+        "hccl_buffer_mib=%d reuse_world_group=%s",
         sum(t.nbytes for t in runtime.staging),
         sum(row.nbytes for row in runtime._routing_rows.values()),
         p2p_buffer_mib,
+        borrow_world_group,
     )
     return AsyncEplbCoordinator(EplbControl(control_group), runtime)
