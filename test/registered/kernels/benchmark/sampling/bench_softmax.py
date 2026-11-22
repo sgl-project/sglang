@@ -9,10 +9,7 @@ from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15,
-    stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-small",
-    disabled="requires SM100; no benchmark lane runs SM100",
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-b200"
 )
 
 

@@ -18,7 +18,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+)
 
 
 def _make_inputs(m: int, n: int, k: int):
@@ -126,7 +128,7 @@ def benchmark(model: str, m: int, n: int, k: int, provider: str):
     NATIVE_M1_CASES,
     [("Qwen3.8-27B/attn-qkv", 8192, 5120)],
 )
-@marker.benchmark("provider", ["kda", "native"], gate=["kda"])
+@marker.benchmark("provider", ["kda", "native"])
 def benchmark_m1_native(model: str, n: int, k: int, provider: str):
     """Compare M=1 with SGLang's existing SM120 GEMV before dispatching."""
     del model

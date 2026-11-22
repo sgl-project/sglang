@@ -44,7 +44,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner_config: [1-gpu-small, 1-gpu-large, 1-gpu-b200]
+        include:
+          - runner_config: 1-gpu-small
+            suites: base-b-kernel-benchmark-test-1-gpu-small
+          - runner_config: 1-gpu-large
+            suites: base-b-kernel-benchmark-test-1-gpu-large
+          # The nightly-only B200 benchmarks are too slow for every PR; record them here.
+          - runner_config: 1-gpu-b200
+            suites: base-b-kernel-benchmark-test-1-gpu-b200,nightly-test-4-gpu-b200
     runs-on: ${{ fromJson(needs.runners.outputs.runs_on_map)[matrix.runner_config] }}
     timeout-minutes: 180
     steps:
@@ -71,7 +78,7 @@ jobs:
             > "$RUNNER_TEMP/marker-benchmarks.txt"
           cd test/
           python3 run_suite.py --hw cuda \
-            --suite base-b-kernel-benchmark-test-${{ matrix.runner_config }} \
+            --suite ${{ matrix.suites }} \
             --only-file-list "$RUNNER_TEMP/marker-benchmarks.txt" --continue-on-error
 
       - name: Upload records

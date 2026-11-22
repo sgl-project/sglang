@@ -134,6 +134,8 @@ jobs:
 
       - name: Upload kernel benchmark records
         if: ${{ always() && matrix.kernel_bench }}
+        # Records only feed the report; an upload error must not fail the job.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: kernel-bench-${{ matrix.runner_config }}
