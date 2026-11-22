@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -406,6 +407,8 @@ class NpuEplbRuntime:
 
 
 def create_npu_async_eplb(model_config, weights, metadata):
+    import torch_npu
+
     from sglang.srt.eplb.eplb_algorithms import compute_algorithm
     from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -430,7 +433,12 @@ def create_npu_async_eplb(model_config, weights, metadata):
     timeout = timedelta(seconds=90)
     control_group = dist.new_group(backend="gloo", timeout=timeout)
     plan_group = dist.new_group(backend="gloo", timeout=timeout)
-    p2p_group = dist.new_group(backend="hccl", timeout=timeout)
+    # Migration uses its own HCCL group. Large inference buffers would reserve
+    # HBM a second time, before sizing the KV cache.
+    p2p_buffer_mib = min(int(os.environ.get("HCCL_BUFFSIZE") or 64), 64)
+    p2p_options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    p2p_options.hccl_config = {"hccl_buffer_size": p2p_buffer_mib}
+    p2p_group = dist.new_group(backend="hccl", timeout=timeout, pg_options=p2p_options)
     error = None
     signature = None
     try:
@@ -456,6 +464,7 @@ def create_npu_async_eplb(model_config, weights, metadata):
             runtime.layer_ids,
             tuple(tuple(t.shape) for t in runtime.staging),
             batch_size,
+            p2p_buffer_mib,
             spec,
             metadata.num_logical_experts,
             hashlib.sha256(initial_layout.numpy().tobytes()).digest(),
@@ -472,8 +481,10 @@ def create_npu_async_eplb(model_config, weights, metadata):
         )
     prewarm_eplb_communication(p2p_group)
     logger.info(
-        "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d",
+        "Async NPU EPLB ready: weight_staging_bytes=%d routing_staging_bytes=%d "
+        "hccl_buffer_mib=%d",
         sum(t.nbytes for t in runtime.staging),
         sum(row.nbytes for row in runtime._routing_rows.values()),
+        p2p_buffer_mib,
     )
     return AsyncEplbCoordinator(EplbControl(control_group), runtime)
