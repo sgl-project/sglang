@@ -180,7 +180,6 @@ _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotati
 _TOOL_ADAPTERS = {
     "beam": BeamToolAdapter,
     "minicpm5_moe": MiniCPMToolAdapter,
-    "minicpm5_latent_moe_swa_msa": MiniCPMToolAdapter,
 }
 
 

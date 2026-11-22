@@ -73,7 +73,6 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
     def test_adapter_selected_by_model_type(self):
         expected = {
             "minicpm5_moe": MiniCPMToolAdapter,
-            "minicpm5_latent_moe_swa_msa": MiniCPMToolAdapter,
             "beam": BeamToolAdapter,
             "llama": None,
             "minicpm3": None,
