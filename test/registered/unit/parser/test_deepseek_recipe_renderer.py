@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from sglang.srt.parser import deepseek_recipe_renderer as renderer
@@ -251,6 +252,125 @@ class TestDeepSeekRecipe(CustomTestCase):
                 )
                 self.assertEqual(full_ids[: len(prefix_ids) - 2], prefix_ids[:-2])
 
+    def test_v4_rejects_tools_declared_in_messages(self):
+        """V4's encoding has no place for message-declared tools and would drop them."""
+        tool = {"type": "function", "function": {"name": "f"}}
+        with self.assertRaisesRegex(ValueError, "tools declared in messages"):
+            renderer.DeepSeekRecipe("dsv4", self.tokenizer).encode(
+                {
+                    "messages": [
+                        {"role": "system", "content": "", "tools": [tool]},
+                        {"role": "user", "content": "x"},
+                    ],
+                    "thinking": False,
+                    "tool_choice": "auto",
+                }
+            )
+
+    def test_message_tools_render_none_fields_as_absent(self):
+        """A message-declared tool's None fields, its type among them, render as if
+        absent, as the request's tools do; a null inside its schema stays."""
+
+        def encode(role, tool):
+            return self.deepseek_recipe.encode(
+                {
+                    "messages": [
+                        {"role": role, "content": "s", "tools": [tool]},
+                        {"role": "user", "content": "x"},
+                    ],
+                    "thinking": False,
+                    "tool_choice": "auto",
+                }
+            )
+
+        schema = {"type": "object", "properties": {"x": {"default": None}}}
+        nulls = {"description": None, "strict": None, "parameters": None}
+        for role in ("system", "developer"):
+            for function in ({"name": "f"}, {"name": "f", "parameters": schema}):
+                with self.subTest(role=role, schema="parameters" in function):
+                    declared = encode(
+                        role, {"type": None, "function": nulls | function}
+                    )
+                    self.assertEqual(declared, encode(role, {"function": function}))
+                    self.assertEqual(
+                        '"default": null'
+                        in self.tokenizer.decode(declared, skip_special_tokens=False),
+                        "parameters" in function,
+                    )
+
+    def test_conversion_errors_locate_the_request_message(self):
+        """An error names the message's index in the request, whatever number of
+        earlier messages declare tools."""
+        tools = [{"function": {"name": "f"}}]
+        bad = [{"type": "image_url", "image_url": {"url": "ftp://example.com/a.png"}}]
+        hi = {"role": "user", "content": "hi"}
+        failing = {"role": "user", "content": bad}
+        for index, messages in (
+            (1, [{"role": "system", "content": "s", "tools": tools}, failing]),
+            (1, [hi, failing]),
+            (
+                3,
+                [
+                    {"role": "system", "content": "s", "tools": tools},
+                    hi,
+                    {
+                        "role": "developer",
+                        "content": "",
+                        "tools": [{"function": {"name": "g"}}],
+                    },
+                    failing,
+                ],
+            ),
+            (1, [hi, {"role": "system", "content": bad, "tools": tools}, hi]),
+        ):
+            with self.subTest(index=index, count=len(messages)):
+                with self.assertRaisesRegex(
+                    ValueError, rf"^\.messages\[{index}\]: Unsupported image_url"
+                ):
+                    self.deepseek_recipe.encode(
+                        {"messages": messages, "thinking": False, "tool_choice": "auto"}
+                    )
+
+    def test_unlocatable_conversion_error_keeps_its_text(self):
+        """An error naming an index the request does not hold stays a ValueError
+        with recipe's own text."""
+        from unittest import mock
+
+        recipe = renderer.load_deepseek_recipe()
+        tools = [{"function": {"name": "f"}}]
+        hi = {"role": "user", "content": "hi"}
+        declaring = {"role": "system", "content": "s", "tools": tools}
+        other = {
+            "role": "developer",
+            "content": "",
+            "tools": [{"function": {"name": "g"}}],
+        }
+        for messages, rewritten in (
+            ([], 0),
+            ([hi], 1),
+            ([declaring, hi], 4),
+            ([declaring, hi, other, hi], 8),
+        ):
+            for index in (rewritten, 999999):
+                text = f".messages[{index}]: boundary; keep .messages[0]"
+                error = recipe.ConversionError()
+                error.body = json.dumps({"error": {"message": text}})
+                request = mock.Mock()
+                request.convert.side_effect = error
+                with self.subTest(count=len(messages), index=index):
+                    with mock.patch.object(
+                        recipe, "ChatCompletionRequest", return_value=request
+                    ):
+                        with self.assertRaises(ValueError) as raised:
+                            self.deepseek_recipe.convert(
+                                {
+                                    "messages": messages,
+                                    "thinking": False,
+                                    "tool_choice": "auto",
+                                }
+                            )
+                    self.assertEqual(str(raised.exception), text)
+
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
             self.deepseek_recipe.encode(
@@ -260,6 +380,25 @@ class TestDeepSeekRecipe(CustomTestCase):
                     "reasoning_effort": "x",
                 }
             )
+
+    def test_fastokens_preserves_prompt_ids(self):
+        try:
+            from fastokens import Tokenizer, _ConfiguredTokenizerShim
+        except ImportError:
+            self.skipTest("fastokens is not installed")
+        if not hasattr(Tokenizer, "encode_segments"):
+            self.skipTest("fastokens has no segmented encoder")
+        candidate = renderer.DeepSeekRecipe(
+            "dsv41", _ConfiguredTokenizerShim(self.tokenizer)
+        )
+        self.assertIsNotNone(candidate._fast_prompt_tokenizer)
+        message = {"role": "user", "content": "中文 👩🏽‍💻 <think>x</think>"}
+        for thinking in (False, True):
+            body = {"messages": [message], "thinking": thinking}
+            with self.subTest(thinking=thinking):
+                self.assertEqual(
+                    candidate.encode(body), self.deepseek_recipe.encode(body)
+                )
 
 
 if __name__ == "__main__":

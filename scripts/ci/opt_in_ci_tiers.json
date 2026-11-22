@@ -29,16 +29,52 @@
       ".github/workflows/ci-model-inventory.yml"
     ]
   },
-  "mlu": {
-    "label": "run-ci-mlu",
+  "mlu-extra": {
+    "label": "run-ci-mlu-extra",
     "workflows": [
       ".github/workflows/pr-test-mlu.yml"
     ]
   },
-  "ppu": {
-    "label": "run-ci-ppu",
+  "ppu-extra": {
+    "label": "run-ci-ppu-extra",
     "workflows": [
       ".github/workflows/pr-test-ppu.yml"
+    ]
+  },
+  "xeon-extra": {
+    "label": "run-ci-xeon-extra",
+    "workflows": [
+      ".github/workflows/pr-test-xeon.yml"
+    ]
+  },
+  "npu-extra": {
+    "label": "run-ci-npu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-npu.yml"
+    ]
+  },
+  "xpu-extra": {
+    "label": "run-ci-xpu-extra",
+    "workflows": [
+      ".github/workflows/pr-test-xpu.yml"
+    ]
+  },
+  "musa-extra": {
+    "label": "run-ci-musa-extra",
+    "workflows": [
+      ".github/workflows/pr-test-musa.yml"
+    ]
+  },
+  "arm64-extra": {
+    "label": "run-ci-arm64-extra",
+    "workflows": [
+      ".github/workflows/pr-test-arm64.yml"
+    ]
+  },
+  "mlx-extra": {
+    "label": "run-ci-mlx-extra",
+    "workflows": [
+      ".github/workflows/pr-test-mlx.yml"
     ]
   }
 }

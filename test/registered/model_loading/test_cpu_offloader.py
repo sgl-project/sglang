@@ -1,4 +1,4 @@
-"""CPU offload must preserve device buffers and cached convolution views."""
+"""CPU offload must preserve device buffers, cached views, and eager indexers."""
 
 import os
 import unittest
@@ -14,14 +14,14 @@ from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelL
 from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: XPU CPU-offload loads host Gemma weights into device buffers
 # and must retain cached GDN/KDA views after checkpoint loading.
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 
 class CachedConvolution(nn.Module):
@@ -133,6 +133,29 @@ class TestCpuOffloader(CustomTestCase):
                 for projection in projections:
                     self.assertEqual(projection.weight.device.type, "cpu")
 
+    def test_indexer_runs_outside_offloaded_forward(self) -> None:
+        """Graph replay must run indexer projections after the layer restores CPU weights."""
+        with torch.no_grad():
+            attention = nn.Sequential()
+            attention.add_module(
+                "indexer",
+                nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 3)),
+            )
+            model = nn.Sequential(attention, nn.Linear(3, 2)).to(self.device)
+            inputs = torch.randn(2, 3, device=self.device)
+            expected = model(inputs)
+            expected_indexer = attention.indexer(inputs)
+
+            model = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(
+                model
+            )
+            torch.testing.assert_close(model(inputs), expected)
+            self.assertEqual(model[1].weight.device.type, "cpu")
+
+            # DSA eager breaks resolve the indexer from the forward context and
+            # invoke it after the offloaded layer's functional_call has returned.
+            torch.testing.assert_close(attention.indexer(inputs), expected_indexer)
+
     def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
         norm = GemmaRMSNorm(16).to(self.device)
         norm = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(norm)
@@ -225,7 +248,7 @@ class TestCpuOffloader(CustomTestCase):
     def test_loaders_rebuild_replaced_convolution_view(self) -> None:
         for rebind in (
             PreshardedModelLoader._rebind_parameter_aliases,
-            IpcModelLoader._rebuild_stale_views,
+            WeightCacheModelLoader._rebuild_stale_views,
         ):
             with self.subTest(loader=rebind.__qualname__), torch.no_grad():
                 model = CachedConvolution("conv1d", self.device)

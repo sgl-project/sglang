@@ -12,6 +12,7 @@ import sys
 import torch
 
 from ..executors.flux import FluxExecutor
+from ..executors.ltx_av import LTXAVExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
     MiniMaxH3Executor,
@@ -30,8 +31,6 @@ class _HeaderTensor:
     """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
 
     def __init__(self, shape):
-        import torch
-
         self.shape = torch.Size(shape)
 
     def numel(self):
@@ -128,6 +127,15 @@ def _looks_like_gguf(path: str) -> bool:
     return path.lower().endswith(".gguf") or (
         ":" in path and path.count("/") == 1 and not os.path.isabs(path)
     )
+
+
+# ensure_executor default: resend the adapters the executor last set.
+_LAST_LORA = object()
+
+
+def _applied(lora):
+    """The LoRA input as the worker sees it: None when it names no adapter."""
+    return lora if lora and lora.get("lora_nickname") else None
 
 
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
@@ -239,6 +247,7 @@ def _load_executor_classes():
         MiniMaxH3Executor,
         FastH3Executor,
         VDNH3Executor,
+        LTXAVExecutor,
         QwenImage21Executor,
     ]
     try:
@@ -322,12 +331,14 @@ class SGLDiffusionGenerator:
     """
 
     def __init__(self):
-        self.model_path = None
         self.generator = None
         self.executor = None
         # Executor that sent the last request; differs from self.executor
         # after a cached executor rebuilt the worker.
         self._active_executor = None
+        # Executor whose adapter state the worker has; self.executor stays the
+        # one behind the patcher load_model hands out.
+        self._worker_owner = None
         self.model_type = None
         self.last_options = None
         self._patcher = None
@@ -400,7 +411,7 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
                 scheduler_profiles,
             )
 
@@ -445,8 +456,6 @@ class SGLDiffusionGenerator:
         """Worker summary from ServerArgs and the worker's RequestMetrics."""
         if self.generator is None:
             return "SGLD worker: not started (run the workflow once to load a model)"
-        import torch
-
         import sglang
 
         args = self.generator.server_args
@@ -527,8 +536,15 @@ class SGLDiffusionGenerator:
             and self._is_live()
         )
 
-    def ensure_executor(self, executor) -> None:
-        """Rebuild the worker if this cached executor no longer owns it."""
+    def ensure_executor(self, executor, lora_input=_LAST_LORA) -> None:
+        """Rebuild the worker if this cached executor no longer owns it.
+
+        The worker ends up with ``lora_input``; by default (mid-run) the
+        adapters the executor last set. ``load_model`` may hand back a live
+        worker built for the same config instead of a new one; that worker
+        still has the adapters its owner set, so they are taken over and
+        reconciled rather than assumed empty. One executor owns a worker.
+        """
         self._active_executor = executor
         if self._owns_live(executor):
             return
@@ -538,14 +554,29 @@ class SGLDiffusionGenerator:
                 "SGLD worker is down and this executor has no reload spec"
             )
         logger.info(
-            "Rebuilding SGLD worker for %s (previous worker was replaced or died)",
+            "Rebinding SGLD worker for %s (previous worker was replaced or died)",
             reload.get("model_path"),
         )
         self.load_model(**reload)
+        lora = executor._lora_input if lora_input is _LAST_LORA else lora_input
+        # After load_model the worker's owner is a fresh executor (no adapters)
+        # when it rebuilt, or the previous owner when it reused a live worker
+        # with the same config, whose adapters are still applied.
+        owner = self._worker_owner
+        on_worker = None
+        if owner is not None and owner is not executor:
+            on_worker = owner._lora_input
+            # It goes through ensure_executor again before its next request.
+            owner.generator = None
+        self._worker_owner = executor
         executor.generator = self.generator
-        lora = executor._lora_input
-        if lora and lora.get("lora_nickname"):
-            executor.set_lora(**lora)
+        executor._lora_input = _applied(on_worker)
+        if _applied(lora) != _applied(on_worker):
+            if _applied(on_worker) is not None:
+                self.generator.unmerge_lora_weights()
+                executor._lora_input = None
+            if _applied(lora) is not None:
+                executor.set_lora(**lora)
         # The new worker's session cache starts empty, so conditioning the
         # old worker already had cannot be restored; resend it.
         executor.begin_sampler_run()
@@ -578,10 +609,10 @@ class SGLDiffusionGenerator:
                 logger.warning("DiffGenerator.shutdown failed", exc_info=True)
             self.kill_generator()
         self.last_options = None
-        self.model_path = None
         self.generator = None
         self.executor = None
         self._active_executor = None
+        self._worker_owner = None
         self.model_type = None
         self._patcher = None
 
@@ -589,7 +620,6 @@ class SGLDiffusionGenerator:
         """Get ComfyUI model from model path."""
         if model_options is None:
             model_options = {}
-        dtype = model_options.get("dtype", None)
         # Header-only read: H3 BF16 is ~66GB and we only need keys + shapes
         # for detect_unet_config. SGLD loads the real weights later.
         from comfy import model_detection, model_management
@@ -642,13 +672,10 @@ class SGLDiffusionGenerator:
                 for k in diffusers_keys:
                     if k in sd:
                         new_sd[diffusers_keys[k]] = sd.pop(k)
-        if dtype is None:
-            unet_dtype = model_management.unet_dtype(
-                model_params=parameters,
-                supported_dtypes=model_config.supported_inference_dtypes,
-            )
-        else:
-            unet_dtype = dtype
+        unet_dtype = model_management.unet_dtype(
+            model_params=parameters,
+            supported_dtypes=model_config.supported_inference_dtypes,
+        )
 
         manual_cast_dtype = model_management.unet_manual_cast(
             unet_dtype, load_device, model_config.supported_inference_dtypes
@@ -680,7 +707,7 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
-        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
             canonical_profiles,
             validate_options,
         )
@@ -746,7 +773,6 @@ class SGLDiffusionGenerator:
         # Checks above run first so a rejected config keeps the current worker.
         self.close_generator()
         self.last_options = gather_options
-        self.model_path = detect_path
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
         worker_model_path = runtime_model_path or detect_path
@@ -773,6 +799,7 @@ class SGLDiffusionGenerator:
         _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
+        self._worker_owner = self.executor
         comfyui_model.diffusion_model = self.executor
 
         from comfy import model_management

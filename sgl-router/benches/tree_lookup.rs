@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cache-aware tree-lookup microbench.
-//!
-//! Mirrors the shape of `sgl-model-gateway/benches/radix_tree_benchmark.rs`
-//! (specifically the `TokenTree` / `PositionalIndexer` paths — which serve
-//! the same role as sgl-router's `HashTree`). The bench measures:
+//! Cache-aware tree-lookup microbench over sgl-router's `HashTree`. The
+//! bench measures:
 //!
 //!   * `insert` — populate one worker's prefix.
 //!   * `match_prefix` — score an incoming request against the tree.
@@ -26,7 +23,7 @@
 //!   cargo bench --bench tree_lookup
 //!   cargo bench --bench tree_lookup -- --sample-size 30   # faster
 //!
-//! See `BENCHMARKS.md` for the SMG↔sgl-router comparison table.
+//! See `BENCHMARKS.md` for quick-run data points.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

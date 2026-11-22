@@ -5,12 +5,22 @@ translates field annotations into argparse arguments.
 """
 
 import argparse
+import contextlib
+import io
+import os
+import tempfile
 import unittest
 
+from sglang.srt.arg_groups.choices import REMOVED_CHOICES
 from sglang.srt.arg_groups.overrides import resolution_result
-from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_timeout,
+    read_local_media_file,
+)
 from sglang.srt.runtime_context import get_model, publish, reset_context
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import REMOVED_FLAGS, ServerArgs, reject_removed_kwargs
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -105,12 +115,31 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
+    def test_media_url_timeout_and_local_files_args(self):
+        try:
+            sa = self._parse([])
+            self.assertIsNone(sa.media_url_timeout)
+            self.assertTrue(sa.allow_local_media_files)
+            sa = self._parse(
+                ["--media-url-timeout", "2.5", "--no-allow-local-media-files"]
+            )
+            self.assertEqual(sa.media_url_timeout, 2.5)
+            self.assertFalse(sa.allow_local_media_files)
+            # Parsing applies the policy to this process.
+            self.assertEqual(media_url_timeout(3), 2.5)
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                read_local_media_file(__file__)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
     def test_media_url_security_args_reject_invalid_values(self):
         try:
             with self.assertRaises(ValueError):
                 self._parse(["--allowed-media-domains", "https://media.example.com"])
             with self.assertRaises(ValueError):
                 self._parse(["--media-url-max-file-size-mb", "-1"])
+            with self.assertRaises(ValueError):
+                self._parse(["--media-url-timeout", "0"])
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
@@ -145,45 +174,72 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 ]
             )
 
-    def test_the_deprecated_flag_still_reaches_its_replacement(self):
-        """`--disable-cuda-graph` is the one deprecated alias left standing.
+    def test_removed_flags_name_their_replacement(self):
+        """A flag removed in SGLang 1.0 stops the launch with a message naming
+        what to pass instead, not argparse's generic "unrecognized arguments";
+        so does its key in a YAML `--config` file and its keyword to `Engine`."""
+        # A bare flag, and one that took a value.
+        for argv in (["--show-time-cost"], ["--monokernel-backend", "amd"]):
+            flag = argv[0]
+            replacement = REMOVED_FLAGS[flag]
+            with self.subTest(flag=flag):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        self.parser.parse_args(["--model", "dummy", *argv])
+                self.assertIn(
+                    f"{flag} was removed in SGLang 1.0; {replacement}.",
+                    " ".join(stderr.getvalue().split()),
+                )
 
-        It is worth a test because it is not a rename. The flag writes
-        `disable_cuda_graph`, which is `no_cli=True` -- so this spelling is its
-        only way in -- and the cuda-graph hook is what turns that into the two
-        phase backends the replacement flag sets directly. Asserting the
-        backends, against the baseline of not passing it, covers that second
-        half; asserting the dest alone would not.
-        """
-        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
-        from sglang.srt.model_executor.cuda_graph_config import (
-            Backend,
-            default_prefill_backend,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.yaml")
+            with open(config, "w") as handle:
+                handle.write("model-path: dummy\nshow-time-cost: true\n")
+            with self.assertRaises(ValueError) as raised:
+                ConfigArgumentMerger(self.parser).merge_config_with_args(
+                    ["--config", config]
+                )
+            self.assertEqual(
+                str(raised.exception),
+                "--show-time-cost was removed in SGLang 1.0; "
+                f"{REMOVED_FLAGS['--show-time-cost']}.",
+            )
 
-        def backends(argv):
-            sa = self._parse(argv)
-            parse_cuda_graph_config(sa)
-            config = resolution_result(sa, "cuda_graph_config")
-            return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
+        with self.assertRaisesRegex(
+            TypeError,
+            "enable_dp_attention was removed in SGLang 1.0; use --attn-dp-size",
+        ):
+            reject_removed_kwargs(ServerArgs, {"enable_dp_attention": True})
+        # `disable_cuda_graph` is still a field; only its flag was removed.
+        reject_removed_kwargs(ServerArgs, {"disable_cuda_graph": True})
 
-        # Not a literal: the prefill default is BREAKABLE on CUDA and
-        # disabled elsewhere, and this file runs on the CPU runner.
-        self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
-        self.assertEqual(
-            backends(["--disable-cuda-graph"]),
-            (True, Backend.DISABLED, Backend.DISABLED),
-        )
+    def test_removed_choices_name_their_replacement(self):
+        """A removed choice value stops the launch with a message naming the
+        value to pass instead, not argparse's generic invalid-choice list.
+        Each field wires its own parser type, so each is checked once."""
+        for field, removed in REMOVED_CHOICES.items():
+            flag = "--" + field.replace("_", "-")
+            value, replacement = next(iter(removed.items()))
+            with self.subTest(flag=flag, value=value):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        self.parser.parse_args(["--model", "dummy", flag, value])
+                self.assertIn(
+                    f"{value} was removed in SGLang 1.0; use {replacement}",
+                    " ".join(stderr.getvalue().split()),
+                )
 
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 
-        Only `DeprecatedStoreTrueAction` has registrations in `ServerArgs`
-        today (`--disable-cuda-graph`, covered above, and
-        `--enable-dp-attention`). The other three are kept for the next flag
-        that needs them, which makes this the only thing
-        standing between them and silent rot -- and it doubles as the worked
-        example of which shape to reach for.
+        `ServerArgs` registers `DeprecatedAction` with `error_message=` (the
+        removed flags, covered above) and `DeprecatedAliasStoreAction`
+        (`--mamba-max-states-per-path`). The other shapes are kept for the
+        next flag that needs them, which makes this the only thing standing
+        between them and silent rot -- and it doubles as the worked example of
+        which shape to reach for.
         """
         from sglang.srt.arg_groups.argparse_actions import (
             DeprecatedAction,
