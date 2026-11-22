@@ -89,8 +89,8 @@ class UocrGreedyGraph:
             or forward_batch.return_logprob
         ):
             return None
-        # The argmax ran inside the graph, before _preprocess_logits and watermark
-        # forcing, so any transform of the logits invalidates it.
+        # The argmax ran inside the graph, before the sampling pipeline's
+        # adjustments, so any transform of the logits invalidates it.
         if (
             sampling_info.logit_bias is not None
             or sampling_info.grammar_mask is not None
