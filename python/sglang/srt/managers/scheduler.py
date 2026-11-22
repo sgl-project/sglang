@@ -5941,9 +5941,8 @@ class Scheduler(
         self._copy_result_to_cpu(batch_result, cur_batch)
 
         # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
+        # The delay_sample_func closure captures forward_batch and logits_output
+        # (which holds next_token_logits). Without clearing these, they stay alive via
         # batch_result in result_queue and batch_record_buf until the next
         # iteration, causing a steady VRAM leak with structured output.
         batch_result.delay_sample_func = None

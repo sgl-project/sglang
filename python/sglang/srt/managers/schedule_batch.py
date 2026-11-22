@@ -2006,7 +2006,7 @@ def branch_checkpoint(
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
-    # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
+    # === Core: request list (ForwardBatch derives lora_ids / rids / positions from it) ===
     reqs: List[Req]
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
