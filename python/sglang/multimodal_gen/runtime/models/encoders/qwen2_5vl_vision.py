@@ -21,11 +21,34 @@ from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VisionPatchMerger as Qwen2_5VLVisionPatchMerger,
 )
 from sglang.srt.models.qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding as Qwen2_5VLVisionRotaryEmbedding,
-)
-from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VLMLP,
 )
+
+
+class Qwen2_5VLVisionRotaryEmbedding(nn.Module):
+    recompute_on_device_change = False
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._inv_freq_device = inv_freq.device
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        if self.recompute_on_device_change and (
+            self.inv_freq.device != self._inv_freq_device
+            or self.inv_freq.dtype != torch.float32
+        ):
+            # match resident initialization: CPU and GPU pow round differently,
+            # and a reload with a component precision casts this buffer too
+            indices = torch.arange(
+                0, self.dim, 2, dtype=torch.float32, device=self.inv_freq.device
+            )
+            self.inv_freq = 1.0 / (self.theta ** (indices / self.dim))
+            self._inv_freq_device = self.inv_freq.device
+        return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
 
 
 class Qwen2_5VLVisionBlock(nn.Module):
