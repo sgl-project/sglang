@@ -2101,6 +2101,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            self._record_filters_sampling(tokenized_obj)
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
                 self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
@@ -2108,7 +2109,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
@@ -2197,8 +2197,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ) -> None:
-        """Keep whether the request filters sampling for its response. Every state
-        that receives output was dispatched, a parallel-sampling copy included."""
+        """Keep whether the request filters sampling for its response. Call it
+        before the abort check: a request aborted before dispatch still answers."""
         state = self.rid_to_state.get(tokenized_obj.rid)
         if state is not None:
             state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()
@@ -2229,6 +2229,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            for tokenized_obj in tokenized_objs:
+                self._record_filters_sampling(tokenized_obj)
             tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
             if not tokenized_objs:
                 return
@@ -2237,8 +2239,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
-            for tokenized_obj in tokenized_objs:
-                self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 for tokenized_obj in tokenized_objs:
                     hook.on_request_dispatched(
