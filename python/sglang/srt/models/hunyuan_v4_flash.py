@@ -33,13 +33,10 @@ from sglang.kernels.ops.layernorm.hy4_ihc import (
 )
 from sglang.srt.configs.hy_v4_flash import (
     SLIDING_ATTENTION,
+    HYV4FlashConfig,
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -50,10 +47,20 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
+)
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    prepare_mm_inputs,
+)
+from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
+    MultimodalDataItem,
+    MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -69,6 +76,8 @@ from sglang.srt.models.hunyuan_v4 import (
     HYV4HCHeadLayer,
     HYV4HCLayer,
 )
+from sglang.srt.models.hunyuan_v4_vl import HYV4VisionTransformer
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
 
@@ -82,9 +91,66 @@ _DIRECT_WEIGHT_UPDATE_ERROR = (
 
 
 def _maybe_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    if get_tensor_model_parallel_world_size() > 1:
+    if get_parallel().tp_size > 1:
         return tensor_model_parallel_all_reduce(x)
     return x
+
+
+class _FlashMRotaryEmbedding(nn.Module):
+    def __init__(self, rope, mrope):
+        super().__init__()
+        self.rope = rope
+        self.mrope = mrope
+
+    @property
+    def cos_sin_cache(self):
+        return self.rope.cos_sin_cache
+
+    @property
+    def is_neox_style(self):
+        return self.rope.is_neox_style
+
+    def forward(self, positions, query, key):
+        if positions.ndim == 1:
+            return self.rope(positions, query, key)
+        query_out, key_out = self.mrope(positions, query.flatten(1), key.flatten(1))
+        return query_out.view_as(query), key_out.view_as(key)
+
+
+def _build_mrope(rope_dim, max_position, theta, section, interleaved, neox_style):
+    return get_rope(
+        rope_dim,
+        rotary_dim=rope_dim,
+        max_position=max_position,
+        base=theta,
+        is_neox_style=neox_style,
+        rope_scaling={
+            "rope_type": "default",
+            "mrope_section": list(section),
+            "mrope_interleaved": interleaved,
+        },
+    )
+
+
+class _MRopePositionStore:
+    def __init__(self, section):
+        self.section = tuple(section)
+        self.buffer: Optional[torch.Tensor] = None
+
+    def write(self, positions: torch.Tensor, out_cache_loc: torch.Tensor):
+        if self.buffer is None:
+            pool = get_token_to_kv_pool()
+            slots = pool.size + 2 * pool.page_size + 1
+            self.buffer = torch.zeros(
+                (slots, 3), dtype=torch.int32, device=positions.device
+            )
+        rows = min(out_cache_loc.shape[0], positions.shape[-1])
+        if positions.ndim == 2:
+            xyz = positions[:, :rows].t()
+        else:
+            xyz = positions[:rows, None].expand(-1, 3)
+        slots = layout_clamp(out_cache_loc[:rows].to(torch.int64), self.buffer.shape[0])
+        self.buffer[slots] = xyz.to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +266,12 @@ class FlashIndexPool(nn.Module):
         config: HYV4FlashTextConfig,
         layer_id: int,
         prefix: str,
+        rope_store: Optional[_MRopePositionStore] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.rope_store = rope_store
+        self.mrope_section = rope_store.section if rope_store is not None else None
         self.ratio = config.compressed_indexer_compress_ratio
         if self.ratio != 4:
             raise ValueError("The Hy4-Flash IndexPool kernels assume 4-token groups")
@@ -324,6 +393,7 @@ class FlashIndexPool(nn.Module):
             self.inv_freq,
             buf,
             page_size,
+            mrope_section=self.mrope_section,
         )
 
     def _decode_update_cache(self, raw_key_proj, forward_batch, layout: "_RowLayout"):
@@ -347,6 +417,8 @@ class FlashIndexPool(nn.Module):
             self.inv_freq,
             buf,
             page_size,
+            rope_xyz=self.rope_store.buffer if self.rope_store is not None else None,
+            mrope_section=self.mrope_section,
         )
 
     def _update_cache(self, keys, forward_batch, layout: "_RowLayout"):
@@ -378,7 +450,10 @@ class FlashIndexPool(nn.Module):
         group = first_group[batch] + torch.arange(total, device=device) - prefix[batch]
         members = group[:, None] * ratio + torch.arange(ratio, device=device)
         member_slots = layout.slots(members, batch)
-        self._pool_groups(member_slots, members[:, 0], member_slots[:, 0])
+        first_positions = members[:, 0]
+        if self.rope_store is not None:
+            first_positions = self.rope_store.buffer[member_slots[:, 0]]
+        self._pool_groups(member_slots, first_positions, member_slots[:, 0])
 
     def _select(self, layout: "_RowLayout", q_fp8, weights, decode: bool):
         """Top groups strictly before each query's group, expanded to tokens, plus
@@ -436,6 +511,14 @@ class FlashIndexPool(nn.Module):
             self.index_topk,
         )
 
+    def _query_rope_positions(self, positions, layout: "_RowLayout"):
+        if self.rope_store is None:
+            return layout.positions
+        rows = layout.num_rows
+        if positions.ndim == 2:
+            return positions[:, :rows].t()
+        return positions[:rows]
+
     def forward(
         self, x, q_lora, positions, forward_batch, layer_id, return_indices=True
     ):
@@ -452,10 +535,11 @@ class FlashIndexPool(nn.Module):
             self._update_cache(keys, forward_batch, layout)
         q_fp8, weights = indexpool_kernels.indexpool_query(
             self.query_projection(q_lora)[0],
-            layout.positions,
+            self._query_rope_positions(positions, layout),
             head_weights,
             self.inv_freq,
             self.num_heads,
+            mrope_section=self.mrope_section,
         )
         return self._select(
             layout, q_fp8, weights, decode=forward_batch.forward_mode.is_decode()
@@ -535,6 +619,7 @@ class FlashEngramHasher(EngramHasher):
         self.pad_id = 0
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        self.visual_token_ids: tuple[int, ...] = ()
         self._cpu_hash_params = None
         self._loaded = False
 
@@ -568,10 +653,21 @@ class FlashEngramHasher(EngramHasher):
             self.init_history(get_req_to_token_pool().size + 1, device)
         return self.history
 
+    def _restore_visual_ids(self, tokens, mm_pad_ids):
+        pads = tokens >= MM_PAD_SHIFT_VALUE
+        restored = torch.full_like(tokens, self.visual_token_ids[0])
+        if mm_pad_ids is not None:
+            pad_values, token_ids = mm_pad_ids
+            match = tokens[..., None] == pad_values
+            first = match.int().argmax(-1)
+            restored = torch.where(match.any(-1), token_ids[first], restored)
+        return torch.where(pads, restored, tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        mm_pad_ids: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         n = self.max_ngram_size
         device = input_ids.device
@@ -608,6 +704,8 @@ class FlashEngramHasher(EngramHasher):
             positions = forward_batch.positions[:num_tokens].to(torch.int64)
             commit_rows = req
             commit_last = (starts + lens - 1).clamp_min(0)
+        if self.visual_token_ids and not mode.is_decode_or_idle():
+            tokens = self._restore_visual_ids(tokens, mm_pad_ids)
         shifts = torch.arange(n, device=device)
         blocked = positions[:, None] < shifts
         compressed = torch.where(blocked, self.pad_id, self.token_map[tokens])
@@ -618,6 +716,9 @@ class FlashEngramHasher(EngramHasher):
             hashes.append(rolling[..., None] % self.primes[None, :, i - 1])
         hash_ids = torch.cat(hashes, -1) + self.offsets[None]
         no_hash = input_ids == self.pad_token_id
+        if self.visual_token_ids:
+            for token_id in self.visual_token_ids:
+                no_hash |= input_ids == token_id
         hash_ids = hash_ids.masked_fill(no_hash[:, None, None], -1)
         if num_tokens:
             last = tokens[commit_last]
@@ -634,10 +735,7 @@ class FlashEngramHasher(EngramHasher):
 class FlashEngramEmbedding(nn.Module):
     def __init__(self, sizes, dim: int, fp8: bool):
         super().__init__()
-        tp, rank = (
-            get_tensor_model_parallel_world_size(),
-            get_tensor_model_parallel_rank(),
-        )
+        tp, rank = get_parallel().tp_size, get_parallel().tp_rank
         self.head_start, self.head_end = _engram_head_range(sizes, tp, rank)
         self.vocab_start = sum(sizes[: self.head_start])
         self.vocab_end = sum(sizes[: self.head_end])
@@ -693,7 +791,7 @@ class FlashEngram(nn.Module):
         self.total_width = len(sizes) * self.head_dim
         self.start = self.multi_head_embedding.head_start * self.head_dim
         self.stop = self.multi_head_embedding.head_end * self.head_dim
-        self.rank = get_tensor_model_parallel_rank()
+        self.rank = get_parallel().tp_rank
         self.lookup_gamma = nn.Parameter(
             torch.ones(local, self.head_dim, dtype=torch.bfloat16)
         )
@@ -857,6 +955,7 @@ class HYV4FlashAttention(HYV4Attention):
         quant_config,
         prefix,
         alt_stream,
+        rope_store: Optional[_MRopePositionStore] = None,
     ):
         self.is_window_layer = config.layer_types[layer_id] == SLIDING_ATTENTION
         layer_config = copy(config)
@@ -869,6 +968,18 @@ class HYV4FlashAttention(HYV4Attention):
             layer_config.qk_rope_head_dim = config.swa_qk_rope_head_dim
             layer_config.v_head_dim = config.swa_v_head_dim
         super().__init__(layer_config, layer_id, quant_config, prefix, alt_stream)
+        if rope_store is not None:
+            self.rotary_emb = _FlashMRotaryEmbedding(
+                self.rotary_emb,
+                _build_mrope(
+                    rope_dim=layer_config.qk_rope_head_dim,
+                    max_position=config.max_position_embeddings,
+                    theta=layer_config.rope_parameters["rope_theta"],
+                    section=rope_store.section,
+                    interleaved=config.mrope_interleaved,
+                    neox_style=self.rotary_emb.is_neox_style,
+                ),
+            )
         # The sandwich norm needs the full sum before the post-projection norm.
         self.o_proj.reduce_results = True
         if self.is_window_layer:
@@ -877,7 +988,9 @@ class HYV4FlashAttention(HYV4Attention):
             width = min(config.index_topk, triton.cdiv(config.sliding_window, 64) * 64)
             self.indexer = FlashWindowIndexer(config.sliding_window, width)
         else:
-            self.indexer = FlashIndexPool(config, layer_id, f"{prefix}.indexer")
+            self.indexer = FlashIndexPool(
+                config, layer_id, f"{prefix}.indexer", rope_store=rope_store
+            )
         self.post_proj_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.sandwich_norm
@@ -1038,7 +1151,9 @@ class HYV4FlashMoE(nn.Module):
 
 
 class HYV4FlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id, quant_config, prefix, alt_stream):
+    def __init__(
+        self, config, layer_id, quant_config, prefix, alt_stream, rope_store=None
+    ):
         super().__init__()
         self.layer_id = layer_id
         self.self_attn = HYV4FlashAttention(
@@ -1047,6 +1162,7 @@ class HYV4FlashDecoderLayer(nn.Module):
             quant_config,
             f"{prefix}.self_attn",
             alt_stream,
+            rope_store=rope_store,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -1144,6 +1260,7 @@ class HYV4FlashModel(nn.Module):
         config: HYV4FlashTextConfig,
         quant_config=None,
         prefix="",
+        visual_token_ids: Optional[tuple[int, int]] = None,
     ):
         super().__init__()
         if get_parallel().pp_group.world_size != 1:
@@ -1158,6 +1275,11 @@ class HYV4FlashModel(nn.Module):
             **get_embedding_tp_kwargs(),
         )
         self.alt_stream = None
+        self.rope_store = (
+            _MRopePositionStore(config.mrope_section)
+            if visual_token_ids is not None
+            else None
+        )
         self.layers = nn.ModuleList(
             HYV4FlashDecoderLayer(
                 config,
@@ -1165,6 +1287,7 @@ class HYV4FlashModel(nn.Module):
                 quant_config,
                 f"{prefix}.layers.{i}",
                 self.alt_stream,
+                rope_store=self.rope_store,
             )
             for i in range(config.num_hidden_layers)
         )
@@ -1172,6 +1295,8 @@ class HYV4FlashModel(nn.Module):
         self.engram_index = {}
         if config.engram_layer_ids:
             self.engram_hasher = FlashEngramHasher(config)
+            if visual_token_ids is not None:
+                self.engram_hasher.visual_token_ids = visual_token_ids
             for index, layer_number in enumerate(config.engram_layer_ids):
                 layer = self.layers[layer_number - 1]
                 layer.engram_layer = FlashEngram(
@@ -1183,13 +1308,17 @@ class HYV4FlashModel(nn.Module):
         self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self, input_ids, positions, forward_batch, input_embeds=None, mm_pad_ids=None
+    ):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        if self.rope_store is not None and not forward_batch.forward_mode.is_idle():
+            self.rope_store.write(positions, forward_batch.out_cache_loc)
         hashes = None
         if self.engram_hasher is not None:
-            hashes = self.engram_hasher(input_ids, forward_batch)
+            hashes = self.engram_hasher(input_ids, forward_batch, mm_pad_ids)
         forward_batch.hy4f_layouts = {}
         zero_allocator = BumpAllocator(
             buffer_size=2 * len(self.layers),
@@ -1234,7 +1363,26 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
-        self.model = HYV4FlashModel(text_config, quant_config, "model")
+        self.visual = None
+        self.visual_token_ids = None
+        if (
+            isinstance(config, HYV4FlashConfig)
+            and config.vision_config is not None
+            and not config.language_model_only
+        ):
+            if text_config.mrope_section is None:
+                raise ValueError("Hy4-Flash vision serving requires mrope_section")
+            self.visual = HYV4VisionTransformer(
+                config.vision_config, quant_config=None, prefix="visual"
+            )
+            self.visual_token_ids = (config.image_token_id, config.video_token_id)
+        self.is_mrope_enabled = self.visual is not None
+        self.model = HYV4FlashModel(
+            text_config,
+            quant_config,
+            "model",
+            visual_token_ids=self.visual_token_ids,
+        )
         self.lm_head = ParallelLMHead(
             text_config.vocab_size,
             text_config.hidden_size,
@@ -1246,23 +1394,85 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        mm_pad_ids = None
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
+            if forward_batch.forward_mode.is_decode():
+                positions = positions[0]
+        if self.is_mrope_enabled and input_embeds is None:
+            mm_pad_ids = self._mm_pad_ids(forward_batch, input_ids.device)
+            input_embeds = prepare_mm_inputs(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self,
+                kwargs={},
+                multimodal_model=self,
+            )
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, mm_pad_ids=mm_pad_ids
+        )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def _mm_pad_ids(self, forward_batch, device):
+        if forward_batch.forward_mode.is_decode() or not (
+            forward_batch.contains_mm_inputs()
+        ):
+            return None
+        image_id, video_id = self.visual_token_ids
+        token_of_pad = {}
+        for mm_input in forward_batch.mm_inputs:
+            if mm_input is None:
+                continue
+            for item in mm_input.mm_items:
+                token_id = video_id if item.modality == Modality.VIDEO else image_id
+                for pad in item.padding_values():
+                    token_of_pad.setdefault(pad, token_id)
+        return (
+            torch.tensor(list(token_of_pad), dtype=torch.int64, device=device),
+            torch.tensor(list(token_of_pad.values()), dtype=torch.int64, device=device),
+        )
+
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def pad_input_ids(self, input_ids, mm_inputs: MultimodalInputs):
+        if mm_inputs and mm_inputs.mm_items and self.visual is None:
+            raise RuntimeError(
+                "Hy4-Flash was loaded language_model_only; multimodal inputs are "
+                "not supported."
+            )
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        return self._get_visual_feature(items, "image_grid_thw")
+
+    def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        return self._get_visual_feature(items, "video_grid_thw")
+
+    def _get_visual_feature(self, items, grid_key: str) -> torch.Tensor:
+        pixel_values = torch.cat([item.feature for item in items], dim=0)
+        grid_thw = torch.cat([getattr(item, grid_key) for item in items], dim=0)
+        return torch.cat(self.visual(pixel_values, grid_thw.tolist()), dim=0)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         model = self.model
+        vision_weights = []
 
         def mapped_weights():
             for name, loaded_weight in weights:
-                if name.startswith(("vit.", "model.dfly_layers.", "model.mtp_layers.")):
+                if name.startswith("vit."):
+                    if self.visual is not None:
+                        vision_weights.append(
+                            (name.removeprefix("vit."), loaded_weight)
+                        )
+                    continue
+                if name.startswith(("model.dfly_layers.", "model.mtp_layers.")):
                     continue
                 if ".engram_layer." in name:
                     self._load_engram(name, loaded_weight)
@@ -1288,6 +1498,8 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         for module in model.modules():
             if isinstance(module, (FlashIndexPool, FlashEngram)):
                 module.refresh_derived_weights()
+        if self.visual is not None:
+            self.visual.load_weights(vision_weights)
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
 

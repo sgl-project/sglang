@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.sampling.penalties import uses_penalty
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -29,13 +31,7 @@ def validate_uno_request(req: Req) -> Optional[str]:
     if req.return_hidden_states_mode.need_capture():
         return "UNO speculative decoding does not support return_hidden_states."
 
-    has_penalties = (
-        sampling_params.frequency_penalty != 0.0
-        or sampling_params.presence_penalty != 0.0
-        or sampling_params.repetition_penalty != 1.0
-        or sampling_params.min_new_tokens > 0
-    )
-    if has_penalties:
+    if uses_penalty(sampling_params):
         return "UNO speculative decoding does not support sampling penalties."
 
     if sampling_params.logit_bias is not None:

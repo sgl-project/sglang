@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import itertools
 import time
 import unittest
 from array import array
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import numpy as np
 from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +43,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
+    _add_sampling_mask_to_meta_info,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
     CudaIpcTensorTransportProxy,
@@ -51,6 +54,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
@@ -196,6 +200,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.stream = False
     obj.return_logprob = False
     obj.return_routed_experts = False
+    obj.return_sampling_mask = False
     obj.lora_path = None
     obj.log_metrics = False
     return ReqState(
@@ -491,6 +496,42 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 class TestAbortOutputPayload(CustomTestCase):
     """An abort chunk is often the only thing a client sees;
     it must carry the same optional fields as a normal finish chunk."""
+
+    def test_abort_returns_the_sampling_masks_of_the_tokens_so_far(self):
+        """A retracted request aborted from the waiting queue still has output tokens."""
+        chunk = SamplingMaskChunk(
+            lengths=np.asarray([3, 1], dtype=np.int32),
+            token_ids=np.asarray([5, 7, 9, 2], dtype=np.int32),
+            logprobs=np.asarray([-0.5, -1.0], dtype=np.float32),
+        )
+        for flat, routed_experts in itertools.product((False, True), repeat=2):
+            with self.subTest(flat=flat, routed_experts=routed_experts):
+                tm = _make_tokenizer_manager(self)
+                obj = GenerateReqInput(
+                    text="hi",
+                    return_sampling_mask=True,
+                    return_flat_raw_sampling_mask=flat,
+                    return_routed_experts=routed_experts,
+                )
+                obj.normalize_batch_and_arguments()
+                state = ReqState(
+                    out_list=[],
+                    finished=False,
+                    event=asyncio.Event(),
+                    obj=obj,
+                    time_stats=APIServerReqTimeStats(),
+                )
+                state.output_ids = [5, 2]
+                _add_sampling_mask_to_meta_info({}, state, chunk, finished=False)
+                tm.rid_to_state[obj.rid] = state
+
+                tm._handle_abort_req(_make_abort_req(obj.rid))
+
+                meta_info = state.out_list[-1]["meta_info"]
+                self.assertEqual(
+                    meta_info["output_token_sampling_mask_length"],
+                    len(state.out_list[-1]["output_ids"]),
+                )
 
     def test_abort_includes_prompt_token_ids_only_when_requested(self):
         """The abort chunk carries prompt_token_ids captured at tokenization,

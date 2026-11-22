@@ -1365,6 +1365,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
+        shared_alt_output = None
 
         def issue_shared():
             nonlocal shared_input, shared_output, shared_event
@@ -1386,7 +1387,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1441,18 +1441,29 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 pre_handle.remove()
 
         def wait_and_finalize_shared_experts():
-            nonlocal shared_output
+            nonlocal shared_output, shared_alt_output
             if shared_event is None:
                 return
             # Join just before consuming the shared result. The legacy path
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            shared_output.record_stream(current_stream)
+            if fine_grained_overlap:
+                shared_output.record_stream(current_stream)
+            else:
+                shared_alt_output = shared_output
             if self._shared_experts_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
                     shared_output, hidden_states
                 )
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
+
+        def release_shared_output():
+            nonlocal shared_alt_output
+            if shared_alt_output is not None:
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                shared_alt_output = None
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
@@ -1484,6 +1495,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             wait_and_finalize_shared_experts()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
+            release_shared_output()
             return expert_output
 
         # Latent MoE: compress after routing, before experts
@@ -1522,7 +1534,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 and not self._shared_experts_tp_comm
             ):
                 shared_output = self._reduce_shared(shared_output)
+                if shared_output is not shared_alt_output:
+                    release_shared_output()
             out = _add3(out, shared_output, prefix_sum)
+            release_shared_output()
             return out
         out = out if prefix_sum is None else out + prefix_sum
         return out

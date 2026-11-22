@@ -18,7 +18,6 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
-from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
@@ -261,11 +260,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if batch.return_hidden_states:
             raise NotImplementedError("UNO does not support returned hidden states.")
 
-        penalizer = sampling_info.penalizer_orchestrator
-        penalties_active = (
-            penalizer is not None and penalizer.is_required
-        ) or has_acc_penalties(sampling_info)
-        if penalties_active:
+        if sampling_info.step_penalties is not None:
             raise NotImplementedError("UNO does not support sampling penalties.")
 
         if sampling_info.logit_bias is not None:
