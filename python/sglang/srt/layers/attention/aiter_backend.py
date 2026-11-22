@@ -276,8 +276,8 @@ def _asm_cprr_shape_verdict(
         )
     supported = support.supported
     if supported is None:
-        # aiter cannot confirm a kernel (a failed asm query, or a backend it has no table
-        # for); the copied table is gfx950 data, so only gfx950 consults it.
+        # aiter cannot confirm a kernel (failed asm query or no backend table);
+        # the copied table is gfx950 data, so only gfx950 consults it.
         supported = in_table if support.arch == "gfx950" else True
         if not supported:
             reasons.append(
