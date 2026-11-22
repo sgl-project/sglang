@@ -4,12 +4,16 @@
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.glm_image import (
     GlmImageAttention,
     GlmImageRotaryPosEmbed,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="needs the CUDA RoPE")
@@ -52,3 +56,32 @@ def test_in_place_rope_on_contiguous_views_matches_the_copy_back_path(
 
     for actual, expected in zip(in_place, copied, strict=True):
         assert torch.equal(actual, expected)
+
+
+def test_declared_attention_backends_constrain_backend_selection(
+    single_process_model_parallel, monkeypatch
+):
+    """The backend set the model declares for its attention layers reaches the
+    backend selector; without it selection is unconstrained."""
+    declared = {AttentionBackendEnum.TORCH_SDPA}
+    selections = []
+    select = attention_layer.get_attn_backend
+
+    def record(*args, **kwargs):
+        selections.append(kwargs["supported_attention_backends"])
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(attention_layer, "get_attn_backend", record)
+    attn = GlmImageAttention(
+        query_dim=64,
+        heads=2,
+        dim_head=32,
+        out_dim=64,
+        bias=True,
+        qk_norm="layer_norm",
+        elementwise_affine=False,
+        eps=1e-5,
+        supported_attention_backends=declared,
+    )
+    assert selections == [declared]
+    assert attn.attn.backend is AttentionBackendEnum.TORCH_SDPA

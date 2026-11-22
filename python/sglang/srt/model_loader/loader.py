@@ -1585,6 +1585,13 @@ class DummyModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _checkpoint_shard_rank() -> int:
+    """The shard index of this rank's weights in a sharded or remote checkpoint:
+    the TP rank, offset by the pipeline stage so stages do not collide."""
+    parallel = get_parallel()
+    return parallel.pp_rank * parallel.tp_size + parallel.tp_rank
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -1692,7 +1699,7 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             pattern = os.path.join(
                 local_model_path,
                 self.pattern.format(rank=rank, part="*"),
@@ -1745,7 +1752,7 @@ class ShardedStateLoader(BaseModelLoader):
 
         if pattern is None:
             pattern = ShardedStateLoader.DEFAULT_PATTERN
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
@@ -3445,7 +3452,7 @@ class RemoteModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights from remote storage."""
         assert get_connector_type(client) == ConnectorType.KV
-        rank = get_parallel().tp_rank
+        rank = _checkpoint_shard_rank()
         return client.weight_iterator(rank)
 
     def _get_weights_iterator_fs(
@@ -3468,7 +3475,7 @@ class RemoteModelLoader(BaseModelLoader):
         with create_remote_connector(url) as client:
             assert get_connector_type(client) == ConnectorType.KV
             model_name = parse_model_name(url)
-            rank = get_parallel().tp_rank
+            rank = _checkpoint_shard_rank()
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
