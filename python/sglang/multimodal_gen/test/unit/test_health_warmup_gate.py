@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -140,8 +141,10 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
                                 self.assertTrue(aborted.is_set())
                                 self.assertIn("Scheduler worker", client.failure_reason)
                                 self.assertEqual(response.status_code, 503)
-                                self.assertIn(b"Scheduler worker", response.body)
-                                self.assertIn(b"cgroup", response.body)
+                                self.assertIn("cgroup", client.failure_reason)
+                                self.assertEqual(
+                                    json.loads(response.body), {"status": "unhealthy"}
+                                )
                     finally:
                         if worker.poll() is None:
                             worker.terminate()
@@ -272,6 +275,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
         client = AsyncSchedulerClient()
         args = SimpleNamespace(
             enable_metrics=False,
+            media_gateway_key_file=None,
             pipeline_config=mock.Mock(
                 supports_action_endpoint=lambda: False,
                 supports_openpi_endpoint=lambda: False,
@@ -294,7 +298,10 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase, CustomTestCase):
 
                 resp = await asyncio.wait_for(req_task, timeout=5)
                 self.assertEqual(resp.status_code, 503)
-                self.assertIn("Scheduler worker", resp.json()["error"])
+                self.assertIn("Scheduler worker", client.failure_reason)
+                self.assertEqual(
+                    resp.json(), {"error": "Inference backend unavailable"}
+                )
 
     async def test_liveness_returns_200_before_warmup(self):
         self.assertEqual(await liveness(), {"status": "ok"})
