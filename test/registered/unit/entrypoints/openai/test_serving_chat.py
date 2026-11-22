@@ -1004,6 +1004,34 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_harness_stream_interval_applies_to_session_header_requests(self):
+        result = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], ["</s>"], None
+        )
+        cases = [
+            ({"x-deepseek-harness-session-id": "s1"}, True, 16, 16),
+            ({"x-session-id": "s1"}, True, 16, 16),
+            ({}, True, 16, None),
+            ({"x-deepseek-harness-session-id": "s1"}, False, 16, None),
+            ({"x-deepseek-harness-session-id": "s1"}, True, None, None),
+        ]
+        for headers, stream, interval, expected in cases:
+            with self.subTest(headers=headers, stream=stream, interval=interval):
+                self.fastapi_request.headers = headers
+                request = self.stream_req if stream else self.basic_req
+                with (
+                    patch.object(self.chat, "_process_messages", return_value=result),
+                    get_context().override_server_args(
+                        harness_stream_interval=interval
+                    ),
+                ):
+                    adapted, _ = self.chat._convert_to_internal_request(
+                        request, self.fastapi_request
+                    )
+                self.assertEqual(
+                    adapted.sampling_params.get("stream_interval"), expected
+                )
+
     def test_response_template_prefix_uses_prompt_token_ids(self):
         class ResponseTemplateAlias(ResponseTemplateToolDetector):
             pass

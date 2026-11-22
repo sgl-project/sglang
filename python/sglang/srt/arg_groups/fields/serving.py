@@ -258,6 +258,14 @@ class Serving(msgspec.Struct):
         int,
         "The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
     ] = 1
+    harness_stream_interval: A[
+        Optional[int],
+        "Streaming interval, in tokens, for chat requests from an agent harness "
+        "(a request carrying a session header such as x-deepseek-harness-session-id). "
+        "A harness consumes whole thinking and tool-call blocks, so coarser chunks "
+        "cut per-token frontend work; the first token is still sent at once. "
+        "Unset: such requests use --stream-interval.",
+    ] = None
     batch_notify_size: A[
         int,
         "Number of streaming notifications to batch before yielding to the event loop. Reduces asyncio wakeup overhead under high concurrency.",

@@ -156,6 +156,7 @@ POSITIONAL_FIELD_ORDER = (
     "preferred_sampling_params",
     "allow_auto_truncate",
     "stream_interval",
+    "harness_stream_interval",
     "batch_notify_size",
     "stream_response_default_include_usage",
     "incremental_streaming_output",

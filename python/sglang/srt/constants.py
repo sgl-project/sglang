@@ -16,6 +16,13 @@ HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
 # Request header carrying the routing key; must equal ROUTING_KEY_HEADER in
 # rust/sglang-processor/src/openai/mod.rs, which sgl-router's sticky policy reads.
 ROUTING_KEY_HEADER = "x-sgl-routing-key"
+# Session headers that agent harnesses and routers send with each request.
+SESSION_ID_HEADERS = (
+    "x-session-id",
+    "x-dynamo-session-id",
+    "x-deepseek-harness-session-id",
+    "x-session-affinity",
+)
 
 
 def is_health_check_request(rid: Optional[str]) -> bool:

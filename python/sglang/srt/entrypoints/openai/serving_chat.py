@@ -19,6 +19,7 @@ from typing import (
     Optional,
 )
 
+from sglang.srt.constants import SESSION_ID_HEADERS
 from sglang.srt.runtime_context import get_model, get_serving
 
 
@@ -1275,6 +1276,14 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
+        harness_interval = get_serving().harness_stream_interval
+        if (
+            harness_interval
+            and request.stream
+            and raw_request is not None
+            and any(raw_request.headers.get(h) for h in SESSION_ID_HEADERS)
+        ):
+            sampling_params.setdefault("stream_interval", harness_interval)
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
