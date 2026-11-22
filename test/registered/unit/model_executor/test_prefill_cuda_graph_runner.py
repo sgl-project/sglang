@@ -132,6 +132,7 @@ def _load_batch_runner(backend):
     )
     runner.enable_cp_bcg_capture = False
     runner._is_full_backend = False
+    runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
     runner.backend = backend
     runner.has_mha_companion_layers = False
     runner._prefill_static_buffers = None
