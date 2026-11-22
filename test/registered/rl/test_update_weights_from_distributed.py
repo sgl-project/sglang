@@ -53,7 +53,7 @@ from sglang.utils import terminate_process
 
 register_cuda_ci(est_time=110, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=160, suite="extra-a-test-2-gpu-large-amd")
-register_xpu_ci(est_time=200, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=200, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 mp.set_start_method("spawn", force=True)
 

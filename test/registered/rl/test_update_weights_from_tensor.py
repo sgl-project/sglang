@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import (
 
 register_cuda_ci(est_time=174, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="extra-a-test-1-gpu-small-amd")
-register_xpu_ci(est_time=190, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=190, suite="nightly-kernel-main-test-1-gpu-xpu", nightly=True)
 
 import gc
 import json
