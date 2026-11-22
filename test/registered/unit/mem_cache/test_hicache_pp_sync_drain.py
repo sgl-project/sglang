@@ -13,6 +13,7 @@ import torch.distributed
 import torch.multiprocessing
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.storage_events import StorageEventReducer
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
@@ -42,6 +43,291 @@ def _holder(*, window: int) -> _Holder:
     holder.pp_sync_window = window
     holder.work_rounds = deque([[]])
     return holder
+
+
+class _PublishingBackend:
+    """A storage backend stand-in that reports its own residency."""
+
+    def __init__(self, *, publishes=True, pending=0, shard=0, shard_count=1):
+        self.publishes_kv_events = publishes
+        self.kv_event_shard = shard
+        self.kv_event_shard_count = shard_count
+        self.pending = pending
+        self.take_kv_events = MagicMock(return_value=[])
+
+    def pending_kv_events(self):
+        return self.pending
+
+
+class TestStorageKvEventSync(CustomTestCase):
+    """The residency column exists only for a backend that publishes KV events."""
+
+    def _make_cache(self, backend, *, launched=True):
+        cache = object.__new__(UnifiedRadixCache)
+        # init_hicache builds the reducer only for a launch-time publisher.
+        cache._storage_event_reducer = (
+            StorageEventReducer(backend.kv_event_shard_count)
+            if launched and getattr(backend, "publishes_kv_events", False)
+            else None
+        )
+        cache.tree_core = SimpleNamespace(
+            enable_storage=True,
+            write_back_duplicate_reclaim_digest=7,
+            kv_events=SimpleNamespace(enabled=False),
+        )
+        cache.pp_rank = 0
+        cache.pp_size = 1
+        cache.host_memory_mode = "cache"
+        cache.prefetch_stop_policy = "best_effort"
+        cache.ongoing_prefetch = {}
+        cache._shm_count_exchange = MagicMock(return_value=None)
+        cache._all_reduce = MagicMock()
+        cache._drain_storage_kv_events = MagicMock()
+        cache.cache_controller = SimpleNamespace(
+            ack_write_queue=[],
+            ack_load_queue=[],
+            prefetch_hit_queue=Queue(),
+            ack_prefetch_queue=Queue(),
+            ack_backup_queue=Queue(),
+            host_mem_release_queue=Queue(),
+            extra_host_mem_release_queues={},
+            storage_backend=backend,
+        )
+        return cache
+
+    def test_non_publishing_backend_keeps_the_row_unchanged(self):
+        # A publisher left attached at runtime (a failed rollback of a rejected
+        # attach) has no launch-time reducer and must not widen the row.
+        for backend, launched in (
+            (None, True),
+            (_PublishingBackend(publishes=False, pending=3), True),
+            (_PublishingBackend(pending=3), False),
+        ):
+            with self.subTest(backend=backend, launched=launched):
+                cache = self._make_cache(backend, launched=launched)
+                self.assertEqual(
+                    cache._sync_hicache_ready_counts(), (0, 0, (0, 0, 0, 0), ())
+                )
+                self.assertEqual(
+                    cache._all_reduce.call_args.args[0].tolist(),
+                    [0, 0, 0, 0, 0, 0, 7, -7],
+                )
+                cache._drain_storage_kv_events.assert_not_called()
+
+    def test_publishing_backend_adds_a_column_and_drains_on_any_rank(self):
+        for pending, peer_pending, drains in ((0, 0, False), (0, 2, True)):
+            with self.subTest(pending=pending, peer_pending=peer_pending):
+                cache = self._make_cache(_PublishingBackend(pending=pending))
+
+                def reduce_with_peer(counts, _, peer=peer_pending):
+                    counts[6] = min(int(counts[6]), 0 if peer else 1)
+
+                cache._all_reduce.side_effect = reduce_with_peer
+                self.assertEqual(
+                    cache._sync_hicache_ready_counts(), (0, 0, (0, 0, 0, 0), ())
+                )
+                self.assertEqual(
+                    cache._all_reduce.call_args.args[0].tolist(),
+                    [0, 0, 0, 0, 0, 0, 0 if peer_pending else 1, 7, -7],
+                )
+                self.assertEqual(cache._drain_storage_kv_events.called, drains)
+
+    def test_shared_memory_exchange_carries_the_column(self):
+        for pending, peer_pending, drains in ((0, 0, False), (0, 2, True)):
+            with self.subTest(pending=pending, peer_pending=peer_pending):
+                cache = self._make_cache(_PublishingBackend(pending=pending))
+                exchange = MagicMock(width=9)
+
+                def allgather(values, peer=peer_pending):
+                    # The shm exchange stores only values in [0, 2**40).
+                    self.assertTrue(all(0 <= value < 1 << 40 for value in values))
+                    return [values, [*values[:6], 0 if peer else 1, *values[7:]]]
+
+                exchange.allgather.side_effect = allgather
+                cache._shm_count_exchange.return_value = exchange
+                self.assertEqual(
+                    cache._sync_hicache_ready_counts(), (0, 0, (0, 0, 0, 0), ())
+                )
+                self.assertEqual(cache._drain_storage_kv_events.called, drains)
+                cache._all_reduce.assert_not_called()
+
+    def test_shared_memory_table_fits_the_column(self):
+        # A dense storage row is 8 values; the event column needs a 9th.
+        for backend, width in ((_PublishingBackend(), 9), (None, 8)):
+            with self.subTest(width=width):
+                cache = self._make_cache(backend)
+                cache.attn_cp_group = cache.attn_tp_group = None
+                cache.tp_group, cache.tp_world_size = object(), 2
+                with patch(
+                    "sglang.srt.mem_cache.unified_radix_cache.get_shm_exchange"
+                ) as get_exchange:
+                    UnifiedRadixCache._shm_count_exchange(cache)
+                self.assertEqual(get_exchange.call_args.kwargs["width"], width)
+
+    def _sync_event_column(self, cache):
+        self.assertEqual(cache._sync_hicache_ready_counts(), (0, 0, (0, 0, 0, 0), ()))
+        return cache._all_reduce.call_args.args[0].tolist()[6]
+
+    def test_drain_waits_for_the_interval_since_the_last_drain(self):
+        """A gathering drain runs at most once per interval unless a peer is due."""
+        in_interval = time.monotonic() + 3600
+        for drained_at, peer_due, drains in (
+            (in_interval, False, False),
+            (float("-inf"), False, True),
+            (in_interval, True, True),
+        ):
+            with self.subTest(drained_at=drained_at, peer_due=peer_due):
+                cache = self._make_cache(_PublishingBackend(pending=2, shard_count=2))
+                cache.attn_cp_group, cache.attn_tp_group = None, object()
+                cache.tp_world_size = 2
+                if drained_at != float("-inf"):
+                    cache._storage_events_drained_at = drained_at
+
+                def reduce_with_peer(counts, _, peer=peer_due):
+                    counts[6] = min(int(counts[6]), 0 if peer else 1)
+
+                cache._all_reduce.side_effect = reduce_with_peer
+                with patch.object(
+                    torch.distributed, "get_world_size", return_value=2
+                ) as world_size:
+                    column = self._sync_event_column(cache)
+                    self._sync_event_column(cache)
+                self.assertEqual(column, 0 if drains else 1)
+                self.assertEqual(cache._drain_storage_kv_events.called, drains)
+                # The gather groups are resolved once, not per step.
+                world_size.assert_called_once()
+
+    def test_drain_without_a_gather_publishes_every_step(self):
+        # TP1, or one shard holding every page at TP2, gathers nothing, so the
+        # interval would only delay its events.
+        for world_size, shard_count in ((1, 1), (2, 1)):
+            with self.subTest(world_size=world_size):
+                cache = self._make_cache(
+                    _PublishingBackend(pending=2, shard_count=shard_count)
+                )
+                cache.attn_cp_group, cache.attn_tp_group = None, object()
+                cache.tp_world_size = world_size
+                cache._storage_events_drained_at = time.monotonic() + 3600
+                with patch.object(
+                    torch.distributed, "get_world_size", return_value=world_size
+                ):
+                    self.assertEqual(self._sync_event_column(cache), 0)
+                cache._drain_storage_kv_events.assert_called_once()
+
+    def test_drain_records_when_it_ran(self):
+        cache = object.__new__(UnifiedRadixCache)
+        backend = _PublishingBackend()
+        cache.cache_controller = SimpleNamespace(storage_backend=backend)
+        cache.tree_core = SimpleNamespace(kv_events=SimpleNamespace(enabled=False))
+        cache.attn_cp_group = cache.attn_tp_group = None
+        cache.tp_world_size = 1
+        cache._storage_event_reducer = StorageEventReducer(1)
+        before = time.monotonic()
+        UnifiedRadixCache._drain_storage_kv_events(cache)
+        self.assertLessEqual(before, cache._storage_events_drained_at)
+        self.assertLessEqual(cache._storage_events_drained_at, time.monotonic())
+        backend.take_kv_events.assert_called_once()
+
+    def _gathering_cache(self, backend, recorder, *, cp_size=1, tp_size=2):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = SimpleNamespace(storage_backend=backend)
+        cache.tree_core = SimpleNamespace(kv_events=recorder)
+        cache.attn_cp_group = "cp" if cp_size > 1 else None
+        cache.attn_tp_group = "tp"
+        cache.tp_world_size = cp_size * tp_size
+        cache._storage_event_reducer = StorageEventReducer(backend.kv_event_shard_count)
+        sizes = {"cp": cp_size, "tp": tp_size}
+        return cache, sizes
+
+    def _drain(self, cache, sizes, *, rank, roots, peers):
+        """Run one drain as `rank`; peers[group] are the other members' batches."""
+        sent = []
+
+        def gather(batch, out, dst, group):
+            sent.append((group, dst, batch))
+            self.assertEqual(out is not None, rank == dst)
+            if out is not None:
+                self.assertEqual(len(out), sizes[group])
+                out[:] = [batch, *peers[group]]
+
+        with (
+            patch.object(
+                torch.distributed,
+                "get_world_size",
+                side_effect=lambda group: sizes[group],
+            ),
+            patch.object(
+                torch.distributed,
+                "get_global_rank",
+                side_effect=lambda group, index: roots[group],
+            ),
+            patch.object(torch.distributed, "get_rank", return_value=rank),
+            patch.object(torch.distributed, "gather_object", side_effect=gather),
+            patch.object(torch.distributed, "all_gather_object") as all_gather,
+        ):
+            UnifiedRadixCache._drain_storage_kv_events(cache)
+        all_gather.assert_not_called()
+        return sent
+
+    def test_follower_sends_to_the_publisher_and_keeps_nothing(self):
+        # A follower that skipped the collective would hang the publisher.
+        backend = _PublishingBackend(shard=1, shard_count=2)
+        backend.take_kv_events.return_value = ["event"]
+        recorder = SimpleNamespace(enabled=False)
+        cache, sizes = self._gathering_cache(backend, recorder)
+        sent = self._drain(cache, sizes, rank=1, roots={"tp": 0}, peers={})
+        self.assertEqual(sent, [("tp", 0, {1: ["event"]})])
+
+    def test_publisher_reduces_shards_and_enqueues(self):
+        from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
+        from sglang.srt.mem_cache.events import KVCacheEventRecorder
+
+        stored = BlockStored(
+            block_hashes=[5],
+            parent_block_hash=None,
+            token_ids=[1, 2],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.CPU,
+            ownership="owner",
+        )
+        backend = _PublishingBackend(shard=0, shard_count=2)
+        backend.take_kv_events.return_value = [stored]
+        recorder = KVCacheEventRecorder(enabled=True, page_size=2)
+        cache, sizes = self._gathering_cache(backend, recorder, tp_size=3)
+        # Shard 1 also holds the page; rank 2 replicates a shard out of range
+        # and sends nothing.
+        self._drain(
+            cache, sizes, rank=0, roots={"tp": 0}, peers={"tp": [{1: [stored]}, {}]}
+        )
+        self.assertEqual(recorder.take(), [stored])
+
+    def test_cp_gathers_to_cp_rank_0_before_tp(self):
+        backend = _PublishingBackend(shard=2, shard_count=4)
+        recorder = SimpleNamespace(enabled=False)
+        # TP2 x CP2: rank 2 is (cp 1, tp 0); its CP root is rank 0.
+        cache, sizes = self._gathering_cache(backend, recorder, cp_size=2)
+        sent = self._drain(cache, sizes, rank=2, roots={"cp": 0, "tp": 2}, peers={})
+        self.assertEqual(sent, [("cp", 0, {2: []})])
+        # A CP root joins its TP gather with its CP peers' shards.
+        backend = _PublishingBackend(shard=1, shard_count=4)
+        cache, sizes = self._gathering_cache(backend, recorder, cp_size=2)
+        sent = self._drain(
+            cache, sizes, rank=1, roots={"cp": 1, "tp": 0}, peers={"cp": [{3: []}]}
+        )
+        self.assertEqual(sent, [("cp", 1, {1: []}), ("tp", 0, {1: [], 3: []})])
+
+    def test_one_shard_drains_without_a_collective(self):
+        for shard, enabled in ((0, True), (1, False)):
+            with self.subTest(shard=shard):
+                backend = _PublishingBackend(shard=shard, shard_count=1)
+                backend.take_kv_events.return_value = []
+                recorder = MagicMock(enabled=enabled)
+                cache, sizes = self._gathering_cache(backend, recorder)
+                self.assertEqual(
+                    self._drain(cache, sizes, rank=shard, roots={}, peers={}), []
+                )
+                backend.take_kv_events.assert_called_once()
 
 
 def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:

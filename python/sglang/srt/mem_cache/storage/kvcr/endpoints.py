@@ -38,6 +38,22 @@ def control_address(config, extra_config) -> tuple[str, int]:
     return host, port
 
 
+def require_routable_host(host: str) -> None:
+    """Reject a resolved control host other workers cannot connect to.
+
+    Takes a host as control_address() returns it. Mirrors the advertise-host
+    check of Dynamo's KV state agent, which subscribes from another host:
+    loopback, unspecified, wildcard and localhost names fail, including
+    abbreviated IPv4 forms such as 127.1 and IPv4-mapped IPv6. DNS names are
+    not resolved.
+    """
+    # Imported here: this module stays stdlib-only at import time.
+    from sglang.srt.utils.network import is_unreachable_host
+
+    if is_unreachable_host(host):
+        raise ValueError("KVCR control_advertise_host must not be loopback")
+
+
 def rank_offset(config) -> int:
     """TP is the innermost rank within one advertised DP replica."""
     return config.tp_rank + config.tp_size * (

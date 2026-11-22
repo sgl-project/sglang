@@ -47,6 +47,28 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
+def is_unreachable_host(host: str) -> bool:
+    """Whether a peer on another host cannot dial ``host``.
+
+    True for loopback, unspecified, wildcard and localhost names, including
+    abbreviated IPv4 forms such as 127.1, IPv4-mapped IPv6 and a bracketed
+    IPv6 literal. DNS names are not resolved.
+    """
+    literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    if literal == "*" or literal.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(literal)
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(literal))
+        except OSError:
+            return False
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback or address.is_unspecified
+
+
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
     for conn in psutil.net_connections(kind="inet"):
         if conn.laddr.port == port:

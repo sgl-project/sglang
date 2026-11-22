@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_events import StorageEventReducer
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -185,6 +186,11 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+# A drain is an object gather over the attention groups whatever its size, so
+# residency events coalesce for up to this long instead of gathering on every
+# step that has some.
+_STORAGE_KV_EVENT_DRAIN_INTERVAL_S = 0.1
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -598,6 +604,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        self._init_storage_kv_events()
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
@@ -764,6 +771,44 @@ class UnifiedRadixCache(BasePrefixCache):
             and controller.storage_backend is not None
             and controller.storage_backend.consumes_kv_hints()
         )
+
+    # Joins the per-shard residency of a backend that publishes KV events;
+    # set by _init_storage_kv_events for a backend configured at launch.
+    _storage_event_reducer: Optional[StorageEventReducer] = None
+    # When this rank last drained; the first pending events are due at once.
+    _storage_events_drained_at: float = float("-inf")
+    # The attention groups the drain gathers over, resolved on first use.
+    _storage_event_groups: Optional[list] = None
+
+    def _init_storage_kv_events(self) -> None:
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
+        if backend is None or not backend.publishes_kv_events:
+            return
+        if self.pp_size > 1 or self.cache_controller.storage_config.dcp_size > 1:
+            # PP tickets and the PP sync placeholders carry neither the event
+            # metadata nor the residency column, and the shard math and page
+            # identities assume one tree page per published block.
+            raise ValueError(
+                "A HiCache storage backend that publishes KV events requires "
+                "--pp-size 1 and no decode context parallelism."
+            )
+        # Fixed for the worker's lifetime: a backend attached at runtime never
+        # publishes (StorageAttachment rejects it), so every rank keeps the
+        # same sync row.
+        self._storage_event_reducer = StorageEventReducer(backend.kv_event_shard_count)
+
+    @property
+    def storage_kv_events_enabled(self) -> bool:
+        """Whether the launch-time storage backend publishes its own residency."""
+        return (
+            self._storage_event_reducer is not None
+            and self.cache_controller.storage_backend is not None
+        )
+
+    def storage_kv_event_metadata(self, node_id: NodeId) -> dict:
+        """The node's storage page identities, for a backend that publishes them."""
+        return self.tree_core.storage_event_metadata(node_id)
 
     @rank_consensus(
         same_params=["len(params.key)"],
@@ -2634,12 +2679,17 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers = [x for xfers in spec.comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
+        # Passed only when the backend publishes, keeping every other call shape.
+        event_kwargs = {}
+        if self.storage_kv_events_enabled:
+            event_kwargs["kv_event_metadata"] = self.storage_kv_event_metadata(node_id)
         operation_id = self.cache_controller.write_storage(
             spec.host_value,
             spec.token_ids,
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+            **event_kwargs,
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -2870,6 +2920,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Passed only when the backend publishes, keeping every other call shape.
+        event_kwargs = {}
+        if self.storage_kv_events_enabled:
+            event_kwargs["kv_event_metadata"] = (
+                self.tree_core.kv_events.prefetch_storage_metadata(
+                    prefetch_key, matched_prefix_tokens, last_hash
+                )
+            )
         submission = self.cache_controller.submit_prefetch(
             request,
             prefetch_key,
@@ -2881,6 +2939,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_read_metadata=self._storage_read_metadata(
                 kv_hints, prefetch_key, matched_prefix_tokens, last_hash
             ),
+            **event_kwargs,
         )
         operation = submission.operation
         if operation is None:
@@ -4313,9 +4372,30 @@ class UnifiedRadixCache(BasePrefixCache):
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
         # equal iff reclaim victim order and live prefetch set matched on every rank.
         digest = self._hicache_sync_digest()
+        # A KV-event-publishing backend adds one column, 0 if this rank has
+        # residency events due and 1 otherwise: its MIN is 0 iff any rank is
+        # due, and then every rank joins the drain's gather. Pending events are
+        # due once the last drain is an interval old, or at once when the drain
+        # gathers nothing. Non-negative, as the shm exchange requires. Absent
+        # otherwise, so the row is unchanged.
+        event_column = ()
+        if self.storage_kv_events_enabled:
+            due = self.cache_controller.storage_backend.pending_kv_events() and (
+                not self._storage_event_gather_groups()
+                or time.monotonic() - self._storage_events_drained_at
+                >= _STORAGE_KV_EVENT_DRAIN_INTERVAL_S
+            )
+            event_column = (0 if due else 1,)
+        counts_end = 2 + len(storage_queue_sizes)
         exchange = self._shm_count_exchange()
         if exchange is not None:
-            values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
+            values = [
+                write_acks,
+                load_acks,
+                *storage_queue_sizes,
+                *event_column,
+                *fold_u64(digest),
+            ]
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.
             if len(values) <= exchange.width:
@@ -4325,12 +4405,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     "prefetches diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
-                return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+                if event_column and mins[counts_end] == 0:
+                    self._drain_storage_kv_events()
+                return mins[0], mins[1], tuple(mins[2:counts_end]), extra_pool_names
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                *event_column,
                 digest,
                 -digest,
             ],
@@ -4347,10 +4430,12 @@ class UnifiedRadixCache(BasePrefixCache):
             "write_back duplicate-reclaim victims or live storage prefetches "
             "diverged across PP/TP ranks"
         )
+        if event_column and count_values[counts_end] == 0:
+            self._drain_storage_kv_events()
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:-2]),
+            tuple(count_values[2:counts_end]),
             extra_pool_names,
         )
 
@@ -4370,7 +4455,65 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        return get_shm_exchange(group, "hicache", multihost=True)
+        # A publishing backend's event column makes a dense storage row 9 wide.
+        width = 8 + int(self.storage_kv_events_enabled)
+        return get_shm_exchange(group, "hicache", multihost=True, width=width)
+
+    def _storage_event_gather_groups(self) -> list:
+        """The attention groups the storage KV event drain gathers over.
+
+        Empty when one shard holds every published page: the publisher keeps
+        its own batch, with no collective.
+        """
+        if self._storage_event_groups is None:
+            groups = [
+                group
+                for group in (self.attn_cp_group, self.attn_tp_group)
+                if group is not None
+                and torch.distributed.get_world_size(group=group) > 1
+            ]
+            if not groups and self.tp_world_size > 1:
+                groups = [self.tp_group]
+            if self._storage_event_reducer.shard_count == 1:
+                groups = []
+            self._storage_event_groups = groups
+        return self._storage_event_groups
+
+    def _drain_storage_kv_events(self) -> None:
+        """Join every attention shard's backend residency into published events.
+
+        Every rank calls it in the same sync step. It gathers this DP
+        replica's attention groups to the rank that publishes KV events (CP
+        first, then TP among CP rank 0); a rank that is not a group's root
+        drops out after sending.
+        """
+        self._storage_events_drained_at = time.monotonic()
+        backend = self.cache_controller.storage_backend
+        reducer = self._storage_event_reducer
+        events = backend.take_kv_events()
+        # Replicas of a shard are out of range; they send nothing.
+        batches = (
+            {backend.kv_event_shard: events}
+            if backend.kv_event_shard < reducer.shard_count
+            else {}
+        )
+        for group in self._storage_event_gather_groups():
+            root = torch.distributed.get_global_rank(group, 0)
+            gathered = (
+                [None] * torch.distributed.get_world_size(group=group)
+                if torch.distributed.get_rank() == root
+                else None
+            )
+            torch.distributed.gather_object(batches, gathered, dst=root, group=group)
+            if gathered is None:
+                return
+            batches = {
+                shard: events for batch in gathered for shard, events in batch.items()
+            }
+        if not self.tree_core.kv_events.enabled:
+            return
+        for event in reducer.update(batches):
+            self.tree_core.kv_events.enqueue(event)
 
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
