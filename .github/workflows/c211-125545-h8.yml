@@ -21,6 +21,8 @@ jobs:
         - {label: 2-gpu-h100, tag: h8f}
         - {label: 1-gpu-h100, tag: h8g}
         - {label: 1-gpu-h100, tag: h8h}
+        - {label: 8-gpu-h100, tag: h8x}
+        - {label: 8-gpu-h100, tag: h8y}
     runs-on: ${{ matrix.label }}
     timeout-minutes: 15
     steps:
