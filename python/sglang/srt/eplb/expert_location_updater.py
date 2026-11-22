@@ -302,6 +302,20 @@ def update_expert_weights_single_layer(
         (rank + 1) * num_local_physical_experts,
     )
 
+    def _ranks_by_expert(layout):
+        # Keep each rank once in physical-slot order. Source assignment depends
+        # on this order when an expert has replicas on multiple ranks.
+        ranks_by_expert = defaultdict(list)
+        for location in range(num_physical_experts):
+            expert_rank = location // num_local_physical_experts
+            ranks = ranks_by_expert[layout[location]]
+            if not ranks or ranks[-1] != expert_rank:
+                ranks.append(expert_rank)
+        return ranks_by_expert
+
+    old_ranks = _ranks_by_expert(old_physical_to_logical_map)
+    new_ranks = _ranks_by_expert(new_physical_to_logical_map)
+
     def _entrypoint():
         # List[Tuple[logical_expert_id, List[P2POp]]]
         p2p_op_infos: List[Tuple[int, List[P2POp]]] = []
@@ -495,26 +509,16 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        all_src_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if old_physical_to_logical_map[x] == logical_expert_id
-            ]
-        )
-        all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
+        all_src_ranks = old_ranks[logical_expert_id]
+        source_ranks = set(all_src_ranks)
+        all_src_nodes = {x // num_gpu_per_node for x in all_src_ranks}
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
 
-        need_comm_dst_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if new_physical_to_logical_map[x] == logical_expert_id
-                and x // num_local_physical_experts not in all_src_ranks
-            ]
-        )
+        need_comm_dst_ranks = [
+            x for x in new_ranks[logical_expert_id] if x not in source_ranks
+        ]
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -656,14 +660,6 @@ class _ChunkUtils:
         start = chunk_index * short_chunk_size + min(chunk_index, num_long_chunks)
         end = start + short_chunk_size + int(chunk_index < num_long_chunks)
         return slice(start, end)
-
-
-def _deduplicate_ordered(arr: List[int]):
-    output = []
-    for item in arr:
-        if len(output) == 0 or item != output[-1]:
-            output.append(item)
-    return output
 
 
 def _log_p2p_op_metrics(
