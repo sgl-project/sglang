@@ -43,7 +43,7 @@ _SKIP_REASON = "requires mlx + mlx_lm"
 
 if _HAS_MLX:
     import mlx.core as mx
-    from mlx_lm.models import gpt_oss
+    from mlx_lm.models import gemma3_text, gpt_oss
     from mlx_lm.models.base import create_causal_mask
     from mlx_lm.models.cache import KVCache
 
@@ -140,6 +140,37 @@ class TestGptOssAttentionContract(CustomTestCase):
         )
         self.assertEqual(get_layer_window_sizes(model), {0: 16, 1: None})
 
+    def test_get_layer_window_sizes_reads_gemma3_pattern(self):
+        # gemma3 has no layer_types; the map must match each layer's own flag.
+        args = gemma3_text.ModelArgs(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=7,
+            intermediate_size=32,
+            num_attention_heads=2,
+            head_dim=16,
+            vocab_size=64,
+            sliding_window=TINY_WINDOW,
+            sliding_window_pattern=3,
+        )
+        model = gemma3_text.Model(args)
+        windows = get_layer_window_sizes(model)
+        self.assertEqual(
+            [windows[i] is not None for i in range(7)],
+            [layer.self_attn.is_sliding for layer in model.model.layers],
+        )
+        self.assertEqual(set(windows.values()), {TINY_WINDOW, None})
+
+    def test_get_layer_window_sizes_ignores_pattern_beside_config_layer_types(self):
+        # gemma4_text keeps a default pattern next to its real config.layer_types.
+        container = SimpleNamespace(
+            layers=[object()] * 6,
+            window_size=16,
+            sliding_window_pattern=5,
+            config=SimpleNamespace(layer_types=["sliding_attention"] * 6),
+        )
+        self.assertEqual(get_layer_window_sizes(SimpleNamespace(model=container)), {})
+
     def test_get_layer_window_sizes_defaults_to_empty(self):
         self.assertEqual(get_layer_window_sizes(SimpleNamespace()), {})
         no_window = SimpleNamespace(
@@ -148,8 +179,8 @@ class TestGptOssAttentionContract(CustomTestCase):
         self.assertEqual(get_layer_window_sizes(no_window), {})
 
     def test_patch_warns_when_window_declared_but_unmapped(self):
-        # A container that declares a scalar window without layer_types
-        # (gemma3-style pattern models): prefill masks honor the window but
+        # A container that declares a scalar window but neither layer_types
+        # nor a gemma3-style pattern: prefill masks honor the window but
         # batched decode cannot; the mismatch must be surfaced.
         model = _tiny_gpt_oss_model()
         model.model.layer_types = []

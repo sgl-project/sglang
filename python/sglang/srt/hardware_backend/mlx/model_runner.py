@@ -612,7 +612,8 @@ class MlxModelRunner:
             raise NotImplementedError(
                 f"Attention layer {layer_idx} declares sliding-window "
                 "attention but the model exposes no per-layer window map "
-                "(container `layer_types` plus a scalar window), so the MLX "
+                "(container `layer_types` or a gemma3-style "
+                "`sliding_window_pattern`, plus a scalar window), so the MLX "
                 "KV cache cannot bound its sliding-window KV."
             )
         n_kv_heads = get_num_kv_heads(sample_attn)
