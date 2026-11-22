@@ -69,11 +69,19 @@ const MAX_LINE_BYTES: usize = 16 << 20;
 #[derive(Default)]
 pub(crate) struct LineBuffer {
     line: Vec<u8>,
+    discarding: bool,
 }
 
 impl LineBuffer {
     pub(crate) fn push(&mut self, chunk: &[u8], mut f: impl FnMut(&[u8])) {
         let mut rest = chunk;
+        if self.discarding {
+            let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
+                return;
+            };
+            self.discarding = false;
+            rest = &rest[nl + 1..];
+        }
         while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
             if self.line.len() + nl <= MAX_LINE_BYTES {
                 self.line.extend_from_slice(&rest[..nl]);
@@ -88,11 +96,12 @@ impl LineBuffer {
             self.line.extend_from_slice(rest);
         } else {
             self.line.clear();
+            self.discarding = true;
         }
     }
 
     pub(crate) fn flush(&mut self, mut f: impl FnMut(&[u8])) {
-        if !self.line.is_empty() {
+        if !self.discarding && !self.line.is_empty() {
             let line = std::mem::take(&mut self.line);
             f(line.strip_suffix(b"\r").unwrap_or(&line));
         }
@@ -123,4 +132,31 @@ pub(crate) fn write_event(out: &mut Vec<u8>, event: &str, data: &serde_json::Val
     out.extend_from_slice(b"\ndata: ");
     serde_json::to_writer(&mut *out, data).expect("serialize event");
     out.extend_from_slice(b"\n\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_line_suffix_is_not_reparsed_as_a_new_line() {
+        let mut lines = Vec::new();
+        let mut buffer = LineBuffer::default();
+        buffer.push(&vec![b' '; MAX_LINE_BYTES + 1], |line| {
+            lines.push(line.to_vec())
+        });
+        buffer.push(b"data: [DONE]\ndata: {\"ok\":true}\n", |line| {
+            lines.push(line.to_vec())
+        });
+        buffer.flush(|line| lines.push(line.to_vec()));
+
+        assert_eq!(lines, [b"data: {\"ok\":true}".to_vec()]);
+
+        let mut completed = Vec::new();
+        let mut buffer = LineBuffer::default();
+        let mut chunk = vec![b' '; MAX_LINE_BYTES + 1];
+        chunk.extend_from_slice(b"\ndata: {\"next\":true}\n");
+        buffer.push(&chunk, |line| completed.push(line.to_vec()));
+        assert_eq!(completed, [b"data: {\"next\":true}".to_vec()]);
+    }
 }
