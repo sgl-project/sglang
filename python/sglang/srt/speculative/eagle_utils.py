@@ -727,13 +727,17 @@ def _sharded_sampling_applies(
     gathered path before sampling. Anything that reads or edits full logits also
     stays on the stock gathered path.
     """
+    info = batch.sampling_info
     return (
         _is_cuda
         and verify_input.tree_topk == 1
-        and grammar_mask is None
-        and not watermark
         and sampling_allows_vocab_shards(
-            batch.sampling_info,
+            info,
+            # Not adjusts_logits: info may be the provider's VerifySamplingView.
+            adjusts_logits=grammar_mask is not None
+            or watermark
+            or info.step_penalties is not None
+            or info.logit_bias is not None,
             return_logprob=batch.return_logprob,
             has_local_keys=has_local_keys,
         )
@@ -767,7 +771,6 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -805,11 +808,14 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    apply_acc_penalties(
-        next_token_logits, sampling_info, rows_per_request=verify_input.draft_token_num
-    )
+    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(
+            next_token_logits,
+            candidates,
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+        )
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -834,7 +840,6 @@ def eagle_sample(
             keep_logits=batch.return_logprob,
         )
 
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     greedy = _verify_uses_greedy(
@@ -1187,8 +1192,6 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
-    if watermark is not None:
-        watermark.record(accept_index, accept_lens)
     return predict, accept_lens, accept_index
 
 
@@ -1279,11 +1282,6 @@ def _verify_outputs(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()

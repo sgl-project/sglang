@@ -15,6 +15,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -198,6 +199,12 @@ class DFlyWorkerV2(BaseSpecWorker):
             batch, draft_input, candidates, logits_output.next_token_logits
         )
         out_tokens, commit_lens = commit_accept(candidates, num_correct_drafts, bonus)
+        if batch.sampling_info is not None:
+            commit_verify_accept(
+                batch.sampling_info,
+                VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
+                watermark=None,
+            )
         new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
@@ -272,6 +279,7 @@ class DFlyWorkerV2(BaseSpecWorker):
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=self.block_size,
+                verify_tokens=candidates,
             )
         if (
             sampling_info is not None

@@ -13,7 +13,7 @@ use axum::{
         Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::auth::DeclaredRoute;
 use super::native_api::native_error;
-use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::core::{CoreError, FORWARD_PEER_PATH, PEER_TOKEN_HEADER, own_peer_token};
 use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::{
@@ -436,7 +436,23 @@ async fn update_weight_version(
 /// encoded by another DP rank's listener; the reply body is this scheduler's
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
-async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+///
+/// Served only for this launch's other listeners: the request must present
+/// this listener's peer token (`api_server::core::peer`), or it is refused
+/// with 403 whatever message it carries; the listener that relayed it has
+/// already applied its own HTTP route's checks.
+async fn forward_control_req(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let presented = headers.get(PEER_TOKEN_HEADER).map(|value| value.as_bytes());
+    let from_peer = own_peer_token(&state.server_args.deployment_info).is_some_and(|token| {
+        presented.is_some_and(|presented| super::auth::secret_matches(presented, token))
+    });
+    if !from_peer {
+        return (StatusCode::FORBIDDEN, "not a request from a peer listener").into_response();
+    }
     let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1497,7 +1513,37 @@ mod tests {
         RustServerEndpoint {
             dp_rank,
             endpoint: endpoint.to_owned(),
+            peer_token: Some(peer_token(dp_rank)),
         }
+    }
+
+    fn peer_token(dp_rank: u32) -> String {
+        format!("peer-token-{dp_rank}")
+    }
+
+    /// The server args of DP rank 0's listener in a two-rank table.
+    fn rank0_args() -> ServerArgs {
+        ServerArgs {
+            deployment_info: DeploymentInfo {
+                dp_rank: Some(0),
+                rust_server_endpoints: vec![
+                    endpoint(0, "http://127.0.0.1:1"),
+                    endpoint(1, "http://127.0.0.1:1"),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A relayed control request for DP rank 0's listener, as its peers send it.
+    fn relayed_to_rank0(body: Bytes) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(FORWARD_PEER_PATH)
+            .header(PEER_TOKEN_HEADER, peer_token(0))
+            .body(Body::from(body))
+            .unwrap()
     }
 
     /// `/flush_cache` relays one `FlushCacheReqInput` carrying the query
@@ -1652,6 +1698,8 @@ mod tests {
                     .method("POST")
                     .uri(uri)
                     .header(CONTENT_TYPE, "application/json")
+                    // Read only by the relay route, as this listener's own.
+                    .header(PEER_TOKEN_HEADER, peer_token(0))
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -1736,9 +1784,9 @@ mod tests {
     }
 
     /// A table that points a listener back at itself (a peer published at
-    /// this listener's own address) cannot loop: its own relayed abort is
-    /// served on the local registry and never relayed again, so one client
-    /// abort is two requests served, the client's and its own.
+    /// this listener's own address) cannot loop: its own relayed abort, sent
+    /// with the other rank's peer token, is refused and never relayed again,
+    /// so one client abort is two requests served, the client's and its own.
     #[tokio::test]
     async fn a_self_dial_is_one_local_abort() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2490,16 +2538,12 @@ mod tests {
             ControlRequest::ProfileReq(ProfileReq::stop(rid())),
         ];
         let post = |state: Arc<AppState>, message: &ControlRequest| {
-            routes().with_state(state).oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(message.encode().unwrap()))
-                    .unwrap(),
-            )
+            routes()
+                .with_state(state)
+                .oneshot(relayed_to_rank0(message.encode().unwrap()))
         };
 
-        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let (state, intake_rx, _abort_rx) = test_state(rank0_args());
         for message in &forced {
             // A relayed operation would wait on the scheduler's reply forever.
             let response = tokio::time::timeout(
@@ -2519,7 +2563,7 @@ mod tests {
         assert!(intake_rx.is_empty(), "refused before the scheduler");
 
         // With an admin key, the relayed detach reaches the scheduler.
-        let mut args = ServerArgs::default();
+        let mut args = rank0_args();
         args.api_keys.admin_api_key = Some("sk-admin".into());
         let (state, intake_rx, _abort_rx) = test_state(args);
         let response = tokio::spawn(post(state, &forced[1]));
@@ -2548,18 +2592,12 @@ mod tests {
     /// before it reaches the scheduler.
     #[tokio::test]
     async fn peer_route_refuses_a_message_no_listener_relays() {
-        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let (state, intake_rx, _abort_rx) = test_state(rank0_args());
         for tag in ["TokenizedGenerateReqInput", "NotAControlMessage"] {
             let body = rmp_serde::to_vec(&(tag, "sender-rid", ())).unwrap();
             let response = routes()
                 .with_state(state.clone())
-                .oneshot(
-                    HttpRequest::builder()
-                        .method("POST")
-                        .uri(FORWARD_PEER_PATH)
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
+                .oneshot(relayed_to_rank0(Bytes::from(body)))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
@@ -2827,20 +2865,16 @@ mod tests {
     /// its sender encoded, and the scheduler's bytes come back as the body.
     #[tokio::test]
     async fn forward_control_relays_the_sender_rid_and_the_reply_bytes() {
-        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let (state, intake_rx, _abort_rx) = test_state(rank0_args());
         let header = crate::message::io_struct::ControlRequest::FlushCacheReqInput(
             crate::message::io_struct::FlushCacheReqInput::new("sender-rid".into(), Some(2.0)),
         )
         .encode()
         .unwrap();
         let response = tokio::spawn(
-            routes().with_state(state.clone()).oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(header.clone()))
-                    .unwrap(),
-            ),
+            routes()
+                .with_state(state.clone())
+                .oneshot(relayed_to_rank0(header.clone())),
         );
         let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
             panic!("forwarded control must submit one control request");
@@ -2866,17 +2900,159 @@ mod tests {
         let no_rid = rmp_serde::to_vec(&("FlushCacheReqInput", (), ())).unwrap();
         let response = routes()
             .with_state(state)
-            .oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(no_rid))
-                    .unwrap(),
-            )
+            .oneshot(relayed_to_rank0(Bytes::from(no_rid)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// Every control operation a listener fans out reaches the other DP
+    /// rank's listener through its relay route, which serves only its
+    /// peers: the same message sent without that listener's peer token, or
+    /// with another rank's, is refused before it reaches the scheduler, a
+    /// writing `/weights_checker` action included.
+    #[tokio::test]
+    async fn fanned_out_control_reaches_a_peer_listener_and_only_from_a_peer() {
+        use crate::api_server::core::fanout::testing::status_bytes;
+
+        /// Answers every control request `intake` receives as a success, and
+        /// reports each one's wire bytes.
+        fn answer_control(intake: flume::Receiver<TmEvent>) -> flume::Receiver<Bytes> {
+            let (seen_tx, seen_rx) = flume::unbounded();
+            tokio::spawn(async move {
+                while let Ok(event) = intake.recv_async().await {
+                    let TmEvent::Intake { request, admission } = event else {
+                        continue;
+                    };
+                    assert!(admission.try_accept());
+                    let RequestKind::Control(control) = &request.kind else {
+                        continue;
+                    };
+                    seen_tx.send(control.encode().unwrap()).unwrap();
+                    let _ = request
+                        .sink
+                        .try_send(ResponseItem::Control(status_bytes(true, "")));
+                }
+            });
+            seen_rx
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rank1_url = format!("http://{}", listener.local_addr().unwrap());
+        let args = |dp_rank| {
+            let mut args = ServerArgs {
+                deployment_info: DeploymentInfo {
+                    dp_size: 2,
+                    dp_rank: Some(dp_rank),
+                    rust_server_endpoints: vec![
+                        endpoint(0, "http://127.0.0.1:1"),
+                        endpoint(1, &rank1_url),
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The forced admin routes relay only with one.
+            args.api_keys.admin_api_key = Some("sk-admin".into());
+            args
+        };
+        let (rank1, rank1_intake, _rank1_aborts) = test_state(args(1));
+        // Rank 1's relay route statuses, in the order it answered.
+        let (served_tx, served_rx) = flume::unbounded();
+        let rank1_app = routes()
+            .with_state(rank1)
+            .layer(axum::middleware::map_response(move |response: Response| {
+                let served_tx = served_tx.clone();
+                async move {
+                    served_tx.send(response.status()).unwrap();
+                    response
+                }
+            }));
+        tokio::spawn(async move { axum::serve(listener, rank1_app).await.unwrap() });
+        let rank1_seen = answer_control(rank1_intake);
+        let peers = peer_endpoints(&args(0).deployment_info, 0, &Default::default()).unwrap();
+        let (rank0, rank0_intake, _rank0_aborts) =
+            test_state_with_peers(args(0), peers, Vec::new());
+        let rank0_seen = answer_control(rank0_intake);
+        let rank0_app = routes().with_state(rank0);
+        let client = reqwest::Client::new();
+        async fn next<T>(what: &str, received: &flume::Receiver<T>) -> T {
+            tokio::time::timeout(std::time::Duration::from_secs(10), received.recv_async())
+                .await
+                .unwrap_or_else(|_| panic!("{what}: timed out"))
+                .unwrap()
+        }
+
+        for (method, uri, body, tag) in [
+            ("POST", "/flush_cache", "", "FlushCacheReqInput"),
+            ("POST", "/start_profile", "{}", "ProfileReq"),
+            ("POST", "/stop_profile", "", "ProfileReq"),
+            (
+                "POST",
+                "/weights_checker",
+                r#"{"action": "checksum"}"#,
+                "CheckWeightsReqInput",
+            ),
+            (
+                "POST",
+                "/weights_checker",
+                r#"{"action": "reset_tensors"}"#,
+                "CheckWeightsReqInput",
+            ),
+            ("GET", "/server_info", "", "GetInternalStateReq"),
+        ] {
+            let response = rank0_app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri} {body}");
+            let local = next("rank 0", &rank0_seen).await;
+            let relayed = next("rank 1", &rank1_seen).await;
+            for frame in [&local, &relayed] {
+                assert_eq!(forwarded_tag(frame).as_deref(), Some(tag), "{uri} {body}");
+            }
+            assert_eq!(served_rx.try_recv(), Ok(StatusCode::OK), "{uri} {body}");
+
+            for token in [None, Some(peer_token(0)), Some("guess".to_owned())] {
+                let mut post = client
+                    .post(format!("{rank1_url}{FORWARD_PEER_PATH}"))
+                    .body(relayed.clone());
+                if let Some(token) = &token {
+                    post = post.header(PEER_TOKEN_HEADER, token);
+                }
+                let status = post.send().await.unwrap().status();
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} {body} {token:?}");
+                assert_eq!(next("refusal", &served_rx).await, StatusCode::FORBIDDEN);
+            }
+            assert!(
+                rank1_seen.is_empty(),
+                "{uri} {body}: served without the token"
+            );
+        }
+
+        // An abort is relayed too; rank 1 serves it on its own registry.
+        let response = rank0_app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/abort_request")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"rid": "client-rid"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(next("abort", &served_rx).await, StatusCode::OK);
     }
 
     #[tokio::test]

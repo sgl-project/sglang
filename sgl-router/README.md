@@ -128,6 +128,7 @@ routes under `/v1/responses/`, the Conversations API, `/v1/loads`) answer
 
 Worker mutations require `--worker-management-api-key` and a matching
 `Authorization: Bearer <key>` header; without the flag they are unavailable.
+A missing or wrong key returns `401` with `worker_management_unauthorized`.
 They return `202`. `GET /workers/{id}` exposes the operation and runtime state,
 including discovery IDs that contain `/`. `PUT` and `DELETE` require the current
 revision in `If-Match`. This revision is the Worker control record's version,

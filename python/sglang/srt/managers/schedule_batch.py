@@ -568,6 +568,9 @@ class Req(ReqDllmMixin):
                 "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
+        # Index in the scheduler's PenaltyStatusPool, held while the request uses
+        # a penalty; a retraction keeps it.
+        self.penalty_index: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor
         # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
         self.page_guard_state: Optional[PageGuardState] = None
@@ -3273,27 +3276,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 track_positions[i] = -1
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
-    def cumulate_penalty_output_tokens(self):
-        # Under overlap batch.input_ids is just a placeholder here -- the
-        # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
-        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
-        # pin_memory (matching the prefill-path tensors) keeps the copy async;
-        # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
-        )
-
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
@@ -3326,9 +3308,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # tensors before allocation so alloc_for_decode covers them too.
         strip_beam_tail(self)
         append_beam_tail(self)
-
-        if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).
@@ -3490,9 +3469,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
-        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
-        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
-        # needs to be called with pre-merged Batch.reqs.
         self.sampling_info.merge_batch(other.sampling_info)
 
         # Encoder-decoder infos
