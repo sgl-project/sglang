@@ -382,7 +382,7 @@ def resolve_embedding_model_spec(
         if architecture in architecture_set:
             return _native_embedding_spec(family, execution, pooling)
 
-    # Only token heads declared; mixed declarations keep their other head's task.
+    # mixed declarations keep the non-token task
     if architecture_set and all(
         architecture.endswith("ForTokenClassification")
         for architecture in architecture_set

@@ -208,7 +208,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         return {"label": labels, "probs": probs, "num_classes": rows.shape[-1]}
 
     def _score_rows(self, *, scores: Any, num_tokens: int) -> torch.Tensor:
-        # [num_rows, num_classes]: one row for the sequence, or one per input token.
+        # one row for a sequence, or one per input token
         try:
             rows = torch.as_tensor(scores, dtype=torch.float32)
         except (TypeError, ValueError, RuntimeError) as e:
@@ -226,7 +226,7 @@ class OpenAIServingClassify(OpenAIServingBase):
                 f"Expected [{num_tokens}, num_classes] classification scores, "
                 f"got shape {shape}"
             )
-        # A token head scores every class, so id2label must map exactly its columns.
+        # token heads require one id2label entry per score column
         if self.id2label.keys() != set(range(shape[1])):
             raise RuntimeError(
                 f"Got {shape[1]} classification scores per token, but id2label "
@@ -235,7 +235,7 @@ class OpenAIServingClassify(OpenAIServingBase):
         return rows
 
     def _label(self, class_id: int) -> str:
-        # A sequence head may be wider than id2label; only its winning class needs one.
+        # sequence heads only require the winning class label
         if class_id not in self.id2label:
             raise RuntimeError(
                 f"Predicted class {class_id} of the classification scores "

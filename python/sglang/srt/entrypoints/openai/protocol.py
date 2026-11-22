@@ -1595,7 +1595,6 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyData(BaseModel):
     index: int
-    # Token classifiers return one label and one probs row per input token.
     label: Union[str, List[str]]
     probs: Union[List[float], List[List[float]]]
     num_classes: int

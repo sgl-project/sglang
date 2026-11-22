@@ -80,7 +80,7 @@ When the model's `config.json` sets `"problem_type": "multi_label_classification
 
 ### Token classification
 
-For a checkpoint whose declared architectures all end in `ForTokenClassification`, `/v1/classify` returns a prediction for each input token when the served model returns one row of class scores per input token:
+When every declared architecture ends in `ForTokenClassification`, the checkpoint is treated as a token classifier. If the served model returns one row of class scores per input token, `/v1/classify` returns one prediction per token:
 
 - `probs` has shape `[num_tokens, num_classes]`, with one row per input token, including special tokens added by the tokenizer, and one column per label in `id2label`. Each row uses softmax, or an elementwise sigmoid for multi-label models as described above.
 - `label` lists the top-scoring class for each token. For multi-label models, apply your thresholds to each row of `probs`.
