@@ -1,0 +1,667 @@
+name: c211-128714-mi35x1q2
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-mi35x1-01:
+    name: probe-job-mi35x1-01
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-01 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-01 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-01 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-01 nonce=$NONCE"
+          exit 0
+  job-mi35x1-02:
+    name: probe-job-mi35x1-02
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-02 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-02 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-02 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-02 nonce=$NONCE"
+          exit 0
+  job-mi35x1-03:
+    name: probe-job-mi35x1-03
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-03 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-03 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-03 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-03 nonce=$NONCE"
+          exit 0
+  job-mi35x1-04:
+    name: probe-job-mi35x1-04
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-04 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-04 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-04 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-04 nonce=$NONCE"
+          exit 0
+  job-mi35x1-05:
+    name: probe-job-mi35x1-05
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-05 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-05 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-05 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-05 nonce=$NONCE"
+          exit 0
+  job-mi35x1-06:
+    name: probe-job-mi35x1-06
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-06 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-06 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-06 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-06 nonce=$NONCE"
+          exit 0
+  job-mi35x1-07:
+    name: probe-job-mi35x1-07
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-07 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-07 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-07 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-07 nonce=$NONCE"
+          exit 0
+  job-mi35x1-08:
+    name: probe-job-mi35x1-08
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-08 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-08 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-08 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-08 nonce=$NONCE"
+          exit 0
+  job-mi35x1-09:
+    name: probe-job-mi35x1-09
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-09 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-09 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-09 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-09 nonce=$NONCE"
+          exit 0
+  job-mi35x1-10:
+    name: probe-job-mi35x1-10
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-10 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-10 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-10 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-10 nonce=$NONCE"
+          exit 0
+  job-mi35x1-11:
+    name: probe-job-mi35x1-11
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-11 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-11 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-11 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-11 nonce=$NONCE"
+          exit 0
+  job-mi35x1-12:
+    name: probe-job-mi35x1-12
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-12 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-12 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-12 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-12 nonce=$NONCE"
+          exit 0
+  job-mi35x1-13:
+    name: probe-job-mi35x1-13
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-13 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-13 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-13 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-13 nonce=$NONCE"
+          exit 0
+  job-mi35x1-14:
+    name: probe-job-mi35x1-14
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-14 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-14 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-14 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-14 nonce=$NONCE"
+          exit 0
+  job-mi35x1-15:
+    name: probe-job-mi35x1-15
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-15 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-15 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-15 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-15 nonce=$NONCE"
+          exit 0
+  job-mi35x1-16:
+    name: probe-job-mi35x1-16
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-16 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-16 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-16 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-16 nonce=$NONCE"
+          exit 0
+  job-mi35x1-17:
+    name: probe-job-mi35x1-17
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-17 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-17 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-17 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-17 nonce=$NONCE"
+          exit 0
+  job-mi35x1-18:
+    name: probe-job-mi35x1-18
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-18 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-18 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-18 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-18 nonce=$NONCE"
+          exit 0
+  job-mi35x1-19:
+    name: probe-job-mi35x1-19
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-19 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-19 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-19 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-19 nonce=$NONCE"
+          exit 0
+  job-mi35x1-20:
+    name: probe-job-mi35x1-20
+    runs-on: [linux-mi35x-gpu-1]
+    timeout-minutes: 15
+    steps:
+      - name: devices
+        shell: bash
+        env:
+          NONCE: c211-128714-5b859ff7d593b3e4
+        run: |
+          set -u
+          set +e
+          NONCE='c211-128714-5b859ff7d593b3e4'
+          echo "C211_JOB=job-mi35x1-20 NONCE=$NONCE"
+          echo "C211_MARKER job=job-mi35x1-20 nonce=$NONCE host=$(hostname 2>/dev/null) uid=$(id -u) user=$(id -un 2>/dev/null)"
+          id 2>&1 || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "--- KFD ---"
+          if [ -e /dev/kfd ]; then echo "KFD_DEV=PRESENT"; else echo "KFD_DEV=ABSENT"; echo "C211_PROBE_END job=job-mi35x1-20 nonce=$NONCE"; exit 0; fi
+          ls -l /dev/kfd 2>/dev/null || true
+          ls -l /dev/dri 2>/dev/null | head -20 || true
+          echo "--- ROCM-SMI ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD-SMI ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static --asic 2>&1 | head -400 || echo AMD_SMI_ASIC_FAILED
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "C211_PROBE_END job=job-mi35x1-20 nonce=$NONCE"
+          exit 0
