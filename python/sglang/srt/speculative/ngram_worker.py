@@ -22,13 +22,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import (
-    commit_accept_tokens_to_penalties,
-    eagle_sample,
-)
+from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
@@ -536,8 +534,12 @@ class NGRAMWorker(BaseSpecWorker):
                     grammar_mask,
                     watermark=watermark,
                 )
-            commit_accept_tokens_to_penalties(
-                batch.sampling_info, predict, accept_index
+            commit_verify_accept(
+                batch.sampling_info,
+                VerifyAccept(
+                    tokens=predict, accept_lens=accept_lens, accept_index=accept_index
+                ),
+                watermark=watermark,
             )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
@@ -547,15 +549,7 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index]
-            if watermark is not None:
-                self.model_runner.watermark.append_accept_tokens(
-                    batch.sampling_info.watermark,
-                    batch.req_pool_indices,
-                    accept_tokens,
-                    accept_lens,
-                )
-            accept_tokens = accept_tokens.flatten()
+            accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's

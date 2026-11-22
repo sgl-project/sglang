@@ -25,7 +25,6 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.sampling.penalties import uses_penalty
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -286,19 +285,6 @@ def apply_dflash_verify_logits_adjustments(
             next_token_logits,
             sampling_info,
             num_tokens_in_batch=draft_token_num,
-        )
-
-
-def commit_block_accept_tokens_to_penalties(
-    sampling_info: SamplingBatchInfo,
-    out_tokens: torch.Tensor,
-    commit_lens: torch.Tensor,
-) -> None:
-    if sampling_info.step_penalties is not None:
-        # Guarded here: building the mask launches device work.
-        positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
-        sampling_info.step_penalties.commit(
-            out_tokens, accept_mask=positions < commit_lens[:, None]
         )
 
 

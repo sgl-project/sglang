@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
+from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
@@ -303,7 +304,7 @@ class TestSynthIDEngine(CustomTestCase):
 
         accept_tokens = torch.tensor([[1, 0, 0], [4, 5, 0], [10, 11, 12]])
         accept_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
-        engine.append_accept_tokens(rows, req_pool_indices, accept_tokens, accept_lens)
+        verify.commit(VerifyAccept(tokens=accept_tokens, accept_lens=accept_lens))
         twin.state.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
         assert_synthid_state_equal(
             synthid_state(watermark.state), synthid_state(twin.state)

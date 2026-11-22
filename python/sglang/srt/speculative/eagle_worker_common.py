@@ -24,11 +24,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
-    commit_accept_tokens_to_penalties,
     eagle_prepare_for_verify,
     eagle_sample,
 )
@@ -997,7 +997,13 @@ def run_eagle_verify(
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
         )
-    commit_accept_tokens_to_penalties(batch.sampling_info, predict, accept_index)
+    commit_verify_accept(
+        batch.sampling_info,
+        VerifyAccept(
+            tokens=predict, accept_lens=accept_lens, accept_index=accept_index
+        ),
+        watermark=watermark,
+    )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:
@@ -1044,14 +1050,6 @@ def run_eagle_verify(
         num_draft_tokens,
         prepared_step_indices=prepared_commit_steps,
     )
-
-    if not batch.forward_mode.is_idle() and watermark is not None:
-        target_worker.model_runner.watermark.append_accept_tokens(
-            batch.sampling_info.watermark,
-            batch.req_pool_indices,
-            predict[accept_index],
-            accept_lens,
-        )
 
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
