@@ -2651,6 +2651,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

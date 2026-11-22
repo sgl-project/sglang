@@ -555,14 +555,17 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
 
 
 class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
+    def __init__(self, length: int, ignored_stop_position: Optional[int] = None):
         super().__init__()
         self.length = length
+        self.ignored_stop_position = ignored_stop_position
 
     def to_json(self):
+        position = self.ignored_stop_position
         return {
             "type": "length",  # to match OpenAI API's return value
             "length": self.length,
+            "ignored_stop": None if position is None else {"position": position},
         }
 
 

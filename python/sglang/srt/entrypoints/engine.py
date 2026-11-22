@@ -1932,7 +1932,8 @@ class Engine(EngineScoreMixin, EngineBase):
         result = self.loop.run_until_complete(
             self.tokenizer_manager.collective_rpc(obj)
         )
-        assert result.success, result.message
+        if not result.success:
+            raise RuntimeError(f"collective_rpc {method!r} failed: {result.message}")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
