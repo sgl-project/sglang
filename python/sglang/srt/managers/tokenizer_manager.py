@@ -116,6 +116,7 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
+    SchedulerIdleReqInput,
     SessionParams,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
@@ -2695,13 +2696,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self._abort_all_until_unlocked()
 
     async def _abort_all_until_unlocked(self):
+        self.auto_create_handle_loop()
         # we are using the model_update_lock to check if there is still on-going requests.
         while True:
             # TODO: maybe make it async instead of fire-and-forget
             self.abort_request(abort_all=True)
             is_locked = await self.model_update_lock.is_locked()
             if not is_locked:
-                break
+                # A handler whose client disconnected has already returned, but
+                # the scheduler drops its running request only at its next step,
+                # so a release_memory_occupation right after the pause is refused.
+                results = await self.scheduler_idle_communicator(
+                    SchedulerIdleReqInput()
+                )
+                if all(r.idle for r in results):
+                    break
+                # Only that step is left.
+                await asyncio.sleep(0.01)
+                continue
             await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):

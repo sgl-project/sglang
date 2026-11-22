@@ -203,6 +203,8 @@ from sglang.srt.managers.io_struct import (
     RpcReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
+    SchedulerIdleReqInput,
+    SchedulerIdleReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -2095,6 +2097,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
+                (SchedulerIdleReqInput, self.get_scheduler_idle),
                 (SetInternalStateReq, self.set_internal_state),
                 (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
                 (RpcReqInput, self.handle_rpc_request),
@@ -6459,6 +6462,15 @@ class Scheduler(
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)
+
+    def get_scheduler_idle(
+        self, recv_req: SchedulerIdleReqInput
+    ) -> SchedulerIdleReqOutput:
+        # An aborted running request leaves the batch only at the next step,
+        # which a paused loop never runs: waiting for it would not end.
+        return SchedulerIdleReqOutput(
+            idle=self.pause_state.paused or self.is_fully_idle()
+        )
 
     def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout

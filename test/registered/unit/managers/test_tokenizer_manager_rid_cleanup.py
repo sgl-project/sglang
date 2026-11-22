@@ -38,7 +38,10 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseGenerationReqInput,
     RequestOutputStats,
+    SchedulerIdleReqInput,
+    SchedulerIdleReqOutput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -1719,6 +1722,32 @@ class TestAbortBeforeDispatch(CustomTestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(list(sent[1].batch), [tokenized_objs[0]])
         self.assertTrue(tm.rid_to_state[kept].dispatched)
+
+
+class TestAbortPauseWaitsForSchedulerIdle(CustomTestCase):
+    def test_pause_returns_once_every_scheduler_is_idle(self):
+        """A disconnected request's handler has returned, so the tokenizer holds
+        no reader lock, but the scheduler still runs the request until its next
+        step. pause_generation(mode="abort") must not return before that, or a
+        release_memory_occupation right after it is refused."""
+        tm = _make_tm_for_generate(self)
+        tm.tokenizer_ipc_name = None
+        tm._dispatch_to_scheduler = Mock()
+        tm.model_update_lock.is_locked = AsyncMock(return_value=False)
+        replies = [
+            [SchedulerIdleReqOutput(idle=True), SchedulerIdleReqOutput(idle=False)],
+            [SchedulerIdleReqOutput(idle=True), SchedulerIdleReqOutput(idle=True)],
+        ]
+        tm.scheduler_idle_communicator = AsyncMock(side_effect=replies)
+
+        asyncio.run(tm.pause_generation(PauseGenerationReqInput(mode="abort")))
+
+        probes = tm.scheduler_idle_communicator.await_args_list
+        self.assertEqual(len(probes), 2)
+        self.assertIsInstance(probes[0].args[0], SchedulerIdleReqInput)
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual([type(m) for m in sent], [AbortReq, AbortReq])
+        self.assertTrue(all(m.abort_all for m in sent))
 
 
 class TestLoRARequestLifecycle(CustomTestCase):

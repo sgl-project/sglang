@@ -2606,6 +2606,15 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
     internal_state: Dict[str, Any]
 
 
+class SchedulerIdleReqInput(BaseReq, kw_only=True):
+    """Ask each scheduler whether an abort-mode pause has drained it."""
+
+
+class SchedulerIdleReqOutput(BaseReq, kw_only=True):
+    # Idle, or paused: a paused loop runs no step, so it would not drain further.
+    idle: bool
+
+
 class SetInternalStateReq(BaseReq, kw_only=True):
     # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
     server_args: Dict[str, Union[int, float]]

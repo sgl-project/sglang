@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
+    SchedulerIdleReqInput,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -419,6 +420,23 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+
+    def test_idle_probe_waits_for_the_full_idle_check_until_paused(self):
+        """An aborted running request stays in the batch until its next step, so
+        the probe reports the full idle check; a paused loop runs no step, so a
+        paused scheduler reports idle instead of being waited on forever."""
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle = MagicMock(return_value=False)
+        probe = SchedulerIdleReqInput()
+
+        self.assertFalse(scheduler.get_scheduler_idle(probe).idle)
+        scheduler.is_fully_idle.assert_called_once_with()
+        scheduler.is_fully_idle.return_value = True
+        self.assertTrue(scheduler.get_scheduler_idle(probe).idle)
+
+        scheduler.is_fully_idle.return_value = False
+        scheduler.pause_state.pause()
+        self.assertTrue(scheduler.get_scheduler_idle(probe).idle)
 
     def test_retract_clears_last_batch_state(self):
         """retract mode should clear last_batch and cur_batch_for_debug."""
