@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -220,6 +221,7 @@ class SchedulePolicy:
         enable_uniboost_gamma_ada: bool = False,
         uniboost_rank_invariant: bool = False,
         uniboost_step_clock: Optional[Callable[[], int]] = None,
+        shortest_prefill_load_scaling: Optional[ShortestPrefillLoadScaling] = None,
     ):
         self._lpm_gate_calls = 0
         self._on_bounded_state_change = None
@@ -249,6 +251,11 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
+        self.shortest_prefill_load_scaling = shortest_prefill_load_scaling
+        # Recomputed on every shortest-prefill-first pass. Without load scaling the
+        # boundary stays inf, so every request is in the shortest-first class.
+        self.shortest_prefill_backlog = 0
+        self.shortest_prefill_class_boundary = math.inf
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
 
@@ -275,6 +282,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
+        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
@@ -374,6 +382,8 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                if self.shortest_prefill_load_scaling is not None:
+                    self._update_shortest_prefill_load(waiting_queue, chunked_req)
                 self._sort_by_shortest_prefill(
                     waiting_queue,
                     temporary_deprioritized,
@@ -381,11 +391,7 @@ class SchedulePolicy:
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
-                    logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
-                        len(waiting_queue),
-                        self._shortest_prefill_work(waiting_queue[0]),
-                    )
+                    self._log_shortest_prefill(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -684,12 +690,73 @@ class SchedulePolicy:
         processed_tokens: int,
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
-        waiting_queue.sort(
-            key=lambda r: (
+        # Requests at or above the class boundary go after the shorter ones in
+        # arrival order, so a large request is not passed indefinitely.
+        def key(r: Req):
+            arrived = r.time_stats.wait_queue_entry_time
+            by_arrival = self._shortest_prefill_by_arrival(r)
+            return (
                 r.rid in temporary_deprioritized,
-                self._prefill_rank(r, self._shortest_prefill_work(r), processed_tokens),
-                r.time_stats.wait_queue_entry_time,
+                by_arrival,
+                arrived
+                if by_arrival
+                else self._prefill_rank(
+                    r, self._shortest_prefill_work(r), processed_tokens
+                ),
+                arrived,
             )
+
+        waiting_queue.sort(key=key)
+
+    def _update_shortest_prefill_load(
+        self, waiting_queue: List[Req], chunked_req: Optional[Req]
+    ) -> None:
+        # The backlog uses the work the sort uses, so every TP rank computes the
+        # same boundary and budget.
+        backlog = sum(self._shortest_prefill_work(r) for r in waiting_queue)
+        if chunked_req is not None:
+            backlog += max(
+                0, len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+            )
+        self.shortest_prefill_backlog = backlog
+        self.shortest_prefill_class_boundary = (
+            self.shortest_prefill_load_scaling.class_boundary(backlog)
+        )
+
+    def _log_shortest_prefill(self, waiting_queue: List[Req]) -> None:
+        load = ""
+        if self.shortest_prefill_load_scaling is not None:
+            load = (
+                f" class_boundary={int(self.shortest_prefill_class_boundary)}"
+                f" backlog={self.shortest_prefill_backlog}"
+            )
+        logger.info(
+            "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d%s",
+            len(waiting_queue),
+            self._shortest_prefill_work(waiting_queue[0]),
+            load,
+        )
+
+    def _shortest_prefill_by_arrival(self, r: Req) -> bool:
+        return (
+            self.shortest_prefill_load_scaling is not None
+            and self._shortest_prefill_work(r) >= self.shortest_prefill_class_boundary
+        )
+
+    def can_join_continuing_chunk(self, req: Req) -> bool:
+        """Whether req may share a pass with a continuing chunked prefill: requests
+        at or above the class boundary go by arrival and never do. The queue is in
+        class order, so joining stops at the first of them."""
+        return not self._shortest_prefill_by_arrival(req)
+
+    def prefill_token_budget(
+        self, *, page_size: int, align: Optional[int]
+    ) -> Optional[int]:
+        """Prefill tokens this pass may carry, or None for no cap."""
+        if self.shortest_prefill_load_scaling is None:
+            return None
+        return self.shortest_prefill_load_scaling.token_budget(
+            self.shortest_prefill_backlog, page_size=page_size, align=align
         )
 
     def shortest_prefill_chunk_limit(
@@ -723,6 +790,7 @@ class SchedulePolicy:
             if (
                 self._prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
+                or not self.can_join_continuing_chunk(req)
             ):
                 break
             reserved += charge
@@ -1334,6 +1402,7 @@ class PrefillAdder:
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
         reuses_kv: bool = False,
+        commit_unfinished: bool = False,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -1381,6 +1450,7 @@ class PrefillAdder:
             # prefix before the chunk cached (``prefix_len`` by default).
             admitted_chunk_limit=admitted_chunk_limit,
             cached_tokens=prefix_len if cached_tokens is None else cached_tokens,
+            commit_unfinished=commit_unfinished,
         )
         self.rem_input_tokens -= compute_charge
 
@@ -1789,6 +1859,9 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=_rem_tokens,
+            # Under a chunk cap, requests are admitted after a chunk cut short;
+            # holding its rest and decode keeps them off the KV later passes need.
+            commit_unfinished=truncated and self.chunked_req_limit is not None,
         )
 
         # Return if chunked prefill not finished
