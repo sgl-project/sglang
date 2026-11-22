@@ -187,8 +187,8 @@ class MambaPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
-            # A PP stage without Mamba layers holds no bytes per slot; it must not cap the
-            # group minimum, and sizes itself like the ratio path below.
+            # A PP stage without Mamba layers holds no bytes per slot;
+            # it must not cap the group minimum, and uses the ratio path if no stage does.
             no_mamba_layers = self.size_per_token == 0
             self.size = sync_fixed_hicache_size(
                 (
