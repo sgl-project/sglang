@@ -362,7 +362,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
             features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
             mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
         )
-        # Allocation and sampling are collaborators; exercise the scheduler's
+        # Allocation is a collaborator; exercise the scheduler's
         # real cache accounting on two revisits of the same fixed-size block.
         with (
             patch(
@@ -371,9 +371,6 @@ class TestDllmCommittedTokens(unittest.TestCase):
             patch(
                 "sglang.srt.managers.schedule_batch.alloc_for_extend",
                 return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
             ),
         ):
             for _ in range(2):
