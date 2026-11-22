@@ -365,6 +365,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/vla/Runway/Praxis-1",
     },
     {
+      name: "LingBot-VLA 2.0",
+      modelIds: ["lerobot/lingbot_vla_v2_robotwin", "lerobot/lingbot_vla_v2_base"],
+      cookbook: "/cookbook/vla/Robbyant/LingBot-VLA-2.0",
+    },
+    {
       name: "LingBotWorld",
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",
