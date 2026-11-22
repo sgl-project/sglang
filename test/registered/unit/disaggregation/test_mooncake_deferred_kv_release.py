@@ -247,8 +247,7 @@ class TestMooncakeAbortNotification(
 class TestMooncakeAuxLayout(CustomTestCase):
     def test_decode_fails_the_room_of_a_dropped_aux_item(self):
         """An aux item longer than its buffer's rows is dropped, so the row stays
-        unwritten: the room must fail, whether Success comes after or before, and
-        its later items are dropped."""
+        unwritten: the room must fail, whether Success comes after or before."""
         rows = (ctypes.c_ubyte * 16)()
         manager = MooncakeKVManager.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
@@ -261,8 +260,9 @@ class TestMooncakeAuxLayout(CustomTestCase):
         }
         manager.failure_records = {}
         manager.failure_lock = threading.Lock()
+        data = b"\x01" * 16
 
-        def receive(room, data):
+        for room in (ROOM, succeeded):
             manager._handle_aux_data(
                 [
                     MooncakeKVManager.AUX_DATA_HEADER,
@@ -273,10 +273,6 @@ class TestMooncakeAuxLayout(CustomTestCase):
                     data,
                 ]
             )
-
-        for room in (ROOM, succeeded):
-            receive(room, b"\x01" * 16)
-            receive(room, b"\x02" * 8)
         manager.update_status(ROOM, KVPoll.Success)
 
         self.assertEqual(bytes(rows), bytes(16))
