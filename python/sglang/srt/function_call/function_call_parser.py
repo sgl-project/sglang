@@ -140,14 +140,21 @@ class FunctionCallParser:
         prefix: str = "",
         constrained: bool = False,
         thinking_end: str = "",
+        keep_thinking_before_calls: bool = False,
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         # The output opens with a thinking block ending at thinking_end that no
-        # reasoning parser took out, so it is dropped instead of parsed.
+        # reasoning parser took out; it is dropped, or with
+        # keep_thinking_before_calls dropped only on a turn that answers.
         self._thinking_end = thinking_end
+        self._keep_thinking_before_calls = keep_thinking_before_calls
         self._in_streamed_thinking = bool(thinking_end)
         self._thinking_tail = ""
+        self._held_thinking: List[str] = []
+        # Text after the thinking block, held until it shows whether the turn
+        # calls a tool; None while still inside the block.
+        self._undecided_answer: Optional[str] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -186,10 +193,15 @@ class FunctionCallParser:
 
     def strip_thinking(self, text: str) -> str:
         """Non-streaming `text` without the thinking block it opens with; text
-        cut off inside the block has no content."""
+        cut off inside the block has no content unless the block is kept."""
         if not self._thinking_end:
             return text
-        return text.partition(self._thinking_end)[2]
+        _, end, answer = text.partition(self._thinking_end)
+        if self._keep_thinking_before_calls and (
+            not end or answer.lstrip().startswith(self.detector.bot_token)
+        ):
+            return text
+        return answer
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -277,15 +289,39 @@ class FunctionCallParser:
         return final_normal_text, final_calls
 
     def _skip_streamed_thinking(self, chunk_text: str) -> str:
+        if self._undecided_answer is not None:
+            return self._decide_streamed_turn(chunk_text)
         text = self._thinking_tail + chunk_text
         end = text.find(self._thinking_end)
         if end == -1:
             # Keep what may be the start of a marker split across chunks.
             self._thinking_tail = text[-(len(self._thinking_end) - 1) :]
+            if self._keep_thinking_before_calls:
+                self._held_thinking.append(text[: len(text) - len(self._thinking_tail)])
             return ""
-        self._in_streamed_thinking = False
         self._thinking_tail = ""
-        return text[end + len(self._thinking_end) :]
+        end += len(self._thinking_end)
+        if self._keep_thinking_before_calls:
+            self._held_thinking.append(text[:end])
+            self._undecided_answer = ""
+            return self._decide_streamed_turn(text[end:])
+        self._in_streamed_thinking = False
+        return text[end:]
+
+    def _decide_streamed_turn(self, chunk_text: str) -> str:
+        # "" while the answer so far could still be the start of a tool call.
+        answer = self._undecided_answer + chunk_text
+        head = answer.lstrip()
+        bot_token = self.detector.bot_token
+        if len(head) < len(bot_token) and bot_token.startswith(head):
+            self._undecided_answer = answer
+            return ""
+        if head.startswith(bot_token):
+            answer = "".join(self._held_thinking) + answer
+        self._in_streamed_thinking = False
+        self._held_thinking = []
+        self._undecided_answer = None
+        return answer
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -293,12 +329,26 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        # A held marker prefix is still thinking, so it is not released.
+        # A stream cut off inside the thinking block keeps it only when it is
+        # kept; text after the block that never reached a tool call is the answer.
+        normal_text, calls = "", []
+        if (
+            self._keep_thinking_before_calls
+            and self._in_streamed_thinking
+            and self._undecided_answer is None
+        ):
+            normal_text = "".join(self._held_thinking) + self._thinking_tail
         self._thinking_tail = ""
+        self._held_thinking = []
+        answer, self._undecided_answer = self._undecided_answer, None
+        if answer:
+            self._in_streamed_thinking = False
+            answer_text, calls = self.parse_stream_chunk(answer)
+            normal_text += answer_text
         if not self.tools and not self.detector.parses_without_tools():
-            return "", []
+            return normal_text, calls
         sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+        return normal_text + sp_result.normal_text, calls + sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False

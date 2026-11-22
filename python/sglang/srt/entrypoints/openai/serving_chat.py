@@ -1880,7 +1880,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 if tool_call_constraint_covers_answer
                 and answer_thinking
                 and not self.reasoning_parser
-                and request.separate_reasoning
                 else ""
             )
             if tool_call_constraint is None:
@@ -3139,6 +3138,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request._response_parser_grammar_start,
                     ),
                     thinking_end=request._response_parser_thinking_end,
+                    keep_thinking_before_calls=not request.separate_reasoning,
                     response_unwrapped=response_unwrapped,
                 )
 
@@ -3356,6 +3356,7 @@ class OpenAIServingChat(OpenAIServingBase):
         constrained: bool = False,
         *,
         thinking_end: str = "",
+        keep_thinking_before_calls: bool = False,
         response_unwrapped: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
@@ -3374,6 +3375,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prefix=response_parser_prefix,
                 constrained=constrained,
                 thinking_end=thinking_end,
+                keep_thinking_before_calls=keep_thinking_before_calls,
             )
             text = parser.strip_thinking(text)
             detector_owns_format = parser.owns_tool_format()
@@ -3875,6 +3877,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prefix=request._response_parser_prefix,
                     constrained=constrained,
                     thinking_end=request._response_parser_thinking_end,
+                    keep_thinking_before_calls=not request.separate_reasoning,
                 )
 
         parser = parser_dict[index]

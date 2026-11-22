@@ -3078,7 +3078,7 @@ class ServingChatTestCase(CustomTestCase):
         for reasoning_parser, template_kwargs, separate, thinking_end in (
             (None, None, True, "</think>"),
             (None, {"enable_thinking": False}, True, ""),
-            (None, None, False, ""),
+            (None, None, False, "</think>"),
             ("glm45", None, True, ""),
         ):
             with self.subTest(
@@ -3134,26 +3134,62 @@ class ServingChatTestCase(CustomTestCase):
                     )
                     self.assertEqual(served, expected)
 
-    def test_glm_json_answer_unseparated_keeps_thinking(self):
-        """separate_reasoning=false keeps the thinking text before a tool call
-        in the content when no reasoning parser is set, as without JSON."""
+    def test_glm_json_answer_unseparated_keeps_thinking_before_calls(self):
+        """With separate_reasoning=false and no reasoning parser, the thinking
+        text stays in the content unless the turn answers, as without JSON,
+        so an answer turn returns only the JSON it was asked for."""
         self.chat.tool_call_parser = "glm47"
-        output = self._stopped_on_token(
-            "Plan.</think><tool_call>read_file<arg_key>path</arg_key>"
-            "<arg_value>note.txt</arg_value></tool_call>",
-            1,
+        call = (
+            "<tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>note.txt</arg_value></tool_call>"
         )
-        for stream in (False, True):
-            with self.subTest(stream=stream):
-                served = self._served(
-                    output,
-                    stream,
-                    separate_reasoning=False,
-                    **self._json_answer_fields(),
-                )
-                self.assertEqual(
-                    served, ("", "Plan.</think>", [("read_file", {"path": "note.txt"})])
-                )
+        cut_off = self._stopped_on_token("Plan the", 1)
+        cut_off["meta_info"]["finish_reason"] = {"type": "length", "length": 2}
+        cases = (
+            (
+                self._stopped_on_token("Plan.</think>" + call, 1),
+                ("", "Plan.</think>", [("read_file", {"path": "note.txt"})]),
+            ),
+            (
+                self._stopped_on_token('Plan.</think>{"word": "hi"}', 1),
+                ("", '{"word": "hi"}', []),
+            ),
+            (cut_off, ("", "Plan the", [])),
+        )
+        modes = ((False, False), (True, False), (True, True))
+        for output, expected in cases:
+            for stream, incremental in modes:
+                with self.subTest(
+                    text=output["text"], stream=stream, incremental=incremental
+                ):
+                    served = self._served(
+                        output,
+                        stream,
+                        incremental=incremental,
+                        separate_reasoning=False,
+                        **self._json_answer_fields(),
+                    )
+                    self.assertEqual(served, expected)
+        # A stream cut off at the call's opening marker still keeps the thinking.
+        parser = FunctionCallParser(
+            [Tool.model_validate(self._READ_FILE_TOOL)],
+            "glm47",
+            thinking_end="</think>",
+            keep_thinking_before_calls=True,
+        )
+        streamed = "".join(
+            parser.parse_stream_chunk(char)[0] for char in "Plan.</think><tool_call>"
+        )
+        streamed += parser.parse_stream_end()[0]
+        self.assertTrue(streamed.startswith("Plan.</think>"), streamed)
+        # A marker quoted in the answer does not make it a tool-call turn.
+        served = self._served(
+            self._stopped_on_token('Plan.</think>{"word": "<tool_call>"}', 1),
+            False,
+            separate_reasoning=False,
+            **self._json_answer_fields(),
+        )
+        self.assertEqual(served, ("", '{"word": "<tool_call>"}', []))
 
     def test_kimi_k3_json_answer_content_matches_streaming(self):
         """A Kimi-K3 answer loses only its response-channel markers: unseparated
