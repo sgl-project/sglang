@@ -33,6 +33,7 @@ from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
     SumGroup,
+    TokenAxis,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -57,6 +58,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_num_fused_shared_experts,
+    is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -1177,18 +1179,18 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_ascend_ops()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_deepep_v2()
-        ):
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = is_moe_input_scattered_across_dp_ranks()
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    @staticmethod
+    def _captures_attn_tp_slices(layer, forward_batch) -> bool:
+        # The capture sees the previous FFN's output rows for this batch, which
+        # stay whole on an unpadded batch (--disable-attn-tp-gather).
+        plan = layer.attn_boundary.plan
+        edge = plan.edges[plan.variant_for(forward_batch)].incoming
+        return TokenAxis.ATTN_TP in edge.produced.layout.sharded
 
     def _prepare_aux_hidden_state(self, aux_hidden_state: torch.Tensor) -> torch.Tensor:
         if self.dflash_capture and self.config.mhc:
@@ -1261,7 +1263,13 @@ class Glm5NextModel(nn.Module):
                 def capture_output(aux_hidden_state, *, owned=False):
                     aux_hidden_state = self._prepare_aux_hidden_state(aux_hidden_state)
                     owned = owned or (self.dflash_capture and self.config.mhc)
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                    if (
+                        self.enable_a2a_moe
+                        and i > self.first_k_dense_replace
+                        and self._captures_attn_tp_slices(
+                            layer=self.layers[i], forward_batch=forward_batch
+                        )
+                    ):
                         group = get_parallel().attn_tp_group
                         aux_hidden_state = group.all_gather(aux_hidden_state, dim=0)
                         owned = owned or group.world_size > 1

@@ -2680,6 +2680,10 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+    # A request-log line that finds the log writer's buffer full: "wait" holds
+    # the request until the sink takes it, as in the Python server; "drop"
+    # drops the line (counted in sglang:request_log_dropped_lines_total).
+    SGLANG_RUST_REQUEST_LOG_FULL_BUFFER = EnvStr("wait")
 
     # ===================================================================
     # Weight Cache Daemon
