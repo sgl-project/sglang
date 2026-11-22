@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import is_sail
+from sglang.srt.utils import get_device_sm, is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,6 +18,10 @@ class TestSailMxfp4ScaleLayout(CustomTestCase):
         if not is_sail() or not torch.cuda.is_available():
             raise unittest.SkipTest(
                 "The MXFP4 quantization kernels only run on SAIL devices."
+            )
+        if get_device_sm() < 89:
+            raise unittest.SkipTest(
+                "The e2m1 conversion PTX instructions require SM89+ devices."
             )
 
     def test_fused_layout_preserves_quantized_values(self):

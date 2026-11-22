@@ -5,12 +5,18 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import is_sail
+from sglang.srt.utils import get_device_sm, is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 
 register_ppu_ci(est_time=120, suite="extra-test-1-gpu-ppu")
 
-pytestmark = pytest.mark.skipif(not is_sail(), reason="SAIL-only kernel")
+pytestmark = [
+    pytest.mark.skipif(not is_sail(), reason="SAIL-only kernel"),
+    pytest.mark.skipif(
+        get_device_sm() < 89,
+        reason="The e2m1 conversion PTX instructions require SM89+ devices",
+    ),
+]
 
 
 _EP_SHAPES = [

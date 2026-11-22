@@ -9,8 +9,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_context, get_flags
-from sglang.srt.utils import is_sail
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.utils import get_device_sm, is_sail
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,6 +83,21 @@ class TestSailDeepGemmFusedMoE(CustomTestCase):
         )
         cls._stack.callback(destroy_model_parallel)
         initialize_model_parallel()
+        # Group building publishes widths and groups but not ranks; the
+        # launcher's rank bundle is absent here, so state the single-process
+        # ranks explicitly.
+        cls._stack.enter_context(
+            get_parallel().override(
+                tp_rank=0,
+                pp_rank=0,
+                attn_tp_rank=0,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                moe_dp_rank=0,
+                moe_tp_rank=0,
+            )
+        )
         cls._layer_cls = FusedMoE
         cls._reference = staticmethod(fused_moe)
         # Restrict the warmup shapes while still exercising the real factory,
@@ -294,12 +309,20 @@ class TestSailDeepGemmFusedMoE(CustomTestCase):
     def test_bf16_unquantized(self):
         self._compare("bf16")
 
+    @unittest.skipIf(
+        get_device_sm() < 89,
+        "The SAIL FP8 MoE activation quantization requires SM89+ devices.",
+    )
     def test_fp8_blockwise(self):
         self._compare("fp8")
 
     def test_int8_channelwise(self):
         self._compare("int8")
 
+    @unittest.skipIf(
+        get_device_sm() < 89,
+        "The e2m1 conversion PTX instructions require SM89+ devices.",
+    )
     def test_fp4(self):
         with (
             envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(False),
@@ -307,6 +330,10 @@ class TestSailDeepGemmFusedMoE(CustomTestCase):
         ):
             self._compare("fp4")
 
+    @unittest.skipIf(
+        get_device_sm() < 89,
+        "The e2m1 conversion PTX instructions require SM89+ devices.",
+    )
     def test_w4a16_valu_and_mma(self):
         """BF16 activations, real weight conversion and warmup, compared against the
         decoded-weight reference on both TP paths."""
