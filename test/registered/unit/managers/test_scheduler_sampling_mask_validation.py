@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -32,11 +33,13 @@ class _PastSamplingChecks(Exception):
 
 
 def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
-    """Run admission on `req`: the abort mock, the queue mock, and whether the
-    request got past the sampling-output checks."""
+    """Run admission on `req`: the abort mock, the queue mock, whether the request
+    got past the sampling-output checks, and the Req constructor mock."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
-    scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+    scheduler.model_config = SimpleNamespace(
+        hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
+    )
     scheduler.disaggregation_mode = mode
     scheduler.disagg_metadata_buffers = SimpleNamespace(enable_sampling_mask=False)
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
@@ -54,6 +57,7 @@ def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
     scheduler.hisparse_coordinator = None
     scheduler.uocr_runtime = None
     scheduler.send_abort_output = MagicMock()
+    scheduler.penalty_status_pool = idle_penalty_status_pool()
     scheduler.init_request_retirer()
     recv_req = MagicMock(
         session_params=None,
@@ -72,7 +76,7 @@ def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
             "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
             return_value=1,
         ),
-        patch("sglang.srt.managers.scheduler.Req", return_value=req),
+        patch("sglang.srt.managers.scheduler.Req", return_value=req) as make_req,
         patch(
             "sglang.srt.managers.scheduler.prepare_abort", wraps=prepare_abort
         ) as abort,
@@ -81,7 +85,7 @@ def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
             scheduler.handle_generate_request(recv_req)
         except _PastSamplingChecks:
             passed = True
-    return abort, scheduler._add_request_to_queue, passed
+    return abort, scheduler._add_request_to_queue, passed, make_req
 
 
 def _sampling_req(sampling_params, *, logprobs=False, mask=False):
@@ -122,7 +126,7 @@ class TestSamplingCapture(CustomTestCase):
         refused, and an unfiltered one, which returns no sampling fields, is not."""
         for sampling_params, refused in (({"top_k": 20}, True), ({}, False)):
             with self.subTest(params=sampling_params):
-                abort, _, passed = _handle_request(
+                abort, _, passed, _ = _handle_request(
                     DisaggregationMode.NULL,
                     _sampling_req(sampling_params, logprobs=True, mask=True),
                     spec_algorithm=SpeculativeAlgorithm.EAGLE,
@@ -163,9 +167,10 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         """Neither PD role may queue mask requests without metadata buffers."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                abort, add_to_queue, _ = _handle_request(
+                abort, add_to_queue, _, make_req = _handle_request(
                     mode, MagicMock(captures_sampling=True, return_logprob=False)
                 )
+                self.assertEqual(make_req.call_args.kwargs["vocab_size"], 120)
                 abort.assert_called_once()
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
@@ -177,7 +182,9 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
         nothing for it."""
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                abort, _, passed = _handle_request(mode, _sampling_req({}, mask=True))
+                abort, _, passed, _ = _handle_request(
+                    mode, _sampling_req({}, mask=True)
+                )
                 self.assertTrue(passed)
                 abort.assert_not_called()
 
@@ -195,7 +202,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 ):
                     req = MagicMock(captures_sampling=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
-                    abort, add_to_queue, _ = _handle_request(mode, req)
+                    abort, add_to_queue, _, _ = _handle_request(mode, req)
                     abort.assert_called_once()
                     self.assertIn(
                         (
@@ -222,7 +229,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
             ({"top_k": 65}, {"mask": True}, True),
         ):
             with self.subTest(params=sampling_params, flags=flags):
-                abort, _, passed = _handle_request(
+                abort, _, passed, _ = _handle_request(
                     DisaggregationMode.NULL, _sampling_req(sampling_params, **flags)
                 )
                 self.assertEqual(passed, not rejected)
@@ -238,7 +245,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.enable_session_radix_cache = False
                 scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128
+                    hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
                 )
                 scheduler.disaggregation_mode = DisaggregationMode.NULL
                 scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
@@ -260,6 +267,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.beam_coordinator = MagicMock()
                 scheduler.hisparse_coordinator = None
                 scheduler.uocr_runtime = None
+                scheduler.penalty_status_pool = idle_penalty_status_pool()
                 scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)

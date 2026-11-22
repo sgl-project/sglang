@@ -368,6 +368,9 @@ class TestAllocationIntegration(CustomTestCase):
             cache_request_handle=CacheRequestHandle(rid="retry", attempt_id=0),
             prefill_attempt_count=1,
             output_ids=[42],
+            grammar=None,
+            return_logprob=False,
+            captures_sampling=False,
             skip_radix_cache_insert=False,
             kv=SimpleNamespace(cache_protected_len=16),
             full_untruncated_fill_ids=list(range(32)),
@@ -375,8 +378,6 @@ class TestAllocationIntegration(CustomTestCase):
             storage_prefetch_retry_attempts=3,
             storage_prefetch_last_match_len=8,
             metadata_buffer_index=0,
-            return_logprob=False,
-            sampling_mask_rows=None,
             reset_for_retract=Mock(),
             advance_cache_request_handle=Mock(),
             time_stats=MagicMock(),
@@ -451,14 +452,15 @@ class TestAllocationIntegration(CustomTestCase):
         req.multimodal_inputs = Mock()
         req.prefill_attempt_count = 0
         req.output_ids = [42]
+        req.grammar = None
+        req.return_logprob = False
+        req.captures_sampling = False
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
         req.full_untruncated_fill_ids = list(range(32))
         req._compute_max_prefix_len = Mock(return_value=31)
         req.storage_prefetch_retry_attempts = 0
         req.storage_prefetch_last_match_len = None
-        req.return_logprob = False
-        req.sampling_mask_rows = None
         req.reset_for_retract = Mock()
         req.advance_cache_request_handle = Mock()
         req.time_stats = MagicMock()
@@ -501,12 +503,15 @@ class TestAllocationIntegration(CustomTestCase):
             output_token_logprobs_idx=[],
             output_top_logprobs_val=[],
             output_top_logprobs_idx=[],
+            output_token_ids_logprobs_val=[],
+            output_token_ids_logprobs_idx=[],
         )
         req = FakeReq(
             rid="retry-token",
             cache_request_handle=CacheRequestHandle(rid="retry-token", attempt_id=0),
             prefill_attempt_count=0,
             output_ids=array("q"),
+            grammar=None,
             skip_radix_cache_insert=True,
             storage_prefetch_retry_attempts=0,
             storage_prefetch_last_match_len=None,
@@ -773,6 +778,7 @@ class TestAllocationIntegration(CustomTestCase):
             req.pending_bootstrap = True
             req.disagg_kv_sender = self.sender(room=i + 1)
         scheduler = self.inflight_scheduler(reqs)
+        scheduler.prefill_admission_no_token = False
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
         waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)

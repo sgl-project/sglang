@@ -61,6 +61,7 @@ class TestSamplingMaskValidation(CustomTestCase):
     def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
         """A malformed or oversized candidate count must not reach the scheduler."""
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         for top_logprobs_num, return_logprob, accepted in (
             (None, True, True),
             (0, True, True),
@@ -133,6 +134,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         Each enabled item keeps its own count.
         """
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         self.manager.preferred_sampling_params = None
         self.manager.sampling_params_class = SamplingParams
         self.manager.tokenizer = None

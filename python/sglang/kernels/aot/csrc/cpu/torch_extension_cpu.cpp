@@ -395,6 +395,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
     int64_t quant_method_4bit);
+
+std::tuple<at::Tensor, at::Tensor> per_token_quant_fp8_cpu(at::Tensor& input);
 #endif
 
 // gemm
@@ -875,6 +877,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_tensor_quant_fp8_cpu", torch::kCPU, &sgl_per_tensor_quant_fp8_cpu);
   m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
   m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  m.def("per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("per_token_quant_fp8_cpu", torch::kCPU, &per_token_quant_fp8_cpu);
+#endif
 
   // igemm
   m.def(

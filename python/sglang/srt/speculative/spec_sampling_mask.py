@@ -29,7 +29,6 @@ def validate_spec_sampling_mask_request(
             "with speculative decoding."
         )
 
-    # build_speculative_verify_target_probs applies top-k/top-p only.
     if req.sampling_params.min_p > 0:
         return (
             "return_sampling_logprobs or return_sampling_mask with speculative "
