@@ -8,6 +8,7 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from sglang.kernels.numerics import round_bf16_to_fp32
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 
 @triton.jit
@@ -94,6 +95,7 @@ def _validate_conv_post(x: torch.Tensor, bias: torch.Tensor | None) -> None:
         )
 
 
+@replay_launches
 def fused_bias_silu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     _validate_conv_post(x, bias)
     out = torch.empty_like(x, memory_format=torch.preserve_format)
@@ -110,6 +112,7 @@ def fused_bias_silu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@replay_launches
 def fused_bias_glu(x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """Apply optional bias then ``hidden * silu(gate)`` along the channel axis.
 
