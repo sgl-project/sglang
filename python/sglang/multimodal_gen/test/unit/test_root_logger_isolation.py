@@ -3,8 +3,6 @@
 
 import logging
 
-import pytest
-
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 _ROOT_LEVEL_BEFORE = logging.getLogger().level
@@ -15,8 +13,5 @@ def test_server_args_reconfigures_the_root_logger():
     assert logging.getLogger().level == logging.ERROR
 
 
-@pytest.mark.skip(
-    reason="DIAGNOSTIC: restore_root_logger removed to test the cosmos3 AMD crash"
-)
 def test_next_test_sees_the_root_logger_it_started_with():
     assert logging.getLogger().level == _ROOT_LEVEL_BEFORE
