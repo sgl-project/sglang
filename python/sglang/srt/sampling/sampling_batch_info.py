@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import operator
-import random
 from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -50,21 +49,6 @@ def _any_row_with_seed(reqs: List[Req]) -> bool:
         )
         return False
     return True
-
-
-# TP ranks sample independently, so their filler seeds must match. Every rank runs
-# the same steps, but other code (e.g. tracing) may draw from the global `random`
-# on one rank and not another, which would put the ranks' sequences out of step.
-_FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
-
-
-def _filler_seed(req: Req) -> int:
-    """The random seed an unseeded request samples with beside seeded rows, drawn
-    the first time it is needed and kept for the request's later steps."""
-    if req.filler_sampling_seed is None:
-        # The seeded samplers hash each seed as uint64; any int64 works.
-        req.filler_sampling_seed = _FILLER_SEED_RNG.getrandbits(63)
-    return req.filler_sampling_seed
 
 
 @dataclasses.dataclass
@@ -178,7 +162,7 @@ class SamplingBatchInfo:
                 seed = r.sampling_params.sampling_seed
                 if seed is None:
                     # A deterministic run defaults to 42; otherwise the row stays random.
-                    seed = 42 if enable_deterministic else _filler_seed(r)
+                    seed = 42 if enable_deterministic else r.filler_seed
                 seeds.append(seed)
         mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
         capture_rows = [
