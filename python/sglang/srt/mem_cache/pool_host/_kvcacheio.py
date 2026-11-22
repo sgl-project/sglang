@@ -128,3 +128,5 @@ if _is_xpu:
     transfer_kv_per_layer_mla_pf_lf = _bind("transfer_kv_per_layer_mla_pf_lf")
     transfer_kv_per_layer_pf_lf = _bind("transfer_kv_per_layer_pf_lf")
     transfer_kv_per_layer_ph_lf = _bind("transfer_kv_per_layer_ph_lf")
+    transfer_kv_mamba_lf_pf = _bind("transfer_kv_mamba_lf_pf")
+    transfer_kv_mamba_pf_lf = _bind("transfer_kv_mamba_pf_lf")

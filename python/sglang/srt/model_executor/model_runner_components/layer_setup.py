@@ -134,7 +134,7 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
     # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
-    is_hybrid_swa_mtp_draft: bool = False
+    draft_owns_its_depth: bool = False
 
 
 def resolve_layer_indices(
@@ -158,15 +158,14 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
-    is_hybrid_swa_mtp_draft = (
+    draft_owns_its_depth = (
         is_draft_worker
         and draft_model_idx is not None
-        and model_config.is_hybrid_swa
         and getattr(model, "mtp_layer_id_is_depth", False)
     )
     owned_layers = (
         range(draft_model_idx, draft_model_idx + 1)
-        if is_hybrid_swa_mtp_draft
+        if draft_owns_its_depth
         else range(pp_range.start_layer, pp_range.end_layer)
     )
     swa_attention_layer_ids, full_attention_layer_ids = (
@@ -181,8 +180,31 @@ def resolve_layer_indices(
         num_effective_layers=num_effective_layers,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
-        is_hybrid_swa_mtp_draft=is_hybrid_swa_mtp_draft,
+        draft_owns_its_depth=draft_owns_its_depth,
     )
+
+
+def check_layer_types_hybrid_swa_split(*, model: nn.Module, model_config: ModelConfig):
+    """Fail if `layer_types` put a layer in the KV pool its attention does not use.
+
+    Only a split taken from `layer_types` alone is checked: the model code decides
+    each layer's window, and it may not read `layer_types`.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    swa_layer_ids = set(model_config.swa_attention_layer_ids)
+    misplaced = sorted(
+        module.layer_id
+        for module in model.modules()
+        if isinstance(module, RadixAttention)
+        and (module.layer_id in swa_layer_ids) != (module.sliding_window_size > 0)
+    )
+    if misplaced:
+        raise ValueError(
+            f"{model_config.hf_config.architectures[0]}: layer_types puts layers "
+            f"{misplaced} in the wrong KV pool for the attention the model builds. "
+            "Pass --disable-hybrid-swa-memory to serve it from a single KV pool."
+        )
 
 
 def _resolve_local_hybrid_swa_layer_ids(

@@ -5,25 +5,12 @@ from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
     NVFP4_BIAS_GELU,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
 )
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import _WanGELUMLP
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
@@ -34,7 +21,6 @@ requires_blackwell = pytest.mark.skipif(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.no_grad()
 def test_wan_gelu_mlp_quality_path_and_lossless_restore():
-    _ensure_single_process_parallel_runtime()
     torch.manual_seed(0)
     mlp = _WanGELUMLP(64, 256, prefix="", quant_config=None).to(
         device="cuda", dtype=torch.bfloat16
@@ -56,7 +42,6 @@ def test_wan_gelu_mlp_quality_path_and_lossless_restore():
 
 @requires_blackwell
 def test_wan_nvfp4_mlp_defers_bias_for_gelu_fusion():
-    _ensure_single_process_parallel_runtime()
     quant_config = ModelOptFp4Config(
         is_checkpoint_nvfp4_serialized=True,
         group_size=16,
@@ -79,7 +64,6 @@ def test_wan_nvfp4_mlp_defers_bias_for_gelu_fusion():
 
 @requires_blackwell
 def test_wan_nvfp4_mlp_does_not_mark_excluded_linear():
-    _ensure_single_process_parallel_runtime()
     quant_config = ModelOptFp4Config(
         is_checkpoint_nvfp4_serialized=True,
         group_size=16,

@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -33,6 +33,8 @@ def _make_backend():
     backend.use_sliding_window_kv_pool = False
     backend.prefill_split_tile_size = None
     backend.num_wrappers = 1
+    backend.dispatch_reason = None
+    backend.runner_ids = None
     backend.prefill_uses_dequant_workspace = True
     backend.prefill_uses_native_fp4 = False
     backend.kv_cache_quant_method = SimpleNamespace(needs_global_scale=lambda: True)
@@ -57,6 +59,11 @@ def _make_backend():
         ),
         set_kv_buffer=create_autospec(pool_methods.set_kv_buffer),
     )
+    backend.token_to_kv_pool.layer_router = SimpleNamespace(
+        layer=lambda layer_id: SimpleNamespace(
+            store=backend.token_to_kv_pool.set_kv_buffer
+        )
+    )
     return backend
 
 
@@ -77,7 +84,8 @@ def _make_batch(mode, explicit_prefix):
         encoder_lens=None,
         out_cache_loc=torch.tensor([12, 13, 14, 21, 22, 23], dtype=torch.int32),
         out_cache_loc_is_physical=True,
-        kv_loc_plan=object(),
+        iteration_ids=object(),
+        ragged_verify_layout=None,
         spec_info=SimpleNamespace(num_tokens_per_req=width, ragged_verify_layout=None),
     )
 
@@ -97,7 +105,7 @@ def test_speculative_metadata_and_forward_use_physical_workspace(mode, explicit_
     backend.init_forward_metadata(batch)
 
     update_kwargs = backend.indices_updater_prefill.update.call_args.kwargs
-    assert update_kwargs["plan"] is batch.kv_loc_plan
+    assert update_kwargs["plan"] is batch.iteration_ids
     assert update_kwargs["spec_info"] is batch.spec_info
     assert update_kwargs["use_ragged"] is False
     expected_wrappers = (
@@ -163,7 +171,7 @@ def test_speculative_graph_metadata_passes_location_plan(mode):
     backend.init_forward_metadata_out_graph(batch)
 
     update_kwargs = backend.indices_updater_prefill.update.call_args.kwargs
-    assert update_kwargs["plan"] is batch.kv_loc_plan
+    assert update_kwargs["plan"] is batch.iteration_ids
     assert update_kwargs["use_ragged"] is False
     expected_wrappers = (
         backend.prefill_cuda_graph_metadata[batch.batch_size]
@@ -193,7 +201,7 @@ def test_non_quantized_draft_extend_preserves_ragged_metadata():
     assert update_args.args[4] is batch.extend_prefix_lens
     assert update_args.kwargs["spec_info"] is None
     assert update_args.kwargs["use_ragged"] is True
-    assert update_args.kwargs["plan"] is batch.kv_loc_plan
+    assert update_args.kwargs["plan"] is batch.iteration_ids
     assert backend.forward_metadata.use_ragged is True
 
 

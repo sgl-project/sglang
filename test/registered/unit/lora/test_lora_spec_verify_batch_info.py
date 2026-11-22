@@ -20,11 +20,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 def _verify_batch(bs: int, draft_token_num: int) -> SimpleNamespace:

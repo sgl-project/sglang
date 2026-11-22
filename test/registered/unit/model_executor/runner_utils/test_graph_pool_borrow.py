@@ -24,7 +24,7 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGraphPoolBorrow(CustomTestCase):
@@ -193,8 +193,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             draft_probs=None,
         )
         sampling_info = SimpleNamespace(
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
@@ -208,7 +207,10 @@ class TestGraphPoolBorrow(CustomTestCase):
             sampling_info=sampling_info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn((2, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,
@@ -387,6 +389,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                         extend_return_top_logprob=True,
                         extend_token_ids_logprob=True,
                         top_logprobs_nums=[2, 3],
+                        input_candidate_selectors=None,
                         extend_logprob_pruned_lens_cpu=[split, rows - split],
                         extend_input_logprob_token_ids_gpu=token_ids,
                         token_ids_logprobs=[[0, 7], [4]],
@@ -468,6 +471,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,

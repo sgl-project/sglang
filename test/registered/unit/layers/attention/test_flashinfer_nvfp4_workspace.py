@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.attention import flashinfer_backend as fi
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -92,6 +92,8 @@ def test_metadata_uses_normal_physical_page_table(ragged):
 def test_attention_scales_match_the_kv_representation(route, workspace):
     backend = object.__new__(fi.FlashInferAttnBackend)
     backend.num_wrappers = 1
+    backend.dispatch_reason = None
+    backend.runner_ids = None
     backend.use_sliding_window_kv_pool = False
     backend.is_dllm_model = False
     backend.prefill_uses_dequant_workspace = workspace
@@ -121,6 +123,9 @@ def test_attention_scales_match_the_kv_representation(route, workspace):
         get_flashinfer_speculative_dequant_workspace_kv_buffer=Mock(return_value=cache),
         get_flashinfer_decode_dequant_workspace_kv_buffer=Mock(return_value=cache),
         set_kv_buffer=Mock(),
+    )
+    pool.layer_router = SimpleNamespace(
+        read=lambda layer_id: SimpleNamespace(kv=lambda: pool.get_kv_buffer(layer_id))
     )
     backend.token_to_kv_pool = pool
     layer = SimpleNamespace(
@@ -169,6 +174,7 @@ def test_attention_scales_match_the_kv_representation(route, workspace):
         torch.zeros(1, 1),
     )
     backend.prefill_wrapper_ragged = Mock()
+    backend.prefill_wrappers_ragged = [backend.prefill_wrapper_ragged]
     backend.prefill_wrapper_ragged.forward_return_lse.return_value = (
         torch.zeros_like(q),
         torch.zeros(1, 1),

@@ -4,28 +4,31 @@
 use serde_json::{Map, Value, json};
 
 use super::schema_types::normalize_json_schema_types;
+use crate::render::RenderError;
 
-/// The `continue_final_message` prefix, taken off a final assistant turn with
-/// text content; without the flag that turn renders as a user turn.
-pub(super) fn split_continuation(
-    messages: &mut Vec<Value>,
-    request: &Value,
-) -> Result<String, String> {
+/// The request's `continue_final_message`, coerced as pydantic's `bool`.
+pub fn continues_final_message(request: &Value) -> Result<bool, String> {
+    request
+        .get("continue_final_message")
+        .map_or(Ok(false), pydantic_bool)
+}
+
+/// `_handle_last_assistant_message`: the `continue_final_message` prefix, taken
+/// off a final assistant turn with text content; without the flag that turn
+/// renders as a user turn.
+pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) -> String {
     let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") else {
-        return Ok(String::new());
+        return String::new();
     };
     let Some(content) = last["content"].as_str().map(str::to_owned) else {
-        return Ok(String::new());
+        return String::new();
     };
-    if request
-        .get("continue_final_message")
-        .map_or(Ok(false), pydantic_bool)?
-    {
+    if continuing {
         messages.pop();
-        return Ok(content);
+        return content;
     }
     *last = json!({"role": "user", "content": content});
-    Ok(String::new())
+    String::new()
 }
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
@@ -87,36 +90,86 @@ pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut V
         .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
-/// `protocol.py::Function.model_dump()`, in declared field order, after
-/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
+/// `Tool.model_dump()`'s `function` for each request tool, typed `"function"`;
+/// the encoder serializes it verbatim.
 pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
-        .map(|tool| {
-            let f = &tool["function"];
-            let name = f["name"].as_str().ok_or("tool function requires name")?;
-            let mut function = Map::new();
-            function.insert("description".into(), f["description"].clone());
-            function.insert("name".into(), name.into());
-            let mut parameters = f["parameters"].clone();
-            normalize_json_schema_types(&mut parameters);
-            function.insert("parameters".into(), parameters);
-            let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
-            function.insert("strict".into(), strict.into());
-            if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
-                .into_iter()
-                .flatten()
-                .find(|v| !v.is_null())
-            {
-                function.insert("defer_loading".into(), pydantic_bool(defer)?.into());
-            }
-            Ok(json!({"type": "function", "function": function}))
-        })
+        .map(|tool| Ok(json!({"type": "function", "function": function_dump(tool)?})))
         .collect()
 }
 
+/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
+/// parse to a JSON object. Nesting beyond serde_json's recursion limit, which
+/// orjson parses, is left to the engine.
+pub(super) fn parse_tool_arguments(message: &mut Value) -> Result<(), RenderError> {
+    if message["role"] != "assistant" {
+        return Ok(());
+    }
+    let calls = message.get_mut("tool_calls").and_then(Value::as_array_mut);
+    for arguments in calls
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.get_mut("function")?.get_mut("arguments"))
+    {
+        if let Some(text) = arguments.as_str() {
+            let parsed = serde_json::from_str::<Value>(text).map_err(|error| {
+                if error.to_string().starts_with("recursion limit exceeded") {
+                    RenderError::Declined("deeply nested tool arguments".into())
+                } else {
+                    "Assistant tool call function.arguments must be valid JSON.".into()
+                }
+            })?;
+            if !parsed.is_object() {
+                return Err("Assistant tool call function.arguments must be a JSON object.".into());
+            }
+            *arguments = parsed;
+        }
+    }
+    Ok(())
+}
+
+/// `protocol.py::Function.model_dump()`, after `Tool._propagate_defer_loading`
+/// and `_validate_request`'s schema-type normalization. `Function._serialize`
+/// keeps the keys in the order the client sent them, then the rest as declared,
+/// and leaves out an unset `strict` or `defer_loading`.
+pub(crate) fn function_dump(tool: &Value) -> Result<Map<String, Value>, String> {
+    let f = &tool["function"];
+    let name = f["name"].as_str().ok_or("tool function requires name")?;
+    let flag = |value: Option<&Value>| {
+        value
+            .filter(|value| !value.is_null())
+            .map(pydantic_bool)
+            .transpose()
+    };
+    let defer = match flag(f.get("defer_loading"))? {
+        Some(defer) => Some(defer),
+        None => flag(tool.get("defer_loading"))?,
+    };
+    let mut parameters = f["parameters"].clone();
+    normalize_json_schema_types(&mut parameters);
+    let declared = [
+        ("description", Some(f["description"].clone())),
+        ("name", Some(name.into())),
+        ("parameters", Some(parameters)),
+        ("strict", flag(f.get("strict"))?.map(Value::from)),
+        ("defer_loading", defer.map(Value::from)),
+    ];
+    let sent = f
+        .as_object()
+        .into_iter()
+        .flat_map(|function| function.keys().map(String::as_str));
+    let mut function = Map::new();
+    for key in sent.chain(declared.iter().map(|(key, _)| *key)) {
+        if let Some((_, Some(value))) = declared.iter().find(|(name, _)| *name == key) {
+            function.entry(key).or_insert_with(|| value.clone());
+        }
+    }
+    Ok(function)
+}
+
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-pub(super) fn pydantic_bool(value: &Value) -> Result<bool, String> {
+pub(crate) fn pydantic_bool(value: &Value) -> Result<bool, String> {
     let parsed = match value {
         Value::Bool(value) => Some(*value),
         Value::Number(number) => match number.as_f64() {

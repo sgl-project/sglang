@@ -101,6 +101,14 @@ class DecodeHiCachePreallocMixin:
                     prefix_keys,
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    kv_hints=req.kv_hints,
+                    # Only a namespaced binding reads the matched prefix.
+                    matched_prefix_tokens=(
+                        req.origin_input_ids[:matched_len]
+                        if (req.extra_key is not None or req.cache_salt is not None)
+                        and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
+                        else None
+                    ),
                 )
 
         return DecodePrefixMatch(
@@ -147,6 +155,7 @@ class DecodeHiCachePreallocMixin:
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
                 storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
+                kv_hints=req.kv_hints,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
@@ -169,7 +178,7 @@ class DecodeHiCachePreallocMixin:
             return 0
         return sum(
             dr.prefix_match.restore_token_count
-            for dr in self.transfer_queue.queue
+            for dr in self.transfer_queue.queue.items()
             if dr.prefix_match is not None and dr.hicache_restore_lock is None
         )
 
@@ -219,7 +228,9 @@ class DecodeHiCacheTransferMixin:
         if pm.l3_storage_hit_length > 0:
             if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
+            dr.req.storage_hit_length, dr.req.storage_hit_start = (
+                self.tree_cache.pop_prefetch_loaded_span(dr.req.cache_request_handle)
+            )
 
         # The transfer suffix is already allocated: rematch only promised tokens,
         # without overwriting the request's preallocation state or lock receipt.
@@ -267,6 +278,9 @@ class DecodeHiCacheTransferMixin:
             return False
 
         # The load published its span: the restored path holds the whole prefix.
+        dr.req.host_loaded_length = max(
+            0, pm.decode_prefix_len - rematch.device_prefix_len
+        )
         dr.hicache_restored_kv_indices = self.tree_cache.path_device_indices(
             restored_node
         )[pm.l1_prefix_len : pm.decode_prefix_len]

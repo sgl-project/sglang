@@ -1,11 +1,11 @@
 {
   "added_tokens_decoder": {
-    "308": {"content": "[BOS]"},
-    "309": {"content": "[EOS]"},
-    "310": {"content": "<|end_of_msg|>"},
-    "311": {"content": "<|open|>"},
-    "312": {"content": "<|close|>"},
-    "313": {"content": "<|sep|>"},
+    "322": {"content": "[BOS]"},
+    "323": {"content": "[EOS]"},
+    "324": {"content": "<|end_of_msg|>"},
+    "325": {"content": "<|open|>"},
+    "326": {"content": "<|close|>"},
+    "327": {"content": "<|sep|>"},
     "329": {"content": "<|media_pad|>"},
     "562": {"content": "[UNK]"},
     "563": {"content": "[PAD]"}

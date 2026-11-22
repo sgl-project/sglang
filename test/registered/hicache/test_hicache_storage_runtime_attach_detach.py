@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=308, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=226, stage="extra-a", runner_config="2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
@@ -209,15 +209,15 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             code_info, _body_info = self._http_get(
                 f"{self.base_url}/hicache/storage-backend", timeout=10
             )
-            self.assertEqual(code_info, 400)
+            self.assertEqual(code_info, 403)
             code_attach_no_admin, _body_attach_no_admin = self._attach_backend(
                 base_url=self.base_url, backend="file", extra_cfg={}
             )
-            self.assertEqual(code_attach_no_admin, 400)
+            self.assertEqual(code_attach_no_admin, 403)
             code_detach_no_admin, _body_detach_no_admin = self._detach_backend(
                 self.base_url
             )
-            self.assertEqual(code_detach_no_admin, 400)
+            self.assertEqual(code_detach_no_admin, 403)
         finally:
             terminate_and_kill_process_tree(process1)
             time.sleep(2)

@@ -6,10 +6,6 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
 from sglang.multimodal_gen.configs.pipeline_configs import krea2
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
@@ -18,21 +14,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
 from sglang.multimodal_gen.runtime.models.dits.krea2 import (
     Krea2Transformer2DModel,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 
 
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
-def test_krea2_online_fp8_quantizes_transformer_linears():
-    _ensure_single_process_parallel_runtime()
-
+def test_krea2_online_fp8_quantizes_transformer_linears(
+    single_process_model_parallel,
+):
     quant_config = Fp8Config(
         ignored_layers=[
             "transformer_blocks.0.attn.to_q",
