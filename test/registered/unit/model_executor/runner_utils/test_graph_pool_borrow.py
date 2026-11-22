@@ -193,8 +193,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             draft_probs=None,
         )
         sampling_info = SimpleNamespace(
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
+            step_penalties=None,
             logit_bias=None,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
@@ -390,6 +389,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                         extend_return_top_logprob=True,
                         extend_token_ids_logprob=True,
                         top_logprobs_nums=[2, 3],
+                        input_candidate_selectors=None,
                         extend_logprob_pruned_lens_cpu=[split, rows - split],
                         extend_input_logprob_token_ids_gpu=token_ids,
                         token_ids_logprobs=[[0, 7], [4]],
@@ -471,6 +471,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,
