@@ -4456,6 +4456,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
+        self.sampler_params_pool.write(new_batch.reqs)
         # Replays the prefill node's output token into the penalty history.
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
