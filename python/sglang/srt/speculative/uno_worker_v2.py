@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
@@ -251,23 +252,17 @@ class UnoWorkerV2(BaseSpecWorker):
         if sampling_info.need_min_p_sampling:
             raise NotImplementedError("UNO does not support min-p sampling.")
 
-        if batch.has_grammar:
-            raise NotImplementedError("UNO does not support grammar decoding.")
+        if adjusts_logits(sampling_info, has_grammar=batch.has_grammar):
+            raise NotImplementedError(
+                "UNO does not support logit adjustments (grammar, penalties, "
+                "logit bias, custom logit processors, or watermarks)."
+            )
 
         if batch.return_logprob:
             raise NotImplementedError("UNO does not support returned logprobs.")
 
         if batch.return_hidden_states:
             raise NotImplementedError("UNO does not support returned hidden states.")
-
-        if sampling_info.step_penalties is not None:
-            raise NotImplementedError("UNO does not support sampling penalties.")
-
-        if sampling_info.logit_bias is not None:
-            raise NotImplementedError("UNO does not support logit bias.")
-
-        if sampling_info.has_custom_logit_processor:
-            raise NotImplementedError("UNO does not support custom logit processors.")
 
         if any(req.lora_id is not None for req in batch.reqs):
             raise NotImplementedError("UNO does not support multi-LoRA.")
