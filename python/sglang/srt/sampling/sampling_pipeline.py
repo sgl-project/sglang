@@ -102,9 +102,11 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             maybe_detect_nan(
                 logits_output.next_token_logits, "sampler: next_token_logits"
             )
-            _adjust_after_watermark(logits_output.next_token_logits, sampler_info)
-            if logprob_logits is not None:
-                _adjust_after_watermark(logprob_logits, sampler_info)
+            _adjust_after_watermark(
+                logits_output.next_token_logits,
+                sampler_info,
+                logprob_logits=logprob_logits,
+            )
             next_token_ids = self.sampler(
                 logits_output,
                 sampler_info,
@@ -216,12 +218,37 @@ def _adjust_before_watermark(
 
 
 def _adjust_after_watermark(
-    logits: torch.Tensor, sampling_info: SamplingBatchInfo
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    *,
+    logprob_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The custom logit processors, then non-finite sanitizing, in place."""
-    apply_custom_logit_processor(logits, sampling_info)
+    """Decode's stages after the watermark, in place: the custom logit
+    processor, then non-finite sanitizing."""
+    _apply_custom_logit_processor(logits, sampling_info, logprob_logits=logprob_logits)
     sanitize_nan_logits(logits, "sampler: next_token_logits")
+    if logprob_logits is not None:
+        sanitize_nan_logits(logprob_logits, "sampler: next_token_logits")
     return logits
+
+
+def _apply_custom_logit_processor(
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    *,
+    logprob_logits: Optional[torch.Tensor],
+    rows_per_request: int = 1,
+) -> None:
+    """The custom logit processor stage, in place, on the logits the sampler or
+    accept core reads and on `logprob_logits`, the unwatermarked copy the
+    watermark keeps for the logprobs."""
+    apply_custom_logit_processor(
+        logits, sampling_info, rows_per_request=rows_per_request
+    )
+    if logprob_logits is not None:
+        apply_custom_logit_processor(
+            logprob_logits, sampling_info, rows_per_request=rows_per_request
+        )
 
 
 class VerifyRoute(msgspec.Struct, frozen=True):
@@ -374,10 +401,10 @@ def adjust_verify_logits(
             logits, sampling_info=sampling_info
         )
     if has_custom_logit_processor:
-        width = draft_tokens.shape[1]
-        apply_custom_logit_processor(
-            verify_logits, sampling_info, rows_per_request=width
+        _apply_custom_logit_processor(
+            verify_logits,
+            sampling_info,
+            logprob_logits=None if verify_logits is logits else logits,
+            rows_per_request=draft_tokens.shape[1],
         )
-        if verify_logits is not logits:
-            apply_custom_logit_processor(logits, sampling_info, rows_per_request=width)
     return verify_logits, sampling_info

@@ -115,7 +115,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             ),
             patch(
                 f"{module}.apply_custom_logit_processor",
-                side_effect=lambda logits, info: events.append(
+                side_effect=lambda logits, info, **kwargs: events.append(
                     f"custom {named(logits)}"
                 ),
             ),
@@ -138,8 +138,8 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 "logit_bias",
                 "watermark",
                 "custom logits",
-                "sanitize logits",
                 "custom logprob",
+                "sanitize logits",
                 "sanitize logprob",
                 "sampler",
                 "watermark commit",
