@@ -181,6 +181,25 @@ def test_alpha_pattern_is_checked_against_the_original_alpha(fmt):
         )
 
 
+@pytest.mark.parametrize("fmt", list(_ALPHA_PATTERN_MODULES))
+def test_alpha_pattern_with_default_adapter_slot(fmt):
+    # PEFT-saved Kohya files name the slot: `.lora_down.default.weight`.
+    kohya, native, dit_class_name = _ALPHA_PATTERN_MODULES[fmt]
+    plain = _kohya([kohya.format("v")])
+    plain[f"lora_unet_{kohya.format('v')}.alpha"] = torch.tensor(float(RANK))
+    slotted = {k.replace(".weight", ".default.weight"): v for k, v in plain.items()}
+    cfg = {"alpha_pattern": {"to_v": RANK}}
+    out = normalize_lora_state_dict(
+        slotted, adapter_config=cfg, dit_class_name=dit_class_name
+    )
+    ref = normalize_lora_state_dict(
+        plain, adapter_config=cfg, dit_class_name=dit_class_name
+    )
+    n = native.format("v")
+    for suffix in (".lora_A.weight", ".lora_B.weight", ".alpha"):
+        torch.testing.assert_close(out[n + suffix], ref[n + suffix])
+
+
 def test_alpha_pattern_on_fused_z_image_qkv_must_agree_across_q_k_v():
     # Newer diffusers split a fused `qkv` into to_q/k/v that share one alpha.
     torch.manual_seed(0)

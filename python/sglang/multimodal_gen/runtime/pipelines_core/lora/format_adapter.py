@@ -478,6 +478,12 @@ _Z_IMAGE_MODULE_NAME_FIXUPS = {
 _KOHYA_DOWN_SUFFIXES = (".lora_down.weight", ".lora.down.weight")
 
 
+def _strip_default_slot(key: str) -> str:
+    if key.endswith(".default.weight"):
+        return key.removesuffix(".default.weight") + ".weight"
+    return key
+
+
 def _kohya_alpha_key(module: str) -> str:
     # Dot-format "to.q" modules look their alpha up as "to_q".
     return re.sub(r"to\.([qkv])$", r"to_\1", module) + ".alpha"
@@ -580,7 +586,12 @@ def _convert_kohya_dit_via_diffusers(
             sd, converter_name, model_name, log, module_name_fixups
         )
 
-    state_dict = dict(state_dict)
+    # PEFT-saved files can name the adapter slot (`.lora_down.default.weight`).
+    # Diffusers drops it before converting; drop it here so alphas resolve per
+    # module as well.
+    state_dict = {
+        _strip_default_slot(key): tensor for key, tensor in state_dict.items()
+    }
     downs = {
         key[: -len(suffix)]: key
         for key in state_dict
