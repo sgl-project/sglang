@@ -551,7 +551,9 @@ MarlinFuncPtr get_marlin_kernel(
     if (false) {
     }
     MXFP4_GET_IF(host::kFE2M1f)
+#ifndef SGL_MARLIN_MOE_HOST_COPY
     MXFP8_GET_IF(host::kFE4M3fn)
+#endif
   }
 
   return kernel;
