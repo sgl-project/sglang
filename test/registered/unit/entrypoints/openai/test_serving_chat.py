@@ -3104,8 +3104,9 @@ class ServingChatTestCase(CustomTestCase):
         }
 
     def test_glm_json_answer_thinking_end_only_without_reasoning_parser(self):
-        """Only a thinking block that no reasoning parser takes out is dropped
-        from the content; without the block there is nothing to drop."""
+        """Only a thinking block that no reasoning parser takes out, because
+        none is set or reasoning is not separated, is marked for the tool
+        parser; without the block there is nothing to mark."""
         self.chat.tool_call_parser = "glm47"
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=True
@@ -3115,6 +3116,7 @@ class ServingChatTestCase(CustomTestCase):
             (None, {"enable_thinking": False}, True, ""),
             (None, None, False, "</think>"),
             ("glm45", None, True, ""),
+            ("glm45", None, False, "</think>"),
         ):
             with self.subTest(
                 reasoning_parser=reasoning_parser,
@@ -3241,8 +3243,8 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_glm_json_answer_with_reasoning_parser_parses_calls_by_turn(self):
         """With --reasoning-parser glm45, a JSON answer quoting the call marker
-        stays an answer, streamed or not, also unseparated with thinking off,
-        while unseparated reasoning ahead of a call does not hide the call."""
+        stays an answer, streamed or not, separated or not; unseparated
+        reasoning stays ahead of a call and is dropped from a JSON answer."""
         self.chat.tool_call_parser = "glm47"
         self.chat.reasoning_parser = "glm45"
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -3266,6 +3268,14 @@ class ServingChatTestCase(CustomTestCase):
                 False,
                 None,
                 ("", "Plan.</think>", [("read_file", {"path": "note.txt"})]),
+            ),
+            # Unseparated reasoning is skipped as without a reasoning parser.
+            ('Plan.</think>{"word": "hi"}', False, None, ("", '{"word": "hi"}', [])),
+            (
+                'Plan.</think>{"word": "<tool_call>"}',
+                False,
+                None,
+                ("", '{"word": "<tool_call>"}', []),
             ),
             # With thinking off nothing precedes a call, so the answer check holds.
             (quoted_call, False, thinking_off, ("", quoted_call, [])),

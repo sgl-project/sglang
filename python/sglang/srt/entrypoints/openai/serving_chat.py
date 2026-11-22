@@ -1895,20 +1895,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 request, parser, answer_json_schema, thinking_mode=answer_thinking
             )
             tool_call_constraint_covers_answer = tool_call_constraint is not None
-            # Unseparated reasoning reaches the tool parser ahead of the calls.
             request._response_parser_answer_excludes_calls = (
                 tool_call_constraint_covers_answer
-                and (
-                    request.separate_reasoning
-                    or not self.reasoning_parser
-                    or not answer_thinking
-                )
             )
+            # Unseparated reasoning reaches the tool parser as it does without a
+            # reasoning parser, so the same marker skips it.
             request._response_parser_thinking_end = (
                 GlmSpecialTokenConfig().end_of_thinking
                 if tool_call_constraint_covers_answer
                 and answer_thinking
-                and not self.reasoning_parser
+                and (not self.reasoning_parser or not request.separate_reasoning)
                 else ""
             )
             if tool_call_constraint is None:
