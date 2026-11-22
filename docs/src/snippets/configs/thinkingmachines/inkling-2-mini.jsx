@@ -57,8 +57,8 @@ export const config = {
     rtx6000: "lmsysorg/sglang:inkling-2-mini",
     rtx5090: "lmsysorg/sglang:inkling-2-mini",
     "dgx-spark": "lmsysorg/sglang:inkling-2-mini",
-    mi350x: "radixark/sglang:dev-inkling-2-mini-mi35x",
-    mi355x: "radixark/sglang:dev-inkling-2-mini-mi35x",
+    mi350x: "lmsysorg/sglang:inkling-2-mini-mi35x",
+    mi355x: "lmsysorg/sglang:inkling-2-mini-mi35x",
     tpu7x: "lmsysorg/sglang:inkling-2-mini-tpu",
   },
 
