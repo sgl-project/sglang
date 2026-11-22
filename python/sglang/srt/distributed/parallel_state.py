@@ -134,61 +134,63 @@ class GraphCaptureContext:
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
+    waited: bool = False
 
-    def wait(self) -> None:
-        if self.work is not None:
-            self.work.wait()
-
-
-class _WaitedHostSend:
-    """Stands in for a gloo send that ``wait_host_sends`` waited: a second wait of a
-    gloo send blocks for a completion that never comes."""
-
-    def wait(self, timeout=None) -> bool:
-        return True
-
-    def is_completed(self) -> bool:
-        return True
+    def wait(self, timeout: Optional[timedelta] = None) -> None:
+        """Wait once: a gloo send waited again blocks until the group's timeout."""
+        if self.work is not None and not self.waited:
+            if timeout is None:
+                self.work.wait()
+            else:
+                self.work.wait(timeout)
+        self.waited = True
 
 
-_WAITED_HOST_SEND = _WaitedHostSend()
-# Async CPU-group sends of the scheduler thread since the torch profiler started.
+# Async CPU-group sends of one thread since the torch profiler started, and that thread.
 _tracked_host_sends: Optional["weakref.WeakSet[P2PWork]"] = None
+_tracking_thread: Optional[int] = None
 
 
 def host_send(work: torch.distributed.Work, payload: torch.Tensor) -> P2PWork:
     """Wrap an async CPU-group (gloo) send; tracked for ``wait_host_sends`` while a
     torch profiler runs."""
     p2p_work = P2PWork(work, payload)
-    if (
-        _tracked_host_sends is not None
-        and threading.current_thread() is threading.main_thread()
-    ):
+    if _tracked_host_sends is not None and threading.get_ident() == _tracking_thread:
         _tracked_host_sends.add(p2p_work)
     return p2p_work
 
 
 def track_host_sends() -> None:
-    """Call right after the torch profiler starts."""
-    global _tracked_host_sends
+    """Call right after the torch profiler starts, on the thread that stops it."""
+    global _tracked_host_sends, _tracking_thread
     _tracked_host_sends = weakref.WeakSet()
+    _tracking_thread = threading.get_ident()
 
 
-def wait_host_sends() -> int:
-    """Call right before the torch profiler stops: wait every tracked send nobody has
-    waited yet, once, and return how many. A gloo send started under the profiler ends
-    its RecordFunction in ``wait()``; after ``stop()`` that write lands in freed event
-    storage and corrupts the host heap. The caller must be at a point where every
-    receiver can post its receive without this rank's further progress."""
-    global _tracked_host_sends
-    tracked, _tracked_host_sends = _tracked_host_sends, None
-    if not tracked:
-        return 0
-    pending = [w for w in tracked if not w.work.is_completed()]
-    for p2p_work in pending:
-        p2p_work.work.wait()
-        p2p_work.work = _WAITED_HOST_SEND
-    return len(pending)
+def wait_host_sends(timeout: timedelta) -> None:
+    """Call right before the torch profiler stops: wait each tracked send nobody has
+    waited yet. A gloo send started under the profiler ends its RecordFunction in
+    ``wait()``, and after ``stop()`` that write lands in freed host memory.
+
+    Every receiver must be able to post its receive without this rank's further
+    progress (PP loops stop at an iteration boundary). A send its peer does not
+    receive within ``timeout`` raises; gloo then closes that connection."""
+    global _tracked_host_sends, _tracking_thread
+    tracked, _tracked_host_sends, _tracking_thread = _tracked_host_sends, None, None
+    pending = [w for w in tracked or () if not w.waited]
+    try:
+        for p2p_work in pending:
+            p2p_work.wait(timeout)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Stopping the torch profiler: {len(pending)} async CPU-group sends of "
+            f"this PP stage were not received within {timeout}; the receiving "
+            "stage is gone or stuck"
+        ) from exc
+    if pending:
+        logger.info(
+            "Waited %d PP host sends before stopping the profiler.", len(pending)
+        )
 
 
 def _split_tensor_dict(

@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -61,8 +62,8 @@ class SchedulerProfilerManager:
     def __post_init__(self) -> None:
         self.dp_tp_cpu_group = get_dp_tp_group().cpu_group
         # PP loops run the step predicate at the end of each iteration
-        # (run_at_boundary): a stop there may wait the stage's sends.
-        self.at_boundary = False
+        # (run_at_boundary), where a stop may wait the stage's sends.
+        self.at_boundary = get_parallel().pp_size > 1
         self._boundary_batch: Optional[ScheduleBatch] = None
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
@@ -344,7 +345,14 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
-            wait_host_sends()
+            try:
+                # The same bound the scheduler watchdog puts on a stuck batch.
+                wait_host_sends(timedelta(seconds=get_device().watchdog_timeout))
+            except RuntimeError:
+                # The profiler cannot stop safely; let the error surface once.
+                self.torch_profiler = None
+                self.profile_in_progress = False
+                raise
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
@@ -425,8 +433,8 @@ class SchedulerProfilerManager:
 
     def run_at_boundary(self) -> None:
         """Run the step predicate of the batch this PP loop iteration launched, if any.
-        Every send of the iteration is out by now, so the next stage can receive them
-        all and a stop may wait them (wait_host_sends)."""
+        Every send of the iteration is out, so a stop may wait them (wait_host_sends);
+        a capture the predicate starts here covers the stage's next batch onward."""
         batch, self._boundary_batch = self._boundary_batch, None
         if batch is not None:
             self._run_profile_predicate(batch)

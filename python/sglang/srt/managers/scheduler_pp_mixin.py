@@ -671,8 +671,6 @@ class SchedulerPPMixin:
         self.pp_loop_size: int = (
             get_parallel().pp_size + get_parallel().pp_async_batch_depth
         )
-        # Profiler starts and stops wait for the end of the loop iteration.
-        self.profiler_manager.at_boundary = True
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -868,7 +866,7 @@ class SchedulerPPMixin:
     ) -> None:
         with self.pp_comm_stream_ctx:
             for p2p_work in work:
-                p2p_work.work.wait()
+                p2p_work.wait()
         if fence_next_forward and work:
             # CUDA Graph outputs are views of replay-owned static buffers. Do not
             # replay the next forward until NCCL has stopped reading the previous

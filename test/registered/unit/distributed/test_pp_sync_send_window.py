@@ -1,9 +1,12 @@
 """Unit tests for srt/distributed/pp_sync_window."""
 
+import tempfile
 import threading
 import unittest
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -14,11 +17,13 @@ from sglang.srt.distributed.parallel_state import (
     wait_host_sends,
 )
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import profiler_manager
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -76,26 +81,26 @@ class TestPPSyncSendWindow(CustomTestCase):
 
 
 class _GlooSendWork:
-    """A gloo send Work: completed only once waited, and a second wait never returns."""
+    """A gloo send Work: a second wait blocks until the group's timeout."""
 
-    def __init__(self):
+    def __init__(self, fail=False):
         self.waits = 0
+        self.fail = fail
 
-    def wait(self):
+    def wait(self, timeout=None):
         assert self.waits == 0, "a gloo send waited twice blocks"
         self.waits += 1
-
-    def is_completed(self):
-        return self.waits > 0
+        if self.fail:
+            raise RuntimeError("Timed out waiting for send operation to complete")
 
 
 class TestHostSendsBeforeProfilerStop(CustomTestCase):
-    """A gloo send started under the torch profiler ends its RecordFunction in
-    wait(); waited after profiler.stop(), that write lands in freed memory. The
-    stop waits the scheduler thread's un-waited sends first, each exactly once."""
+    """The profiler stop waits the tracking thread's un-waited sends, each once;
+    any later wait of the same send returns at once."""
 
     def tearDown(self):
         parallel_state._tracked_host_sends = None
+        parallel_state._tracking_thread = None
 
     def test_stop_waits_each_unwaited_send_once_and_the_window_skips_it_later(self):
         untracked = host_send(_GlooSendWork(), torch.zeros(1))
@@ -109,42 +114,72 @@ class TestHostSendsBeforeProfilerStop(CustomTestCase):
             )
             window.add(rounds[-1])
         works = [p2p.work for sends in rounds for p2p in sends]
-        # The window already waited the oldest round; the stop must not wait it again.
         self.assertEqual([w.waits for w in works], [1, 1, 0, 0, 0, 0])
 
-        self.assertEqual(wait_host_sends(), 4)
+        wait_host_sends(timedelta(seconds=1))
         self.assertEqual([w.waits for w in works], [1] * 6)
         self.assertEqual(untracked.work.waits, 0)
-        # The window's own later waits reach none of the drained sends.
         for _ in range(3):
             window.begin_round()
         self.assertEqual([w.waits for w in works], [1] * 6)
-        self.assertEqual(wait_host_sends(), 0)
 
-    def test_only_the_scheduler_thread_sends_are_tracked(self):
-        track_host_sends()
-        other = []
-        thread = threading.Thread(
-            target=lambda: other.append(host_send(_GlooSendWork(), torch.zeros(1)))
-        )
+    def test_only_the_tracking_thread_sends_are_tracked(self):
+        tracked = []
+
+        def stage_thread():
+            track_host_sends()
+            tracked.append(host_send(_GlooSendWork(), torch.zeros(1)))
+
+        thread = threading.Thread(target=stage_thread)
         thread.start()
         thread.join()
-        self.assertEqual(wait_host_sends(), 0)
-        self.assertEqual(other[0].work.waits, 0)
+        other = host_send(_GlooSendWork(), torch.zeros(1))
+        wait_host_sends(timedelta(seconds=1))
+        self.assertEqual((tracked[0].work.waits, other.work.waits), (1, 0))
 
-    def test_pp_loops_run_the_step_predicate_at_the_iteration_boundary(self):
+    def test_a_peer_that_never_receives_fails_the_stop_and_leaves_no_tracking(self):
+        track_host_sends()
+        send = host_send(_GlooSendWork(fail=True), torch.zeros(1))
+        with self.assertRaisesRegex(RuntimeError, "were not received"):
+            wait_host_sends(timedelta(seconds=1))
+        self.assertFalse(send.waited)
+        self.assertIsNone(parallel_state._tracked_host_sends)
+
         manager = object.__new__(SchedulerProfilerManager)
-        manager.at_boundary = True
-        manager._boundary_batch = None
-        manager._run_profile_predicate = Mock()
-        batch = SimpleNamespace()
+        manager.__dict__.update(
+            profile_in_progress=True,
+            torch_profiler=Mock(),
+            torch_profiler_output_dir=Path(tempfile.mkdtemp()),
+            profile_prefix=None,
+        )
+        profiler = manager.torch_profiler
+        with (
+            published_topology(),
+            envs.SGLANG_PROFILE_V2.override(False),
+            patch.object(
+                profiler_manager, "wait_host_sends", side_effect=RuntimeError("gone")
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            manager._stop_profile()
+        profiler.stop.assert_not_called()
+        self.assertFalse(manager.profile_in_progress)
+        self.assertIsNone(manager.torch_profiler)
 
-        manager._profile_batch_predicate(batch)
-        manager._run_profile_predicate.assert_not_called()
-        manager.run_at_boundary()
-        manager._run_profile_predicate.assert_called_once_with(batch)
-        manager.run_at_boundary()
-        manager._run_profile_predicate.assert_called_once_with(batch)
+    def test_only_pp_loops_defer_the_step_predicate_to_the_iteration_boundary(self):
+        for at_boundary in (False, True):
+            manager = object.__new__(SchedulerProfilerManager)
+            manager.at_boundary = at_boundary
+            manager._boundary_batch = None
+            manager._run_profile_predicate = Mock()
+            batch = SimpleNamespace()
+
+            manager._profile_batch_predicate(batch)
+            self.assertEqual(
+                manager._run_profile_predicate.call_count, 0 if at_boundary else 1
+            )
+            manager.run_at_boundary()
+            manager._run_profile_predicate.assert_called_once_with(batch)
 
 
 if __name__ == "__main__":
