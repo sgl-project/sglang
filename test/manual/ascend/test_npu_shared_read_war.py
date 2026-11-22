@@ -12,8 +12,6 @@ device delay did not expose the race and the test must not report success.
 Metadata stays outside the graph; only the snapshot-consuming tail is captured.
 The MTP fixture exercises plan-stream hand-offs and last-reader selection,
 not the full EAGLE worker or an attention kernel.
-Hybrid fixtures use the real wrapper and KDA/GDN read-end declarations with a
-delayed Mamba-index gather, without running a linear-attention kernel.
 """
 
 from types import SimpleNamespace
@@ -27,9 +25,7 @@ class _SharedReadCase:
     REPLAYS = 8
     SLEEP_CYCLES = 100_000_000
 
-    def __init__(
-        self, *, graph, mode="DECODE", marker=True, early=False, plan=False, linear=None
-    ):
+    def __init__(self, *, graph, mode="DECODE", marker=True, early=False, plan=False):
         # Keep imports behind the NPU fixture so CPU-only collection can skip.
         from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
@@ -126,59 +122,17 @@ class _SharedReadCase:
         self.attn.graph_metadata = {2: self.attn.forward_metadata}
         self.observed = torch.empty_like(self.attn.forward_metadata.block_tables)
 
-        self.metadata_backend = self.attn
-        self.linear = linear
-        if linear is not None:
-            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
-                AscendGDNAttnBackend,
-            )
-            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
-                AscendHybridLinearAttnBackend,
-            )
-            from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-            from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-
-            self.old_slots = torch.tensor([4, 7], device="npu")
-            self.new_slots = self.old_slots + 31
-            self.linear_pool = SimpleNamespace(
-                req_index_to_mamba_index_mapping=self.old_slots.clone()
-            )
-            self.state_indices = torch.empty_like(self.old_slots)
-            self.observed_states = torch.empty_like(self.old_slots)
-
-            def prepare_linear(batch, **kwargs):
-                self._delay()
-                self.state_indices.copy_(
-                    HybridReqToTokenPool.get_mamba_indices(
-                        self.linear_pool, batch.req_pool_indices
-                    )
-                )
-
-            cls = AscendGDNAttnBackend if linear == "gdn" else KDAAttnBackend
-            linear_backend = cls.__new__(cls)
-            linear_backend.init_forward_metadata = prepare_linear
-            linear_backend.init_forward_metadata_out_graph = prepare_linear
-            hybrid = AscendHybridLinearAttnBackend.__new__(
-                AscendHybridLinearAttnBackend
-            )
-            hybrid.full_attn_backend = self.attn
-            hybrid.linear_attn_backend = linear_backend
-            hybrid.attn_backend_list = [self.attn, linear_backend]
-            self.metadata_backend = hybrid
-
         self.runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         self.runner.device_module = torch.npu
         self.runner.model_runner = SimpleNamespace(shared_read_done_event=None)
         self.attn._shared_read_runner = self.runner.model_runner
-        self.runner.attn_backend = self.metadata_backend
+        self.runner.attn_backend = self.attn
         self.runner.capture_forward_mode = self.batch.forward_mode
         self.runner.backend = NPUCudaGraphBackend.__new__(NPUCudaGraphBackend)
         self.runner.backend._decode_runner = self.runner
         assert self.runner.backend.supports_shared_read_events
         assert (
-            self.runner._resolve_shared_read_ends(
-                self.metadata_backend, self.batch.forward_mode
-            )
+            self.runner._resolve_shared_read_ends(self.attn, self.batch.forward_mode)
             is SharedReadEnds.PRE_REPLAY
         )
 
@@ -238,13 +192,11 @@ class _SharedReadCase:
             early_event = self.runner.model_runner.shared_read_done_event
         self._delay()
         if self.graph_enabled:
-            self.metadata_backend.init_forward_metadata_out_graph(self.batch)
+            self.attn.init_forward_metadata_out_graph(self.batch)
             self.runner._publish_read_done(in_graph=False)
         else:
-            with self.forward_context(
-                self.ForwardContext(attn_backend=self.metadata_backend)
-            ):
-                self.metadata_backend.init_forward_metadata(self.batch)
+            with self.forward_context(self.ForwardContext(attn_backend=self.attn)):
+                self.attn.init_forward_metadata(self.batch)
         assert self.runner.model_runner.shared_read_done_event is not None
         if not self.marker or self.early:
             # Negative controls suppress or replace the real publication.
@@ -254,8 +206,6 @@ class _SharedReadCase:
         self._delay()
         # No live req_to_token reads after the marker: only the private snapshot.
         self.observed.copy_(self.attn.forward_metadata.block_tables)
-        if self.linear is not None:
-            self.observed_states.copy_(self.state_indices)
 
     def _plan_copy(self, stream, context, destination, source):
         if stream is not None:
@@ -274,10 +224,6 @@ class _SharedReadCase:
             self.new_table.add_(8 * self.PAGE_SIZE)
             self.attn.req_to_token.copy_(self.old_table)
             self.input_requests.copy_(self.request_orders[order])
-            if self.linear is not None:
-                self.old_slots.add_(8)
-                self.new_slots.add_(8)
-                self.linear_pool.req_index_to_mamba_index_mapping.copy_(self.old_slots)
 
         forward_done = torch.npu.Event()
         write_done = torch.npu.Event()
@@ -323,8 +269,6 @@ class _SharedReadCase:
             if protection != "off":
                 assert self.runner.model_runner.shared_read_done_event is None
             self.attn.req_to_token.copy_(self.new_table)
-            if self.linear is not None:
-                self.linear_pool.req_index_to_mamba_index_mapping.copy_(self.new_slots)
             write_done.record()
 
         # All competing work is now enqueued. Host waits/readbacks only observe
@@ -417,39 +361,3 @@ def test_mtp_waits_for_the_last_reader(make_case, plan, wrong_phase, graph):
         early_releases += early
     if not wrong_phase:
         assert early_releases, "read-done unexpectedly waited for the whole forward"
-
-
-@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
-@pytest.mark.parametrize("linear", ["gdn", "kda"])
-@pytest.mark.parametrize("mode", ["DECODE", "TARGET_VERIFY"])
-def test_hybrid_read_done_covers_linear_mapping(make_case, graph, linear, mode):
-    case = make_case(graph=graph, linear=linear, mode=mode)
-    early_releases = 0
-    for _ in range(case.REPLAYS):
-        observed, expected, early = case.run()
-        order = (case.iteration - 1) % 2
-        expected_states = (torch.tensor([4, 7]) + 8 * case.iteration)[
-            [order, 1 - order]
-        ]
-        assert torch.equal(observed, expected)
-        assert torch.equal(case.observed_states.cpu(), expected_states)
-        early_releases += early
-    assert early_releases, "hybrid read-done waited for the independent forward tail"
-
-
-@pytest.mark.parametrize("linear", ["gdn", "kda"])
-def test_full_child_event_does_not_cover_linear_mapping(make_case, linear, monkeypatch):
-    case = make_case(graph=False, linear=linear)
-    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-        HybridLinearAttnBackend,
-    )
-
-    # Reproduce the old full-child publication before the linear child's gather.
-    monkeypatch.setattr(
-        case.metadata_backend,
-        "init_forward_metadata",
-        HybridLinearAttnBackend.init_forward_metadata.__get__(case.metadata_backend),
-    )
-    observed, expected, _ = case.run()
-    assert torch.equal(observed, expected)
-    assert torch.equal(case.observed_states.cpu(), torch.tensor([4, 7]) + 8 + 31)

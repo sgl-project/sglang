@@ -7,7 +7,11 @@ import torch
 import torch_npu
 from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -578,6 +582,11 @@ class AscendAttnBackend(AttentionBackend):
         self._shared_read_runner = model_runner
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        if not (self.use_dsa or is_deepseek_v4(model_runner.model_config.hf_config)):
+            return False
+        # Hybrid targets and their drafts share the state-bearing request pool.
+        if model_runner.req_to_token_pool.holds_state_slots:
+            return False
         if not (
             model_runner.spec_algorithm.is_none()
             or model_runner.spec_algorithm is SpeculativeAlgorithm.EAGLE
@@ -599,19 +608,11 @@ class AscendAttnBackend(AttentionBackend):
             return SharedReadEnds.PRE_REPLAY
         return SharedReadEnds.UNKNOWN
 
-    def _publish_eager_shared_read_done(
-        self,
-        forward_batch: ForwardBatch,
-        *,
-        read_end: SharedReadEnds = SharedReadEnds.PRE_REPLAY,
-    ) -> None:
+    def _publish_eager_shared_read_done(self, forward_batch: ForwardBatch) -> None:
         # The final eager preparation replaces any earlier phase's event.
         runner = self._shared_read_runner
         runner.shared_read_done_event = None
-        if (
-            read_end is not SharedReadEnds.PRE_REPLAY
-            or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
-        ):
+        if envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             return
         mode = forward_batch.forward_mode
         if mode.is_draft_extend_v2() and not has_forward_context():

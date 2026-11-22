@@ -16,7 +16,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -260,21 +259,6 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         full_attn_layers: list[int],
     ):
         super().__init__(full_attn_backend, linear_attn_backend, full_attn_layers)
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        full = self.full_attn_backend
-        if (
-            not getattr(full, "shared_read_enabled", False)
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            # Draft extend keeps the existing full-attention-only preparation.
-            return super().init_forward_metadata(forward_batch)
-        full.init_forward_metadata(forward_batch, publish_read_done=False)
-        self.linear_attn_backend.init_forward_metadata(forward_batch)
-        # Publish once both the KV and Mamba mapping snapshots are ready.
-        full._publish_eager_shared_read_done(
-            forward_batch, read_end=self.shared_read_ends(forward_batch.forward_mode)
-        )
 
     def update_mamba_state_after_mtp_verify(
         self,

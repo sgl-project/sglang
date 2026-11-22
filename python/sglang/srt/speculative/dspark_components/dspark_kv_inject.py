@@ -156,7 +156,10 @@ class TargetHiddenKvInjector:
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
         iteration_ids: Optional[IterationIds] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
+        if swa_loc is not None and commit_lens is not None:
+            swa_loc = self.mask_committed_swa_loc(swa_loc, commit_lens)
         self._inject(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -167,7 +170,18 @@ class TargetHiddenKvInjector:
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
             iteration_ids=iteration_ids,
+            swa_loc=swa_loc,
         )
+
+    def mask_committed_swa_loc(
+        self, swa_loc: torch.Tensor, commit_lens: torch.Tensor
+    ) -> torch.Tensor:
+        # A pre-verify snapshot includes rejected columns; only accepted tokens write KV.
+        return torch.where(
+            self._block_pos_offsets.view(1, -1) < commit_lens.view(-1, 1),
+            swa_loc.view(-1, self.verify_num_draft_tokens),
+            -1,
+        ).reshape(-1)
 
     def _inject(
         self,

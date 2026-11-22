@@ -14,6 +14,7 @@ from sgl_kernel_npu.operators import attention as npu_attention_ops
 from sgl_kernel_npu.operators import indexer as npu_indexer_ops
 from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
 
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
@@ -25,6 +26,7 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -34,7 +36,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
@@ -2638,6 +2640,42 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+        self.prepare_in_graph = (
+            envs.SGLANG_NPU_PREPARE_METADATA_IN_GRAPH.get()
+            and self._supports_shared_read(model_runner)
+            and get_disagg().disaggregation_mode != "prefill"
+        )
+
+    def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        if not model_runner.spec_algorithm.is_dspark():
+            return super()._supports_shared_read(model_runner)
+        if model_runner.is_draft_worker or not is_deepseek_v4(
+            model_runner.spec_aux_config.draft_model_config.hf_config
+        ):
+            return False
+        # The target's verify event also covers the draft inject's precomputed addresses.
+        # Deferred KV stores carry reads into the next round and keep the old barrier.
+        disagg = get_disagg()
+        return not (
+            model_runner.req_to_token_pool.holds_state_slots
+            or envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get()
+            or (
+                disagg.disaggregation_mode == "decode"
+                and disagg.disaggregation_decode_enable_offload_kvcache
+            )
+        )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        if self._is_dspark_algorithm and not fm.is_target_verify():
+            return SharedReadEnds.UNKNOWN
+        end = super().shared_read_ends(fm)
+        if (
+            self.prepare_in_graph
+            and end is SharedReadEnds.PRE_REPLAY
+            and (fm.is_decode() or fm.is_target_verify() or fm.is_draft_extend_v2())
+        ):
+            return SharedReadEnds.IN_REPLAY
+        return end
 
         # The prefill graph records compressor / indexer kernels, so their
         # metadata must live in stable, capacity-sized buffers.  See
@@ -3083,7 +3121,10 @@ class DeepseekV4AscendAttnBackend(
             if ragged_layout is not None
             else bs
         )
-        if in_capture:
+        # Shape variants must keep the addresses already bound by earlier captures.
+        if in_capture and (
+            not self.prepare_in_graph or metadata_key not in self.graph_metadata
+        ):
             self._init_dsv4_graph_metadata(
                 metadata_key=metadata_key,
                 forward_batch=forward_batch,
@@ -3093,6 +3134,53 @@ class DeepseekV4AscendAttnBackend(
             metadata_key=metadata_key,
             forward_batch=forward_batch,
             in_capture=in_capture,
+        )
+
+    def init_forward_metadata_in_graph(
+        self, forward_batch: ForwardBatch, *, out_cache_loc=None
+    ) -> None:
+        if not self.prepare_in_graph:
+            return
+        fm = self.forward_metadata
+        bs = fm.block_tables.shape[0]
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        # Fixed-width snapshots avoid host length reads and keep replay addresses fixed.
+        pages = min(
+            fm.block_tables.shape[1],
+            (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
+        )
+        full_page_locs = self.req_to_token[
+            req_pool_indices, : pages * self.page_size : self.page_size
+        ]
+        fm.block_tables[:, :pages].copy_(full_page_locs // self.page_size)
+        fm.block_tables[:, pages:].zero_()
+        if self.is_hybrid_swa:
+            fm.block_tables_swa[:, :pages].copy_(
+                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+            )
+            fm.block_tables_swa[:, pages:].zero_()
+        fm.swa_page_table.copy_(
+            fm.block_tables_swa if self.is_hybrid_swa else fm.block_tables
+        )
+        if self._dsv4_has_c4:
+            # C4 shares full-pool page ids, with one compressed slot per four tokens.
+            fm.c4_page_table.copy_(fm.block_tables)
+        if self._dsv4_has_c128:
+            sidecar = self.req_to_token_pool.req_to_c128_sidecar
+            pages = min(fm.c128_page_table.shape[1], sidecar.shape[1])
+            fm.c128_page_table[:, :pages].copy_(sidecar[req_pool_indices, :pages])
+            fm.c128_page_table[:, pages:].fill_(-1)
+
+        self._refresh_graph_explicit_state_block_tables(
+            SimpleNamespace(fm=fm, bs=bs, forward_batch=forward_batch)
+        )
+        # Draft steps pass their view of the runner-owned cache-location buffer.
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
+        fm.swa_loc.copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int64
+            )
         )
 
     def _init_dsv4_graph_metadata(
@@ -3888,54 +3976,55 @@ class DeepseekV4AscendAttnBackend(
         metadata = self.graph_metadata[metadata_key]
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
-        seq_lens_cpu = (
-            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
-        )
-        forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
+        if not self.prepare_in_graph:
+            seq_lens_cpu = (
+                forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+            )
+            forward_mode = forward_batch.forward_mode
+            spec_info = forward_batch.spec_info
 
-        if seq_lens_cpu is not None:
-            max_len = seq_lens_cpu[:bs].max().item()
-            is_dflash_verify = (
-                spec_info is not None
-                and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-            )
-            if forward_mode.is_target_verify() and not is_dflash_verify:
-                max_len += self.speculative_num_draft_tokens
-            elif forward_mode.is_decode_or_idle() and spec_info is not None:
-                max_len += self.speculative_step_id + 1
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-        else:
-            # Mirrorless: bound by the scheduler's max_seq_len_host hint
-            # (+1 page overlap-lag slack) when available, else the full
-            # captured width.
-            hint = getattr(forward_batch, "max_seq_len_host", None)
-            max_len = (
-                hint + self.page_size
-                if hint
-                else metadata.block_tables.shape[1] * self.page_size
-            )
-            max_seq_pages = min(
-                (max_len + self.page_size - 1) // self.page_size,
-                metadata.block_tables.shape[1],
-            )
+            if seq_lens_cpu is not None:
+                max_len = seq_lens_cpu[:bs].max().item()
+                is_dflash_verify = (
+                    spec_info is not None
+                    and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                )
+                if forward_mode.is_target_verify() and not is_dflash_verify:
+                    max_len += self.speculative_num_draft_tokens
+                elif forward_mode.is_decode_or_idle() and spec_info is not None:
+                    max_len += self.speculative_step_id + 1
+                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            else:
+                # Mirrorless: bound by the scheduler's max_seq_len_host hint
+                # (+1 page overlap-lag slack) when available, else the full
+                # captured width.
+                hint = getattr(forward_batch, "max_seq_len_host", None)
+                max_len = (
+                    hint + self.page_size
+                    if hint
+                    else metadata.block_tables.shape[1] * self.page_size
+                )
+                max_seq_pages = min(
+                    (max_len + self.page_size - 1) // self.page_size,
+                    metadata.block_tables.shape[1],
+                )
 
-        if self.is_hybrid_swa:
-            full_page_locs = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_len : self.page_size,
-            ]
-            swa_page_table = (
-                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
-            )
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            if self.is_hybrid_swa:
+                full_page_locs = self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : max_len : self.page_size,
+                ]
+                swa_page_table = (
+                    self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+                )
+                metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+                metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
 
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
-        )
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
+            )
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
 
         self.forward_metadata = metadata
         self.graph_mode = True
@@ -3949,7 +4038,8 @@ class DeepseekV4AscendAttnBackend(
         self._refresh_graph_seq_metadata(ctx)
 
         # Generation page tables.
-        self._refresh_v4_compress_page_tables(ctx)
+        if not self.prepare_in_graph:
+            self._refresh_v4_compress_page_tables(ctx)
         if self._dsv4_has_low_ratio and not ctx.is_idle_replay:
             self._refresh_graph_dsv41_index_page_tables(ctx.fm)
 
@@ -3961,8 +4051,9 @@ class DeepseekV4AscendAttnBackend(
             self._refresh_graph_verify_rows(ctx)
 
         # Tail refresh shared by both generations.
-        self._refresh_graph_explicit_state_block_tables(ctx)
-        self._refresh_graph_swa_metadata_direct(ctx)
+        if not self.prepare_in_graph:
+            self._refresh_graph_explicit_state_block_tables(ctx)
+            self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
         self._refresh_graph_kernel_metadata(ctx)
 
@@ -4095,7 +4186,10 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
-        if self.shared_read_enabled:
+        if self.shared_read_enabled and (
+            not self._is_dspark_algorithm
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             # Snapshot addresses before read-done; compressor and KV stores must
             # not resolve shared mappings later in the layer loop.
             fm.swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -4844,7 +4938,12 @@ class DeepseekV4AscendMultiStepDraftBackend:
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+            backend = self.attn_backends[i]
+            if backend.prepare_in_graph:
+                backend.init_forward_metadata_in_graph(
+                    forward_batch,
+                    out_cache_loc=self._step_out_cache_loc(forward_batch, i),
+                )
 
         self.common_template(forward_batch, call_fn)
 
