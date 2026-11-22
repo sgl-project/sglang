@@ -242,7 +242,7 @@ def apply_dflash_verify_logits_adjustments(
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
 
-    bs = len(sampling_info)
+    bs = sampling_info.temperatures.shape[0]
     if next_token_logits.shape[0] != bs * draft_token_num:
         raise ValueError(
             "next_token_logits row count mismatch for DFlash verify adjustments. "

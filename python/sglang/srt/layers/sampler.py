@@ -1088,16 +1088,10 @@ def apply_custom_logit_processor(
     tokens. By default, we assume each batch contains only 1 token.
     """
 
-    assert logits.shape[0] == len(sampling_batch_info) * num_tokens_in_batch, (
-        f"The batch size of logits ({logits.shape[0]}) does not match the batch size of "
-        f"sampling_batch_info ({len(sampling_batch_info)}) x num_tokens_in_batch "
-        f"({num_tokens_in_batch})"
-    )
-
-    batch_size = len(sampling_batch_info)
-    assert len(sampling_batch_info.custom_params) == batch_size, (
-        f"The number of custom params ({len(sampling_batch_info.custom_params)}) does "
-        f"not match the number of sampling_batch_info ({batch_size})"
+    batch_size = len(sampling_batch_info.custom_params)
+    assert logits.shape[0] == batch_size * num_tokens_in_batch, (
+        f"The batch size of logits ({logits.shape[0]}) does not match the number of "
+        f"custom params ({batch_size}) x num_tokens_in_batch ({num_tokens_in_batch})"
     )
 
     token_offsets = (
