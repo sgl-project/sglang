@@ -45,73 +45,6 @@ def _serial_batched_fill(entries, vocab_mask):
         entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
 
 
-class TestSamplingMaskBatchIndices(CustomTestCase):
-    def test_filter_and_merge_preserve_support_logprob_modes(self):
-        info = _make_info(
-            return_sampling_masks=[True, True, False],
-            return_sampling_support_logprobs=[False, True, False],
-            sampling_mask_batch_indices=torch.tensor([0, 1]),
-        )
-        info.filter_batch([1, 2], torch.tensor([1, 2]))
-        self.assertEqual(info.return_sampling_support_logprobs, [True, False])
-        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
-
-        other = _make_info(
-            return_sampling_masks=[True, True],
-            return_sampling_support_logprobs=[False, True],
-            sampling_mask_batch_indices=torch.tensor([0, 1]),
-        )
-        info.merge_batch(other, self_len=2, other_len=2)
-        self.assertEqual(
-            info.return_sampling_support_logprobs,
-            [True, False, False, True],
-        )
-        self.assertEqual(
-            info.sampling_support_logprobs_capture_indices.tolist(), [0, 2]
-        )
-
-    def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
-        info = _make_info(
-            return_sampling_masks=[False, True],
-            sampling_mask_batch_indices=torch.tensor([1]),
-        )
-        info.filter_batch([0], torch.tensor([0]))
-        self.assertIsNone(info.sampling_mask_batch_indices)
-        other = _make_info(
-            return_sampling_masks=[True],
-            sampling_mask_batch_indices=torch.tensor([0]),
-        )
-        info.merge_batch(other, self_len=1, other_len=1)
-        self.assertEqual(info.return_sampling_masks, [False, True])
-        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
-
-    def test_filter_rebuilds_row_indices(self):
-        info = _make_info(
-            return_sampling_masks=[False, True, False, True],
-            sampling_mask_batch_indices=torch.tensor([1, 3]),
-        )
-
-        info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
-
-        self.assertEqual(info.return_sampling_masks, [True, False, True])
-        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
-
-    def test_merge_offsets_rhs_row_indices(self):
-        lhs = _make_info(
-            return_sampling_masks=[False, True],
-            sampling_mask_batch_indices=torch.tensor([1]),
-        )
-        rhs = _make_info(
-            return_sampling_masks=[True, False, True],
-            sampling_mask_batch_indices=torch.tensor([0, 2]),
-        )
-
-        lhs.merge_batch(rhs, self_len=2, other_len=3)
-
-        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
-        self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
-
-
 def _grammar(vocab_mask, apply_vocab_mask):
     """An active grammar whose step mask is `vocab_mask`."""
     grammar = MagicMock(finished=False)
@@ -338,57 +271,6 @@ class TestBuildGrammarMask(CustomTestCase):
         other.fill_vocab_mask.assert_not_called()
 
 
-# filter_batch
-class TestFilterBatch(CustomTestCase):
-    def test_seeds_follow_rows_through_merge_and_filter(self):
-        """A merged-in unseeded side gets filler seeds; once the last seeded row
-        leaves, the batch returns to the unseeded samplers."""
-        info = _make_info()
-        seeded = _make_info(
-            sampling_seed=torch.tensor([123], dtype=torch.int64),
-            rows_with_seed=[True],
-        )
-        info.merge_batch(seeded, self_len=1, other_len=1)
-        self.assertEqual(info.sampling_seed[1].item(), 123)
-        self.assertEqual(info.rows_with_seed, [False, True])
-
-        info.filter_batch([0], torch.tensor([0]))
-        self.assertIsNone(info.sampling_seed)
-        self.assertIsNone(info.rows_with_seed)
-
-    def test_filter_with_none_sampling_seed(self):
-        """Test that filter preserves None sampling_seed without error."""
-        info = _make_info()
-        info.sampling_seed = None
-        keep = torch.tensor([1])
-        info.filter_batch([1], keep)
-        self.assertIsNone(info.sampling_seed)
-
-
-# merge_batch
-class TestMergeBatch(CustomTestCase):
-    def test_merge_with_none_sampling_seed(self):
-        """Test that merge preserves None when both sampling_seeds are None."""
-        info1 = _make_info()
-        info1.sampling_seed = None
-        info2 = _make_info()
-        info2.sampling_seed = None
-        info1.merge_batch(info2, self_len=1, other_len=1)
-        self.assertIsNone(info1.sampling_seed)
-
-    def test_merge_with_both_sampling_seeds(self):
-        """Test that merge concatenates both sampling_seed tensors."""
-        info1 = _make_info()
-        info1.sampling_seed = torch.tensor([10, 20], dtype=torch.int64)
-        info2 = _make_info()
-        info2.sampling_seed = torch.tensor([30], dtype=torch.int64)
-        info1.merge_batch(info2, self_len=2, other_len=1)
-        self.assertEqual(info1.sampling_seed.shape[0], 3)
-        self.assertEqual(info1.sampling_seed[0].item(), 10)
-        self.assertEqual(info1.sampling_seed[1].item(), 20)
-        self.assertEqual(info1.sampling_seed[2].item(), 30)
-
-
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy(self):
@@ -411,8 +293,8 @@ class TestCopyForForward(CustomTestCase):
                 self.assertIs(copied.__dict__[name], value, name)
 
 
-# from_schedule_batch and set_plugin_state
-class TestFromScheduleBatch(CustomTestCase):
+# set_plugin_state and set_seeds_and_mask_rows
+class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()
         # These read two flags from the exec bag; give
@@ -445,6 +327,7 @@ class TestFromScheduleBatch(CustomTestCase):
         seed=None,
         stop_ids=None,
         eos_id=2,
+        mask_mode=None,
     ):
         req = MagicMock()
         req.sampling_params.top_k = top_k
@@ -457,6 +340,9 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
         req.grammar = None
+        req.filler_sampling_seed = None
+        req.return_sampling_mask = mask_mode is not None
+        req.sampling_logprobs_mode = mask_mode
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
@@ -465,36 +351,74 @@ class TestFromScheduleBatch(CustomTestCase):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
         self._exec_ns.deterministic.enable_deterministic_inference = True
 
-        reqs = [self._make_req(seed=123), self._make_req(seed=None)]
-        batch = MagicMock()
-        batch.reqs = reqs
-        batch.device = DEVICE
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertIsNotNone(info.sampling_seed)
-        self.assertEqual(info.sampling_seed[0].item(), 123)
-        self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+        info = _make_info()
+        info.set_seeds_and_mask_rows([self._make_req(seed=123), self._make_req()])
+        self.assertEqual(info.sampling_seed.tolist(), [123, 42])
+
+        # An idle batch still seeds, with no rows.
+        info.set_seeds_and_mask_rows([])
+        self.assertEqual(info.sampling_seed.tolist(), [])
 
     def test_seed_without_deterministic_inference(self):
-        """A non-greedy request's seed applies and the other rows get seeds too; a
-        greedy seed, or speculative decoding, leaves the batch unseeded."""
-        batch = MagicMock()
-        batch.device = DEVICE
-        batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
-        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
-        self.assertEqual(info.sampling_seed.shape[0], 2)
-        self.assertEqual(info.sampling_seed[0].item(), 123)
-        self.assertEqual(info.rows_with_seed, [True, False])
+        """A non-greedy request's seed applies; a greedy seed, or speculative
+        decoding, leaves the batch unseeded."""
+        info = _make_info()
+        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
+        self.assertEqual(info.sampling_seed.tolist(), [123])
 
-        batch.reqs = [self._make_req(seed=123, top_k=1)]
-        self.assertIsNone(
-            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
-        )
+        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=1)])
+        self.assertIsNone(info.sampling_seed)
 
         self._spec_ns.speculative_algorithm = "EAGLE"
-        batch.reqs = [self._make_req(seed=123, top_k=50)]
-        self.assertIsNone(
-            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
+        self.assertIsNone(info.sampling_seed)
+
+    def test_unseeded_row_keeps_its_filler_seed_across_steps(self):
+        """An unseeded request samples with one random seed in every seeded step,
+        wherever its row is, and unseeded once no seeded row is left."""
+        seeded, a, b = (
+            self._make_req(seed=123, top_k=50),
+            self._make_req(),
+            self._make_req(),
         )
+        info = _make_info()
+        info.set_seeds_and_mask_rows([seeded, a])
+        seed_a = info.sampling_seed[1].item()
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+
+        info.set_seeds_and_mask_rows([b, a, seeded])
+        self.assertEqual(info.sampling_seed[1].item(), seed_a)
+        self.assertNotEqual(info.sampling_seed[0].item(), seed_a)
+        self.assertEqual(info.sampling_seed[2].item(), 123)
+
+        info.set_seeds_and_mask_rows([b, a])
+        self.assertIsNone(info.sampling_seed)
+
+    def test_mask_rows(self):
+        """Mask rows index the batch; support rows index the mask rows."""
+        reqs = [
+            self._make_req(top_k=5),
+            self._make_req(top_k=7, mask_mode="full"),
+            self._make_req(top_k=50, mask_mode="support", seed=9),
+            self._make_req(top_k=3, mask_mode="support"),
+        ]
+        info = _make_info()
+        info.set_seeds_and_mask_rows(reqs)
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1, 2, 3])
+        self.assertEqual(
+            info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
+        )
+        self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
+        self.assertEqual(info.sampling_seed[2].item(), 9)
+
+        info.set_seeds_and_mask_rows(reqs[:2])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
+        self.assertIsNone(info.sampling_support_logprobs_capture_indices)
+        self.assertIsNone(info.sampling_seed)
+
+        info.set_seeds_and_mask_rows(reqs[:1])
+        self.assertIsNone(info.sampling_mask_batch_indices)
+        self.assertIsNone(info.sampling_mask_top_ks)
 
     def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
         from array import array

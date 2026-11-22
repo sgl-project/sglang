@@ -4357,8 +4357,8 @@ class Scheduler(
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch, self.model_config.vocab_size
+        batch.sampling_info = SamplingBatchInfo(
+            vocab_size=self.model_config.vocab_size, device=batch.device
         )
         # todo hisparse, maybe other info to contain for the new batch
         return batch
@@ -5495,6 +5495,7 @@ class Scheduler(
                 batch.reqs, batch.device
             )
             batch.sampling_info.set_plugin_state(batch.reqs)
+            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
