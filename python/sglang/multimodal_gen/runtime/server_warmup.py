@@ -253,6 +253,7 @@ async def run_async_client_warmup(
 
     `forward(req, replica=i)` must deliver to replica i: each replica compiles
     and allocates on its own GPUs, and each counts the same `warmup_total`.
+    `check_backend` must raise if serving is no longer possible.
     """
     try:
         warmup_input_path = None
