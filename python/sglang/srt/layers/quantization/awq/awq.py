@@ -57,9 +57,44 @@ logger = logging.getLogger(__name__)
 
 ScalarType, scalar_types = get_scalar_types()
 
+# Generic fused-name -> shard names, used when the checkpoint lists the dense
+# modules under their unfused names (see is_layer_skipped_awq / #52208).
+_AWQ_FALLBACK_FUSED_SHARDS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
 
-def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
-    return any(module_name in prefix for module_name in modules_to_not_convert)
+
+def is_layer_skipped_awq(prefix: str, modules_to_not_convert: Optional[List[str]]):
+    if not modules_to_not_convert:
+        return False
+    # Plain substring match first: covers unfused layers and workaround
+    # configs that list the fused name itself (e.g. "self_attn.qkv_proj").
+    if any(module_name in prefix for module_name in modules_to_not_convert):
+        return True
+    # Checkpoints list the dense modules under their *unfused* names, while
+    # SGLang builds fused modules. Expand the fused name into its shards and
+    # require every shard to be dense, mirroring is_layer_skipped in
+    # quantization/utils.py (#52208).
+    proj_name = prefix.split(".")[-1]
+    shard_proj_names = _AWQ_FALLBACK_FUSED_SHARDS.get(proj_name)
+    if shard_proj_names is None:
+        return False
+    is_skipped = None
+    for shard_proj_name in shard_proj_names:
+        shard_prefix = prefix.replace(proj_name, shard_proj_name)
+        is_shard_skipped = any(
+            module_name in shard_prefix for module_name in modules_to_not_convert
+        )
+        if is_skipped is None:
+            is_skipped = is_shard_skipped
+        elif is_shard_skipped != is_skipped:
+            raise ValueError(
+                f"Detected some but not all shards of {prefix} "
+                "are quantized. All shards of fused layers "
+                "to have the same precision."
+            )
+    return is_skipped
 
 
 class AWQConfig(QuantizationConfig):

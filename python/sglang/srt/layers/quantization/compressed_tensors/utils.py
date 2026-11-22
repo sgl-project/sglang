@@ -23,6 +23,16 @@ def is_activation_quantization_format(format: str) -> bool:
     return format in _ACTIVATION_QUANTIZATION_FORMATS
 
 
+# Generic fused-name -> unfused shard names. Checkpoints without a
+# packed_modules_mapping (e.g. LFM2) still list the dense modules under their
+# unfused names, and configs may list the fused name itself; both need the
+# shards resolved for the check below (#52209).
+_FALLBACK_FUSED_SHARDS = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+}
+
+
 def should_ignore_layer(
     layer_name: Optional[str],
     ignore: Iterable[str] = tuple(),
@@ -35,12 +45,21 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        # The fused layer itself is listed explicitly (workaround configs put
+        # "model.layers.N.self_attn.qkv_proj" into ignore): it is ignored
+        # regardless of what its shards say.
+        return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping and layer_name not in ignore:
-        shard_proj_names = fused_mapping[proj_name]
+    effective_mapping = (
+        fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS
+    )
+    if proj_name in effective_mapping:
+        shard_proj_names = effective_mapping[proj_name]
 
         # Convert fused_name --> [shard_names]
         shard_names = [
