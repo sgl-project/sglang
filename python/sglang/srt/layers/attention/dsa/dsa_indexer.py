@@ -235,9 +235,7 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    # PyNCCL is the faster path under capture, but it is not a precondition:
-    # a split attn-TP group is built without one (parallel_state.py), and the
-    # process-group broadcast captures and replays correctly.
+    # PyNCCL is faster under capture; the process-group broadcast also captures correctly.
     pynccl_comm = group.get_available_pynccl_comm()
     if (
         topk_indices.device.type == "cuda"
@@ -2452,6 +2450,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             loc=out_cache_loc,
             index_k=k_fp8,
             index_k_scale=k_scale,
+        )
+
+    def forward_k_only(
+        self,
+        *,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> None:
+        """Write the indexer K cache for the batch's tokens without a top-k."""
+        # Only CUDA runs the KV-only draft pass (EagleDraftWorker), where
+        # forward_cuda quantizes with the Triton kernel.
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return
+        self._forward_cuda_k_only(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            act_quant,
+            metadata,
+            return_indices=False,
         )
 
     def forward_native(self, *args, **kwargs):
