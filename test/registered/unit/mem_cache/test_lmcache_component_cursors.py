@@ -200,10 +200,10 @@ def test_external_slots_on_independent_full_pool_reclaim_for_allocation(
     allocator.alloc.assert_called_once_with(4096)
 
 
-def test_external_slots_on_independent_full_mamba_pool_keep_component_eviction(
+def test_external_slots_on_independent_full_mamba_pool_reclaim_only_full_tokens(
     cache_class,
 ):
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     cache = cache_class.__new__(cache_class)
     cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
@@ -215,8 +215,42 @@ def test_external_slots_on_independent_full_mamba_pool_keep_component_eviction(
     cache.token_to_kv_pool_allocator = allocator
 
     assert cache._allocate_external_slots(4096) is allocator.alloc.return_value
-    cache.evict.assert_called_once_with(EvictParams(num_tokens=4096))
-    cache.evict_for_alloc.assert_not_called()
+    cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=4096))
+    cache.evict.assert_not_called()
+
+
+def test_independent_window_load_reclaims_full_and_only_the_window_tail(cache_class):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache, _, _ = _cache_and_request(cache_class, swa_enabled=True)
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=False, hands_out_virtual_ids=False)
+    allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
+    allocator.swa_attn_allocator.alloc.return_value = torch.arange(4)
+    cache.token_to_kv_pool_allocator = allocator
+    with mock.patch.object(cache_class, "sliding_window_size", 4):
+        slots = cache._allocate_external_slots(8)
+    assert slots is allocator.full_attn_allocator.alloc.return_value
+    cache.evict_for_alloc.assert_called_once_with(
+        KVDemand(full_tokens=8, window_tokens={FIRST: 4})
+    )
+    allocator.swa_attn_allocator.alloc.assert_called_once_with(4)
+
+
+def test_mamba_slot_allocation_reclaims_one_checkpoint_on_exhaustion(cache_class):
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache = cache_class.__new__(cache_class)
+    cache._mamba_component = mock.Mock()
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock()
+    cache.token_to_kv_pool_allocator = allocator
+    slot = torch.tensor([7])
+    allocator.state_slots.alloc.side_effect = [None, slot]
+    cache.req_to_token_pool = mock.Mock()
+    cache.lmcache_connector = mock.Mock()
+    assert cache._allocate_external_mamba_slot() is slot
+    cache.evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
 
 
 if __name__ == "__main__":
