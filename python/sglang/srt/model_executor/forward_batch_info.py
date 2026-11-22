@@ -581,6 +581,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    extend_logits_row_index: Optional[torch.Tensor] = None
+    # trailing speculative-verify requests; None (not 0) when there are none, so
+    # the two-batch-overlap split, which rejects unknown non-None fields, still runs
+    mixed_verify_rows: Optional[int] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.

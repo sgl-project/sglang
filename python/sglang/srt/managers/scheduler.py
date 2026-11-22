@@ -4723,7 +4723,18 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
         max_prefill_tokens = self.max_prefill_tokens
-        num_mixed_decode_tokens = running_bs if self.is_mixed_chunk else 0
+        # a mixed DFlash batch carries each running request's verify block
+        num_mixed_decode_tokens = (
+            running_bs
+            * (
+                int(get_spec().speculative_num_draft_tokens or 1)
+                if envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+                and self.spec_algorithm.is_dflash()
+                else 1
+            )
+            if self.is_mixed_chunk
+            else 0
+        )
         token_budget = self.policy.prefill_token_budget(
             page_size=self.page_size, align=self.truncation_align_size
         )
@@ -5545,6 +5556,10 @@ class Scheduler(
                                 fwd_kwargs["grammar_barrier"] = (
                                     self._advance_pending_grammar
                                 )
+                            if self.future_map.deferred_tails is not None:
+                                fwd_kwargs["bind_tails"] = partial(
+                                    self.future_map.bind_tails, batch
+                                )
 
                         if input_ids_from_graph:
                             fwd_kwargs["input_ids_from_graph"] = True
@@ -5589,6 +5604,10 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+                    # Bind the deferred tails if the forward did not need them (idempotent).
+                    if self.future_map.deferred_tails is not None:
+                        self.future_map.bind_tails(batch)
+                        self.future_map.deferred_tails = None
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

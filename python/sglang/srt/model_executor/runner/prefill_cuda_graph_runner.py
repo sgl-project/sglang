@@ -779,6 +779,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
+        self.raw_logits_rows = 0
 
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
@@ -2059,6 +2060,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         bs = forward_batch.batch_size
         self.raw_bs = bs
+        row_index = forward_batch.extend_logits_row_index
+        self.raw_logits_rows = bs if row_index is None else row_index.numel()
 
         self.buffer_registry.fill_from(
             forward_batch,
@@ -2192,6 +2195,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+            extend_logits_row_index=forward_batch.extend_logits_row_index,
+            mixed_verify_rows=forward_batch.mixed_verify_rows,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
@@ -2487,7 +2492,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and output.mm_input_embeds is not None
         ):
             mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
-        logits_rows = self.raw_bs if self._is_full_backend else self.raw_num_tokens
+        logits_rows = (
+            self.raw_logits_rows if self._is_full_backend else self.raw_num_tokens
+        )
         return LogitsProcessorOutput(
             next_token_logits=(
                 output.next_token_logits[:logits_rows]

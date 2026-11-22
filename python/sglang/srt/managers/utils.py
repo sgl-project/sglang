@@ -166,6 +166,8 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+    # mixed verify: next_token_ids [bs, stride], accept_lens 1 for prefill rows
+    mixed_verify: bool = False
 
     block_accept_lens: Optional[torch.Tensor] = None
 
