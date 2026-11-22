@@ -15,7 +15,10 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
-from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
+from sglang.srt.arg_groups.choices import (
+    HICACHE_WRITE_POLICY_CHOICES,
+    RADIX_EVICTION_POLICY_CHOICES,
+)
 
 
 class Memory(msgspec.Struct):
@@ -132,8 +135,12 @@ class Memory(msgspec.Struct):
     hicache_write_policy: A[
         str,
         Arg(
-            help="The write policy of hierarchical cache.",
-            choices=["write_back", "write_through", "write_through_selective"],
+            help=(
+                "The write policy of hierarchical cache. 'write_back_ahead' is "
+                "write_back that backs up the coldest device KV in the "
+                "background, so eviction rarely waits on a device-to-host copy."
+            ),
+            choices=HICACHE_WRITE_POLICY_CHOICES,
         ),
     ] = "write_through"
     hicache_io_backend: A[

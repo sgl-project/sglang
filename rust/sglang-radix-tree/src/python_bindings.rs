@@ -2001,6 +2001,16 @@ macro_rules! tree_core_methods {
                 cache_actions_to_py(py, actions)
             }
 
+            /// Mark the coldest evictable chains as the write_back_ahead tail;
+            /// returns the leaves to back up and the tokens their chains write.
+            fn cold_tail_backup_candidates(
+                &self,
+                py: Python<'_>,
+                num_tokens: usize,
+            ) -> (Vec<NodeId>, usize) {
+                py.detach(|| self.core().cold_tail_backup_candidates(num_tokens))
+            }
+
             /// Queue a write-back victim for its demote; returns its FULL device tokens.
             fn mark_write_back_queued(
                 &self,
@@ -3389,6 +3399,16 @@ macro_rules! tree_core_binding {
                     self.inner
                         .commit_load_back(py, node_id, device_indices, kv_xfer, comp_xfers)
                 })
+            }
+
+            /// Mark the coldest evictable chains as the write_back_ahead tail;
+            /// returns the leaves to back up and the tokens their chains write.
+            fn cold_tail_backup_candidates(
+                &self,
+                py: Python<'_>,
+                num_tokens: usize,
+            ) -> PyResult<(Vec<NodeId>, usize)> {
+                catch_native_panic(|| Ok(self.inner.cold_tail_backup_candidates(py, num_tokens)))
             }
 
             /// Queue a write-back victim for its demote; returns its FULL device tokens.

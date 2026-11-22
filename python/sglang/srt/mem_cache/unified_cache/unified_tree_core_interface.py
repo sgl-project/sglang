@@ -456,6 +456,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def cold_tail_backup_candidates(self, num_tokens: int) -> tuple[list[NodeId], int]:
+        """Mark the coldest evictable device leaves' unbacked chains, which
+        together with already-backed coldest leaves cover ``num_tokens``, as
+        the write_back_ahead tail. Returns the leaves to back up and the Full
+        tokens their chains will write."""
+        ...
+
+    @abstractmethod
     def mark_write_back_queued(
         self, node_id: NodeId, copied: Sequence[NodeId] = ()
     ) -> int:

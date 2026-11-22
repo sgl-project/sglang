@@ -845,6 +845,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, result)
 
+    def cold_tail_backup_candidates(self, num_tokens: int) -> tuple[list[NodeId], int]:
+        return self._binding.cold_tail_backup_candidates(num_tokens)
+
     def mark_write_back_queued(
         self, node_id: NodeId, copied: Sequence[NodeId] = ()
     ) -> int:

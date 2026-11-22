@@ -1743,7 +1743,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .arena
             .get_and_batch_bump_access_counter(path.len() as i64);
         for (i, id) in path.iter().enumerate() {
-            self.arena.node_mut(*id).last_access_counter = newest_tick - i as i64;
+            let node = self.arena.node_mut(*id);
+            node.last_access_counter = newest_tick - i as i64;
+            node.cold_tail_backup = false;
         }
 
         // last_host_node will be used as the starting node for the subsequent
@@ -1857,6 +1859,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let tick = self.arena.get_and_bump_access_counter();
         let node = self.arena.node_mut(node_id);
         node.last_access_counter = tick;
+        node.cold_tail_backup = false;
         if node.is_root() {
             return;
         }
@@ -3077,6 +3080,43 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         assert!(self.joint_walk.is_some(), "joint eviction not started");
         self.evict_device_end(SWA);
         self.joint_walk = None;
+    }
+
+    /// See `UnifiedTreeCoreInterface.cold_tail_backup_candidates`.
+    pub fn cold_tail_backup_candidates(&mut self, num_tokens: usize) -> (Vec<NodeId>, usize) {
+        let mut heap: BinaryHeap<_> = self
+            .evictable_device_leaves
+            .iter()
+            .map(|id| Reverse((self.eviction_strategy.get_priority(self.arena.node(id)), id)))
+            .collect();
+        let mut covered = 0;
+        let mut to_write = 0;
+        let mut leaves = Vec::new();
+        let mut chained = HashSet::new();
+        while covered < num_tokens {
+            let Some(Reverse((_, leaf))) = heap.pop() else {
+                break;
+            };
+            let mut chain_tokens = 0;
+            let mut cur = Some(leaf);
+            while let Some(idx) = cur {
+                let node = self.arena.node(idx);
+                if node.is_root() || node.backuped() || !chained.insert(idx) {
+                    break;
+                }
+                chain_tokens += node.device_value_len(FULL);
+                cur = node.try_parent();
+                self.arena.node_mut(idx).cold_tail_backup = true;
+            }
+            if chain_tokens == 0 {
+                covered += self.arena.node(leaf).device_value_len(FULL);
+                continue;
+            }
+            leaves.push(self.arena.node(leaf).id);
+            covered += chain_tokens;
+            to_write += chain_tokens;
+        }
+        (leaves, to_write)
     }
 
     /// See `UnifiedTreeCoreInterface.mark_write_back_queued`.

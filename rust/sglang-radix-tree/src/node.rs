@@ -191,6 +191,8 @@ pub struct Node<K: ChildKeyType> {
     pub write_through_pending_id: Option<usize>,
     /// Queued for its demote by the running write-back eviction walk.
     pub write_back_queued: bool,
+    /// In the write_back_ahead cold tail until touched again.
+    pub cold_tail_backup: bool,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -433,6 +435,7 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            cold_tail_backup: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             cost_stamp: f64::NAN,
@@ -463,6 +466,7 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            cold_tail_backup: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             cost_stamp: f64::NAN,
