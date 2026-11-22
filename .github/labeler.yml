@@ -1,11 +1,6 @@
 # Configuration for the GitHub Labeler action
 # Automatically adds labels to PRs based on the files changed
 
-# Router specific (Rust code in sgl-model-gateway)
-model-gateway:
-  - changed-files:
-    - any-glob-to-any-file: 'sgl-model-gateway/**/*'
-
 # Kernel specific
 sgl-kernel:
   - changed-files:

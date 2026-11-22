@@ -30,10 +30,6 @@ class SageAttention3Backend(AttentionBackend):
     def get_impl_cls() -> type["SageAttention3Impl"]:
         return SageAttention3Impl
 
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
 
 class SageAttention3Impl(AttentionImpl):
     _warned_gqa_fallback_global: bool = False

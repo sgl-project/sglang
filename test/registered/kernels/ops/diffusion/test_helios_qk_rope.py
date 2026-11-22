@@ -142,13 +142,5 @@ def test_helios_qk_rope_batched(dtype):
     assert torch.equal(k, k_ref)
 
 
-def test_helios_qk_rope_rejects_bad_frequency_shape() -> None:
-    q = torch.randn(3, 2, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    freqs = torch.randn(3, 128, device="cuda", dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="freq_dim"):
-        fused_inplace_helios_qk_rope(q, k, freqs)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

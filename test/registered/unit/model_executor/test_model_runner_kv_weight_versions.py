@@ -146,12 +146,17 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             out_cache_loc=None,
             has_grammar=False,
             return_logprob=False,
+            sampling_info=SimpleNamespace(step_penalties=None),
         )
         tokens = torch.tensor([1])
         post = (tokens, tokens, tokens, tokens, tokens, None)
         target_worker = SimpleNamespace(
             forward_batch_generation=lambda **_: output,
-            model_runner=SimpleNamespace(canary_manager=None),
+            model_runner=SimpleNamespace(
+                canary_manager=None,
+                watermark=None,
+                attn_backend=SimpleNamespace(verify_mask=None),
+            ),
         )
 
         with (
