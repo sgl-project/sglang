@@ -367,6 +367,58 @@ class TestHipFusedDecodeArming(CustomTestCase):
                     get_exec().mamba.enable_linear_replayssm_spec,
                 )
 
+    def test_fused_verify_arms_without_the_decode_kernel(self):
+        # Verify loads only from AITER; a decode kernel that rejects the state
+        # dtype (the vendored one is FP32-only) must not keep it off.
+        attention = _armable_hip_attention()
+        with (
+            get_context().override_server_args(
+                speculative_num_draft_tokens=5,
+                speculative_eagle_topk=1,
+                linear_attn_verify_backend="aiter",
+            ),
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(False),
+            mock.patch.object(
+                kda_fused_decode_aiter_hip, "available", return_value=False
+            ),
+            mock.patch.object(kda_fused_decode_aiter_hip, "warmup") as decode_warmup,
+            mock.patch.object(
+                kda_fused_verify_aiter_hip, "available", return_value=True
+            ),
+            mock.patch.object(kda_fused_verify_aiter_hip, "warmup"),
+            mock.patch.object(kimi_k3_kda_hip, "print_warning_once"),
+        ):
+            prepare_fused_kda_hip(attention)
+
+            self.assertFalse(attention._kda_hip_fused_decode_ready)
+            self.assertIsNotNone(attention.attn.kda_fused_verify)
+            decode_warmup.assert_not_called()
+
+    def test_buffers_are_dropped_when_neither_decode_nor_verify_arms(self):
+        attention = _armable_hip_attention()
+        with (
+            get_context().override_server_args(
+                speculative_num_draft_tokens=5,
+                speculative_eagle_topk=1,
+                linear_attn_verify_backend="aiter",
+                enable_linear_replayssm_spec=True,
+            ),
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(False),
+            mock.patch.object(
+                kda_fused_decode_aiter_hip, "available", return_value=True
+            ),
+            mock.patch.object(
+                kda_fused_verify_aiter_hip, "available", return_value=False
+            ),
+            mock.patch.object(kimi_k3_kda_hip, "print_warning_once"),
+        ):
+            prepare_fused_kda_hip(attention)
+
+            self.assertIsNone(attention.attn.kda_fused_verify)
+            self.assertIsNone(attention.attn._k3_hip_fused_decode_args)
+
     def test_fp16_activations_leave_the_fused_verify_unarmed(self):
         """The kernel takes BF16 f_a, but a Quark FP8 f_b arms its BF16 copy under
         any activation dtype; --dtype float16 must keep verify on the Triton chain."""

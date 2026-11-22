@@ -97,7 +97,7 @@ _FUSED_VERIFY_HOOK_OP = "attention.kda_fused_verify_aiter_hip"
 
 
 def _kernel_runs_here(op: str) -> bool:
-    """Whether a registered implementation of ``op`` declares this device."""
+    # Whether a registered implementation of ``op`` declares this device.
     from sglang.kernels import PlatformInfo, capabilities_satisfied, registry
 
     platform = PlatformInfo.detect()
@@ -1657,7 +1657,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token: Optional[torch.Tensor],
         replayssm_on: bool,
     ) -> Optional[str]:
-        """A batch property a KDAFusedVerify hook cannot handle, or None."""
+        # A batch property a KDAFusedVerify hook cannot handle, or None.
         if ragged_layout is not None:
             return "ragged verify layout"
         if retrieve_parent_token is not None:

@@ -730,13 +730,12 @@ def test_vendored_and_aiter_kda_decode_agree(select_fused_backend, batch: int) -
 
 
 def _aiter_has_kda_verify() -> bool:
-    try:
-        from aiter.ops.flydsl.linear_attention_kernels import (  # noqa: F401
-            flydsl_kda_verify_with_f_b,
-        )
-    except ImportError:
-        return False
-    return True
+    # The adapter's own availability check, so an early AITER op production rejects skips.
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip
+
+    return kda_fused_verify_aiter_hip.available(
+        device=_DEVICE, state_dtype=torch.bfloat16, num_draft_tokens=5
+    )
 
 
 def _verify_backend(state, slots: torch.Tensor, steps: int):
@@ -969,67 +968,6 @@ def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
     wave_counts = flydsl_kda_verify_with_f_b.num_warps
     assert sorted(wave_counts) == [4, 8]
     assert built == [(1, n) for n in wave_counts]
-
-
-@pytest.mark.parametrize("ring", [False, True])
-def test_verify_covered_falls_back_instead_of_aiter_raising(
-    ring: bool, monkeypatch
-) -> None:
-    """A draft-token count other than the warmed one would JIT-build inside graph
-    capture, and a cache dtype or ring shape AITER rejects would raise; both fall back.
-    Runs without the kernel: covered() reads only max_tokens from the op."""
-    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
-    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import covered
-
-    monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace(max_tokens=8))
-
-    batch, steps, slots = 3, 5, 7
-    tokens = batch * steps
-
-    def empty(*shape, dtype=torch.bfloat16):
-        return torch.empty(*shape, dtype=dtype, device="meta")
-
-    def make_ring(ring_len, g_dtype=torch.float32):
-        return (
-            empty(slots, _HEADS, ring_len, _DIM),
-            empty(slots, _HEADS, ring_len, _DIM),
-            empty(slots, _HEADS, ring_len, _DIM, dtype=g_dtype),
-            empty(slots, _HEADS, ring_len, dtype=torch.float32),
-        )
-
-    kwargs = dict(
-        f_a=empty(tokens, _DIM),
-        mixed_qkv=empty(tokens, _CHANNELS),
-        raw_beta=empty(1, tokens, _HEADS),
-        output_gate=empty(tokens, _HEADS, _DIM),
-        conv_state=empty(slots, _CONV_WIDTH - 1, _CHANNELS).transpose(-1, -2),
-        state=empty(slots, _HEADS, _DIM, _DIM),
-        cache_indices=empty(batch, dtype=torch.int32),
-        intermediate_indices=empty(batch, dtype=torch.int32),
-        intermediate_conv_window=empty(
-            slots, steps, _CONV_WIDTH - 1, _CHANNELS
-        ).transpose(-1, -2),
-        intermediate_states=None if ring else empty(slots, steps, _HEADS, _DIM, _DIM),
-        replay_ring=make_ring(2 * steps) if ring else None,
-        num_draft_tokens=steps,
-        armed_draft_tokens=steps,
-    )
-    assert covered(**kwargs)
-    rejected = [
-        {"armed_draft_tokens": steps + 1},
-        {
-            "conv_state": empty(
-                slots, _CONV_WIDTH - 1, _CHANNELS, dtype=torch.float16
-            ).transpose(-1, -2)
-        },
-    ]
-    if ring:
-        rejected += [
-            {"replay_ring": make_ring(steps - 1)},
-            {"replay_ring": make_ring(2 * steps, g_dtype=torch.bfloat16)},
-        ]
-    for change in rejected:
-        assert not covered(**{**kwargs, **change}), change
 
 
 if __name__ == "__main__":

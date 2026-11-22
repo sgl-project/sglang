@@ -228,12 +228,18 @@ def prepare_fused_kda_hip(attention: KimiK3DeltaAttention) -> None:
         if backend != "aiter" or not verify_selected:
             return
     state_dtype = attention.config.mamba2_cache_params.dtype.temporal
-    backend_available = fused_ops.available(
+    verify_wanted = backend == "aiter" and verify_selected
+    # Verify loads only from AITER, so the decode kernel's coverage must not gate it.
+    decode_available = not replayssm_ring and fused_ops.available(
         device=attention.f_b_proj.weight.device, state_dtype=state_dtype
     )
-    f_b_weight = attention._fused_decode_f_b_weight() if backend_available else None
+    f_b_weight = (
+        attention._fused_decode_f_b_weight()
+        if decode_available or verify_wanted
+        else None
+    )
     if (
-        backend_available
+        (decode_available or verify_wanted)
         and w is not None
         and tuple(w.shape) == (3 * 12 * 128, 4)
         and w.dtype == torch.float32
@@ -257,7 +263,7 @@ def prepare_fused_kda_hip(attention: KimiK3DeltaAttention) -> None:
             float(attention.o_norm.eps),
             a_log,
         )
-        if not replayssm_ring:
+        if decode_available:
             fused_ops.warmup(
                 f_b_weight=f_b_weight,
                 conv_weight=w,
@@ -271,10 +277,13 @@ def prepare_fused_kda_hip(attention: KimiK3DeltaAttention) -> None:
             layer._k3_hip_fused_decode_backend = backend
             layer._k3_hip_fused_decode_ops = fused_ops
             attention._kda_hip_fused_decode_ready = True
-        if backend == "aiter" and verify_selected:
+        if verify_wanted:
             layer.kda_fused_verify = build_fused_verify_hip(
                 layer=layer,
                 use_full_rank_gate=attention.use_full_rank_gate,
                 state_dtype=state_dtype,
                 activation_dtype=attention.o_norm.weight.dtype,
             )
+        if layer.kda_fused_verify is None and not decode_available:
+            # Nothing armed from these buffers; do not keep them on every layer.
+            layer._k3_hip_fused_decode_args = None

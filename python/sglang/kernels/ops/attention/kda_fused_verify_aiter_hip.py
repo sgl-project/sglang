@@ -75,7 +75,7 @@ def available(
 
 
 def _ring_covered(replay_ring: tuple[torch.Tensor, ...], num_draft_tokens: int) -> bool:
-    """ReplaySSM ring (raw_v, raw_k, g, beta) as [slots, 12, L(, 128)], L >= tokens."""
+    # ReplaySSM ring (raw_v, raw_k, g, beta) as [slots, 12, L(, 128)], L >= tokens.
     raw_v, raw_k, g, beta = replay_ring
     ring_len = raw_v.shape[2] if raw_v.ndim == 4 else 0
     step_strides = ((ring_len * _DIM, _DIM, 1),)
@@ -123,6 +123,7 @@ def covered(
         op is None
         or num_draft_tokens != armed_draft_tokens
         or num_draft_tokens > op.max_tokens
+        or state.dtype not in op.state_dtypes
     ):
         return False
     if (intermediate_states is None) == (replay_ring is None):
@@ -133,6 +134,7 @@ def covered(
         intermediate_states.dtype != state.dtype
         or intermediate_states.ndim != 5
         or intermediate_states.shape[1] < num_draft_tokens
+        or intermediate_states.shape[2:] != (_HEADS, _DIM, _DIM)
         or not _dense_slots(intermediate_states, _SNAPSHOT_LINE_STRIDES)
     ):
         return False
@@ -299,7 +301,7 @@ def _run_zeros(
     num_draft_tokens: int,
     replay_ring: bool,
 ) -> None:
-    """One verify over zero inputs, to JIT-build its specialization."""
+    # One verify over zero inputs, to JIT-build its specialization.
     zeros = functools.partial(torch.zeros, device=f_b_weight.device)
     tokens = batch * num_draft_tokens
     ring = (

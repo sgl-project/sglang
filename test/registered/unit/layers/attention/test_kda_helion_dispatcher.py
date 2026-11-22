@@ -7,6 +7,7 @@ import torch
 from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
 from sglang.srt.arg_groups.glm5_next_hook import apply_glm5_next_spec_backend_defaults
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     KDAKernelDispatcher,
@@ -206,6 +207,41 @@ class TestHelionKDADispatcher(unittest.TestCase):
                     ),
                     override_platform(is_sm100=False),
                     override_platform(is_cuda=False),
+                ):
+                    if error is None:
+                        handle_linear_attn_backend(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_linear_attn_backend(args)
+
+    def test_ragged_replayssm_spec_takes_aiter_verify_for_kda_dspark(self):
+        """Ragged ring writes accept KDA's aiter verify, which falls back to the
+        triton kernel for ragged layouts, only with a fold-every-commit algorithm."""
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["KimiK3LinearForCausalLM"],
+                linear_attn_config={"kda_layers": [0]},
+            )
+        )
+        for algorithm, error in (
+            ("DSPARK", None),
+            ("EAGLE", "triton, nv_cutedsl or aiter"),
+        ):
+            with self.subTest(algorithm=algorithm):
+                args = ServerArgs(
+                    model_path="dummy",
+                    linear_attn_verify_backend="aiter",
+                    enable_linear_replayssm_spec=True,
+                    speculative_algorithm=algorithm,
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.attention_hook.model_config_of",
+                        return_value=config,
+                    ),
+                    override_platform(is_sm100=False),
+                    override_platform(is_cuda=False),
+                    envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
                 ):
                     if error is None:
                         handle_linear_attn_backend(args)
