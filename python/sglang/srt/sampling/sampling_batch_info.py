@@ -21,29 +21,18 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penalties import StepPenalties, apply_scaling_penalties
+from sglang.srt.sampling.logit_bias import build_logit_bias
+from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampler_params import SamplerParams
-    from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 logger = logging.getLogger(__name__)
-
-
-def _rows_to_device_indices(
-    rows: List[int], device: str, pin: Optional[bool] = None
-) -> torch.Tensor:
-    """Move batch row numbers to the device without blocking on a pageable copy."""
-    if pin is None:
-        pin = is_pin_memory_available(device)
-    return torch.tensor(rows, dtype=torch.long, pin_memory=pin).to(
-        device, non_blocking=True
-    )
 
 
 def _rows_with_seed(
@@ -124,11 +113,9 @@ class SamplingBatchInfo:
     # Set by the scheduler at each launch.
     step_penalties: Optional[StepPenalties] = None
 
-    # Whether any request has custom logit processor
+    # Set by the scheduler at each launch (set_plugin_state).
     has_custom_logit_processor: bool = False
-    # Custom parameters
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
-    # Custom logit processor
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
@@ -152,7 +139,7 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
-    # Handle logit bias
+    # Set by the scheduler at each launch (set_plugin_state).
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
@@ -178,40 +165,6 @@ class SamplingBatchInfo:
                 device, non_blocking=True
             )
 
-        logit_bias = None
-        if any(r.sampling_params.logit_bias is not None for r in reqs):
-            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
-            rows, cols, vals = [], [], []
-            for i, r in enumerate(reqs):
-                if r.sampling_params.logit_bias is not None:
-                    # Dedup on int(key) first ("1" and "01" collide): duplicate
-                    # indices make the index_put below nondeterministic on CUDA.
-                    row_bias = {
-                        int(key): value
-                        for key, value in r.sampling_params.logit_bias.items()
-                    }
-                    for token_id, value in row_bias.items():
-                        rows.append(i)
-                        cols.append(token_id)
-                        vals.append(value)
-            if rows:
-                logit_bias[
-                    _rows_to_device_indices(rows, device, _pin),
-                    _rows_to_device_indices(cols, device, _pin),
-                ] = torch.tensor(vals, dtype=logit_bias.dtype, pin_memory=_pin).to(
-                    device, non_blocking=True
-                )
-
-        # Check if any request has custom logit processor
-        enable_custom_processor = get_exec().features.enable_custom_logit_processor
-        has_custom_logit_processor = any(
-            r.custom_logit_processor
-            and (
-                enable_custom_processor
-                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
-            )
-            for r in reqs
-        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
@@ -231,39 +184,11 @@ class SamplingBatchInfo:
             r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
         ]
 
-        if has_custom_logit_processor:
-            # Merge the same type of custom logit processors together
-            processor_dict = {}
-            for i, r in enumerate(reqs):
-                if r.custom_logit_processor is None:
-                    continue
-                processor_str = r.custom_logit_processor
-                if processor_str not in processor_dict:
-                    processor_dict[processor_str] = []
-                processor_dict[processor_str].append(i)
-
-            merged_custom_logit_processor = {
-                hash(processor_str): ProcessorEntry(
-                    processor=CustomLogitProcessor.from_str(processor_str),
-                    rows=rows,
-                    indices=_rows_to_device_indices(rows, device, _pin),
-                )
-                for processor_str, rows in processor_dict.items()
-            }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
-        else:
-            merged_custom_logit_processor = None
-            custom_params = None
-
         ret = cls(
             sampling_seed=sampling_seed,
             rows_with_seed=rows_with_seed,
             vocab_size=vocab_size,
-            has_custom_logit_processor=has_custom_logit_processor,
-            custom_params=custom_params,
-            custom_logit_processor=merged_custom_logit_processor,
             device=device,
-            logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
@@ -299,7 +224,7 @@ class SamplingBatchInfo:
         ]
         if not indices:
             return None
-        return _rows_to_device_indices(indices, device)
+        return async_h2d(indices, dtype=torch.long, device=device)
 
     @staticmethod
     def _make_sampling_support_logprobs_capture_indices(
@@ -323,11 +248,45 @@ class SamplingBatchInfo:
                 indices.append(capture_index)
         if not indices:
             return None
-        return _rows_to_device_indices(indices, device)
+        return async_h2d(indices, dtype=torch.long, device=device)
 
     def set_sampler_params(self, params: SamplerParams) -> None:
         for name, value in zip(params._fields, params):
             setattr(self, name, value)
+
+    def set_plugin_state(self, reqs: List[Req]) -> None:
+        """Build logit_bias and the custom logit processors from the step's requests."""
+        self.logit_bias = build_logit_bias(
+            reqs, vocab_size=self.vocab_size, device=self.device
+        )
+
+        # Group the step's requests by custom logit processor.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        self.has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
+            )
+            for r in reqs
+        )
+        if not self.has_custom_logit_processor:
+            self.custom_params = None
+            self.custom_logit_processor = None
+            return
+        rows_by_processor: Dict[str, List[int]] = {}
+        for i, r in enumerate(reqs):
+            if r.custom_logit_processor is not None:
+                rows_by_processor.setdefault(r.custom_logit_processor, []).append(i)
+        self.custom_params = [r.sampling_params.custom_params for r in reqs]
+        self.custom_logit_processor = {
+            hash(processor_str): ProcessorEntry(
+                processor=CustomLogitProcessor.from_str(processor_str),
+                rows=rows,
+                indices=async_h2d(rows, dtype=torch.long, device=self.device),
+            )
+            for processor_str, rows in rows_by_processor.items()
+        }
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
@@ -356,46 +315,7 @@ class SamplingBatchInfo:
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
-    def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.step_penalties is None:
-            return
-        additive, scaling = self.step_penalties.logit_penalties()
-        if additive is not None:
-            logits.add_(additive)
-        if scaling is not None:
-            apply_scaling_penalties(logits, scaling)
-
-    def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
-
-    def apply_logits_bias(self, logits: torch.Tensor):
-        self._apply_pre_grammar_logits_transforms(logits)
-
-        if self.grammar_mask is not None:
-            self.grammar_mask.apply(logits)
-
-        self._apply_post_grammar_logits_transforms(logits)
-
-    def apply_logits_bias_with_observer(
-        self,
-        logits: torch.Tensor,
-        observer: SamplingObserver,
-    ) -> Any:
-        self._apply_pre_grammar_logits_transforms(logits)
-        observer_state = observer.before_grammar(logits, self)
-
-        if self.grammar_mask is not None:
-            self.grammar_mask.apply(logits)
-
-        self._apply_post_grammar_logits_transforms(logits)
-
-        return observer_state
-
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        if self.has_custom_logit_processor:
-            self._filter_batch_custom_logit_processor(keep_indices)
-
         if self.rows_with_seed is not None:
             self.rows_with_seed = [self.rows_with_seed[i] for i in keep_indices]
             if not any(self.rows_with_seed):
@@ -406,8 +326,6 @@ class SamplingBatchInfo:
         if self.sampling_seed is not None:
             self.sampling_seed = self.sampling_seed[keep_indices_device]
 
-        if self.logit_bias is not None:
-            self.logit_bias = self.logit_bias[keep_indices_device]
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
@@ -436,52 +354,7 @@ class SamplingBatchInfo:
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
-    def _filter_batch_custom_logit_processor(self, keep_indices: List[int]):
-        """Filter the custom logit processor and custom params"""
-        position = {old: new for new, old in enumerate(keep_indices)}
-        pin = is_pin_memory_available(self.device)
-        kept = {}
-        for key, entry in self.custom_logit_processor.items():
-            new_rows = sorted(position[old] for old in entry.rows if old in position)
-            if not new_rows:
-                continue
-            kept[key] = (
-                entry
-                if new_rows == entry.rows
-                else ProcessorEntry(
-                    processor=entry.processor,
-                    rows=new_rows,
-                    indices=_rows_to_device_indices(new_rows, self.device, pin),
-                )
-            )
-        self.custom_logit_processor = kept
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
-
-        # If the custom logit processor is an empty dict, set the flag to False,
-        # and set the custom logit processor and custom params to None.
-        if len(self.custom_logit_processor) == 0:
-            self.custom_logit_processor = None
-            self.custom_params = None
-            self.has_custom_logit_processor = False
-
     def merge_batch(self, other: SamplingBatchInfo, *, self_len: int, other_len: int):
-        # Merge the custom logit processors and custom params lists
-        if self.has_custom_logit_processor or other.has_custom_logit_processor:
-            # Merge the custom logit processors
-            self.custom_logit_processor = self._merge_processor_entries(
-                other, offset=self_len
-            )
-            # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * self_len
-            other.custom_params = other.custom_params or [None] * other_len
-            self.custom_params.extend(other.custom_params)
-
-            # Set the flag to True if any of the two has custom logit processor
-            self.has_custom_logit_processor = True
-
-        self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
-        )
         if (
             self.return_sampling_masks is not None
             or other.return_sampling_masks is not None
@@ -532,36 +405,6 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
-    def _merge_processor_entries(
-        self, other: SamplingBatchInfo, *, offset: int
-    ) -> Dict[int, ProcessorEntry]:
-        """Merge both batches' processor entries, shifting the right batch's rows."""
-        left = self.custom_logit_processor or {}
-        right = other.custom_logit_processor or {}
-
-        merged = {}
-        for key in left.keys() | right.keys():
-            left_entry = left.get(key)
-            right_entry = right.get(key)
-            if right_entry is None:
-                merged[key] = left_entry
-                continue
-            shifted_rows = [row + offset for row in right_entry.rows]
-            shifted_indices = right_entry.indices + offset
-            if left_entry is None:
-                merged[key] = ProcessorEntry(
-                    processor=right_entry.processor,
-                    rows=shifted_rows,
-                    indices=shifted_indices,
-                )
-            else:
-                merged[key] = ProcessorEntry(
-                    processor=left_entry.processor,
-                    rows=left_entry.rows + shifted_rows,
-                    indices=torch.cat([left_entry.indices, shifted_indices]),
-                )
-        return merged
-
     def copy_for_forward(self):
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
             new = object.__new__(SamplingBatchInfo)
@@ -606,42 +449,3 @@ def _fast_copy_enabled() -> bool:
 
 _FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
 _FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
-
-
-def merge_bias_tensor(
-    lhs: Optional[torch.Tensor],
-    rhs: Optional[torch.Tensor],
-    bs1: int,
-    bs2: int,
-    device: str,
-    default: float,
-):
-    """Merge two bias tensors for batch merging.
-
-    Args:
-        lhs: Left-hand side tensor
-        rhs: Right-hand side tensor
-        bs1: Batch size of left-hand side tensor
-        bs2: Batch size of right-hand side tensor
-        device: Device to place the merged tensor on
-        default: Default value for missing tensor elements
-
-    Returns:
-        Merged tensor or None if both inputs are None
-    """
-    if lhs is None and rhs is None:
-        return None
-
-    if lhs is not None and rhs is not None:
-        return torch.cat([lhs, rhs])
-    else:
-        if lhs is not None:
-            shape, dtype = lhs.shape[1:], lhs.dtype
-        else:
-            shape, dtype = rhs.shape[1:], rhs.dtype
-
-        if lhs is None:
-            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
-        if rhs is None:
-            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
-        return torch.cat([lhs, rhs])
