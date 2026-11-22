@@ -373,6 +373,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         max_top_k=vocab_size,
         need_top_k_sampling=False,
         need_top_p_sampling=False,
+        need_min_p_sampling=False,
     )
     states = [
         WatermarkState(
