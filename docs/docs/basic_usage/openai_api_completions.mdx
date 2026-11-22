@@ -416,7 +416,7 @@ idx = np.frombuffer(
 
 #### Returning Sampling Logprobs and Sampling Masks
 
-`logprobs` and `top_logprobs` describe the distribution before top-k / top-p / min-p: after temperature, unless every request in the batch is greedy or `SGLANG_RETURN_ORIGINAL_LOGPROB=1` is set. Two more flags in `extra_body`, together with `return_meta_info: true`, describe the distribution each token was actually sampled from: after those filters, renormalized. Each can be set without the other.
+`logprobs` and `top_logprobs` describe the distribution before top-k / top-p / min-p. Two more flags in `extra_body`, together with `return_meta_info: true`, describe the distribution each token was actually sampled from: after those filters, renormalized. Each can be set without the other.
 
 - `return_sampling_logprobs: true` adds `output_token_sampling_logprobs` to `meta_info`: one float per output token.
 - `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id]` for a token the sampler could have drawn. Unlike a `top_logprobs` entry it carries no text, whatever `return_text_in_logprobs` is.
