@@ -23,7 +23,6 @@ import torch
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
-from sglang.srt.sampling.penalties import apply_scaling_penalties
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
 if TYPE_CHECKING:
@@ -142,11 +141,7 @@ def _adjust_before_watermark(
 ) -> Any:
     """Penalty, grammar mask, then logit_bias; returns the observer's state."""
     if sampling_info.step_penalties is not None:
-        additive, scaling = sampling_info.step_penalties.logit_penalties()
-        if additive is not None:
-            logits.add_(additive)
-        if scaling is not None:
-            apply_scaling_penalties(logits, scaling)
+        sampling_info.step_penalties.apply(logits)
     observer_state = (
         observer.before_grammar(logits, sampling_info) if observer is not None else None
     )

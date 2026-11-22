@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import operator
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -30,6 +30,9 @@ from sglang.srt.utils.device import (
     is_cuda,
     is_npu,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 _is_cuda = is_cuda()
 # The verify kernel stages rows with cp.async, which needs sm_80.
@@ -373,6 +376,14 @@ class StepPenalties:
             self._logit_penalties = self._build_logit_penalties()
         return self._logit_penalties
 
+    def apply(self, logits: torch.Tensor) -> None:
+        """Apply each row's penalties to its sampling logits row, in place."""
+        additive, scaling = self.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
+
     def _build_logit_penalties(
         self,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -521,6 +532,10 @@ class StepPenalties:
         self.pool.accumulate(
             self.batch_indices, self.penalty_indices, token_ids, accept_mask
         )
+
+    def commit_accept(self, accept: VerifyAccept) -> None:
+        """Commit a verify's accepted tokens to the penalty history."""
+        self.commit(accept.accept_tokens(), accept_mask=accept.accept_mask())
 
 
 def _compute_logit_penalties(

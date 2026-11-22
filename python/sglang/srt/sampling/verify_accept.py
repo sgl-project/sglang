@@ -45,9 +45,6 @@ def commit_verify_accept(
 ) -> None:
     """Commit the accepted tokens to the penalty history and the watermark context."""
     if sampling_info.step_penalties is not None:
-        # Guarded here: building the arguments launches device work.
-        sampling_info.step_penalties.commit(
-            accept.accept_tokens(), accept_mask=accept.accept_mask()
-        )
+        sampling_info.step_penalties.commit_accept(accept)
     if watermark is not None:
         watermark.commit(accept)
