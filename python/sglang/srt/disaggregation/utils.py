@@ -354,8 +354,8 @@ def _apply_metadata_gate(polls, pollers, decode_reqs, metadata_buffers) -> None:
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
             else:
-                # The room marker follows every variable-width item, so a room
-                # whose item was dropped has failed by now: poll it again.
+                # An item that does not fit its row is dropped before the room
+                # marker arrives, and fails the room: poll again now.
                 polls[i] = int(pollers[i].poll())
 
 
