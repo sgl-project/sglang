@@ -49,6 +49,12 @@ PREFILL_ARGS = [
     "4",
     "--chunked-prefill-size",
     str(CHUNKED_PREFILL_SIZE),
+    # test_long_context_needle re-sends the exact prompt and expects the
+    # prefill tree to resume it. The default level (2) keeps only the
+    # prompt-end Mamba state, which an identical re-send cannot match;
+    # level 3 also checkpoints every prefill chunk.
+    "--hybrid-cache-checkpoints-level",
+    "3",
 ]
 DECODE_ARGS = [
     "--dcp-size",

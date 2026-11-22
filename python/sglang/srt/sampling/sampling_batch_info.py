@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
@@ -22,7 +21,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.sampling.penalties import StepPenalties, apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.interface import (
     WatermarkRows,
@@ -132,12 +131,8 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
 
-    # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
-    acc_scaling_penalties: Optional[torch.Tensor] = (
-        None  # Used in the overlap mode for repetition penalty
-    )
+    # Set by the scheduler at each launch.
+    step_penalties: Optional[StepPenalties] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -310,24 +305,6 @@ class SamplingBatchInfo:
             merged_custom_logit_processor = None
             custom_params = None
 
-        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
-        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
-        # should not add hefty computation overhead other than simple checks.
-        #
-        # While we can choose not to even create the class instances if they are not required, this
-        # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
-            batch=batch,
-            penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
-            },
-        )
-
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -339,7 +316,6 @@ class SamplingBatchInfo:
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             **_top_k_flags([r.sampling_params.top_k for r in reqs]),
             vocab_size=vocab_size,
-            penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
@@ -437,35 +413,14 @@ class SamplingBatchInfo:
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
-    def update_penalties(self):
-        if self.penalizer_orchestrator.is_required:
-            self.acc_additive_penalties = torch.zeros(
-                (len(self.temperatures), self.vocab_size),
-                dtype=torch.float32,
-                device=self.temperatures.device,
-            )
-            self.penalizer_orchestrator.accumulate_additive_penalties(
-                self.acc_additive_penalties
-            )
-            self.acc_scaling_penalties = (
-                self.penalizer_orchestrator.accumulate_scaling_penalties()
-            )
-        else:
-            self.acc_additive_penalties = None
-            self.acc_scaling_penalties = None
-
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.acc_additive_penalties is not None:
-            # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
-
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
-
-        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
-            # Used in the non-overlap mode
-            self.penalizer_orchestrator.apply(logits)
+        if self.step_penalties is None:
+            return
+        additive, scaling = self.step_penalties.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
 
     def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.logit_bias is not None:
@@ -495,8 +450,6 @@ class SamplingBatchInfo:
         return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
-
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
@@ -580,8 +533,6 @@ class SamplingBatchInfo:
             self.has_custom_logit_processor = False
 
     def merge_batch(self, other: SamplingBatchInfo):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
-
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors
@@ -724,14 +675,12 @@ class SamplingBatchInfo:
         return merged
 
     def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
-        self.update_penalties()
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
             new = object.__new__(SamplingBatchInfo)
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
-            new.penalizer_orchestrator = None
-            return new
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        else:
+            new = dataclasses.replace(self)
+        return new
 
 
 @cache
