@@ -2212,6 +2212,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             extend_logits_row_index=forward_batch.extend_logits_row_index,
             mixed_verify_rows=forward_batch.mixed_verify_rows,
+            mixed_verify_tree=forward_batch.mixed_verify_tree,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
