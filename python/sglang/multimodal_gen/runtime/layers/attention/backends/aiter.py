@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import inspect
 import logging
 import os
 
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
@@ -228,6 +230,188 @@ def _fmha_fp8_prefill_attention(
     )
 
 
+def _load_mha_v4():
+    """aiter's MHA v4 module when its gfx950 BF16 kernel is safe to use.
+
+    MHA v4 is 8-9% faster than fmha v3 (flash_attn_func) at MiniMax-H3's MI350X
+    shapes; both are BF16 flash attention with FP32 softmax and accumulation.
+    Before ROCm/aiter#6841 it had RAW races: on 8 MI350X about 1 call in 800
+    returned wrong rows (up to 0.25 off), so outputs varied run to run. That
+    change also dropped ``sparse`` from ``_check_lse_capable``, which tells the
+    builds apart.
+    """
+    if not USE_AITER_GFX95:
+        return None
+    try:
+        from aiter.ops import mha_v4
+    except ImportError:
+        return None
+    try:
+        racy = "sparse" in inspect.signature(mha_v4._check_lse_capable).parameters
+    except AttributeError:  # gone in later aiter, after the fix
+        racy = False
+    return None if racy else mha_v4
+
+
+_MHA_V4 = _load_mha_v4()
+
+# fmha v3 and MHA v4 run one 256-row query tile per CU per wave. When the last
+# wave holds only a few tiles (Pika H3 Flex 5 s on 8 GPUs: 7 heads x 148 tiles
+# = 4 waves + 12 tiles on 256 CUs), the tail rows finish sooner with their keys
+# split over every CU and the partial results merged by LSE. Adapted from
+# tail_plan in github.com/Pika-Labs/Pika-H3-Flex, branch contrib/amd-mi350x
+# (src/pika_h3/sp_model.py, Apache-2.0).
+_TILE_ROWS = 256
+_TAIL_MAX_TILES = 96
+# that branch reports no gain at 8+ waves: a nearly idle last wave runs at a
+# higher clock under the power cap
+_TAIL_MAX_WAVES = 6
+_TAIL_KEY_CHUNKS = 8
+
+
+@functools.lru_cache(maxsize=None)
+def _num_cus(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _tail_split_rows(rows: int, heads: int, device: torch.device) -> int | None:
+    """Query rows of the full waves when the last wave is mostly idle, else None."""
+    cus = _num_cus(device.index)
+    waves, rem = divmod(heads * -(-rows // _TILE_ROWS), cus)
+    if not 0 < waves <= _TAIL_MAX_WAVES or rem == 0 or rem > _TAIL_MAX_TILES:
+        return None
+    return waves * cus // heads * _TILE_ROWS
+
+
+def _flash(q, k, v, softmax_scale, return_lse=False, out=None):
+    """Non-causal BSHD attention, written into ``out`` when given; with
+    return_lse also the [B, H, S] softmax LSE. q/k/v need a unit-stride head
+    dim only. MHA v4 for BF16 head dim 128, else fmha v3."""
+    if _MHA_V4 is not None and q.dtype == torch.bfloat16 and q.shape[-1] == 128:
+        bf16 = _MHA_V4.AttentionFormat.BF16
+        none = _MHA_V4.AttentionScaleMode.NONE
+        # the descale operands are unused for BF16; aiter takes any tensor there
+        result = _MHA_V4.mha_v4_packed(
+            q,
+            k,
+            v,
+            q,
+            k,
+            v,
+            bf16,
+            bf16,
+            bf16,
+            none,
+            none,
+            none,
+            softmax_scale=softmax_scale,
+            out=out,
+            return_lse=return_lse,
+        )
+        return tuple(result) if return_lse else result
+    result = aiter.flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_lse=return_lse,
+        how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+    )
+    o = result[0] if return_lse else result
+    if out is not None:
+        out.copy_(o)
+        o = out
+    return (o, result[1]) if return_lse else o
+
+
+@triton.jit
+def _lse_merge_kernel(
+    o_ptr,
+    lse_ptr,
+    out_ptr,
+    heads,
+    n_chunks,
+    o_stride_c,
+    o_stride_r,
+    o_stride_h,
+    lse_stride_c,
+    lse_stride_h,
+    out_stride_r,
+    out_stride_h,
+    CHUNKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0) // heads
+    head = tl.program_id(0) % heads
+    c = tl.arange(0, CHUNKS)
+    live = c < n_chunks
+    lse = tl.load(
+        lse_ptr + c * lse_stride_c + head * lse_stride_h + row,
+        mask=live,
+        other=float("-inf"),
+    )
+    w = tl.exp(lse - tl.max(lse, 0))
+    w = w / tl.sum(w, 0)
+    d = tl.arange(0, HEAD_DIM)
+    o = tl.load(
+        o_ptr + c[:, None] * o_stride_c + row * o_stride_r + head * o_stride_h + d,
+        mask=live[:, None],
+        other=0.0,
+    )
+    acc = tl.sum(o.to(tl.float32) * w[:, None], 0)
+    tl.store(
+        out_ptr + row * out_stride_r + head * out_stride_h + d,
+        acc.to(out_ptr.dtype.element_ty),
+    )
+
+
+def _lse_merge(o, lse, out):
+    """o [C, rows, H, D] partial outputs, lse [C, H, rows] -> out [rows, H, D]."""
+    chunks, rows, heads, head_dim = o.shape
+    _lse_merge_kernel[(rows * heads,)](
+        o,
+        lse,
+        out,
+        heads,
+        chunks,
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        out.stride(0),
+        out.stride(1),
+        CHUNKS=triton.next_power_of_2(chunks),
+        HEAD_DIM=head_dim,
+    )
+
+
+def _tail_split_attention(q, k, v, softmax_scale, out, full_rows):
+    """q/k/v [1, S, H, D] -> out [S, H, D]: rows [:full_rows] in one launch,
+    the rest with keys split in _TAIL_KEY_CHUNKS ranges, merged by LSE."""
+    _flash(q[:, :full_rows], k, v, softmax_scale, out=out[None, :full_rows])
+    tail_rows, keys = q.shape[1] - full_rows, k.shape[1]
+    chunks = _TAIL_KEY_CHUNKS
+    size = keys // chunks
+    split = chunks * size
+    q_tail = q[:, full_rows:]
+    o, lse = _flash(
+        q_tail.expand(chunks, tail_rows, *q.shape[2:]),
+        k[0, :split].unflatten(0, (chunks, size)),
+        v[0, :split].unflatten(0, (chunks, size)),
+        softmax_scale,
+        return_lse=True,
+    )
+    if split < keys:
+        o_rest, lse_rest = _flash(
+            q_tail, k[:, split:], v[:, split:], softmax_scale, return_lse=True
+        )
+        o, lse = torch.cat((o, o_rest)), torch.cat((lse, lse_rest))
+    _lse_merge(o, lse, out[full_rows:])
+
+
 @functools.lru_cache(maxsize=64)
 def _cu_seqlens(bounds: tuple[int, ...], device: torch.device) -> torch.Tensor:
     # one upload per bounds and device; callers must not mutate the result
@@ -284,6 +468,9 @@ class AITerImpl(AttentionImpl):
         self.causal = causal
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
 
     @torch.compiler.disable
     def _forward_fp8(
@@ -415,7 +602,49 @@ class AITerImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
+        used = None
+        # gfx950 only: the batch kernels and the key split were measured there;
+        # other architectures keep the varlen kernel
+        if USE_AITER_GFX95 and cu_seqlens_host is not None:
+            if tuple(cu_seqlens_host) == (0, query.shape[0]):
+                used = query.shape[0]
+            elif self.packed_trailing_padding:
+                used = trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=cu_seqlens_host,
+                )
+        if used is not None:
+            # One live sequence (plus trailing padding): the batch kernels read
+            # strided q/k/v. fmha v3 gives its rows the varlen kernel's bytes
+            # and is 9-14% faster at MiniMax-H3's MI350X shapes. Padding rows
+            # are zeroed, as the FA path leaves them; no live row attends to them.
+            q, k, v = (t[None, :used] for t in (query, key, value))
+            if self.causal or self.dropout_p != 0.0:
+                live = aiter.flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout_p,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+                )[0]
+            elif full_rows := _tail_split_rows(used, query.shape[1], query.device):
+                output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+                _tail_split_attention(
+                    q, k, v, self.softmax_scale, output[:used], full_rows
+                )
+                output[used:].zero_()
+                return output
+            else:
+                live = _flash(q, k, v, self.softmax_scale)[0]
+            if used == query.shape[0]:
+                return live
+            output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+            output[:used] = live
+            output[used:].zero_()
+            return output
         attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()

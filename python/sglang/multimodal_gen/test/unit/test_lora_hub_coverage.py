@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     map_lora_state_dict_to_dit,
+    strip_diffusers_transformer_prefix,
 )
 
 # Base model -> (its pipeline config as registered, transformer weight files).
@@ -211,8 +212,10 @@ def _base_layers(base_model: str) -> frozenset[str]:
 def _lora_layers(base_model: str, lora_repo: str, lora_file: str) -> set[str]:
     """Layers the loader would apply this LoRA to (both A and B present)."""
     arch = _arch_config(base_model)
-    lora_state_dict = normalize_lora_state_dict(
-        _header_state_dict(lora_repo, lora_file), adapter_config={}
+    lora_state_dict = strip_diffusers_transformer_prefix(
+        normalize_lora_state_dict(
+            _header_state_dict(lora_repo, lora_file), adapter_config={}
+        )
     )
     adapter = map_lora_state_dict_to_dit(
         lora_state_dict,
