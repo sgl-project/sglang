@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
@@ -22,18 +21,14 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.watermarking.interface import (
-    WatermarkRows,
-    merge_watermark_rows,
-)
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
+from sglang.srt.sampling.penalties import StepPenalties, apply_scaling_penalties
+from sglang.srt.sampling.watermarking.interface import WatermarkRows
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.sampling.sampler_params import SamplerParams
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
@@ -105,39 +100,29 @@ class ProcessorEntry:
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    # Basic batched sampling params
-    temperatures: torch.Tensor
-    top_ps: torch.Tensor
-    top_ks: torch.Tensor
-    min_ps: torch.Tensor
+    vocab_size: int
 
-    # Whether all requests use greedy sampling
-    is_all_greedy: bool
-
-    is_any_greedy: bool
-
-    # Whether any requests use top_p sampling
-    need_top_p_sampling: bool
-
-    # Whether any requests use top_k sampling
-    need_top_k_sampling: bool
-
-    # Whether any request needs min_p sampling
-    need_min_p_sampling: bool
+    # The SamplerParams fields, set by the scheduler at each launch.
+    temperatures: Optional[torch.Tensor] = None
+    top_ps: Optional[torch.Tensor] = None
+    top_ks: Optional[torch.Tensor] = None
+    min_ps: Optional[torch.Tensor] = None
+    is_all_greedy: bool = False
+    is_any_greedy: bool = False
+    need_top_p_sampling: bool = False
+    need_top_k_sampling: bool = False
+    need_min_p_sampling: bool = False
+    npu_top_k_top_p_eligible: bool = False
+    max_top_k: Optional[int] = None
 
     # Masking tensors for grammar-guided structured outputs
-    vocab_size: int
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
 
-    # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
-    acc_scaling_penalties: Optional[torch.Tensor] = (
-        None  # Used in the overlap mode for repetition penalty
-    )
+    # Set by the scheduler at each launch.
+    step_penalties: Optional[StepPenalties] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -160,7 +145,8 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    # Per-row watermark policy; None unless some row is a watermark candidate.
+    # Per-row watermark policy, None unless some row is a watermark candidate;
+    # set by the scheduler at each launch.
     watermark: Optional[WatermarkRows] = None
 
     # Device
@@ -169,16 +155,6 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
-    # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
-    # device avoids a scalar synchronization in the per-token sampling path.
-    npu_top_k_top_p_eligible: bool = False
-
-    # Host-side upper bound on every row's top_k, or None when some row samples
-    # from the whole vocabulary. Any value >= the true max stays exact, so
-    # filter_batch keeps it unchanged (ScheduleBatch tightens it with
-    # refresh_top_k_flags).
-    max_top_k: Optional[int] = None
-
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
@@ -186,30 +162,6 @@ class SamplingBatchInfo:
         reqs = batch.reqs
         device = batch.device
         _pin = is_pin_memory_available(device)
-        temperatures = (
-            torch.tensor(
-                [r.sampling_params.temperature for r in reqs],
-                dtype=torch.float,
-                pin_memory=_pin,
-            )
-            .to(device, non_blocking=True)
-            .view(-1, 1)
-        )
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs],
-            dtype=torch.float,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs],
-            dtype=torch.int32,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs],
-            dtype=torch.float,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
         rows_with_seed = _rows_with_seed(
             reqs, enable_deterministic=enable_deterministic
         )
@@ -268,13 +220,6 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-        watermark = (
-            build_watermark_rows(reqs, device)
-            if isinstance(batch, ScheduleBatch)
-            else None
-        )
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -310,36 +255,10 @@ class SamplingBatchInfo:
             merged_custom_logit_processor = None
             custom_params = None
 
-        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
-        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
-        # should not add hefty computation overhead other than simple checks.
-        #
-        # While we can choose not to even create the class instances if they are not required, this
-        # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
-            batch=batch,
-            penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
-            },
-        )
-
         ret = cls(
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            min_ps=min_ps,
             sampling_seed=sampling_seed,
             rows_with_seed=rows_with_seed,
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
             vocab_size=vocab_size,
-            penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
@@ -348,7 +267,6 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
-            watermark=watermark,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -407,8 +325,9 @@ class SamplingBatchInfo:
             return None
         return _rows_to_device_indices(indices, device)
 
-    def __len__(self):
-        return len(self.temperatures)
+    def set_sampler_params(self, params: SamplerParams) -> None:
+        for name, value in zip(params._fields, params):
+            setattr(self, name, value)
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
@@ -420,7 +339,7 @@ class SamplingBatchInfo:
 
         vocab_mask = first_grammar.allocate_vocab_mask(
             vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
+            batch_size=len(self.grammars),
             device=self.device,
         )
 
@@ -437,35 +356,14 @@ class SamplingBatchInfo:
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
-    def update_penalties(self):
-        if self.penalizer_orchestrator.is_required:
-            self.acc_additive_penalties = torch.zeros(
-                (len(self.temperatures), self.vocab_size),
-                dtype=torch.float32,
-                device=self.temperatures.device,
-            )
-            self.penalizer_orchestrator.accumulate_additive_penalties(
-                self.acc_additive_penalties
-            )
-            self.acc_scaling_penalties = (
-                self.penalizer_orchestrator.accumulate_scaling_penalties()
-            )
-        else:
-            self.acc_additive_penalties = None
-            self.acc_scaling_penalties = None
-
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.acc_additive_penalties is not None:
-            # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
-
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
-
-        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
-            # Used in the non-overlap mode
-            self.penalizer_orchestrator.apply(logits)
+        if self.step_penalties is None:
+            return
+        additive, scaling = self.step_penalties.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
 
     def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.logit_bias is not None:
@@ -495,8 +393,6 @@ class SamplingBatchInfo:
         return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
-
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
@@ -507,19 +403,8 @@ class SamplingBatchInfo:
                 self.rows_with_seed = None
                 self.sampling_seed = None
 
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[keep_indices_device])
-
-        if self.watermark is not None:
-            self.watermark = self.watermark.filter(keep_indices, keep_indices_device)
+        if self.sampling_seed is not None:
+            self.sampling_seed = self.sampling_seed[keep_indices_device]
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -579,26 +464,21 @@ class SamplingBatchInfo:
             self.custom_params = None
             self.has_custom_logit_processor = False
 
-    def merge_batch(self, other: SamplingBatchInfo):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
-
+    def merge_batch(self, other: SamplingBatchInfo, *, self_len: int, other_len: int):
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
             # Merge the custom logit processors
-            self.custom_logit_processor = self._merge_processor_entries(other)
+            self.custom_logit_processor = self._merge_processor_entries(
+                other, offset=self_len
+            )
             # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
+            self.custom_params = self.custom_params or [None] * self_len
+            other.custom_params = other.custom_params or [None] * other_len
             self.custom_params.extend(other.custom_params)
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
 
-        self_len = len(self)
-        other_len = len(other)
-
-        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
-        # See note below on len(self) and len(other).
         self.logit_bias = merge_bias_tensor(
             self.logit_bias, other.logit_bias, self_len, other_len, self.device, 0.0
         )
@@ -647,58 +527,17 @@ class SamplingBatchInfo:
             if other.sampling_seed is None:
                 other.sampling_seed = _filler_seeds(other_len, self.device)
 
-        # Note: because the __len()__ operator is defined on the temperatures tensor,
-        # please make sure any merge operation with len(self) or len(other) is done before
-        # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
-
-        self.watermark = merge_watermark_rows(
-            self.watermark, other.watermark, self_len, other_len
-        )
-
-        self.is_all_greedy &= other.is_all_greedy
-        self.is_any_greedy |= other.is_any_greedy
-        self.need_top_p_sampling |= other.need_top_p_sampling
-        self.need_top_k_sampling |= other.need_top_k_sampling
-        self.need_min_p_sampling |= other.need_min_p_sampling
-        self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
-        self.max_top_k = (
-            None
-            if self.max_top_k is None or other.max_top_k is None
-            else max(self.max_top_k, other.max_top_k)
-        )
+        if self.sampling_seed is not None and other.sampling_seed is not None:
+            self.sampling_seed = torch.cat([self.sampling_seed, other.sampling_seed])
 
         self.adjusted_merge_batch(other)
 
-    def refresh_top_k_flags(self, top_ks: List[int]) -> None:
-        """Set the top-k flags from the rows' top_k, as from_schedule_batch does.
-
-        filter_batch leaves them as they were, which is safe but sticky: one
-        finished greedy row (top_k=1) keeps need_top_k_sampling on and max_top_k
-        None for the rest of the running batch. ScheduleBatch.filter_batch calls
-        this with its kept requests' top_k.
-        """
-        for name, value in _top_k_flags(top_ks).items():
-            setattr(self, name, value)
-
     def _merge_processor_entries(
-        self, other: SamplingBatchInfo
+        self, other: SamplingBatchInfo, *, offset: int
     ) -> Dict[int, ProcessorEntry]:
         """Merge both batches' processor entries, shifting the right batch's rows."""
-        # This runs before temperatures are concatenated, so len(self) is the left batch size.
         left = self.custom_logit_processor or {}
         right = other.custom_logit_processor or {}
-        offset = len(self)
 
         merged = {}
         for key in left.keys() | right.keys():
@@ -724,14 +563,32 @@ class SamplingBatchInfo:
         return merged
 
     def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
-        self.update_penalties()
         if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
             new = object.__new__(SamplingBatchInfo)
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
-            new.penalizer_orchestrator = None
-            return new
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        else:
+            new = dataclasses.replace(self)
+        return new
+
+
+def adjusts_logits(info: SamplingBatchInfo, *, has_grammar: bool) -> bool:
+    """Whether sampling edits the logits before choosing tokens. has_grammar comes
+    from the batch: verify builds its grammar mask per step, outside the sampling info.
+    """
+    return (
+        has_grammar
+        or info.step_penalties is not None
+        or info.logit_bias is not None
+        or info.has_custom_logit_processor
+        or info.watermark is not None
+    )
+
+
+def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
+    """Whether some row truncates its distribution with top-k, top-p, or min-p."""
+    return (
+        info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
+    )
 
 
 @cache
@@ -749,20 +606,6 @@ def _fast_copy_enabled() -> bool:
 
 _FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
 _FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
-
-
-def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
-    """The SamplingBatchInfo flags that follow from the rows' top_k values."""
-    return {
-        "is_all_greedy": all(k <= 1 for k in top_ks),
-        "is_any_greedy": any(k <= 1 for k in top_ks),
-        "need_top_k_sampling": any(k != TOP_K_ALL for k in top_ks),
-        "npu_top_k_top_p_eligible": all(1 <= k <= 1024 for k in top_ks),
-        # None when any row samples the whole vocabulary.
-        "max_top_k": (
-            max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None
-        ),
-    }
 
 
 def merge_bias_tensor(
