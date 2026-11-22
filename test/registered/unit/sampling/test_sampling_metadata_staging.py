@@ -101,9 +101,10 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
         pool = _admitted_pool(reqs, self.device)
+        penalty_indices = StepPenalties.build(reqs, pool).penalty_indices
         self.assert_device_tensor(
-            StepPenalties.build(reqs, pool).min_new_tokens,
-            torch.tensor([[2], [1]], dtype=torch.int32),
+            pool.live_tables().min_new_tokens[penalty_indices],
+            torch.tensor([2, 1], dtype=torch.int32),
             torch.int32,
         )
         for step in range(3):
@@ -159,6 +160,19 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
             copy_counts[batch_size] = len(copies.numels)
             self.assertTrue(torch.isneginf(additive[:, 2:4]).all().item())
         self.assertEqual(copy_counts[16], copy_counts[1])
+
+    def test_step_build_copies_only_the_indices(self):
+        reqs = [
+            _req(min_new_tokens=2, stop_token_ids=[2, 3], frequency_penalty=0.5),
+            _req(),
+            _req(repetition_penalty=1.2),
+        ]
+        pool = _admitted_pool(reqs, self.device)
+        pool.live_tables()
+        with _H2DCopies() as copies:
+            StepPenalties.build(reqs, pool)
+        torch.cuda.synchronize()
+        self.assertEqual(copies.numels, [4])
 
     def test_logit_bias_never_copies_a_dense_row(self):
         reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]
