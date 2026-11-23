@@ -68,8 +68,10 @@ class AutoRoundConfig(QuantizationConfig):
         true_sequential: bool = False,
         static_groups: bool = False,
         gptq_defaulted_config_keys: Optional[tuple[str, ...]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
     ) -> None:
         super().__init__()
+        self.packed_modules_mapping = packed_modules_mapping or {}
         if weight_bits not in self.SUPPORTED_BITS:
             raise ValueError(
                 f"Unsupported weight_bits: {weight_bits}, "
@@ -178,6 +180,9 @@ class AutoRoundConfig(QuantizationConfig):
             true_sequential=cls.get_from_keys_or(config, ["true_sequential"], False),
             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
+            packed_modules_mapping=cls.get_from_keys_or(
+                config, ["packed_modules_mapping"], {}
+            ),
         )
 
     def get_scaled_act_names(self) -> list[str]:
