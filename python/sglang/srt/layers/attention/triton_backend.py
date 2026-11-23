@@ -1057,8 +1057,9 @@ class TritonAttnBackend(AttentionBackend):
         return rails
 
     def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
-        """Read a DFLASH MLA draft's window keys from its per-request KV ring; only
-        ROCm's DCP window verify admits the ring on this backend."""
+        """Read a draft's window keys from its per-request KV ring. On this backend
+        only ROCm admits the ring: DFLASH MLA drafts under DCP window verify, and
+        GQA DSPARK drafts through their sliding-window rail."""
         if _is_hip and not self.use_mla:
             _draft_hip.set_gqa_draft_kv_ring(self, ring)
             return

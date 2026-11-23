@@ -29,8 +29,8 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     # --speculative-draft-kv-cache-dtype says otherwise; keep q and the attention
     # math in BF16 over it instead of casting q and the probabilities to FP8.
     backend.draft_bf16_dot = algorithm.is_dflash_family()
-    # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
-    # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
+    # A DFLASH or DSPARK draft never runs forward_decode, so its graphs skip the
+    # split-KV decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
     backend.runs_decode = not algorithm.is_dflash_family()
     # The monokernel's DFLASH MLA draft verifies on its own tuning of the
     # grouped-head kernel (a sliding window, two heads a tile); nothing else does.

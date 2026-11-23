@@ -496,7 +496,7 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 self.assertTrue(torch.equal(dst_pool[read], keys))
 
 
-class TestDSparkGqaDraftKVRingRocm(unittest.TestCase):
+class TestDSparkGqaDraftKVRingRocm(CustomTestCase):
     def _gqa_config(self):
         return SimpleNamespace(
             layer_types=["sliding_attention"] * 5,
@@ -509,36 +509,39 @@ class TestDSparkGqaDraftKVRingRocm(unittest.TestCase):
             },
         )
 
-    def test_rocm_gqa_dspark_ring_allowed_on_triton_and_rejected_on_pd_or_cuda(self):
+    def _reason(self, **overrides):
         cfg = self._gqa_config()
-        self.assertIsNone(
-            draft_kv_ring_unsupported_reason(
-                lambda: cfg,
-                draft_backend="triton",
-                dcp_size=8,
-                is_cuda=False,
-                is_dspark=True,
-            )
+        kwargs = dict(
+            draft_backend="triton",
+            dcp_size=8,
+            is_cuda=False,
+            is_hip=True,
+            is_dspark=True,
         )
-        self.assertIsNotNone(
-            draft_kv_ring_unsupported_reason(
-                lambda: cfg,
-                draft_backend="triton",
-                disaggregation_mode="prefill",
-                dcp_size=8,
-                is_cuda=False,
-                is_dspark=True,
-            )
-        )
-        self.assertIsNotNone(
-            draft_kv_ring_unsupported_reason(
-                lambda: cfg,
-                draft_backend="triton",
-                dcp_size=8,
-                is_cuda=True,
-                is_dspark=True,
-            )
-        )
+        kwargs.update(overrides)
+        return draft_kv_ring_unsupported_reason(lambda: cfg, **kwargs)
+
+    def test_rocm_triton_gqa_dspark_ring_is_allowed(self):
+        self.assertIsNone(self._reason())
+
+    def test_dspark_ring_is_rejected_off_rocm_triton(self):
+        """The DSpark ring only has a ROCm Triton reader; other platforms and draft
+        backends must not fall through to the DFLASH ring paths."""
+        for overrides in (
+            dict(is_cuda=True, is_hip=False),
+            dict(is_cuda=False, is_hip=False),
+            dict(draft_backend="fa3"),
+            dict(draft_backend="flashinfer"),
+            dict(disaggregation_mode="prefill"),
+        ):
+            with self.subTest(**overrides):
+                self.assertIsNotNone(self._reason(**overrides))
+
+    def test_dspark_ring_needs_static_ragged_verify(self):
+        """Compact and cap-accept verify inject draft KV by pool ids, not ring rows."""
+        for mode in ("compact", "cap-accept"):
+            with self.subTest(mode=mode), envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                self.assertIn("SGLANG_RAGGED_VERIFY_MODE", self._reason())
 
 
 if __name__ == "__main__":

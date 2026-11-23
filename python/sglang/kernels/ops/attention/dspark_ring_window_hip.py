@@ -44,10 +44,23 @@ def fill_dspark_ring_window_buffer_hip(
     sliding_window_size: int,
     window_kv_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fill sliding-window rail indices from a per-request draft ring (``dcp_size == 1``)."""
+    """Fill sliding-window rail indices from a per-request draft ring.
+
+    Coverage: ROCm (Triton), ``dcp_size == 1``, positive window and ring rows.
+    Request ``b`` reads keys ``[start_b, seq_lens[b])`` with ``start_b =
+    max(min_pos[slot_b], seq_lens[b] - sliding_window_size, 0)``, from ring row
+    ``1 + slot_b * rows_per_req + pos % rows_per_req``. Returns ``(kv_indptr``
+    int32 ``[bs + 1]``, ``kv_indices`` int64, ``kv_lens``, ``starts)``. A given
+    ``window_kv_indices`` (the CUDA graph buffer) is filled in place without a
+    host sync; otherwise it is sized with one ``.item()``."""
     if dcp_size != 1:
         raise ValueError(
             f"fill_dspark_ring_window_buffer_hip requires dcp_size == 1, got {dcp_size}"
+        )
+    if sliding_window_size <= 0 or rows_per_req <= 0:
+        raise ValueError(
+            "fill_dspark_ring_window_buffer_hip needs a positive window and ring "
+            f"rows, got {sliding_window_size} and {rows_per_req}"
         )
     req_slots = req_pool_indices[:bs]
     lens = seq_lens[:bs].to(torch.int32)

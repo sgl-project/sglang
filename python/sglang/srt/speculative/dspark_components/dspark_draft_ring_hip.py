@@ -26,6 +26,15 @@ def rocm_dspark_gqa_ring_unsupported_reason(
     draft_window_size: Optional[int],
 ) -> Optional[str]:
     """Return why a ROCm Triton GQA DSpark ring cannot be enabled, or None."""
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    # Only the static verify path writes draft KV through the ring; the ragged
+    # (compact, cap-accept) injector writes by pool ids.
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        return "the DSpark draft KV ring needs SGLANG_RAGGED_VERIFY_MODE=static"
     if disaggregation_mode != "null":
         return "ROCm GQA DSpark draft KV ring does not support PD disaggregation"
     if draft_window_size is not None:

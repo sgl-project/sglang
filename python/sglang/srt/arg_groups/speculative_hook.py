@@ -884,7 +884,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    _resolve_dflash_draft_kv_ring(server_args, is_dspark=True)
+    if current_platform.is_rocm():
+        _resolve_dflash_draft_kv_ring(server_args, is_dspark=True)
 
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
@@ -1139,6 +1140,7 @@ def _resolve_dflash_draft_kv_ring(
         enable_dp_attention=attn_dp_enabled_of(cfg),
         draft_window_size=cfg.speculative_draft_window_size,
         is_cuda=current_platform.is_cuda(),
+        is_hip=current_platform.is_rocm(),
         is_dspark=is_dspark,
     )
     if reason is not None:

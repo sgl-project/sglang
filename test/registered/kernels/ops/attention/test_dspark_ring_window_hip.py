@@ -68,6 +68,62 @@ def test_ring_window_indices_match_reference(window: int, rows_per_req: int) -> 
     assert starts.cpu().tolist() == ref_starts
 
 
+def test_preallocated_graph_buffer_is_filled_in_place() -> None:
+    window, rows_per_req = 64, 64
+    seq_lens = torch.tensor([10, 200], dtype=torch.int64)
+    req_pool_indices = torch.tensor([1, 2], dtype=torch.int64)
+    min_pos = torch.zeros(POOL, dtype=torch.int32)
+    buf = torch.full((2 * window + 7,), -1, dtype=torch.int64, device="cuda")
+    indptr, indices, _, _ = fill_dspark_ring_window_buffer_hip(
+        min_pos=min_pos.cuda(),
+        rows_per_req=rows_per_req,
+        dcp_size=1,
+        window_kv_indptr=torch.zeros(4, dtype=torch.int32, device="cuda"),
+        req_pool_indices=req_pool_indices.cuda(),
+        seq_lens=seq_lens.cuda(),
+        bs=2,
+        sliding_window_size=window,
+        window_kv_indices=buf,
+    )
+    ref_indptr, ref_indices, _, _ = _reference(
+        min_pos, rows_per_req, req_pool_indices, seq_lens, window
+    )
+    assert indices.data_ptr() == buf.data_ptr()
+    assert indptr.cpu().tolist() == ref_indptr
+    assert buf[: ref_indptr[-1]].cpu().tolist() == ref_indices
+    assert (buf[ref_indptr[-1] :] == -1).all()
+
+
+def test_empty_batch_writes_only_indptr() -> None:
+    indptr, indices, kv_lens, _ = fill_dspark_ring_window_buffer_hip(
+        min_pos=torch.zeros(POOL, dtype=torch.int32, device="cuda"),
+        rows_per_req=64,
+        dcp_size=1,
+        window_kv_indptr=torch.full((3,), 9, dtype=torch.int32, device="cuda"),
+        req_pool_indices=torch.zeros(2, dtype=torch.int64, device="cuda"),
+        seq_lens=torch.ones(2, dtype=torch.int64, device="cuda"),
+        bs=0,
+        sliding_window_size=64,
+    )
+    assert indptr.cpu().tolist() == [0]
+    assert indices.numel() == 0 and kv_lens.numel() == 0
+
+
+@pytest.mark.parametrize("window,rows_per_req", [(0, 64), (64, 0)])
+def test_non_positive_window_or_ring_is_rejected(window, rows_per_req) -> None:
+    with pytest.raises(ValueError, match="positive window"):
+        fill_dspark_ring_window_buffer_hip(
+            min_pos=torch.zeros(POOL, dtype=torch.int32, device="cuda"),
+            rows_per_req=rows_per_req,
+            dcp_size=1,
+            window_kv_indptr=torch.zeros(2, dtype=torch.int32, device="cuda"),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64, device="cuda"),
+            seq_lens=torch.ones(1, dtype=torch.int64, device="cuda"),
+            bs=1,
+            sliding_window_size=window,
+        )
+
+
 def test_dcp_above_one_is_rejected() -> None:
     with pytest.raises(ValueError, match="dcp_size == 1"):
         fill_dspark_ring_window_buffer_hip(
