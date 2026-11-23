@@ -261,9 +261,9 @@ def transformer_class_name_matches(current_model: Any, needle: str) -> bool:
 
 # --- Model-specific prompt-padder registry ------------------------------- #
 # Each model that needs custom prompt padding registers a (predicate, padder)
-# pair from its own module in ``model_specific_stages`` so the base denoising
-# stage stays model-agnostic. ``padder(call_kwargs, current_model, buckets)``
-# returns the padded kwargs.
+# pair from its own module in ``breakable_cuda_graph.model_padders`` so the base
+# denoising stage stays model-agnostic.
+# ``padder(call_kwargs, current_model, buckets)`` returns the padded kwargs.
 PromptPadder = Callable[[dict, Any, tuple], dict]
 _PROMPT_PADDERS: list[tuple[Callable[[Any, dict], bool], PromptPadder]] = []
 
