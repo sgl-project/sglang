@@ -147,6 +147,11 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     truncate_input_ids,
 )
+from sglang.srt.managers.worker_rid import (
+    add_worker_rid_suffix,
+    make_worker_rid_suffix,
+    strip_worker_rid_suffix,
+)
 from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
@@ -611,6 +616,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     tokenized_generate_req_type = TokenizedGenerateReqInput
     batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
     canary_info_hook: Optional[CanaryInfoTokenizerManagerHook] = None
+    # Appended to every rid this worker sends on; empty with a single tokenizer worker.
+    worker_rid_suffix: str = ""
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -848,6 +855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
             self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+            self.worker_rid_suffix = make_worker_rid_suffix(multi_worker=True)
 
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
@@ -2650,6 +2658,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        if rid not in self.rid_to_state:
+            # A client names its request by the rid it sent, without this worker's suffix.
+            suffixed_rid = add_worker_rid_suffix(rid, self.worker_rid_suffix)
+            if suffixed_rid in self.rid_to_state:
+                rid = suffixed_rid
         state = None if abort_all else self.rid_to_state.get(rid)
         if not abort_all:
             if state is not None:
@@ -2981,7 +2994,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Build meta_info and return value
             meta_info = {
-                "id": rid,
+                "id": strip_worker_rid_suffix(rid, self.worker_rid_suffix),
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": request_stats.prompt_tokens,
                 "weight_version": self.config_value("weight_version"),
@@ -4010,7 +4023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": strip_worker_rid_suffix(recv_obj.rid, self.worker_rid_suffix),
             "finish_reason": finish_reason,
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
@@ -4244,6 +4257,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    def _add_worker_rid_suffix(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        obj.rid = add_worker_rid_suffix(obj.rid, self.worker_rid_suffix)
+        if isinstance(obj.rid, list):
+            # Sub-objects already cached by __getitem__ hold their own copy of the rid.
+            for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+                sub_obj.rid = obj.rid[i]
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -4261,6 +4283,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             elif request:
                 external_trace_header = extract_trace_headers(request.headers)
                 obj.external_trace_header = external_trace_header
+
+        if self.worker_rid_suffix:
+            self._add_worker_rid_suffix(obj)
 
         # Normalize single/batch into a uniform list of (rid, sub_obj, bootstrap_room)
         if not hasattr(obj, "is_single") or obj.is_single:
@@ -4282,7 +4307,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids = set()
         for rid, _, _ in items:
             if rid in self.rid_to_state or rid in rids:
-                raise ValueError(f"Duplicate request ID detected: {rid}")
+                client_rid = strip_worker_rid_suffix(rid, self.worker_rid_suffix)
+                raise ValueError(f"Duplicate request ID detected: {client_rid}")
             rids.add(rid)
 
         new_states = {}
