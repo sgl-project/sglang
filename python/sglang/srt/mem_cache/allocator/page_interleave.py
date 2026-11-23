@@ -429,6 +429,10 @@ def page_interleave_shard_size(allocator: BaseTokenToKVPoolAllocator) -> int:
     rotation-base plumbing, invariant slack) branch on this, exactly
     parallel to their existing DCP conditions.
     """
-    if isinstance(allocator, PageInterleavePoolAllocator):
+    # A unified chain with a sharded owner band answers alike; imported here
+    # because the chain builds on this module.
+    from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+    if isinstance(allocator, (PageInterleavePoolAllocator, ChainAllocator)):
         return allocator.shard_size
     return 1
