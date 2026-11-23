@@ -82,6 +82,9 @@ class NixlBackendConfig:
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
 
+        # config is empty, in flat form {'param1': 'value1', 'param2': 'value2', ...},
+        # or in fully qualified form with no active plugin
+        plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
         if "plugin" in self.config:
             # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
             # choose the FIRST active plugin
@@ -89,9 +92,6 @@ class NixlBackendConfig:
                 if item.get("active", False) in [True, "true", "True"]:
                     plugin = key.upper()
                     break
-        else:
-            # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
-            plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
 
         return plugin
 
@@ -159,6 +159,8 @@ class NixlBackendSelection:
 
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
+        plugin_list = []
+        initparams = {}
         try:
             plugin_list = agent.get_plugin_list()
             logger.debug(f"Available NIXL plugins: {plugin_list}")
