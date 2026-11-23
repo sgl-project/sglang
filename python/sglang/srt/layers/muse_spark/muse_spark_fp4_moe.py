@@ -566,8 +566,6 @@ class MuseSpark1xFp4Experts(nn.Module):
         if pre_expert_norm is not None:
             hidden_states = _pre_expert_rms_norm(pre_expert_norm, hidden_states)
         if self._fused_w4a16_ready():
-            from sglang.srt.layers.muse_spark.fused.glue import ar_out
-
             return nvfp4_w4a16_moe_with_post_norm(
                 hidden_states,
                 self._expert_map[topk_ids],
@@ -577,7 +575,6 @@ class MuseSpark1xFp4Experts(nn.Module):
                 self.w2_weight,
                 self.w2_weight_scale_2,
                 self._post_expert_norm_weight_f32,
-                out=ar_out(hidden_states.shape[0], self.hidden_size),
             )
         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
             hidden_states, topk_scores, topk_ids
