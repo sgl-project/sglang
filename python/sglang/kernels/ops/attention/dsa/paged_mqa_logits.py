@@ -118,8 +118,12 @@ def aiter_paged_mqa_logits(
     # gfx950 decode / MTP-verify rows: the in-tree re-tuned kernel (see
     # gluon_paged_mqa_logits.py); everything else keeps aiter's.
     gluon = _gluon_paged_mqa_logits()
-    if gluon is not None and gluon.supported(
-        q_fp8, kv_cache_fp8, preshuffle=preshuffle, kv_block_size=kv_block_size
+    if (
+        persistent_schedule is None
+        and gluon is not None
+        and gluon.supported(
+            q_fp8, kv_cache_fp8, preshuffle=preshuffle, kv_block_size=kv_block_size
+        )
     ):
         fn = gluon.gluon_fp8_paged_mqa_logits
     else:

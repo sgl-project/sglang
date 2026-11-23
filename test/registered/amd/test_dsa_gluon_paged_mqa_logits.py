@@ -2,7 +2,12 @@
 MTP-verify rows: same logits to fp32 rounding (the head sum is reordered) and
 the same top-2048 selection."""
 
+import ast
+import sys
+import types
 import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -35,7 +40,7 @@ def _skip_reason():
 SKIP = _skip_reason()
 
 # Same placement as test_dsa_gfx950_fused_indexer.py: a gfx950 suite.
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipIf(SKIP is not None, SKIP or "")
@@ -167,6 +172,69 @@ class TestGluonPagedMqaLogits(unittest.TestCase):
         self.assertFalse(
             self.mod.supported(q[:8], self.kv, preshuffle=False, kv_block_size=PAGE)
         )
+
+
+class TestPagedMqaDispatch(unittest.TestCase):
+    def test_persistent_schedule_keeps_aiter_path(self):
+        # Exercise the actual wrapper without importing GPU-only dependencies.
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "python/sglang/kernels/ops/attention/dsa/paged_mqa_logits.py"
+        )
+        tree = ast.parse(source.read_text())
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "aiter_paged_mqa_logits"
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                function,
+            ],
+            type_ignores=[],
+        )
+        optimized = Mock()
+        optimized.supported.return_value = True
+        baseline = Mock()
+        aiter_module = types.ModuleType("aiter.ops.triton.pa_mqa_logits")
+        aiter_module.deepgemm_fp8_paged_mqa_logits = baseline
+        namespace = {"torch": torch, "_gluon_paged_mqa_logits": lambda: optimized}
+        exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+        q = torch.empty(2, HEADS, DIM)
+        kv = torch.empty(1, PAGE, 1, DIM + 4)
+        weights = torch.empty(2, HEADS)
+        lengths = torch.tensor([1, 2], dtype=torch.int32)
+        tables = torch.zeros(2, 1, dtype=torch.int32)
+        schedule = torch.zeros(1, dtype=torch.int32)
+        with patch.dict(sys.modules, {aiter_module.__name__: aiter_module}):
+            for persistent in (None, schedule):
+                baseline.reset_mock()
+                optimized.gluon_fp8_paged_mqa_logits.reset_mock()
+                result = namespace["aiter_paged_mqa_logits"](
+                    q,
+                    kv,
+                    weights,
+                    lengths,
+                    tables,
+                    PAGE,
+                    preshuffle=True,
+                    kv_block_size=PAGE,
+                    persistent_schedule=persistent,
+                )
+                self.assertEqual(result.shape, (2, PAGE))
+                if persistent is None:
+                    baseline.assert_not_called()
+                    optimized.gluon_fp8_paged_mqa_logits.assert_called_once()
+                else:
+                    optimized.gluon_fp8_paged_mqa_logits.assert_not_called()
+                    baseline.assert_called_once()
+                    self.assertIs(
+                        baseline.call_args.kwargs["PersistentSchedule"], schedule
+                    )
 
 
 if __name__ == "__main__":
