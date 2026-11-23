@@ -41,11 +41,6 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    # TEMPORARY: MLA defaults the host pool to the ACL backend, whose buffers
-    # are not torch-pinned, and the Mamba state backup kernel then dies with
-    # "host buffer must use pinned memory". Any value other than acl/memfabric
-    # falls back to plain pinned memory.
-    "SGLANG_HICACHE_HOST_MEM_BACKEND": "torch",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
@@ -71,11 +66,6 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
-    # TEMPORARY: text-only serving keeps is_multimodal false, so the remote-code
-    # processor/image processor is not loaded (the 16 scheduler processes of a
-    # pod otherwise race to copy its transformers dynamic module and one dies
-    # with "has no attribute KimiK3VisionProcessor").
-    "--disable-multimodal",
     "--mem-fraction-static",
     0.72,
     "--chunked-prefill-size",

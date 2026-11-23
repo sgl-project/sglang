@@ -50,11 +50,6 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "64",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    # TEMPORARY: MLA defaults the host pool to the ACL backend, whose buffers
-    # are not torch-pinned, and the Mamba state backup kernel then dies with
-    # "host buffer must use pinned memory". Any value other than acl/memfabric
-    # falls back to plain pinned memory.
-    "SGLANG_HICACHE_HOST_MEM_BACKEND": "torch",
 }
 
 # L3 store client: MemFabric TENT transport over the NPU device path, as in the
@@ -97,14 +92,6 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
-    # TEMPORARY: this case only sends text. Serving the model text-only keeps
-    # is_multimodal false, so neither the scheduler nor the tokenizer manager
-    # loads the remote-code processor/image processor, whose transformers
-    # dynamic module the 16 scheduler processes of a pod race to copy (one rank
-    # imports a half-written file and dies with "has no attribute
-    # KimiK3VisionProcessor"). --language-model-only is not an option here: it
-    # rejects KimiK3ForConditionalGeneration. Remove once the race is fixed.
-    "--disable-multimodal",
     "--mem-fraction-static",
     0.72,
     "--chunked-prefill-size",
