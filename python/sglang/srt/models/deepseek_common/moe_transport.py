@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    attn_cp_all_gather_into_tensor,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -101,6 +102,39 @@ def _attn_tp_all_gather_chunks(
     )
 
 
+def _align_cp_router_ids(input_ids, input_ids_global, local_rows, router_rows):
+    """Return token ids that describe the CP rank-major router row space.
+
+    The a2a-none CP fast path expands hidden rows to `router_rows` with
+    `attn_cp_interleave_gather`, and the router indexes the per-token bias by
+    those same rows. Two producer shapes reach the transport:
+    `cp_shard_model_inputs` already attached the complete router-row view, or
+    the caller only has rank-local ids (DSpark prefill never enters that context
+    manager, so `input_ids_global` collapses onto the local ids). Reuse the
+    attached view when it already spans the router rows; otherwise rebuild it
+    from the rank-local operand with the collective that moved the hidden rows,
+    which keeps ids and hidden states in one row order by construction. A global
+    view that matches neither row count is stale rather than authoritative, so
+    it is replaced instead of trusted.
+
+    `input_ids` is left rank-local: Engram reads it before the transport.
+    """
+    if input_ids_global is not None and input_ids_global.shape[0] == router_rows:
+        return input_ids_global
+    ids_src = input_ids if input_ids is not None else input_ids_global
+    if ids_src is None:
+        # DSpark next-token layers are not hash-routed and carry no ids.
+        return None
+    assert ids_src.shape[0] == local_rows, (
+        "CP MoE token ids describe neither the rank-local "
+        f"({local_rows}) nor the router ({router_rows}) row view: "
+        f"got {tuple(ids_src.shape)}."
+    )
+    gathered_ids = ids_src.new_empty((router_rows, *ids_src.shape[1:]))
+    attn_cp_all_gather_into_tensor(gathered_ids, ids_src.contiguous())
+    return gathered_ids
+
+
 class MoeRowTransport(ComputeTransport):
     def __init__(
         self,
@@ -166,7 +200,11 @@ class MoeRowTransport(ComputeTransport):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
+                local_rows = hidden_states.shape[0]
                 hidden_states = attn_cp_interleave_gather(hidden_states)
+                input_ids_global = _align_cp_router_ids(
+                    input_ids, input_ids_global, local_rows, hidden_states.shape[0]
+                )
             else:
                 assert (
                     moe_a2a_backend.is_deepep()

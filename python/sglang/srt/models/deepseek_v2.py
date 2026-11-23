@@ -655,29 +655,23 @@ def _scale_routed_and_add_shared(
     return routed
 
 
-def _gate_ids_for_vision_topk(
-    input_ids_global: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    """Geometric gate for the vision_topk ids argument.
+def _check_router_row_ids(input_ids_global, router_rows):
+    """Fail loudly when the vision_topk ids do not describe the router rows.
 
-    The MoE transport CP fast path (a2a none) expands hidden_states to the
-    full CP-interleaved sequence unconditionally, but `input_ids_global` is
-    attached under a predicate (`is_cp_active` / `attn_cp_metadata` liveness)
-    that can flip during the batch's lifetime. When the two views diverge,
-    `moe_fused_gate` asserts `input_ids.shape == (scores.size(0),)`.
-
-    Degrade the mismatched batch to plain MoE routing (input_ids=None ->
-    HAS_TOKEN_BIAS=False) instead of crashing; consistent batches keep
-    their real ids. Multimodal batches under prefill-CP still need the
-    upstream attach to produce MoE-view ids; this gate only prevents the
-    mismatch from being fatal to text traffic.
+    `moe_fused_gate` indexes the per-token bias by `input_ids`, so a stale row
+    view here does not raise on its own: it either trips a fused-gate shape
+    assert or silently selects experts from the wrong bias. The MoE transport
+    aligns ids for every CP path it owns (`_align_cp_router_ids`), so a mismatch
+    reaching this point means a caller bypassed the transport (issue #52215).
     """
     if input_ids_global is None:
-        return None
-    if input_ids_global.shape[0] != hidden_states.shape[0]:
-        return None
-    return input_ids_global
+        # Next-token layers are not hash-routed and carry no token ids.
+        return
+    assert input_ids_global.shape[0] == router_rows, (
+        "vision_topk ids do not describe the router rows: "
+        f"ids={tuple(input_ids_global.shape)} rows={router_rows} "
+        f"cp_size={get_parallel().attn_cp_size}."
+    )
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1254,11 +1248,11 @@ class DeepseekV2MoE(nn.Module):
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
             if use_vision_topk:
-                gate_ids = _gate_ids_for_vision_topk(input_ids_global, hidden_states)
+                _check_router_row_ids(input_ids_global, hidden_states.shape[0])
                 topk_output = vision_topk(
                     self,
                     router_logits,
-                    gate_ids,
+                    input_ids_global,
                 )
             else:
                 topk_output = self.topk(
@@ -1444,11 +1438,11 @@ class DeepseekV2MoE(nn.Module):
             if router_logits_partials is not None:
                 topk_kwargs["router_logits_partials"] = router_logits_partials
             if use_vision_topk:
-                gate_ids = _gate_ids_for_vision_topk(input_ids_global, hidden_states)
+                _check_router_row_ids(input_ids_global, hidden_states.shape[0])
                 topk_output = vision_topk(
                     self,
                     router_logits,
-                    gate_ids,
+                    input_ids_global,
                 )
             else:
                 topk_output = self.topk(
