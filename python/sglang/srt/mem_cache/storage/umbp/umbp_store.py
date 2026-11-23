@@ -1185,17 +1185,15 @@ class UMBPStore(HiCacheStorage):
             f"_{rank}_{component}" for rank in ranks for component in ("k", "v")
         )
 
+    def _namespace_key(self, key: str) -> str:
+        """Apply the served-model prefix. Every anchor and hybrid key goes through here."""
+        return f"{self.config_prefix}_{key}" if self.config_prefix else key
+
     def _anchor_keys(self, keys) -> tuple[list[str], int]:
         suffixes = self._anchor_key_suffixes()
-        prefix = f"{self.config_prefix}_" if self.config_prefix else ""
-        key_list = [f"{prefix}{key}{suffix}" for key in keys for suffix in suffixes]
-        # MoRI's SPDK proxy truncates keys past 255 bytes, which would cut off
-        # the rank and K/V suffix that keeps keys distinct.
-        if any(len(key.encode("utf-8")) > 255 for key in key_list):
-            raise ValueError(
-                "UMBP anchor keys must not exceed 255 UTF-8 bytes; "
-                "shorten model_name or extra_backend_tag."
-            )
+        key_list = [
+            self._namespace_key(f"{key}{suffix}") for key in keys for suffix in suffixes
+        ]
         return key_list, len(suffixes)
 
     def _batch_preprocess(self, keys, host_indices):
@@ -1410,11 +1408,7 @@ class UMBPStore(HiCacheStorage):
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]
-        if self.config_prefix:
-            component_keys = [
-                f"{self.config_prefix}_{component_key}"
-                for component_key in component_keys
-            ]
+        component_keys = [self._namespace_key(key) for key in component_keys]
         return component_keys, len(suffixes)
 
     def batch_exists_v2(
