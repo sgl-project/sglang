@@ -188,6 +188,8 @@ class StaticKVStorage:
         table, was told at startup."""
         self._shape = other._shape
         self._window_retention = other._window_retention
+        # The rows index the same allocator state: a pending reset survives the swap.
+        self._row_resets = other._row_resets
         self.bind_transfer_draft(
             other._draft_token_to_kv_pool, other._num_hidden_layers
         )
@@ -1105,7 +1107,9 @@ def _static_state_entries(
                     tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
                     tail_lens = list(tail_lens) + list(draft_tail_lens)
                     tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
-                add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
+                # NPU includes index buffers in its main KV entries.
+                if not isinstance(dsa_pool, NPUMLATokenToKVPool):
+                    add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
                 if tail_ptrs:
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
