@@ -243,7 +243,6 @@ def _warn_extra_config_scope(extra: dict, distributed_enabled: bool) -> None:
 # Stands in for a real page hash when sizing the SPDK key guard. Page keys are
 # SHA-256 hex, the same width as get_hash_str (cpp_utils/hash_binding.cpp,
 # kHexLen). If the page hash changes, update this and the guard together.
-# test_umbp_store.py checks this width against get_hash_str.
 _PAGE_HASH_PLACEHOLDER = hashlib.sha256(b"").hexdigest()
 
 
@@ -929,13 +928,13 @@ class UMBPStore(HiCacheStorage):
 
         # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
-        self._kv_anchor_is_logical = False
-        self._kv_anchor_is_page_envelope = False
+        self._kv_anchor_is_logical = (
+            mem_pool_host is not None and mem_pool_host.kv_buffer is None
+        )
+        self._kv_anchor_is_page_envelope = bool(
+            mem_pool_host is not None and mem_pool_host.stores_page_envelope
+        )
         self._registered_regions: set = set()
-
-        self.client = UMBPClient(cfg)
-        if mem_pool_host is not None:
-            self.register_mem_pool_host(mem_pool_host)
 
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
@@ -986,6 +985,12 @@ class UMBPStore(HiCacheStorage):
                     f"The namespace prefix is {prefix_bytes} bytes; "
                     "shorten the served model name or extra_backend_tag."
                 )
+
+        # Build the client only after the key check, so a failed check does not
+        # leave a standalone server started by UMBPClient running.
+        self.client = UMBPClient(cfg)
+        if mem_pool_host is not None:
+            self.register_mem_pool_host(mem_pool_host)
 
         # ------------------------------------------------------------------
         # Optional KV events subscriber

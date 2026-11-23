@@ -3,7 +3,6 @@
 
 import ctypes
 import importlib
-import os
 import sys
 import tempfile
 import unittest
@@ -347,9 +346,11 @@ class TestUMBPStore(unittest.TestCase):
             def from_environment(cls):
                 return cls()
 
+        built_clients = []
+
         class FakeUMBPClient:
             def __init__(self, _config):
-                pass
+                built_clients.append(_config)
 
         fake_role = SimpleNamespace(
             Standalone="standalone",
@@ -391,8 +392,10 @@ class TestUMBPStore(unittest.TestCase):
             umbp_module, "_import_umbp_client", return_value=imported
         ):
             umbp_module.UMBPStore(standalone_external_spdk).close()
+            clients_before = len(built_clients)
             with self.assertRaisesRegex(ValueError, "longest anchor key"):
                 umbp_module.UMBPStore(standalone_spdk)
+            self.assertEqual(len(built_clients), clients_before)
             umbp_module.UMBPStore(dram).close()
             umbp_module.UMBPStore(embedded_spdk).close()
 
