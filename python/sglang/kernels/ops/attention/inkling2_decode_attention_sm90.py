@@ -228,7 +228,9 @@ def decode_partials(
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
     interior, interior_cost, masked_cost, num_stages = 0, 1, 1, 2 if qlen == 1 else 3
-    if qlen > 1 and window_size_left is None:
+    # Tuned on blocks of up to 8 tokens x 6 heads, which pad to 64 rows;
+    # at 128 rows, interior tiles add spills and ran up to 13% slower at batch 1-4.
+    if qlen > 1 and window_size_left is None and qlen * group <= 64:
         interior, interior_cost, masked_cost, num_stages = _global_verify_tiles(
             batch * heads_k
         )
