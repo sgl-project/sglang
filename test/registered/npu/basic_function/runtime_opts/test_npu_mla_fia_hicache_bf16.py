@@ -16,9 +16,9 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=800,
-    suite="base-b-test-2-npu-a3",
+    suite="extra-b-test-2-npu-a3",
 )
-register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=1400, suite="nightly-test-2-npu-a3", nightly=True)
 
 # The nightly pipeline is also triggered by pull requests via path filters, so the
 # pipeline is identified by GITHUB_WORKFLOW_REF (inherited from the caller's github
@@ -61,7 +61,9 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
         # The PR pipeline runs eager to shorten startup; the nightly pipeline
         # covers the default decode graph path with FIA + HiCache.
         if _is_pr_pipeline:
-            other_args.append("--disable-cuda-graph")
+            other_args.extend(
+                ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

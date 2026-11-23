@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST, admin_post
 
 register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
 
@@ -45,6 +46,7 @@ class _PrefillCompleteServer(PDDisaggregationServerBase):
             "--cuda-graph-max-bs-decode",
             "16",
             "--enable-metrics",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         cls.extra_prefill_args = common + ["--chunked-prefill-size", "512"]
         cls.extra_decode_args = list(common)
@@ -99,7 +101,7 @@ class _PrefillCompleteServer(PDDisaggregationServerBase):
         for url in (self.prefill_url, self.decode_url):
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                response = requests.post(url + "/flush_cache", timeout=10)
+                response = admin_post(url + "/flush_cache", timeout=10)
                 if response.status_code == 200:
                     break
                 time.sleep(0.1)
@@ -147,7 +149,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
     def test_decode_abort_before_allocation_releases_prefill(self):
         self._flush_when_idle()
         rid = "prefill-complete-abort-" + uuid.uuid4().hex
-        response = requests.post(
+        response = admin_post(
             self.prefill_url + "/slow_down",
             json={"forward_sleep_time": 1.0},
             timeout=10,
@@ -186,7 +188,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                     self.assertEqual(load["queues"]["prealloc_ready"], 0, load)
                     # Only abort decode: the readiness CANCEL must release the
                     # source request even though no KV metadata was published.
-                    abort = requests.post(
+                    abort = admin_post(
                         self.decode_url + "/abort_request",
                         json={"rid": rid},
                         timeout=10,
@@ -197,11 +199,13 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 finally:
                     if not future.done():
                         for url in (self.prefill_url, self.decode_url):
-                            requests.post(
-                                url + "/abort_request", json={"rid": rid}, timeout=10
+                            admin_post(
+                                url + "/abort_request",
+                                json={"rid": rid},
+                                timeout=10,
                             )
         finally:
-            requests.post(
+            admin_post(
                 self.prefill_url + "/slow_down",
                 json={"forward_sleep_time": 0.0},
                 timeout=10,
@@ -234,8 +238,10 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                         break
             else:
                 self.fail("No token arrived before streaming abort")
-            requests.post(
-                self.decode_url + "/abort_request", json={"rid": rid}, timeout=10
+            admin_post(
+                self.decode_url + "/abort_request",
+                json={"rid": rid},
+                timeout=10,
             ).raise_for_status()
         self._flush_when_idle()
         self.generate("The capital of France is")
@@ -251,7 +257,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
             },
         }
         rid = "prefill-complete-rebootstrap-" + uuid.uuid4().hex
-        requests.post(
+        admin_post(
             self.decode_url + "/slow_down",
             json={"forward_sleep_time": 0.01},
             timeout=10,
@@ -287,7 +293,7 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                         retractions < 3
                         and final["meta_info"]["completion_tokens"] > retractions * 32
                     ):
-                        requests.post(
+                        admin_post(
                             self.decode_url + "/pause_generation",
                             json={"mode": "retract"},
                             timeout=15,
@@ -295,10 +301,11 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                         paused = True
                         # Retract pause frees destination KV and stages a true
                         # rebootstrap; flush must succeed before resuming it.
-                        requests.post(
-                            self.decode_url + "/flush_cache", timeout=10
+                        admin_post(
+                            self.decode_url + "/flush_cache",
+                            timeout=10,
                         ).raise_for_status()
-                        requests.post(
+                        admin_post(
                             self.decode_url + "/continue_generation",
                             json={"torch_empty_cache": False},
                             timeout=15,
@@ -312,12 +319,18 @@ class TestPrefillCompleteAllocation(_PrefillCompleteServer):
                 self.assertTrue(all(math.isfinite(logprob) for logprob, _ in emitted))
         finally:
             if paused:
-                requests.post(
-                    self.decode_url + "/continue_generation", json={}, timeout=15
+                admin_post(
+                    self.decode_url + "/continue_generation",
+                    json={},
+                    timeout=15,
                 )
             for url in (self.prefill_url, self.decode_url):
-                requests.post(url + "/abort_request", json={"rid": rid}, timeout=10)
-            requests.post(
+                admin_post(
+                    url + "/abort_request",
+                    json={"rid": rid},
+                    timeout=10,
+                )
+            admin_post(
                 self.decode_url + "/slow_down",
                 json={"forward_sleep_time": 0.0},
                 timeout=10,
@@ -352,7 +365,7 @@ class TestPrefillCompleteTimeout(_PrefillCompleteServer):
 
     def test_readiness_timeout_releases_both_sides(self):
         self._flush_when_idle()
-        requests.post(
+        admin_post(
             self.prefill_url + "/slow_down",
             json={"forward_sleep_time": 1.0},
             timeout=10,
@@ -375,7 +388,7 @@ class TestPrefillCompleteTimeout(_PrefillCompleteServer):
             self.assertIn("Timed out waiting for prefill completion", response.text)
             self.assertLess(time.monotonic() - start, 15)
         finally:
-            requests.post(
+            admin_post(
                 self.prefill_url + "/slow_down",
                 json={"forward_sleep_time": 0.0},
                 timeout=10,
