@@ -229,9 +229,9 @@ def _mix_fused(
         return prefix_sum
     cw = get_cw(score_proj, score_norm)
     if is_npu():
-        from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
+        from sgl_kernel_npu.operators.hyper_conn import attn_res_mix_fused
 
-        return mix_fused(
+        return attn_res_mix_fused(
             prefix_sum,
             bank,
             nvb,
@@ -457,17 +457,17 @@ class AttnResidual:
     One instance lives for one model forward pass.
     """
 
-    # gfx950: a read attn_residual_hip.gather_tail_read staged for the next
-    # forward() of its prefix (a StagedRead).
-    staged = None
-
     def __init__(
         self,
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        num_rows: Optional[int] = None,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
+        if num_rows is not None:
+            num_tokens = num_rows
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
@@ -514,10 +514,9 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
-        if _is_gfx95 and self.staged is not None:
-            read = self.staged.take(
-                self, hidden_states, prefix_sum, score_proj, rows, write
-            )
+        # gfx950: a read attn_residual_hip.gather_tail_read staged for this prefix
+        if _is_gfx95 and (staged := getattr(self, "staged", None)) is not None:
+            read = staged.take(self, hidden_states, prefix_sum, score_proj, rows, write)
             if read is not None:
                 return read
         nvb = self.num_valid_blocks

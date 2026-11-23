@@ -157,6 +157,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: nightly-test-1-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -172,6 +173,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: nightly-test-2-npu-a3
       runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -188,6 +190,7 @@ jobs:
     needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: nightly-test-4-npu-a3
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -206,6 +209,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: nightly-test-8-npu-a3
       runner_config: linux-aarch64-a3-8-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -221,6 +225,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       self_name: nightly-test-16-npu-a3
       runner_config: linux-aarch64-a3-16-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -236,6 +241,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-2
       test_type: 'perf'
       test_suite: nightly-perf-test-2-npu-a3
@@ -252,6 +258,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-test-4-npu-a3
@@ -268,6 +275,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
       test_suite: nightly-perf-test-16-npu-a3
@@ -286,6 +294,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: nightly-acc-test-2-npu-a3
@@ -303,6 +312,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: nightly-acc-test-16-npu-a3
@@ -319,6 +329,7 @@ jobs:
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
+       ref: ${{ inputs.ref || '' }}
        runner: linux-amd64-a5-4
        test_type: 'accuracy'
        test_suite: nightly-acc-test-4-npu-a5
@@ -336,6 +347,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
+      git_ref: ${{ inputs.ref || '' }}
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64-nightly-npu
     secrets: inherit
@@ -425,6 +437,7 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
@@ -463,6 +476,7 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
       test_config_name: ${{ matrix.test_config.name }}
@@ -495,6 +509,7 @@ jobs:
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
       test_config_name: ${{ matrix.test_config.name }}
@@ -538,6 +553,7 @@ jobs:
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
+      ref: ${{ inputs.ref || '' }}
       runner: linux-amd64-cpu-4
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}

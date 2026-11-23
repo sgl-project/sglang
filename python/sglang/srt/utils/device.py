@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import logging
 import os
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "is_hip",
     "FP8_E4M3_MAX",
-    "FP8_E4M3_MIN",
     "is_cuda",
     "is_cuda_alike",
     "is_hpu",
@@ -88,6 +86,7 @@ __all__ = [
     "device_stream_context",
     "is_device_stream_capturing",
     "create_device_event",
+    "current_device_stream",
     "get_amdgpu_memory_capacity",
     "get_device_sm",
     "get_nvgpu_memory_capacity",
@@ -144,15 +143,6 @@ if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-FP8_E4M3_MIN = -FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)
@@ -720,6 +710,13 @@ def create_device_event(device):
     if not isinstance(device, torch.device):
         device = torch.device(device)
     return torch.get_device_module(device).Event()
+
+
+def current_device_stream(device):
+    """The calling thread's current stream on ``device``."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).current_stream(device)
 
 
 def get_amdgpu_memory_capacity():

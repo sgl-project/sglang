@@ -43,6 +43,7 @@ class SyncExecutor(PipelineExecutor):
                     run_stage,
                     use_nvtx,
                 )
+                self._check_peer_waits(stage)
                 self._step_stage_profiler()
             raise_if_cancelled(requests)
         return payload
