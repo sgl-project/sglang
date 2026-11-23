@@ -59,8 +59,7 @@ def main():
         world_rank=rank,
         tp_size=world,
         attn_cp_size=1 if dp else world,
-        dp_size=world if dp else 1,
-        enable_dp_attention=dp,
+        attn_dp_size=world if dp else 1,
         disable_custom_all_reduce=True,
     )
     initialize_model_parallel()

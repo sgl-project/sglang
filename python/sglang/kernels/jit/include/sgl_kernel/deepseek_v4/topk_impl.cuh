@@ -1198,7 +1198,13 @@ struct TopKStreaming : TopKRadixBase<12> {
     if constexpr (kExact) {
       if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
         // See the register path.
+#ifdef USE_ROCM
+        // The register path does this to keep its fast path small; here it is
+        // correctness: hipcc miscompiles it inlined into topk_split_select<PAGE_TABLE> on gfx950.
+        refine_ties_cold(problem, smem, v_lo, v_hi, smem->count_eq);
+#else
         refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
+#endif
       }
     }
     handle_staged_ties(problem, smem);
@@ -1222,6 +1228,8 @@ struct TopKStreaming : TopKRadixBase<12> {
 /// Single-instruction PTX wrappers of the cluster path, on top of sgl_kernel/ptx/barrier.cuh.
 namespace ptx {
 
+using device::ptx::bar_sync;
+using device::ptx::fence_barrier_init;
 using device::ptx::mbar_init;
 using device::ptx::to_shared;
 
@@ -1253,9 +1261,6 @@ SGL_DEVICE void st_async_v2(uint32_t dst, uint32_t a, uint32_t b, uint32_t mbar)
                "r"(b),
                "r"(mbar)
                : "memory");
-}
-SGL_DEVICE void fence_mbar_init() {
-  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 // The waits below differ from ptx/barrier.cuh: a "memory" clobber, and a cluster-scope acquire
 // that pairs with the remote st.async complete_tx. They wait on phase 0 only: after every
@@ -1308,10 +1313,6 @@ SGL_DEVICE void barrier_cluster_arrive_release() {
 }
 SGL_DEVICE void barrier_cluster_wait() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-}
-/// Named barrier `id` over `num_threads` threads (a multiple of the warp size).
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
 }
 SGL_DEVICE void cluster_sync() {
   barrier_cluster_arrive_release();
@@ -1491,7 +1492,7 @@ struct TopKCluster : TopKRadixBase<11> {
     const auto smem = static_cast<Smem*>(_smem);
     if (threadIdx.x >= kNumMbars) return;
     ptx::mbar_init(&smem->mbars[threadIdx.x], 1);
-    ptx::fence_mbar_init();
+    ptx::fence_barrier_init();
   }
 
   /// Phase 2: the threshold bin across the cluster, from every rank's coarse histogram. Two

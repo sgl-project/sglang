@@ -336,6 +336,12 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_token_group_quant_8bit_cpu(const at::Tensor& input, int64_t group_size, double eps);
+std::tuple<at::Tensor, at::Tensor> sgl_per_token_quant_fp8_cpu(const at::Tensor& input);
+std::tuple<at::Tensor, at::Tensor>
+sgl_per_tensor_quant_fp8_cpu(const at::Tensor& input, const std::optional<at::Tensor>& scale);
+std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -388,7 +394,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
     at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
-    int64_t quant_method_4bit);
+    int64_t quant_method_4bit,
+    bool is_symmetric);
+
+std::tuple<at::Tensor, at::Tensor> per_token_quant_fp8_cpu(at::Tensor& input);
 #endif
 
 // gemm
@@ -861,6 +870,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+  m.def("sgl_per_token_group_quant_8bit_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_group_quant_8bit_cpu", torch::kCPU, &sgl_per_token_group_quant_8bit_cpu);
+  m.def("sgl_per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("sgl_per_token_quant_fp8_cpu", torch::kCPU, &sgl_per_token_quant_fp8_cpu);
+  m.def("sgl_per_tensor_quant_fp8_cpu(Tensor input, Tensor? scale) -> (Tensor, Tensor)");
+  m.impl("sgl_per_tensor_quant_fp8_cpu", torch::kCPU, &sgl_per_tensor_quant_fp8_cpu);
+  m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+  m.def("per_token_quant_fp8_cpu(Tensor input) -> (Tensor, Tensor)");
+  m.impl("per_token_quant_fp8_cpu", torch::kCPU, &per_token_quant_fp8_cpu);
+#endif
 
   // igemm
   m.def(
@@ -895,7 +917,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // weight prepack for int4 weights
   m.def(
-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit) -> (Tensor, "
+      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit, "
+      "bool is_symmetric=False) -> (Tensor, "
       "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 #endif
