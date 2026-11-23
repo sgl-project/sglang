@@ -389,7 +389,11 @@ C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM
 
-#define FULL_MASK 0xffffffff
+#ifdef USE_ROCM
+#define FULL_MASK 0xffffffffffffffffULL
+#else
+#define FULL_MASK 0xffffffffu
+#endif
 
 __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 #ifndef USE_ROCM
@@ -409,11 +413,10 @@ __device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
 }
 
 __device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 16));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 8));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 4));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 2));
-  value = fmaxf(value, __shfl_xor_sync(FULL_MASK, value, 1));
+#pragma unroll
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    value = fmaxf(value, SGLANG_SHFL_XOR_SYNC(FULL_MASK, value, offset));
+  }
   return value;
 }
 
