@@ -146,6 +146,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_req_to_token_pool,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
@@ -4669,6 +4670,16 @@ class DeepseekV4Model(nn.Module):
                 else hidden_states
             )
         else:
+            if self.config.model_type == "deepseek_v41":
+                from sglang.srt.models.deepseek_v4_vpp_state import install_state
+
+                install_state(
+                    pp_proxy_tensors.tensors,
+                    batch=forward_batch,
+                    pool=get_token_to_kv_pool(),
+                    req_to_token=get_req_to_token_pool().req_to_token,
+                    metadata=get_attn_backend().forward_metadata,
+                )
             hidden_states = pp_proxy_tensors["hidden_states"]
             if hidden_states.ndim != 2 or hidden_states.shape[1] != (
                 self.hc_mult * self.hidden_size
@@ -4693,10 +4704,14 @@ class DeepseekV4Model(nn.Module):
         for attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, attr):
                 delattr(forward_batch, attr)
-        hash_ids = (
-            self.engram_hasher(input_ids, forward_batch)
-            if self.hc_pre_from_prev_sublayer and self.engram_hasher is not None
-            else None
+        from sglang.srt.models.deepseek_v4_vpp_state import stage_hash_ids
+
+        hash_ids = stage_hash_ids(
+            stage.stage_id,
+            self.engram_hasher if self.hc_pre_from_prev_sublayer else None,
+            input_ids,
+            forward_batch,
+            {} if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
         )
         for i in range(stage.start_layer, stage.end_layer):
             layer = self.layers[i]
@@ -4725,6 +4740,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch=forward_batch,
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
+                    allow_cross_layer_fusion=i + 1 < stage.end_layer,
                 )
         # Complete this stage's producer work before publishing tensors. Python
         # boundary objects and pending reductions never cross the stage seam.
@@ -4740,6 +4756,20 @@ class DeepseekV4Model(nn.Module):
             tensors = {"hidden_states": hidden_states.flatten(1)}
             if self.hc_pre_from_prev_sublayer:
                 tensors["hc_pre"] = last_pre
+            if hash_ids is not None:
+                tensors["vpp_engram_hash_ids"] = hash_ids
+            if self.config.model_type == "deepseek_v41":
+                from sglang.srt.models.deepseek_v4_vpp_state import export_state
+
+                export_state(
+                    tensors,
+                    config=self.config,
+                    next_layer=stage.end_layer,
+                    batch=forward_batch,
+                    pool=get_token_to_kv_pool(),
+                    req_to_token=get_req_to_token_pool().req_to_token,
+                    metadata=get_attn_backend().forward_metadata,
+                )
             return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)

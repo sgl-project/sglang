@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4UniformFP8KVPool,
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
+    collect_sources_by_ratio,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -41,6 +42,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.deepseek_v4_vpp_state import (
+    _export_candidates,
+    _install_candidates,
+    full_page_ids,
+    logical_selection,
+    physical_selection,
+    stage_hash_ids,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -52,6 +61,158 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_v41_dense_candidates_preserve_block_ids_and_decode_mask(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
+
+        candidate = BlockIds(
+            blocks=torch.tensor([[1, 3, -1]]),
+            rows_per_request=None,
+            decode_mask=torch.tensor([[False, True, False, True]]),
+        )
+        payload = {}
+        _export_candidates(payload, candidate)
+        # Scheduler snapshots all tensor payloads before recording readiness.
+        payload = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in payload.items()
+        }
+        candidate.blocks.zero_()
+        restored = _install_candidates(payload, None, None, None)
+        self.assertIsInstance(restored, BlockIds)
+        self.assertEqual(restored.blocks.tolist(), [[1, 3, -1]])
+        self.assertTrue(torch.equal(restored.decode_mask, candidate.decode_mask))
+
+    def test_v41_sparse_candidates_rebuild_against_local_index_pages(self):
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 0]),
+            seq_lens_cpu=[8, 8],
+            seq_lens=torch.tensor([8, 8]),
+            forward_mode=ForwardMode.DECODE,
+        )
+        mapping = torch.tensor(
+            [[8, 9, 10, 11, 4, 5, 6, 7], [20, 21, 22, 23, 12, 13, 14, 15]]
+        )
+        payload = {
+            "vpp_candidate_kind": "sparse",
+            "vpp_candidate_blocks": torch.tensor([[0], [0]], dtype=torch.int32),
+            "vpp_candidate_lengths": torch.tensor([8, 8], dtype=torch.int32),
+        }
+        with patch(
+            "sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table._build_prefill_table"
+        ) as build:
+            _install_candidates(
+                payload,
+                batch,
+                SimpleNamespace(get_index_k_page_size=lambda r: 2),
+                mapping,
+            )
+        self.assertEqual(
+            build.call_args.kwargs["page_table"].tolist(),
+            [[10, 11, 6, 7], [4, 5, 2, 3]],
+        )
+        self.assertNotIn("vpp_candidate_phys_blocks", payload)
+
+    def test_engram_history_commits_once_across_virtual_passes(self):
+        hasher = MagicMock(return_value=torch.tensor([[1, 14]]))
+        tokens, batch = torch.tensor([5]), object()
+        hashes = stage_hash_ids(0, hasher, tokens, batch, {})
+        for stage in range(1, 4):
+            received = hashes.clone()
+            hashes = stage_hash_ids(
+                stage, hasher, tokens, batch, {"vpp_engram_hash_ids": received}
+            )
+            self.assertIs(hashes, received)
+        hasher.assert_called_once_with(tokens, batch)
+        with self.assertRaisesRegex(ValueError, "hash ids"):
+            stage_hash_ids(2, hasher, tokens, batch, {})
+
+    def test_v41_consumer_sources_require_explicit_replica_support(self):
+        ratios = [0, 0] + [2] * 18 + [1] * 20
+        with self.assertRaisesRegex(ValueError, "local ratio-2"):
+            collect_sources_by_ratio(ratios, [2, 8, 14, 20], range(9, 20))
+        self.assertEqual(
+            collect_sources_by_ratio(
+                ratios, [2, 8, 14, 20], range(9, 20), allow_remote_sources=True
+            ),
+            {2: [8, 14]},
+        )
+        self.assertEqual(
+            collect_sources_by_ratio(
+                ratios, [2, 8, 14, 20], range(25, 30), allow_remote_sources=True
+            ),
+            {1: [20]},
+        )
+
+    def test_v41_shared_kv_and_index_install_use_consumer_pages(self):
+        for split in (False, True):
+            with self.subTest(split=split):
+
+                def pool():
+                    p = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+                    p.compression_ratios = [1]
+                    p.sources_by_ratio = {1: [0]}
+                    p.page_size = 8
+                    p.kv_pools = {1: SimpleNamespace(kv_buffer=[torch.zeros(6, 5)])}
+                    index = torch.arange(48).reshape(24, 2).clone()
+                    p.index_pools = {
+                        1: SimpleNamespace(
+                            page_size=2,
+                            index_k_with_scale_buffer=None if split else [index],
+                            index_k_payload_buffer=[index],
+                            index_k_scale_buffer=[index.clone() + 100],
+                        )
+                    }
+                    return p
+
+                producer, consumer = pool(), pool()
+                producer.kv_pools[1].kv_buffer[0].copy_(torch.arange(30).reshape(6, 5))
+                snapshot = producer.export_source_pages(0, torch.tensor([1, 3]))
+                consumer.install_source_pages(0, torch.tensor([4, 2]), snapshot)
+                self.assertTrue(
+                    torch.equal(
+                        consumer.kv_pools[1].kv_buffer[0][[4, 2]],
+                        producer.kv_pools[1].kv_buffer[0][[1, 3]],
+                    )
+                )
+                for name, target, pages in consumer._source_page_buffers(
+                    0, torch.tensor([4, 2])
+                ):
+                    self.assertTrue(torch.equal(target[pages], snapshot[name]))
+                producer.kv_pools[1].kv_buffer[0].zero_()
+                self.assertTrue(snapshot["kv"].any())
+
+    def test_v41_selections_remap_across_request_slots_and_page_ids(self):
+        producer = torch.tensor(
+            [[8, 9, 10, 11, 4, 5, 6, 7], [20, 21, 22, 23, 12, 13, 14, 15]]
+        )
+        consumer = torch.tensor(
+            [[0, 1, 2, 3, 24, 25, 26, 27], [16, 17, 18, 19, 28, 29, 30, 31]]
+        )
+        for mode in (ForwardMode.DECODE, ForwardMode.EXTEND):
+            for ratio in (1, 2):
+                with self.subTest(mode=mode, ratio=ratio):
+                    batch = SimpleNamespace(
+                        forward_mode=mode,
+                        req_pool_indices=torch.tensor([1, 0]),
+                        seq_lens=torch.tensor([8, 6]),
+                        seq_lens_cpu=[8, 6],
+                        extend_seq_lens=torch.tensor([2, 1]),
+                        input_ids=torch.zeros(3, dtype=torch.int64),
+                    )
+                    logical = torch.tensor([[0, 2, -1], [1, 2, -1]])
+                    if mode.is_extend():
+                        logical = logical[[0, 0, 1]]
+                    slots = physical_selection(logical, batch, producer, ratio)
+                    transported = logical_selection(slots, batch, producer, 4, ratio)
+                    self.assertTrue(torch.equal(transported, logical))
+                    actual = physical_selection(transported, batch, consumer, ratio)
+                    expected = physical_selection(logical, batch, consumer, ratio)
+                    self.assertTrue(torch.equal(actual, expected))
+                    self.assertFalse(torch.equal(actual, slots))
+                    self.assertEqual(
+                        full_page_ids(batch, producer, 4).tolist(), [5, 3, 2, 1]
+                    )
+
     def test_checkpoint_pages_alias_complete_rings_and_exclude_trailing_rows(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):
@@ -429,6 +590,30 @@ class TestV41KVPoolLayouts(CustomTestCase):
             kv_layout=kv_layout,
             compressed_kv_layout=compressed,
             **({"layer_ids": layer_ids} if layer_ids is not None else {}),
+            allow_remote_sources=sizes.get("allow_remote_sources", False),
+        )
+
+    def test_v41_replica_storage_is_allocated_but_not_registered_for_pd(self):
+        ratios = [0, 0] + [2] * 18 + [1] * 20
+        pool = self.make_pool(
+            ratios,
+            [2, 8, 14, 20],
+            KVLayout.V41,
+            layer_ids=tuple(range(9, 20)),
+            allow_remote_sources=True,
+        )
+        self.assertEqual(pool.sources_by_ratio, {2: [8, 14]})
+        self.assertEqual(pool.layer_mapping[9].compress_layer_id, 0)
+        self.assertEqual(pool.layer_mapping[14].compress_layer_id, 1)
+        # Only source 14 is owned here. Source 8 is a consumer replica; it has
+        # KV and index storage, but neither a compressor ring nor PD entries.
+        self.assertIsNone(pool.compress_state_pools[8])
+        self.assertIsNotNone(pool.compress_state_pools[14])
+        ptrs, _, _ = pool.get_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), 2)
+        self.assertEqual(ptrs[0], pool.kv_pools[2].kv_buffer[1].data_ptr())
+        self.assertEqual(
+            ptrs[1], pool.index_pools[2].contiguous_page_row_buffers()[1].data_ptr()
         )
 
     def test_interleaved_ownership_aligns_buffers_states_and_transfer_waits(self):

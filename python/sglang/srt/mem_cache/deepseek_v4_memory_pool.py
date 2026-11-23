@@ -106,6 +106,8 @@ def collect_sources_by_ratio(
     compression_ratios: Sequence[int],
     kv_source_layers: Sequence[int],
     stage: Sequence[int],
+    *,
+    allow_remote_sources: bool = False,
 ) -> dict[int, List[int]]:
     """Layers owning compressed storage: all of ratios 4/128, kv_sources of 1/2."""
     for idx in stage:
@@ -116,11 +118,24 @@ def collect_sources_by_ratio(
     sources_by_ratio: dict[int, List[int]] = {}
     for ratio in (4, 128, 1, 2):
         if ratio in (1, 2):
-            layers = [
-                l
-                for l in kv_source_layers
-                if l in stage and compression_ratios[l] == ratio
-            ]
+            layers = sorted(
+                {
+                    max(
+                        (
+                            source
+                            for source in kv_source_layers
+                            if source <= layer and compression_ratios[source] == ratio
+                        ),
+                        default=-1,
+                    )
+                    for layer in stage
+                    if compression_ratios[layer] == ratio
+                }
+            )
+            if -1 in layers:
+                raise ValueError(f"DSV4 ratio-{ratio} layer has no KV source")
+            if not allow_remote_sources and any(layer not in stage for layer in layers):
+                raise ValueError(f"DSV4 requires a local ratio-{ratio} KV source")
         else:
             layers = [l for l in stage if compression_ratios[l] == ratio]
         if layers:
@@ -1061,6 +1076,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compressed_kv_layout: Optional[str] = None,
         *,
         layer_ids: Optional[Sequence[int]] = None,
+        allow_remote_sources: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -1175,6 +1191,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self._stage_start = 0
             self._stage_end = len(compression_ratios)
+        self.allow_remote_sources = allow_remote_sources
         self._set_stage_layer_ids(layer_ids, layer_num, kv_source_layers)
         stage_ratios = [compression_ratios[idx] for idx in self.stage_layer_ids]
 
@@ -1350,6 +1367,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.compression_ratios,
             self.kv_source_layers,
             self.stage_layer_ids,
+            allow_remote_sources=allow_remote_sources,
         )
         self._init_compressed_pools(
             stage_ratios=stage_ratios,
@@ -1450,7 +1468,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                             self.unified_kv_pool.kv_buffer_rope[local_layer_id], ratio
                         )
             elif kv_pool is not None:
-                for buf in kv_pool.kv_buffer:
+                for index, buf in enumerate(kv_pool.kv_buffer):
+                    if ratio in (1, 2) and (
+                        self.sources_by_ratio[ratio][index]
+                        not in self._owned_layer_ids()
+                    ):
+                        continue
                     append_page_buffer(buf)
 
             indexer_pool = self.index_pools.get(ratio)
@@ -1468,7 +1491,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 index_pages_per_full_page = (
                     slots_per_full_page // indexer_pool.page_size
                 )
-            for buf in indexer_pool.contiguous_page_row_buffers():
+            buffers = indexer_pool.contiguous_page_row_buffers()
+            for index, buf in enumerate(buffers):
+                if ratio in (1, 2):
+                    sources = self.sources_by_ratio[ratio]
+                    if sources[index % len(sources)] not in self._owned_layer_ids():
+                        continue
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -2201,12 +2229,71 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 for source in kv_source_layers
                 if source <= idx and self.compression_ratios[source] == ratio
             ]
-            if not sources or max(sources) not in mapping:
+            if not sources or (
+                max(sources) not in mapping
+                and not getattr(self, "allow_remote_sources", False)
+            ):
                 raise ValueError(
                     f"DSV4 layer {idx} requires a local ratio-{ratio} KV source"
                 )
         self.stage_layer_ids = ids
         self._stage_layer_mapping = mapping
+
+    def export_source_pages(
+        self, source_layer_id: int, full_page_ids: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Snapshot shared KV and index pages in logical request-page order."""
+        return {
+            name: buffer.index_select(0, page_ids).clone()
+            for name, buffer, page_ids in self._source_page_buffers(
+                source_layer_id, full_page_ids
+            )
+        }
+
+    def install_source_pages(
+        self,
+        source_layer_id: int,
+        full_page_ids: torch.Tensor,
+        tensors: dict[str, torch.Tensor],
+    ) -> None:
+        """Install a snapshot at this rank's independently allocated page ids."""
+        for name, buffer, page_ids in self._source_page_buffers(
+            source_layer_id, full_page_ids
+        ):
+            buffer.index_copy_(0, page_ids, tensors[name])
+
+    def _source_page_buffers(self, source_layer_id, full_page_ids):
+        ratio = self.compression_ratios[source_layer_id]
+        if ratio not in (1, 2):
+            raise ValueError("VPP source snapshots require ratio-1/2 storage")
+        source_index = self.sources_by_ratio[ratio].index(source_layer_id)
+        pages = full_page_ids.to(torch.int64)
+        yield "kv", self.kv_pools[ratio].kv_buffer[source_index], pages
+        index_pool = self.index_pools.get(ratio)
+        if index_pool is None:
+            return
+        pages_per_full_page = self.page_size // ratio // index_pool.page_size
+        index_pages = (
+            pages[:, None] * pages_per_full_page
+            + torch.arange(pages_per_full_page, device=pages.device)
+        ).flatten()
+        if index_pool.index_k_with_scale_buffer is not None:
+            yield (
+                "index",
+                index_pool.index_k_with_scale_buffer[source_index],
+                index_pages,
+            )
+        else:
+            yield (
+                "index_payload",
+                index_pool.index_k_payload_buffer[source_index],
+                index_pages,
+            )
+            yield (
+                "index_scale",
+                index_pool.index_k_scale_buffer[source_index],
+                index_pages,
+            )
 
     def _owned_layer_ids(self) -> Sequence[int]:
         # Wire/layout test stubs may provide only the legacy stage bounds.

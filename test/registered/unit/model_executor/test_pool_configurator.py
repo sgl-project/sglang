@@ -1851,6 +1851,11 @@ class TestSWAPoolFloor(CustomTestCase):
         # size + ring + 1 rows, padded to the ratio (2); 2 * head_dim fp32 per row.
         rows = (slots * 2 + 2 + 1 + 1) // 2 * 2
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), rows * 2 * 512 * 4 * 2)
+        cfg.stage_c2_producer_count = 1
+        self.assertEqual(cfg._get_c2_state_fixed_bytes(10), rows * 2 * 512 * 4)
+        cfg.stage_c2_producer_count = 0
+        self.assertEqual(cfg._get_c2_state_fixed_bytes(10), 0)
+        del cfg.stage_c2_producer_count
         cfg.stage_owner_layers = {1: [20]}
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), 0)
 
@@ -2290,9 +2295,28 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         )
         state = sum(
             pool._make_pair_state_pool(False).kv_score_buffer.kv_score.nbytes
-            for _ in pool.sources_by_ratio.get(2, ())
+            for _ in range(planner.stage_c2_producer_count)
         )
         return main, index, state
+
+    def test_vpp_replica_budget_includes_pages_without_producer_ring(self):
+        with self._planner(
+            "v41",
+            "fp4",
+            256,
+            128,
+            [0, 2, 2, 2, 1, 1],
+            [1, 4],
+            stage=(2, 5),
+            layer_ids=(2, 4),
+        ) as planner:
+            self.assertEqual(planner.stage_owner_layers, {1: [4], 2: [1]})
+            self.assertEqual(planner.stage_c2_producer_count, 0)
+            self.assertEqual(planner._get_c2_state_fixed_bytes(2), 0)
+            budget = sum(self._allocated_bytes(planner, 512, "v41", "fp4"))
+            self.assertEqual(
+                planner.calculate_pool_sizes(budget, 256).max_total_num_tokens, 512
+            )
 
     def test_low_ratio_coefficient_matches_allocated_growth(self):
         for layout, option in (("v4", None), ("v41", "fp8"), ("v41", None)):

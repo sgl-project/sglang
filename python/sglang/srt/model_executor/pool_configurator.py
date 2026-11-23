@@ -1302,7 +1302,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Layers of this stage that own compressed storage, per ratio. Same rule
         # as the pool, so a ratio budgeted here is one it allocates.
         self.stage_owner_layers = collect_sources_by_ratio(
-            cfg.compress_ratios, cfg.hf_config.kv_source_layer_ids, stage
+            cfg.compress_ratios,
+            cfg.hf_config.kv_source_layer_ids,
+            stage,
+            allow_remote_sources=layer_ids is not None
+            and tuple(layer_ids)
+            != tuple(range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)),
+        )
+        self.stage_c2_producer_count = sum(
+            layer in stage for layer in self.stage_owner_layers.get(2, ())
         )
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
@@ -1750,7 +1758,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_c2_state_fixed_bytes(self, max_running_requests: int) -> int:
         """Ratio-2 pending-pair state, one fp32 (kv, score) ring per request slot
         on each ratio-2 kv_source layer; mirrors _make_pair_state_pool."""
-        num_layers = self.num_layers(2)
+        num_layers = getattr(self, "stage_c2_producer_count", self.num_layers(2))
         if num_layers == 0:
             return 0
 

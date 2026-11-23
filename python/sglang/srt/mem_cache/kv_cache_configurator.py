@@ -2200,6 +2200,7 @@ class KVCacheConfigurator:
                     range(self.layer_info.start_layer, self.layer_info.end_layer)
                 ):
                     kv_layout_kwargs["layer_ids"] = self.layer_info.layer_ids
+                    kv_layout_kwargs["allow_remote_sources"] = True
 
         unified_fp8 = unified_fp8_for_dsv4_pool(
             is_draft_worker=self.is_draft_worker,
