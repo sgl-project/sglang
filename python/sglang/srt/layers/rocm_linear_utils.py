@@ -7,7 +7,7 @@ from aiter.tuned_gemm import tgemm
 
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported
 
 __all__ = [
     "fused_fp8_bmm_rope_cat_and_cache_mla",
@@ -15,11 +15,11 @@ __all__ = [
     "fused_qk_rope_cat_and_cache_mla",
 ]
 
-# This module is imported wherever AITER is on, gfx942 included, but the fused
-# bmm+rope+cache op is gfx95-only. Import it behind the same predicate its one
-# caller gates on, so an aiter build without the op cannot take down every
+# This module is imported wherever AITER is on, but the fused bmm+rope+cache op
+# ships configs for gfx942 and gfx95 only. Import it behind the same predicate its
+# one caller gates on, so an aiter build without the op cannot take down every
 # DeepSeek import on another card. The name stays bound either way.
-if is_gfx95_supported():
+if is_gfx95_supported() or is_gfx942_supported():
     from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
         fused_fp8_bmm_rope_cat_and_cache_mla,
     )
