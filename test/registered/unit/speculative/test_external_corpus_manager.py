@@ -56,9 +56,7 @@ def _run_tp_rank(rank: int, port: int):
         remove_a = RemoveExternalCorpusReqInput(corpus_id="a")
 
         with patch(f"{_MODULE}.get_parallel", return_value=parallel):
-            manager.add(
-                AddExternalCorpusReqInput(corpus_id="b", token_chunks=[[1, 2]])
-            )
+            manager.add(AddExternalCorpusReqInput(corpus_id="b", token_chunks=[[1, 2]]))
             if rank == 0:
                 # Rank 0 finishes its load. Rank 1 still loads.
                 manager._pending_load[1].join(timeout=30)
