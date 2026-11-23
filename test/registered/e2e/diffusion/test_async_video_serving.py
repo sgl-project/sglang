@@ -24,8 +24,8 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
-register_cuda_ci(est_time=180, stage="base-b", runner_config="diffusion-1-gpu-h100")
-register_cuda_ci(est_time=480, stage="base-b", runner_config="diffusion-2-gpu-h100")
+register_cuda_ci(est_time=180, stage="base-b-diffusion", runner_config="1-gpu-large")
+register_cuda_ci(est_time=480, stage="base-b-diffusion", runner_config="2-gpu-large")
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -209,7 +209,12 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
 
     failed_jobs = {}
     with _paused(workers):
-        timed_out = [submit() for _ in range(num_gpus if mode == "dp2" else 1)]
+        # keep late work out of recovery batches so the hash check compares
+        # the same serial execution shape as the reference
+        timed_out = [
+            submit(num_inference_steps=8 if mode == "batch2" else 4)
+            for _ in range(num_gpus if mode == "dp2" else 1)
+        ]
         wait(timed_out, expected="failed")
         for job_id in timed_out:
             call("GET", f"/v1/videos/{job_id}/content", expected=404)

@@ -165,7 +165,8 @@ def resolve_load_pub_range(
     ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
     block, so the range binds unadvertised; and with DP-attention across
     ``nnodes`` > 1 the single advertised base is paired with one worker-URL
-    host, so ranks on other nodes are unreachable at that host.
+    host, so ranks on other nodes are unreachable at that host
+    (`warn_multi_node_kv_events` says so at startup).
     """
     # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
     # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
@@ -265,15 +266,6 @@ class StorageMedium(str, enum.Enum):
     CPU = "CPU_PINNED"  # L2: host pinned memory
     DISK = "DISK"  # L3: SSD / NVMe
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
-
-
-class OffloadedState(msgspec.Struct):
-    """Decode-side offload progress for one request, keyed by Req in the manager."""
-
-    # Decode-incremental length already submitted for D2H offload.
-    inc_len: int = 0
-    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
-    last_hash: Optional[str] = None
 
 
 class BlockStored(KVCacheEvent):
@@ -769,6 +761,8 @@ class EventPublisherFactory:
         config_dict.pop("format")
 
         kind = config_dict.pop("publisher", "null")
+        if kind == "null":
+            return NullEventPublisher()
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:

@@ -24,6 +24,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -59,6 +60,7 @@ def _fake_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Te
     mutates_args=[],
     fake_impl=_fake_temb_table_slices,
 )
+@replay_launches
 def fused_temb_table_slices(table: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
     """``table.unsqueeze(0) + temb.float()`` as a ``(6, B, S, D)`` buffer.
 

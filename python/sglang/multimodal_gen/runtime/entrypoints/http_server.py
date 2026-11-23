@@ -1,22 +1,28 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-import base64
 import os
 import signal
 import uuid
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 import psutil
+import pybase64
 import torch
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
 from sglang.multimodal_gen.runtime.entrypoints.action import openpi
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    StartProfileReq,
+    StopProfileReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     PromptEnhancer,
@@ -43,6 +49,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    start_request_watchdog,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import (
     async_scheduler_client,
@@ -59,6 +68,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
+from sglang.srt.environ import envs
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
     init_http_request_metrics,
@@ -105,10 +115,18 @@ async def _wait_until_http_live(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
-async def _run_server_warmup_after_http_live(
-    server_args: ServerArgs, warmup_done: asyncio.Event
-) -> None:
+async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
+    server_args = app.state.server_args
+    warmup_done = app.state.server_warmup_done
+
+    def check_backend() -> None:
+        error = async_scheduler_client.failure_reason or _backend_failure(app)
+        if error is not None:
+            async_scheduler_client.mark_failed(error)
+            raise RuntimeError(error)
+
     try:
+        check_backend()
         if not should_run_synthetic_server_warmup(server_args):
             warmup_done.set()
             return
@@ -119,13 +137,19 @@ async def _run_server_warmup_after_http_live(
             server_args,
             async_scheduler_client.forward,
             fail_open=server_args.warmup_resolutions is None,
+            check_backend=check_backend,
         )
+        # A worker can exit after replying, before the periodic monitor runs.
+        check_backend()
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        if not async_scheduler_client.failure_reason:
+            async_scheduler_client.mark_failed(str(e))
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -151,6 +175,9 @@ async def lifespan(app: FastAPI):
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     app.state.broker_task = broker_task
     backend_monitor = asyncio.create_task(_monitor_backend(app))
+    request_watchdog = start_request_watchdog(
+        server_args, app.state.worker_processes, async_scheduler_client.mark_failed
+    )
     # 3. Receive per-step progress of video jobs from the replica drivers
     progress_task = None
     if server_args.progress_endpoint is not None:
@@ -162,9 +189,7 @@ async def lifespan(app: FastAPI):
         start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
-        warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_live(server_args, warmup_done)
-        )
+        warmup_task = asyncio.create_task(_run_server_warmup_after_http_live(app))
     else:
         warmup_done.set()
 
@@ -179,6 +204,10 @@ async def lifespan(app: FastAPI):
         backend_monitor.cancel()
         with suppress(asyncio.CancelledError):
             await backend_monitor
+        if request_watchdog is not None:
+            request_watchdog.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_watchdog
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -226,7 +255,11 @@ def _backend_failure(app: FastAPI) -> str | None:
                 continue
         except psutil.NoSuchProcess:
             pass
-        return "Scheduler worker exited; restart the server."
+        return (
+            f"Scheduler worker exited (pid={worker.pid}); restart the server. "
+            "Possible SIGKILL from a host/cgroup OOM: check memory.events "
+            "(oom_kill) and kernel logs."
+        )
     return None
 
 
@@ -292,8 +325,8 @@ async def get_models(request: Request):
 async def server_info_endpoint(request: Request):
     """Get server information.
 
-    Returns fields compatible with the LLM engine's /server_info so that
-    the model gateway can discover diffusion workers.
+    Returns fields compatible with the LLM engine's /server_info, so a client
+    that discovers LLM workers through it discovers diffusion workers too.
     """
     server_args: ServerArgs = request.app.state.server_args
 
@@ -310,8 +343,8 @@ async def server_info_endpoint(request: Request):
 async def model_info_endpoint(request: Request):
     """Get model information.
 
-    Returns fields compatible with the LLM engine's /model_info so that
-    the model gateway can detect capabilities for diffusion workers.
+    Returns fields compatible with the LLM engine's /model_info, so a client
+    reads a diffusion worker's capabilities as it reads an LLM worker's.
     """
     from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
         get_served_pipeline_class,
@@ -328,7 +361,7 @@ async def model_info_endpoint(request: Request):
         pipeline_cls = None
 
     return {
-        # Fields consumed by the model gateway for worker discovery
+        # Fields that identify the worker's model
         "model_path": server_args.model_path,
         "is_generation": True,
         "model_type": "diffusion",
@@ -380,6 +413,173 @@ async def stats_endpoint(request: Request):
     return response
 
 
+class ProfileReqInput(BaseModel):
+    """
+    Request input for profile endpoints.
+    Similar to LLM's ProfileReqInput for consistency.
+    """
+
+    # Directory to save traces. Uses SGLANG_TORCH_PROFILER_DIR env var if not provided.
+    output_dir: Optional[str] = None
+    # Activities to profile: ["CPU", "GPU"]
+    activities: Optional[list[str]] = None
+    # Whether to record stack traces
+    with_stack: Optional[bool] = None
+    # Whether to record tensor shapes
+    record_shapes: Optional[bool] = None
+
+
+class ProfileReqOutput(BaseModel):
+    """Response output for profile endpoints."""
+
+    success: bool
+    message: str
+
+
+# Global profiler state for online serving
+_global_profiler_state = {
+    "profiler": None,
+    "is_profiling": False,
+    "profile_id": None,
+}
+
+
+@health_router.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None):
+    """Start profiling."""
+    import time as time_module
+
+    if _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is already in progress. Call /stop_profile first.\n",
+            status_code=400,
+        )
+
+    try:
+        # Get parameters
+        if obj is None:
+            obj = ProfileReqInput()
+
+        output_dir = obj.output_dir or envs.SGLANG_TORCH_PROFILER_DIR.get()
+
+        profile_id = str(int(time_module.time()))
+
+        with_stack = obj.with_stack or envs.SGLANG_PROFILE_WITH_STACK.get()
+        record_shapes = obj.record_shapes or envs.SGLANG_PROFILE_RECORD_SHAPES.get()
+
+        try:
+            rank = get_world_rank()
+        except Exception:
+            logger.warning("Failed to get world rank, defaulting to 0")
+            rank = 0
+
+        # Lazy import to reduce import time (see issue #10492)
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        http_profiler = SGLDiffusionProfiler(
+            request_id=profile_id,
+            rank=rank,
+            full_profile=True,
+            activities=obj.activities,
+            num_steps=-1,
+            num_inference_steps=100,
+            log_dir=output_dir,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            is_host=True,
+        )
+        _global_profiler_state["profiler"] = http_profiler
+        _global_profiler_state["profile_id"] = profile_id
+
+        start_req = StartProfileReq(
+            output_dir=output_dir,
+            profile_id=profile_id,
+            activities=obj.activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+        )
+        try:
+            response = await async_scheduler_client.forward(start_req)
+            if response.error:
+                logger.warning(f"GPU Worker profiler warning: {response.error}")
+        except Exception as e:
+            logger.warning(f"Could not start GPU Worker profiler: {e}")
+
+        _global_profiler_state["is_profiling"] = True
+
+        logger.info(
+            f"Profilers started with profile_id={profile_id}. Output: {output_dir}"
+        )
+
+        return Response(
+            content=f"Profiling started (profile_id={profile_id}). Traces will be saved to: {output_dir}\n",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to start profiler: {e}")
+        return Response(
+            content=f"Failed to start profiler: {str(e)}\n",
+            status_code=500,
+        )
+
+
+@health_router.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    """Stop profiling and save traces."""
+    if not _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is not in progress. Call /start_profile first.\n",
+            status_code=400,
+        )
+
+    errors = []
+    profile_id = _global_profiler_state.get("profile_id", "unknown")
+
+    host_failed = False
+    try:
+        profiler = _global_profiler_state["profiler"]
+        if profiler is not None:
+            profiler.stop(export_trace=True, dump_rank=None)
+    except Exception as e:
+        host_failed = True
+        errors.append(f"HTTP Server: {e}")
+
+    try:
+        response = await async_scheduler_client.forward(
+            StopProfileReq(export_trace=True)
+        )
+        if response.error:
+            errors.append(f"GPU Worker: {response.error}")
+    except Exception as e:
+        errors.append(f"GPU Worker: {e}")
+    finally:
+        _global_profiler_state["profiler"] = None
+        _global_profiler_state["is_profiling"] = False
+        _global_profiler_state["profile_id"] = None
+
+    if errors:
+        details = "; ".join(errors)
+        if host_failed:
+            logger.error(
+                "Failed to stop profiler (profile_id=%s): %s", profile_id, details
+            )
+            return Response(
+                content=f"Failed to stop profiler: {details}\n", status_code=500
+            )
+        message = (
+            f"Profiling stopped (profile_id={profile_id}) with warnings: {details}"
+        )
+        logger.warning(message)
+        return Response(content=f"{message}\n", status_code=200)
+
+    logger.info("Profilers stopped (profile_id=%s).", profile_id)
+    return Response(
+        content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+        status_code=200,
+    )
+
+
 def make_serializable(obj):
     """Serialize output metadata without copying tensors back to the CPU."""
     if isinstance(obj, torch.Tensor):
@@ -398,7 +598,7 @@ def encode_video_to_base64(file_path: str):
         content = f.read()
     if not content:
         raise ValueError(f"Empty model output file: {file_path}")
-    return base64.b64encode(content).decode("utf-8")
+    return pybase64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -518,7 +718,9 @@ def create_app(
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
         # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
+        if (
+            request.method == "POST" or request.url.path in ("/v1/models", "/models")
+        ) and async_scheduler_client.failure_reason:
             return orjson_response(
                 {"error": async_scheduler_client.failure_reason}, status_code=503
             )
@@ -529,6 +731,10 @@ def create_app(
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
         ):
             await warmup_done.wait()
+            if async_scheduler_client.failure_reason:
+                return orjson_response(
+                    {"error": async_scheduler_client.failure_reason}, status_code=503
+                )
         return await call_next(request)
 
     app.include_router(health_router)
