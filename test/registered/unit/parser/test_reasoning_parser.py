@@ -1,7 +1,10 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
+import argparse
+import pickle
 import unittest
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
@@ -21,10 +24,117 @@ from sglang.srt.parser.reasoning_parser import (
     ReasoningParser,
 )
 from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestCustomReasoningParser(CustomTestCase):
+    def test_cli_resolution_and_serialized_delimiters(self):
+        """Workers must receive literal delimiters, not a tokenizer-file edit."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for parser_args in (
+            [],
+            ["--reasoning-parser", "auto"],
+            ["--reasoning-parser", "custom"],
+        ):
+            with self.subTest(parser_args=parser_args):
+                args = ServerArgs.from_cli_args(
+                    parser.parse_args(
+                        [
+                            "--model-path",
+                            "dummy",
+                            "--reasoning-start-str",
+                            "<reason>",
+                            "--reasoning-end-str",
+                            "</reason>",
+                        ]
+                        + parser_args
+                    )
+                )
+                args.resolve_once()
+                args = pickle.loads(pickle.dumps(args))
+                self.assertEqual(resolution_result(args, "reasoning_parser"), "custom")
+                with get_context().override_server_args(
+                    reasoning_parser=resolution_result(args, "reasoning_parser"),
+                    reasoning_start_str=args.reasoning_start_str,
+                    reasoning_end_str=args.reasoning_end_str,
+                ):
+                    self.assertEqual(
+                        ReasoningParser("custom").parse_non_stream(
+                            "<reason>check</reason>answer"
+                        ),
+                        ("check", "answer"),
+                    )
+
+    def test_invalid_configuration_fails_before_loading(self):
+        for kwargs in (
+            {"reasoning_parser": "custom"},
+            {"reasoning_start_str": "<reason>"},
+            {"reasoning_end_str": "</reason>"},
+            {"reasoning_start_str": "", "reasoning_end_str": "</reason>"},
+            {"reasoning_start_str": "same", "reasoning_end_str": "same"},
+            {
+                "reasoning_parser": "qwen3",
+                "reasoning_start_str": "<reason>",
+                "reasoning_end_str": "</reason>",
+            },
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ServerArgs(model_path="dummy", **kwargs).resolve_once()
+
+    def test_streaming_matches_non_streaming_at_every_split(self):
+        """Network chunks may split either delimiter, including non-ASCII delimiters."""
+        for start, end in (("<reason>", "</reason>"), ("[思考]", "[/思考]")):
+            with get_context().override_server_args(
+                reasoning_parser="custom",
+                reasoning_start_str=start,
+                reasoning_end_str=end,
+            ):
+                text = f"{start}检查事实{end}\n\n答案"
+                for split in range(len(text) + 1):
+                    with self.subTest(start=start, split=split):
+                        parser = ReasoningParser("custom")
+                        pieces = [
+                            parser.parse_stream_chunk(chunk)
+                            for chunk in (text[:split], text[split:])
+                        ]
+                        pieces.append(parser.parse_stream_end())
+                        self.assertEqual(
+                            tuple(
+                                "".join(p[i] or "" for p in pieces) for i in range(2)
+                            ),
+                            ("检查事实", "\n\n答案"),
+                        )
+                self.assertEqual(
+                    ReasoningParser("custom").parse_non_stream(text),
+                    ("检查事实", "\n\n答案"),
+                )
+                self.assertEqual(
+                    ReasoningParser("custom").parse_non_stream("答案"), ("", "答案")
+                )
+
+    def test_prefilled_opening_and_sequential_reconfiguration(self):
+        """A prefilled opener belongs to reasoning; old server config must not leak."""
+        for start, end in (
+            ("<reason>", "</reason>"),
+            ("<analysis>", "</analysis>"),
+            ("<reason>\n", "</reason>"),
+        ):
+            with get_context().override_server_args(
+                reasoning_parser="custom",
+                reasoning_start_str=start,
+                reasoning_end_str=end,
+            ):
+                parser = ReasoningParser("custom", prefix="assistant\n" + start)
+                self.assertEqual(
+                    parser.parse_non_stream("check" + end + "answer"),
+                    ("check", "answer"),
+                )
 
 
 class TestBaseReasoningFormatDetector(CustomTestCase):

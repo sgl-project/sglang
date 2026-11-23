@@ -26,6 +26,31 @@ from sglang.srt.utils.device import (
 logger = logging.getLogger(__name__)
 
 
+def handle_custom_reasoning(server_args: Any) -> None:
+    """Reject incomplete or conflicting delimiter configuration before model loading."""
+    cfg = resolving_view(server_args)
+    start, end = cfg.reasoning_start_str, cfg.reasoning_end_str
+    if start is None and end is None:
+        if cfg.reasoning_parser == "custom":
+            raise ValueError(
+                "--reasoning-parser custom requires --reasoning-start-str and "
+                "--reasoning-end-str"
+            )
+        return
+    if not isinstance(start, str) or not isinstance(end, str) or not start or not end:
+        raise ValueError(
+            "--reasoning-start-str and --reasoning-end-str must both be non-empty strings"
+        )
+    if start == end:
+        raise ValueError("Reasoning opening and closing delimiters must differ")
+    if cfg.reasoning_parser not in (None, "auto", "custom"):
+        raise ValueError(
+            "Custom reasoning delimiters cannot be combined with "
+            f"--reasoning-parser {cfg.reasoning_parser}"
+        )
+    declare_resolution(server_args, "custom-reasoning", reasoning_parser="custom")
+
+
 def handle_admin_api_key_env(server_args: Any) -> None:
     """`--admin-api-key` wins; without it the server takes `SGLANG_ADMIN_API_KEY`."""
     env_key = envs.SGLANG_ADMIN_API_KEY.get()

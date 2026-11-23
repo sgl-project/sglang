@@ -201,6 +201,16 @@ class Serving(msgspec.Struct):
         "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids_in_sglext were set on the request.",
     ] = False
     reasoning_parser: A[Optional[str], Arg(no_cli=True, resolvable=True)] = None
+    reasoning_start_str: A[
+        Optional[str],
+        "Literal reasoning opening delimiter for --reasoning-parser custom. "
+        "Must be supplied with --reasoning-end-str; does not require a special token.",
+    ] = None
+    reasoning_end_str: A[
+        Optional[str],
+        "Literal reasoning closing delimiter for --reasoning-parser custom. "
+        "Must be supplied with --reasoning-start-str; regular expressions are not supported.",
+    ] = None
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],
         Arg(

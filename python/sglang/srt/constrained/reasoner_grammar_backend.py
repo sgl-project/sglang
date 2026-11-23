@@ -22,7 +22,7 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import CustomReasoningDetector, ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -57,6 +57,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
         think_starts: Sequence[str] = (),
         decode: Optional[Callable[[List[int]], str]] = None,
         tool_start_ids: Optional[List[int]] = None,
+        text_boundary=None,
+        text_boundary_factory=None,
     ):
         super().__init__()
         self.grammar = grammar
@@ -77,6 +79,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.allocate_vocab_mask_fn = allocate_vocab_mask_fn
         self.move_vocab_mask_fn = move_vocab_mask_fn
         self.apply_vocab_mask_fn = apply_vocab_mask_fn
+        self.text_boundary = text_boundary
+        self.text_boundary_factory = text_boundary_factory
+        self._matched_end_bytes = 0
+        self._text_match_history: List[int] = []
+        self._text_boundary_completed = False
+        self._rejected_boundary_tokens = {}
 
         self.tokens_in_think = -1
         self.tokens_after_end = -1
@@ -96,6 +104,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._tool_start_rejected: Optional[bool] = None
 
     def maybe_init_reasoning(self, reasoning: bool):
+        self._matched_end_bytes = 0
+        self._text_match_history.clear()
+        self._text_boundary_completed = False
         self._matched_think_end_tokens = 0
         self._thinking_match_history.clear()
         self._matched_tool_start_tokens = 0
@@ -123,6 +134,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.think_end_ids = token_ids
         self._think_end_matcher = TokenSequenceMatcher(token_ids)
         self._matched_think_end_tokens = 0
+        if self.text_boundary_factory is not None:
+            self.text_boundary = self.text_boundary_factory(token_ids)
+        self._matched_end_bytes = 0
+        self._rejected_boundary_tokens.clear()
 
     def set_reasoning_in_grammar(self) -> None:
         """Apply the grammar from the first token, as it also describes the
@@ -169,6 +184,21 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self._is_thinking():
             previous_match = self._matched_think_end_tokens
             matched = self._think_end_matcher.advance(previous_match, token)
+            text_end = False
+            if self.text_boundary is not None:
+                next_match, suffix = self.text_boundary.advance(
+                    self._matched_end_bytes, token
+                )
+                if suffix is not None:
+                    if self.grammar is not None and not self.reasoning_in_grammar:
+                        if not self.grammar.try_accept_tokens(list(suffix)):
+                            raise ValueError(
+                                "Reasoning boundary has an invalid grammar suffix"
+                            )
+                    text_end = True
+                    self._text_boundary_completed = True
+                self._text_match_history.append(self._matched_end_bytes)
+                self._matched_end_bytes = next_match
             tool_match = (
                 self._tool_start_matcher.advance(self._matched_tool_start_tokens, token)
                 if self._tool_start_matcher is not None
@@ -178,6 +208,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self._tool_start_matcher is not None
                 and tool_match == len(self._tool_start_matcher)
                 and matched != len(self._think_end_matcher)
+                and not text_end
             )
             if implicit_end and not self._accept_tool_start():
                 # A constraint that cannot start with the marker (e.g. a JSON
@@ -188,7 +219,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             if self._tool_start_matcher is not None:
                 self._tool_start_match_history.append(self._matched_tool_start_tokens)
             self._matched_tool_start_tokens = tool_match
-            if matched == len(self._think_end_matcher):
+            if matched == len(self._think_end_matcher) or text_end:
                 self._matched_think_end_tokens = 0
                 self._matched_tool_start_tokens = 0
                 self.tokens_after_end = 0
@@ -229,6 +260,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self._tool_start_rejected
 
     def rollback_state(self):
+        if self._text_match_history and (
+            self._is_thinking()
+            or (self._is_generation() and self.tokens_after_end == 0)
+        ):
+            self._matched_end_bytes = self._text_match_history.pop()
+            self._text_boundary_completed = False
         if self._is_thinking():
             if self._thinking_match_history:
                 previous_match = self._thinking_match_history.pop()
@@ -289,7 +326,13 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 if self._is_generation() and k > self.tokens_after_end:
                     # Undo the whole marker replay even when only its last token is
                     # rolled back; re-accepting that token replays it exactly once.
-                    steps_after += self._tool_start_prefix_len
+                    if self._text_boundary_completed:
+                        # The inner grammar was untouched before this boundary.
+                        # Reset also handles suffixes longer than its rollback window.
+                        self.grammar = self.grammar.copy()
+                        steps_after = 0
+                    else:
+                        steps_after += self._tool_start_prefix_len
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
         if self.reasoning_in_grammar:
@@ -372,9 +415,26 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     is_allowed=False,
                     reset_vocab_mask=False,
                 )
+            self._filter_boundary_suffix(vocab_mask, idx)
             return
         if self._is_generation() and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
+
+    def _filter_boundary_suffix(self, vocab_mask: torch.Tensor, idx: int):
+        if self.text_boundary is None or self.grammar is None:
+            return
+        matched = self._matched_end_bytes
+        if matched not in self._rejected_boundary_tokens:
+            self._rejected_boundary_tokens[matched] = [
+                token
+                for token, suffix in self.text_boundary.closing_tokens(matched)
+                if not self.grammar.copy().try_accept_tokens(list(suffix))
+            ]
+        rejected = self._rejected_boundary_tokens[matched]
+        if rejected:
+            self.token_filter_fn(
+                vocab_mask, rejected, idx, is_allowed=False, reset_vocab_mask=False
+            )
 
     def allocate_vocab_mask(self, vocab_size, batch_size, device):
         if self.grammar is not None:
@@ -397,8 +457,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.apply_vocab_mask_fn
 
     def copy(self):
+        grammar = None
+        if self.grammar is not None:
+            grammar = (
+                self.grammar.copy_state()
+                if self.text_boundary is not None
+                else self.grammar.copy()
+            )
         new_obj = ReasonerGrammarObject(
-            grammar=self.grammar.copy() if self.grammar is not None else None,
+            grammar=grammar,
             think_end_ids=self.think_end_ids,
             think_excluded_token_ids=self.think_excluded_token_ids,
             max_think_tokens=self.max_think_tokens,
@@ -410,6 +477,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
             think_starts=self.think_starts,
             decode=self.decode,
             tool_start_ids=self.tool_start_ids,
+            text_boundary=self.text_boundary,
+            text_boundary_factory=self.text_boundary_factory,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
@@ -419,6 +488,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._tool_start_match_history = list(self._tool_start_match_history)
         new_obj._tool_start_prefix_len = self._tool_start_prefix_len
         new_obj._tool_start_rejected = self._tool_start_rejected
+        new_obj._matched_end_bytes = self._matched_end_bytes
+        new_obj._text_match_history = list(self._text_match_history)
+        new_obj._text_boundary_completed = self._text_boundary_completed
+        new_obj._rejected_boundary_tokens = dict(self._rejected_boundary_tokens)
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
         new_obj.reasoning_in_grammar = self.reasoning_in_grammar
@@ -469,6 +542,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 f"could not be encoded by the tokenizer."
             )
         self.think_end_ids = think_end_ids
+        self._text_boundary_factory = grammar_backend.get_token_text_boundary
+        self._text_boundary = self._text_boundary_factory(think_end_ids)
         detector = reasoning_parser.detector
         self.think_starts = ()
         if isinstance(detector, ResponseTemplateReasoningDetector):
@@ -521,11 +596,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     ) -> Optional[List[int]]:
         excluded_ids = []
-        if (not self.enable_strict_thinking) or (
-            not reasoning_parser.detector.think_excluded_tokens
-        ):
+        if not self.enable_strict_thinking:
             return None
-        for token in reasoning_parser.detector.think_excluded_tokens:
+        detector = reasoning_parser.detector
+        excluded_tokens = detector.think_excluded_tokens
+        if isinstance(detector, CustomReasoningDetector):
+            excluded_tokens = detector.get_think_excluded_tokens(tokenizer)
+        if not excluded_tokens:
+            return None
+        for token in excluded_tokens:
             new_ids = tokenizer.encode(token, add_special_tokens=False)
             if not new_ids:
                 raise ValueError(
@@ -552,6 +631,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             think_starts=self.think_starts,
             decode=self._decode,
             tool_start_ids=self.tool_start_ids,
+            text_boundary=self._text_boundary,
+            text_boundary_factory=self._text_boundary_factory,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj

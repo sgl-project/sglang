@@ -119,6 +119,10 @@ class BaseGrammarObject:
     def copy(self) -> "BaseGrammarObject":
         return self
 
+    def copy_state(self) -> "BaseGrammarObject":
+        """Copy the current parsing state when the backend supports it."""
+        return self.copy()
+
     def memory_size_bytes(self) -> Optional[int]:
         """Approximate host memory held by the compiled artifact behind this
         grammar, or None when the backend cannot report it (the cache then
@@ -255,6 +259,10 @@ class BaseGrammarBackend:
 
     def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
         """Let ``token_ids`` match only token-level framing, never grammar text."""
+
+    def get_token_text_boundary(self, token_ids: Sequence[int]):
+        """An exact byte matcher for ordinary text terminators, if supported."""
+        return None
 
     def compile_framed_grammar(
         self, grammar: BaseGrammarObject, frame: Callable[[dict], dict]

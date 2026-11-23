@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import torch
@@ -44,6 +45,7 @@ from sglang.srt.constrained.json_schema_validation import (
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.token_text_boundary import TokenTextBoundary
 
 _is_hip = is_hip()
 
@@ -115,6 +117,14 @@ class XGrammarGrammar(BaseGrammarObject):
     def try_accept_tokens(self, tokens: List[int]) -> bool:
         if self.is_terminated():
             return False
+        if len(tokens) > MAX_ROLLBACK_TOKENS:
+            matcher = self.matcher.fork()
+            if not all(matcher.accept_token(token) for token in tokens):
+                return False
+            self.matcher = matcher
+            self.accepted_tokens.extend(tokens)
+            self.current_token = tokens[-1]
+            return True
         current_token = self.current_token
         accepted = 0
         for token in tokens:
@@ -188,6 +198,14 @@ class XGrammarGrammar(BaseGrammarObject):
         size = getattr(self.ctx, "memory_size_bytes", None)
         return size if isinstance(size, int) else None
 
+    def copy_state(self):
+        copied = self.copy()
+        copied.matcher = self.matcher.fork()
+        copied.accepted_tokens = list(self.accepted_tokens)
+        copied.current_token = self.current_token
+        copied._finished = self._finished
+        return copied
+
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
@@ -246,6 +264,38 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
         self.max_whitespace_cnt = max_whitespace_cnt
+        self._text_boundaries = OrderedDict()
+        self._byte_tokens = None
+        self._text_vocab = None
+
+    def get_token_text_boundary(self, token_ids: Sequence[int]):
+        ids = tuple(token_ids)
+        info = self._tokenizer_info
+        special = set(info.special_token_ids) | set(info.stop_token_ids)
+        if len(ids) <= 1 or any(token in special for token in ids):
+            return None
+        if info.vocab_type not in (VocabType.RAW, VocabType.BYTE_LEVEL):
+            return None
+        if ids in self._text_boundaries:
+            self._text_boundaries.move_to_end(ids)
+            return self._text_boundaries[ids]
+        if self._byte_tokens is None:
+            self._text_vocab = tuple(info.decoded_vocab)
+            self._byte_tokens = {
+                piece: token
+                for token, piece in enumerate(self._text_vocab)
+                if piece and token not in special
+            }
+        if any(bytes([i]) not in self._byte_tokens for i in range(256)):
+            return None
+        pattern = b"".join(self._text_vocab[token] for token in ids)
+        if not pattern:
+            return None
+        boundary = TokenTextBoundary(pattern, self._text_vocab, self._byte_tokens)
+        self._text_boundaries[ids] = boundary
+        if len(self._text_boundaries) > 16:
+            self._text_boundaries.popitem(last=False)
+        return boundary
 
     @property
     def is_support_token_filter(self):
