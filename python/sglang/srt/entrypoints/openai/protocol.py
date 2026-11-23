@@ -986,6 +986,8 @@ class ChatCompletionRequest(PDRoutingFields):
     # Kimi-K3's answer is a JSON response block that reaches the tool parser
     # still framed, so markers quoted inside the JSON are answer text.
     _response_parser_json_answer_channel: bool = PrivateAttr(default=False)
+    # The output thinks before that answer.
+    _response_parser_answer_after_thinking: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
@@ -2082,6 +2084,7 @@ class ResponsesRequest(PDRoutingFields):
     _response_parser_thinking_end: str = PrivateAttr(default="")
     _response_parser_answer_excludes_calls: bool = PrivateAttr(default=False)
     _response_parser_json_answer_channel: bool = PrivateAttr(default=False)
+    _response_parser_answer_after_thinking: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False

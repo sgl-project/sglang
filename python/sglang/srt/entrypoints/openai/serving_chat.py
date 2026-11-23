@@ -1955,6 +1955,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         and request.separate_reasoning
                     )
                 )
+                # Thinking reaches the output only through the reasoning parser's
+                # grammar wrapper, which follows the request's thinking mode.
+                request._response_parser_answer_after_thinking = thinking_mode
                 if tool_call_constraint is None:
                     tool_call_constraint = parser.get_structure_constraint(
                         request.tool_choice,
@@ -3178,6 +3181,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                     response_unwrapped=response_unwrapped,
                     json_answer_channel=request._response_parser_json_answer_channel,
+                    json_answer_after_thinking=(
+                        request._response_parser_answer_after_thinking
+                    ),
                 )
 
             # Extract prompt_token_ids if requested
@@ -3398,6 +3404,7 @@ class OpenAIServingChat(OpenAIServingBase):
         answer_excludes_calls: bool = False,
         response_unwrapped: bool = False,
         json_answer_channel: bool = False,
+        json_answer_after_thinking: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3477,7 +3484,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(None, text, finish_reason)
 
             if isinstance(parser.detector, KimiK3Detector) and not response_unwrapped:
-                text = strip_response_markers(text, json_answer_channel)
+                text = strip_response_markers(
+                    text, json_answer_channel, json_answer_after_thinking
+                )
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -3928,6 +3937,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         request._response_parser_answer_excludes_calls
                     ),
                     json_answer_channel=request._response_parser_json_answer_channel,
+                    json_answer_after_thinking=(
+                        request._response_parser_answer_after_thinking
+                    ),
                 )
 
         parser = parser_dict[index]

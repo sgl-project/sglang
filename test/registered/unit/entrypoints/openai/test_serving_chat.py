@@ -16,6 +16,7 @@ import gc
 import json
 import unittest
 import uuid
+import weakref
 from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -3382,6 +3383,10 @@ class ServingChatTestCase(CustomTestCase):
         for reasoning_parser, prefix in ((None, ""), ("kimi_k3", thinking)):
             self.chat.reasoning_parser = reasoning_parser
             self.template_manager.force_reasoning = reasoning_parser is not None
+            # The output thinks only when the request does.
+            self.template_manager.reasoning_config = (
+                ReasoningToggleConfig(special_case="always") if prefix else None
+            )
             for answer in answers:
                 raw = prefix + opener + answer + closer + "<|close|>message<|sep|>"
                 for stream, incremental in (
@@ -3405,67 +3410,72 @@ class ServingChatTestCase(CustomTestCase):
                         self.assertEqual(served, ("", prefix + answer, []))
 
     def test_kimi_k3_json_answer_opener_only_at_the_channel_boundary(self):
-        """Only the opener that starts the output or follows the think closer
-        opens the answer: one mentioned in unseparated thinking, or quoted in a
-        JSON answer whose channel the prompt opened, is text."""
+        """The answer grammar opens the answer at the start of the output, or
+        right after the first think closer when the request thinks; an opener or
+        think closer anywhere else, in the thinking or quoted in the JSON, is
+        text."""
         self.chat.tool_call_parser = "kimi_k3"
         opener, closer = "<|open|>response<|sep|>", "<|close|>response<|sep|>"
+        think_close = "<|close|>think<|sep|>"
         ending = closer + "<|close|>message<|sep|>"
-        thinking = "I mention " + opener + " here<|close|>think<|sep|>"
+        mention = "I mention " + opener + " here" + think_close
         quoted = '{"word": "' + opener + '"}'
-        quoted_pair = '{"word": "<|close|>think<|sep|>' + opener + 'x"}'
+        quoted_pair = '{"word": "' + think_close + opener + 'x"}'
         cases = (
+            # Thinking request with unseparated reasoning.
             (
-                None,
-                thinking + opener + '{"word": "hi"}' + ending,
-                thinking + '{"word": "hi"}',
+                True,
+                mention + opener + '{"word": "hi"}' + ending,
+                mention + '{"word": "hi"}',
             ),
             (
-                "kimi_k3",
-                thinking + opener + '{"word": "hi"}' + ending,
-                thinking + '{"word": "hi"}',
+                True,
+                "Plan." + think_close + quoted_pair + ending,
+                "Plan." + think_close + quoted_pair,
             ),
-            (None, quoted + ending, quoted),
-            # Only the first think closer ends the thinking; a quoted pair is text.
-            (
-                None,
-                "Plan.<|close|>think<|sep|>" + quoted_pair + ending,
-                "Plan.<|close|>think<|sep|>" + quoted_pair,
-            ),
+            # No thinking: the prompt opened the channel or the output opens it.
+            (False, quoted + ending, quoted),
+            (False, quoted_pair + ending, quoted_pair),
+            (False, opener + quoted_pair + ending, quoted_pair),
         )
-        for reasoning_parser, raw, content in cases:
-            self.chat.reasoning_parser = reasoning_parser
-            self.template_manager.force_reasoning = reasoning_parser is not None
+        self.chat.reasoning_parser = "kimi_k3"
+        self.template_manager.force_reasoning = True
+        for thinking, raw, content in cases:
+            self.template_manager.reasoning_config = ReasoningToggleConfig(
+                toggle_param="thinking", default_enabled=True
+            )
             for stream, incremental in ((False, False), (True, False), (True, True)):
                 with self.subTest(
-                    parser=reasoning_parser,
-                    raw=raw,
-                    stream=stream,
-                    incremental=incremental,
+                    thinking=thinking, raw=raw, stream=stream, incremental=incremental
                 ):
                     served = self._served(
                         self._stopped_on_token(raw, 1),
                         stream,
                         incremental=incremental,
                         separate_reasoning=False,
+                        chat_template_kwargs={"thinking": thinking},
                         **self._json_answer_fields(),
                     )
                     self.assertEqual(served, ("", content, []))
 
-    def test_kimi_k3_answer_without_json_format_keeps_the_first_opener_rule(self):
-        """Without the JSON-answer grammar the opener is not pinned to the
-        channel boundary: a response opened without closing the thinking still
-        loses its opener, as before."""
-        self.chat.tool_call_parser = "kimi_k3"
-        tool_calls, text, _ = self.chat._process_tool_calls(
-            text="Plan.<|open|>response<|sep|>hi<|close|>response<|sep|>",
-            tools=[{"type": "function", "function": {"name": "read_file"}}],
-            finish_reason={"type": "stop", "matched": None},
-            tool_choice="auto",
+    def test_kimi_k3_json_answer_parser_frees_without_the_collector(self):
+        """A JSON-answer Kimi-K3 parser holds no reference cycle: with the
+        collector off (--gc-threshold 0), a finished stream's detector and its
+        output buffer must be freed with the parser."""
+        parser = FunctionCallParser(
+            [Tool.model_validate(self._READ_FILE_TOOL)],
+            "kimi_k3",
+            json_answer_channel=True,
         )
-
-        self.assertIsNone(tool_calls)
-        self.assertEqual(text, "Plan.hi")
+        parser.parse_stream_chunk('<|open|>response<|sep|>{"word": "hi"}')
+        parser.parse_stream_end()
+        detector = weakref.ref(parser.detector)
+        gc.disable()
+        try:
+            del parser
+            self.assertIsNone(detector())
+        finally:
+            gc.enable()
 
     def test_kimi_k3_json_answer_channel_holds_a_closer_before_tools(self):
         """An empty answer closed right before a tools channel streams no

@@ -799,6 +799,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request._response_parser_json_answer_channel = (
             chat_request._response_parser_json_answer_channel
         )
+        request._response_parser_answer_after_thinking = (
+            chat_request._response_parser_answer_after_thinking
+        )
 
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]
@@ -1254,7 +1257,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and not response_unwrapped
             ):
                 content = strip_response_markers(
-                    content, request._response_parser_json_answer_channel
+                    content,
+                    request._response_parser_json_answer_channel,
+                    request._response_parser_answer_after_thinking,
                 )
 
         if (
@@ -2374,6 +2379,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 thinking_end=request._response_parser_thinking_end,
                 answer_excludes_calls=request._response_parser_answer_excludes_calls,
                 json_answer_channel=request._response_parser_json_answer_channel,
+                json_answer_after_thinking=(
+                    request._response_parser_answer_after_thinking
+                ),
             )
         reasoning_parser_obj: Optional[ReasoningParser] = None
         if token_stream is None and self.reasoning_parser:

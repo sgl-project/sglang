@@ -73,11 +73,11 @@ def closing_markers_len(text: str) -> int:
 THINK_THEN_RESPONSE = THINK_CLOSE + RESPONSE_OPEN
 
 
-def response_opener_idx(text: str) -> int:
+def response_opener_idx(text: str, after_thinking: bool) -> int:
     """Where the response channel's own opener starts in `text`, or -1; an
     opener anywhere else is quoted text."""
-    if text.startswith(RESPONSE_OPEN):
-        return 0
+    if not after_thinking:
+        return 0 if text.startswith(RESPONSE_OPEN) else -1
     idx = text.find(THINK_CLOSE)
     if idx == -1:
         return -1
@@ -85,12 +85,18 @@ def response_opener_idx(text: str) -> int:
     return idx if text.startswith(RESPONSE_OPEN, idx) else -1
 
 
-def strip_response_markers(text: str, json_answer_channel: bool = False) -> str:
+def strip_response_markers(
+    text: str, json_answer_channel: bool = False, after_thinking: bool = False
+) -> str:
     """`text` without the opener and closers of its response channel, keeping
     the text before the opener and any marker quoted inside the answer."""
     # Only the JSON-answer grammar pins the opener to the channel boundary;
     # unconstrained output may open the response without closing its thinking.
-    idx = response_opener_idx(text) if json_answer_channel else text.find(RESPONSE_OPEN)
+    idx = (
+        response_opener_idx(text, after_thinking)
+        if json_answer_channel
+        else text.find(RESPONSE_OPEN)
+    )
     if idx == -1:
         head, answer = "", text
     else:
