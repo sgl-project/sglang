@@ -754,8 +754,14 @@ def is_deepep_class_backend() -> bool:
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
-    """Check whether fused shared experts use per-rank physical slots."""
-    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+    """Check whether fused shared experts use per-rank physical slots.
+
+    ascend_fuseep is deliberately absent: its fused dispatch (forward_fuseep ->
+    aclnnFusedDeepMoe) has no per-rank shared-slot layout, so it must not be
+    sized like DeepEP-family expert blocks.
+    """
+    b = get_moe_a2a_backend()
+    return is_deepep_class_backend() or b.is_megamoe() or b.is_ascend_ops()
 
 
 def has_per_rank_fused_shared_slots(num_shared: int) -> bool:

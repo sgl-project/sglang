@@ -84,8 +84,10 @@ class TestNPURoutingInputs(CustomTestCase):
         """NPU padding must stay inert without inventing invalid or duplicate routes."""
         router = self._router(num_fused_shared_experts=1)
         router.topk_config.scoring_func = "sqrtsoftplus"
-        logical = torch.tensor([[0, 4], [1, 4], [2, 4], [3, 4]], dtype=torch.int32)
-        weights = torch.tensor([[0.75, 0.25]]).repeat(4, 1)
+        # The NPU gates return routed experts only; the shared slot (id 4) is
+        # appended afterwards, so it must never reach the EPLB remap table.
+        logical = torch.tensor([[0], [1], [2], [3]], dtype=torch.int32)
+        weights = torch.tensor([[0.75]]).repeat(4, 1)
 
         class Capture:
             def capture(self, *, layer_id, topk_indices):
@@ -98,7 +100,7 @@ class TestNPURoutingInputs(CustomTestCase):
         with patch(
             "sglang.srt.hardware_backend.npu.moe.topk.moe_gating_top_k",
             return_value=(weights, logical, None),
-        ):
+        ) as gating_op:
             output = fused_topk_npu(
                 hidden_states=self.hidden,
                 router_logits=self.logits,
@@ -107,9 +109,13 @@ class TestNPURoutingInputs(CustomTestCase):
                 expert_location_dispatch_info=info,
                 layer_id=0,
             )
+        # Only the routed columns are requested from the gate.
+        self.assertEqual(gating_op.call_args.kwargs["k"], 1)
         self.assertEqual(output.topk_ids.tolist(), [[2, 4], [0, 4], [3, 4], [1, 4]])
+        # Valid rows keep the routed weight; the appended shared slot defaults
+        # to a unit weight when no routed scaling factor is set.
         torch.testing.assert_close(
-            output.topk_weights[:2], torch.tensor([[0.75, 0.25]]).repeat(2, 1)
+            output.topk_weights[:2], torch.tensor([[0.75, 1.0]]).repeat(2, 1)
         )
         torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
         self.assertEqual(capture.ids.tolist(), [[0], [1], [2], [3]])
