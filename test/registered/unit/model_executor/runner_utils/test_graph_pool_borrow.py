@@ -199,6 +199,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             temperatures=torch.ones((1, 1)),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
             sampling_seed=None,
         )
         batch = SimpleNamespace(
@@ -809,6 +810,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             top_ps=torch.ones(1),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
         )
         with (
             patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),

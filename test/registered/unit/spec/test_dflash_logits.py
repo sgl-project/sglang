@@ -554,7 +554,7 @@ def _sparse_verify_support(
         dict(sampling_fields={"has_custom_logit_processor": True}),
         dict(sampling_fields={"step_penalties": object()}),
         dict(sampling_fields={"logit_bias": torch.zeros(1)}),
-        dict(sampling_fields={"grammar_mask": object()}),
+        dict(sampling_fields={"watermark": object()}),
         dict(sampling_fields={"sampling_mask_batch_indices": torch.zeros(1)}),
         dict(batch_fields={"has_grammar": True}),
         dict(batch_fields={"return_logprob": True}),
@@ -649,7 +649,7 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
     worker._selector_sparse_accept = fake_sparse_accept
     worker._selector_sampling_accept = lambda **kwargs: pytest.fail("dense accept")
     worker._use_triton_accept_bonus = False
-    accept_len, *_ = worker._accept_block(
+    accept_len, commit_lens, *_, cap_trim_lens = worker._accept_block(
         candidates=torch.zeros(bs, block, dtype=torch.int64),
         next_token_logits=None,
         sampling_info=None,
@@ -662,6 +662,9 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
     assert sparse_calls == ["support"]
     assert accept_len.tolist() == [1, 1]
     assert syncs == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 2
+    # Zero trims, like the dense selector accept, so block_accept_lens counts the step.
+    assert cap_trim_lens.tolist() == [0, 0]
+    assert (commit_lens + cap_trim_lens).tolist() == commit_lens.tolist()
 
 
 if __name__ == "__main__":
