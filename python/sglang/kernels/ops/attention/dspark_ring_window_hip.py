@@ -46,7 +46,8 @@ def fill_dspark_ring_window_buffer_hip(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fill sliding-window rail indices from a per-request draft ring.
 
-    Coverage: ROCm (Triton), ``dcp_size == 1``, positive window and ring rows.
+    Coverage: ROCm (Triton), ``dcp_size == 1``, a non-paged ring (one sink row)
+    with at least ``sliding_window_size`` rows per request.
     Request ``b`` reads keys ``[start_b, seq_lens[b])`` with ``start_b =
     max(min_pos[slot_b], seq_lens[b] - sliding_window_size, 0)``, from ring row
     ``1 + slot_b * rows_per_req + pos % rows_per_req``. Returns ``(kv_indptr``
@@ -57,10 +58,19 @@ def fill_dspark_ring_window_buffer_hip(
         raise ValueError(
             f"fill_dspark_ring_window_buffer_hip requires dcp_size == 1, got {dcp_size}"
         )
-    if sliding_window_size <= 0 or rows_per_req <= 0:
+    if sliding_window_size <= 0 or rows_per_req < sliding_window_size:
         raise ValueError(
-            "fill_dspark_ring_window_buffer_hip needs a positive window and ring "
-            f"rows, got {sliding_window_size} and {rows_per_req}"
+            "fill_dspark_ring_window_buffer_hip needs a positive window and at least "
+            f"as many ring rows, got {sliding_window_size} and {rows_per_req}"
+        )
+    # Shapes only, so this holds under CUDA graph capture: a window is at most
+    # sliding_window_size keys, and the kernel stores without a bound check.
+    if window_kv_indices is not None and window_kv_indices.numel() < bs * int(
+        sliding_window_size
+    ):
+        raise ValueError(
+            f"window_kv_indices holds {window_kv_indices.numel()} indices, fewer than "
+            f"{bs} requests x a {sliding_window_size}-key window"
         )
     req_slots = req_pool_indices[:bs]
     lens = seq_lens[:bs].to(torch.int32)
