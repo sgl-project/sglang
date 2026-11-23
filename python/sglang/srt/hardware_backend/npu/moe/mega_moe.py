@@ -85,7 +85,9 @@ def destroy_mega_moe_buffers() -> None:
             del buffers[key]
 
 
-def prepare_mega_moe_arch22_weights(layer, prefix, weight, *, packed_int4=False) -> None:
+def prepare_mega_moe_arch22_weights(
+        layer, prefix, weight, *, packed_int4=False
+) -> None:
     """Build per-expert NZ tensors for arch22 alongside the grouped matmul weights."""
     config = getattr(getattr(layer, "dispatcher", None), "moe_ascend_ops_config", None)
     if config is None or not config.uses_fused_op:
@@ -179,7 +181,10 @@ def _activation_args(config):
         return {
             "activation": "swigluoai",
             "activation_clamp": clamp,
-            "activation_params": {"alpha": 1.702 if alpha is None else alpha, "beta": 1.0},
+            "activation_params": {
+                "alpha": 1.702 if alpha is None else alpha,
+                "beta": 1.0,
+            },
         }
     if config.activation != "silu":
         raise ValueError(f"Unsupported MegaMoE activation {config.activation!r}")

@@ -1018,7 +1018,9 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
-        prepare_mega_moe_arch22_weights(layer, weight_prefix, weight.data.transpose(1, 2))
+        prepare_mega_moe_arch22_weights(
+            layer, weight_prefix, weight.data.transpose(1, 2)
+        )
         weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
