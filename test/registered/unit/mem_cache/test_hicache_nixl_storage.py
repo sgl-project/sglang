@@ -835,11 +835,13 @@ class TestNixlUnified(CustomTestCase):
         from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
 
         cases = (
+            # Zero-copy transfers are handed to NIXL whole, without chunking.
             (
                 PoolName.MAMBA,
                 MockHybridPool(num_pages=STORAGE_BATCH_SIZE + 2, expose_zero_copy=True),
-                2,
+                [(STORAGE_BATCH_SIZE + 2) * 2],
             ),
+            # Bounce-buffer transfers chunk at the staging buffer capacity.
             (
                 PoolName.SWA,
                 MockMemPoolHost(
@@ -847,10 +849,10 @@ class TestNixlUnified(CustomTestCase):
                     page_size=2,
                     num_pages=STORAGE_BATCH_SIZE + 2,
                 ),
-                1,
+                [STORAGE_BATCH_SIZE, 2],
             ),
         )
-        for pool_name, pool, key_multiplier in cases:
+        for pool_name, pool, expected_sizes in cases:
             with self.subTest(pool_name=pool_name, page_size=pool.page_size):
                 page_count = STORAGE_BATCH_SIZE + 2
                 self.hicache.register_mem_host_pool_v2(pool, pool_name)
@@ -872,10 +874,7 @@ class TestNixlUnified(CustomTestCase):
                 self.hicache._batch_xfer = fake_write
                 set_results = self.hicache.batch_set_v2([transfer])
                 self.assertEqual(set_results[pool_name], [True] * page_count)
-                self.assertEqual(
-                    write_batch_sizes,
-                    [STORAGE_BATCH_SIZE * key_multiplier, 2 * key_multiplier],
-                )
+                self.assertEqual(write_batch_sizes, expected_sizes)
 
                 read_batch_sizes = []
 
@@ -889,10 +888,7 @@ class TestNixlUnified(CustomTestCase):
                 self.hicache._batch_xfer = fake_read
                 get_results = self.hicache.batch_get_v2([transfer])
                 self.assertEqual(get_results[pool_name], [True] * page_count)
-                self.assertEqual(
-                    read_batch_sizes,
-                    [STORAGE_BATCH_SIZE * key_multiplier, 2 * key_multiplier],
-                )
+                self.assertEqual(read_batch_sizes, expected_sizes)
                 if not self.hicache._hybrid_pool_ctx[pool_name].is_zero_copy:
                     self.assertTrue(torch.all(pool.get_data_page(0) == 1))
                     last_page_start = (page_count - 1) * pool.page_size

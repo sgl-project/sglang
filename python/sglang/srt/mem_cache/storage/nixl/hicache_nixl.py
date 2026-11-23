@@ -115,20 +115,15 @@ class HiCacheNixl(HiCacheStorage):
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
         )
-        # nixl 1.6.0 renamed nixl_agent_config fields:
-        # enable_pthread -> enable_prog_thread, enable_listen ->
-        # enable_listen_thread, port -> listen_port.
-        try:
-            agent_config = nixl_agent_config(backends=[], enable_prog_thread=True)
-            prog_thread = True
-        except TypeError:
-            agent_config = nixl_agent_config(backends=[])
-            prog_thread = agent_config.enable_pthread
+        # nixl 1.6.0 renamed nixl_agent_config fields: enable_listen ->
+        # enable_listen_thread, port -> listen_port. The progress-thread
+        # attribute keeps the name enable_pthread.
+        agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
         pin_aiter_hip_runtime()
         self.agent = nixl_agent(self.agent_name, agent_config)
         bind_cfg = nixlBind.nixlAgentConfig()
-        bind_cfg.useProgThread = prog_thread
+        bind_cfg.useProgThread = agent_config.enable_pthread
         bind_cfg.useListenThread = getattr(
             agent_config,
             "enable_listen_thread",
@@ -778,7 +773,9 @@ class HiCacheNixl(HiCacheStorage):
     def _iter_storage_pool_transfer_chunks(
         self, transfer: PoolTransfer
     ) -> Iterator[tuple[List[str], Optional[torch.Tensor]]]:
-        """Yield storage-only ``(keys, host_indices)`` chunks."""
+        """Yield storage-only ``(keys, host_indices)`` chunks: whole for
+        zero-copy transfers, capped at STORAGE_BATCH_SIZE pages (the bounce
+        staging capacity) otherwise."""
         keys = transfer.keys or []
         host_indices = transfer.host_indices
         ctx = self._hybrid_pool_ctx.get(transfer.name)
@@ -796,7 +793,7 @@ class HiCacheNixl(HiCacheStorage):
                 host_indices.numel() if host_indices is not None else 0,
             )
             return
-        if len(keys) <= STORAGE_BATCH_SIZE:
+        if ctx.is_zero_copy or len(keys) <= STORAGE_BATCH_SIZE:
             yield keys, host_indices
             return
         for start in range(0, len(keys), STORAGE_BATCH_SIZE):
