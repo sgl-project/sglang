@@ -2748,6 +2748,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
 
+        if error := self._native_weight_update_error(obj):
+            return False, error, 0
         if obj.load_format is None:
             obj.load_format = self.config_value("load_format")
         logger.info("Start update_weights. Load format=%s", obj.load_format)
@@ -2825,7 +2827,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Any, bool]:
         expected_workers = self.elastic_worker_count
         self.model_update_expected_workers = expected_workers
         self.model_update_tmp = []
@@ -2833,19 +2835,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._dispatch_to_scheduler(obj)
         if expected_workers == 1:
             result = await self.model_update_result
-            if result.success:
+            if result.weights_loaded:
                 self._update_model_path_info(obj.model_path, obj.load_format)
-            return result.success, result.message, result.num_paused_requests
+            return (
+                result.success,
+                result.message,
+                result.num_paused_requests,
+                result.weights_loaded,
+            )
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
+            weights_loaded = all(r.weights_loaded for r in result)
+            if weights_loaded:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
+            return all_success, all_message, all_paused_requests, weights_loaded
 
     def configure_logging(self, obj: ConfigureLoggingReq):
         self.request_logger.configure(

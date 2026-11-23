@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgspec
+
 from sglang.srt.managers import tokenizer_control_mixin
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -12,6 +14,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqOutput,
     ProfileReqType,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -76,6 +79,16 @@ class TestStartProfilePlatformDefaults(CustomTestCase):
 
 
 class TestGlobalNativeWeightVersion(CustomTestCase):
+    def test_legacy_disk_reply_keeps_its_paused_request_count(self):
+        """The IPC schema is array encoded: inserting load metadata before an
+        existing field would reinterpret the old paused-request count as a bool."""
+        legacy = msgspec.msgpack.encode(
+            ["UpdateWeightFromDiskReqOutput", None, None, True, "Success", 7]
+        )
+        reply = msgspec.msgpack.decode(legacy, type=UpdateWeightFromDiskReqOutput)
+        self.assertEqual(reply.num_paused_requests, 7)
+        self.assertFalse(reply.weights_loaded)
+
     _requests = {
         "disk": lambda version: UpdateWeightFromDiskReqInput(
             model_path="checkpoint", weight_version=version
@@ -105,7 +118,9 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
         states = [
             SimpleNamespace(version="v1", weights="v1") for _ in range(worker_count)
         ]
-        state = SimpleNamespace(failed_rank=failed_rank, checkpoint="v2", commits=0)
+        state = SimpleNamespace(
+            failed_rank=failed_rank, checkpoint="v2", commits=0, flush_ok=True
+        )
         tasks = []
         updates = []
         commit_started = asyncio.Event()
@@ -142,7 +157,7 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
                 ),
                 draft_worker=None,
                 memory_saver_adapter=None,
-                flush_cache=lambda **kwargs: True,
+                flush_cache=lambda **kwargs: state.flush_ok,
                 is_fully_idle=lambda **kwargs: True,
                 scheduler=SimpleNamespace(
                     record_weight_version_change=record,
@@ -341,6 +356,106 @@ class TestGlobalNativeWeightVersion(CustomTestCase):
                 ),
             ):
                 asyncio.run(scenario(route))
+
+    def test_flush_refusal_still_commits_the_version_of_successfully_loaded_weights(
+        self,
+    ):
+        """A paused v2 load can fail only at cache flush; later flushing must
+        not leave fully installed v2 weights tagged as v1."""
+
+        async def scenario(route, worker_count):
+            manager, residents, state, tasks, _ = self._manager(
+                route, paused=True, worker_count=worker_count
+            )
+            state.flush_ok = False
+            result = await asyncio.wait_for(
+                getattr(manager, f"update_weights_from_{route}")(
+                    self._requests[route]("v2")
+                ),
+                timeout=5,
+            )
+            self.assertFalse(result[0])
+            self.assertIn("cache was not flushed", result[1])
+            self.assertTrue(all(s.weights == s.version == "v2" for s in residents))
+            self.assertEqual(manager.config_value("weight_version"), "v2")
+            self.assertTrue(manager.is_pause)
+            self.assertEqual(state.commits, int(worker_count > 1))
+            await asyncio.gather(*tasks)
+
+        for route in self._requests:
+            for workers in (1, 2):
+                with (
+                    self.subTest(route=route, workers=workers),
+                    get_context().override_server_args(
+                        weight_version="v1", tp_size=workers, attn_dp_size=workers
+                    ),
+                    get_parallel().override(
+                        tp_rank=0,
+                        tp_size=workers,
+                        dp_size=1,
+                        num_dp_ranks=workers,
+                        pp_size=1,
+                        attn_dp_enabled=True,
+                        enable_dp_attention_local_control_broadcast=True,
+                        tp_group=SimpleNamespace(cpu_group=None),
+                        attn_tp_group=SimpleNamespace(world_size=1),
+                        attn_cp_group=SimpleNamespace(world_size=1),
+                    ),
+                ):
+                    asyncio.run(scenario(route, workers))
+
+    def test_unsupported_global_version_configs_are_rejected_before_loading(self):
+        """A local lock and stage-zero replies cannot protect other tokenizer
+        workers or prove a later pipeline stage loaded the checkpoint."""
+
+        async def scenario(route, reason):
+            manager, residents, state, tasks, _ = self._manager(route)
+            manager.abort_request = MagicMock()
+            request = self._requests[route]("v2")
+            if hasattr(request, "abort_all_requests"):
+                request.abort_all_requests = True
+            result = await asyncio.wait_for(
+                getattr(manager, f"update_weights_from_{route}")(request), timeout=5
+            )
+            self.assertFalse(result[0])
+            self.assertIn(reason, result[1])
+            self.assertTrue(all(s.weights == s.version == "v1" for s in residents))
+            self.assertEqual(manager.config_value("weight_version"), "v1")
+            self.assertEqual(state.commits, 0)
+            self.assertEqual(tasks, [])
+            manager.abort_request.assert_not_called()
+
+        for route in self._requests:
+            for pp_size, tokenizer_workers, reason in (
+                (2, 1, "pipeline parallelism"),
+                (1, 2, "tokenizer workers"),
+            ):
+                with (
+                    self.subTest(
+                        route=route,
+                        pp_size=pp_size,
+                        tokenizer_workers=tokenizer_workers,
+                    ),
+                    get_context().override_server_args(
+                        weight_version="v1",
+                        tp_size=2,
+                        attn_dp_size=2,
+                        tokenizer_worker_num=tokenizer_workers,
+                    ),
+                    get_parallel().override(
+                        tp_rank=0,
+                        tp_size=2,
+                        dp_size=1,
+                        num_dp_ranks=2,
+                        pp_size=pp_size,
+                        attn_dp_enabled=True,
+                        enable_dp_attention_local_control_broadcast=True,
+                        tp_group=SimpleNamespace(cpu_group=None),
+                        attn_tp_group=SimpleNamespace(world_size=1),
+                        attn_cp_group=SimpleNamespace(world_size=1),
+                    ),
+                ):
+                    asyncio.run(scenario(route, reason))
 
 
 if __name__ == "__main__":

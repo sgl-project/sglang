@@ -214,7 +214,7 @@ class SchedulerWeightUpdaterManager:
         update: Callable[[Any], Tuple[bool, str]],
         session_load: bool = False,
         release_weights: Optional[Callable[[], None]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, bool]:
         success, message = True, "Success"
         attempted = False
         for _, runner in self._select_runners(selector):
@@ -228,7 +228,8 @@ class SchedulerWeightUpdaterManager:
         if release_weights is not None:
             release_weights()
 
-        if success:
+        weights_loaded = success
+        if weights_loaded:
             if session_load:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
@@ -243,13 +244,13 @@ class SchedulerWeightUpdaterManager:
             if not flushed:
                 message = flush_message if success else f"{message} | {flush_message}"
                 success = False
-        return success, message
+        return success, message, weights_loaded
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
             self.scheduler.wait_for_launched_forward()
-            success, message = self._update_native_runners(
+            success, message, weights_loaded = self._update_native_runners(
                 recv_req,
                 selector="all",
                 update=lambda runner: runner.weight_updater.update_weights_from_disk(
@@ -261,7 +262,10 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             return UpdateWeightFromDiskReqOutput(
-                success=success, message=message, num_paused_requests=0
+                success=success,
+                message=message,
+                weights_loaded=weights_loaded,
+                num_paused_requests=0,
             )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
@@ -315,8 +319,9 @@ class SchedulerWeightUpdaterManager:
             else:
                 success, message = True, "Success"
             success, message = self._agree_native_update(success, message)
+            weights_loaded = False
             if success:
-                success, message = self._update_native_runners(
+                success, message, weights_loaded = self._update_native_runners(
                     recv_req,
                     selector=recv_req.selector,
                     update=lambda runner: (
@@ -325,7 +330,7 @@ class SchedulerWeightUpdaterManager:
                     session_load=True,
                 )
             return UpdateWeightsFromDistributedReqOutput(
-                success=success, message=message
+                success=success, message=message, weights_loaded=weights_loaded
             )
 
     def _load_into_selected_runners(
@@ -373,7 +378,7 @@ class SchedulerWeightUpdaterManager:
 
             # Deserialization either succeeds or raises; there is no recoverable
             # outcome to agree on before the per-runner load agreement below.
-            success, message = self._update_native_runners(
+            success, message, weights_loaded = self._update_native_runners(
                 recv_req,
                 selector=recv_req.selector,
                 update=lambda runner: runner.weight_updater.update_weights_from_tensor(
@@ -386,13 +391,15 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             control_request_barrier()
-            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+            return UpdateWeightsFromTensorReqOutput(
+                success=success, message=message, weights_loaded=weights_loaded
+            )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
             self.scheduler.wait_for_launched_forward()
-            success, message = self._update_native_runners(
+            success, message, weights_loaded = self._update_native_runners(
                 recv_req,
                 selector="all",
                 update=lambda runner: runner.weight_updater.update_weights_from_ipc(
@@ -402,7 +409,9 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             control_request_barrier()
-            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+            return UpdateWeightsFromIPCReqOutput(
+                success=success, message=message, weights_loaded=weights_loaded
+            )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)

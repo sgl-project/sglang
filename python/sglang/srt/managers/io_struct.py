@@ -2210,6 +2210,8 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+    # Loading can succeed even when the subsequent cache flush is refused.
+    weights_loaded: bool = False
 
 
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
@@ -2235,6 +2237,7 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
@@ -2263,6 +2266,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
 class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
@@ -2296,6 +2300,7 @@ class UpdateWeightsFromIPCReqInput(BaseReq, kw_only=True):
 class UpdateWeightsFromIPCReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    weights_loaded: bool = False
 
 
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq, kw_only=True):

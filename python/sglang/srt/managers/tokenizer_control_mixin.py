@@ -487,9 +487,21 @@ class TokenizerControlMixin:
         )
         return FanOutCommunicator.merge_results(results)
 
+    def _native_weight_update_error(self: TokenizerManager, obj) -> Optional[str]:
+        if (
+            getattr(obj, "weight_version", None) is None
+            or get_parallel().num_dp_ranks == 1
+        ):
+            return None
+        if get_parallel().pp_size > 1:
+            return "Versioned multi-shard updates are not supported with pipeline parallelism."
+        if get_serving().tokenizer_worker_num > 1:
+            return "Versioned multi-shard updates are not supported with multiple tokenizer workers."
+        return None
+
     def _native_weight_update_request(self: TokenizerManager, obj) -> tuple[Any, bool]:
         # Shards may handle control in different steps. Let the frontend commit
-        # a requested version only after every shard has reported success.
+        # a requested version only after every shard has reported load success.
         if (
             getattr(obj, "weight_version", None) is not None
             and get_parallel().num_dp_ranks > 1
@@ -498,10 +510,10 @@ class TokenizerControlMixin:
         return obj, False
 
     async def _commit_native_weight_version(
-        self: TokenizerManager, obj, success, *, deferred: bool
+        self: TokenizerManager, obj, weights_loaded, *, deferred: bool
     ):
         version = getattr(obj, "weight_version", None)
-        if not success or version is None:
+        if not weights_loaded or version is None:
             return
         if deferred:
             await self.update_weight_version_communicator(
@@ -514,16 +526,22 @@ class TokenizerControlMixin:
     async def _native_weight_update_replies(self: TokenizerManager, communicator, obj):
         request, deferred = self._native_weight_update_request(obj)
         results = await communicator(request)
-        await self._commit_native_weight_version(
-            obj, all(r.success for r in results), deferred=deferred
-        )
+        if getattr(obj, "weight_version", None) is not None:
+            await self._commit_native_weight_version(
+                obj, all(r.weights_loaded for r in results), deferred=deferred
+            )
         return results
 
     async def _update_weights_from_disk_and_commit(self: TokenizerManager, obj):
         request, deferred = self._native_weight_update_request(obj)
-        result = await self._wait_for_model_update_from_disk(request)
-        await self._commit_native_weight_version(obj, result[0], deferred=deferred)
-        return result
+        (
+            success,
+            message,
+            num_paused_requests,
+            weights_loaded,
+        ) = await self._wait_for_model_update_from_disk(request)
+        await self._commit_native_weight_version(obj, weights_loaded, deferred=deferred)
+        return success, message, num_paused_requests
 
     async def _weight_update_session_replies(
         self: TokenizerManager, communicator, obj
@@ -591,6 +609,8 @@ class TokenizerControlMixin:
             "data-parallel replicas are not supported for update weights from distributed"
         )
 
+        if error := self._native_weight_update_error(obj):
+            return False, error
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -642,6 +662,8 @@ class TokenizerControlMixin:
             "data-parallel replicas are not supported for update weights from tensor"
         )
 
+        if error := self._native_weight_update_error(obj):
+            return False, error
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -671,6 +693,8 @@ class TokenizerControlMixin:
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for update weights from IPC"
             )
+            if error := self._native_weight_update_error(obj):
+                return False, error
             logger.info("Starting IPC weight update")
 
             success, message = await self._weight_update_session_call(
