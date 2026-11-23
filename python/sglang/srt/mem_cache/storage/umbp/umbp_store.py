@@ -1221,8 +1221,6 @@ class UMBPStore(HiCacheStorage):
     def _check_spdk_key_budget(self, keys: list[str], what: str) -> None:
         """Startup-only check. MoRI's SPDK proxy clamps keys to 255 bytes, which
         cuts off the rank and K/V suffix and lets keys collide."""
-        if not keys:
-            return
         longest = max(len(key.encode("utf-8")) for key in keys)
         if longest > self._SPDK_MAX_KEY_BYTES:
             prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
