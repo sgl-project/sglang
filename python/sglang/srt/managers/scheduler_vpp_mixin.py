@@ -35,8 +35,8 @@ def _vpp_manifest(batch) -> tuple:
             (
                 req.rid,
                 getattr(req, "session_generation", None),
-                None if req.extend_range is None else req.extend_range.start,
-                None if req.extend_range is None else req.extend_range.end,
+                None if req.extend_end is None else req.prefix_len,
+                req.extend_end,
             )
             for req in batch.reqs
         ),
@@ -336,7 +336,9 @@ class SchedulerVPPMixin:
                 self.resolve_forward_inputs(batch, self.future_map)
                 self.tp_worker.set_hicache_consumer(batch.hicache_consumer_index)
                 state.forward_batch = ForwardBatch.init_new(
-                    batch, self.tp_worker.model_runner
+                    batch,
+                    self.tp_worker.model_runner,
+                    return_hidden_states_before_norm=False,
                 )
                 state.metadata = PPBatchMetadata(
                     can_run_cuda_graph=False,

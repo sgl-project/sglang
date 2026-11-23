@@ -1,6 +1,7 @@
 """Finite VPP waves against queue transport and CPU model boundaries."""
 
 import unittest
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Queue
@@ -108,6 +109,31 @@ class _Worker:
 
 
 class TestSchedulerVPP(CustomTestCase):
+    def test_manifest_tracks_real_request_chunk_boundaries(self):
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = Req(
+            rid="chunked",
+            origin_input_text="",
+            origin_input_ids=array("q", range(12)),
+            sampling_params=SamplingParams(max_new_tokens=2),
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(value=1),
+            reqs=[req],
+            seq_lens_cpu=torch.tensor([8]),
+            extend_lens=[4],
+        )
+        self.assertEqual(
+            vpp_mod._vpp_manifest(batch)[1], (("chunked", None, None, None),)
+        )
+        req.prefix_len, req.extend_end = 4, 8
+        first = vpp_mod._vpp_manifest(batch)
+        self.assertEqual(first[1], (("chunked", None, 4, 8),))
+        req.prefix_len, req.extend_end = 8, 12
+        self.assertNotEqual(first, vpp_mod._vpp_manifest(batch))
+
     def test_pd_terminal_consensus_waits_for_all_layers_and_failure_wins(self):
         """A stage that finished early cannot admit or free a partial KV request."""
         from threading import Barrier
@@ -242,7 +268,8 @@ class TestSchedulerVPP(CustomTestCase):
                     SimpleNamespace(
                         rid=f"req-{i}",
                         session_generation=0,
-                        extend_range=None,
+                        prefix_len=0,
+                        extend_end=None,
                         beam_group=None,
                         finished=False,
                     )
@@ -325,7 +352,7 @@ class TestSchedulerVPP(CustomTestCase):
             enable_spec=False,
             is_dllm=lambda: False,
             _maybe_finalize_elastic_cuda_graph_scale=lambda: None,
-            model_runner=SimpleNamespace(
+            _model_runner=SimpleNamespace(
                 model=SimpleNamespace(vpp_layout=layout),
                 forward=forward,
                 sample=lambda logits, batch: samples.append(batch) or torch.tensor([2]),
@@ -443,7 +470,8 @@ class TestSchedulerVPP(CustomTestCase):
             )
             schedulers.append(scheduler)
 
-        def init_forward_batch(batch, runner):
+        def init_forward_batch(batch, runner, *, return_hidden_states_before_norm):
+            self.assertFalse(return_hidden_states_before_norm)
             return SimpleNamespace(
                 batch_seq=batch.batch_seq, final_stage=layout.logical_size - 1
             )
