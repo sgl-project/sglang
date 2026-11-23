@@ -140,12 +140,37 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
             )
         )
 
-    def test_fused_name_the_model_does_not_declare_is_one_tensor(self):
-        """Qwen2.5-VL leaves vision attn.qkv_proj out of its mapping: it is not split."""
+    @staticmethod
+    def _qwen2_5_vl_mapping():
+        from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+
+        return Qwen2_5_VLForConditionalGeneration.packed_modules_mapping
+
+    def test_qwen2_5_vl_text_qkv_follows_its_listed_shards(self):
+        """Listing the text q/k/v makes the text self_attn.qkv_proj dense."""
         not_convert = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
-        mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        self.assertTrue(
+            _skipped(
+                "model.layers.0.self_attn.qkv_proj",
+                not_convert,
+                self._qwen2_5_vl_mapping(),
+            )
+        )
+
+    def test_qwen2_5_vl_vision_qkv_is_one_tensor(self):
+        """The vision attn.qkv_proj is not stacked, so text shard names leave it quantized."""
+        not_convert = ["attn.q_proj", "attn.k_proj", "attn.v_proj"]
         self.assertFalse(
-            _skipped("visual.blocks.0.attn.qkv_proj", not_convert, mapping)
+            _skipped(
+                "visual.blocks.0.attn.qkv_proj",
+                not_convert,
+                self._qwen2_5_vl_mapping(),
+            )
+        )
+        self.assertTrue(
+            _skipped(
+                "visual.blocks.0.attn.qkv_proj", ["visual"], self._qwen2_5_vl_mapping()
+            )
         )
 
     def test_shard_name_match_does_not_decide_for_the_other_shards(self):
@@ -157,14 +182,94 @@ class TestIsLayerSkippedAWQ(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "same precision"):
             _skipped("model.decoder.layers.0.encoder_attn.kv_proj", ["v_proj"], mapping)
 
-    def test_k_eq_v_layer_needs_no_v_proj_entry(self):
+    def test_unlisted_v_proj_does_not_follow_k_proj(self):
+        """Whisper self-attention has a real v_proj, so dense q/k alone is rejected."""
+        mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "kv_proj": ["k_proj", "v_proj"],
+        }
+        with self.assertRaisesRegex(ValueError, "same precision"):
+            _skipped(
+                "model.decoder.layers.0.self_attn.qkv_proj",
+                ["self_attn.q_proj", "self_attn.k_proj"],
+                mapping,
+            )
+
+    def test_gemma4_k_eq_v_layer_resolves_from_q_and_k(self):
         """Gemma 4 attention_k_eq_v layers ship q_proj and k_proj only."""
-        not_convert = [
-            "model.layers.5.self_attn.q_proj",
-            "model.layers.5.self_attn.k_proj",
-        ]
+        from types import SimpleNamespace
+
+        from sglang.srt.models.gemma4_causal import _declare_k_eq_v_qkv_shards
+
+        text_config = SimpleNamespace(
+            attention_k_eq_v=True,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        # Gemma4ForCausalLM and Gemma4ForConditionalGeneration text layer paths.
+        for layers_prefix in ("model.layers", "model.language_model.layers"):
+            with self.subTest(layers_prefix=layers_prefix):
+                not_convert = [
+                    f"{layers_prefix}.{i}.self_attn.{shard}"
+                    for i in (0, 1)
+                    for shard in ("q_proj", "k_proj")
+                ]
+                quant_config = _awq_config(not_convert, QWEN3_5_MAPPING)
+                _declare_k_eq_v_qkv_shards(text_config, quant_config, layers_prefix)
+
+                def skipped(prefix):
+                    return is_layer_skipped_awq(
+                        prefix,
+                        modules_to_not_convert=not_convert,
+                        quant_config=quant_config,
+                    )
+
+                # Full-attention layer 1 has no v_proj in the checkpoint.
+                self.assertTrue(skipped(f"{layers_prefix}.1.self_attn.qkv_proj"))
+                # Sliding layer 0 has a real v_proj, which the list leaves quantized.
+                with self.assertRaisesRegex(ValueError, "same precision"):
+                    skipped(f"{layers_prefix}.0.self_attn.qkv_proj")
+        # The model class mapping itself is left untouched.
+        self.assertEqual(
+            set(QWEN3_5_MAPPING),
+            {"qkv_proj", "gate_up_proj", "in_proj_qkvz", "in_proj_ba"},
+        )
+
+    def test_router_entry_does_not_split_gate_up_proj(self):
+        """ "mlp.gate" names the MoE router, not the gate_proj shard of a dense MLP."""
+        for not_convert in (["mlp.gate"], ["gate"]):
+            with self.subTest(not_convert=not_convert):
+                self.assertFalse(
+                    _skipped("model.layers.0.mlp.gate_up_proj", not_convert)
+                )
+                self.assertFalse(
+                    _skipped(
+                        "model.layers.3.mlp.shared_experts.gate_up_proj", not_convert
+                    )
+                )
+
+    def test_layer_entry_does_not_reach_later_layers(self):
+        """ "model.layers.1" names layer 1, not layers 10-19."""
+        not_convert = ["model.layers.1"]
+        self.assertTrue(_skipped("model.layers.1.self_attn.qkv_proj", not_convert))
+        self.assertFalse(_skipped("model.layers.12.self_attn.qkv_proj", not_convert))
+
+    def test_partial_model_mapping_keeps_the_fallback(self):
+        """DeepSeek-V3 declares only fused_qkv_a_proj_with_mqa; gate_up_proj still expands."""
+        mapping = {"fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"]}
+        not_convert = ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"]
         self.assertTrue(
-            _skipped("model.layers.5.self_attn.qkv_proj", not_convert, QWEN3_5_MAPPING)
+            _skipped("model.layers.0.mlp.gate_up_proj", not_convert, mapping)
+        )
+
+    def test_leading_dot_mapping_keys_are_leaf_names(self):
+        """Gemma3n writes ".qkv_proj": [".q_proj", ...]."""
+        mapping = {
+            ".qkv_proj": [".q_proj", ".k_proj", ".v_proj"],
+            ".gate_up_proj": [".gate_proj", ".up_proj"],
+        }
+        not_convert = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+        self.assertTrue(
+            _skipped("model.layers.0.self_attn.qkv_proj", not_convert, mapping)
         )
 
     def test_partially_listed_fused_layer_raises(self):

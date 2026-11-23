@@ -872,6 +872,22 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states
 
 
+def _declare_k_eq_v_qkv_shards(
+    config: Gemma4TextConfig,
+    quant_config: Optional[QuantizationConfig],
+    layers_prefix: str,
+) -> None:
+    # K=V layers ship only q_proj and k_proj; load_weights copies K into V.
+    if quant_config is None or not getattr(config, "attention_k_eq_v", False):
+        return
+    mapping = dict(quant_config.packed_modules_mapping)
+    for i, layer_type in enumerate(config.layer_types):
+        if layer_type == "full_attention":
+            attn = f"{layers_prefix}.{i}.self_attn"
+            mapping[f"{attn}.qkv_proj"] = [f"{attn}.q_proj", f"{attn}.k_proj"]
+    quant_config.update_packed_modules_mapping(mapping)
+
+
 class Gemma4TextModel(PreTrainedModel):
     def __init__(
         self,
@@ -967,6 +983,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
+        _declare_k_eq_v_qkv_shards(config, quant_config, add_prefix("layers", prefix))
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(

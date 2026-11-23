@@ -61,17 +61,49 @@ logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
 
-def _fused_layer_shards(
-    quant_config: QuantizationConfig, proj_name: str
+def _names_module(entry: str, path: str) -> bool:
+    # Substring match that ends on a module boundary: "mlp.gate" names
+    # "mlp.gate" but not "mlp.gate_proj", and "layers.1" not "layers.12".
+    start = path.find(entry)
+    while start != -1:
+        end = start + len(entry)
+        if end == len(path) or path[end] == "." or entry.endswith("."):
+            return True
+        start = path.find(entry, start + 1)
+    return False
+
+
+def _fused_layer_shard_paths(
+    quant_config: QuantizationConfig, prefix: str
 ) -> Optional[List[str]]:
-    # A model that declares packed_modules_mapping lists exactly the layers it
-    # stacks; a fused name it leaves out (Qwen2.5-VL's vision attn.qkv_proj) is
-    # one checkpoint tensor. Only models that declare nothing use the fallback.
-    mapping = quant_config.packed_modules_mapping
-    shards = (
-        mapping.get(proj_name) if mapping else _FALLBACK_FUSED_SHARDS.get(proj_name)
-    )
-    return list(shards) if isinstance(shards, (list, tuple)) else None
+    proj_name = prefix.rsplit(".", 1)[-1]
+    leaf, scoped = {}, {}
+    for key, shards in (quant_config.packed_modules_mapping or {}).items():
+        if not isinstance(shards, (list, tuple)):
+            continue
+        # Gemma3n writes its keys and shards with a leading dot.
+        key = key.lstrip(".")
+        (scoped if "." in key else leaf)[key] = [s.lstrip(".") for s in shards]
+
+    # A dotted key scopes a fusion to the paths ending in it (Qwen2.5-VL's
+    # text self_attn.qkv_proj, Gemma 4 K=V layers); the longest match wins.
+    matches = [k for k in scoped if prefix == k or prefix.endswith("." + k)]
+    if matches:
+        key = max(matches, key=len)
+        parent = prefix[: len(prefix) - len(key)]
+        return [parent + shard for shard in scoped[key]]
+
+    if proj_name in leaf:
+        shards = leaf[proj_name]
+    elif any(k.rsplit(".", 1)[-1] == proj_name for k in scoped):
+        # Scoped elsewhere only, so here it is one tensor (Qwen2.5-VL vision).
+        return None
+    else:
+        shards = _FALLBACK_FUSED_SHARDS.get(proj_name)
+        if shards is None:
+            return None
+    parent = prefix[: -len(proj_name)]
+    return [parent + shard for shard in shards]
 
 
 def is_layer_skipped_awq(
@@ -80,28 +112,23 @@ def is_layer_skipped_awq(
     modules_to_not_convert: List[str],
     quant_config: QuantizationConfig,
 ) -> bool:
-    proj_name = prefix.rsplit(".", 1)[-1]
-    shards = _fused_layer_shards(quant_config, proj_name)
-    if not shards:
+    shard_paths = _fused_layer_shard_paths(quant_config, prefix)
+    if not shard_paths:
         return any(module_name in prefix for module_name in modules_to_not_convert)
 
     # The list names checkpoint shards (self_attn.q_proj), not SGLang's fused
     # layer (self_attn.qkv_proj). An entry that matches the fused layer only
     # through a shard name (v_proj in kv_proj) must not decide for all shards.
-    parent = prefix[: -len(proj_name)]
-    shard_paths = [parent + shard for shard in shards]
     for module_name in modules_to_not_convert:
-        if module_name in prefix and not any(module_name in p for p in shard_paths):
+        if _names_module(module_name, prefix) and not any(
+            _names_module(module_name, p) for p in shard_paths
+        ):
             return True
 
     shard_not_converted = {
-        shard: any(module_name in path for module_name in modules_to_not_convert)
-        for shard, path in zip(shards, shard_paths)
+        path: any(_names_module(m, path) for m in modules_to_not_convert)
+        for path in shard_paths
     }
-    # qkv_proj layers whose V shares K's weights (Gemma 4 attention_k_eq_v) have
-    # no v_proj in the checkpoint, so an unlisted v_proj follows k_proj.
-    if proj_name == "qkv_proj" and shard_not_converted.get("k_proj"):
-        shard_not_converted["v_proj"] = True
     if all(shard_not_converted.values()):
         return True
     if any(shard_not_converted.values()):
