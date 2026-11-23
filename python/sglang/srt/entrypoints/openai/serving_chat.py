@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
 from typing import (
@@ -1053,6 +1052,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return encoding_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
+        if request.return_flat_raw_sampling_mask and not request.return_meta_info:
+            return "return_flat_raw_sampling_mask requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -1317,6 +1318,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.return_flat_raw_output_top_logprobs
                 and request.return_flat_raw_top_logprobs_b64
             ),
+            return_flat_raw_sampling_mask=request.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=(
+                request.return_flat_raw_sampling_mask
+                and request.return_flat_raw_sampling_mask_b64
+            ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
@@ -1336,13 +1342,13 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
-            images_config=getattr(request, "images_config", None),
+            images_config=request.images_config,
             video_config=_build_video_config(request),
             mm_processor_kwargs=request.mm_processor_kwargs,
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
-            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
-            use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            max_dynamic_patch=request.max_dynamic_patch,
+            use_audio_in_video=request.use_audio_in_video,
             return_prompt_token_ids=(
                 request.return_prompt_token_ids
                 or request.return_token_ids
@@ -2341,6 +2347,8 @@ class OpenAIServingChat(OpenAIServingBase):
         stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
         if request.stop:
+            # A template declares stop_str as a string, a tuple or a list.
+            stop = [stop] if isinstance(stop, str) else list(stop)
             if isinstance(request.stop, str):
                 stop.append(request.stop)
             else:

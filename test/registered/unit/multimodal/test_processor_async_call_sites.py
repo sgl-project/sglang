@@ -210,6 +210,8 @@ _NO_WORKER_POOL_ROUTE = {
     "deepseek_v41.py",
     "dots_note_omni.py",
     "inkling.py",
+    # Expands audio placeholders and extracts per-clip features in io_executor.
+    "lfm3_audio.py",
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",
@@ -220,6 +222,9 @@ _NO_WORKER_POOL_ROUTE = {
     # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
     "muse_spark_omni.py",
     "nano_nemotron_vl.py",
+    # Inkling2 renders token-first prompts and assembles them in io_executor
+    # (process_mm_data_async in multimodal/inkling2/processor.py).
+    "processor.py",
     "voxtral.py",
     "whisper.py",
 }
