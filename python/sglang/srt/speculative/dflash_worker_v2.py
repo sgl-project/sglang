@@ -67,7 +67,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -909,12 +909,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         processors[0].defer_verify_gather = True
         return processors[0]
 
-    def _can_skip_verify_logits(
-        self, batch: ScheduleBatch, *, sampling_info, route: VerifyRoute
-    ) -> bool:
+    def _can_skip_verify_logits(self, verify: VerifyStep) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.return_logprob or route.adjusts_logits:
+        if verify.batch.return_logprob or verify.route.adjusts_logits:
             return False
+        sampling_info = verify.batch.sampling_info
         if sampling_info is None:
             return self._selector_sample is None
         # A sampling mask is captured from the full target distribution.
@@ -3640,9 +3639,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
-            if self._can_skip_verify_logits(
-                batch, sampling_info=sampling_info, route=verify.route
-            ):
+            if self._can_skip_verify_logits(verify):
                 target_predict = target_lp.deferred_argmax(
                     logits_output.next_token_logits
                 )
