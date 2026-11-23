@@ -1196,18 +1196,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        verify.build_grammar_mask(
-            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
-        )
-        target_logits = logits_output.next_token_logits
-        # Without sampling info (a simulated greedy accept drops it), nothing
-        # adjusts the logits: the drop requires a route that adjusts nothing.
-        if sampling_info is not None:
-            # run_compact scatters its rows back to (bs * chain_len), so the rows
-            # line up with the verify ids on both verify paths.
-            target_logits, sampling_info = verify.adjust(
-                target_logits, verify_ids_2d, positions=verify_window.positions_2d
-            )
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
             fold_eligible
@@ -1226,36 +1214,62 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         ):
+            # The region's route adjusts nothing: no grammar mask to build and
+            # no stage to run first.
             if simulate_bonus_sampling_info is not None:
                 epilogue.begin_sim_bonus(
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
             region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
+                bs=bs, target_logits=logits_output.next_token_logits
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
         graph_accept = folded_accept or region_accept is not None
-        if region_accept is not None:
-            accept = region_accept
-        else:
-            accept = self._verify_executor.accept_and_finalize(
-                folded_accept=folded_accept,
-                bs=bs,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                draft_block=draft_block,
-                sampling_info=sampling_info,
-                route=verify.route,
-                draft_input=draft_input,
-                layout=layout,
-                prefix_lens=prefix_lens,
-                draft_tokens=draft_tokens,
-                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+
+        # Returns the accept with the sampling info it read: the watermark's
+        # replacement, or None after the simulated greedy drop.
+        def accept_core() -> tuple:
+            accept_info = sampling_info
+            if region_accept is not None:
+                accept = region_accept
+            else:
+                target_logits = logits_output.next_token_logits
+                # Without sampling info (a simulated greedy accept drops it),
+                # nothing adjusts the logits: the drop requires a route that
+                # adjusts nothing.
+                if accept_info is not None:
+                    # run_compact scatters its rows back to (bs * chain_len), so
+                    # the rows line up with the verify ids on both verify paths.
+                    target_logits, accept_info = verify.adjust(
+                        target_logits,
+                        verify_ids_2d,
+                        positions=verify_window.positions_2d,
+                    )
+                accept = self._verify_executor.accept_and_finalize(
+                    folded_accept=folded_accept,
+                    bs=bs,
+                    verify_ids_2d=verify_ids_2d,
+                    target_logits=target_logits,
+                    draft_block=draft_block,
+                    sampling_info=accept_info,
+                    route=verify.route,
+                    draft_input=draft_input,
+                    layout=layout,
+                    prefix_lens=prefix_lens,
+                    draft_tokens=draft_tokens,
+                    simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                )
+            verify_accept = VerifyAccept(
+                tokens=accept.out_tokens, accept_lens=accept.commit_lens
             )
-        verify.commit(
-            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
-            logits_output=logits_output,
+            return verify_accept, (accept, accept_info)
+
+        _, (accept, sampling_info) = verify.run(
+            logits_output,
+            accept_core=accept_core,
+            grammar_tree=grammar_tree,
+            barrier=grammar_barrier,
         )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(

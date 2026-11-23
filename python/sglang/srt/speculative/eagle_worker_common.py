@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
@@ -870,27 +870,38 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    verify.build_grammar_mask(
-        grammar_tree, logits_output=logits_output, barrier=grammar_barrier
-    )
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
-    # SGLang's post-verify graphs when they are on, for a batch they can replay;
-    # they skip the c128 cleanup below, so not for a KV pool that needs it.
-    post = (
-        None
-        if post_verify_graphs is None or clears_c128
-        else post_verify_graphs.run(
-            batch=batch,
-            route=verify.route,
-            verify_input=verify_input,
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            max_top_k=uno_target_max_top_k,
+
+    # Returns the post-verify graphs' outputs when they replayed, else None.
+    def accept_core() -> Tuple[VerifyAccept, Optional[tuple]]:
+        # SGLang's post-verify graphs when they are on, for a batch they can replay;
+        # they skip the c128 cleanup below, so not for a KV pool that needs it.
+        post = (
+            None
+            if post_verify_graphs is None or clears_c128
+            else post_verify_graphs.run(
+                batch=batch,
+                route=verify.route,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+                max_top_k=uno_target_max_top_k,
+            )
         )
-    )
-    if post is not None:
-        predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if post is None:
+            accept = accept_draft_tree(
+                verify,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                speculative_runtime_hooks=speculative_runtime_hooks,
+                post_verify_graphs=post_verify_graphs,
+                uno_target_max_top_k=uno_target_max_top_k,
+                simulated_acc_len_rng=simulated_acc_len_rng,
+                sparse_bonus_argmax=sparse_bonus_argmax,
+            )
+            return accept, None
+        predict, accept_lens, accept_index = post[:3]
         if (c := target_worker.model_runner.canary_manager) is not None:
             c.on_verify_accept(
                 logits_output=logits_output,
@@ -899,12 +910,24 @@ def run_eagle_verify(
                 accept_lens=accept_lens,
                 num_draft_tokens=num_draft_tokens,
             )
-        verify.commit(
-            VerifyAccept(
-                tokens=predict, accept_lens=accept_lens, accept_index=accept_index
-            ),
-            logits_output=logits_output,
+        accept = VerifyAccept(
+            tokens=predict, accept_lens=accept_lens, accept_index=accept_index
         )
+        return accept, post
+
+    accept, post = verify.run(
+        logits_output,
+        accept_core=accept_core,
+        grammar_tree=grammar_tree,
+        barrier=grammar_barrier,
+    )
+    predict, accept_lens, accept_index = (
+        accept.tokens,
+        accept.accept_lens,
+        accept.accept_index,
+    )
+    if post is not None:
+        new_seq_lens, bonus_tokens = post[3:5]
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -921,22 +944,6 @@ def run_eagle_verify(
             prepared_draft_extend_inputs=post[5],
         )
 
-    accept = accept_draft_tree(
-        verify,
-        verify_input=verify_input,
-        logits_output=logits_output,
-        speculative_runtime_hooks=speculative_runtime_hooks,
-        post_verify_graphs=post_verify_graphs,
-        uno_target_max_top_k=uno_target_max_top_k,
-        simulated_acc_len_rng=simulated_acc_len_rng,
-        sparse_bonus_argmax=sparse_bonus_argmax,
-    )
-    verify.commit(accept, logits_output=logits_output)
-    predict, accept_lens, accept_index = (
-        accept.tokens,
-        accept.accept_lens,
-        accept.accept_index,
-    )
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:

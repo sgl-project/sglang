@@ -3649,35 +3649,32 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        verify.build_grammar_mask(
-            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
-        )
-        if sampling_info is not None and target_predict is None:
-            # In place: DFlash refuses the watermark, the one stage that returns
-            # new logits.
-            verify.adjust(logits_output.next_token_logits, draft_tokens)
+        def accept_core() -> Tuple[VerifyAccept, tuple]:
+            if sampling_info is not None and target_predict is None:
+                # In place: DFlash refuses the watermark, the one stage that
+                # returns new logits.
+                verify.adjust(logits_output.next_token_logits, draft_tokens)
+            outputs = self._accept_block(
+                candidates=draft_tokens,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                prefix_lens=prefix_lens,
+                bs=bs,
+                target_predict=target_predict,
+                cutoff_verify_lens=None if layout is None else layout.verify_lens,
+            )
+            out_tokens, commit_lens = outputs[3], outputs[1]
+            return VerifyAccept(tokens=out_tokens, accept_lens=commit_lens), outputs
 
-        candidates = draft_tokens
-        (
-            accept_len,
-            commit_lens,
-            bonus,
-            out_tokens,
-            new_seq_lens,
-            cap_trim_lens,
-        ) = self._accept_block(
-            candidates=candidates,
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
-            bs=bs,
-            target_predict=target_predict,
-            cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        _, outputs = verify.run(
+            logits_output,
+            accept_core=accept_core,
+            grammar_tree=grammar_tree,
+            barrier=grammar_barrier,
         )
-        verify.commit(
-            VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
-            logits_output=logits_output,
+        accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens = (
+            outputs
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(

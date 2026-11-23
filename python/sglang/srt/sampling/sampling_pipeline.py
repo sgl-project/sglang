@@ -10,9 +10,8 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch the verify worker calls `build_grammar_mask`, the stages
-  (`VerifyStep.adjust`, inside `eagle_sample` for a tree), its accept core, and
-  `commit`.
+  launch the verify worker calls `VerifyStep.run` with its accept core, which
+  runs the stages (`VerifyStep.adjust`) on the logits it accepts from.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
@@ -294,7 +293,7 @@ class VerifyRoute(msgspec.Struct, frozen=True):
 class VerifyStep(msgspec.Struct):
     """One target verify's sampling state, from `SamplingPipeline.bind_verify`:
     the route its fast paths read, the bound watermark, and the grammar mask,
-    built after the target forward launches."""
+    which `run` builds after the target forward launches."""
 
     batch: ScheduleBatch
     route: VerifyRoute
@@ -302,27 +301,34 @@ class VerifyStep(msgspec.Struct):
     watermark_full_mask: bool
     grammar_mask: Optional[GrammarMask] = None
 
-    def build_grammar_mask(
+    def run(
         self,
-        tree: Optional[GrammarTree],
-        *,
         logits_output: LogitsProcessorOutput,
-        barrier: Optional[Callable[[], None]],
-    ) -> None:
-        """Build the grammar mask over the verify tree. Call it after the target
-        verify launches, so the mask's host work overlaps the forward."""
-        if tree is None:
-            return
-        # Lazy: spec_utils imports the scheduler stack.
-        from sglang.srt.speculative.spec_utils import build_grammar_vocab_mask
+        *,
+        accept_core: Callable[[], Tuple[VerifyAccept, Any]],
+        grammar_tree: Optional[GrammarTree] = None,
+        barrier: Optional[Callable[[], None]] = None,
+    ) -> Tuple[VerifyAccept, Any]:
+        """The verify's sampling after the target forward launches: build the
+        grammar mask over `grammar_tree` (host work that overlaps the forward),
+        run `accept_core`, then commit its accept. The accept core is the
+        algorithm's own accept; it runs the stages (`adjust`) on the logits it
+        accepts from, and returns its `VerifyAccept` with the algorithm's own
+        outputs, which `run` returns."""
+        if grammar_tree is not None:
+            # Lazy: spec_utils imports the scheduler stack.
+            from sglang.srt.speculative.spec_utils import build_grammar_vocab_mask
 
-        self.grammar_mask = build_grammar_vocab_mask(
-            reqs=self.batch.reqs,
-            tree=tree,
-            sampling_info=self.batch.sampling_info,
-            device=logits_output.next_token_logits.device,
-            barrier=barrier,
-        )
+            self.grammar_mask = build_grammar_vocab_mask(
+                reqs=self.batch.reqs,
+                tree=grammar_tree,
+                sampling_info=self.batch.sampling_info,
+                device=logits_output.next_token_logits.device,
+                barrier=barrier,
+            )
+        accept, outputs = accept_core()
+        self.commit(accept, logits_output=logits_output)
+        return accept, outputs
 
     def adjust(
         self,

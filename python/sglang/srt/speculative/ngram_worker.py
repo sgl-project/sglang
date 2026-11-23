@@ -478,19 +478,20 @@ class NGRAMWorker(BaseSpecWorker):
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.build_grammar_mask(
-                grammar_tree,
-                logits_output=logits_output,
-                # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
-                barrier=None,
+            # Host corpus lookup, so NGRAM stays synchronous: no barrier.
+            accept, _ = verify.run(
+                logits_output,
+                accept_core=lambda: (
+                    accept_draft_tree(
+                        verify,
+                        verify_input=verify_input,
+                        logits_output=logits_output,
+                        speculative_runtime_hooks=self._speculative_runtime_hooks,
+                    ),
+                    None,
+                ),
+                grammar_tree=grammar_tree,
             )
-            accept = accept_draft_tree(
-                verify,
-                verify_input=verify_input,
-                logits_output=logits_output,
-                speculative_runtime_hooks=self._speculative_runtime_hooks,
-            )
-            verify.commit(accept, logits_output=logits_output)
             predict, accept_lens, accept_index = (
                 accept.tokens,
                 accept.accept_lens,
