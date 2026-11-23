@@ -542,5 +542,45 @@ def test_quick_all_reduce_names_invalid_quantization_level(monkeypatch, caplog):
     assert "Invalid quantization level: int4" in caplog.text
 
 
+def _capture_comm(monkeypatch, *, disabled):
+    # capture() checks the stream on exit; no GPU is needed for that here.
+    monkeypatch.setattr(
+        custom_all_reduce_v2.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    # Skip __init__: it needs a process group and a symmetric workspace.
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = disabled
+    comm._in_capture = False
+    comm._pending_graph_inputs = []
+    # close() (run from __del__) reads these
+    comm._hier = comm._ring = comm._hier_ring = None
+    return comm
+
+
+def test_capture_builds_communicator_before_capturing(monkeypatch):
+    comm = _capture_comm(monkeypatch, disabled=False)
+    calls = []
+    monkeypatch.setattr(
+        custom_all_reduce_v2.CustomAllReduceV2,
+        "obj",
+        property(lambda self: calls.append(self._in_capture)),
+    )
+    with comm.capture():
+        pass
+    # Built once, before any capture, even though nothing inside used it.
+    assert calls == [False]
+
+
+def test_disabled_capture_does_not_build_communicator(monkeypatch):
+    comm = _capture_comm(monkeypatch, disabled=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2.CustomAllReduceV2,
+        "obj",
+        property(lambda self: pytest.fail("built the communicator")),
+    )
+    with comm.capture():
+        pass
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
