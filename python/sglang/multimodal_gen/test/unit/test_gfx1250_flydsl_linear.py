@@ -64,7 +64,9 @@ class TestGfx1250FlyDSLTdmLinear(unittest.TestCase):
     def test_tdm_matches_fp32_on_both_tile_sizes(self):
         # 128-row tiles when 256x256 underfills the CUs, 256-row tiles otherwise;
         # M=4112 ends on 16 leftover rows, which take a second 16-row-tile launch.
-        for m, n, k, launches in ((512, 1024, 512, 1), (4112, 6144, 6144, 2)):
+        # M=8192 is 32 M tiles, the fewest that take the large-M swizzle group.
+        shapes = ((512, 1024, 512, 1), (4112, 6144, 6144, 2), (8192, 1024, 512, 1))
+        for m, n, k, launches in shapes:
             with self.subTest(m=m, n=n, k=k):
                 x, w = _inputs(m, n, k)
                 bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)

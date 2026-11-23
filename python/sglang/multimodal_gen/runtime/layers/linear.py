@@ -131,6 +131,17 @@ if USE_AITER_GFX1250:
             split_k=split_k,
         )
 
+    # M tiles per swizzle group. Measured with both halves of a package loaded:
+    # 2 is 10-15% faster from 48 M tiles up (Wan 2.2), 8 is 2-6% faster at 17 (FLUX.2).
+    _TDM_GROUP_M_SMALL = 8
+    _TDM_GROUP_M_LARGE = 2
+    _TDM_GROUP_M_LARGE_MIN_TILES = 32
+
+    def _tdm_group_m(m: int, block_m: int) -> int:
+        if -(-m // block_m) >= _TDM_GROUP_M_LARGE_MIN_TILES:
+            return _TDM_GROUP_M_LARGE
+        return _TDM_GROUP_M_SMALL
+
     def _flydsl_tdm_gemm_2d(
         x_2d: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
@@ -155,7 +166,7 @@ if USE_AITER_GFX1250:
             block_k=_TDM_BLOCK_K,
             m_waves=2,
             n_waves=2,
-            group_m=8,
+            group_m=_tdm_group_m(m - tail, block_m),
             interleave=True,
         )
         if tail:
