@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_logger
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,8 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
+# Peers call the data routes without a key, so only the admin levels are enforced here.
+add_api_key_middleware(app, get_keys=lambda: (None, get_serving().admin_api_key))
 
 
 def _register_encoder_url_with_bootstrap():

@@ -11,6 +11,7 @@ from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectness
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.kits.eval_accuracy_kit import MMLUSanityMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import SpecSamplingMaskKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -23,7 +24,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=91, stage="base-a", runner_config="1-gpu-small")
 # backend-specific: SAIL DFLASH verification kernels, decode graphs, and sampling masks.
-register_ppu_ci(est_time=450, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=450, suite="extra-test-1-gpu-ppu")
 
 
 class TestBasicSanityDFlash(
@@ -32,6 +33,7 @@ class TestBasicSanityDFlash(
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
     MMLUSanityMixin,
+    PenalizedEOSMixin,
     SpecSamplingMaskKit,
     CustomTestCase,
 ):

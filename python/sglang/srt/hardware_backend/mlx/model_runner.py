@@ -1187,7 +1187,7 @@ class MlxModelRunner:
         edits) is exactly the pre-sampling ``mx.argmax``.  ``edit_rows`` is the
         worker's pre-combined additive [B, vocab] array (grammar mask +
         logit_bias), applied before token selection and logprobs, mirroring the
-        CUDA ``ModelRunner._preprocess_logits`` order.  Positions for seeded
+        CUDA ``SamplingPipeline`` order.  Positions for seeded
         rows come from the attention cache offsets; they are build-time Python
         ints, so this is chained-decode safe.
         """
