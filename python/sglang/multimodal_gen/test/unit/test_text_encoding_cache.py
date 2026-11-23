@@ -482,10 +482,10 @@ def test_rollout_neg_cond_request_encodes_negative_without_cfg():
                 negative_prompt="bad quality",
                 guidance_scale=1.0,
                 rollout=True,
-                rollout_return_neg_cond_kwargs=neg_cond,
+                rollout_return_neg_cond_kwargs=return_neg_cond_kwargs,
             )
         )
-        for neg_cond in (False, True)
+        for return_neg_cond_kwargs in (False, True)
     ]
     plain, asking = executor.execute_group([stage], requests, args)
     assert not asking.do_classifier_free_guidance

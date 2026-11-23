@@ -1390,7 +1390,7 @@ class DenoisingStage(PipelineStage):
             ),
         )
 
-        if batch.needs_negative_cond:
+        if batch.needs_neg_cond:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
                 {

@@ -320,7 +320,7 @@ class Req:
         object.__setattr__(self, name, value)
 
     @property
-    def needs_negative_cond(self) -> bool:
+    def needs_neg_cond(self) -> bool:
         return self.do_classifier_free_guidance or (
             self.rollout and self.rollout_return_neg_cond_kwargs
         )

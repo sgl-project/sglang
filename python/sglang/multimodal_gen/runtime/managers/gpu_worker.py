@@ -277,7 +277,7 @@ def _neg_cond_without_cfg_error(
     pipeline: ComposedPipelineBase, batch: list[Req]
 ) -> str | None:
     if pipeline.neg_cond_without_cfg_supported or not any(
-        req.needs_negative_cond and not req.do_classifier_free_guidance for req in batch
+        req.needs_neg_cond and not req.do_classifier_free_guidance for req in batch
     ):
         return None
     return "rollout_return_neg_cond_kwargs needs CFG on this pipeline"
