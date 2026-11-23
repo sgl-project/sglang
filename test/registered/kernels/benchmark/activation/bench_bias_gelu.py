@@ -22,7 +22,7 @@ FN_MAP = {
 
 @marker.parametrize(
     "rows,hidden_dim",
-    [(32760, 5120), (32760, 13824)],
+    [(4096, 13824), (32760, 5120), (32760, 13824)],
     [(4096, 13824)],
 )
 @marker.benchmark("impl", ["jit", "torch"])

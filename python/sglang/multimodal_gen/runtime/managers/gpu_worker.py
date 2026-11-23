@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Callable, Iterator, List, Union
@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a impo
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
     IPC_A2A_MULTI,
+    IpcPeerTimeoutError,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
@@ -598,9 +599,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         assert self.pipeline is not None
         # request boundary: the IPC watchdog flag is a device read, illegal
-        # inside a graph capture and too costly per exchange
+        # inside a graph capture and too costly per exchange (the multi-rank
+        # transport is checked after each denoising stage and after the forward)
         IPC_A2A.check_timeout()
-        IPC_A2A_MULTI.check_timeout()
         if not any(
             req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch
         ):
@@ -840,6 +841,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     forward_failed = True
                     raise
 
+            # every rank is here: an expired Ulysses peer wait that no denoising
+            # stage reported (a stage outside the denoiser role) still fails
+            # this request, before its output is saved or returned
+            try:
+                IPC_A2A_MULTI.check_timeout()
+            except IpcPeerTimeoutError:
+                # a decode that encodes while it decodes (Cosmos 3) has already
+                # written the request's file
+                if isinstance(result, OutputBatch):
+                    for path in result.output_file_paths or ():
+                        with suppress(FileNotFoundError):
+                            os.remove(path)
+                raise
             # still on the scheduler thread, before saving or handing off to a thread
             raise_if_cancelled(log_reqs)
 
@@ -926,6 +940,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            if isinstance(e, IpcPeerTimeoutError):
+                output_batch.fatal_error = str(e)
             self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
             # clean cache if OOM
             if not current_platform.is_cpu():
@@ -1781,10 +1797,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
-            LoRAPipeline,
-        )
-
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
