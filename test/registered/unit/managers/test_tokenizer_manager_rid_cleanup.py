@@ -499,8 +499,7 @@ class TestAbortOutputPayload(CustomTestCase):
     it must carry the same optional fields as a normal finish chunk."""
 
     def test_abort_returns_the_sampling_output_of_the_tokens_so_far(self):
-        """A retracted request aborted from the waiting queue still has output tokens.
-        An unfiltered request is not captured, so its abort carries no sampling field."""
+        """A retracted request aborted from the waiting queue still has output tokens."""
         chunk = SamplingMaskChunk(
             selected_logprobs=np.asarray([-0.5, -1.0], dtype=np.float32),
             lengths=np.asarray([3, 1], dtype=np.int32),
@@ -1588,8 +1587,7 @@ class TestAbortBeforeDispatch(CustomTestCase):
         side_effect=lambda obj: obj,
     )
     def test_abort_during_preprocessing_is_not_dispatched(self, _wrap_shm):
-        # Feature publication is the last await before dispatch. The abort answers
-        # with the sampling fields of a request that filters sampling, and only then.
+        # Feature publication is the last await before dispatch.
         for stage, filters in itertools.product(("tokenize", "publish"), (True, False)):
             with self.subTest(stage=stage, filters=filters):
                 tm = self._make_tm(self)
@@ -1721,7 +1719,6 @@ class TestAbortBeforeDispatch(CustomTestCase):
             tokenized.rid = rid
             tokenized.mm_inputs = self._mm_inputs()
             tokenized_objs.append(tokenized)
-        # The aborted request filters sampling and asked for its sampling logprobs.
         aborted_obj = tm.rid_to_state[aborted].obj
         aborted_obj.return_sampling_logprobs = True
         aborted_obj.return_flat_raw_sampling_mask = False

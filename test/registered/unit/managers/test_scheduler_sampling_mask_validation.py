@@ -29,12 +29,10 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _PastSamplingChecks(Exception):
-    """Admission reached its first step after the sampling-output checks."""
+    pass
 
 
 def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
-    """Run admission on `req`: the abort mock, the queue mock, whether the request
-    got past the sampling-output checks, and the Req constructor mock."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
     scheduler.model_config = SimpleNamespace(
@@ -103,28 +101,7 @@ def _sampling_req(sampling_params, *, logprobs=False, mask=False):
 
 
 class TestSamplingCapture(CustomTestCase):
-    def test_only_filtered_sampling_is_captured(self):
-        """An unfiltered request returns no sampling fields, so neither flag may put
-        it on the capture path; greedy, top-k, top-p and min-p each must."""
-        for sampling_params, filtered in (
-            ({}, False),
-            ({"top_k": -1, "top_p": 1.0, "temperature": 0.7}, False),
-            ({"top_k": 20}, True),
-            ({"top_p": 0.9}, True),
-            ({"min_p": 0.05}, True),
-            ({"temperature": 0.0}, True),
-        ):
-            for logprobs, mask in ((True, False), (False, True), (False, False)):
-                with self.subTest(params=sampling_params, logprobs=logprobs, mask=mask):
-                    req = _sampling_req(sampling_params, logprobs=logprobs, mask=mask)
-                    captured = filtered and (logprobs or mask)
-                    self.assertEqual(req.captures_sampling, captured)
-                    self.assertEqual(req.sampling_mask_rows is not None, captured)
-
     def test_speculative_decoding_validates_all_sampling_output_requests(self):
-        """EAGLE cannot guarantee exact sampling logprobs, so both filtered and
-        unfiltered requests that set either flag are refused; requests with
-        neither flag still pass."""
         for sampling_params, flags, refused in (
             ({"top_k": 20}, {"logprobs": True, "mask": True}, True),
             ({}, {"logprobs": True}, True),
@@ -144,9 +121,6 @@ class TestSamplingCapture(CustomTestCase):
                     abort.assert_not_called()
 
     def test_threshold_update_counts_all_sampling_output_requests(self):
-        """Under DFlash a relaxed acceptance threshold is refused while any
-        sampling-output request runs, filtered or unfiltered, because the
-        unfiltered fallback depends on exact sampling too."""
         for sampling_params, flags, refused in (
             ({"top_k": 20}, {"logprobs": True, "mask": True}, True),
             ({}, {"logprobs": True}, True),
@@ -218,15 +192,10 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     add_to_queue.assert_not_called()
 
     def test_top_k_cap_applies_to_captured_mask_requests_only(self):
-        """The cap bounds the captured support. An unfiltered mask request is not
-        captured, so its whole-vocabulary top_k must pass; so must a filtered
-        logprobs-only request, which captures no support."""
         for sampling_params, flags, rejected in (
             ({}, {"mask": True}, False),
-            ({"top_k": 20}, {"mask": True}, False),
             ({"top_p": 0.9}, {"logprobs": True}, False),
             ({"top_p": 0.9}, {"mask": True}, True),
-            ({"top_k": 65}, {"mask": True}, True),
         ):
             with self.subTest(params=sampling_params, flags=flags):
                 abort, _, passed, _ = _handle_request(

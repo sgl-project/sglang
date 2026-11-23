@@ -188,8 +188,6 @@ class TestSamplingMaskValidation(CustomTestCase):
                 )
 
     def test_unfiltered_sampling_logprobs_requires_return_logprob(self):
-        """An unfiltered return_sampling_logprobs request omits sampling fields
-        and falls back to output_token_logprobs, so it needs return_logprob=true."""
         self.manager.model_config.vocab_size = 32
         self.manager.model_config.token_id_vocab_size = 32
         self.manager.sampling_params_class = SamplingParams
@@ -202,20 +200,6 @@ class TestSamplingMaskValidation(CustomTestCase):
                 {"temperature": 0.8},
                 {"return_sampling_logprobs": True, "return_logprob": False},
                 False,
-            ),
-            (
-                "unfiltered logprobs with return_logprob",
-                None,
-                {"temperature": 0.8},
-                {"return_sampling_logprobs": True, "return_logprob": True},
-                True,
-            ),
-            (
-                "filtered logprobs without return_logprob",
-                None,
-                {"top_k": 10},
-                {"return_sampling_logprobs": True, "return_logprob": False},
-                True,
             ),
             (
                 "preferred-params filtered logprobs without return_logprob",

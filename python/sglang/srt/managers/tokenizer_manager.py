@@ -298,8 +298,6 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
-    # SamplingParams.filters_sampling() of the dispatched request; an unfiltered
-    # request is not captured and its response omits the sampling fields.
     filters_sampling: bool = False
     # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
     prompt_released: bool = False
@@ -514,7 +512,6 @@ def _add_sampling_output_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
-    # An unfiltered request is not captured (Req.captures_sampling): nothing to add.
     if not state.filters_sampling:
         return
     obj = state.obj

@@ -718,7 +718,6 @@ class Req(ReqDllmMixin):
         self.top_p_normalized_logprobs = False
         self.return_sampling_logprobs = return_sampling_logprobs
         self.return_sampling_mask = return_sampling_mask
-        # An unfiltered request is not captured; its response omits the sampling fields.
         filters_sampling = sampling_params.filters_sampling()
         self.captures_sampling = filters_sampling and (
             return_sampling_logprobs or return_sampling_mask

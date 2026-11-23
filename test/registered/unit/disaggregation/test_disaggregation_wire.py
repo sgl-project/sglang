@@ -3589,10 +3589,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             self.assertEqual(chunk.lengths.tolist(), [])
 
     def test_pd_sampling_capture_mismatch_aborts_without_leaking_stale_slot(self):
-        """If prefill and decode disagree on whether a request filters sampling
-        (e.g. different --preferred-sampling-params), decode must abort instead
-        of reading the previous slot occupant's sampling data or ignoring a
-        filtered first token."""
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(
                 size=1,
@@ -3600,7 +3596,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 hidden_states_dtype=torch.float32,
                 max_sampling_mask_tokens=4,
             )
-            # Request X leaves sampling data in slot 0.
             buffers.set_buf(
                 self._make_req(
                     None,
@@ -3642,7 +3637,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                             sampling_mask_logprobs=[-0.5],
                         )
                     else:
-                        # Leave stale values from a prior owner before set_buf.
                         buffers.set_buf(
                             self._make_req(
                                 None,
