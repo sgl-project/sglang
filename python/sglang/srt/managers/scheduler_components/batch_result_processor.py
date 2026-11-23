@@ -1725,7 +1725,7 @@ class SchedulerBatchResultProcessor:
                 token_ids_logprobs_val=[[]],
                 token_ids_logprobs_idx=[[]],
             )
-        if req.captures_sampling:
+        if req.captures_sampling and sampling_logprob is not None:
             req.sampling_mask_rows.append(
                 sampling_logprob, sampling_mask_idx, sampling_mask_logprobs
             )

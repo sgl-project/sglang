@@ -183,21 +183,14 @@ class TestSamplingMaskValidation(CustomTestCase):
         )
 
     def test_sampling_logprobs_need_no_mask(self):
-        self._validate(
-            None,
-            return_sampling_mask=False,
-            return_sampling_logprobs=True,
-            return_logprob=True,
-        )
-        with self.assertRaisesRegex(
-            ValueError, "only supports DisallowedTokensLogitsProcessor"
-        ):
-            self._validate(
-                Qwen3ThinkingBudgetLogitProcessor.to_str(),
-                return_sampling_mask=False,
-                return_sampling_logprobs=True,
-                return_logprob=True,
-            )
+        for processor in (None, Qwen3ThinkingBudgetLogitProcessor.to_str()):
+            with self.subTest(processor=processor):
+                self._validate(
+                    processor,
+                    return_sampling_mask=False,
+                    return_sampling_logprobs=True,
+                    return_logprob=True,
+                )
 
     def test_removed_sampling_logprobs_mode_is_rejected(self):
         for mode in ("selected", "support", [None, None]):
