@@ -414,7 +414,7 @@ def parse_dfly_config(
     n = text_config.num_hidden_layers
     for name, layers in (("kv", kv_layers), ("index", index_layers)):
         if len(layers) != num_layers or any(
-            type(i) is not int or not 1 <= i < n for i in layers
+            type(i) is not int or not 0 <= i < n for i in layers
         ):
             raise ValueError(f"DFly needs one target {name} layer per draft layer")
         if any(text_config.layer_types[i] != SPARSE_ATTENTION for i in layers):

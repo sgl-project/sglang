@@ -37,8 +37,7 @@ def _build_draft_topk_kernel(
         base = out_rows + layer * out_layer_stride + row * out_row_stride
         tl.store(base + packed, history, mask=valid)
         tl.store(base + num_valid + block, slots, mask=block <= j)
-        if layer == 0:
-            tl.store(out_counts + row, num_valid + j + 1)
+        tl.atomic_max(out_counts + row, num_valid + j + 1)
 
 
 def build_draft_topk(
@@ -53,6 +52,7 @@ def build_draft_topk(
     layers, _, target_topk = state_topk.shape
     rows = out_rows[:, : bs * width]
     rows.fill_(-1)
+    out_counts[: bs * width].zero_()
     _build_draft_topk_kernel[(bs, layers)](
         state_topk,
         req_pool_indices,
