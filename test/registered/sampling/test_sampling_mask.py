@@ -615,11 +615,19 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
 
     def test_generate_rejects_unbounded_sampling_mask(self):
-        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"top_p": 1.0}):
+        for params in ({"top_p": _TOP_P}, {"top_k": 65}, {"min_p": 0.05}):
             with self.subTest(sampling_params=params):
                 response = self._post_generate(params)
                 self.assertEqual(response.status_code, 400, response.text)
                 self.assertIn(_INVALID_SAMPLING_MASK_ERROR, response.text)
+
+    def test_unfiltered_request_omits_sampling_fields(self):
+        response = self._post_generate({"top_k": -1, "top_p": 1.0, "min_p": 0.0})
+        self.assertEqual(response.status_code, 200, response.text)
+        meta_info = response.json()["meta_info"]
+        self.assertEqual(len(meta_info["output_token_logprobs"]), _MAX_NEW_TOKENS)
+        self.assertNotIn("output_token_sampling_logprobs", meta_info)
+        self.assertNotIn("output_sampling_mask_logprobs", meta_info)
 
 
 class TestSamplingMaskPacking(CustomTestCase):

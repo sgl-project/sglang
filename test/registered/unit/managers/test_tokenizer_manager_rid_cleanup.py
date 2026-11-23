@@ -499,15 +499,18 @@ class TestAbortOutputPayload(CustomTestCase):
     it must carry the same optional fields as a normal finish chunk."""
 
     def test_abort_returns_the_sampling_output_of_the_tokens_so_far(self):
-        """A retracted request aborted from the waiting queue still has output tokens."""
+        """A retracted request aborted from the waiting queue still has output tokens.
+        An unfiltered request is not captured, so its abort carries no sampling field."""
         chunk = SamplingMaskChunk(
             selected_logprobs=np.asarray([-0.5, -1.0], dtype=np.float32),
             lengths=np.asarray([3, 1], dtype=np.int32),
             token_ids=np.asarray([5, 7, 9, 2], dtype=np.int32),
             support_logprobs=np.asarray([-0.5, -1.5, -2.0, -1.0], dtype=np.float32),
         )
-        for flat, routed_experts in itertools.product((False, True), repeat=2):
-            with self.subTest(flat=flat, routed_experts=routed_experts):
+        for flat, routed_experts, filters in itertools.product((False, True), repeat=3):
+            with self.subTest(
+                flat=flat, routed_experts=routed_experts, filters=filters
+            ):
                 tm = _make_tokenizer_manager(self)
                 obj = GenerateReqInput(
                     text="hi",
@@ -523,6 +526,7 @@ class TestAbortOutputPayload(CustomTestCase):
                     event=asyncio.Event(),
                     obj=obj,
                     time_stats=APIServerReqTimeStats(),
+                    filters_sampling=filters,
                 )
                 state.output_ids = [5, 2]
                 _add_sampling_output_to_meta_info({}, state, chunk, finished=False)
@@ -531,6 +535,9 @@ class TestAbortOutputPayload(CustomTestCase):
                 tm._handle_abort_req(_make_abort_req(obj.rid))
 
                 meta_info = state.out_list[-1]["meta_info"]
+                if not filters:
+                    self.assertFalse([key for key in meta_info if "sampling" in key])
+                    continue
                 num_tokens = len(state.out_list[-1]["output_ids"])
                 self.assertEqual(
                     len(meta_info["output_token_sampling_logprobs"]), num_tokens
@@ -1581,14 +1588,22 @@ class TestAbortBeforeDispatch(CustomTestCase):
         side_effect=lambda obj: obj,
     )
     def test_abort_during_preprocessing_is_not_dispatched(self, _wrap_shm):
-        # Feature publication is the last await before dispatch.
-        for stage in ("tokenize", "publish"):
-            with self.subTest(stage=stage):
+        # Feature publication is the last await before dispatch. The abort answers
+        # with the sampling fields of a request that filters sampling, and only then.
+        for stage, filters in itertools.product(("tokenize", "publish"), (True, False)):
+            with self.subTest(stage=stage, filters=filters):
                 tm = self._make_tm(self)
                 rid = f"abort_during_{stage}"
-                obj = GenerateReqInput(text="prompt", rid=rid, sampling_params={})
+                obj = GenerateReqInput(
+                    text="prompt",
+                    rid=rid,
+                    sampling_params={},
+                    return_sampling_logprobs=True,
+                    return_sampling_mask=True,
+                )
                 tokenized = MagicMock()
                 tokenized.rid = rid
+                tokenized.sampling_params.filters_sampling.return_value = filters
                 tokenized.mm_inputs = self._mm_inputs()
                 prepared = [Mock()]
 
@@ -1616,6 +1631,11 @@ class TestAbortBeforeDispatch(CustomTestCase):
                 out = asyncio.run(drive())
 
                 self._assert_finished_as_aborted(tm, rid, out)
+                for field in (
+                    "output_token_sampling_logprobs",
+                    "output_sampling_mask_logprobs",
+                ):
+                    self.assertEqual(field in out["meta_info"], filters)
                 tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
                     prepared
                 )
@@ -1701,6 +1721,11 @@ class TestAbortBeforeDispatch(CustomTestCase):
             tokenized.rid = rid
             tokenized.mm_inputs = self._mm_inputs()
             tokenized_objs.append(tokenized)
+        # The aborted request filters sampling and asked for its sampling logprobs.
+        aborted_obj = tm.rid_to_state[aborted].obj
+        aborted_obj.return_sampling_logprobs = True
+        aborted_obj.return_flat_raw_sampling_mask = False
+        tokenized_objs[1].sampling_params.filters_sampling.return_value = True
 
         async def publish(_mm_inputs):
             # The abort lands while the batch's features are being published.
@@ -1717,6 +1742,7 @@ class TestAbortBeforeDispatch(CustomTestCase):
         out = asyncio.run(drive())
 
         self._assert_finished_as_aborted(tm, aborted, out)
+        self.assertEqual(out["meta_info"]["output_token_sampling_logprobs"], [])
         tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
             tokenized_objs[1].mm_inputs.mm_items
         )

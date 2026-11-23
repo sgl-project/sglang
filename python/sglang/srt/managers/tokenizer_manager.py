@@ -298,6 +298,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # SamplingParams.filters_sampling() of the dispatched request; an unfiltered
+    # request is not captured and its response omits the sampling fields.
+    filters_sampling: bool = False
     # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
     prompt_released: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
@@ -512,6 +515,9 @@ def _add_sampling_output_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
+    # An unfiltered request is not captured (Req.captures_sampling): nothing to add.
+    if not state.filters_sampling:
+        return
     obj = state.obj
     if chunk is not None:
         if obj.return_sampling_logprobs:
@@ -2094,6 +2100,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     (tokenized_obj.mm_inputs,)
                 )
             )
+            self._record_filters_sampling(tokenized_obj)
             if self._skip_dispatch_if_aborted(tokenized_obj.rid):
                 self._cancel_cuda_ipc_features((tokenized_obj,))
                 return
@@ -2185,6 +2192,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
 
+    def _record_filters_sampling(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> None:
+        # Called before the abort check: a request aborted before dispatch still answers.
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()
+
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
 
@@ -2211,6 +2227,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
                 )
             )
+            for tokenized_obj in tokenized_objs:
+                self._record_filters_sampling(tokenized_obj)
             tokenized_objs = self._drop_aborted_before_dispatch(tokenized_objs)
             if not tokenized_objs:
                 return
@@ -4065,7 +4083,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         return_b64=state.obj.return_flat_raw_top_logprobs_b64,
                     )
                 )
-            if state.obj.return_flat_raw_sampling_mask:
+            if state.filters_sampling and state.obj.return_flat_raw_sampling_mask:
                 meta_info.update(
                     _build_flat_sampling_mask_fields(
                         [], return_b64=state.obj.return_flat_raw_sampling_mask_b64

@@ -40,7 +40,7 @@ def _chunk(rows) -> SamplingMaskChunk:
     )
 
 
-def _make_state(**obj_kwargs) -> ReqState:
+def _make_state(filters_sampling: bool = True, **obj_kwargs) -> ReqState:
     obj = GenerateReqInput(
         text="hello",
         return_logprob=True,
@@ -55,6 +55,7 @@ def _make_state(**obj_kwargs) -> ReqState:
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
+        filters_sampling=filters_sampling,
     )
 
 
