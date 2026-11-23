@@ -21,7 +21,9 @@ def _verify_spec_info():
     )
 
 
-def _sync(forward_mode, num_reqs, global_num_tokens):
+def _sync(
+    forward_mode, num_reqs, global_num_tokens, padding_mode=fbi.DpPaddingMode.MAX_LEN
+):
     """Run prepare_mlp_sync_batch for one rank of a hybrid-SSM model in a DP
     step padded to MAX_LEN with an extend-mode batch somewhere in the group."""
     num_tokens = num_reqs * NUM_TOKENS_PER_REQ
@@ -65,11 +67,16 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
         patch.object(
             fbi.DpPaddingMode,
             "get_dp_padding_mode",
-            return_value=fbi.DpPaddingMode.MAX_LEN,
+            return_value=padding_mode,
         ),
         patch.object(ForwardBatch, "_pad_inputs_to_size"),
-        patch(
-            "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
+        patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.batch_overlap.two_batch_overlap": SimpleNamespace(
+                    TboForwardBatchPreparer=SimpleNamespace(prepare=MagicMock())
+                )
+            },
         ),
     ):
         batch.prepare_mlp_sync_batch(model_runner)
@@ -92,6 +99,16 @@ class TestMlpSyncHybridTargetVerify(CustomTestCase):
         self.assertEqual(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertEqual(batch._original_forward_mode, ForwardMode.IDLE)
         self.assertEqual(batch.batch_size, 8 // NUM_TOKENS_PER_REQ)
+
+    def test_zero_row_idle_rank_stays_idle_with_sum_len(self):
+        batch = _sync(
+            ForwardMode.IDLE,
+            num_reqs=0,
+            global_num_tokens=[0, 8],
+            padding_mode=fbi.DpPaddingMode.SUM_LEN,
+        )
+        self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+        self.assertEqual(batch.batch_size, 0)
 
 
 if __name__ == "__main__":

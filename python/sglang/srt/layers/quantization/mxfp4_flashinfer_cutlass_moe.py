@@ -64,11 +64,16 @@ class Mxfp4FlashinferCutlassMoEMethod:
         params_dtype,
         **extra_weight_attrs,
     ):
-        # Both CUTLASS paths require dimensions aligned to 128.
-        if hidden_size % 128 != 0 or intermediate_size_per_partition % 128 != 0:
+        # Keep native TP shard offsets while loading. SM120 pads the loaded
+        # shard to CUTLASS's 128-element alignment before scale swizzling.
+        intermediate_alignment = _GROUP_SIZE if self._use_mxfp8_act_scaling else 128
+        if (
+            hidden_size % 128 != 0
+            or intermediate_size_per_partition % intermediate_alignment != 0
+        ):
             raise ValueError(
-                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size and "
-                "intermediate_size_per_partition to be multiples of 128 "
+                "Mxfp4FlashinferCutlassMoEMethod requires hidden_size aligned "
+                f"to 128 and intermediate_size_per_partition to {intermediate_alignment} "
                 f"(got hidden={hidden_size}, "
                 f"intermediate={intermediate_size_per_partition})."
             )
@@ -139,6 +144,16 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         if getattr(layer, "_mega_moe_weights_built", False):
             return
+
+        if self._use_mxfp8_act_scaling:
+            from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                _pad_intermediate_size,
+            )
+
+            _pad_intermediate_size(layer)
+            self.moe_runner_config.intermediate_size_per_partition = (
+                layer.intermediate_size_per_partition
+            )
 
         arch = "SM120" if self._use_mxfp8_act_scaling else "SM90"
         precision = (

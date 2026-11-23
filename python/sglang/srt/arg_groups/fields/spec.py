@@ -223,6 +223,7 @@ class Spec(msgspec.Struct):
                 "deepep_v2",
                 "pplx",
                 "ascend_ops",
+                "flashinfer_rdma",
             ],
             resolvable=True,
         ),

@@ -5,7 +5,9 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    dspark_dp_a2a_backends,
     model_config_of,
+    register_dspark_dp_a2a_backends,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -13,6 +15,12 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+for _architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"):
+    register_dspark_dp_a2a_backends(
+        _architecture,
+        (*dspark_dp_a2a_backends(_architecture), "flashinfer_rdma"),
+    )
 
 # The compressed-KV pool's page; its C128 sub-pool hardcodes 256-token pages.
 DSV4_PAGE_SIZE = 256
@@ -83,7 +91,14 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         elif (
             cfg.device == "cuda"
             and not get_platform().is_hip
-            and cfg.moe_a2a_backend == "none"
+            and (
+                cfg.moe_a2a_backend == "none"
+                or (
+                    cfg.moe_a2a_backend == "flashinfer_rdma"
+                    and get_platform().is_sm120
+                    and cfg.quantization in (None, "fp8")
+                )
+            )
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
             and (

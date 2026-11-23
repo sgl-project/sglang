@@ -157,6 +157,11 @@ class DecoderReplayTail:
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
+        # RDMA prefill uses eager rank-varying dispatch; its layout cannot be
+        # captured by this independent tail runner. Full decode graphs remain
+        # available through the ordinary model runner.
+        if get_moe_a2a_backend().is_flashinfer_rdma():
+            return None
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
         if not (
             model.tail_writes_source_kv

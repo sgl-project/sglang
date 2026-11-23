@@ -296,6 +296,8 @@ ACTIVATION_SCHEMES = ["static"]
 
 
 def _use_nvfp4_dispatch() -> bool:
+    if get_moe_a2a_backend().is_flashinfer_rdma():
+        return True
     if not get_moe_a2a_backend().is_flashinfer():
         return MOE_NVFP4_DISPATCH
     return get_flashinfer_a2a_dispatch_type() == FlashinferA2ADispatchType.NVFP4

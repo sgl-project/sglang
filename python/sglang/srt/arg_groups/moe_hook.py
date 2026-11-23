@@ -381,9 +381,12 @@ def handle_a2a_moe(server_args: Any):
     # Check the requested backend before Waterfill's backend override. Waterfill
     # currently supports DeepEP/MegaMOE only; otherwise the override below would
     # hide an explicitly incompatible ascend_ops selection.
-    if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
+    if cfg.enable_waterfill and cfg.moe_a2a_backend in (
+        "ascend_ops",
+        "flashinfer_rdma",
+    ):
         raise ValueError(
-            "--enable-waterfill is incompatible with --moe-a2a-backend ascend_ops."
+            f"--enable-waterfill is incompatible with --moe-a2a-backend {cfg.moe_a2a_backend}."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
@@ -409,6 +412,9 @@ def handle_a2a_moe(server_args: Any):
             "--flashinfer-a2a-dispatch-type requires "
             "--moe-a2a-backend flashinfer_nvlink_one_sided."
         )
+
+    if a2a_backend == "flashinfer_rdma":
+        handle_flashinfer_rdma(server_args)
 
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
@@ -839,6 +845,100 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         )
 
 
+def handle_flashinfer_rdma(server_args: Any) -> None:
+    """Resolve the SM120 RDMA backend's supported compute and capture paths."""
+    cfg = resolved_view(server_args)
+    architectures = model_config_of(server_args).hf_config.architectures or []
+    supported = {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+    }
+    if not architectures or architectures[0] not in supported:
+        raise ValueError(
+            "flashinfer_rdma currently supports the GLM and DeepSeek V2/V3/V4 MoE families."
+        )
+    if (
+        cfg.tp_size < 2
+        or cfg.attn_dp_size != cfg.tp_size
+        or not attn_dp_enabled_of(cfg)
+        or cfg.attn_cp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.moe_dp_size != 1
+        or cfg.pp_size != 1
+        or cfg.dwdp_size != 1
+    ):
+        raise ValueError(
+            "flashinfer_rdma requires TP=attention DP=EP with at least two ranks, "
+            "with PP1, CP1, DCP1, MoE-DP1 and DWDP1."
+        )
+    for name in (
+        "enable_two_batch_overlap",
+        "enable_single_batch_overlap",
+        "enable_eplb",
+        "enable_layernorm_sp",
+        "enable_paged_experts",
+    ):
+        if getattr(cfg, name):
+            raise ValueError(
+                f"flashinfer_rdma does not support --{name.replace('_', '-')}."
+            )
+    # A static permutation of the experts keeps slot p on rank p // local experts,
+    # which is all the dispatcher relies on, so --init-expert-location is allowed.
+    if cfg.ep_num_redundant_experts or cfg.ep_dispatch_algorithm not in (
+        None,
+        "static",
+    ):
+        raise ValueError(
+            "flashinfer_rdma requires non-redundant, statically placed experts."
+        )
+    if cfg.elastic_ep_backend is not None:
+        raise ValueError("flashinfer_rdma does not support elastic expert parallelism.")
+    if cfg.moe_runner_backend not in ("auto", "flashinfer_cutlass", "flashinfer_mxfp4"):
+        raise ValueError(
+            "flashinfer_rdma requires flashinfer_cutlass or flashinfer_mxfp4."
+        )
+    draft_a2a_backend = (
+        "flashinfer_rdma"
+        if cfg.speculative_algorithm == "DSPARK"
+        and architectures[0] in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+        else "none"
+    )
+    if cfg.speculative_algorithm and cfg.speculative_moe_a2a_backend not in (
+        None,
+        draft_a2a_backend,
+    ):
+        raise ValueError(
+            "flashinfer_rdma requires --speculative-moe-a2a-backend "
+            f"{draft_a2a_backend} for this speculative model."
+        )
+    if cfg.flashinfer_rdma_max_tokens_per_rank <= 0:
+        raise ValueError("--flashinfer-rdma-max-tokens-per-rank must be positive.")
+    declare_resolution(
+        server_args,
+        "_handle_a2a_moe",
+        moe_runner_backend=(
+            "flashinfer_cutlass"
+            if cfg.moe_runner_backend == "auto"
+            else cfg.moe_runner_backend
+        ),
+        disable_overlap_schedule=True,
+        speculative_moe_a2a_backend=(
+            draft_a2a_backend
+            if cfg.speculative_algorithm
+            else cfg.speculative_moe_a2a_backend
+        ),
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        ),
+    )
+
+
 def _required_flashinfer_a2a_dispatch_tokens_per_rank(server_args: Any) -> int:
     """Largest token count one DP rank dispatches through FlashInfer A2A in one
     forward: eager prefill chunks, prefill CUDA graphs, and decode/verify graphs.
@@ -858,6 +958,45 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
     largest forward; at runtime the dispatcher asserts on the first such batch."""
     view = resolved_view(server_args)
+    if view.moe_a2a_backend == "flashinfer_rdma":
+        if view.enable_layernorm_sp:
+            raise ValueError(
+                "flashinfer_rdma does not support layernorm sequence parallelism."
+            )
+        if view.cuda_graph_config.decode.backend == Backend.BREAKABLE:
+            raise ValueError(
+                "flashinfer_rdma requires full or disabled decode CUDA graphs."
+            )
+        capacity = view.flashinfer_rdma_max_tokens_per_rank
+        tokens_per_req = (
+            max_speculative_num_draft_tokens(server_args) or 1
+            if view.speculative_algorithm
+            else 1
+        )
+        if capacity < tokens_per_req:
+            raise ValueError(
+                "FlashInfer RDMA capacity cannot hold one request's verification tokens."
+            )
+        if server_args.max_running_requests is None:
+            # Bound eager admission and graph capture, preserving any lower
+            # default already chosen by speculative decoding.
+            limit = (capacity // tokens_per_req) * view.attn_dp_size
+            declare_resolution(
+                server_args,
+                "validate_flashinfer_a2a_token_budget",
+                max_running_requests=min(view.max_running_requests or limit, limit),
+            )
+            view = resolved_view(server_args)
+        per_rank_requests = max(1, view.max_running_requests // view.attn_dp_size)
+        graph_requests, _ = _decode_graph_dispatch_tokens_per_rank(server_args)
+        required = max(per_rank_requests, graph_requests) * tokens_per_req
+        if required > capacity:
+            raise ValueError(
+                f"FlashInfer RDMA decode/verify requires {required} tokens per rank, "
+                f"but capacity is {capacity}. Set --flashinfer-rdma-max-tokens-per-rank "
+                f"to at least {required}, or reduce --max-running-requests and the decode graph batch size."
+            )
+        return
     if view.moe_a2a_backend != "flashinfer_nvlink_one_sided":
         return
     if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
