@@ -68,10 +68,6 @@ class SDPABackend(AttentionBackend):
     def get_impl_cls() -> type["SDPAImpl"]:
         return SDPAImpl
 
-    # @staticmethod
-    # def get_metadata_cls() -> Type["AttentionMetadata"]:
-    #     return FlashAttentionMetadata
-
 
 class SDPAImpl(AttentionImpl):
     def __init__(
