@@ -3725,10 +3725,11 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Stream value after `layer_idx` on the bank path: the pre-norm
-        mixture its next consumer would compute (next layer's attention side;
-        output side for the last layer). The standard path captures at the
-        next input instead."""
+        """Stream value after `layer_idx` on the bank path. With the draft's
+        ``prefix`` stream, the stream rows themselves (every row); with
+        ``attn_res``, the pre-norm mixture its next consumer would compute (next
+        layer's attention side; output side for the last layer). The standard
+        path captures at the next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
         if self.dspark_aux_hidden_stream == "prefix":
             if _is_gfx95:  # the draft reads every row of a row-sharded stream
@@ -3872,7 +3873,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             draft_cfg = get_config(
                 spec_cfg.speculative_draft_model_path,
-                trust_remote_code=True,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=spec_cfg.speculative_draft_model_revision,
             )
             self.model.dspark_aux_hidden_stream = get_dflash_aux_hidden_stream(

@@ -16,8 +16,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 WORLD = 8
-# 10 tokens over 8 ranks: the row-sharded tail leaves 2 rows on ranks 0-4, none on 5-7.
-TOTAL = 10
+# 9 tokens over 8 ranks: the row-sharded tail leaves 2 rows on ranks 0-3, 1 on rank 4
+# and none on ranks 5-7.
+TOTAL = 9
 HIDDEN = 4
 
 

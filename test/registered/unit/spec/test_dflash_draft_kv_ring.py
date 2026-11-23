@@ -567,6 +567,13 @@ class TestSpeculatorsDSparkConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transformer_layer_config.model_type"):
             self._load({"hidden_size": 64})
 
+    def test_unknown_aux_hidden_stream_is_rejected(self):
+        from sglang.srt.speculative.dflash_utils import get_dflash_aux_hidden_stream
+
+        cfg = SimpleNamespace(dflash_config={"aux_hidden_stream": "prefixx"})
+        with self.assertRaisesRegex(ValueError, "aux_hidden_stream"):
+            get_dflash_aux_hidden_stream(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@ def try_load_speculators_dspark_config(
     layer_model_type = (
         layer_config.get("model_type") if isinstance(layer_config, dict) else None
     )
-    if not isinstance(layer_model_type, str):
+    if not isinstance(layer_model_type, str) or not layer_model_type:
         raise ValueError(
             "speculators DSpark config needs transformer_layer_config.model_type"
         )

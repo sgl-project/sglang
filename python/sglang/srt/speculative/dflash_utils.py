@@ -396,9 +396,18 @@ def _get_dflash_config(config: Any) -> dict:
         return {}
 
 
+_DFLASH_AUX_HIDDEN_STREAMS = ("attn_res", "prefix")
+
+
 def get_dflash_aux_hidden_stream(config: Any) -> str:
     stream = _get_dflash_config(config).get("aux_hidden_stream")
-    return str(stream) if stream is not None else "attn_res"
+    stream = "attn_res" if stream is None else str(stream)
+    if stream not in _DFLASH_AUX_HIDDEN_STREAMS:
+        raise ValueError(
+            f"Unknown dflash_config.aux_hidden_stream {stream!r}; "
+            f"expected one of {_DFLASH_AUX_HIDDEN_STREAMS}."
+        )
+    return stream
 
 
 def is_nemotron_35_draft_config(config: Any) -> bool:
