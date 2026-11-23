@@ -279,7 +279,7 @@ def _raise_if_not_created(
     """Raise for a transfer NIXL could not create: what NIXL raised, or
     ``error_type(error_msg)`` when it returned no transfer."""
     for handle in handles:
-        if handle.result is not None and handle.result.quiescent:
+        if handle.xfer is None:
             if handle.error is not None:
                 raise handle.error
             raise error_type(error_msg)
@@ -288,7 +288,7 @@ def _raise_if_not_created(
 def _raise_if_rejected(handles: List[NixlHandle], *, error_msg: str) -> None:
     """Raise _NixlPostError for a transfer whose post NIXL rejected."""
     for handle in handles:
-        if handle.result is not None and not handle.result.quiescent:
+        if handle.xfer is not None and handle.result is not None:
             if handle.error is not None:
                 raise _NixlPostError(f"{error_msg}: {handle.error}") from handle.error
             raise _NixlPostError(error_msg)
@@ -306,7 +306,7 @@ def _require_posted(
     return handles
 
 
-# Once one handle of a batch reports ERR, its siblings settle only when NIXL
+# Once one transfer of a batch fails, its siblings settle only when NIXL
 # notices their peer is gone, which for UCX means waiting out peer keepalive.
 # This worker serves other rooms, so bound that wait.
 NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
@@ -1203,37 +1203,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
         The wait is unbounded while every handle is still healthy, and bounded
-        to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
-        ``failure_seen`` arms that deadline up front, for a batch that raised
-        before the barrier ran. A state that cannot be read counts as running,
-        since it does not prove the write into the decode's pages is over.
+        to NIXL_ERR_SETTLE_TIMEOUT_S for a batch that raised before the barrier
+        ran (``failure_seen``). A FAILED handle counts as running, since it does
+        not prove the write into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
         while True:
             all_settled = True
-            any_failed = failure_seen
             for handle in handles:
                 result = self.transport.status(handle)
                 if result.status is Status.FAILED:
-                    if not result.quiescent:
-                        logger.warning(
-                            f"Failed to read NIXL transfer state: {handle.error}"
-                        )
-                        return False, True
-                    any_failed = True
-                elif result.status is Status.PENDING:
+                    logger.warning(f"NIXL transfer failed: {result.reason}")
+                    return False, True
+                if result.status is Status.PENDING:
                     all_settled = False
             if all_settled:
-                return True, any_failed
-            if not any_failed:
+                return True, failure_seen
+            if deadline is None:
                 time.sleep(0)
                 continue
             # This room is already lost, so trade its notification for the
             # worker's other rooms: back off, and give up waiting for the
             # siblings once the deadline passes.
-            if deadline is None:
-                deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S
-            elif time.time() >= deadline:
+            if time.time() >= deadline:
                 return False, True
             time.sleep(NIXL_ERR_SETTLE_POLL_S)
 
@@ -2031,19 +2023,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             )
                         )
 
-                # Raise only once every handle of this batch settled, not on the
-                # first ERR: a sibling still in PROC keeps writing into the
-                # decode's KV pages, and the failure path below tells the decode
-                # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                settled, _ = self._await_handles(handles, failure_seen=False)
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
                         f"NIXL transfer for room {room} left a handle running "
                         f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
                     )
-                if any_failed:
-                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
                 if staging_deferred:
                     # Drain posted writes before the retry reuses this worker's

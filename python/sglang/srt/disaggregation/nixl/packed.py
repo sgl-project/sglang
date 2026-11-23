@@ -190,7 +190,7 @@ class PackedKVSender:
                 dst_layout=dst_layout,
                 dst_indices=dst_indices,
             )
-            if handle.result is not None and handle.result.quiescent:
+            if handle.xfer is None:
                 _raise_failure(handle, "Failed to create NIXL packed transfer")
             self.inflight = handle
             # Let the caller settle posted writes if a later batch fails.

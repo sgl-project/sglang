@@ -24,12 +24,6 @@ from sglang.srt.utils.common import run_with_deadline
 logger = logging.getLogger(__name__)
 
 
-class NixlResult(Result, frozen=True):
-    # FAILED only: the write already stopped touching memory, as when NIXL
-    # reports a posted transfer as terminated.
-    quiescent: bool = False
-
-
 class Registration(msgspec.Struct, frozen=True):
     key: BufferKey
     ptr: int
@@ -49,8 +43,8 @@ class StridedRun(msgspec.Struct, frozen=True):
     count: int
 
 
-_DONE = NixlResult(Status.DONE)
-_PENDING = NixlResult(Status.PENDING)
+_DONE = Result(Status.DONE)
+_PENDING = Result(Status.PENDING)
 
 # (ptr, length, device): one engine registration.
 _Region = Tuple[int, int, int]
@@ -98,7 +92,7 @@ class NixlHandle(Handle):
         self,
         *,
         xfer: Any = None,
-        result: Optional[NixlResult] = None,
+        result: Optional[Result] = None,
         error: Optional[BaseException] = None,
     ):
         self.xfer = xfer
@@ -118,13 +112,6 @@ class _Layout(msgspec.Struct, frozen=True):
 
 
 class NixlTransport(Transport):
-    """Transport over a NIXL agent made by create().
-
-    write() and write_prepared() post without waiting. An ERR that NIXL reports
-    for a posted transfer is final and quiescent; a rejected post or an
-    unreadable state is not, since NIXL may still have writes on the wire.
-    """
-
     def __init__(self, *, agent: Any):
         # One agent per KVManager, owned here: close() also drops its peers.
         self._agent = agent
@@ -366,9 +353,11 @@ class NixlTransport(Transport):
                 remote.agent_name,
             )
         except Exception as e:
-            return self._never_posted(f"NIXL could not create the transfer: {e}", e)
+            reason = f"NIXL could not create the transfer: {e}"
+            return NixlHandle(result=Result(Status.FAILED, reason=reason), error=e)
         if not xfer:
-            return self._never_posted("NIXL could not create the transfer")
+            reason = "NIXL could not create the transfer"
+            return NixlHandle(result=Result(Status.FAILED, reason=reason))
         return self._post(xfer)
 
     def _locate(
@@ -474,9 +463,11 @@ class NixlTransport(Transport):
                 "WRITE", src, src_indices, dst, dst_indices
             )
         except Exception as e:
-            return [self._never_posted(f"NIXL could not create the transfer: {e}", e)]
+            reason = f"NIXL could not create the transfer: {e}"
+            return [NixlHandle(result=Result(Status.FAILED, reason=reason), error=e)]
         if not xfer:
-            return [self._never_posted("NIXL could not create the transfer")]
+            reason = "NIXL could not create the transfer"
+            return [NixlHandle(result=Result(Status.FAILED, reason=reason))]
         return [self._post(xfer)]
 
     def _post(self, xfer: Any) -> NixlHandle:
@@ -490,32 +481,23 @@ class NixlTransport(Transport):
                 return NixlHandle(xfer=xfer)
             reason, error = "NIXL rejected the post", None
         return NixlHandle(
-            xfer=xfer, result=NixlResult(Status.FAILED, reason=reason), error=error
+            xfer=xfer, result=Result(Status.FAILED, reason=reason), error=error
         )
 
-    @staticmethod
-    def _never_posted(reason: str, error: Optional[BaseException] = None) -> NixlHandle:
-        return NixlHandle(
-            result=NixlResult(Status.FAILED, reason=reason, quiescent=True),
-            error=error,
-        )
-
-    def status(self, handle: NixlHandle) -> NixlResult:
+    def status(self, handle: NixlHandle) -> Result:
         if handle.result is not None:
             return handle.result
         try:
             state = self._agent.check_xfer_state(handle.xfer)
         except Exception as e:
             # Not proof that the write into the peer's memory is over.
-            result = NixlResult(Status.FAILED, reason=f"NIXL state unreadable: {e}")
+            result = Result(Status.FAILED, reason=f"NIXL state unreadable: {e}")
             handle.error = e
         else:
             if state == "DONE":
                 result = _DONE
             elif state == "ERR":
-                result = NixlResult(
-                    Status.FAILED, reason="NIXL reported ERR", quiescent=True
-                )
+                result = Result(Status.FAILED, reason="NIXL reported ERR")
             else:
                 return _PENDING
         handle.result = result
