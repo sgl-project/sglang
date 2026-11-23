@@ -140,6 +140,7 @@ MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis Inferenc
 - **HiCache.** `--hicache-size` is the host tier in GB per rank, so 180 GB needs about 720 GB of host memory across the four ranks. With `--hicache-write-policy write_back`, a page reaches the host tier when it leaves the GPU, so the host tier adds to the device KV capacity instead of mirroring it.
 - **TreeCore backend.** Set `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` with write-back. Each rank picks the Rust or the Python TreeCore on its own, and the two fold the write-back reclaim digest differently, so ranks that end up on different cores stop the scheduler with `write_back duplicate-reclaim victims diverged across PP/TP ranks` ([#48112](https://github.com/sgl-project/sglang/pull/48112)).
 - **Prefill CUDA graphs.** TP4·EP4 captures prefill with `--cuda-graph-backend-prefill breakable`. TP8·EP1 keeps eager prefill: in this image, aiter `gemm_afp4wfp4` returns non-finite rows for the TP8 dense `down_proj` shape, and the sampler's device assert then stops the server.
+- **AMD monokernel (TP8·EP1, concurrency 1).** `--enable-amd-monokernel` runs decode and verify steps of up to 8 rows on the gfx950 monokernel. It needs `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261120` or a later MI35x image: its SGLang pins sgl-amd-mono [`32a12203`](https://github.com/sgl-project/sgl-amd-mono/commit/32a122031b7b63858c1610370b49a3bf9a215997), which serves this checkpoint ([sgl-amd-mono#126](https://github.com/sgl-project/sgl-amd-mono/pull/126)). Pair it with a 3-step draft (4 draft tokens): a verify step then has 4 rows a request, so the steps of one or two running requests stay on the monokernel. Keep the 5-step commands above at concurrency 2 and 4. With 3 steps, a verify step of 4 or 8 requests has 16 or 32 rows and reaches the `gemm_afp4wfp4` shape above ([ROCm/aiter#7910](https://github.com/ROCm/aiter/pull/7910)). With 5 steps, the 20261120 image stops at startup when the flag is set. This command is not part of the InferenceX config yet.
 
 ```bash TP4·EP4 (concurrency 4–20)
 SGLANG_OPT_USE_TOPK_V2=true \
@@ -198,11 +199,38 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
+```bash TP8·EP1 with the AMD monokernel (concurrency 1)
+SGLANG_OPT_USE_TOPK_V2=true \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+sglang serve \
+  --model-path amd/GLM-5.3-Quark-MXFP4-AttnFP8 \
+  --tp-size 8 \
+  --ep-size 1 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --chunked-prefill-size 32768 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 2 \
+  --cuda-graph-max-bs-decode 2 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-amd-monokernel \
+  --watchdog-timeout 1800 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ### MI355X FP8 deployment with the AMD monokernel
 
 Official FP8 checkpoint `zai-org/GLM-5.3` with EAGLE MTP, an FP8 E4M3 KV cache, and the AMD monokernel on MI355X, measured with the InferenceX AgentX harness ([InferenceX #4829](https://github.com/SemiAnalysisAI/InferenceX/pull/4829)): TP8·EP1 with GPU-resident KV at concurrency 1–10. Concurrency counts live sessions, not requests, because subagent branches fan out within one session.
 
-- **Checkpoint.** The monokernel accepts only FP8 block-128 weights. With the MXFP4 checkpoint of the [recipe above](#mi355x-deployment-measured-with-semianalysis-inferencex), `--enable-amd-monokernel` stops the server at startup.
+- **Checkpoint.** This recipe serves the FP8 block-128 weights. For the MXFP4 checkpoint with the monokernel, see the [recipe above](#mi355x-deployment-measured-with-semianalysis-inferencex).
 - **Monokernel.** `--enable-amd-monokernel` runs the target model's verify step on the gfx950 monokernel when one or two requests are running (4 or 8 tokens a step). Larger steps take the normal forward, so the kernel serves fewer steps as concurrency grows.
 - **KV cache.** Keep `--kv-cache-dtype fp8_e4m3`. The monokernel also accepts the BF16 cache, but BF16 KV slows the DSA prefill and raises TTFT on long agentic prompts.
 - **Container image.** Use `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261105` or a later MI35x image. Its SGLang pins sgl-amd-mono [`e52803f9`](https://github.com/sgl-project/sgl-amd-mono/commit/e52803f9d2b7dabff4bfd2f53ec25c03d56af947), which contains the FP8 KV support of [sgl-amd-mono#60](https://github.com/sgl-project/sgl-amd-mono/pull/60) and the GLM-5.3 kernels of [sgl-amd-mono#85](https://github.com/sgl-project/sgl-amd-mono/pull/85) and [#86](https://github.com/sgl-project/sgl-amd-mono/pull/86). With a pin that predates sgl-amd-mono#60, the monokernel does not accept the FP8 KV cache, and the server exits at startup.
