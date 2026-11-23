@@ -7,7 +7,7 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple, Union
 
 import msgspec
 
@@ -76,6 +76,8 @@ CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
 # Update scheduler time counters every 1 second.
 _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
+_DEVICE_TIMER_FIFO_MAXLEN = 256
+_DEVICE_TIMER_FIFO_MAX_AGE_S = 5.0
 
 
 class _CacheHitRateWindow:
@@ -323,6 +325,18 @@ class SchedulerMetricsReporter:
         )
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
+        # FIFO of (wall-clock recorded-at, GPU elapsed seconds) for each
+        # completed "extend" (prefill) forward, populated from the device
+        # timer below and drained by _consume_device_gpu_time -- gives
+        # _prefill_sol_suffix an accurate per-forward duration instead of the
+        # wall-clock gap between log lines. Keyed by category (currently only
+        # "extend" is populated) so a future consumer (e.g. a decode
+        # equivalent) can reuse the same structure without resurrecting the
+        # unbounded-growth bug this avoids: only append for categories
+        # something actually drains.
+        self._device_timer_elapsed_by_category: Dict[
+            str, Deque[Tuple[float, float]]
+        ] = defaultdict(lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN))
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -336,6 +350,29 @@ class SchedulerMetricsReporter:
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
                 self._forward_occupancy_log_window.gpu_seconds += kwargs["t"]
+                # Only "extend" (prefill) is ever drained, via
+                # _consume_device_gpu_time below -- tracking every category
+                # here (decode, idle, eagle_draft, ...) would queue entries
+                # that nothing consumes, growing unboundedly for the life of
+                # the process. Also gate on the same conditions that let
+                # report_prefill_stats() reach _consume_device_gpu_time at all
+                # (mirrors its own early-return check): on TP ranks other than
+                # attn_tp_rank 0 (without --enable-metrics-for-all-schedulers),
+                # or with --enable-mfu-metrics off, report_prefill_stats()
+                # returns before ever draining this queue, so appending here
+                # unconditionally leaks the same way the all-categories
+                # version used to.
+                if (
+                    kwargs.get("category") == "extend"
+                    and self.enable_mfu_metrics
+                    and (
+                        self.is_stats_logging_rank
+                        or self.current_scheduler_metrics_enabled
+                    )
+                ):
+                    self._device_timer_elapsed_by_category["extend"].append(
+                        (time.perf_counter(), kwargs["t"])
+                    )
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
@@ -346,9 +383,7 @@ class SchedulerMetricsReporter:
             enabled=self.enable_metrics,
             query_forward_active=(
                 self.forward_pass_device_timer.is_active
-                if self.enable_metrics
-                and self.forward_pass_device_timer is not None
-                and self.scheduler.device == "cuda"
+                if self.enable_metrics and self.forward_pass_device_timer is not None
                 else None
             ),
         )
@@ -696,12 +731,51 @@ class SchedulerMetricsReporter:
         )
         return flops, read_bytes, write_bytes
 
+    def _consume_device_gpu_time(self, category: str) -> Optional[float]:
+        """Pop the next not-yet-consumed per-forward GPU elapsed time (seconds)
+        recorded for `category`, FIFO-ordered so it matches 1:1 with however
+        many forwards of that category actually ran before this call -- even
+        if several completed (and got drained by the device timer's internal
+        `_report()`) before either of their stats got reported. Returns None
+        when the device timer is disabled or nothing is queued yet; callers
+        should fall back to a wall-clock estimate in that case. Discards
+        entries older than _DEVICE_TIMER_FIFO_MAX_AGE_S instead of returning
+        them."""
+        if self.forward_pass_device_timer is None:
+            return None
+        # Poll completed events before reading, without synchronizing.
+        self.forward_pass_device_timer._report()
+        queue = self._device_timer_elapsed_by_category.get(category)
+        if not queue:
+            return None
+        now = time.perf_counter()
+        while queue:
+            recorded_at, elapsed = queue.popleft()
+            if now - recorded_at <= _DEVICE_TIMER_FIFO_MAX_AGE_S:
+                return elapsed
+        return None
+
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
-        """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        Call ``_prefill_attention_pairs(batch)`` for the exact causal
-        attention pair-count. No model arch here, so returns "";
-        a subclass may override it."""
-        return ""
+        """Device-timer-based replacement for the wall-clock `est. prefill
+        TFLOPS/s` estimate in report_prefill_stats.
+
+        `elapsed_s` (the wall-clock gap between consecutive "Prefill batch"
+        log lines) is not this forward's own execution time -- under overlap
+        scheduling, two distinct admissions' results can get processed and
+        logged back-to-back, making `elapsed_s` for the second one collapse
+        toward zero even though real GPU work happened, which previously
+        produced physically-impossible TFLOPS/s values (multiples of the
+        hardware's peak). This computes the same FLOPs estimate but divides by
+        this specific forward's own GPU time (SGLANG_ENABLE_METRICS_DEVICE_TIMER's
+        CUDA-event-based "extend" interval), which stays accurate regardless of
+        scheduler-loop logging cadence. Falls back to "" (letting the caller
+        use the wall-clock estimate) when the device timer is unavailable."""
+        device_elapsed_s = self._consume_device_gpu_time("extend")
+        if device_elapsed_s is None or device_elapsed_s <= 0:
+            return ""
+        flops, _, _ = self._estimate_prefill_perf(batch)
+        tflops_per_s = flops / device_elapsed_s / 1e12
+        return f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
     def _decode_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Hook: model-specific speed-of-light % suffix for the decode log line.
