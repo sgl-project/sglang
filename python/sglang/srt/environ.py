@@ -1390,9 +1390,6 @@ class Envs:
     # default group priority). Fail-soft: a torch_npu build without the option
     # logs once and continues.
     SGLANG_NPU_ENABLE_PG_PRIORITY = EnvBool(True)
-    # DCP on NPU: shard the latent KV in page_size runs, as #37787 and
-    # vLLM-Ascend do, instead of one position per rank.
-    SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
