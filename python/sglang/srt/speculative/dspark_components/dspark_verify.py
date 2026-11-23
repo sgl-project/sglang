@@ -174,6 +174,8 @@ class TargetVerifyExecutor:
         # Block-wise rejection draws (blockwise_rejection.py); None keeps the classic kernel.
         self._rejection_noise = rejection_noise
         self._simulated_correct_len = simulated_correct_len
+        # [bs * verify] input positions of the last static verify's rows, the TOP race accept's keys.
+        self.verify_positions: Optional[torch.Tensor] = None
 
     def accept_and_finalize(
         self,
@@ -205,19 +207,37 @@ class TargetVerifyExecutor:
         # Simulated acceptance overwrites correct_len below, so a sampling accept
         # (draft/target softmax + rejection) would be computed only to be discarded.
         accept_sampling_info = None if simulate else sampling_info
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
-            target_logits=target_logits,
-            draft_block=draft_block,
-            sampling_info=accept_sampling_info,
-            draft_input=draft_input,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
-            fused_argmax=self._fused_argmax,
-            block_verification=self._block_verification,
-            rejection_noise=self._rejection_noise,
-        )
+        from sglang.srt.speculative.eagle_utils import _verify_uses_top_race
+
+        # Asked of the batch's own sampling info: simulated acceptance drops it above.
+        if sampling_info is not None and _verify_uses_top_race(sampling_info):
+            from sglang.srt.true_on_policy.dsv41_dspark import race_accept
+
+            if layout is not None or simulate:
+                raise NotImplementedError(
+                    "[top] DSpark's race accept takes a static chain without simulated acceptance"
+                )
+            correct_len, bonus, cap_trim_lens = race_accept(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                sampling_info=sampling_info,
+                positions=self.verify_positions,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+            )
+        else:
+            correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+                candidates=verify_ids_2d,
+                target_logits=target_logits,
+                draft_block=draft_block,
+                sampling_info=accept_sampling_info,
+                draft_input=draft_input,
+                gamma=self.gamma,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                cutoff_layout=layout,
+                fused_argmax=self._fused_argmax,
+                block_verification=self._block_verification,
+                rejection_noise=self._rejection_noise,
+            )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if accept_sampling_info is None or accept_sampling_info.is_all_greedy
@@ -311,6 +331,8 @@ class TargetVerifyExecutor:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
+        # The race accept keys each verify row by its input position (true_on_policy.dsv41_dspark).
+        self.verify_positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=verify_ids_2d.reshape(-1),

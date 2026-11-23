@@ -643,6 +643,7 @@ _MODEL_TYPES_BY_ARCH = {
     "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
     "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
     "InklingForConditionalGeneration": ("inkling_mm_model",),
+    "DeepseekV4ForCausalLM": ("deepseek_v41",),
 }
 
 
@@ -650,6 +651,10 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces,
         except the alpha compositing `_STRATEGY_RGB_CONVERSION` records for it."""
+        # Some legacy processors read the multimodal config while they set their defaults.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy", model_impl="sglang"), role="test")
         import_processors("sglang.srt.multimodal.processors")
         register_token_space_models()
         legacy = {
