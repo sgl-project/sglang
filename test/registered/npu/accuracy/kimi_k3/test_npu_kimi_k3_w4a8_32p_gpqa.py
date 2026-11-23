@@ -92,6 +92,12 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
     "--enable-dense-mlp-attn-tp",
+    # TEMPORARY: this case only sends text. Skipping the multimodal encoder also
+    # skips the remote-code processor/image-processor load, which races when the
+    # 16 scheduler processes of a pod build the transformers dynamic module
+    # cache at the same time (one rank imports a half-copied file and dies with
+    # "has no attribute KimiK3VisionProcessor"). Remove once that is fixed.
+    "--language-model-only",
     "--mem-fraction-static",
     0.72,
     "--chunked-prefill-size",
