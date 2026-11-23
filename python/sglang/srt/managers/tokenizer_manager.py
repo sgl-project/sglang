@@ -512,7 +512,6 @@ def _add_sampling_output_to_meta_info(
     chunk: Optional[SamplingMaskChunk],
     finished: bool,
 ):
-    """Add the sampling logprobs and mask rows a request asked for."""
     obj = state.obj
     if chunk is not None:
         if obj.return_sampling_logprobs:

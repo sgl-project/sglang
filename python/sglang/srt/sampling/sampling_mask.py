@@ -10,7 +10,6 @@ import numpy as np
 
 
 def returns_sampling_output(request) -> bool:
-    """Whether a request asked for sampling logprobs or for the sampling mask."""
     return bool(request.return_sampling_logprobs) or bool(request.return_sampling_mask)
 
 
