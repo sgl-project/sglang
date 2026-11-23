@@ -2,7 +2,7 @@
 
 Tests moonshotai/Kimi-K2.5 with GSM8K few-shot benchmark on MI325.
 
-Registry: nightly-amd-accuracy-8-gpu-kimi-k25 suite
+Registry: nightly-accuracy-test-8-gpu-amd-kimi-k25 suite
 """
 
 import os
@@ -24,7 +24,10 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - Kimi K2.5 accuracy test (~60 min)
 register_amd_ci(
-    est_time=3600, suite="nightly-amd-accuracy-8-gpu-kimi-k25", nightly=True
+    est_time=3600,
+    suite="nightly-accuracy-test-8-gpu-amd-kimi-k25",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"

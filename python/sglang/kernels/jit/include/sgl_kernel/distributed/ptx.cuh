@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace sglang {
 
@@ -189,6 +190,16 @@ SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
   asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
 }
 
+/// Rank-local counter increment; nothing on another GPU reads it.
+SGL_DEVICE void red_add_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+  asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
+/// 64-bit form of `red_add_relaxed_gpu`.
+SGL_DEVICE void red_add_relaxed_gpu(uint64_t* ptr, uint64_t val) {
+  asm volatile("red.relaxed.gpu.global.add.u64 [%0], %1;" : : "l"(ptr), "l"(val) : "memory");
+}
+
 /// Flag increment that also publishes every prior write to system scope.
 SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
   asm volatile("red.release.sys.global.add.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
@@ -198,6 +209,20 @@ SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
 /// so a peer's acquire load of that flag also observes the payload.
 SGL_DEVICE void fence_release_sys() {
   asm volatile("fence.release.sys;" ::: "memory");
+}
+
+/// Owner-side take of a peer-written flag, returning the old value.
+SGL_DEVICE uint32_t atomic_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  uint32_t old;
+  asm volatile("atom.relaxed.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(val) : "memory");
+  return old;
+}
+
+/// Same, and acquires the writes peers released before their increments.
+SGL_DEVICE uint32_t atomic_add_acquire_sys(uint32_t* ptr, uint32_t val) {
+  uint32_t old;
+  asm volatile("atom.acquire.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(ptr), "r"(val) : "memory");
+  return old;
 }
 
 /// Device-scope arrival counter. acq_rel so the winner of the count also
@@ -313,6 +338,107 @@ SGL_DEVICE void st_relaxed_16B(const V& x, void* addr, int64_t vec_offset) {
 #endif
 }
 
+/// Eight `st_relaxed_16B`s to `base` + kOffset + i * kStep bytes, for long
+/// runs of stores into a peer's buffer: the builtin form makes the compiler
+/// wait (s_wait_xcnt) after every store on gfx1250.
+/// One asm statement owns all eight operands until its own trailing wait has
+/// seen them read, so the compiler cannot reuse a register too early.
+template <int32_t kOffset, int32_t kStep, typename V>
+SGL_DEVICE void st_relaxed_x8_16B(const V* x, void* base) {
+  static_assert(alignof(V) == 16 && sizeof(V) == 16);
+  const auto v = reinterpret_cast<const details::u32x4_t*>(x);
+#if defined(__gfx1250__)
+  asm volatile(
+      "global_store_b128 %0, %1, off offset:%9 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %2, off offset:%10 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %3, off offset:%11 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %4, off offset:%12 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %5, off offset:%13 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %6, off offset:%14 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %7, off offset:%15 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %8, off offset:%16 scope:SCOPE_SYS\n\t"
+      "s_wait_xcnt 0x0"
+      :
+      : "v"(base),
+        "v"(v[0]),
+        "v"(v[1]),
+        "v"(v[2]),
+        "v"(v[3]),
+        "v"(v[4]),
+        "v"(v[5]),
+        "v"(v[6]),
+        "v"(v[7]),
+        "i"(kOffset),
+        "i"(kOffset + kStep),
+        "i"(kOffset + 2 * kStep),
+        "i"(kOffset + 3 * kStep),
+        "i"(kOffset + 4 * kStep),
+        "i"(kOffset + 5 * kStep),
+        "i"(kOffset + 6 * kStep),
+        "i"(kOffset + 7 * kStep)
+      : "memory");
+#else
+#pragma unroll
+  for (int32_t i = 0; i < 8; ++i) {
+    st_relaxed_16B(x[i], static_cast<uint8_t*>(base) + kOffset + i * kStep, 0);
+  }
+#endif
+}
+
+/// Four-store form of `st_relaxed_x8_16B`.
+template <int32_t kOffset, int32_t kStep, typename V>
+SGL_DEVICE void st_relaxed_x4_16B(const V* x, void* base) {
+  static_assert(alignof(V) == 16 && sizeof(V) == 16);
+  const auto v = reinterpret_cast<const details::u32x4_t*>(x);
+#if defined(__gfx1250__)
+  asm volatile(
+      "global_store_b128 %0, %1, off offset:%5 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %2, off offset:%6 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %3, off offset:%7 scope:SCOPE_SYS\n\t"
+      "global_store_b128 %0, %4, off offset:%8 scope:SCOPE_SYS\n\t"
+      "s_wait_xcnt 0x0"
+      :
+      : "v"(base),
+        "v"(v[0]),
+        "v"(v[1]),
+        "v"(v[2]),
+        "v"(v[3]),
+        "i"(kOffset),
+        "i"(kOffset + kStep),
+        "i"(kOffset + 2 * kStep),
+        "i"(kOffset + 3 * kStep)
+      : "memory");
+#else
+#pragma unroll
+  for (int32_t i = 0; i < 4; ++i) {
+    st_relaxed_16B(x[i], static_cast<uint8_t*>(base) + kOffset + i * kStep, 0);
+  }
+#endif
+}
+
+namespace details {
+
+template <uint32_t kStride, typename V, uint32_t... G>
+SGL_DEVICE void st_relaxed_x8_run(const V* x, void* base, std::integer_sequence<uint32_t, G...>) {
+  constexpr auto kStep = static_cast<int32_t>(kStride * sizeof(V));
+  (st_relaxed_x8_16B<static_cast<int32_t>(G * 8) * kStep, kStep>(x + G * 8, base), ...);
+}
+
+}  // namespace details
+
+/// `x[u]` to `base` + u * kStride vectors for u < kCount, as system-scope
+/// stores: eight per `st_relaxed_x8_16B`, then four per `st_relaxed_x4_16B`.
+template <uint32_t kStride, uint32_t kCount, typename V>
+SGL_DEVICE void st_relaxed_run_16B(const V* x, void* base) {
+  static_assert(kCount % 4 == 0);
+  constexpr auto kStep = static_cast<int32_t>(kStride * sizeof(V));
+  constexpr uint32_t kRuns = kCount / 8;
+  details::st_relaxed_x8_run<kStride>(x, base, std::make_integer_sequence<uint32_t, kRuns>{});
+  if constexpr (kCount % 8 != 0) {
+    st_relaxed_x4_16B<static_cast<int32_t>(kRuns * 8) * kStep, kStep>(x + kRuns * 8, base);
+  }
+}
+
 template <typename V>
 SGL_DEVICE void ld_multimem_16B(V&, const void*, int64_t) {
   assert(false && "multimem load is not supported on ROCm");
@@ -348,6 +474,22 @@ SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
 
 SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
   __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE void red_add_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE void red_add_relaxed_gpu(uint64_t* ptr, uint64_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE uint32_t atomic_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE uint32_t atomic_add_acquire_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
