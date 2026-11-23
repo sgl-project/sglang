@@ -8,6 +8,7 @@ from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
 )
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
@@ -390,6 +391,153 @@ class TestAdmissionMatchedPrefixTokens(CustomTestCase):
         self.assertEqual(req.num_matched_prefix_tokens, 0)
         req.init_next_round_input(tree_cache)
         self.assertEqual(req.num_matched_prefix_tokens, len(self.PREFIX))
+
+
+class TestShortestPrefillLoadScaling(CustomTestCase):
+    make_req = TestShortestPrefillFirst.make_req
+
+    def setUp(self):
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def make_policy(self, **scaling):
+        return SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            shortest_prefill_load_scaling=resolve(chunked_prefill_size=4096, **scaling),
+        )
+
+    def sort(self, policy, queue, chunked_req=None):
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            return policy.calc_priority(queue, chunked_req=chunked_req)
+
+    def sorted_rids(self, policy, queue):
+        return [req.rid for req in self.sort(policy, queue)]
+
+    def test_unset_values_derive_and_explicit_zeros_stay(self):
+        self.assertIsNone(resolve(chunked_prefill_size=32768, halving_chunks=0))
+        derived = resolve(chunked_prefill_size=32768, halving_chunks=2.5)
+        self.assertEqual(
+            (
+                derived.halving_tokens,
+                derived.decay_start_tokens,
+                derived.budget_min_tokens,
+                derived.budget_doubling_tokens,
+                derived.budget_full_backlog,
+            ),
+            (81920, 163840, 4096, 81920, 245760),
+        )
+        zeros = resolve(
+            chunked_prefill_size=32768,
+            halving_chunks=2.5,
+            decay_start_chunks=0,
+            budget_min_ratio=0,
+        )
+        self.assertEqual(zeros.decay_start_tokens, 0)
+        self.assertIsNone(zeros.token_budget(0, page_size=1, align=None))
+
+    def test_needs_chunked_prefill(self):
+        with self.assertRaises(ValueError):
+            resolve(chunked_prefill_size=None, halving_chunks=1)
+
+    def test_mid_size_request_moves_to_arrival_class_as_backlog_grows(self):
+        policy = self.make_policy(halving_chunks=0.5, decay_start_chunks=3.5)
+        queue = [
+            self.make_req("long-new", 4200, arrived=5),
+            self.make_req("mid", 2500, arrived=4),
+            self.make_req("short", 500, arrived=3),
+            self.make_req("long-old", 6000, arrived=1),
+        ]
+        # Up to the decay start the boundary is the chunk size, so only
+        # chunk-sized requests go by arrival.
+        self.assertEqual(
+            self.sorted_rids(policy, queue), ["short", "mid", "long-old", "long-new"]
+        )
+        self.assertEqual(policy.shortest_prefill_backlog, 13200)
+        self.assertEqual(policy.shortest_prefill_class_boundary, 4096)
+        # Half a chunk past the decay start, the boundary halves.
+        queue.append(self.make_req("newcomer", 3184, arrived=6))
+        self.assertEqual(
+            self.sorted_rids(policy, queue),
+            ["short", "long-old", "mid", "long-new", "newcomer"],
+        )
+        self.assertEqual(policy.shortest_prefill_backlog, 16384)
+        self.assertEqual(policy.shortest_prefill_class_boundary, 2048)
+
+    def test_backlog_counts_what_the_continuing_chunk_has_left(self):
+        policy = self.make_policy(halving_chunks=0.5, decay_start_chunks=2)
+        continuation = self.make_req("continuation", 6000, cached=2000)
+        continuation.prefix_len = 4000
+        self.sort(
+            policy,
+            [self.make_req("a", 3000), self.make_req("b", 5288)],
+            chunked_req=continuation,
+        )
+        self.assertEqual(policy.shortest_prefill_backlog, 12288)
+        self.assertEqual(policy.shortest_prefill_class_boundary, 1024)
+
+    def test_reservation_stops_at_the_first_arrival_ordered_request(self):
+        # 14768 tokens left in the chunk and 1616 waiting: two halvings of 2 chunks.
+        policy = self.make_policy(halving_chunks=2, decay_start_chunks=0)
+        continuation = self.make_req("continuation", 14768)
+        queue = [
+            self.make_req("mid", 1104, arrived=1),
+            self.make_req("small", 512, arrived=2),
+        ]
+        queue = self.sort(policy, queue, chunked_req=continuation)
+        self.assertEqual(policy.shortest_prefill_class_boundary, 1024)
+        self.assertEqual(
+            policy.shortest_prefill_chunk_limit(
+                continuation, queue, 4096, 256, processed_tokens=0
+            ),
+            3584,
+        )
+        # Without the boundary, the mid-size request fits beside the small one.
+        self.assertEqual(
+            self.make_policy(halving_chunks=0).shortest_prefill_chunk_limit(
+                continuation, queue, 4096, 256, processed_tokens=0
+            ),
+            2304,
+        )
+
+    def test_token_budget_scales_with_backlog_and_rounds_to_page_and_alignment(self):
+        for min_ratio, doubling_chunks, page_size, align, backlog, budget in (
+            # An empty queue gets the minimum, rounded down to a page.
+            (0.24, 1, 64, None, 0, 960),
+            (0.24, 1, 64, None, 4096, 1920),
+            # No cap once the budget reaches the chunk size.
+            (0.24, 0.001, 64, None, 2000, None),
+            # Never below one page, or one alignment unit.
+            (0.005, 1, 64, None, 0, 64),
+            (0.25, 1, 64, 1536, 0, 1536),
+        ):
+            with self.subTest(min_ratio=min_ratio, align=align, backlog=backlog):
+                scaling = resolve(
+                    chunked_prefill_size=4096,
+                    halving_chunks=1,
+                    budget_min_ratio=min_ratio,
+                    budget_doubling_chunks=doubling_chunks,
+                )
+                self.assertEqual(
+                    scaling.token_budget(backlog, page_size=page_size, align=align),
+                    budget,
+                )
+
+
+def resolve(**kwargs):
+    return ShortestPrefillLoadScaling.resolve(
+        **{
+            "decay_start_chunks": None,
+            "budget_min_ratio": None,
+            "budget_doubling_chunks": None,
+            **kwargs,
+        }
+    )
 
 
 if __name__ == "__main__":

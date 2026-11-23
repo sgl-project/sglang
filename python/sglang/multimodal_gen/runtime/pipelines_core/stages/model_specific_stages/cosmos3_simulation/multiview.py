@@ -1622,6 +1622,10 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
     arrays when frames are returned); otherwise a joint request returns only video.
     """
 
+    # output_rank_saved is a collective over the VAE decode group, so every
+    # rank of the group runs this stage, also when the base rule picks one.
+    parallelism_type = StageParallelismType.REPLICATED
+
     def __init__(
         self,
         vae,

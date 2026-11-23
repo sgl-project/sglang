@@ -84,7 +84,10 @@ def output_rank_saved(saved: bool) -> bool:
 
 
 class EncodeWhileDecoding:
-    """Feed each run of finished frames to the MP4 encoder while the VAE decodes the rest."""
+    """Feed each run of finished frames to the MP4 encoder while the VAE decodes the rest.
+
+    ``audio`` may be a zero-argument callable (``CudaVideoEncoder.open``).
+    """
 
     def __init__(
         self,

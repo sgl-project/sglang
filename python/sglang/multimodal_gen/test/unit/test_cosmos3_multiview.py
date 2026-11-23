@@ -2294,6 +2294,26 @@ class TestInputLoading(unittest.TestCase):
                 stage.forward(batch, None)
             self.assertEqual(decode.call_count, decodes)
 
+    def test_every_rank_decodes_under_cfg_parallel_with_an_unsharded_vae(self):
+        """A streamed request returns under CFG parallel when the VAE does not
+        shard its decode: no rank skips the stage that exchanges the save result."""
+        decoding = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        stage_cls = multiview_stage.Cosmos3MultiviewDecodingStage
+        stage = stage_cls.__new__(stage_cls)
+        stage.vae = SimpleNamespace(use_parallel_decode=False)
+        with (
+            mock.patch(
+                f"{decoding}.get_global_server_args",
+                return_value=SimpleNamespace(enable_cfg_parallel=True),
+            ),
+            mock.patch(f"{decoding}.model_parallel_is_initialized", return_value=True),
+            mock.patch(f"{decoding}.get_decode_parallel_world_size", return_value=2),
+        ):
+            self.assertEqual(
+                stage.parallelism_type_for(None),
+                multiview_stage.StageParallelismType.REPLICATED,
+            )
+
 
 class TestLidarItems(unittest.TestCase):
     def test_layout_items_drive_plan_offsets_and_tokens(self):
