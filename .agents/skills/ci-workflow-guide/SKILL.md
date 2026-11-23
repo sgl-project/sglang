@@ -95,16 +95,25 @@ The control labels `bypass-fail-fast`, `parallel-stages`, `max-concurrency`, and
 
 ## Execution Modes
 
-| Aspect | PR (`pull_request`) | Scheduled (cron, twice daily) | Manual dispatch (`workflow_dispatch`) |
+| Aspect | PR (`pull_request_target`) | Scheduled (cron, twice daily) | Manual dispatch (`workflow_dispatch`) |
 |--------|---------------------|-------------------------------|--------------------------------------|
 | **Stage ordering** | Sequential: A → B → C via `wait-for-base-*` | Parallel | Parallel (the wait jobs run only on PRs) |
 | **continue-on-error** | No (stop at first failure within suite) | Yes (run all tests) | With `force_continue_on_error` or `run_all_tests` |
 | **Retry** | Enabled | Enabled | Enabled |
 | **Shards at once** | `max_parallel` (about a third of the shards); all with `max-concurrency` | All | All with `run_all_tests`; otherwise as on a PR |
-| **PR gate** | Yes (draft, label, rate limit) | Skipped | Skipped with `test_parallel_dispatch` |
+| **PR gate** | Yes (draft, run-ci approval of the head commit, rate limit) | Skipped | Skipped with `test_parallel_dispatch` |
 | **Extra tier** | Only with `run-ci-nv-extra` | Called from the same run | Called with `run_all_tests` or `test_parallel_dispatch` |
 
 A single test, class, or method on a PR runs through `/rerun-test`, not a stage dispatch.
+
+### Testing workflow changes
+
+`pr-test.yml` and `pr-test-extra.yml` run on `pull_request_target`, so a PR's CI runs the workflow files from `main`, including every `_pr-test-*.yml` they call. Scripts and tests come from the PR checkout and are tested as usual; edits to the workflow YAML itself are not exercised by the PR's own CI. To test them:
+
+- **Branch in `sgl-project/sglang`:** `gh workflow run pr-test.yml --ref <branch>` (add `-f run_all_tests=true` or other inputs as needed). A dispatch runs the branch's workflow files and needs write access. It does not report the PR's required check, so the PR still needs a normal run before merge; link the dispatch run in the PR description.
+- **Fork PR:** a maintainer reviews the workflow change, pushes the branch to `sgl-project/sglang`, and dispatches it there.
+
+The run-ci approval is per commit: the gate records a `ci/run-ci-approved` status on the commit `run-ci` was added on, and a run passes only if its own head commit carries it.
 
 ---
 
