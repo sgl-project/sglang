@@ -536,10 +536,19 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                     context: ConversationContext
                     if self.use_harmony:
+                        function_names = {
+                            tool.name
+                            for tool in request.tools
+                            if tool.type == "function" and tool.name is not None
+                        }
                         if request.stream:
-                            context = StreamingHarmonyContext(messages, tool_sessions)
+                            context = StreamingHarmonyContext(
+                                messages, tool_sessions, function_names=function_names
+                            )
                         else:
-                            context = HarmonyContext(messages, tool_sessions)
+                            context = HarmonyContext(
+                                messages, tool_sessions, function_names=function_names
+                            )
                     else:
                         context = SimpleContext()
 
