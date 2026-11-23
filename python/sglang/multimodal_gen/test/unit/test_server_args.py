@@ -38,6 +38,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import (
+    LTX25PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
@@ -2472,6 +2475,50 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertTrue(unsized.text_encoder_cpu_offload)
         self.assertFalse(sized.text_encoder_cpu_offload)
         self.assertEqual(set(self._residency(sized).values()), {RESIDENT})
+
+    # (parameters, stored bytes) of Lightricks/LTX-2.5-Diffusers, all bf16: 75.5 GiB
+    # declared in model_index.json, 65.2 GiB without the prompt enhancer and the
+    # diffusion decoder
+    LTX25_SIZES = {
+        "transformer": (18_987_859_200, 37_975_718_400),
+        "text_encoder": (11_959_730_224, 23_919_460_448),
+        "prompt_enhancer": (5_104_298_467, 10_208_596_934),
+        "connectors": (3_172_227_584, 6_344_455_168),
+        "vae": (726_106_225, 1_452_212_450),
+        "diffusion_decoder": (417_134_000, 834_268_000),
+        "vocoder": (129_085_032, 258_170_064),
+        "audio_vae": (53_248_402, 106_496_804),
+        "duration_head": (1_903_361, 3_806_722),
+    }
+
+    def _ltx25(self, *, available_memory_gb=139, **kwargs):
+        return self._from_dict_with_pipeline_config(
+            LTX25PipelineConfig(),
+            memory_gb=141,
+            available_memory_gb=available_memory_gb,
+            checkpoint_sizes=self.LTX25_SIZES,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.5-Diffusers",
+                "performance_mode": "auto",
+                **kwargs,
+            },
+        )
+
+    def test_auto_tier_leaves_out_components_the_pipeline_does_not_load(self):
+        # an H200: the loaded weights fit twice, every declared component does not
+        args = self._ltx25()
+        self.assertEqual(set(self._residency(args).values()), {RESIDENT})
+
+        with patch.object(
+            LTX25PipelineConfig, "unloaded_checkpoint_components", return_value=()
+        ):
+            counted = self._ltx25()
+        self.assertEqual(counted.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_auto_tier_keeps_the_full_ltx25_size_with_the_diffusion_decoder(self):
+        # the decoder's untiled decode needs the headroom the full size leaves
+        args = self._ltx25(load_diffusion_decoder=True)
+        self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
 
     def test_auto_lingbot_keeps_dit_resident_on_h100(self):
         args = self._from_dict_with_pipeline_config(

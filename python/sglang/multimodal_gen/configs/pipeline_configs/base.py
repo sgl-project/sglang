@@ -241,6 +241,12 @@ class PipelineConfig:
         del server_args
         return ()
 
+    def unloaded_checkpoint_components(self, server_args: Any) -> tuple[str, ...]:
+        """model_index.json components this deployment does not load, for the
+        automatic memory policy."""
+        del server_args
+        return ()
+
     def get_supported_task_types(self) -> tuple[ModelTaskType, ...]:
         """Return the tasks implemented by this configured pipeline.
 

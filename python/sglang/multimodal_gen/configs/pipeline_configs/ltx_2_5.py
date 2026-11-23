@@ -56,6 +56,15 @@ class LTX25PipelineConfig(LTX2PipelineConfig):
         default_factory=lambda: LTX25_DISTILLED_SIGMA_VALUES
     )
 
+    def unloaded_checkpoint_components(self, server_args) -> tuple[str, ...]:
+        # The checkpoint ships a prompt-enhancer LLM that the pipeline never
+        # loads, and the diffusion decoder loads only on request. A deployment
+        # that loads the decoder keeps the full-checkpoint size as headroom: its
+        # untiled decode peaks at 135.7 GB on an H200 with everything resident.
+        if getattr(server_args, "load_diffusion_decoder", False):
+            return ()
+        return ("prompt_enhancer", "diffusion_decoder")
+
 
 def register():
     from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
