@@ -337,7 +337,7 @@ def pre_alloc_fill_len(req: Req) -> int:
 
 
 def _apply_metadata_gate(polls, pollers, decode_reqs, metadata_buffers) -> None:
-    """Downgrade Success → Transferring for requests whose metadata hasn't landed,
+    """Downgrade Success -> Transferring for requests whose metadata hasn't landed,
     and to Failed for requests whose metadata the receive thread rejected.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
