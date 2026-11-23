@@ -155,8 +155,8 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
 
 
 @contextlib.contextmanager
-def _single_rank_capture():
-    yield SimpleNamespace(stream=torch.cuda.Stream())
+def _single_rank_capture(stream):
+    yield SimpleNamespace(stream=stream)
 
 
 def _graph(epi, sampler, monkeypatch, rejection_noise=None):

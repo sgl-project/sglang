@@ -38,6 +38,9 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_capture_stream,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -152,6 +155,7 @@ class DsparkSamplingAcceptGraph:
         self._graphs: dict[Hashable, torch.cuda.CUDAGraph] = {}
         self._warmed_up: set[Hashable] = set()
         self._pool = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         self.disabled = False
         self.num_replays = 0
         # Set by run(): whether this step's region committed the engram history.
@@ -210,13 +214,25 @@ class DsparkSamplingAcceptGraph:
             if key not in self._warmed_up:
                 if len(self._warmed_up) < self.MAX_GRAPHS:
                     self._warmed_up.add(key)
-                region()
+                    self._warm_up(region)
+                else:
+                    region()
                 return
             graph = self._capture(key, region)
             if graph is None:
                 return
         graph.replay()
         self.num_replays += 1
+
+    def _warm_up(self, region: Callable[[], object]) -> None:
+        """Run on the capture stream: split sampling keeps scratch per stream."""
+        if self._capture_stream is None:
+            self._capture_stream = get_or_create_global_graph_capture_stream()
+        current = torch.cuda.current_stream()
+        self._capture_stream.wait_stream(current)
+        with torch.cuda.stream(self._capture_stream):
+            region()
+        current.wait_stream(self._capture_stream)
 
     def _capture(
         self, key: Hashable, region: Callable[[], object]
@@ -227,7 +243,7 @@ class DsparkSamplingAcceptGraph:
         try:
             # graph_capture() enables pynccl, which the in-graph accept broadcast needs.
             with (
-                graph_capture() as ctx,
+                graph_capture(stream=self._capture_stream) as ctx,
                 torch.cuda.graph(
                     graph,
                     pool=self._pool,
