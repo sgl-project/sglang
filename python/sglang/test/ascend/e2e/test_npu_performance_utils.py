@@ -634,13 +634,15 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
-                elif stripped_line.startswith("Storage:") and stripped_line.endswith(
-                    "%"
-                ):
-                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%"
+                elif stripped_line.startswith(
+                    ("Storage:", "Storage (")
+                ) and stripped_line.endswith("%"):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%" or
+                    # "Storage (MooncakeStore): 19.7%" when the engine that
+                    # served the request has a storage backend configured.
                     parts = stripped_line.split()
                     if len(parts) >= 2:
-                        metrics["storage_hit_rate_pct"] = parts[1].rstrip("%")
+                        metrics["storage_hit_rate_pct"] = parts[-1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
