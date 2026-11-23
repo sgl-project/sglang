@@ -781,6 +781,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
         self.raw_logits_rows = 0
 
+    def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
+        # Shapes are captured largest first; an SP body returns only its shard's rows
+        if torch.is_tensor(output):
+            return output.shape[0]
+        if isinstance(output, (list, tuple)):
+            return max(
+                (
+                    r
+                    for r in map(self.cuda_graph_output_capacity_rows, output)
+                    if r is not None
+                ),
+                default=None,
+            )
+        return None
+
     def _is_mamba_track_enabled(self) -> bool:
         return get_exec().mamba.enable_mamba_extra_buffer and (
             not get_memory().disable_radix_cache

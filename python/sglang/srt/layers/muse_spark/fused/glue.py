@@ -1,5 +1,5 @@
 """Hopper-only Muse Spark paths: the gate shared by every one of them and the fused
-attention (attn_srv verify, pfa extend / mixed)."""
+attention (attn_srv verify, pfa extend / mixed, the SP o_proj push)."""
 
 import functools
 from typing import Optional
@@ -16,7 +16,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
 )
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_forward, get_memory
 
 _HOPPER = (9, 0)
 # pfa packs each key read; below this kv-weighted mean extend (measured break-even) FA3 wins
@@ -184,6 +184,23 @@ def _prefill_args(module, forward_batch):
     kv = _paged_kv(module, backend, md, forward_batch)
     return (
         None if kv is None else (*kv, md.cache_seqlens_int32, md.cu_seqlens_q, ext, seq)
+    )
+
+
+def sp_o_proj_push_plan(module, num_tokens: int) -> Optional[tuple]:
+    o = module.o_proj
+    b = getattr(o, "_sp_a2a_push", None)
+    if (
+        b is None
+        or not module._fused_attn
+        or getattr(o, "_sp_full_weight", None) is None
+        or num_tokens < o._sp_full_weight_min_tokens
+    ):
+        return None
+    return (
+        b.o_proj_push_plan(num_tokens, module.q_size)
+        if get_forward().sp_active
+        else None
     )
 
 
