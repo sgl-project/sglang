@@ -49,6 +49,15 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _host_source(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """A rank's rows of a mapped checkpoint tensor, read with pread (see
+    ``mapped_reads``); copies to the GPU out of the mapping run several times
+    slower. Imported here: model_loader imports this module."""
+    from sglang.srt.model_loader.mapped_reads import host_source
+
+    return host_source(loaded_weight)
+
+
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
     """Pad the vocab size to the given value."""
     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
@@ -438,7 +447,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Copy the data.
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
+        param[: loaded_weight.shape[0]].data.copy_(_host_source(loaded_weight))
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:

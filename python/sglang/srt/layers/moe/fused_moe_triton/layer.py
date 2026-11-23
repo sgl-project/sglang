@@ -75,6 +75,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_loader import mapped_reads
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
@@ -176,6 +177,10 @@ def _maybe_copy_weight_view_before_h2d(
 ) -> torch.Tensor:
     if envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
         return _copy_weight_view_before_h2d(loaded_weight)
+    # A rank's rows of a mapped checkpoint tensor: read them with pread, since
+    # copies to the GPU out of the mapping run several times slower.
+    if (read := mapped_reads.read_mapped_slice(loaded_weight)) is not None:
+        return read
     # Faulting a safetensors mmap inside the driver copy is several times
     # slower than faulting it on the CPU: touch one byte per page first.
     # Non-contiguous sources are already gathered on the CPU by copy_.

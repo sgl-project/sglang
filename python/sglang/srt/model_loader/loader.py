@@ -828,6 +828,7 @@ class DefaultModelLoader(BaseModelLoader):
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     readers=readers,
                     max_inflight_bytes=extra_config.get("max_inflight_bytes"),
+                    prefetched=concurrent_prefetch_active,
                 )
             else:
                 if "max_inflight_bytes" in extra_config:
@@ -842,6 +843,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     readers=readers,
+                    prefetched=concurrent_prefetch_active,
                 )
 
         else:

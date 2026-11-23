@@ -69,6 +69,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.model_loader import mapped_reads
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -1161,6 +1162,7 @@ def _read_tensors(
     readers: Optional[CheckpointTensorReaders] = None,
     num_threads: int = 4,
     max_bytes_ahead: int = 1 << 30,
+    prefetched: bool = False,
 ):
     """Yield the tensors of a safetensors file this rank reads, in name order.
 
@@ -1168,16 +1170,25 @@ def _read_tensors(
     by ``num_threads`` threads, at most ``max_bytes_ahead`` ahead of the caller:
     copies to the GPU out of such memory run several times faster than out of a
     mapping of the file. Without, tensors stay mapped views, of which tensor
-    parallelism may read only a slice."""
-    if readers is None:
-        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                yield name, f.get_tensor(name)
-        return
+    parallelism may read only a slice; ``mapped_reads`` then reads that slice
+    with ``pread`` when it is a range of rows (``prefetched``: whether the file
+    is being read into the page cache meanwhile)."""
     with open(path, "rb") as f:
         (size,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(size))
     header.pop("__metadata__", None)
+    file = mapped_reads.open_file(path, prefetched)
+
+    def get_mapped(mapped, name):
+        tensor = mapped.get_tensor(name)
+        mapped_reads.register(file, header[name]["data_offsets"][0] + 8 + size, tensor)
+        return tensor
+
+    if readers is None:
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                yield name, get_mapped(f, name)
+        return
     plan, todo, nbytes = [], collections.deque(), 0
     for name in sorted(header):
         info = header[name]
@@ -1220,7 +1231,7 @@ def _read_tensors(
         pending, ready, ahead = collections.deque(), collections.deque(), 0
         for name, read, dtype, shape in plan:
             if not read:
-                yield name, mapped.get_tensor(name)
+                yield name, get_mapped(mapped, name)
                 continue
             if not ready:
                 while todo and (not pending or ahead < max_bytes_ahead):
@@ -1469,8 +1480,14 @@ def safetensors_weights_iterator(
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
     readers: Optional[CheckpointTensorReaders] = None,
+    prefetched: Optional[bool] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    ``prefetched``: whether the files are read into the page cache while they
+    load, by default whether ``prefetch`` starts that."""
+    if prefetched is None:
+        prefetched = prefetch
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -1496,7 +1513,9 @@ def safetensors_weights_iterator(
                 for name in sorted(result.keys()):
                     yield name, result[name]
         else:
-            yield from _read_tensors(st_file, readers, prefetch_num_threads)
+            yield from _read_tensors(
+                st_file, readers, prefetch_num_threads, prefetched=prefetched
+            )
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1701,6 +1720,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     drop_cache_after_load: bool = False,
     readers: Optional[CheckpointTensorReaders] = None,
     max_inflight_bytes: Optional[int] = None,
+    prefetched: Optional[bool] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1712,7 +1732,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     Peak RAM is a small multiple of max(cap, largest shard): the shard being
     yielded is not counted, and with ``disable_mmap`` a shard is held as
     bytes and then as tensors (measured 2-3x with ``disable_mmap``).
+    ``prefetched`` is as in ``safetensors_weights_iterator``.
     """
+    if prefetched is None:
+        prefetched = prefetch
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(
@@ -1729,7 +1752,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            result = dict(_read_tensors(st_file, readers, num_threads=1))
+            result = dict(
+                _read_tensors(st_file, readers, num_threads=1, prefetched=prefetched)
+            )
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

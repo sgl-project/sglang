@@ -60,6 +60,15 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 logger = logging.getLogger(__name__)
 
 
+def _host_source(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """A rank's rows of a mapped checkpoint tensor, read with pread (see
+    ``mapped_reads``); copies to the GPU out of the mapping run several times
+    slower. Imported here: model_loader imports this module."""
+    from sglang.srt.model_loader.mapped_reads import host_source
+
+    return host_source(loaded_weight)
+
+
 class ReplicatedParallelGroup(msgspec.Struct, frozen=True):
     """Share weight partitions across consecutive ranks; collectives stay separate."""
 
@@ -382,7 +391,7 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size(), (
             f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         )
-        param.data.copy_(loaded_weight)
+        param.data.copy_(_host_source(loaded_weight))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
@@ -585,7 +594,7 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         )
-        param_data.copy_(loaded_weight)
+        param_data.copy_(_host_source(loaded_weight))
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -900,7 +909,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        param_data.copy_(_host_source(loaded_weight))
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -1566,7 +1575,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        param_data.copy_(_host_source(loaded_weight))
 
 
 class RowParallelLinear(LinearBase):
@@ -1729,7 +1738,7 @@ class RowParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        param_data.copy_(_host_source(loaded_weight))
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
 
