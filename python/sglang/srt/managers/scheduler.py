@@ -5624,7 +5624,7 @@ class Scheduler(
 
                         # PP speculative decoding refuses the watermark.
                         verify = (
-                            self.tp_worker.model_runner.sampling_pipeline.bind_verify(
+                            self.tp_worker.model_runner.sampling_pipeline.plan_verify(
                                 batch, watermark_full_mask=False
                             )
                         )
