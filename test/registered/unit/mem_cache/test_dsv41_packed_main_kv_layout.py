@@ -376,6 +376,33 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
         self.assertEqual(pool.get_kv_size_bytes(), 2 * expected_pages * 98_304)
         with self.assertRaisesRegex(NotImplementedError, "get_view"):
             pool.get_key_buffer(0)
+        with self.assertRaisesRegex(NotImplementedError, "get_view"):
+            pool.get_bytes_per_token()
+
+    def test_outer_pool_uses_polymorphic_legacy_accessors(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+            DeepSeekV41PackedMainKVPool,
+        )
+
+        sentinel = torch.empty(0)
+
+        class LegacyCompatiblePackedPool(DeepSeekV41PackedMainKVPool):
+            def get_bytes_per_token(self):
+                return 288
+
+            def get_key_buffer(self, layer_id):
+                self.last_layer_id = layer_id
+                return sentinel
+
+        packed_pool = object.__new__(LegacyCompatiblePackedPool)
+        outer_pool = object.__new__(DeepSeekV4TokenToKVPool)
+        outer_pool.layer_transfer_counter = None
+        outer_pool.layer_mapping = {7: (1, 3, packed_pool)}
+
+        self.assertEqual(outer_pool.get_extra_key_bytes_per_token(7), 288)
+        self.assertIs(outer_pool.get_extra_key_buffer(7), sentinel)
+        self.assertEqual(packed_pool.last_layer_id, 3)
 
     def test_outer_pool_preserves_source_sharing_and_typed_access(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -429,7 +456,7 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
             pool.get_extra_key_layout(1),
             KVLayout.DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1,
         )
-        with self.assertRaisesRegex(TypeError, "legacy FlashMLA"):
+        with self.assertRaisesRegex(NotImplementedError, "get_view"):
             pool.get_extra_key_buffer(1)
         with self.assertRaisesRegex(NotImplementedError, "transfer descriptors"):
             pool.get_contiguous_buf_infos()

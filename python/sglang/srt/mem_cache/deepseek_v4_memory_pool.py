@@ -480,6 +480,9 @@ class DeepSeekV41PackedMainKVPool(KVCache):
     def get_bytes_per_slot(self) -> int:
         return self.spec.bytes_per_slot
 
+    def get_bytes_per_token(self) -> int:
+        raise NotImplementedError("Use get_view or get_page_buffer for packed Main KV.")
+
     def get_kv_size_bytes(self) -> int:
         return sum(buffer.nbytes for buffer in self.kv_buffer)
 
@@ -2371,12 +2374,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kernel detects the extra cache's format from."""
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
-        if isinstance(compress_kv_pool, DeepSeekV41PackedMainKVPool):
-            raise TypeError(
-                "packed Main KV has no legacy FlashMLA bytes-per-token view; "
-                "use get_extra_key_view()"
-            )
-        return compress_kv_pool.kv_cache_total_dim
+        return compress_kv_pool.get_bytes_per_token()
 
     def get_swa_key_layout(self) -> KVLayout:
         # swa_kv_pool is None under the request window and unified_kv.
@@ -2399,11 +2397,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
-        if isinstance(compress_kv_pool, DeepSeekV41PackedMainKVPool):
-            raise TypeError(
-                "packed Main KV cannot be exposed through the legacy FlashMLA "
-                "buffer accessor; use get_extra_key_view()"
-            )
         return compress_kv_pool.get_key_buffer(compress_layer_id)
 
     def get_extra_key_view(self, layer_id: int) -> PackedMainKVView:
