@@ -428,7 +428,7 @@ sglang serve Qwen/Qwen3-VL-2B-Instruct \
   --disable-prefill-cuda-graph
 ```
 
-JPEG decoding uses nvJPEG on the tokenizer GPU when available, then stages decoded uint8 pixels through CPU memory. PNG decoding uses PIL on CPU. TP ranks preprocess their assigned images and broadcast packed inputs before executing the tensor-parallel vision encoder. Image embeddings retain the request's image order. Unsupported image formats or processor settings use the existing processing path.
+The tokenizer validates JPEG and PNG inputs and sends their compressed bytes as part of the request message. For each assigned image, the owning TP rank decodes JPEG with nvJPEG on its GPU where supported, or decodes PNG with PIL in the rank process. That rank runs resize, normalization, and patchification on its GPU. Ranks broadcast the packed processor outputs before executing the tensor-parallel vision encoder. Image embeddings retain the request's image order. Unsupported image formats or processor settings use the existing processing path.
 
 With ViT CUDA graphs enabled, a layout is captured on its second encounter. The TP preprocessing path retains up to eight layouts with at most 8,192 patches each. Other layouts execute eagerly using the same positional interpolation. Replayed outputs receive independent storage before they are split into image embeddings.
 

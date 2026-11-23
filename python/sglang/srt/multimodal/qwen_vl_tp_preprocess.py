@@ -3,32 +3,53 @@
 import hashlib
 import logging
 import math
+from io import BytesIO
 from typing import NamedTuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
+from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, load_image
+
 logger = logging.getLogger(__name__)
 
 DEFERRED_IMAGE_PATCH_WIDTH_KEY = "_qwen_vl_deferred_tp_image"
+DEFERRED_IMAGE_SIZE_KEY = "_qwen_vl_deferred_image_size"
 # Limit the batch by the size of its FP32 processor output.
 MAX_FP32_PIXEL_BATCH_BYTES = 512 << 20
 
 
-def prepare_deferred_image(image, processor, kwargs):
-    """Build the prompt grid and CPU pixels from the same processor settings."""
-    is_tensor = isinstance(image, torch.Tensor)
-    if is_tensor and image.ndim == 3 and image.dtype == torch.uint8:
-        channels, height, width = image.shape
-        if channels != 3:
-            return None
-    elif isinstance(image, Image.Image):
-        height, width = image.height, image.width
-    else:
+class CompressedImage(NamedTuple):
+    data: bytes
+    size: tuple[int, int]
+    mode: str
+
+
+def inspect_compressed_image(data: object) -> CompressedImage | None:
+    if not isinstance(data, bytes) or not data.startswith(
+        (b"\xff\xd8", b"\x89PNG\r\n\x1a\n")
+    ):
         return None
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if (
+                image.format not in ("JPEG", "PNG")
+                or getattr(image, "n_frames", 1) != 1
+            ):
+                return None
+            # Reject truncated/corrupt payloads before they reach a TP collective.
+            # The validation pixels are discarded locally.
+            image.load()
+            return CompressedImage(data, image.size, image.mode)
+    except (OSError, *CLIENT_MEDIA_EXCEPTIONS) as exc:
+        raise ValueError(f"Could not load image: {exc}") from exc
+
+
+def prepare_deferred_image(image: CompressedImage, processor, kwargs):
+    """Build the prompt grid without materializing a transport pixel tensor."""
+    width, height = image.size
     settings = {
         key: kwargs.get(key, getattr(processor, key, None))
         for key in processor._valid_kwargs_names
@@ -36,11 +57,11 @@ def prepare_deferred_image(image, processor, kwargs):
     settings.update(kwargs)
     settings = processor._standardize_kwargs(**settings)
     processor._validate_preprocess_kwargs(**settings)
-    if not is_tensor and image.mode != "RGB" and not settings.get("do_convert_rgb"):
+    if image.mode != "RGB" and not settings.get("do_convert_rgb"):
         return None
     patch = settings["patch_size"]
     factor = patch * settings["merge_size"]
-    raw_bytes = height * width * 3
+    decoded_bytes = height * width * 3
     if settings["do_resize"]:
         size = settings["size"]
         height, width = smart_resize(
@@ -57,18 +78,19 @@ def prepare_deferred_image(image, processor, kwargs):
     expected_fp32_bytes = math.prod(grid) * patch_width * torch.float32.itemsize
     if (
         expected_fp32_bytes > MAX_FP32_PIXEL_BATCH_BYTES
-        or raw_bytes > expected_fp32_bytes
+        or max(decoded_bytes, len(image.data)) > MAX_FP32_PIXEL_BATCH_BYTES
     ):
         return None
-    if is_tensor:
-        # nvJPEG supplies CHW uint8. Transfer decoded pixels before expanding
-        # them into the processor's normalized FP32 patch matrix.
-        pixels = image.to(device="cpu").contiguous()
+    return torch.tensor([grid], dtype=torch.long), patch_width
+
+
+def _decode_owner_image(data: bytes, device: torch.device):
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            image, _ = load_image(data, gpu_image_decode=True)
     else:
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        pixels = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
-    return pixels, torch.tensor([grid], dtype=torch.long), patch_width
+        image, _ = load_image(data, gpu_image_decode=False)
+    return image
 
 
 def _image_layout(item):
@@ -78,6 +100,7 @@ def _image_layout(item):
         return None, None if grid is None else tuple(map(tuple, grid.tolist())), None
     width = item.model_specific_data[DEFERRED_IMAGE_PATCH_WIDTH_KEY]
     feature = item.feature
+    size = item.model_specific_data.get(DEFERRED_IMAGE_SIZE_KEY)
     if (
         not isinstance(width, int)
         or width <= 0
@@ -85,18 +108,17 @@ def _image_layout(item):
         or grid.shape != (1, 3)
         or grid.dtype != torch.long
         or len(item.offsets) != 1
-        or not isinstance(feature, torch.Tensor)
-        or feature.dtype != torch.uint8
-        or not feature.is_cpu
-        or feature.ndim != 3
-        or feature.shape[0] != 3
-        or feature.numel() == 0
+        or not isinstance(feature, bytes)
+        or not feature
+        or not isinstance(size, (tuple, list))
+        or len(size) != 2
+        or any(not isinstance(dim, int) or dim <= 0 for dim in size)
     ):
         raise ValueError("Invalid deferred Qwen-VL image metadata")
     grid_values = tuple(grid.tolist()[0])
     if min(grid_values) <= 0:
         raise ValueError("Invalid deferred Qwen-VL image grid")
-    return width, (grid_values,), tuple(feature.shape)
+    return width, (grid_values,), (tuple(size), len(feature))
 
 
 def _gather_image_plans(local_plan, group, stage, error):
@@ -134,13 +156,13 @@ def agree_on_image_misses(ordered_candidates, local_misses, group):
     }
 
 
-def _assign_images_to_ranks(items, world_size):
+def _assign_images_to_ranks(items, layouts, world_size):
     """Assign the largest images first, balancing source pixels by rank."""
     by_owner = [[] for _ in range(world_size)]
     loads = [0] * world_size
     first_owner = int.from_bytes(items[0].cache_key[:8], "little") % world_size
     ranks = tuple((first_owner + offset) % world_size for offset in range(world_size))
-    areas = [item.feature.shape[-2] * item.feature.shape[-1] for item in items]
+    areas = [math.prod(size) for _, _, (size, _) in layouts]
     for index in sorted(range(len(items)), key=areas.__getitem__, reverse=True):
         owner = min(ranks, key=loads.__getitem__)
         by_owner[owner].append(index)
@@ -183,7 +205,14 @@ def _plan_image_batches(items, layouts, world_size):
             stop,
             width,
             rows,
-            tuple(map(tuple, _assign_images_to_ranks(items[start:stop], world_size))),
+            tuple(
+                map(
+                    tuple,
+                    _assign_images_to_ranks(
+                        items[start:stop], layouts[start:stop], world_size
+                    ),
+                )
+            ),
         )
         for start, stop, width, rows in plans
     ]
@@ -216,9 +245,17 @@ def _preprocess_and_broadcast_pixels(
             )
             for index, target in zip(local_indices, targets):
                 item = items[index]
+                image = _decode_owner_image(item.feature, device)
+                size = (
+                    tuple(reversed(image.shape[-2:]))
+                    if isinstance(image, torch.Tensor)
+                    else image.size
+                )
+                if size != tuple(item.model_specific_data[DEFERRED_IMAGE_SIZE_KEY]):
+                    raise ValueError("Decoded Qwen-VL image dimensions changed")
                 try:
                     output = processor(
-                        images=[item.feature],
+                        images=[image],
                         return_tensors="pt",
                         device=str(device),
                         **image_kwargs,
@@ -228,7 +265,9 @@ def _preprocess_and_broadcast_pixels(
                         "Qwen-VL rank-local image preprocessing OOM; retrying on CPU"
                     )
                     output = processor(
-                        images=[item.feature],
+                        images=[
+                            image.cpu() if isinstance(image, torch.Tensor) else image
+                        ],
                         return_tensors="pt",
                         device="cpu",
                         **image_kwargs,
@@ -245,7 +284,7 @@ def _preprocess_and_broadcast_pixels(
                         "Qwen-VL TP image pixels disagree with the prompt grid"
                     )
                 target.copy_(pixels)
-                del output, pixels
+                del image, output, pixels
     except Exception as exc:
         failure.fill_(1)
         error = exc

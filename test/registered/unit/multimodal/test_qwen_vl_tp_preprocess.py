@@ -3,10 +3,12 @@
 import datetime
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -18,16 +20,28 @@ from sglang.srt.managers.mm_schedule import (
     _get_chunked_prefill_embedding,
     _sync_tp_image_cache_misses,
 )
+from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
     DEFERRED_IMAGE_PATCH_WIDTH_KEY,
+    DEFERRED_IMAGE_SIZE_KEY,
+    _decode_owner_image,
     agree_on_image_misses,
     encode_tp_images,
+    inspect_compressed_image,
     prepare_deferred_image,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
+
+def _encode_image(image, image_format):
+    buffer = BytesIO()
+    image.save(buffer, format=image_format)
+    return buffer.getvalue()
 
 
 def _test_ranks(rank, rendezvous):
@@ -49,10 +63,13 @@ def _test_ranks(rank, rendezvous):
         items = [
             SimpleNamespace(
                 cache_key=bytes([i - 1]) * 32,
-                feature=torch.full((3, size, size), i, dtype=torch.uint8),
+                feature=_encode_image(Image.new("RGB", (size, size), (i, i, i)), "PNG"),
                 image_grid_thw=torch.ones((1, 3), dtype=torch.long),
                 offsets=[(0, 0)],
-                model_specific_data={DEFERRED_IMAGE_PATCH_WIDTH_KEY: 1},
+                model_specific_data={
+                    DEFERRED_IMAGE_PATCH_WIDTH_KEY: 1,
+                    DEFERRED_IMAGE_SIZE_KEY: (size, size),
+                },
             )
             for i, size in enumerate((2, 8, 4), start=1)
         ]
@@ -122,7 +139,7 @@ def _test_ranks(rank, rendezvous):
         fail_owner = False
 
         def processor(images, **kwargs):
-            value = int(images[0][0, 0, 0])
+            value = images[0].getpixel((0, 0))[0]
             if fail_owner and value == 2:
                 raise ValueError("Injected owner failure")
             local_images.append(value)
@@ -191,9 +208,14 @@ class TestQwenVLTPPreprocess(unittest.TestCase):
                 ImageDraw.Draw(image).rectangle(
                     (1, 19, size[0] // 3, size[1] * 2 // 3), fill=(230, 85, 6)
                 )
-                pixels, grid, width = prepare_deferred_image(image, processor, {})
+                data = _encode_image(image, "PNG")
+                source = inspect_compressed_image(data)
+                grid, width = prepare_deferred_image(source, processor, {})
                 original = processor(images=[image], return_tensors="pt", device="cpu")
-                deferred = processor(images=[pixels], return_tensors="pt", device="cpu")
+                decoded = _decode_owner_image(source.data, torch.device("cpu"))
+                deferred = processor(
+                    images=[decoded], return_tensors="pt", device="cpu"
+                )
                 torch.testing.assert_close(
                     grid, original.image_grid_thw, rtol=0, atol=0
                 )
@@ -202,15 +224,43 @@ class TestQwenVLTPPreprocess(unittest.TestCase):
                     deferred.pixel_values, original.pixel_values, rtol=0, atol=0
                 )
 
-    def test_accepts_chw_uint8_from_jpeg_decoder(self):
+    def test_deferred_jpeg_keeps_compressed_bytes_and_rejects_truncation(self):
         processor = Qwen2VLImageProcessor()
-        image = torch.arange(3 * 560 * 560, dtype=torch.int32)
-        image = image.to(torch.uint8).reshape(3, 560, 560)
-        pixels, grid, width = prepare_deferred_image(image, processor, {})
-        native = processor(images=[image], return_tensors="pt", device="cpu")
+        data = _encode_image(Image.new("RGB", (560, 560), (8, 16, 32)), "JPEG")
+        source = inspect_compressed_image(data)
+        self.assertIs(source.data, data)
+        self.assertEqual(source.size, (560, 560))
+        grid, width = prepare_deferred_image(source, processor, {})
+        decoded = _decode_owner_image(data, torch.device("cpu"))
+        native = processor(images=[decoded], return_tensors="pt", device="cpu")
         self.assertEqual(width, native.pixel_values.shape[1])
-        torch.testing.assert_close(pixels, image)
         torch.testing.assert_close(grid, native.image_grid_thw)
+        with self.assertRaisesRegex(ValueError, "Could not load image"):
+            inspect_compressed_image(data[:-64])
+
+    def test_compressed_pixels_bypass_tensor_shm_transport(self):
+        data = _encode_image(Image.new("RGB", (64, 64)), "PNG")
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=data)
+        request = SimpleNamespace(
+            mm_inputs=SimpleNamespace(mm_items=[item], shm_model_specific_data=False)
+        )
+        with (
+            patch(
+                "sglang.srt.managers.mm_utils._get_is_default_transport",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.mm_utils.get_serving",
+                return_value=SimpleNamespace(skip_tokenizer_init=False),
+            ),
+            patch("sglang.srt.managers.mm_utils._wrap_shm_or_inline") as wrap,
+        ):
+            wrap_shm_features(request)
+        wrap.assert_not_called()
+        wire = msgspec.msgpack.encode(item)
+        restored = msgspec.msgpack.decode(wire, type=MultimodalDataItem)
+        self.assertIsInstance(restored.feature, bytes)
+        self.assertEqual(restored.feature, data)
 
     def test_vit_graph_returns_owned_embeddings_for_tp_image_groups(self):
         from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
