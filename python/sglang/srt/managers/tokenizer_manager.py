@@ -881,6 +881,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+        # ShutdownReq goes out once; atexit repeats an explicit Engine.shutdown().
+        self._shutdown_req_sent = False
 
     def is_healthy(self) -> bool:
         """Return whether startup completed and the server is neither unhealthy nor shutting down."""
@@ -3955,10 +3957,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
         if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
-            # Ask schedulers to release resources in userspace and exit (see
-            # ShutdownReq), then wait for them before hard-killing the rest.
-            self._dispatch_to_scheduler(ShutdownReq())
-            wait_for_schedulers_to_exit()
+            self.shutdown_schedulers()
         else:
             logger.info(
                 "Drained. The process that launched the schedulers shuts them down."
@@ -3976,6 +3975,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._server_stop_hook()
             return
         sys.exit(0)
+
+    def shutdown_schedulers(self) -> None:
+        """Ask the schedulers to release resources in userspace and exit (see
+        ShutdownReq), then wait for them before the caller hard-kills the rest."""
+        if self._shutdown_req_sent:
+            return
+        self._shutdown_req_sent = True
+        req = ShutdownReq()
+        if self.tokenizer_ipc_name is not None:
+            stamp_http_worker_ipc(req, self.tokenizer_ipc_name)
+        # Engine.shutdown() can run with no current event loop (after
+        # asyncio.run(), or at exit), which the zmq.asyncio socket needs to send
+        # and a sync shadow of it does not.
+        sock = zmq.Socket.shadow(self.send_to_scheduler.underlying)
+        try:
+            # The schedulers connect before this socket is bound and ZMQ retries
+            # a connect every 100 ms, so right after startup there can briefly
+            # be no peer to send to; wait for one within the grace period.
+            sent = bool(sock.poll(_SCHEDULER_EXIT_TIMEOUT_SECS * 1000, zmq.POLLOUT))
+            if sent:
+                sock_send(sock, req, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as e:
+            logger.warning(
+                f"Could not send ShutdownReq ({e}); the schedulers will be "
+                "killed without releasing in userspace."
+            )
+            return
+        if not sent:
+            logger.warning(
+                f"No scheduler connected within {_SCHEDULER_EXIT_TIMEOUT_SECS}s to "
+                "take ShutdownReq; the schedulers will be killed without "
+                "releasing in userspace."
+            )
+            return
+        wait_for_schedulers_to_exit()
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""

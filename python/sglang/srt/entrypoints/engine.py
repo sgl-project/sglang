@@ -1547,7 +1547,26 @@ class Engine(EngineScoreMixin, EngineBase):
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
+            try:
+                # Same as the server's SIGTERM path: SIGKILLing a scheduler skips
+                # its userspace release, which is how GPU memory survives.
+                # Pipeline-parallel event loops do not honor ShutdownReq yet.
+                if (
+                    isinstance(self.tokenizer_manager, TokenizerManager)
+                    and get_parallel().pp_size == 1
+                ):
+                    self.tokenizer_manager.shutdown_schedulers()
+            finally:
+                self._reap_subprocesses()
+        finally:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
+    def _reap_subprocesses(self) -> None:
+        try:
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
             # .sock/.ready files instead of being SIGKILLed and leaving stale state.
@@ -1555,14 +1574,8 @@ class Engine(EngineScoreMixin, EngineBase):
             if daemon_procs:
                 self._terminate_weight_cache_daemons(daemon_procs)
                 self._weight_cache_daemon_procs = []
-
-            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
-            if isinstance(self.tokenizer_manager, TokenizerManager):
-                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
-                if mm_processor is not None:
-                    mm_processor.shutdown()
-                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
