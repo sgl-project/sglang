@@ -142,6 +142,35 @@ class TestPriorityEvictionDirection(CustomTestCase):
         self.assertFalse(self._present(cache, self.HIGH_TOKENS))
         self.assertTrue(self._present(cache, self.LOW_TOKENS))
 
+    def test_shared_prefix_protects_most_urgent_request_in_both_directions(self):
+        """A shared prefix node aggregates the max sort key of its branches,
+        so it is protected at the level of the most urgent request using it,
+        and evicting the low-priority branch only removes its unique tokens."""
+        # (low_first, high_prio, low_prio): under low_first 0 is the high priority.
+        cases = [(False, 100, 0), (True, 0, 100)]
+        for low_first, high_prio, low_prio in cases:
+            with self.subTest(low_first=low_first):
+                cache = self._make_cache(low_first=low_first)
+                self._insert_req(cache, [1, 2, 3, 4], priority=high_prio)
+                self._insert_req(cache, [1, 2, 3, 5], priority=low_prio)
+
+                # The shared [1,2,3] node carries the max sort key, i.e. the
+                # high-priority request's key — the sort-key space keeps the
+                # max() propagation meaning "protect the highest priority".
+                sign = cache.priority_sign
+                shared = cache.root_node.children[1]
+                self.assertEqual(
+                    shared.priority, max(high_prio * sign, low_prio * sign)
+                )
+
+                # Evicting one token removes only the low-priority branch's
+                # unique token; the shared prefix and the high-priority
+                # branch survive.
+                cache.evict(EvictParams(num_tokens=1))
+                self.assertFalse(self._present(cache, [1, 2, 3, 5]))
+                self.assertTrue(self._present(cache, [1, 2, 3, 4]))
+                self.assertTrue(self._present(cache, [1, 2, 3]))
+
 
 if __name__ == "__main__":
     unittest.main()
