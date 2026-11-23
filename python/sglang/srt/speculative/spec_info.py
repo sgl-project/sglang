@@ -226,6 +226,12 @@ class SpeculativeAlgorithm(Enum):
             return build_dflash_disagg_draft_input(
                 batch, last_tokens_tensor, future_map
             )
+        if self.is_ngram():
+            from sglang.srt.speculative.ngram_disaggregation import (
+                build_ngram_disagg_draft_input,
+            )
+
+            return build_ngram_disagg_draft_input(batch, last_tokens_tensor, future_map)
         return None
 
     def need_topk(self) -> bool:

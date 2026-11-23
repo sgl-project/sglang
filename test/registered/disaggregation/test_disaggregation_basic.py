@@ -28,9 +28,10 @@ from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_NGRAM,
 )
 
-register_cuda_ci(est_time=584, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=740, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -407,6 +408,42 @@ class TestDisaggregationMooncakeSpec(
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
+
+
+class TestDisaggregationNgram(SpecGrammarKit, PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_TARGET_MODEL_NGRAM
+        spec_args = [
+            "--speculative-algorithm",
+            "NGRAM",
+            "--speculative-num-draft-tokens",
+            "16",
+            "--cuda-graph-max-bs-decode",
+            "8",
+        ]
+        cls.extra_prefill_args = spec_args
+        cls.extra_decode_args = spec_args
+        cls.launch_all()
+
+    def test_decode_continues_from_the_prefill_first_token(self):
+        # PD prefill samples the first token and NGRAM drafts from the decode's
+        # token history, so a dropped or repeated first token shows in the text.
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": "Count from 1 to 30: 1, 2, 3,",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 48},
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        out = response.json()
+        self.assertTrue(
+            out["text"].lstrip().startswith("4, 5, 6, 7, 8, 9, 10"), out["text"]
+        )
+        self.assertGreater(out["meta_info"]["spec_verify_ct"], 0)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
