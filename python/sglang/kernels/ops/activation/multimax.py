@@ -15,8 +15,8 @@
 """The "multimax" logit activation in one pointwise launch.
 
 ``x + t0*relu(r0-x) + t1*relu(x-r1) + t2*relu(r2-x)^2 + t3*relu(x-r3)^2`` with
-every primitive rounded to bf16, so it is bit-identical to the eager spelling,
-NaN and infinities included.
+every primitive rounded to the dtype of ``x`` (bf16 or fp32), so it is
+bit-identical to the eager spelling, NaN and infinities included.
 """
 
 from __future__ import annotations
@@ -37,6 +37,13 @@ def _round_bf16(value):
 
 
 @triton.jit
+def _round(value, ROUND_BF16: tl.constexpr):
+    if ROUND_BF16:
+        return _round_bf16(value)
+    return value
+
+
+@triton.jit
 def _relu(value):
     # F.relu keeps a NaN input, which tl.maximum alone would turn into 0.
     return tl.where(value != value, value, tl.maximum(value, 0))
@@ -44,7 +51,13 @@ def _relu(value):
 
 @triton.jit
 def _multimax_kernel(
-    x_ptr, ranges_ptr, ts_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
+    x_ptr,
+    ranges_ptr,
+    ts_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    ROUND_BF16: tl.constexpr,
 ):
     # int64: 11K rows of a 200K vocab already pass 2**31 elements.
     offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -58,14 +71,16 @@ def _multimax_kernel(
     t1 = tl.load(ts_ptr + 1).to(tl.float32)
     t2 = tl.load(ts_ptr + 2).to(tl.float32)
     t3 = tl.load(ts_ptr + 3).to(tl.float32)
-    lower = _round_bf16(_relu(r0 - x))
-    upper = _round_bf16(_relu(x - r1))
-    lower_sq = _round_bf16(_relu(r2 - x))
-    upper_sq = _round_bf16(_relu(x - r3))
-    out = _round_bf16(x + _round_bf16(t0 * lower))
-    out = _round_bf16(out + _round_bf16(t1 * upper))
-    out = _round_bf16(out + _round_bf16(t2 * _round_bf16(lower_sq * lower_sq)))
-    out = _round_bf16(out + _round_bf16(t3 * _round_bf16(upper_sq * upper_sq)))
+    lower = _round(_relu(r0 - x), ROUND_BF16)
+    upper = _round(_relu(x - r1), ROUND_BF16)
+    lower_sq = _round(_relu(r2 - x), ROUND_BF16)
+    upper_sq = _round(_relu(x - r3), ROUND_BF16)
+    out = _round(x + _round(t0 * lower, ROUND_BF16), ROUND_BF16)
+    out = _round(out + _round(t1 * upper, ROUND_BF16), ROUND_BF16)
+    sq = _round(lower_sq * lower_sq, ROUND_BF16)
+    out = _round(out + _round(t2 * sq, ROUND_BF16), ROUND_BF16)
+    sq = _round(upper_sq * upper_sq, ROUND_BF16)
+    out = _round(out + _round(t3 * sq, ROUND_BF16), ROUND_BF16)
     tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -81,9 +96,9 @@ def multimax_torch(
 
 
 def multimax(x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
-    """``ranges`` / ``ts`` are 4-element bf16 tensors; a bf16 ``x`` runs the
-    kernel, any other dtype the eager spelling."""
-    if x.dtype != torch.bfloat16:
+    """``ranges`` / ``ts`` are 4-element bf16 tensors; a bf16 or fp32 ``x`` runs
+    the kernel, any other dtype the eager spelling."""
+    if x.dtype not in (torch.bfloat16, torch.float32):
         return multimax_torch(x, ranges, ts)
     assert ranges.dtype == ts.dtype == torch.bfloat16, (
         f"multimax is bf16-only, got {ranges.dtype}, {ts.dtype}"
@@ -97,6 +112,14 @@ def multimax(x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor) -> torch.T
     # Arbitrary split between small (decode) and large (prefill) launches; not tuned.
     block = 1024 if n <= 1 << 17 else 2048
     _multimax_kernel[(triton.cdiv(n, block),)](
-        x, ranges, ts, out, n, BLOCK_SIZE=block, num_warps=4 if block == 1024 else 8
+        x,
+        ranges,
+        ts,
+        out,
+        n,
+        BLOCK_SIZE=block,
+        ROUND_BF16=x.dtype == torch.bfloat16,
+        num_warps=4 if block == 1024 else 8,
+        enable_fp_fusion=False,
     )
     return out
