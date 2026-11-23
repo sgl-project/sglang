@@ -724,8 +724,8 @@ def forward_dsa_core_npu(
             m, dcp_metadata, k_nope, k_pe
         )
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    # Never set under DCP: the plan refuses it, so a forward never takes both
-    # paths.
+    # Under DCP, set only for an extend that gathers the KV: the plan refuses
+    # the query gather, so a forward never takes both paths.
     dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
     if dsa_token_shard_plan is None:
         attn_output = forward_mla_attention_npu(
