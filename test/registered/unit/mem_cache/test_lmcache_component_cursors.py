@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchResult,
@@ -219,21 +220,36 @@ def test_external_slots_on_independent_full_mamba_pool_reclaim_only_full_tokens(
     cache.evict.assert_not_called()
 
 
-def test_independent_window_load_reclaims_full_and_only_the_window_tail(cache_class):
-    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
-
+@pytest.mark.parametrize(
+    ("full_free", "window_free", "expected"),
+    [
+        (8, 4, None),
+        (6, 4, EvictParams(num_tokens=2)),
+        (8, 3, EvictParams(window_num_tokens={FIRST: 1})),
+        (6, 3, EvictParams(num_tokens=2, window_num_tokens={FIRST: 1})),
+    ],
+)
+def test_independent_window_load_evicts_only_pool_shortfalls(
+    cache_class, full_free, window_free, expected
+):
     cache, _, _ = _cache_and_request(cache_class, swa_enabled=True)
-    cache.evict_for_alloc = mock.Mock()
+    cache.disable = False
+    cache.tree_components = (ComponentType.FULL, FIRST_WINDOW)
+    cache._evict = mock.Mock()
     allocator = mock.Mock(pools_share_memory=False, hands_out_virtual_ids=False)
+    allocator.owner_available_size.return_value = full_free
+    allocator.window_available_size.return_value = window_free
     allocator.full_attn_allocator.alloc.return_value = torch.arange(8)
     allocator.swa_attn_allocator.alloc.return_value = torch.arange(4)
     cache.token_to_kv_pool_allocator = allocator
     with mock.patch.object(cache_class, "sliding_window_size", 4):
         slots = cache._allocate_external_slots(8)
     assert slots is allocator.full_attn_allocator.alloc.return_value
-    cache.evict_for_alloc.assert_called_once_with(
-        KVDemand(full_tokens=8, window_tokens={FIRST: 4})
-    )
+    if expected is None:
+        cache._evict.assert_not_called()
+    else:
+        cache._evict.assert_called_once()
+        assert cache._evict.call_args.args == (expected,)
     allocator.swa_attn_allocator.alloc.assert_called_once_with(4)
 
 
