@@ -2307,34 +2307,15 @@ class DeepseekV4HipRadixBackend(
         )
         graph_tail = None
         if for_prefill_graph:
-            real_rows = int(sum(tail_lens_cpu))
-            cap = self._prefill_graph_tail_block_rows(forward_batch)
-            assert real_rows <= cap, (real_rows, cap)
-            idx_buf, pos_buf, scatter_buf, swa_buf, loc_buf = (
-                buf[:cap]
-                for buf in self._prefill_graph_tail_buffers(
-                    device,
-                    forward_batch.positions.dtype,
-                    forward_batch.out_cache_loc.dtype,
-                )
+            graph_tail, out_cache_loc = self._fill_prefill_graph_tail_block(
+                forward_batch,
+                token_indices=token_indices,
+                tail_lens_cpu=tail_lens_cpu,
+                contiguous_start=contiguous_start,
             )
-            real_idx = (
-                torch.arange(contiguous_start, extend_lens_cpu[0], device=device)
-                if contiguous_start is not None
-                else token_indices
-            )
-            idx_buf[:real_rows].copy_(real_idx)
-            idx_buf[real_rows:].zero_()
-            scatter_buf[:real_rows].copy_(real_idx)
-            scatter_buf[real_rows:].fill_(int(forward_batch.out_cache_loc.shape[0]))
-            pos_buf[:real_rows].copy_(forward_batch.positions[real_idx])
-            pos_buf[real_rows:].zero_()
-            loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[real_idx])
-            loc_buf[real_rows:].zero_()
-            swa_replay_start = F.pad(swa_replay_start, (0, cap - real_rows))
-            graph_tail = (real_rows, idx_buf, pos_buf, scatter_buf, swa_buf)
+            pad_rows = out_cache_loc.shape[0] - sum(tail_lens_cpu)
+            swa_replay_start = F.pad(swa_replay_start, (0, pad_rows))
             contiguous_start = None
-            out_cache_loc = loc_buf
         else:
             out_cache_loc = _tail_rows(
                 forward_batch.out_cache_loc,
@@ -2371,28 +2352,20 @@ class DeepseekV4HipRadixBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         if graph_tail is not None:
-            real_rows, idx_buf, pos_buf, scatter_buf, swa_buf = graph_tail
+            real_rows, token_indices, positions, scatter_indices, swa_buf = graph_tail
             swa_buf.copy_(swa_out_cache_loc.to(torch.int32))
+            swa_out_cache_loc = swa_buf
             if metadata.low_ratio_req_indices is None:
-                cap = idx_buf.shape[0]
                 req = torch.repeat_interleave(
                     forward_batch.req_pool_indices.to(torch.int64),
                     tail_lens.to(torch.int64),
                 )
                 metadata.low_ratio_req_indices = torch.cat(
-                    [req, req.new_zeros(cap - real_rows)]
+                    [req, req.new_zeros(positions.shape[0] - real_rows)]
                 )
-                metadata.low_ratio_pos_i64 = pos_buf.to(torch.int64)
-            metadata.late_layer_tail = LateLayerTail(
-                token_indices=idx_buf,
-                positions=pos_buf,
-                extend_seq_lens=tail_lens,
-                extend_seq_lens_cpu=tail_lens_cpu,
-                swa_out_cache_loc=swa_buf,
-                scatter_indices=scatter_buf,
-                real_rows_count=real_rows,
-            )
+                metadata.low_ratio_pos_i64 = positions.to(torch.int64)
         else:
+            real_rows = scatter_indices = None
             metadata.low_ratio_req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
@@ -2404,16 +2377,57 @@ class DeepseekV4HipRadixBackend(
                 contiguous_start=contiguous_start,
             )
             metadata.low_ratio_pos_i64 = positions.to(torch.int64)
-            metadata.late_layer_tail = LateLayerTail(
-                token_indices=token_indices,
-                positions=positions,
-                extend_seq_lens=tail_lens,
-                extend_seq_lens_cpu=tail_lens_cpu,
-                swa_out_cache_loc=swa_out_cache_loc,
-                contiguous_start=contiguous_start,
-            )
+        metadata.late_layer_tail = LateLayerTail(
+            token_indices=token_indices,
+            positions=positions,
+            extend_seq_lens=tail_lens,
+            extend_seq_lens_cpu=tail_lens_cpu,
+            swa_out_cache_loc=swa_out_cache_loc,
+            contiguous_start=contiguous_start,
+            scatter_indices=scatter_indices,
+            real_rows_count=real_rows,
+        )
         self._refresh_fp4_prefill_workspace(forward_batch, metadata)
         return metadata
+
+    def _fill_prefill_graph_tail_block(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        token_indices: torch.Tensor,
+        tail_lens_cpu: List[int],
+        contiguous_start: Optional[int],
+    ) -> Tuple[tuple, torch.Tensor]:
+        """The shape's tail block in the persistent buffers: real tail rows first;
+        padding rows gather row 0 and scatter past the shape's rows."""
+        device = forward_batch.out_cache_loc.device
+        real_rows = int(sum(tail_lens_cpu))
+        cap = self._prefill_graph_tail_block_rows(forward_batch)
+        assert real_rows <= cap, (real_rows, cap)
+        idx_buf, pos_buf, scatter_buf, swa_buf, loc_buf = (
+            buf[:cap]
+            for buf in self._prefill_graph_tail_buffers(
+                device,
+                forward_batch.positions.dtype,
+                forward_batch.out_cache_loc.dtype,
+            )
+        )
+        real_idx = (
+            torch.arange(
+                contiguous_start, forward_batch.extend_seq_lens_cpu[0], device=device
+            )
+            if contiguous_start is not None
+            else token_indices
+        )
+        idx_buf[:real_rows].copy_(real_idx)
+        idx_buf[real_rows:].zero_()
+        scatter_buf[:real_rows].copy_(real_idx)
+        scatter_buf[real_rows:].fill_(int(forward_batch.out_cache_loc.shape[0]))
+        pos_buf[:real_rows].copy_(forward_batch.positions[real_idx])
+        pos_buf[real_rows:].zero_()
+        loc_buf[:real_rows].copy_(forward_batch.out_cache_loc[real_idx])
+        loc_buf[real_rows:].zero_()
+        return (real_rows, idx_buf, pos_buf, scatter_buf, swa_buf), loc_buf
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
