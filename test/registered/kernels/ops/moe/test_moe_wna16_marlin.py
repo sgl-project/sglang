@@ -1360,5 +1360,170 @@ def test_muse_marlin_inactive_routes(
     torch.testing.assert_close(weights, input_weights, rtol=0, atol=0, equal_nan=True)
 
 
+def _mxfp8_moe_weights(e: int, n: int, k: int):
+    """Canonical E4M3/E8M0 weights and an independent float32 dequantization."""
+    weight = torch.randn(e, n, k, device="cuda") / 16
+    blocks = weight.view(e, n, k // 32, 32)
+    blocks = (
+        blocks
+        * torch.exp2(torch.randint(-6, 7, blocks.shape[:-1], device="cuda"))[..., None]
+    )
+    exponent = torch.ceil(torch.log2(blocks.abs().amax(-1) / 448))
+    scale = torch.exp2(exponent)
+    quantized = (blocks / scale[..., None]).to(torch.float8_e4m3fn)
+    reference = (quantized.float() * scale[..., None]).reshape(e, n, k)
+    return quantized.reshape(e, n, k), (exponent + 127).to(torch.uint8), reference
+
+
+@pytest.mark.parametrize("m", [1, 33, 73, 137, 222])
+# keep_router_weight None leaves the argument at its default.
+@pytest.mark.parametrize(
+    "no_combine, keep_router_weight",
+    [(False, None), (True, None), (True, True), (True, False)],
+)
+def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
+    """Catches missing E8M0 dispatch, FP8 exponent bias and weighted-route regressions."""
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        prepare_moe_mxfp8_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    e, topk, k, n = 8, 2, 256, 128
+    w13, s13, ref13 = _mxfp8_moe_weights(e, 2 * n, k)
+    w2, s2, ref2 = _mxfp8_moe_weights(e, k, n)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
+    prepare_moe_mxfp8_layer_for_marlin(layer)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
+    weights, ids = torch.topk(logits.float().softmax(-1), topk)
+    output = fused_marlin_moe(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=logits,
+        topk_weights=weights,
+        topk_ids=ids.to(torch.int32),
+        num_bits=8,
+        no_combine=no_combine,
+        **(
+            {}
+            if keep_router_weight is None
+            else {"no_combine_keep_router_weight": keep_router_weight}
+        ),
+    )
+    gate_up = torch.einsum("mk,mrnk->mrn", x.float(), ref13[ids])
+    gate, up = gate_up.bfloat16().float().chunk(2, dim=-1)
+    act = (torch.nn.functional.silu(gate) * up).bfloat16().float()
+    routes = torch.einsum("mrn,mrkn->mrk", act, ref2[ids])
+    weighted_routes = routes * weights[..., None]
+    if not no_combine:
+        expected = weighted_routes.sum(1)
+    else:
+        expected = routes if keep_router_weight is False else weighted_routes
+    assert output.shape == expected.shape
+    relative_error = (output.float() - expected).norm() / expected.norm()
+    assert relative_error < 0.01
+    route_error = (output.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
+    assert route_error.max() < 0.02
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [1, 123])
+def test_moe_wna16_marlin_gemm_mxfp8_scale_dtypes(m, dtype):
+    """FP8 group-32 weights dispatch on the scale dtype: E8M0 scales (MXFP8, BF16
+    activations only) and activation-dtype scales with the FP8 exponent bias
+    folded in (Inkling2's repack) must both match the dequantized reference,
+    and each other bitwise."""
+    from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
+        prepare_moe_mxfp8_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    e, topk, k, n = 8, 2, 256, 128
+    w13, s13, ref13 = _mxfp8_moe_weights(e, 2 * n, k)
+    w2, s2, _ = _mxfp8_moe_weights(e, k, n)
+    float_scales = torch.exp2(s13.float() - 127).to(dtype)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
+    prepare_moe_mxfp8_layer_for_marlin(layer)
+    folded_scales = torch.stack(
+        [
+            fp8_fused_exponent_bias_into_scales(
+                marlin_permute_scales(
+                    s=float_scales[i].T.contiguous(),
+                    size_k=k,
+                    size_n=2 * n,
+                    group_size=32,
+                )
+            )
+            for i in range(e)
+        ]
+    )
+    assert layer.w13_weight_scale.dtype == torch.float8_e8m0fnu
+    assert folded_scales.dtype == dtype
+    scale_sets = [folded_scales]
+    if dtype == torch.bfloat16:
+        scale_sets.insert(0, layer.w13_weight_scale)
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids = torch.topk(score.float().softmax(-1), topk)
+    block_size_m = 8 if m == 1 else 16
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, e
+    )
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    workspace = torch.zeros(sms * 4, dtype=torch.int, device="cuda")
+
+    outputs = []
+    for scales in scale_sets:
+        c = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
+        outputs.append(
+            _run_single_gemm(
+                moe_wna16_marlin_gemm,
+                a,
+                c,
+                layer.w13_weight,
+                scales,
+                None,
+                None,
+                None,
+                workspace,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                topk_weights,
+                scalar_types.float8_e4m3fn,
+                block_size_m,
+                topk,
+                m,
+                2 * n,
+                k,
+                False,
+                True,
+                False,
+            )
+        )
+
+    per_expert = torch.matmul(a.float(), ref13.transpose(1, 2))
+    tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    expected = per_expert[topk_ids.flatten(), tokens].to(dtype)
+    for output in outputs:
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    if len(outputs) == 2:
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
