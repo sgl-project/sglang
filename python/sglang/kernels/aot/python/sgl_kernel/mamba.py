@@ -143,100 +143,87 @@ def _mamba_chunk_scan_cpu_varlen(
     track_seq_idx,
     track_end_locs,
 ):
+    """Packed varlen scan: a single kernel launch for all sequences.
+
+    Intermediate (global chunk-grid) and track states are extracted inside the
+    same launch from the materialized per-chunk states, instead of re-running
+    the scan on every prefix.
+    """
     import sgl_kernel  # noqa: F401
 
-    batch, _, nheads, headdim = x.shape
+    batch, total_tokens, nheads, headdim = x.shape
     dstate = B.shape[-1]
-    offsets = [int(value) for value in cu_seqlens.tolist()]
-    total_tokens = x.shape[1]
-    output = torch.empty_like(x) if out is None else out
-    final_by_sequence = []
     result_dtype = state_dtype or C.dtype
-    cpu_scan = torch.ops.sgl_kernel.mamba_chunk_scan_combined_cpu
+    cu = cu_seqlens.to(device="cpu", dtype=torch.int64)
+    num_seqs = cu.numel() - 1
 
-    def initial_state_for(seq_idx):
-        if initial_states is not None:
-            return initial_states[seq_idx].to(result_dtype)
-        return torch.zeros(nheads, headdim, dstate, dtype=result_dtype, device=x.device)
+    # Requested (seq, global position) pairs: chunk-grid boundaries first, then tracks.
+    req_seq = []
+    req_pos = []
+    num_global_chunks = 0
+    if (return_intermediate_states or return_track_states) and num_seqs > 0:
+        num_global_chunks = (total_tokens + chunk_size - 1) // chunk_size
+        boundaries = torch.arange(num_global_chunks, dtype=torch.int64) * chunk_size
+        # last sequence whose start <= boundary (skips empty sequences)
+        owner = torch.searchsorted(cu[:-1].contiguous(), boundaries, right=True) - 1
+        req_seq.append(owner.clamp_(0, num_seqs - 1))
+        req_pos.append(boundaries)
+    num_track = 0
+    if (
+        return_track_states
+        and track_seq_idx is not None
+        and track_end_locs is not None
+        and track_end_locs.numel() > 0
+    ):
+        num_track = track_end_locs.numel()
+        req_seq.append(track_seq_idx.to(device="cpu", dtype=torch.int64).reshape(-1))
+        req_pos.append(track_end_locs.to(device="cpu", dtype=torch.int64).reshape(-1))
 
-    def run_segment(seq_idx, start, end, segment_out=None):
-        init = (
-            initial_states[seq_idx : seq_idx + 1]
-            if initial_states is not None
-            else None
-        )
-        return cpu_scan(
-            x[:, start:end],
-            dt[:, start:end],
+    state_seq_idx = torch.cat(req_seq) if req_seq else None
+    state_pos = torch.cat(req_pos) if req_pos else None
+
+    output, varlen_states, req_states = (
+        torch.ops.sgl_kernel.mamba_chunk_scan_combined_varlen_cpu(
+            x,
+            dt,
             A,
-            B[:, start:end],
-            C[:, start:end],
+            B,
+            C,
             chunk_size,
             D,
-            z[:, start:end] if z is not None else None,
+            z,
             dt_bias,
-            init,
+            initial_states,
+            cu,
+            state_seq_idx,
+            state_pos,
             dt_softplus,
             dt_limit[0],
             dt_limit[1],
-            state_dtype,
-            segment_out,
-        )[1]
+            result_dtype,
+            out,
+        )
+    )
+    if out is not None and output.data_ptr() != out.data_ptr():
+        out.copy_(output)
 
-    for seq_idx, (start, end) in enumerate(zip(offsets, offsets[1:])):
-        segment_out = output[:, start:end]
-        final_state = run_segment(seq_idx, start, end, segment_out)
-        final_by_sequence.append(final_state)
-
-    if final_by_sequence:
-        varlen_states = torch.cat(final_by_sequence, dim=0)
-        final_states = final_by_sequence[-1]
+    if num_seqs > 0:
+        final_states = varlen_states[-1:]
     else:
         final_states = torch.zeros(
             batch, nheads, headdim, dstate, dtype=result_dtype, device=x.device
         )
-        varlen_states = final_states.new_empty((0, nheads, headdim, dstate))
 
     if return_intermediate_states or return_track_states:
-        num_global_chunks = (total_tokens + chunk_size - 1) // chunk_size
-        chunk_states = []
-        seq_idx = 0
-        for chunk_idx in range(num_global_chunks):
-            boundary = chunk_idx * chunk_size
-            while seq_idx + 1 < len(offsets) - 1 and boundary >= offsets[seq_idx + 1]:
-                seq_idx += 1
-            start = offsets[seq_idx]
-            if boundary == start:
-                chunk_states.append(initial_state_for(seq_idx))
-            else:
-                chunk_states.append(run_segment(seq_idx, start, boundary)[0])
-        intermediate_states = (
-            torch.stack(chunk_states).unsqueeze(0)
-            if chunk_states
-            else torch.empty(
-                (1, 0, nheads, headdim, dstate), dtype=result_dtype, device=x.device
-            )
-        )
+        intermediate_states = req_states[:num_global_chunks].unsqueeze(0)
     else:
         intermediate_states = None
 
     if return_track_states:
-        if (
-            track_seq_idx is None
-            or track_end_locs is None
-            or track_end_locs.numel() == 0
-        ):
-            track_states = torch.empty(
-                (0, nheads, headdim, dstate), dtype=result_dtype, device=x.device
-            )
+        if num_track > 0:
+            track_states = req_states[num_global_chunks:]
         else:
-            tracked = []
-            for seq_idx, track_end in zip(
-                track_seq_idx.tolist(), track_end_locs.tolist()
-            ):
-                start = offsets[int(seq_idx)]
-                tracked.append(run_segment(int(seq_idx), start, int(track_end))[0])
-            track_states = torch.stack(tracked)
+            track_states = req_states.new_empty((0, nheads, headdim, dstate))
         return intermediate_states, varlen_states, track_states
 
     if return_intermediate_states:
@@ -446,3 +433,8 @@ def selective_state_update(
         disable_state_update,
         out,
     )
+
+
+# Names imported by sglang.srt.layers.attention.mamba.mamba on CPU.
+mamba_chunk_scan_combined_cpu = mamba_chunk_scan_combined
+selective_state_update_cpu = selective_state_update

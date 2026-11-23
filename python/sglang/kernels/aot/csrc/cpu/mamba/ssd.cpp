@@ -175,17 +175,28 @@ inline void scan_epilogue_row(
 //   3. chunk scan:    y = (C @ S_in^T) * exp(cum) + ((C @ B^T) * L) @ x      [brgemm, amx]
 // states are kept transposed as [N, P] so that they serve directly as the vnni B operand.
 //
-// x, z  : [Bs, T, H, P]
-// B, C  : [Bs, T, G, N]
-// dt    : [Bs, T, H]
-// init  : [Bs, H, P, N]
-// final : [Bs, H, P, N]
-// states: [Bs, NC, H, N, P] workspace
-// dt_buf, cum_buf : [Bs, H, NC, L] workspace
+// Varlen: all sequences are packed along time (T = total tokens), sequence s spans
+// [cu_seqlens[s], cu_seqlens[s + 1]) and is split into its own chunks of size L, so the
+// numerics are identical to scanning every sequence separately, but all (seq, chunk)
+// pairs run inside one parallel region.
+//
+// Optional stage 4 extracts the state after `req_pos - cu_seqlens[req_seq]` tokens of
+// sequence `req_seq` from the materialized chunk states (O(1) chunk per request),
+// instead of re-running the scan on the prefix.
+//
+// x, z  : [T, H, P]
+// B, C  : [T, G, N]
+// dt    : [T, H]
+// init  : [S, H, P, N]
+// final : [S, H, P, N]
+// req   : [R, H, P, N]
+// states: [NCt, H, N, P] workspace
+// dt_buf, cum_buf : [NCt, H, L] workspace
 template <typename scalar_t>
 void mamba_chunk_scan_kernel_impl(
     scalar_t* __restrict__ out,
     float* __restrict__ final_state,
+    float* __restrict__ req_state,
     float* __restrict__ states,
     float* __restrict__ dt_buf,
     float* __restrict__ cum_buf,
@@ -203,51 +214,65 @@ void mamba_chunk_scan_kernel_impl(
     bool dt_softplus,
     float dt_min,
     float dt_max,
-    int64_t Bs,
-    int64_t T,
+    const int64_t* __restrict__ cu_seqlens,   // [S + 1]
+    const int64_t* __restrict__ chunk_start,  // [S + 1], first global chunk of each seq
+    const int64_t* __restrict__ chunk_seq,    // [NCt], seq of each global chunk
+    const int64_t* __restrict__ req_seq,      // [R]
+    const int64_t* __restrict__ req_pos,      // [R], global token position
+    int64_t S,
+    int64_t NCt,
+    int64_t R,
     int64_t H,
     int64_t P,
     int64_t G,
     int64_t N,
     int64_t L) {
-  const int64_t NC = div_up(T, L);
   const int64_t HG = H / G;
   const int64_t Lp = div_up(L, int64_t(TILE_K)) * TILE_K;
   const int64_t Np = div_up(N, int64_t(TILE_K)) * TILE_K;
   const int64_t ld_x = H * P;
   const int64_t ld_bc = G * N;
 
-  // split heads of a group into HB blocks when [Bs, NC, G] alone cannot occupy all threads;
+  // (global token offset, length) of global chunk c
+  auto chunk_range = [&](int64_t c, int64_t& t0, int64_t& Lc) {
+    const int64_t s = chunk_seq[c];
+    const int64_t local = (c - chunk_start[s]) * L;
+    t0 = cu_seqlens[s] + local;
+    Lc = std::min(L, cu_seqlens[s + 1] - cu_seqlens[s] - local);
+  };
+
+  // split heads of a group into HB blocks when [NCt, G] alone cannot occupy all threads;
   // the group-shared B^T / CB are recomputed per block.
-  const int64_t HB = std::min(HG, std::max(int64_t(1), div_up(int64_t(at::get_num_threads()), Bs * NC * G)));
+  const int64_t HB =
+      std::min(HG, std::max(int64_t(1), div_up(int64_t(at::get_num_threads()), std::max(int64_t(1), NCt * G))));
   const int64_t HB_size = div_up(HG, HB);
 
-  // stage 1: dt, cumsum and chunk local states, parallel on [Bs, NC, G, HB]
-  at::parallel_for(0, Bs * NC * G * HB, 0, [&](int64_t begin, int64_t end) {
+  // stage 1: dt, cumsum and chunk local states, parallel on [NCt, G, HB]
+  at::parallel_for(0, NCt * G * HB, 0, [&](int64_t begin, int64_t end) {
     std::vector<scalar_t> Bt(N * Lp);
     std::vector<scalar_t> xw(L * P);
     std::vector<scalar_t> xw_packed(Lp * P);
 
-    int64_t b{0}, c{0}, g{0}, hb{0};
-    data_index_init(begin, b, Bs, c, NC, g, G, hb, HB);
+    int64_t c{0}, g{0}, hb{0};
+    data_index_init(begin, c, NCt, g, G, hb, HB);
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t t0 = c * L;
-      const int64_t Lc = std::min(L, T - t0);
+      int64_t t0, Lc;
+      chunk_range(c, t0, Lc);
       const int64_t Kp = div_up(Lc, int64_t(TILE_K)) * TILE_K;
 
       // B^T: [N, Kp], shared by all heads in the group
-      transpose_16bit(Lc, N, Bm + ((b * T + t0) * G + g) * N, ld_bc, Bt.data(), Kp);
+      transpose_16bit(Lc, N, Bm + (t0 * G + g) * N, ld_bc, Bt.data(), Kp);
       for (int64_t n = 0; n < N; ++n) {
         std::fill(Bt.data() + n * Kp + Lc, Bt.data() + n * Kp + Kp, scalar_t(0));
       }
 
       for (int64_t h = g * HG + hb * HB_size; h < std::min(g * HG + (hb + 1) * HB_size, (g + 1) * HG); ++h) {
-        float* __restrict__ dt_row = dt_buf + ((b * H + h) * NC + c) * L;
-        float* __restrict__ cum_row = cum_buf + ((b * H + h) * NC + c) * L;
+        float* __restrict__ dt_row = dt_buf + (c * H + h) * L;
+        float* __restrict__ cum_row = cum_buf + (c * H + h) * L;
         const float bias = dt_bias != nullptr ? dt_bias[h] : 0.f;
         float running = 0.f;
         for (int64_t l = 0; l < Lc; ++l) {
-          float v = dt[(b * T + t0 + l) * H + h] + bias;
+          float v = dt[(t0 + l) * H + h] + bias;
           if (dt_softplus) {
             v = softplus(v);
           }
@@ -260,7 +285,7 @@ void mamba_chunk_scan_kernel_impl(
         // x * dt * exp(cum_last - cum): [Lc, P]
         for (int64_t l = 0; l < Lc; ++l) {
           const float w = dt_row[l] * std::exp(running - cum_row[l]);
-          scale_row(xw.data() + l * P, x + (b * T + t0 + l) * ld_x + h * P, w, P);
+          scale_row(xw.data() + l * P, x + (t0 + l) * ld_x + h * P, w, P);
         }
         pack_rows_vnni(xw_packed.data(), xw.data(), Lc, Kp, P, P);
 
@@ -274,51 +299,52 @@ void mamba_chunk_scan_kernel_impl(
             /* add_C */ false,
             /*     A */ Bt.data(),
             /*     B */ xw_packed.data(),
-            /*     C */ states + ((b * NC + c) * H + h) * N * P);
+            /*     C */ states + (c * H + h) * N * P);
       }
-      data_index_step(b, Bs, c, NC, g, G, hb, HB);
+      data_index_step(c, NCt, g, G, hb, HB);
     }
     at::native::cpublas::brgemm_release();
   });
 
-  // stage 2: inter-chunk recurrence, parallel on [Bs, H]
+  // stage 2: inter-chunk recurrence, parallel on [S, H]
   //   states[c] is replaced in-place by the state entering chunk c
-  at::parallel_for(0, Bs * H, 0, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, S * H, 0, [&](int64_t begin, int64_t end) {
     constexpr int64_t kVecSize = fVec::size();
     const int64_t size = N * P;
     std::vector<float> run(size);
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t b = i / H;
+      const int64_t s = i / H;
       const int64_t h = i % H;
       if (init != nullptr) {
         at::native::utils::transpose<float>(P, N, init + i * P * N, N, run.data(), P);
       } else {
         std::fill(run.begin(), run.end(), 0.f);
       }
-      for (int64_t c = 0; c < NC; ++c) {
-        const int64_t Lc = std::min(L, T - c * L);
-        const float decay = std::exp(cum_buf[((b * H + h) * NC + c) * L + Lc - 1]);
+      for (int64_t c = chunk_start[s]; c < chunk_start[s + 1]; ++c) {
+        int64_t t0, Lc;
+        chunk_range(c, t0, Lc);
+        const float decay = std::exp(cum_buf[(c * H + h) * L + Lc - 1]);
         const fVec vdecay(decay);
-        float* __restrict__ st = states + ((b * NC + c) * H + h) * size;
+        float* __restrict__ st = states + (c * H + h) * size;
         int64_t j = 0;
         for (; j <= size - kVecSize; j += kVecSize) {
-          fVec s = fVec::loadu(st + j);
+          fVec sv = fVec::loadu(st + j);
           fVec r = fVec::loadu(run.data() + j);
           r.store(st + j);
-          at::vec::fmadd(r, vdecay, s).store(run.data() + j);
+          at::vec::fmadd(r, vdecay, sv).store(run.data() + j);
         }
         for (; j < size; ++j) {
-          const float s = st[j];
+          const float sv = st[j];
           st[j] = run[j];
-          run[j] = run[j] * decay + s;
+          run[j] = run[j] * decay + sv;
         }
       }
       at::native::utils::transpose<float>(N, P, run.data(), P, final_state + i * P * N, N);
     }
   });
 
-  // stage 3: chunk output, parallel on [Bs, NC, G, HB]
-  at::parallel_for(0, Bs * NC * G * HB, 0, [&](int64_t begin, int64_t end) {
+  // stage 3: chunk output, parallel on [NCt, G, HB]
+  at::parallel_for(0, NCt * G * HB, 0, [&](int64_t begin, int64_t end) {
     std::vector<scalar_t> C_pad(N == Np ? 0 : L * Np);
     std::vector<scalar_t> B_packed(Np * L);
     std::vector<float> CB(L * L);
@@ -330,14 +356,14 @@ void mamba_chunk_scan_kernel_impl(
     std::vector<float> acc(L * P);
     std::vector<float> D_row(P);
 
-    int64_t b{0}, c{0}, g{0}, hb{0};
-    data_index_init(begin, b, Bs, c, NC, g, G, hb, HB);
+    int64_t c{0}, g{0}, hb{0};
+    data_index_init(begin, c, NCt, g, G, hb, HB);
     for (int64_t i = begin; i < end; ++i) {
-      const int64_t t0 = c * L;
-      const int64_t Lc = std::min(L, T - t0);
+      int64_t t0, Lc;
+      chunk_range(c, t0, Lc);
       const int64_t Kp = div_up(Lc, int64_t(TILE_K)) * TILE_K;
-      const scalar_t* __restrict__ C_ptr = Cm + ((b * T + t0) * G + g) * N;
-      const scalar_t* __restrict__ B_ptr = Bm + ((b * T + t0) * G + g) * N;
+      const scalar_t* __restrict__ C_ptr = Cm + (t0 * G + g) * N;
+      const scalar_t* __restrict__ B_ptr = Bm + (t0 * G + g) * N;
 
       // C as A operand: [Lc, Np]
       const scalar_t* A_C = C_ptr;
@@ -367,18 +393,18 @@ void mamba_chunk_scan_kernel_impl(
           /*     C */ CB.data());
 
       for (int64_t h = g * HG + hb * HB_size; h < std::min(g * HG + (hb + 1) * HB_size, (g + 1) * HG); ++h) {
-        const float* __restrict__ dt_row = dt_buf + ((b * H + h) * NC + c) * L;
-        const float* __restrict__ cum_row = cum_buf + ((b * H + h) * NC + c) * L;
+        const float* __restrict__ dt_row = dt_buf + (c * H + h) * L;
+        const float* __restrict__ cum_row = cum_buf + (c * H + h) * L;
 
         // W = tril(CB * exp(cum_l - cum_s) * dt_s): [Lc, Kp]
         for (int64_t l = 0; l < Lc; ++l) {
           decay_row(w_row.data(), CB.data() + l * Lc, cum_row, dt_row, l, Kp);
           store_row_fp32(W.data() + l * Kp, w_row.data(), Kp);
         }
-        pack_rows_vnni(x_packed.data(), x + (b * T + t0) * ld_x + h * P, Lc, Kp, P, ld_x);
+        pack_rows_vnni(x_packed.data(), x + t0 * ld_x + h * P, Lc, Kp, P, ld_x);
 
         // state entering this chunk as vnni B operand: [Np/2, P, 2]
-        const float* __restrict__ st = states + ((b * NC + c) * H + h) * N * P;
+        const float* __restrict__ st = states + (c * H + h) * N * P;
         store_row_fp32(s_cvt.data(), st, N * P);
         pack_rows_vnni(s_packed.data(), s_cvt.data(), N, Np, P, P);
 
@@ -419,14 +445,90 @@ void mamba_chunk_scan_kernel_impl(
           D_ptr = D_row.data();
         }
         for (int64_t l = 0; l < Lc; ++l) {
-          const int64_t offset = (b * T + t0 + l) * ld_x + h * P;
+          const int64_t offset = (t0 + l) * ld_x + h * P;
           scan_epilogue_row(
               out + offset, acc.data() + l * P, x + offset, z != nullptr ? z + offset : nullptr, D_ptr, P);
         }
       }
-      data_index_step(b, Bs, c, NC, g, G, hb, HB);
+      data_index_step(c, NCt, g, G, hb, HB);
     }
     at::native::cpublas::brgemm_release();
+  });
+
+  if (R == 0) {
+    return;
+  }
+
+  // stage 4: states at requested positions, parallel on [R, H]
+  //   local = pos - seq_start, k = local / L, r = local % L
+  //   r == 0          : S_in[k] (or final when k == nchunks)
+  //   otherwise       : S = S_in[k] * exp(cum[r-1]) + B[:r]^T @ (x[:r] * dt * exp(cum[r-1] - cum))
+  at::parallel_for(0, R * H, 0, [&](int64_t begin, int64_t end) {
+    std::vector<scalar_t> Bt(N * Lp);
+    std::vector<scalar_t> xw(L * P);
+    std::vector<scalar_t> xw_packed(Lp * P);
+    std::vector<float> tmp(N * P);
+    bool used_brgemm = false;
+
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t q = i / H;
+      const int64_t h = i % H;
+      const int64_t s = req_seq[q];
+      const int64_t seq_len = cu_seqlens[s + 1] - cu_seqlens[s];
+      const int64_t local = req_pos[q] - cu_seqlens[s];
+      float* __restrict__ dst = req_state + i * P * N;
+
+      const int64_t k = local / L;
+      const int64_t r = local % L;
+      if (local == seq_len) {
+        std::copy(final_state + (s * H + h) * P * N, final_state + (s * H + h + 1) * P * N, dst);
+        continue;
+      }
+      const int64_t c = chunk_start[s] + k;
+      const float* __restrict__ st = states + (c * H + h) * N * P;
+      if (r == 0) {
+        at::native::utils::transpose<float>(N, P, st, P, dst, N);
+        continue;
+      }
+
+      int64_t t0, Lc;
+      chunk_range(c, t0, Lc);
+      const int64_t Kp = div_up(r, int64_t(TILE_K)) * TILE_K;
+      const float* __restrict__ dt_row = dt_buf + (c * H + h) * L;
+      const float* __restrict__ cum_row = cum_buf + (c * H + h) * L;
+      const float cum_last = cum_row[r - 1];
+
+      transpose_16bit(r, N, Bm + (t0 * G + h / HG) * N, ld_bc, Bt.data(), Kp);
+      for (int64_t n = 0; n < N; ++n) {
+        std::fill(Bt.data() + n * Kp + r, Bt.data() + n * Kp + Kp, scalar_t(0));
+      }
+      for (int64_t l = 0; l < r; ++l) {
+        const float w = dt_row[l] * std::exp(cum_last - cum_row[l]);
+        scale_row(xw.data() + l * P, x + (t0 + l) * ld_x + h * P, w, P);
+      }
+      pack_rows_vnni(xw_packed.data(), xw.data(), r, Kp, P, P);
+      at::native::cpublas::brgemm(
+          /*     M */ N,
+          /*     N */ P,
+          /*     K */ Kp,
+          /*   lda */ Kp,
+          /*   ldb */ P,
+          /*   ldc */ P,
+          /* add_C */ false,
+          /*     A */ Bt.data(),
+          /*     B */ xw_packed.data(),
+          /*     C */ tmp.data());
+      used_brgemm = true;
+
+      const float decay = std::exp(cum_last);
+      for (int64_t j = 0; j < N * P; ++j) {
+        tmp[j] += st[j] * decay;
+      }
+      at::native::utils::transpose<float>(N, P, tmp.data(), P, dst, N);
+    }
+    if (used_brgemm) {
+      at::native::cpublas::brgemm_release();
+    }
   });
 }
 
@@ -671,6 +773,144 @@ at::Tensor selective_state_update_cpu(
   return output;
 }
 
+namespace {
+
+// Shared launcher. Tensors are already flattened to the packed varlen layout:
+//   x/z [T, H, P], dt [T, H], B/C [T, G, N], init [S, H, P, N] (optional),
+//   cu [S + 1] int64 (cpu), req_seq/req_pos [R] int64 (cpu, optional).
+// Returns (final fp32 [S, H, P, N], req fp32 [R, H, P, N]); writes y into out_buf [T, H, P].
+std::tuple<at::Tensor, at::Tensor> mamba_chunk_scan_varlen_launch(
+    const at::Tensor& out_buf,
+    const at::Tensor& x_c,
+    const at::Tensor& dt_f,
+    const at::Tensor& A_f,
+    const at::Tensor& B_c,
+    const at::Tensor& C_c,
+    int64_t L,
+    const at::Tensor& D_f,
+    const at::Tensor& z_c,
+    const at::Tensor& bias_f,
+    const at::Tensor& init_f,
+    const at::Tensor& cu,
+    const at::Tensor& req_seq,
+    const at::Tensor& req_pos,
+    bool dt_softplus,
+    double dt_min,
+    double dt_max) {
+  const int64_t T = x_c.size(0);
+  const int64_t H = x_c.size(1);
+  const int64_t P = x_c.size(2);
+  const int64_t G = B_c.size(1);
+  const int64_t N = B_c.size(2);
+  const int64_t S = cu.numel() - 1;
+  const int64_t R = req_seq.defined() ? req_seq.numel() : 0;
+  const int64_t* cu_ptr = cu.data_ptr<int64_t>();
+  TORCH_CHECK(S >= 0 && cu_ptr[0] == 0 && cu_ptr[S] == T, "cu_seqlens must start at 0 and end at total tokens");
+
+  std::vector<int64_t> chunk_start(S + 1, 0);
+  for (int64_t s = 0; s < S; ++s) {
+    const int64_t len = cu_ptr[s + 1] - cu_ptr[s];
+    TORCH_CHECK(len >= 0, "cu_seqlens must be non-decreasing");
+    chunk_start[s + 1] = chunk_start[s] + div_up(len, L);
+  }
+  if (R > 0) {
+    const int64_t* rs = req_seq.data_ptr<int64_t>();
+    const int64_t* rp = req_pos.data_ptr<int64_t>();
+    for (int64_t q = 0; q < R; ++q) {
+      TORCH_CHECK(
+          rp[q] >= cu_ptr[rs[q]] && rp[q] <= cu_ptr[rs[q] + 1], "state_pos must lie within its sequence [start, end]");
+    }
+  }
+  const int64_t NCt = chunk_start[S];
+  std::vector<int64_t> chunk_seq(NCt);
+  for (int64_t s = 0; s < S; ++s) {
+    std::fill(chunk_seq.begin() + chunk_start[s], chunk_seq.begin() + chunk_start[s + 1], s);
+  }
+
+  auto float_options = x_c.options().dtype(at::kFloat);
+  auto final_f = at::empty({S, H, P, N}, float_options);
+  auto req_f = at::empty({R, H, P, N}, float_options);
+  auto states = at::empty({NCt, H, N, P}, float_options);
+  auto dt_buf = at::empty({NCt, H, L}, float_options);
+  auto cum_buf = at::empty({NCt, H, L}, float_options);
+
+  if (NCt == 0) {
+    // every sequence is empty: final state = initial state
+    final_f.copy_(init_f.defined() ? init_f : at::zeros_like(final_f));
+    if (R > 0) {
+      req_f.copy_(final_f.index_select(0, req_seq));
+    }
+    return {final_f, req_f};
+  }
+
+  const auto dtype = x_c.scalar_type();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(dtype, "mamba_chunk_scan_combined_cpu", [&] {
+    mamba_chunk_scan_kernel_impl<scalar_t>(
+        out_buf.data_ptr<scalar_t>(),
+        final_f.data_ptr<float>(),
+        R > 0 ? req_f.data_ptr<float>() : nullptr,
+        states.data_ptr<float>(),
+        dt_buf.data_ptr<float>(),
+        cum_buf.data_ptr<float>(),
+        x_c.data_ptr<scalar_t>(),
+        B_c.data_ptr<scalar_t>(),
+        C_c.data_ptr<scalar_t>(),
+        z_c.defined() ? z_c.data_ptr<scalar_t>() : nullptr,
+        dt_f.data_ptr<float>(),
+        A_f.data_ptr<float>(),
+        D_f.defined() ? D_f.data_ptr<float>() : nullptr,
+        D_f.defined() && D_f.dim() == 2 ? P : 1,
+        D_f.defined() && D_f.dim() == 2 ? 1 : 0,
+        bias_f.defined() ? bias_f.data_ptr<float>() : nullptr,
+        init_f.defined() ? init_f.data_ptr<float>() : nullptr,
+        dt_softplus,
+        static_cast<float>(dt_min),
+        static_cast<float>(dt_max),
+        cu_ptr,
+        chunk_start.data(),
+        chunk_seq.data(),
+        R > 0 ? req_seq.data_ptr<int64_t>() : nullptr,
+        R > 0 ? req_pos.data_ptr<int64_t>() : nullptr,
+        S,
+        NCt,
+        R,
+        H,
+        P,
+        G,
+        N,
+        L);
+  });
+  return {final_f, req_f};
+}
+
+void check_scan_inputs(
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    int64_t chunk_size,
+    const std::optional<at::Tensor>& D) {
+  TORCH_CHECK(x.dim() == 4, "x must have shape [batch, time, heads, dim]");
+  TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "x must be bfloat16 or float16 on CPU");
+  TORCH_CHECK(dt.sizes() == at::IntArrayRef({x.size(0), x.size(1), x.size(2)}), "dt shape does not match x");
+  TORCH_CHECK(B.dim() == 4 && C.sizes() == B.sizes(), "B and C must have shape [batch, time, groups, dstate]");
+  TORCH_CHECK(B.size(0) == x.size(0) && B.size(1) == x.size(1), "B shape does not match x");
+  TORCH_CHECK(x.size(2) % B.size(2) == 0, "heads must be divisible by groups");
+  TORCH_CHECK(B.size(3) % 2 == 0, "dstate must be even");
+  TORCH_CHECK(A.numel() == x.size(2), "A must have one value per head");
+  if (D.has_value()) {
+    const int64_t H = x.size(2);
+    const int64_t P = x.size(3);
+    TORCH_CHECK(
+        D->sizes() == at::IntArrayRef({H}) || D->sizes() == at::IntArrayRef({H, P}),
+        "D must be [heads] or [heads, dim]");
+  }
+}
+
+}  // anonymous namespace
+
 std::tuple<at::Tensor, at::Tensor> mamba_chunk_scan_combined_cpu(
     const at::Tensor& x,
     const at::Tensor& dt,
@@ -688,90 +928,131 @@ std::tuple<at::Tensor, at::Tensor> mamba_chunk_scan_combined_cpu(
     const std::optional<at::ScalarType>& state_dtype,
     const std::optional<at::Tensor>& out) {
   RECORD_FUNCTION("sgl-kernel::mamba_chunk_scan_combined_cpu", std::vector<c10::IValue>({x, B, C}));
-  TORCH_CHECK(x.dim() == 4, "x must have shape [batch, time, heads, dim]");
-  TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "x must be bfloat16 or float16 on CPU");
-  TORCH_CHECK(dt.sizes() == at::IntArrayRef({x.size(0), x.size(1), x.size(2)}), "dt shape does not match x");
-  TORCH_CHECK(B.dim() == 4 && C.sizes() == B.sizes(), "B and C must have shape [batch, time, groups, dstate]");
+  check_scan_inputs(x, dt, A, B, C, chunk_size, D);
   const int64_t Bs = x.size(0);
   const int64_t T = x.size(1);
   const int64_t H = x.size(2);
   const int64_t P = x.size(3);
   const int64_t G = B.size(2);
   const int64_t N = B.size(3);
-  TORCH_CHECK(B.size(0) == Bs && B.size(1) == T, "B shape does not match x");
-  TORCH_CHECK(H % G == 0, "heads must be divisible by groups");
-  TORCH_CHECK(N % 2 == 0, "dstate must be even");
-  TORCH_CHECK(A.numel() == H, "A must have one value per head");
   if (initial_states.has_value()) {
     TORCH_CHECK(initial_states->sizes() == at::IntArrayRef({Bs, H, P, N}), "initial_states shape mismatch");
-  }
-  if (D.has_value()) {
-    TORCH_CHECK(
-        D->sizes() == at::IntArrayRef({H}) || D->sizes() == at::IntArrayRef({H, P}),
-        "D must be [heads] or [heads, dim]");
   }
 
   const auto dtype = x.scalar_type();
   auto x_c = x.contiguous();
-  auto B_c = B.to(dtype).contiguous();
-  auto C_c = C.to(dtype).contiguous();
-  auto z_c = z.has_value() ? z->to(dtype).contiguous() : at::Tensor();
-  auto dt_f = dt.to(at::kFloat).contiguous();
-  auto A_f = A.to(at::kFloat).reshape({H}).contiguous();
-  auto D_f = D.has_value() ? D->to(at::kFloat).contiguous() : at::Tensor();
-  auto bias_f = dt_bias.has_value() ? dt_bias->to(at::kFloat).reshape({H}).contiguous() : at::Tensor();
-  auto init_f = initial_states.has_value() ? initial_states->to(at::kFloat).contiguous() : at::Tensor();
-
   auto output = out.has_value() ? *out : at::empty_like(x);
   const bool direct_out = output.scalar_type() == dtype && output.is_contiguous();
   auto out_buf = direct_out ? output : at::empty_like(x_c);
 
-  const int64_t L = chunk_size;
-  const int64_t NC = div_up(T, L);
-  auto float_options = x.options().dtype(at::kFloat);
-  auto final_f = at::empty({Bs, H, P, N}, float_options);
-  auto states = at::empty({Bs, NC, H, N, P}, float_options);
-  auto dt_buf = at::empty({Bs, H, NC, L}, float_options);
-  auto cum_buf = at::empty({Bs, H, NC, L}, float_options);
-
-  if (T == 0) {
-    final_f.copy_(init_f.defined() ? init_f : at::zeros_like(final_f));
-  } else {
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(dtype, "mamba_chunk_scan_combined_cpu", [&] {
-      mamba_chunk_scan_kernel_impl<scalar_t>(
-          out_buf.data_ptr<scalar_t>(),
-          final_f.data_ptr<float>(),
-          states.data_ptr<float>(),
-          dt_buf.data_ptr<float>(),
-          cum_buf.data_ptr<float>(),
-          x_c.data_ptr<scalar_t>(),
-          B_c.data_ptr<scalar_t>(),
-          C_c.data_ptr<scalar_t>(),
-          z.has_value() ? z_c.data_ptr<scalar_t>() : nullptr,
-          dt_f.data_ptr<float>(),
-          A_f.data_ptr<float>(),
-          D.has_value() ? D_f.data_ptr<float>() : nullptr,
-          D.has_value() && D_f.dim() == 2 ? P : 1,
-          D.has_value() && D_f.dim() == 2 ? 1 : 0,
-          dt_bias.has_value() ? bias_f.data_ptr<float>() : nullptr,
-          initial_states.has_value() ? init_f.data_ptr<float>() : nullptr,
-          dt_softplus,
-          static_cast<float>(dt_min),
-          static_cast<float>(dt_max),
-          Bs,
-          T,
-          H,
-          P,
-          G,
-          N,
-          L);
-    });
-  }
+  // a dense batch is a varlen batch with equal lengths
+  auto cu = at::arange(Bs + 1, at::TensorOptions().dtype(at::kLong)).mul_(T);
+  auto [final_f, req_f] = mamba_chunk_scan_varlen_launch(
+      out_buf.view({Bs * T, H, P}),
+      x_c.view({Bs * T, H, P}),
+      dt.to(at::kFloat).contiguous().view({Bs * T, H}),
+      A.to(at::kFloat).reshape({H}).contiguous(),
+      B.to(dtype).contiguous().view({Bs * T, G, N}),
+      C.to(dtype).contiguous().view({Bs * T, G, N}),
+      chunk_size,
+      D.has_value() ? D->to(at::kFloat).contiguous() : at::Tensor(),
+      z.has_value() ? z->to(dtype).contiguous().view({Bs * T, H, P}) : at::Tensor(),
+      dt_bias.has_value() ? dt_bias->to(at::kFloat).reshape({H}).contiguous() : at::Tensor(),
+      initial_states.has_value() ? initial_states->to(at::kFloat).contiguous() : at::Tensor(),
+      cu.contiguous(),
+      at::Tensor(),
+      at::Tensor(),
+      dt_softplus,
+      dt_min,
+      dt_max);
 
   if (!direct_out) {
     output.copy_(out_buf);
   }
   const auto result_type = state_dtype.value_or(C.scalar_type());
   return {output, final_f.to(result_type)};
+}
+
+// Packed varlen scan: one launch for all sequences of a prefill batch.
+//   x [1, T, H, P], dt [1, T, H], B/C [1, T, G, N], z [1, T, H, P]
+//   initial_states [S, H, P, N], cu_seqlens [S + 1]
+//   state_seq_idx / state_pos [R]: optionally also return the state of sequence
+//   state_seq_idx[r] after global token position state_pos[r] (cu_seqlens[s] <= pos <= cu_seqlens[s + 1]),
+//   computed from the materialized chunk states instead of re-scanning the prefix.
+// returns (out [1, T, H, P], final_states [S, H, P, N], states [R, H, P, N])
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba_chunk_scan_combined_varlen_cpu(
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    int64_t chunk_size,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    const std::optional<at::Tensor>& initial_states,
+    const at::Tensor& cu_seqlens,
+    const std::optional<at::Tensor>& state_seq_idx,
+    const std::optional<at::Tensor>& state_pos,
+    bool dt_softplus,
+    double dt_min,
+    double dt_max,
+    const std::optional<at::ScalarType>& state_dtype,
+    const std::optional<at::Tensor>& out) {
+  RECORD_FUNCTION("sgl-kernel::mamba_chunk_scan_combined_varlen_cpu", std::vector<c10::IValue>({x, B, C, cu_seqlens}));
+  check_scan_inputs(x, dt, A, B, C, chunk_size, D);
+  TORCH_CHECK(x.size(0) == 1, "varlen scan expects batch == 1");
+  TORCH_CHECK(cu_seqlens.dim() == 1 && cu_seqlens.numel() >= 1, "cu_seqlens must be 1D [num_seqs + 1]");
+  TORCH_CHECK(state_seq_idx.has_value() == state_pos.has_value(), "state_seq_idx and state_pos must be given together");
+  const int64_t T = x.size(1);
+  const int64_t H = x.size(2);
+  const int64_t P = x.size(3);
+  const int64_t G = B.size(2);
+  const int64_t N = B.size(3);
+  const int64_t S = cu_seqlens.numel() - 1;
+  if (initial_states.has_value()) {
+    TORCH_CHECK(initial_states->sizes() == at::IntArrayRef({S, H, P, N}), "initial_states shape mismatch");
+  }
+
+  at::Tensor req_seq, req_pos;
+  if (state_seq_idx.has_value()) {
+    TORCH_CHECK(state_seq_idx->numel() == state_pos->numel(), "state_seq_idx and state_pos size mismatch");
+    req_seq = state_seq_idx->to(at::kLong).contiguous();
+    req_pos = state_pos->to(at::kLong).contiguous();
+    if (req_seq.numel() > 0) {
+      TORCH_CHECK(
+          req_seq.min().item<int64_t>() >= 0 && req_seq.max().item<int64_t>() < S, "state_seq_idx out of range");
+    }
+  }
+
+  const auto dtype = x.scalar_type();
+  auto x_c = x.contiguous();
+  auto output = out.has_value() ? *out : at::empty_like(x);
+  const bool direct_out = output.scalar_type() == dtype && output.is_contiguous();
+  auto out_buf = direct_out ? output : at::empty_like(x_c);
+
+  auto [final_f, req_f] = mamba_chunk_scan_varlen_launch(
+      out_buf.view({T, H, P}),
+      x_c.view({T, H, P}),
+      dt.to(at::kFloat).contiguous().view({T, H}),
+      A.to(at::kFloat).reshape({H}).contiguous(),
+      B.to(dtype).contiguous().view({T, G, N}),
+      C.to(dtype).contiguous().view({T, G, N}),
+      chunk_size,
+      D.has_value() ? D->to(at::kFloat).contiguous() : at::Tensor(),
+      z.has_value() ? z->to(dtype).contiguous().view({T, H, P}) : at::Tensor(),
+      dt_bias.has_value() ? dt_bias->to(at::kFloat).reshape({H}).contiguous() : at::Tensor(),
+      initial_states.has_value() ? initial_states->to(at::kFloat).contiguous() : at::Tensor(),
+      cu_seqlens.to(at::kLong).contiguous(),
+      req_seq,
+      req_pos,
+      dt_softplus,
+      dt_min,
+      dt_max);
+
+  if (!direct_out) {
+    output.copy_(out_buf);
+  }
+  const auto result_type = state_dtype.value_or(C.scalar_type());
+  return {output, final_f.to(result_type), req_f.to(result_type)};
 }
