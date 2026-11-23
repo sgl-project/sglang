@@ -803,37 +803,6 @@ bandwidth — every fix here is a cost booked under another goal.
 **Cross-goal.** Context parallelism adds inter-device traffic, and an unchunked prefill keeps decode waiting wherever
 the two share a node — long-context settings are the most likely to shift [TPOT](#lower-decode-latency-tpot).
 
-#### Kimi K3.1 prefill context parallelism
-
-Kimi K3.1 combines DSA full attention and KDA linear attention. You can enable prefill context parallelism (PCP)
-for this hybrid model on Ascend NPUs, including prefill/decode disaggregation.
-
-First, install an SGLang revision that includes Kimi K3.1 NPU PCP support and the matching NPU dependencies from the
-[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation). Set `MODEL_PATH` to
-your local Kimi K3.1 checkpoint. For a deployment with 16 NPUs and `TP=16`, enable interleave PCP with:
-
-```bash
-python3 -m sglang.launch_server \
-    --model-path "${MODEL_PATH}" \
-    --device npu --attention-backend ascend \
-    --tp-size 16 --attn-cp-size 16 \
-    --enable-prefill-cp --cp-strategy interleave
-```
-
-Retain the quantization, MoE, memory, and multi-node options required by your existing deployment. The CP size must
-divide the TP size; when using attention DP, `attn_dp_size × attn_cp_size` must also divide the TP size.
-
-For PD disaggregation, add `--disaggregation-mode prefill --disaggregation-transfer-backend ascend` to the prefill
-workers and apply the PCP options there. Keep the decode workers at `--attn-cp-size 1` without `--enable-prefill-cp`;
-configure their transfer backend and connectivity as described in
-[PD disaggregation](/docs/advanced_features/pd_disaggregation). PCP changes prefill execution; it does not enable
-decode context parallelism.
-
-The runtime handles Kimi K3.1's 96 sparse-attention query heads automatically: architectures before arch35 pad the
-query heads for the NPU operator and remove the extra output heads; arch35 uses the native head count. The NPU
-hybrid DSA cache uses an uncompressed index layout (`index_kpool=1`), and PD transfers its index cache and KDA state
-without a compressed index tail.
-
 ### From an observed symptom
 
 The goals above start from what you want; this table starts from what you see on a running deployment. Utilization

@@ -182,6 +182,29 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 - **DFLASH.** Triton draft attention and block verification; block 8 at 1-4 agents, 6 at 8, and 5 from 16 agents and on both PD roles.
 - **HiCache.** The pinned host pools share the node's GTT limit (1511 GiB on MI355X); larger ratios fail at startup.
 
+### Ascend NPU prefill context parallelism
+
+You can enable prefill context parallelism (PCP) for an existing Kimi K3.1 Pro deployment on Ascend NPUs. Prepare the
+NPU runtime using the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+and start from a working launch command with `--device npu --attention-backend ascend`. Keep the checkpoint's
+quantization settings and your deployment's MoE, memory, and multi-node options.
+
+Kimi K3.1 requires `--attn-cp-size` to equal `--tp-size`, with the `interleave` strategy, attention DP size `1`, and
+DCP size `1`. For an existing `--tp-size 16` deployment, append these arguments to its launch command:
+
+```text
+--enable-prefill-cp --attn-cp-size 16 --cp-strategy interleave --attn-dp-size 1 --dcp-size 1
+```
+
+For another TP size, set `--attn-cp-size` to that same value. Keep `--moe-dp-size 1`; PCP cannot be combined with
+`--enable-dsa-cache-layer-split` or `--enable-mixed-chunk`.
+
+For PD disaggregation over the Ascend transfer backend, use `--disaggregation-transfer-backend ascend` on both
+roles. Apply the PCP arguments to the `--disaggregation-mode prefill` workers. The `--disaggregation-mode decode`
+workers use `--attn-cp-size 1` without `--enable-prefill-cp`. Keep `SGLANG_DISAGG_STAGING_BUFFER=0` on the prefill
+workers, because the staging buffer is incompatible with this CP layout. See
+[Ascend PD setup](/docs/advanced_features/pd_disaggregation#ascend) for the transfer runtime and environment variables.
+
 ## 3. Advanced Usage
 
 ### 3.1 Reasoning
