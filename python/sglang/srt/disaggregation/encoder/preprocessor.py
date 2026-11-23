@@ -304,7 +304,6 @@ class EncoderPreprocessor:
         self,
         data,
         modality: Modality,
-        frame_count_limit=None,
         discard_alpha_channel=True,
     ):
         from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
@@ -350,7 +349,7 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
+                vid = load_video(data, use_gpu=False)
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
