@@ -683,7 +683,21 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        # Poll in slices so a dead launcher fails fast. When a rank is killed
+        # during startup, the launch thread raises and a plain wait_server_ready
+        # would keep polling /health for the full timeout instead of failing the
+        # pod, which leaves the job hanging until the CI-side monitor gives up.
+        while sglang_thread.is_alive():
+            try:
+                wait_server_ready(f"{cls.base_url}/health", timeout=60)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(
+                "sglang launch thread exited before the server became ready; "
+                "check the server logs for the first rank that died"
+            )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
@@ -693,15 +707,30 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["worker"])
     def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
+        failed = threading.Event()
+
+        def _launch():
+            try:
+                launch_pd_mix_node(cls.model_config)
+            except BaseException:
+                failed.set()
+                raise
+
+        sglang_thread = threading.Thread(target=_launch)
         sglang_thread.start()
+
+        # Stay alive while the master drives the test, but leave the keep-alive
+        # window as soon as the local launch failed: a worker that sleeps out
+        # the whole window never exits, so its pod stays Running and the
+        # CI-side log monitor waits for its timeout instead of failing fast.
+        if failed.wait(MAX_SERVER_KEEP_ALIVE_TIME):
+            raise RuntimeError(
+                f"Failed to start node on {cls.host}; see the launcher traceback above"
+            )
 
         logger.info(
             f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
         )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):

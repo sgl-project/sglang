@@ -1525,15 +1525,30 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["worker"])
     def start_pd_mix_worker_node(cls):
-        sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
-        )
+        failed = threading.Event()
+
+        def _launch():
+            try:
+                launch_pd_mix_node(cls.model_config)
+            except BaseException:
+                failed.set()
+                raise
+
+        sglang_thread = threading.Thread(target=_launch)
         sglang_thread.start()
+
+        # Stay alive while the master drives the test, but leave the keep-alive
+        # window as soon as the local launch failed: a worker that sleeps out
+        # the whole window never exits, so its pod stays Running and the
+        # CI-side log monitor waits for its timeout instead of failing fast.
+        if failed.wait(MAX_SERVER_KEEP_ALIVE_TIME):
+            raise RuntimeError(
+                f"Failed to start node on {cls.host}; see the launcher traceback above"
+            )
 
         logger.info(
             f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
         )
-        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
     @retry()
     @check_role(allowed_roles=["master", "worker"])
