@@ -96,43 +96,19 @@ class TestAiterFp4Padding(CustomTestCase):
         from sglang.srt.layers.quantization import fp8 as fp8_quant
 
         experts, logical_inter, hidden_packed = 2, 576, 8
+
+        def ones_u8(*shape):
+            return torch.nn.Parameter(
+                torch.ones(*shape, dtype=torch.uint8), requires_grad=False
+            )
+
         layer = SimpleNamespace(
-            w13_weight=torch.nn.Parameter(
-                torch.ones(
-                    experts,
-                    2 * logical_inter,
-                    hidden_packed,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
+            w13_weight=ones_u8(experts, 2 * logical_inter, hidden_packed),
+            w2_weight=ones_u8(experts, 16, logical_inter // 2),
+            w13_weight_scale_inv=ones_u8(
+                experts, 2 * logical_inter, hidden_packed // 4
             ),
-            w2_weight=torch.nn.Parameter(
-                torch.ones(
-                    experts,
-                    16,
-                    logical_inter // 2,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            ),
-            w13_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(
-                    experts,
-                    2 * logical_inter,
-                    hidden_packed // 4,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            ),
-            w2_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(
-                    experts,
-                    16,
-                    logical_inter // 32,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            ),
+            w2_weight_scale_inv=ones_u8(experts, 16, logical_inter // 32),
         )
         quant_config = MagicMock(
             use_mxfp8=False,
@@ -174,22 +150,13 @@ class TestAiterFp4Padding(CustomTestCase):
         self.assertEqual(layer.intermediate_pad, 0)
         self.assertEqual(layer.w13_weight.shape[1], 2 * INTERMEDIATE)
         self.assertEqual(layer.w2_weight.shape[2], INTERMEDIATE // 2)
-        self.assertEqual(
-            torch.count_nonzero(layer.w13_weight[:, logical_inter:INTERMEDIATE]).item(),
-            0,
+        padded_tails = (
+            layer.w13_weight[:, logical_inter:INTERMEDIATE],
+            layer.w13_weight[:, INTERMEDIATE + logical_inter : 2 * INTERMEDIATE],
+            layer.w2_weight[:, :, logical_inter // 2 : INTERMEDIATE // 2],
         )
-        self.assertEqual(
-            torch.count_nonzero(
-                layer.w13_weight[:, INTERMEDIATE + logical_inter : 2 * INTERMEDIATE]
-            ).item(),
-            0,
-        )
-        self.assertEqual(
-            torch.count_nonzero(
-                layer.w2_weight[:, :, logical_inter // 2 : INTERMEDIATE // 2]
-            ).item(),
-            0,
-        )
+        for tail in padded_tails:
+            self.assertEqual(torch.count_nonzero(tail).item(), 0)
 
 
 class TestFallbackWeightPadding(CustomTestCase):
