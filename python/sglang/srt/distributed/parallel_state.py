@@ -2802,8 +2802,6 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
-
     global _ATTN_TP
     assert _ATTN_TP is None, (
         "attention tensor model parallel group is already initialized"
@@ -2829,7 +2827,6 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             # Attention TP can be a derived subgroup of the full TP group.
             # Inherit the global policy and let per-group capability detection
             # select a custom communicator or fall back.
