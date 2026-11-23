@@ -811,15 +811,14 @@ def eagle_sample(
     local_keys: Optional[LocalKeysFn] = None,
 ):
     """
-    Verify and find accepted tokens based on logits output and the verify's
-    batch (which contains spec decoding information). `verify` gives the batch,
-    the route the shard gate reads, and the stages (`VerifyStep.adjust`).
-    simulated_acc_len: the injected
-    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
-    graph can replay the injection. simulated_acc_len_rng: the generator to draw
-    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
-    injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    Verify and find accepted tokens based on logits output and the verify step:
+    its batch (which contains spec decoding information), the route the shard
+    gate reads, and the stages (`VerifyStep.adjust`). simulated_acc_len: the
+    injected acceptance length already drawn on the host, as a device int64 [1],
+    so a CUDA graph can replay the injection. simulated_acc_len_rng: the
+    generator to draw it from here otherwise (the global CPU RNG when None).
+    sparse_bonus_argmax: an injected acceptance's bonus is the target argmax on
+    the compact top-k branch too, as on the dense one.
     """
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.utils.async_probe import sanitize_nan_logits
