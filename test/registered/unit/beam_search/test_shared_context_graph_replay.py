@@ -11,21 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared-context trie graphs replay the batch staged into their shared buffers."""
+"""Shared-context beam graphs replay the batch staged into their shared buffers."""
 
 import unittest
 
 import torch
 
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
+from sglang.srt.beam_search.decode_cuda_graph import (
+    BeamGraphInputs,
+    SharedContextCapacity,
+)
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
 from sglang.srt.beam_search.shared_context_attention import (
     BeamAttentionBucket,
     BeamAttentionMetadata,
-)
-from sglang.srt.beam_search.trie_cuda_graph import (
-    SharedContextCapacity,
-    TrieGraphInputs,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,8 +83,11 @@ class TestSharedContextGraphReplay(CustomTestCase):
         q = torch.randn((2 * WIDTH, 4, 64), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((64, 2, 64), dtype=torch.bfloat16, device="cuda")
         v = torch.randn_like(k)
-        inputs = TrieGraphInputs(
-            max_rows=2 * WIDTH, device="cuda", shared_context=CAPACITY
+        inputs = BeamGraphInputs(
+            max_rows=2 * WIDTH,
+            device="cuda",
+            trie_head=False,
+            shared_context=CAPACITY,
         )
 
         graphs = {}
@@ -107,8 +110,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
             static.context_slots.fill_(STALE_SLOT)
             static.decode_slots.fill_(STALE_SLOT)
             rows = metadata.num_rows
-            levels = torch.zeros(rows, dtype=torch.int64, device="cuda")
-            inputs.stage(BeamForwardInputs(levels, metadata))
+            inputs.stage(BeamForwardInputs(None, metadata))
             graph, output = graphs[rows]
             graph.replay()
             torch.testing.assert_close(
