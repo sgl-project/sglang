@@ -865,6 +865,110 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 torch.equal(host.kv_buffer[host_indices, layer_id], expected[layer_id])
             )
 
+    def test_mla_all_layer_load_fallback_restores_target_and_draft_rows(self):
+        """AOT H2D batching regresses latency; fallback must preserve target/draft KV."""
+        for layout, backend, use_jit in (
+            ("layer_first", "kernel", False),
+            ("page_first", "kernel", False),
+            ("page_first", "kernel", True),
+            ("page_first_direct", "direct", False),
+        ):
+            for dcp_size in (1, 2):
+                for sharded in (False, True):
+                    with self.subTest(
+                        layout=layout, jit=use_jit, dcp=dcp_size, sharded=sharded
+                    ):
+                        host = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
+                        host._is_dummy = False
+                        host.dcp_size, host.dcp_rank = dcp_size, dcp_size - 1
+                        host._layer_shard_enabled = sharded
+                        # A sharded pool owns non-consecutive target layers.
+                        target_ids = (1, 3) if sharded else (0, 1)
+                        host._target_layer_indices = target_ids
+                        host._device_layer_num = 4 if sharded else 2
+                        host._draft_layer_num = 1
+                        host.layer_num = 3
+                        slots = (*target_ids, host._device_layer_num)
+                        host._host_layer_by_controller = dict(zip(slots, range(3)))
+                        host._buffer_index_by_layer = dict(zip(slots, range(3)))
+                        host.layout, host.page_size = layout, 1
+                        host.dtype = torch.float32
+                        host.kv_cache_dim, host.token_stride_size = 4, 16
+                        host.layout_dim = 48
+                        host.can_use_jit = use_jit
+                        data = torch.arange(16 * 3 * 4, dtype=torch.float32)
+                        host.kv_buffer = data.reshape(16, 3, 1, 4)
+                        if layout == "layer_first":
+                            host.kv_buffer = host.kv_buffer.transpose(0, 1).contiguous()
+                            host.data_refs = list(host.kv_buffer)
+                        else:
+                            host.data_refs = list(host.kv_buffer.transpose(0, 1))
+                        host.device_kv_buffers = tuple(
+                            torch.full((16, 1, 4), -1.0) for _ in range(3)
+                        )
+                        host.device_data_ptrs = None
+                        host.data_ptrs = None
+                        if layout == "page_first_direct":
+                            host.kv_buffer = host.kv_buffer.unsqueeze(2)
+
+                        def copy_direct_pf_lf(
+                            *,
+                            src_ptrs,
+                            dst_ptrs,
+                            src_indices,
+                            dst_indices,
+                            layer_id,
+                            **_,
+                        ):
+                            dst_ptrs[0][dst_indices] = src_ptrs[0][
+                                src_indices, layer_id, 0
+                            ]
+
+                        def copy_lf_lf(*, src, dst, src_indices, dst_indices, **_):
+                            dst[dst_indices] = src[src_indices]
+
+                        with (
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_per_layer_mla",
+                                side_effect=copy_lf_lf,
+                                create=True,
+                            ),
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_all_layer_mla",
+                                side_effect=AssertionError(
+                                    "AOT H2D must use the per-layer fallback"
+                                ),
+                                create=True,
+                            ),
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer_mla",
+                                side_effect=_cpu_jit_one_layer_mla_copy,
+                            ),
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_per_layer_mla_pf_lf",
+                                side_effect=_cpu_per_layer_pf_lf_copy,
+                                create=True,
+                            ),
+                            mock.patch(
+                                f"{MLA_POOL_HOST_MODULE}.transfer_kv_per_layer_direct_pf_lf",
+                                side_effect=copy_direct_pf_lf,
+                                create=True,
+                            ),
+                        ):
+                            host.load_to_device_all_layer(
+                                object(), _indices(0, 8), _indices(8, 16), backend
+                            )
+
+                        # Both ranks own physical host rows 0..8/dcp_size.
+                        # Translating twice shrinks this range and changes dst rows.
+                        count = 8 // dcp_size
+                        for layer_id, device_layer in enumerate(host.device_kv_buffers):
+                            expected = torch.full_like(device_layer, -1)
+                            expected[count : 2 * count] = data.reshape(16, 3, 1, 4)[
+                                :count, layer_id
+                            ]
+                            self.assertTrue(torch.equal(device_layer, expected))
+
     @unittest.skip(
         "TODO: Mamba pool is currently incompatible with write-back staging "
         "kernel; re-enable once the staging bug is fixed."
