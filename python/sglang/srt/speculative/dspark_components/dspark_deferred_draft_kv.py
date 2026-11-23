@@ -10,6 +10,12 @@ a graph that would not cover every staged row, writes it eagerly first.
 A draft forward writes only the staged rows of the requests it carries and that were
 not retracted since; a prefill in between leaves the staging pending. Every write
 disarms the staging (commit lengths 0), so a staging is written once.
+
+On a PD decode server the incoming KV transfer also writes draft KV, into slots the
+prealloc queue hands out, and it is not ordered with the forward stream. A request
+that finished in the last verify may have freed slots the staging still points at,
+so the queue writes a pending staging before it hands out any slot
+(``flush_before_slot_reuse``).
 """
 
 from __future__ import annotations
@@ -206,6 +212,20 @@ class DeferredDraftKVStore:
             self.num_written_eagerly += 1
             self._eager_reasons[reason] = self._eager_reasons.get(reason, 0) + 1
 
+    def flush_before_slot_reuse(self) -> bool:
+        """Host, PD decode: before KV slots go to an incoming transfer or a retracted
+        request's restore, write a pending staging (on the current stream, which the
+        caller makes the forward stream). Returns whether it wrote."""
+        if not self.pending or _capturing():
+            return False
+        self._flush("slot reuse")
+        if self._eager_reasons["slot reuse"] == 1:
+            logger.info(
+                "SGLANG_DSPARK_DEFER_CONTEXT_KV: the PD decode wrote the pending "
+                "draft KV store before handing out KV slots (first time)."
+            )
+        return True
+
     def before_draft_forward(self, graph_bs: Optional[int], reqs) -> None:
         """Host, before a draft forward of ``reqs``: a graph of ``graph_bs`` requests
         (None: eager) writes only its own rows, so anything it would miss is
@@ -316,6 +336,7 @@ def maybe_build_deferred_draft_kv(
     )
 
     memory = get_memory()
+    disagg = get_disagg()
     refusal = defer_context_kv_refusal(
         static_verify=static_verify,
         draft_is_moe=draft_is_moe,
@@ -323,7 +344,9 @@ def maybe_build_deferred_draft_kv(
         unified_memory=memory.enable_unified_memory,
         hicache=memory.enable_hierarchical_cache
         or memory.hicache_storage_backend is not None,
-        disaggregated=get_disagg().disaggregation_mode != "null",
+        disaggregation_mode=disagg.disaggregation_mode,
+        decode_offload=disagg.disaggregation_decode_enable_offload_kvcache,
+        hisparse=memory.enable_hisparse,
         attn_dp=get_parallel().attn_dp_enabled,
     )
     if refusal:
@@ -351,17 +374,29 @@ def defer_context_kv_refusal(
     unified_kv: bool,
     unified_memory: bool,
     hicache: bool,
-    disaggregated: bool,
+    disaggregation_mode: str,
+    decode_offload: bool,
+    hisparse: bool,
     attn_dp: bool,
 ) -> str:
-    """Why the deferred draft KV store cannot run here, or ""."""
+    """Why the deferred draft KV store cannot run here, or "". A PD decode server
+    qualifies: the incoming transfer is its only other draft KV writer, and the
+    prealloc queue writes a pending staging before it hands that transfer slots."""
     reasons = (
         (not static_verify, "the verify is not static (SGLANG_RAGGED_VERIFY_MODE)"),
         (not draft_is_moe, "the draft has no MoE layers"),
         (unified_kv, "unified KV writes the draft window through its ring"),
         (unified_memory, "the unified memory pool compacts KV between steps"),
         (hicache, "a HiCache storage backend moves KV between steps"),
-        (disaggregated, "PD disaggregation transfers KV between steps"),
+        (
+            disaggregation_mode == "prefill",
+            "a PD prefill sends KV between steps",
+        ),
+        (
+            disaggregation_mode == "decode" and decode_offload,
+            "PD decode KV offload moves KV between steps",
+        ),
+        (hisparse, "hisparse moves KV between steps"),
         (attn_dp, "attention DP runs idle draft forwards"),
     )
     return "; ".join(why for refused, why in reasons if refused)

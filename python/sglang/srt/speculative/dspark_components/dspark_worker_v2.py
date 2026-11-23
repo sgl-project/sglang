@@ -736,6 +736,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._deferred_draft_kv is not None:
             self._deferred_draft_kv.disarm()
 
+    def flush_deferred_draft_kv_before_slot_reuse(self) -> bool:
+        """PD decode, before the prealloc queue hands KV slots to an incoming
+        transfer: write the deferred draft KV store's pending staging
+        (DeferredDraftKVStore.flush_before_slot_reuse). Returns whether it wrote."""
+        if not self._hosts_draft or self._deferred_draft_kv is None:
+            return False
+        return self._deferred_draft_kv.flush_before_slot_reuse()
+
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
             return

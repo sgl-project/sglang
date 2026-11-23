@@ -2951,6 +2951,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
         return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
 
+    def _flush_deferred_draft_kv_before_slot_reuse(self) -> None:
+        """The slots allocated next go to a KV transfer (or a retracted request's
+        restore), which is not ordered with the forward stream. A request that
+        finished in the last verify may have freed them while the DSpark deferred
+        draft KV store (SGLANG_DSPARK_DEFER_CONTEXT_KV) still points at them, so
+        that store is written now, on the forward stream. No-op when none is pending."""
+        worker = getattr(self.scheduler, "draft_worker", None)
+        flush = getattr(type(worker), "flush_deferred_draft_kv_before_slot_reuse", None)
+        if flush is None:
+            return
+        if self.scheduler.enable_overlap:
+            with self.scheduler.forward_stream_ctx:
+                flush(worker)
+        else:
+            flush(worker)
+
     def _pre_alloc(
         self,
         req: Req,
@@ -2971,6 +2987,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        self._flush_deferred_draft_kv_before_slot_reuse()
         req_pool_indices = kv_storage_of(
             self.req_to_token_pool, self.token_to_kv_pool_allocator
         ).acquire([req])
