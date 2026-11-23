@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -93,6 +94,12 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        # TOP pins one indexer program for prefill, decode and trainer; see true_on_policy/qsa.py.
+        self.top_enabled = is_true_on_policy_enabled()
+        if self.top_enabled and not self.rotary_emb.is_neox_style:
+            raise NotImplementedError("[top] QSA indexer RoPE requires neox style")
+        # TOP verify: each request's window of raw keys and its root position, until the accepted rows are committed.
+        self._top_verify_stash = None
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -131,7 +138,9 @@ class QSAIndexer(MultiPlatformOp):
 
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
-        return (
+        # The fused prep kernels store into the serving pool and run only when one is passed (else the eager
+        # norm + RoPE); the trainer has no pool, so TOP runs true_on_policy.qsa throughout.
+        return not self.top_enabled and (
             tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
@@ -172,6 +181,8 @@ class QSAIndexer(MultiPlatformOp):
         q_heads_padded: int | None = None,
         ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        if self.top_enabled:
+            return self._project_qk_top(hidden_states, positions)
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
@@ -220,6 +231,169 @@ class QSAIndexer(MultiPlatformOp):
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
+
+    def _project_qk_top(self, hidden_states, positions):
+        from sglang.srt.true_on_policy import qsa as top_qsa
+
+        qk = top_qsa.index_projection(hidden_states, self.index_qk_proj.weight)
+        split = self.index_n_heads * self.index_head_dim
+        token_k = qk[:, split:].reshape(-1, self.index_kv_heads, self.index_head_dim)
+        q = top_qsa.norm_rope(
+            qk[:, :split].reshape(-1, self.index_n_heads, self.index_head_dim),
+            top_qsa.rope_positions(positions),
+            weight=self.q_layernorm.weight,
+            eps=self.q_layernorm.variance_epsilon,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            base=self.rotary_emb.base,
+            axes=top_qsa.lane_axes(self.rotary_emb, qk.device),
+        )
+        return q, token_k, False
+
+    def _compress_top(self, source_keys, source_rope, group_locs):
+        """Fused mean -> offset RMSNorm -> RoPE of each group, read by location."""
+        from sglang.srt.true_on_policy import qsa as top_qsa
+
+        keys = top_qsa.compress_norm_rope(
+            source_keys.reshape(-1, self.index_head_dim),
+            group_locs,
+            # [groups, 3]: the RoPE position of each group's first member.
+            source_rope[group_locs[:, 0].long()],
+            weight=self.k_layernorm.weight,
+            eps=self.k_layernorm.variance_epsilon,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            base=self.rotary_emb.base,
+            axes=top_qsa.lane_axes(self.rotary_emb, source_keys.device),
+        )
+        return keys.reshape(-1, self.index_kv_heads, self.index_head_dim)
+
+    def _verify_stash_top(self, ring: torch.Tensor):
+        """([request slots, ratio, kv heads * D] raw keys of the last verify window, [request slots] root position,
+        [request slots, ratio, 3] RoPE positions of the window's rows)."""
+        if self._top_verify_stash is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "[top] the QSA verify stash must be allocated before graph capture"
+                )
+            requests = ring.shape[0] // self.compress_ratio
+            keys = ring.new_zeros(
+                (
+                    requests,
+                    self.compress_ratio,
+                    self.index_kv_heads * self.index_head_dim,
+                )
+            )
+            roots = torch.zeros(requests, dtype=torch.int64, device=ring.device)
+            rope = torch.zeros(
+                (requests, self.compress_ratio, 3),
+                dtype=torch.int64,
+                device=ring.device,
+            )
+            self._top_verify_stash = (keys, roots, rope)
+        return self._top_verify_stash
+
+    def _compress_verify_top(
+        self, token_k, logical_positions, rope_positions, metadata
+    ) -> None:
+        """TOP target verify: compress each group a row completes from the keys its own decode would read.
+
+        A verify forward holds a request's root and its drafts. Members before the root come from the pending ring
+        as the last commit left it, members inside the window from this forward's rows; the ring itself is written
+        by top_commit_verify, for the accepted rows only. (The native path writes every row to the ring first: a
+        group completed mid-window then reads later drafts in place of earlier keys, and rejected drafts stay in
+        the ring.)
+        """
+        from sglang.srt.true_on_policy import qsa as top_qsa
+
+        pool = metadata.token_to_kv_pool
+        ratio = self.compress_ratio
+        rows = token_k.shape[0]
+        positions = logical_positions.long()[:rows]
+        requests = metadata.req_pool_indices.long()[:rows]
+        ring = pool.get_qsa_key_state_buffer(self.layer_id)
+        window = token_k.reshape(rows, -1).to(ring.dtype)
+        # [rows, 3]: a verify row's RoPE position differs from its logical one after an image.
+        window_rope = top_qsa.rope_positions(
+            rope_positions[:, :rows]
+            if rope_positions.ndim == 2
+            else rope_positions[:rows]
+        )
+        stash_keys, stash_roots, stash_rope = self._verify_stash_top(ring)
+        # A request's rows are consecutive positions from its root.
+        roots = torch.full_like(
+            stash_roots, torch.iinfo(torch.int64).max
+        ).scatter_reduce(0, requests, positions, "amin")[requests]
+        offsets = (positions - roots).clamp(0, ratio - 1)
+        stash_keys[requests, offsets] = window
+        stash_rope[requests, offsets] = window_rope
+        stash_roots[requests] = roots
+
+        if metadata.is_cuda_graph:
+            # Fixed shape: every row plans a group; a row that completes none writes the inert slot 0.
+            group_rows = torch.arange(rows, device=positions.device)
+            ends = positions
+            write_locs = metadata.graph_write_locs[:rows]
+        else:
+            if metadata.write_locs.numel() == 0:
+                return
+            group_rows = metadata.compress_sequence_ids.long()
+            ends = metadata.compress_group_positions.long()
+            write_locs = metadata.write_locs
+        back = torch.arange(ratio - 1, -1, -1, device=positions.device)
+        members = (ends[:, None] - back[None, :]).clamp_min(0)
+        # A padding entry of the plan names row 0 with another end position: all its members read the ring.
+        in_window = (ends == positions[group_rows])[:, None] & (
+            back[None, :] <= offsets[group_rows][:, None]
+        )
+        locs = torch.where(
+            in_window,
+            ring.shape[0] + (group_rows[:, None] - back[None, :]).clamp_min(0),
+            requests[group_rows][:, None] * ratio + members % ratio,
+        )
+        # A group rotates at its first member's RoPE position: the ring's for a member before the root, this
+        # forward's for a member inside the window.
+        first = locs[:, 0]
+        ring_slots = ring.shape[0]
+        group_rope = torch.where(
+            (first < ring_slots)[:, None],
+            pool.qsa_rope_position_buffer[first.clamp_max(ring_slots - 1)],
+            window_rope[(first - ring_slots).clamp_min(0)],
+        )
+        keys = top_qsa.compress_norm_rope(
+            torch.cat([ring.reshape(ring.shape[0], -1), window]),
+            locs,
+            group_rope,
+            weight=self.k_layernorm.weight,
+            eps=self.k_layernorm.variance_epsilon,
+            rotary_dim=self.rotary_emb.rotary_dim,
+            base=self.rotary_emb.base,
+            axes=top_qsa.lane_axes(self.rotary_emb, window.device),
+        )
+        pool.set_qsa_compressed_k_buffer(
+            self.layer_id,
+            write_locs,
+            keys.reshape(-1, self.index_kv_heads, self.index_head_dim),
+        )
+
+    def top_commit_verify(
+        self, pool, req_pool_indices, last_correct_step_indices
+    ) -> None:
+        """After a TOP verify: the accepted rows' raw keys and positions enter the pending ring."""
+        if self._top_verify_stash is None:
+            return
+        stash_keys, stash_roots, stash_rope = self._top_verify_stash
+        ratio = self.compress_ratio
+        requests = req_pool_indices.long()
+        steps = torch.arange(ratio, device=requests.device)
+        accepted = steps[None, :] <= last_correct_step_indices.long()[:, None]
+        positions = (stash_roots[requests][:, None] + steps[None, :])[accepted]
+        slots = (requests[:, None] * ratio).expand(-1, ratio)[
+            accepted
+        ] + positions % ratio
+        ring = pool.get_qsa_key_state_buffer(self.layer_id)
+        ring[slots] = stash_keys[requests][accepted].reshape(-1, *ring.shape[1:])
+        pool.set_qsa_rope_position_buffer(
+            slots, stash_rope[requests][accepted].transpose(0, 1)
+        )
 
     def normalize_compressed_keys(
         self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
@@ -367,6 +541,13 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope=source_rope,
             )
             return
+        if self.top_enabled:
+            pool.set_qsa_compressed_k_buffer(
+                self.layer_id,
+                compressed_locs,
+                self._compress_top(source_keys, source_rope, group_locs),
+            )
+            return
         key_groups = source_keys[group_locs]
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
@@ -387,6 +568,16 @@ class QSAIndexer(MultiPlatformOp):
                 pool,
                 group_locs,
                 metadata.graph_write_locs,
+            )
+            return
+        if self.top_enabled:
+            compressed = self._compress_top(
+                pool.get_qsa_key_state_buffer(self.layer_id),
+                pool.qsa_rope_position_buffer,
+                group_locs,
+            )
+            pool.set_qsa_compressed_k_buffer(
+                self.layer_id, metadata.graph_write_locs, compressed
             )
             return
         key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
@@ -467,6 +658,23 @@ class QSAIndexer(MultiPlatformOp):
         kernel ran as thousands of one-CTA launches. Selection is unchanged: the
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
+        if self.top_enabled:
+            from sglang.srt.true_on_policy import qsa as top_qsa
+
+            block_indices = top_qsa.select_contiguous(
+                q,
+                compressed_keys.reshape(-1, self.index_head_dim),
+                row_starts,
+                row_ends - row_starts,
+                self.block_topk,
+            )
+            return expand_qsa_block_indices(
+                block_indices,
+                query_positions,
+                sequence_lengths_for_rows,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         rows = q.shape[0]
         output = torch.empty(
             (rows, self.token_topk + self.compress_ratio - 1),
@@ -546,6 +754,30 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
+        if self.top_enabled:
+            from sglang.srt.true_on_policy import qsa as top_qsa
+
+            block_indices = top_qsa.select_paged(
+                q,
+                compressed_cache.reshape(
+                    compressed_cache.shape[0],
+                    compressed_cache.shape[1],
+                    self.index_head_dim,
+                ),
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                self.block_topk,
+            )
+            if defer_expansion:
+                return block_indices
+            return expand_qsa_block_indices(
+                block_indices,
+                query_positions,
+                sequence_lengths,
+                compress_ratio=self.compress_ratio,
+                token_topk=self.token_topk,
+            )
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
         use_fast_topk = (
@@ -764,14 +996,19 @@ class QSAIndexer(MultiPlatformOp):
                 else None
             ),
         )
-        self.update_key_state_and_compress(
-            token_k,
-            logical_positions,
-            positions,
-            indexer_metadata,
-            state_slots=state_slots,
-            state_stored=state_stored,
-        )
+        if self.top_enabled and is_target_verify:
+            self._compress_verify_top(
+                token_k, logical_positions, positions, indexer_metadata
+            )
+        else:
+            self.update_key_state_and_compress(
+                token_k,
+                logical_positions,
+                positions,
+                indexer_metadata,
+                state_slots=state_slots,
+                state_stored=state_stored,
+            )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

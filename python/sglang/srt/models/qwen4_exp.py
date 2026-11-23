@@ -101,6 +101,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -595,7 +596,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         self.head_dim_per_ngram = self.ngram_embed_dim // self.ngram_heads
         self.eos_token_id = int(config.eos_token_id)
-        self.enable_ple_fusion = envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+        # The fused n-gram hash is integer and equals the eager hash, so TOP keeps it.
+        self.enable_ngram_hash_fusion = envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+        # The float gate/conv fusions round differently from TOP's PLE program.
+        self.enable_ple_fusion = (
+            self.enable_ngram_hash_fusion and not is_true_on_policy_enabled()
+        )
 
         self.register_buffer(
             "layer_multipliers",
@@ -753,7 +759,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
-        if self.enable_ple_fusion and decode_sized:
+        if self.enable_ngram_hash_fusion and decode_sized:
             from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
@@ -1109,6 +1115,8 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
+        # TOP pins one increment program for prefill and decode; see true_on_policy/ple.py.
+        self.top_enabled = is_true_on_policy_enabled()
         self._prefetch_stream = (
             torch.cuda.Stream() if config.ple_offload_embedding else None
         )
@@ -1253,6 +1261,132 @@ class Qwen4ExpPLELayer(nn.Module):
 
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
 
+    def _conv_input_top(
+        self, conv_in: torch.Tensor, conv_state: torch.Tensor, batch: _PLEBatch
+    ) -> torch.Tensor:
+        """[requests, channels, state_len + row_width]: each request's state, then its rows' conv inputs."""
+        state = conv_state.index_select(0, batch.state_indices).to(dtype=conv_in.dtype)
+        padded_seq = conv_in.new_zeros(
+            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+        )
+        padded_seq[batch.req_indices, batch.token_offsets] = conv_in
+        return torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+
+    def _write_verify_conv_states_top(
+        self,
+        conv_in: torch.Tensor,
+        conv_state: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> None:
+        """Verify leaves the state alone and stores the state after each draft step; the accepted one is
+        committed after verification (hybrid_linear_attn_backend._update_ple_state_after_mtp_verify)."""
+        pool = get_req_to_token_pool()
+        intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
+        if intermediate_cache is None or not self.short_conv_state_len:
+            raise NotImplementedError(
+                "[top] Qwen4 PLE verify needs the per-draft conv state scratch"
+            )
+        conv_input = self._conv_input_top(conv_in, conv_state, batch)
+        # [requests, row_width, channels, state_len]: window j is the state once step j is consumed.
+        steps = (
+            conv_input.unfold(2, self.short_conv_state_len, 1)[
+                :, :, 1 : batch.row_width + 1
+            ]
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        valid_steps = batch.valid_tokens.reshape(
+            batch.lengths.shape[0], batch.row_width, 1, 1
+        )
+        steps = torch.where(valid_steps, steps, torch.zeros_like(steps)).to(
+            dtype=intermediate_cache.dtype
+        )
+        dst_indices_raw = select_verify_intermediate_state_indices(
+            None, forward_batch.req_pool_indices, batch.lengths.ne(0), pool.size
+        )
+        if dst_indices_raw is None:
+            intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(steps)
+        else:
+            intermediate_cache[
+                dst_indices_raw.to(dtype=torch.long), : batch.row_width
+            ] = steps
+
+    def _write_short_conv_state_top(
+        self,
+        conv_in: torch.Tensor,
+        conv_state: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> None:
+        """Advance each request's state to its last (K-1)*dil conv inputs; data movement only."""
+        conv_input = self._conv_input_top(conv_in, conv_state, batch)
+        state_cols = torch.arange(
+            self.short_conv_state_len, device=conv_in.device, dtype=torch.long
+        )
+
+        def _gather_at(offsets: torch.Tensor) -> torch.Tensor:
+            return conv_input.gather(
+                2,
+                (offsets.unsqueeze(1) + state_cols.unsqueeze(0))
+                .unsqueeze(1)
+                .expand(-1, self.conv_channels, -1),
+            )
+
+        conv_state[batch.state_indices] = _gather_at(batch.lengths).to(
+            dtype=conv_state.dtype
+        )
+        track = _ple_track_targets(forward_batch, batch)
+        if track is not None:
+            track_indices, track_offsets = track
+            conv_state[track_indices] = _gather_at(track_offsets).to(
+                dtype=conv_state.dtype
+            )
+
+    def _forward_top(
+        self,
+        hidden_states: torch.Tensor,
+        embeddings: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops import matmul_persistent
+        from sglang.srt.true_on_policy import ple as top_ple
+
+        embeddings = embeddings.contiguous()
+        key = matmul_persistent(embeddings, self.key_proj.weight.t())
+        value = matmul_persistent(embeddings, self.value_proj.weight.t())
+        conv_state = get_req_to_token_pool().short_conv_layer_cache(self.layer_id)
+        output, conv_in, _ = top_ple.ple_increment(
+            hc_state=hidden_states,
+            key=key,
+            value=value,
+            norm_key_w=self.norm_key.weight,
+            norm_query_w=self.norm_query.weight,
+            norm_conv_w=self.norm_conv.weight,
+            conv_weight=self.conv1d.weight,
+            n=self.hc_count,
+            eps=self.norm_key.eps,
+            dilation=self.short_conv_dilation,
+            offsets=batch.token_offsets.to(torch.int64),
+            state=conv_state,
+            slots=batch.state_indices.index_select(0, batch.req_indices).to(
+                torch.int64
+            ),
+        )
+        # The kernel read pre-segment history above; advance the state only afterwards. A verify row's earlier
+        # rows are the request's root and earlier drafts, so each row runs the program its own decode would.
+        if batch.mode.is_target_verify():
+            self._write_verify_conv_states_top(
+                conv_in, conv_state, forward_batch, batch
+            )
+        else:
+            self._write_short_conv_state_top(conv_in, conv_state, forward_batch, batch)
+        output = torch.where(
+            batch.valid_tokens.unsqueeze(-1), output, torch.zeros_like(output)
+        )
+        return _pad_token_rows(output, batch.physical_tokens)
+
     def forward_idle(self, forward_batch: ForwardBatch) -> None:
         if self._prefetch_state is not None:
             self._consume_prefetched_embeddings(forward_batch)
@@ -1352,6 +1486,8 @@ class Qwen4ExpPLELayer(nn.Module):
             embeddings = self._consume_prefetched_embeddings(forward_batch)
         else:
             embeddings = self.ple_embedding(batch, forward_batch)
+        if self.top_enabled:
+            return self._forward_top(hidden_states, embeddings, forward_batch, batch)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1602,9 +1738,12 @@ class Qwen4ExpLayerExtensionMixin:
 
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
+        # The fused MoE finalize + shared gate + all-reduce takes only one-token batches;
+        # TOP keeps every batch on the shared MoE forward.
         self._decode_moe_comm = (
             prepare_qwen4_decode_comm(self.mlp)
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and not is_true_on_policy_enabled()
             else None
         )
 
@@ -1984,7 +2123,11 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states, forward_batch, kwargs.get("ple_batch")
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        # A DP-attention rank can run a non-idle batch with no local rows (as the GDN layers also guard).
+        rows = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        ).shape[0]
+        if not forward_batch.forward_mode.is_idle() and rows > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2022,6 +2165,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         prefix: str = "",
         is_nextn: bool = False,
     ) -> None:
+        if is_true_on_policy_enabled():
+            from sglang.srt.true_on_policy.gdn_contract import validate_qwen4_exp_top
+
+            validate_qwen4_exp_top(config, quant_config=quant_config)
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size

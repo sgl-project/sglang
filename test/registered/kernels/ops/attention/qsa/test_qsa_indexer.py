@@ -393,7 +393,9 @@ def test_select_prefill_tokens_relative_matches_absolute(
     q, k, starts, ends, width = _packed_prefill_case(
         lengths, rows_per_block, device, torch.bfloat16, seed=5, empty_rows=True
     )
-    indexer = SimpleNamespace(token_topk=2048, compress_ratio=RATIO, block_topk=512)
+    indexer = SimpleNamespace(
+        token_topk=2048, compress_ratio=RATIO, block_topk=512, top_enabled=False
+    )
     # Shrink the logits budget so the relative path runs as several row chunks,
     # with chunk boundaries inside requests, as large batches do.
     monkeypatch.setattr(
@@ -650,6 +652,58 @@ def test_decode_selection_equivalent():
         ref_set = set(idx_ref[row][idx_ref[row] >= 0].tolist())
         new_set = set(idx_new[row][idx_new[row] >= 0].tolist())
         assert ref_set == new_set, f"row {row}: selection mismatch"
+
+
+def test_top_verify_window_is_decode_of_its_accepted_rows():
+    """A TOP target verify scores a request's root and drafts in one forward. A group that a row completes inside
+    the window is compressed from the keys plain decode would read, and rejected drafts leave the pending ring as
+    it was: written first, they would land on the ring slots of the group still pending."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    indexer = _make_indexer(_make_rotary(None, False, device, dtype), device, dtype)
+    indexer.top_enabled = True
+    request, write_loc = 1, 5
+    base = request * RATIO
+    # Positions 4 and 5 are committed and pending; the window is the root at 6 and drafts at 7, 8 and 9.
+    keys = torch.randn(6, 1, HEAD_DIM, device=device, dtype=dtype)
+    stale = torch.randn(3 * RATIO, 1, HEAD_DIM, device=device, dtype=dtype)
+    pool, decoded = (FakePool(3 * RATIO, 16, device, dtype) for _ in range(2))
+    for p in (pool, decoded):
+        p.key_state.copy_(stale)
+        committed = torch.tensor([base, base + 1], device=device)
+        p.set_qsa_key_state_buffer(0, committed, keys[:2])
+        p.set_qsa_rope_position_buffer(committed, torch.tensor([4, 5], device=device))
+
+    metadata = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_pool_indices=torch.full((4,), request, device=device, dtype=torch.int32),
+        is_cuda_graph=False,
+        # Row 1 (position 7) completes the group of positions 4..7.
+        write_locs=torch.tensor([write_loc], device=device, dtype=torch.int32),
+        compress_sequence_ids=torch.tensor([1], device=device),
+        compress_group_positions=torch.tensor([7], device=device),
+    )
+    window = torch.tensor([6, 7, 8, 9], device=device)
+    # Text rows: the RoPE position is the logical one on every axis.
+    indexer._compress_verify_top(keys[2:], window, window, metadata)
+    # The root and the first draft are accepted.
+    indexer.top_commit_verify(
+        pool,
+        torch.tensor([request], device=device),
+        torch.tensor([1], device=device),
+    )
+
+    accepted = torch.tensor([base + 2, base + 3], device=device)
+    decoded.set_qsa_key_state_buffer(0, accepted, keys[2:4])
+    decoded.set_qsa_rope_position_buffer(accepted, torch.tensor([6, 7], device=device))
+    group = base + torch.arange(RATIO, device=device)[None]
+    expected = indexer._compress_top(
+        decoded.key_state, decoded.qsa_rope_position_buffer, group
+    )
+    assert torch.equal(pool.compressed[write_loc], expected[0])
+    assert torch.equal(pool.key_state, decoded.key_state)
+    assert torch.equal(pool.qsa_rope_position_buffer, decoded.qsa_rope_position_buffer)
 
 
 if __name__ == "__main__":
