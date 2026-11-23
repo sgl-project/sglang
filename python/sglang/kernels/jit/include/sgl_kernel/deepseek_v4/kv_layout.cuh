@@ -219,7 +219,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
 #else
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
-  const float inv_scale = fp4::rcp_nr_e4m3(scale);
+  const float inv_scale = device::math::rcp_nr_ftz(scale);
   const uint8_t scale_bits = scale_e4m3.__x;
 #endif
   AlignedVector<uint8_t, kVecSize / 2> out;

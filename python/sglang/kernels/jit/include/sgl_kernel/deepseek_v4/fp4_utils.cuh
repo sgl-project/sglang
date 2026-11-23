@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
@@ -74,25 +75,13 @@ SGL_DEVICE float compressed_kv_scale(float amax) {
 #endif
 }
 
-#ifndef USE_ROCM
-/// \brief Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`:
-/// 0-ULP bit-identical to `__frcp_rn` across all finite positive E4M3 scales.
-SGL_DEVICE float rcp_nr_e4m3(float s) {
-  const float sx = s > 0.0f ? s : 1.0f;
-  float r;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(sx));
-  r = __fmaf_rn(__fmaf_rn(-sx, r, 1.0f), r, r);
-  return s > 0.0f ? r : 0.0f;
-}
-#endif
-
 /// \brief Quantize compressed KV with its E4M3 scale and return dequantized values.
 SGL_DEVICE fp32x2_t fake_quant_compressed_kv_x2(fp32x2_t x, float scale) {
 #ifdef USE_ROCM
   const fp32x2_t scaled{__fdiv_rn(x.x, scale) + 0.0f, __fdiv_rn(x.y, scale) + 0.0f};
   const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
 #else
-  const float inv_scale = rcp_nr_e4m3(scale);
+  const float inv_scale = device::math::rcp_nr_ftz(scale);
   const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
   const auto grid = device::cast<fp32x2_t>(fp16x2_t{__nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1)});
