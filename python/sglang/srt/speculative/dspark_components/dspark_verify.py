@@ -43,13 +43,15 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_batch_info import (
+    adjusts_logits,
+    need_truncated_sampling,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import (
-    apply_dflash_verify_logits_adjustments,
-    build_speculative_verify_target_probs,
-)
+from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
@@ -57,10 +59,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    VerifyWindow,
-    apply_logits_adjustments_strided,
-)
+from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -88,21 +87,29 @@ def target_model_type(target_worker) -> Optional[str]:
     )
 
 
-def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+def draft_folds_static_commit(
+    *, draft_model, kv_injector: Optional[TargetHiddenKvInjector]
+) -> bool:
+    """The draft opts in and its FULL slots are the target's, unremapped, so it
+    can store the verify commit at the target's cache locations."""
+    if kv_injector is None or not getattr(
+        draft_model, "folds_static_verify_commit", False
+    ):
+        return False
+    target = kv_injector.model_runner.runner_ids.space(IdSpaceKind.FULL)
+    draft = kv_injector.draft_model_runner.runner_ids.space(IdSpaceKind.FULL)
+    return (
+        target is not None
+        and draft is not None
+        and draft.key == target.key
+        and target.write is None
+    )
+
+
+def verify_logits_adjustments_are_noop(sampling_info, *, has_grammar: bool) -> bool:
     if sampling_info is None:
-        return True
-    if sampling_info.has_custom_logit_processor:
-        return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
-        return False
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-    if penalizer is not None and penalizer.is_required:
-        return False
-    if getattr(sampling_info, "grammar_mask", None) is not None:
-        return False
-    if getattr(sampling_info, "logit_bias", None) is not None:
-        return False
-    return True
+        return not has_grammar
+    return not adjusts_logits(sampling_info, has_grammar=has_grammar)
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -144,7 +151,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: Optional[TargetHiddenKvInjector] = None,
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
@@ -309,7 +316,6 @@ class TargetVerifyExecutor:
         draft_input: DFlashDraftInputV2,
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
-        sampling_info,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -340,21 +346,12 @@ class TargetVerifyExecutor:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        result = self._forward_prepared_verify(
+        return self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
-
-        if sampling_info is not None:
-            apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_token_num=verify_w,
-            )
-
-        return result
 
     def _forward_prepared_verify(
         self,
@@ -397,6 +394,7 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        assert self.kv_injector is not None, "commit_hidden needs a kv_injector"
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -438,7 +436,6 @@ class TargetVerifyExecutor:
         batch: ScheduleBatch,
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
-        sampling_info,
         iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
@@ -483,32 +480,41 @@ class TargetVerifyExecutor:
         draft_tokens: torch.Tensor,
         bs: int,
         device: str,
-        sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-        )
+        stride = self.verify_num_draft_tokens
+        full_block = layout.is_full_block(stride)
+        if full_block:
+            # Nothing to pack: the verify rows are the verify window.
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
+            ragged_window = RaggedVerifyWindow(
+                positions=verify_window.positions_2d.reshape(-1),
+                verify_cache_loc=verify_window.verify_cache_loc,
+                verify_ids=verify_ids_2d.reshape(-1).to(torch.int64),
+                window_index=None,
+            )
+        else:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=stride,
+                model_runner=self.model_runner,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
             batch=batch,
             layout=layout,
             ragged_window=ragged_window,
-            sampling_info=sampling_info,
             iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
 
-        stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
@@ -520,29 +526,27 @@ class TargetVerifyExecutor:
             hidden_strided = hidden_strided[: bs * stride]
         else:
             compact_logits = logits_output.next_token_logits
-            strided_logits = ScatterCompactToStrided.execute(
-                compact=compact_logits,
-                layout=layout,
-                fill_value=_PADDING_LOGIT,
-                point_mass_fill=True,
-                verify_num_draft_tokens=stride,
-            )
             compact_hidden = logits_output.hidden_states
             if compact_hidden is None:
                 raise RuntimeError(
                     "DSpark verify requires target hidden states, got None."
                 )
-            hidden_strided = ScatterCompactToStrided.execute(
-                compact=compact_hidden,
-                layout=layout,
-                fill_value=0.0,
-                verify_num_draft_tokens=stride,
-            )
-        apply_logits_adjustments_strided(
-            next_token_logits=strided_logits,
-            sampling_info=sampling_info,
-            verify_num_draft_tokens=stride,
-        )
+            if full_block:
+                strided_logits, hidden_strided = compact_logits, compact_hidden
+            else:
+                strided_logits = ScatterCompactToStrided.execute(
+                    compact=compact_logits,
+                    layout=layout,
+                    fill_value=_PADDING_LOGIT,
+                    point_mass_fill=True,
+                    verify_num_draft_tokens=stride,
+                )
+                hidden_strided = ScatterCompactToStrided.execute(
+                    compact=compact_hidden,
+                    layout=layout,
+                    fill_value=0.0,
+                    verify_num_draft_tokens=stride,
+                )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
         return target_verify, hidden_strided
@@ -625,6 +629,8 @@ class DsparkVerifyEpilogue:
         self.stride = int(verify_num_draft_tokens)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
+        self._draft_folds_static_commit_cache: Optional[bool] = None
+        self._folds_static_commit_cache: Optional[bool] = None
         self._tp_sync = tp_sync
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
         self.verify_lens_buf = torch.zeros(
@@ -761,7 +767,7 @@ class DsparkVerifyEpilogue:
         returns whether the engram history was committed."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
-        folds = self.folds_commit
+        folds = self.folds_static_commit
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
@@ -775,6 +781,14 @@ class DsparkVerifyEpilogue:
             self._scatter_future_relay(io.req_pool_indices, bs)
         if not folds:
             return committed_engram
+        if self._draft_folds_static_commit:
+            self.commit_ctx.draft_model.store_verify_commit(
+                req_pool_indices=io.req_pool_indices,
+                verify_hidden=io.hidden,
+                commit_lens=self.commit_lens_buf[:bs],
+                stride=self.stride,
+                valid=gated_commit_lens > 0,
+            )
         cache_loc = io.out_cache_loc
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
@@ -967,6 +981,28 @@ class DsparkVerifyEpilogue:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+
+    @property
+    def _draft_folds_static_commit(self) -> bool:
+        if self._draft_folds_static_commit_cache is None:
+            self._draft_folds_static_commit_cache = (
+                self._resolve_draft_folds_static_commit()
+            )
+        return self._draft_folds_static_commit_cache
+
+    def _resolve_draft_folds_static_commit(self) -> bool:
+        return self.commit_ctx is not None and draft_folds_static_commit(
+            draft_model=self.commit_ctx.draft_model,
+            kv_injector=self.commit_ctx.kv_injector,
+        )
+
+    @property
+    def folds_static_commit(self) -> bool:
+        if self._folds_static_commit_cache is None:
+            self._folds_static_commit_cache = (
+                self.folds_commit or self._draft_folds_static_commit
+            )
+        return self._folds_static_commit_cache
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor
@@ -1204,8 +1240,8 @@ def sample_simulated_bonus(
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
-    distribution the sampling accept uses: temperature, then top-k / top-p."""
-    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+    distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
+    if need_truncated_sampling(sampling_info):
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1239,15 +1275,14 @@ def _accepts_on_shards(
     draft_block: DraftBlockResult, sampling_info, block_verification: bool
 ) -> bool:
     # The sharded accept is a Triton chain rule on temperature-only target
-    # probabilities; block verification and top-k/top-p need the whole vocab.
+    # probabilities; block verification and truncated sampling need the whole vocab.
     # A SimpleNamespace stand-in (unit tests) has no vocab_shard.
     shard = getattr(draft_block, "vocab_shard", None)
     return (
         shard is not None
         and not getattr(draft_block, "greedy_draft", False)
         and not block_verification
-        and not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
+        and not need_truncated_sampling(sampling_info)
     )
 
 
@@ -1281,8 +1316,7 @@ def _blockwise_rejection_applies(
     return (
         rejection_noise is not None
         and not block_verification
-        and not sampling_info.need_top_k_sampling
-        and not sampling_info.need_top_p_sampling
+        and not need_truncated_sampling(sampling_info)
     )
 
 

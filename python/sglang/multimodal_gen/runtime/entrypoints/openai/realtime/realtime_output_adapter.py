@@ -45,7 +45,6 @@ class RealtimeFrameBatchHeader(TypedDict, total=False):
     bytes_per_frame: int
     raw_size: int
     encoding: str
-    delta_reference: str
     payload_lengths: list[int]
     event_id: int
     frame_batch_index: int
@@ -249,72 +248,17 @@ def _build_transport_payload(
     transport_frames: list[bytes],
     *,
     content_type: str,
-    metadata: dict[str, int | str],
-    output_format: str | None,
-    transport_quality: int | None,
-    preview_max_width: int | None,
 ) -> _TransportPayload:
-    payload_content_type = content_type
     payload_metadata: dict[str, int | str | bool | list[int]] = {}
-    raw_payload = b""
-
-    if (
-        output_format in ENCODED_PREVIEW_FORMATS
-        and content_type == RAW_RGB_CONTENT_TYPE
-        and transport_frames
-    ):
-        if output_format == "webp":
-            encoded_frames = [
-                _encode_rgb_frame_to_webp(
-                    frame,
-                    width=int(metadata["width"]),
-                    height=int(metadata["height"]),
-                    quality=int(transport_quality or WEBP_DEFAULT_QUALITY),
-                    preview_max_width=preview_max_width,
-                )
-                for frame in transport_frames
-            ]
-            payload_content_type = WEBP_FRAME_CONTENT_TYPE
-        else:
-            encoded_frames = [
-                _encode_rgb_frame_to_jpeg(
-                    frame,
-                    width=int(metadata["width"]),
-                    height=int(metadata["height"]),
-                    quality=int(transport_quality or JPEG_DEFAULT_QUALITY),
-                    preview_max_width=preview_max_width,
-                )
-                for frame in transport_frames
-            ]
-            payload_content_type = JPEG_FRAME_CONTENT_TYPE
-        raw_payload = b"".join(encoded_frames)
-        preview_width, preview_height = _preview_dimensions(
-            width=int(metadata["width"]),
-            height=int(metadata["height"]),
-            preview_max_width=preview_max_width,
-        )
-        payload_metadata = {
-            "format": output_format,
-            "encoding": output_format,
-            "source_width": int(metadata["width"]),
-            "source_height": int(metadata["height"]),
-            "preview_width": preview_width,
-            "preview_height": preview_height,
-            "width": preview_width,
-            "height": preview_height,
-            "payload_lengths": [len(frame) for frame in encoded_frames],
-        }
-    elif content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
-        raw_payload = b"".join(transport_frames)
+    raw_payload = b"".join(transport_frames)
+    if content_type == RAW_RGB_CONTENT_TYPE and transport_frames:
         payload_metadata = {
             "raw_size": len(raw_payload),
             "encoding": RAW_LOSSLESS_OUTPUT_FORMAT,
         }
-    else:
-        raw_payload = b"".join(transport_frames)
 
     return _TransportPayload(
-        content_type=payload_content_type,
+        content_type=content_type,
         payload=raw_payload,
         metadata=payload_metadata,
     )
@@ -345,12 +289,10 @@ def _is_encoded_preview_transport(
 async def _build_encoded_preview_payloads(
     split_batches: list[list[bytes]],
     *,
-    content_type: str,
     metadata: dict[str, int | str],
     output_format: str,
     transport_quality: int | None,
     preview_max_width: int | None,
-    event_id: int | None,
 ) -> list[_TransportPayload]:
     return list(
         await asyncio.gather(
@@ -519,12 +461,10 @@ class RawRGBRealtimeOutputAdapter:
                 timer = RealtimeStageTimer()
                 encoded_preview_payloads = await _build_encoded_preview_payloads(
                     split_batches,
-                    content_type=content_type,
                     metadata=metadata,
                     output_format=output_format,
                     transport_quality=transport_quality,
                     preview_max_width=preview_max_width,
-                    event_id=event_id,
                 )
                 stats["raw_payload_build_ms"] += timer.mark_ms()
             for frame_batch_index, transport_frames in enumerate(split_batches):
@@ -542,19 +482,10 @@ class RawRGBRealtimeOutputAdapter:
                             _build_transport_payload,
                             transport_frames,
                             content_type=content_type,
-                            metadata=metadata,
-                            output_format=output_format,
-                            transport_quality=transport_quality,
-                            preview_max_width=preview_max_width,
                         )
                     else:
                         transport_payload = _build_transport_payload(
-                            transport_frames,
-                            content_type=content_type,
-                            metadata=metadata,
-                            output_format=output_format,
-                            transport_quality=transport_quality,
-                            preview_max_width=preview_max_width,
+                            transport_frames, content_type=content_type
                         )
                     stats["raw_payload_build_ms"] += timer.mark_ms()
 
