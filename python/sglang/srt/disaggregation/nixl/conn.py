@@ -1494,6 +1494,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
         All other layouts use explicit layer IDs, or positional pairing for non-PP.
         """
+        if getattr(self.kv_args, "vpp_layers", None) is not None:
+            _, indices, _ = self.get_mla_kv_ptrs_with_pp(
+                list(range(n_src)), list(range(n_dst))
+            )
+            src_lens = self.kv_args.kv_item_lens
+            dst_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
+            if list(src_lens) != dst_lens:
+                raise RuntimeError(
+                    "VPP PD decode KV cell geometry differs from prefill"
+                )
+            return indices
         use_pp_mla_offsets = (
             self.pp_size > 1
             and n_src != n_dst

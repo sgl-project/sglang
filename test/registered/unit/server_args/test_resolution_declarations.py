@@ -847,27 +847,30 @@ class TestVPPResolution(CustomTestCase):
         with tempfile.TemporaryDirectory(prefix="vpp_resolution_") as path:
             with open(os.path.join(path, "config.json"), "w") as handle:
                 json.dump(config, handle)
-            args = ServerArgs(
-                model_path=path,
-                device="cuda",
-                pp_size=2,
-                pp_virtual_stages=3,
-                random_seed=42,
-            )
-            args.resolve_once()
-            cfg = resolving_view(args)
-            layout = resolve_vpp_layout(model_config_of(args), cfg)
-        self.assertEqual(layout.logical_size, 6)
-        self.assertEqual(cfg.attention_backend, "dsv4")
-        self.assertEqual(
-            (
-                cfg.cuda_graph_config.prefill.backend,
-                cfg.cuda_graph_config.decode.backend,
-            ),
-            ("disabled", "disabled"),
-        )
-        self.assertTrue(cfg.disable_overlap_schedule)
-        self.assertFalse(cfg.enable_attn_tp_input_scattered)
+            for role in ("null", "prefill", "decode"):
+                with self.subTest(role=role):
+                    args = ServerArgs(
+                        model_path=path,
+                        device="cuda",
+                        pp_size=2,
+                        pp_virtual_stages=3,
+                        random_seed=42,
+                        disaggregation_mode=role,
+                    )
+                    args.resolve_once()
+                    cfg = resolving_view(args)
+                    layout = resolve_vpp_layout(model_config_of(args), cfg)
+                    self.assertEqual(layout.logical_size, 6)
+                    self.assertEqual(cfg.attention_backend, "dsv4")
+                    self.assertEqual(
+                        (
+                            cfg.cuda_graph_config.prefill.backend,
+                            cfg.cuda_graph_config.decode.backend,
+                        ),
+                        ("disabled", "disabled"),
+                    )
+                    self.assertTrue(cfg.disable_overlap_schedule)
+                    self.assertFalse(cfg.enable_attn_tp_input_scattered)
 
     def test_cli_declarations_survive_publication_and_pickling(self):
         from sglang.srt.arg_groups.arg_utils import add_cli_args_from_dataclass
@@ -923,6 +926,31 @@ class TestVPPResolution(CustomTestCase):
         self.assertFalse(args.disable_cuda_graph)  # The startup seed stays raw.
         self.assertFalse(args.disable_overlap_schedule)
 
+    def test_pd_keeps_eager_resolution_on_both_roles(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.vpp_hook import handle_vpp
+
+        for role in ("prefill", "decode"):
+            for backend in ("mooncake", "nixl"):
+                with self.subTest(role=role, backend=backend):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        device="cuda",
+                        pp_size=2,
+                        pp_virtual_stages=3,
+                        disaggregation_mode=role,
+                        disaggregation_transfer_backend=backend,
+                    )
+                    with unittest.mock.patch(
+                        "sglang.srt.arg_groups.vpp_hook.model_config_of",
+                        return_value=self.model_config(),
+                    ):
+                        handle_vpp(args)
+                    cfg = resolving_view(args)
+                    self.assertTrue(cfg.disable_cuda_graph)
+                    self.assertTrue(cfg.disable_overlap_schedule)
+                    self.assertEqual(cfg.disaggregation_mode, role)
+
     def test_unsupported_modes_fail_before_model_configuration(self):
         from sglang.srt.arg_groups.vpp_hook import handle_vpp, validate_vpp_options
 
@@ -933,7 +961,35 @@ class TestVPPResolution(CustomTestCase):
             ({"attn_cp_size": 2}, "context parallelism"),
             ({"enable_attn_tp_input_scattered": True}, "input scattering"),
             ({"enable_two_batch_overlap": True}, "two-batch overlap"),
-            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+            (
+                {"disaggregation_mode": "decode", "enable_pd_role_switch": True},
+                "runtime role switch",
+            ),
+            (
+                {"disaggregation_mode": "prefill", "optimistic_prefill_attempts": 1},
+                "without optimistic prefill",
+            ),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_allocation_policy": "prefill_complete",
+                },
+                "early allocation",
+            ),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_transfer_backend": "mori",
+                },
+                "Mooncake or NIXL",
+            ),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_enable_offload_kvcache": True,
+                },
+                "KV offload",
+            ),
             ({"lora_paths": ["adapter"]}, "LoRA"),
             ({"speculative_algorithm": "DSPARK"}, "speculative decoding"),
             ({"device": "cpu"}, "CUDA"),

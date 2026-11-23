@@ -119,6 +119,22 @@ class TestPpPrefillToUnpipelinedDecode(CustomTestCase):
 class TestExistingPairingIsUnchanged(CustomTestCase):
     """All layouts outside heterogeneous plain MLA retain existing pairing."""
 
+    def test_vpp_nixl_descriptors_follow_noncontiguous_buffer_groups(self):
+        """Prepared NIXL descriptors must use the same ownership as actual sends."""
+        manager = _StubKVManager(
+            pp_size=2,
+            prefill_start_layer=0,
+            n_src=3,
+            mla_compression_ratios=[4, 128, 0, 4, 128, 4],
+        )
+        manager.kv_args.vpp_layers = [[0, 2, 4], [1, 3, 5]]
+        manager.kv_args.pp_rank = 0
+        peer = _peer(n_dst=8)
+        self.assertEqual(_resolve(manager, peer, 3, 8), [0, 3, 7])
+        peer.dst_kv_item_lens[7] += 1
+        with self.assertRaisesRegex(RuntimeError, "geometry differs"):
+            _resolve(manager, peer, 3, 8)
+
     def test_one_sided_layer_ids_are_rejected(self):
         start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
         with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):

@@ -108,6 +108,129 @@ class _Worker:
 
 
 class TestSchedulerVPP(CustomTestCase):
+    def test_pd_terminal_consensus_waits_for_all_layers_and_failure_wins(self):
+        """A stage that finished early cannot admit or free a partial KV request."""
+        from threading import Barrier
+
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        class TransferQueue(dict):
+            # IndexedReqList.items() exposes queue entries, rather than RID pairs.
+            def items(self):
+                return list(self.values())
+
+        size = 3
+        channels = [Queue() for _ in range(size - 1)]
+        barrier = Barrier(size)
+        broadcast = [None]
+        schedulers = []
+        for rank in range(size):
+            scheduler = object.__new__(SchedulerVPPMixin)
+
+            def recv(rank=rank):
+                return channels[rank - 1].get(timeout=10)
+
+            def send(value, async_send=True, rank=rank):
+                channels[rank].put(value)
+                return []
+
+            def bcast(value, src, rank=rank):
+                if rank == src:
+                    broadcast[0] = value
+                barrier.wait(timeout=10)
+                result = broadcast[0]
+                barrier.wait(timeout=10)
+                return result
+
+            polls = {
+                "request": (KVPoll.Success, KVPoll.Success, KVPoll.Transferring)[rank]
+            }
+            queue = TransferQueue(
+                request=SimpleNamespace(req=SimpleNamespace(rid="request"))
+            )
+            retired = {}
+
+            def get_rids(reqs, is_send, *groups, polls=polls):
+                return tuple(
+                    [req.req.rid for req in reqs if KVPoll.Success in group]
+                    for group in groups
+                )
+
+            def transfer(waiting, outcomes, queue=queue, retired=retired):
+                for rid, failed in outcomes.items():
+                    queue.pop(rid)
+                    retired[rid] = failed
+                return [], outcomes
+
+            scheduler.__dict__.update(
+                disaggregation_mode=vpp_mod.DisaggregationMode.DECODE,
+                _vpp_next_slot=0,
+                pp_group=SimpleNamespace(
+                    is_first_rank=rank == 0,
+                    is_last_rank=rank == size - 1,
+                    world_size=size,
+                    broadcast_object=bcast,
+                ),
+                _pp_recv_pyobj_from_prev_stage=recv,
+                _pp_send_pyobj_to_next_stage=send,
+                _pp_commit_comm_work=lambda work: None,
+                pause_state=SimpleNamespace(may_launch=lambda: True),
+                waiting_queue=[],
+                disagg_decode_prealloc_queue=SimpleNamespace(
+                    queue={},
+                    retracted_queue=[],
+                    publish_pending_destinations=lambda: None,
+                ),
+                disagg_decode_transfer_queue=SimpleNamespace(
+                    queue=queue,
+                    resolve_deferred_releases=lambda: None,
+                    publish_pending_metadata=lambda: None,
+                    enable_staging=True,
+                    _poll_with_staging=lambda polls=polls: list(polls.values()),
+                    move_transferred_with_outcomes=transfer,
+                ),
+                get_rids=get_rids,
+                enable_hisparse=False,
+                process_retract_queue=lambda rids: rids,
+                process_prealloc_queue=lambda rids: rids,
+                retired=retired,
+                polls=polls,
+            )
+            for name in (
+                "_pp_pd_get_retract_ids",
+                "_pp_pd_get_prealloc_ids",
+                "_route_aborts_to_bad",
+                "process_decode_transfer_queue",
+            ):
+                method = getattr(SchedulerPPMixin, name)
+                setattr(
+                    scheduler,
+                    name,
+                    method
+                    if name == "_route_aborts_to_bad"
+                    else method.__get__(scheduler),
+                )
+            schedulers.append(scheduler)
+
+        def advance():
+            with ThreadPoolExecutor(max_workers=size) as pool:
+                results = [pool.submit(s._vpp_pd_advance) for s in schedulers]
+                for result in results:
+                    result.result(timeout=10)
+
+        advance()
+        self.assertTrue(all(s.disagg_decode_transfer_queue.queue for s in schedulers))
+        self.assertTrue(all(not s.retired for s in schedulers))
+        schedulers[1].polls["request"] = KVPoll.Failed
+        schedulers[2].polls["request"] = KVPoll.Success
+        advance()
+        self.assertTrue(
+            all(not s.disagg_decode_transfer_queue.queue for s in schedulers)
+        )
+        self.assertEqual([s.retired for s in schedulers], [{"request": True}] * size)
+        self.assertTrue(all(channel.empty() for channel in channels))
+
     def test_abort_inputs_are_not_dispatched_between_retained_admissions(self):
         """A later input poll could release the preceding unlaunched batch's KV."""
         layout = VPPLayout(12, 2, virtual_stages=3)
@@ -141,6 +264,7 @@ class TestSchedulerVPP(CustomTestCase):
 
         pending = iter(batches)
         scheduler.__dict__.update(
+            disaggregation_mode=vpp_mod.DisaggregationMode.NULL,
             pp_loop_size=2,
             _vpp_next_slot=0,
             _vpp_next_batch_seq=0,

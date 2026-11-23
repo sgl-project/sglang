@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.distributed.vpp_activation import (
     VPPActivationReceiver,
     VPPSendWindow,
@@ -102,10 +104,127 @@ class SchedulerVPPMixin:
             wave = self._vpp_admit_wave()
             if not wave:
                 self._sched_idled = True
-                self.on_idle()
+                self._pp_answer_release_requests()
+                if self._vpp_pd_queues_empty():
+                    self.on_idle()
                 continue
             self._vpp_execute_wave(wave)
             self._vpp_process_wave(wave)
+
+    def _vpp_pd_queues_empty(self: Scheduler) -> bool:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return not (
+                self.disagg_prefill_bootstrap_queue.queue
+                or self.disagg_prefill_transfer_queue
+            )
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return not (
+                self.waiting_queue
+                or self.disagg_decode_prealloc_queue.queue
+                or self.disagg_decode_prealloc_queue.retracted_queue
+                or self.disagg_decode_transfer_queue.queue
+                or self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+            )
+        return True
+
+    def _vpp_pd_consensus(self: Scheduler, collect):
+        """Finish the existing PP reduction before any rank changes a queue."""
+        outcome = collect()
+        if not self.pp_group.is_last_rank:
+            self._pp_commit_comm_work(
+                self._pp_send_pyobj_to_next_stage(outcome, async_send=True)
+            )
+        return self.pp_group.broadcast_object(
+            outcome if self.pp_group.is_last_rank else None,
+            src=self.pp_group.world_size - 1,
+        )
+
+    def _vpp_pd_apply(self: Scheduler, process, outcome) -> None:
+        """Relay actual admission/retirement outcomes, including local shortfalls.
+
+        As in ordinary PP, later ranks consume what the preceding rank actually
+        processed, rather than independently allocating from a stale poll.
+        """
+        if not self.pp_group.is_first_rank:
+            outcome = self._pp_recv_pyobj_from_prev_stage()
+        outcome = process(outcome)
+        if not self.pp_group.is_last_rank:
+            self._pp_commit_comm_work(
+                self._pp_send_pyobj_to_next_stage(outcome, async_send=True)
+            )
+        # Fence all queue mutations before the wave's capacity agreement.
+        self.pp_group.broadcast_object(
+            outcome if self.pp_group.is_last_rank else None,
+            src=self.pp_group.world_size - 1,
+        )
+
+    def _vpp_pd_release_prefill(self: Scheduler, outcomes):
+        released = self.process_disagg_prefill_transfer_queue(outcomes)
+        return {req.rid: outcomes[req.rid] for req in released}
+
+    def _vpp_pd_get_decode_transferred_ids(self: Scheduler):
+        queue = self.disagg_decode_transfer_queue
+        # Raw transport Success does not imply that staged GPU scatters or
+        # metadata publication have finished. Vote on the admission gate itself.
+        polls = (
+            queue._poll_with_staging()
+            if queue.enable_staging
+            else queue._poll_with_metadata_gate()
+        )
+        outcomes = {
+            req.req.rid: poll == KVPoll.Failed
+            for req, poll in zip(queue.queue.items(), polls)
+            if poll in (KVPoll.Success, KVPoll.Failed)
+        }
+        if self.pp_group.is_first_rank:
+            return outcomes
+        previous = self._pp_recv_pyobj_from_prev_stage()
+        return {
+            rid: failed or previous[rid]
+            for rid, failed in outcomes.items()
+            if rid in previous
+        }
+
+    def _vpp_pd_advance(self: Scheduler) -> None:
+        """PD owns queues only while no VPP batch is retained or executing."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.process_bootstrapped_queue()
+            outcomes = self._vpp_pd_consensus(self._pp_pd_get_prefill_transferred_ids)
+            self._vpp_pd_apply(self._vpp_pd_release_prefill, outcomes)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.disagg_decode_transfer_queue.resolve_deferred_releases()
+            self.disagg_decode_prealloc_queue.publish_pending_destinations()
+            self.disagg_decode_transfer_queue.publish_pending_metadata()
+            if self.pause_state.may_launch():
+                retract = self._vpp_pd_consensus(
+                    lambda: self._pp_pd_get_retract_ids(self._vpp_next_slot)
+                )
+                self._vpp_pd_apply(self.process_retract_queue, retract)
+                prealloc = self._vpp_pd_consensus(self._pp_pd_get_prealloc_ids)
+                self._vpp_pd_apply(self.process_prealloc_queue, prealloc)
+                transferred = self._vpp_pd_consensus(
+                    self._vpp_pd_get_decode_transferred_ids
+                )
+                self._vpp_pd_apply(self.process_decode_transfer_queue, transferred)
+
+    def _vpp_plan_batch(self: Scheduler):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.process_pending_chunked_abort()
+            self.process_prefill_chunk(
+                last_batch=self.last_batch, running_batch=self.running_batch
+            )
+            plan = self.get_new_batch_prefill(self.running_batch)
+            plan.running_batch.batch_is_full = False
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            self._flush_staging_scatters()
+        else:
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+        return plan
 
     def _vpp_admit_wave(self: Scheduler) -> list[VPPBatchState]:
         """All physical ranks build the same batches using existing PP input relay.
@@ -122,6 +241,9 @@ class SchedulerVPPMixin:
             self._pp_commit_comm_work(self.send_req_work)
             self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
             self._pp_send_capacity_digest()
+        self.running_batch = self.running_mbs[self._vpp_next_slot]
+        self.last_batch = self.last_mbs[self._vpp_next_slot]
+        self._vpp_pd_advance()
         # Inputs (including aborts and pause) are dispatched only before any
         # batch is retained. Later slots consume the already replicated queue.
         for _ in range(self.pp_loop_size):
@@ -132,9 +254,7 @@ class SchedulerVPPMixin:
             self.last_batch = self.last_mbs[slot_id]
             batch = None
             if self.pause_state.may_launch():
-                plan = self.get_next_batch_to_run(
-                    running_batch=self.running_batch, last_batch=self.last_batch
-                )
+                plan = self._vpp_plan_batch()
                 self.running_batch = plan.running_batch
                 batch = plan.batch_to_run
             self.running_mbs[slot_id] = self.running_batch
@@ -203,6 +323,8 @@ class SchedulerVPPMixin:
         final_local = task.stage_id == self.vpp_batches.stages[-1].stage_id
         final_global = task.stage_id == self.vpp_schedule.layout.logical_size - 1
         fence = None if final_global else self.vpp_sends.acquire()
+        if state.forward_batch is None and getattr(self, "enable_staging", False):
+            self.maybe_prefetch_staging_for_batch(batch)
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.schedule_stream)
             if fence is not None:

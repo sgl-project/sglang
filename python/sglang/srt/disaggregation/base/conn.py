@@ -68,6 +68,9 @@ class KVArgs:
     kv_cache_dtype_str: str
     # KV byte layout both PD roles must share; None for pools with only one.
     kv_layout: Optional[str] = None
+    # Full model layer ownership on every physical VPP rank, also advertised
+    # at bootstrap so equal buffer counts cannot hide a different partition.
+    vpp_layers: Optional[List[List[int]]] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None

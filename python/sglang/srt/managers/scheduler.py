@@ -7023,8 +7023,6 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if getattr(scheduler.tp_worker.model_runner.model, "vpp_layout", None) is not None:
-        if disaggregation_mode != DisaggregationMode.NULL:
-            raise NotImplementedError("VPP disaggregation lifecycle is not wired yet")
         return scheduler.event_loop_vpp()
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:

@@ -360,6 +360,11 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
+        from sglang.srt.disaggregation.vpp import vpp_transfer_layers
+
+        kv_args.vpp_layers = vpp_transfer_layers(
+            self.scheduler.tp_worker.model_runner.model
+        )
         kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = (
             self.scheduler.rust_server.http_port

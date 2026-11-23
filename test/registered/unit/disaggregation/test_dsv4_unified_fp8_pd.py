@@ -3,6 +3,11 @@ from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.vpp import (
+    check_vpp_transfer_layers,
+    vpp_transfer_layers,
+)
+from sglang.srt.distributed.vpp_layout import VPPLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,6 +53,98 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
                         state_type,
                         src=list(range(100, 100 + src_len)),
                     )
+
+    def test_vpp_groups_tile_full_decode_without_touching_other_ranks(self):
+        """A bounding interval includes foreign layers between virtual stages."""
+        ratios = [4, 128, 0, 4, 128, 4, 0, 128, 4, 128, 4, 0]
+        layout = VPPLayout(12, 2, virtual_stages=3, partition=(1, 2, 3, 1, 2, 3))
+        ownership = vpp_transfer_layers(SimpleNamespace(vpp_layout=layout))
+        all_layers = list(range(12))
+        c4 = [0, 3, 5, 8, 10]
+        c128 = [1, 4, 7, 9]
+        for state, groups in (
+            (None, [c4, c4, c128]),
+            (None, [c4, c4, c4, c128, c128]),
+            (StateType.SWA, [all_layers, c4, c4]),
+            (StateType.SWA_RING, [all_layers]),
+            (StateType.SWA_RING, [all_layers, all_layers]),
+            (StateType.DSV4_REQUEST_STATE, [c128]),
+        ):
+            with self.subTest(state=state, groups=len(groups)):
+                full = [layer for group in groups for layer in group]
+                covered = []
+                for rank in range(2):
+                    mgr = _pp_mgr(0, 12, ratios)
+                    mgr.kv_args.vpp_layers = ownership
+                    mgr.kv_args.pp_rank = rank
+                    count = sum(layer in ownership[rank] for layer in full)
+                    src = [1000 + rank] * count
+                    actual_src, selected, n = mgr.get_mla_kv_ptrs_with_pp(
+                        src, list(range(len(full))), state
+                    )
+                    self.assertEqual(actual_src, src)
+                    self.assertEqual(n, count)
+                    self.assertTrue(
+                        all(full[index] in ownership[rank] for index in selected)
+                    )
+                    covered.extend(selected)
+                self.assertEqual(sorted(covered), list(range(len(full))))
+
+    def test_equal_counts_do_not_authorize_different_vpp_partitions(self):
+        """Identical region counts can still represent different global layers."""
+        common = dict(prefill_tp=2, decode_tp=2, decode_pp_size=2)
+        with self.assertRaisesRegex(RuntimeError, "per-rank layer ownership"):
+            check_vpp_transfer_layers([[0, 3], [1, 2]], [[0, 2], [1, 3]], **common)
+        with self.assertRaisesRegex(RuntimeError, "per-rank layer ownership"):
+            check_vpp_transfer_layers(None, [[0, 3], [1, 2]], **common)
+        check_vpp_transfer_layers(
+            [[0, 3], [1, 2]],
+            None,
+            prefill_tp=2,
+            decode_tp=2,
+            decode_pp_size=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "same TP"):
+            check_vpp_transfer_layers(
+                [[0, 3], [1, 2]],
+                None,
+                prefill_tp=2,
+                decode_tp=1,
+                decode_pp_size=1,
+            )
+
+    def test_bootstrap_rejects_same_size_different_layer_ownership(self):
+        """The decoded HTTP schema must retain ownership through peer validation."""
+        from unittest.mock import patch
+
+        manager = object.__new__(CommonKVManager)
+        manager.prefill_info_table = {}
+        manager.vpp_layers = [[0, 3], [1, 2]]
+        manager.attn_tp_size = manager.pp_size = 2
+        payload = dict(
+            attn_tp_size=2,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=2,
+            page_size=256,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            vpp_layers=[[0, 2], [1, 3]],
+        )
+        response = SimpleNamespace(status_code=200, json=lambda: payload)
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "per-rank layer ownership"):
+                manager.try_ensure_parallel_info("127.0.0.1:8765")
+
+    def test_vpp_fp8_bf16_mismatch_is_rejected_before_slicing(self):
+        mgr = _pp_mgr(0, 4, self.RATIOS)
+        mgr.kv_args.vpp_layers = [[0, 2], [1, 3]]
+        mgr.kv_args.pp_rank = 0
+        with self.assertRaisesRegex(ValueError, "buffer layout differs"):
+            mgr.get_mla_kv_ptrs_with_pp([100] * 5, list(range(self.BF16_KV_LEN)))
 
 
 if __name__ == "__main__":

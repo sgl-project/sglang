@@ -136,6 +136,7 @@ class PrefillServerInfo:
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
+    vpp_layers: Optional[List[List[int]]] = None
     # The (state type, sub-pool, window tail) entries every prefill rank registers;
     # None when pipeline stages register different ones or ranks do not report them.
     state_wire: Optional[List[List[Optional[str]]]] = None
@@ -363,6 +364,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
+        self.vpp_layers = getattr(args, "vpp_layers", None)
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
@@ -1509,6 +1511,15 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
+        from sglang.srt.disaggregation.vpp import check_vpp_transfer_layers
+
+        check_vpp_transfer_layers(
+            info.vpp_layers,
+            self.vpp_layers,
+            prefill_tp=info.attn_tp_size,
+            decode_tp=self.attn_tp_size,
+            decode_pp_size=self.pp_size,
+        )
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -1800,6 +1811,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
+            "vpp_layers": self.vpp_layers,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
@@ -2066,6 +2078,13 @@ class CommonKVManager(BaseKVManager):
         dst_kv_ptrs: List[int],
         state_type: Optional[StateType] = None,
     ) -> Tuple[List[int], List[int], int]:
+        if getattr(self.kv_args, "vpp_layers", None) is not None:
+            from sglang.srt.disaggregation.vpp import slice_vpp_mla_entries
+
+            src_kv_ptrs, dst_kv_ptrs = slice_vpp_mla_entries(
+                self.kv_args, src_kv_ptrs, dst_kv_ptrs, state_type
+            )
+            return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
         # Fast path: both sides use exactly the same PP layout
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
             return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
@@ -3255,6 +3274,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
+        self.vpp_layers: Optional[List[List[int]]] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.spec_kv_layout: Optional[dict] = None
         self.state_wire_by_stage: Dict[int, Optional[list]] = {}
@@ -3350,6 +3370,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         kv_layout = data.get("kv_layout")
+        vpp_layers = data.get("vpp_layers")
+        if self._registered_count and self.vpp_layers != vpp_layers:
+            return web.Response(
+                text="VPP layer ownership differs across prefill ranks", status=400
+            )
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
         spec_kv_layout = data.get("spec_kv_layout")
@@ -3373,6 +3398,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        self.vpp_layers = vpp_layers
         if self.spec_kv_layout is None:
             self.spec_kv_layout = spec_kv_layout
         self.decode_allocation_policy = policy
@@ -3489,6 +3515,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
+                vpp_layers=self.vpp_layers,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 spec_kv_layout=self.spec_kv_layout,
                 state_wire=self._state_wire(),

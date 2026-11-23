@@ -35,6 +35,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = success_resp
 
         mgr = self._make_manager()
+        mgr.vpp_layers = [[0, 3], [1, 2]]
         mgr.register_to_bootstrap()
 
         call_kwargs = mock_put.call_args
@@ -48,6 +49,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             "attn_dp_rank",
             "pp_size",
             "pp_rank",
+            "vpp_layers",
             "system_dp_size",
             "system_dp_rank",
             "rank_ip",
@@ -65,6 +67,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+        self.assertEqual(payload["vpp_layers"], [[0, 3], [1, 2]])
         # An empty layout never goes on the wire as a new field.
         self.assertIsNone(payload["spec_kv_layout"])
 
@@ -213,6 +216,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.rank_port = 12345
         # Target-only prefill: knows it injects no draft KV.
         mgr.spec_kv_layout = {}
+        mgr.vpp_layers = None
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16

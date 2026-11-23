@@ -838,6 +838,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
 
         kv_args.pp_rank = self.pp_rank
+        from sglang.srt.disaggregation.vpp import vpp_transfer_layers
+
+        kv_args.vpp_layers = vpp_transfer_layers(
+            self.scheduler.tp_worker.model_runner.model
+        )
         kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
