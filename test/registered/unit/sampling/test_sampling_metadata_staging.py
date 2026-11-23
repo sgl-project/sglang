@@ -12,23 +12,13 @@ from sglang.srt.sampling.logit_bias import LogitBiasEntries, build_logit_bias
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.sampling_test_utils import build_step_penalties
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 VOCAB_SIZE = 32
-
-
-def _build_step(reqs, pool):
-    """The step's penalties from each request's index, as the scheduler's
-    `SamplingParamsPool` gather gives them."""
-    host = np.array(
-        [-1 if r.penalty_index is None else r.penalty_index for r in reqs],
-        dtype=np.int64,
-    )
-    indices = torch.tensor(host, dtype=torch.int32, device=pool.device)
-    return StepPenalties.build(pool, indices, host)
 
 
 def _req(**sampling_params):
@@ -74,7 +64,7 @@ def _admitted_pool(reqs, device):
 
 
 def _step_penalties(reqs, device):
-    return _build_step(reqs, _admitted_pool(reqs, device))
+    return build_step_penalties(reqs, _admitted_pool(reqs, device))
 
 
 class _SamplingMetadataTestBase(CustomTestCase):
@@ -100,14 +90,14 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
         pool = _admitted_pool(reqs, self.device)
-        penalty_indices = _build_step(reqs, pool).penalty_indices
+        penalty_indices = build_step_penalties(reqs, pool).penalty_indices
         self.assert_device_tensor(
             pool.live_tables().min_new_tokens[penalty_indices],
             torch.tensor([2, 1], dtype=torch.int32),
             torch.int32,
         )
         for step in range(3):
-            penalties = _build_step(reqs, pool)
+            penalties = build_step_penalties(reqs, pool)
             additive, scaling = penalties.logit_penalties()
             self.assertIsNone(scaling)
             expected = torch.zeros(3, VOCAB_SIZE)
