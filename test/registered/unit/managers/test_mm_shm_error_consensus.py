@@ -47,7 +47,7 @@ from sglang.srt.multimodal.processors.unlimited_ocr_v2 import (  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
-register_cpu_ci(est_time=160, suite="base-a-test-cpu")
+register_cpu_ci(est_time=75, suite="base-a-test-cpu")
 
 
 class _CloneFailure:
@@ -96,7 +96,7 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
     )
 
 
-def _receiver() -> SchedulerRequestReceiver:
+def _receiver(mm_input_validator=None) -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_skipper=None,
@@ -108,6 +108,7 @@ def _receiver() -> SchedulerRequestReceiver:
         request_retirer=None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
+        mm_input_validator=mm_input_validator,
     )
 
 
@@ -204,14 +205,20 @@ def _run_image_receiver(rank, init_file, pipe):
         torch.distributed.destroy_process_group()
 
 
-def _gemma4_receiver():
-    receiver = _receiver()
-    receiver.model_config.hf_config = SimpleNamespace(
-        model_type="gemma4",
-        vision_config=SimpleNamespace(patch_size=16),
+def _gemma4_receiver(*, unified=False):
+    from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
+    from sglang.srt.models.gemma4_unified import Gemma4UnifiedForConditionalGeneration
+
+    model_cls = (
+        Gemma4UnifiedForConditionalGeneration
+        if unified
+        else Gemma4ForConditionalGeneration
+    )
+    hf_config = SimpleNamespace(
+        vision_config=SimpleNamespace(patch_size=16, model_patch_size=48),
         text_config=SimpleNamespace(hidden_size=4096),
     )
-    return receiver
+    return _receiver(model_cls.build_mm_input_validator(hf_config))
 
 
 def _vision_request(width=768, rid="image", *, video=False):
@@ -223,41 +230,6 @@ def _vision_request(width=768, rid="image", *, video=False):
         torch.zeros((1, 4, 2), dtype=torch.int64),
     )
     return req
-
-
-def _run_gemma4_consensus_rank(rank, world_size, init_file):
-    torch.set_num_threads(1)
-    torch.distributed.init_process_group(
-        backend="gloo",
-        init_method=Path(init_file).as_uri(),
-        rank=rank,
-        world_size=world_size,
-    )
-    try:
-        receiver = _gemma4_receiver()
-        parallel = SimpleNamespace(
-            attn_dp_enabled=False,
-            tp_size=world_size,
-            tp_group=SimpleNamespace(cpu_group=torch.distributed.group.WORLD),
-        )
-        with patch(
-            "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
-            return_value=parallel,
-        ):
-            # Only one rank sees malformed pixels. Both ranks must reject the
-            # same request before a healthy encoder can enter TP collectives.
-            bad = _vision_request(256 if rank else 768, rid="bad")
-            healthy = _vision_request(rid="healthy")
-            receiver._finalize_shm_features([bad, healthy])
-            assert isinstance(bad.mm_inputs, MMInputsProcessError)
-            assert isinstance(healthy.mm_inputs, MultimodalProcessorOutput)
-            # The next request still progresses through the same process group.
-            following = _vision_request(rid="following")
-            receiver._finalize_shm_features([following])
-            assert isinstance(following.mm_inputs, MultimodalProcessorOutput)
-            torch.distributed.all_reduce(torch.ones(1))
-    finally:
-        torch.distributed.destroy_process_group()
 
 
 class TestGemma4InputFailureConsensus(CustomTestCase):
@@ -350,14 +322,38 @@ class TestGemma4InputFailureConsensus(CustomTestCase):
                 self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
                 self.assertEqual(released, [1])
 
-    def test_tp_consensus_rejects_only_bad_request_and_keeps_progressing(self):
-        with TemporaryDirectory() as directory:
-            torch.multiprocessing.spawn(
-                _run_gemma4_consensus_rank,
-                args=(2, str(Path(directory) / "gloo-init")),
-                nprocs=2,
-                join=True,
-            )
+    def test_unified_checks_merged_patch_width(self):
+        """gemma4_unified merges patches: 3 * model_patch_size**2 = 6912."""
+        for width, rejected in ((768, True), (6912, False)):
+            for video in (False, True):
+                with self.subTest(width=width, video=video):
+                    req = _vision_request(width, video=video)
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                        return_value=SimpleNamespace(attn_dp_enabled=False, tp_size=1),
+                    ):
+                        _gemma4_receiver(unified=True)._finalize_shm_features([req])
+                    self.assertEqual(
+                        isinstance(req.mm_inputs, MMInputsProcessError), rejected
+                    )
+
+    def test_validation_without_shm_skips_rank_collectives(self):
+        """Every TP rank validates the same broadcast metadata on its own."""
+        module = "sglang.srt.managers.scheduler_components.request_receiver"
+        parallel = SimpleNamespace(
+            attn_dp_enabled=False, tp_size=2, tp_group=SimpleNamespace(cpu_group=None)
+        )
+        bad, good = _vision_request(256, rid="bad"), _vision_request(rid="good")
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.barrier") as barrier,
+            patch(f"{module}.all_reduce") as all_reduce,
+        ):
+            _gemma4_receiver()._finalize_shm_features([bad, good])
+        barrier.assert_not_called()
+        all_reduce.assert_not_called()
+        self.assertIsInstance(bad.mm_inputs, MMInputsProcessError)
+        self.assertIsInstance(good.mm_inputs, MultimodalProcessorOutput)
 
     def test_pipeline_relay_preserves_rejection(self):
         bad, good = _vision_request(256), _vision_request()

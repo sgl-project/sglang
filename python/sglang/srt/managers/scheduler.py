@@ -366,6 +366,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.mm_input_validation import resolve_mm_input_validator
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     register_token_space_models,
 )
@@ -2752,6 +2753,7 @@ class Scheduler(
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            mm_input_validator=resolve_mm_input_validator(self.model_config),
         )
 
     def init_dp_attn_adapter(self) -> None:

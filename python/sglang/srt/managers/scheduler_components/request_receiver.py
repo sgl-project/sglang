@@ -34,13 +34,12 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.req_types import MultimodalInputs, MultimodalProcessorOutput
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
 )
-from sglang.srt.multimodal.processors.gemma4_validation import (
-    validate_gemma4_vision_inputs,
-)
+from sglang.srt.multimodal.mm_input_validation import MultimodalInputValidator
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -67,6 +66,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _shm_consensus_groups(parallel) -> List:
+    """CPU groups whose ranks open the same SHM segments, in collective order."""
+    if parallel.attn_dp_enabled:
+        groups = []
+        if parallel.attn_tp_size > 1:
+            groups.append(parallel.attn_tp_group.cpu_group)
+        if parallel.attn_cp_size > 1:
+            groups.append(parallel.attn_cp_group.cpu_group)
+        return groups
+    if parallel.tp_size > 1:
+        return [parallel.tp_group.cpu_group]
+    return []
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
@@ -83,6 +96,7 @@ class SchedulerRequestReceiver:
     rust_server_mode: bool
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
+    mm_input_validator: Optional[MultimodalInputValidator] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
@@ -271,7 +285,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
-        """Prepare features and reject bad Gemma 4 inputs before model collectives."""
+        """Prepare features and reject malformed inputs before model collectives."""
         if not recv_reqs or not self.model_config.is_multimodal:
             return
 
@@ -286,22 +300,17 @@ class SchedulerRequestReceiver:
                 tokenized_reqs.extend(req.batch)
         if not tokenized_reqs:
             return
-        hf_config = getattr(self.model_config, "hf_config", None)
-        validate_vision = getattr(hf_config, "model_type", None) == "gemma4" and any(
-            req.mm_inputs is not None for req in tokenized_reqs
-        )
-        if not validate_vision and not has_shm_features(tokenized_reqs):
+        shm = has_shm_features(tokenized_reqs)
+        if not shm and self.mm_input_validator is None:
             return
 
+        # Validation reads broadcast metadata, so every rank reaches the same
+        # verdict; only SHM opening can diverge and needs the rank consensus.
+        groups = _shm_consensus_groups(get_parallel()) if shm else []
+
         # 1. wait until every rank has opened the shared feature segments
-        parallel = get_parallel()
-        if parallel.attn_dp_enabled:
-            if parallel.attn_tp_size > 1:
-                barrier(group=parallel.attn_tp_group.cpu_group)
-            if parallel.attn_cp_size > 1:
-                barrier(group=parallel.attn_cp_group.cpu_group)
-        elif parallel.tp_size > 1:
-            barrier(group=parallel.tp_group.cpu_group)
+        for group in groups:
+            barrier(group=group)
 
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
@@ -309,8 +318,10 @@ class SchedulerRequestReceiver:
             try:
                 if has_shm_features([req]):
                     unwrap_shm_features(req)
-                if validate_vision:
-                    validate_gemma4_vision_inputs(req.mm_inputs, hf_config)
+                if self.mm_input_validator is not None and isinstance(
+                    req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)
+                ):
+                    self.mm_input_validator(req.mm_inputs)
             except Exception:
                 logger.exception(
                     "Failed to prepare multimodal features for rid=%s",
@@ -320,17 +331,8 @@ class SchedulerRequestReceiver:
                 failed[index] = 1
 
         # 3. all ranks reject the same requests before entering model collectives
-        if parallel.attn_dp_enabled:
-            if parallel.attn_tp_size > 1:
-                all_reduce(
-                    failed, op=ReduceOp.MAX, group=parallel.attn_tp_group.cpu_group
-                )
-            if parallel.attn_cp_size > 1:
-                all_reduce(
-                    failed, op=ReduceOp.MAX, group=parallel.attn_cp_group.cpu_group
-                )
-        elif parallel.tp_size > 1:
-            all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
+        for group in groups:
+            all_reduce(failed, op=ReduceOp.MAX, group=group)
 
         error = MMInputsProcessError(
             "Failed to prepare multimodal features on a scheduler rank."
@@ -338,8 +340,11 @@ class SchedulerRequestReceiver:
         for index, req in enumerate(tokenized_reqs):
             if failed[index].item():
                 discard_shm_features(req)
-                for item in getattr(req.mm_inputs, "mm_items", ()):
-                    item.release_transport_proxies()
+                if isinstance(
+                    req.mm_inputs, (MultimodalProcessorOutput, MultimodalInputs)
+                ):
+                    for item in req.mm_inputs.mm_items:
+                        item.release_transport_proxies()
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
