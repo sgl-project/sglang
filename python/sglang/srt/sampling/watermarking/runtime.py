@@ -68,10 +68,11 @@ def watermark_pool_values(req: Req) -> tuple[bool, Sequence[int]]:
 
 
 def build_watermark_rows(
-    values: Optional[torch.Tensor], candidates_host: Optional[np.ndarray]
+    values: torch.Tensor, candidates_host: np.ndarray
 ) -> Optional[WatermarkRows]:
-    """The step's rows from its gathered pool values, or None without a candidate."""
-    if values is None or not candidates_host.any():
+    """The step's rows from its gathered pool values, or None without a candidate
+    (always without watermarking: no row is a candidate)."""
+    if not candidates_host.any():
         return None
     return _ADAPTERS[get_exec().features.watermark_algorithm].build_rows(
         values, candidates_host.tolist()

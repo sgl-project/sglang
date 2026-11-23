@@ -1413,6 +1413,7 @@ class Scheduler(
         self.sampling_params_pool = SamplingParamsPool(
             num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
+            penalty_status_pool=self.penalty_status_pool,
         )
 
     def init_running_status(self):
@@ -5488,8 +5489,7 @@ class Scheduler(
                 self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
-                ),
-                self.penalty_status_pool,
+                )
             )
             batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:

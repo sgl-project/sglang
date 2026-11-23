@@ -3198,7 +3198,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             vocab_size=self.model_config.vocab_size, device=self.device
         )
         # Workers launch some idle batches themselves, without the scheduler's builds.
-        self.sampling_info.set_rows(SamplingRows.empty(self.device), None)
+        self.sampling_info.set_rows(SamplingRows.empty(self.device))
         self.sampling_info.set_step_state([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:

@@ -5,14 +5,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.sampling_params_pool import (
-    SamplerParams,
-    SamplingParamsPool,
-    SamplingRows,
-)
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool, SamplingRows
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 from sglang.srt.sampling.watermarking.synthid import adapter as synthid_adapter
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,7 +93,7 @@ class TestSamplerParams(_PoolTestCase):
             ]
         )
 
-        params = _gather(pool, [2, 5]).sampler_params
+        params = _gather(pool, [2, 5])
 
         self.assertEqual(params.temperatures.shape, (2, 1))
         self.assertEqual(params.top_ks.dtype, torch.int32)
@@ -121,7 +117,7 @@ class TestSamplerParams(_PoolTestCase):
         pool.write([_req(3, temperature=0.5, top_p=0.8, top_k=1, min_p=0.2)])
         pool.write([_req(3, temperature=1.1)])
 
-        params = _gather(pool, [3]).sampler_params
+        params = _gather(pool, [3])
 
         self.assertAlmostEqual(params.temperatures.item(), 1.1, places=6)
         self.assertEqual(params.top_ks.tolist(), [TOP_K_ALL])
@@ -146,7 +142,7 @@ class TestSamplerParams(_PoolTestCase):
                 slots = list(range(1, len(top_ks) + 1))
                 pool.write([_req(s, top_k=k) for s, k in zip(slots, top_ks)])
 
-                params = _gather(pool, slots).sampler_params
+                params = _gather(pool, slots)
 
                 self.assertEqual(
                     (
@@ -165,22 +161,22 @@ class TestSamplerParams(_PoolTestCase):
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, top_p=0.9, min_p=0.1, top_k=1), _req(2, top_k=20)])
 
-        both = _gather(pool, [1, 2]).sampler_params
+        both = _gather(pool, [1, 2])
         self.assertTrue(both.need_top_p_sampling)
         self.assertTrue(both.need_min_p_sampling)
 
-        rest = _gather(pool, [2]).sampler_params
+        rest = _gather(pool, [2])
         self.assertFalse(rest.need_top_p_sampling)
         self.assertFalse(rest.need_min_p_sampling)
         self.assertFalse(rest.is_any_greedy)
         self.assertEqual(rest.max_top_k, 20)
 
-    def test_sampler_params_fields_are_sampling_batch_info_fields(self):
-        """set_rows sets the sampler params by name and copy_for_forward copies
-        only dataclass fields, so a SamplerParams field SamplingBatchInfo does not
+    def test_rows_fields_are_sampling_batch_info_fields(self):
+        """set_rows sets the rows by name and copy_for_forward copies only
+        dataclass fields, so a SamplingRows field SamplingBatchInfo does not
         declare would not reach the forward."""
         fields = {f.name for f in dataclasses.fields(SamplingBatchInfo)}
-        self.assertLessEqual(set(SamplerParams._fields), fields)
+        self.assertLessEqual(set(SamplingRows._fields), fields)
 
 
 class TestSeeds(_PoolTestCase):
@@ -190,9 +186,9 @@ class TestSeeds(_PoolTestCase):
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, seed=123), _req(2)])
 
-        self.assertEqual(_gather(pool, [1, 2]).seeds.tolist(), [123, 42])
+        self.assertEqual(_gather(pool, [1, 2]).sampling_seed.tolist(), [123, 42])
         # An idle batch still seeds, with no rows.
-        self.assertEqual(_gather(pool, []).seeds.tolist(), [])
+        self.assertEqual(_gather(pool, []).sampling_seed.tolist(), [])
 
     def test_seed_without_deterministic_inference(self):
         """A non-greedy request's seed applies; a greedy seed, or speculative
@@ -200,11 +196,11 @@ class TestSeeds(_PoolTestCase):
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, seed=123, top_k=50), _req(2, seed=123, top_k=1)])
 
-        self.assertEqual(_gather(pool, [1]).seeds.tolist(), [123])
-        self.assertIsNone(_gather(pool, [2]).seeds)
-        self.assertIsNone(_gather(pool, []).seeds)
+        self.assertEqual(_gather(pool, [1]).sampling_seed.tolist(), [123])
+        self.assertIsNone(_gather(pool, [2]).sampling_seed)
+        self.assertIsNone(_gather(pool, []).sampling_seed)
         self.spec_ns.speculative_algorithm = "EAGLE"
-        self.assertIsNone(_gather(pool, [1]).seeds)
+        self.assertIsNone(_gather(pool, [1]).sampling_seed)
 
     def test_unseeded_row_samples_with_its_filler_seed(self):
         """An unseeded request samples with its own filler seed in every seeded
@@ -218,9 +214,11 @@ class TestSeeds(_PoolTestCase):
             ]
         )
 
-        self.assertEqual(_gather(pool, [1, 2]).seeds.tolist(), [123, 456])
-        self.assertEqual(_gather(pool, [3, 2, 1]).seeds.tolist(), [789, 456, 123])
-        self.assertIsNone(_gather(pool, [3, 2]).seeds)
+        self.assertEqual(_gather(pool, [1, 2]).sampling_seed.tolist(), [123, 456])
+        self.assertEqual(
+            _gather(pool, [3, 2, 1]).sampling_seed.tolist(), [789, 456, 123]
+        )
+        self.assertIsNone(_gather(pool, [3, 2]).sampling_seed)
 
     def test_every_int64_seed_reads_back_exactly(self):
         """Seeds are kept as two int32 halves; the gather rebuilds the int64."""
@@ -230,40 +228,32 @@ class TestSeeds(_PoolTestCase):
 
         rows = _gather(pool, list(range(len(seeds))))
 
-        self.assertEqual(rows.seeds.dtype, torch.int64)
-        self.assertEqual(rows.seeds.tolist(), seeds)
+        self.assertEqual(rows.sampling_seed.dtype, torch.int64)
+        self.assertEqual(rows.sampling_seed.tolist(), seeds)
 
 
 class TestPenaltyIndices(_PoolTestCase):
     def test_step_penalties_take_the_rows_with_an_index(self):
-        """StepPenalties gets the penalized rows in batch order and their indices,
-        from the gathered column alone."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        """The gather gives StepPenalties the penalized rows in batch order and
+        their indices, from the gathered field alone."""
+        penalty_pool = SimpleNamespace(kinds=[1, 0, 0, 4])
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+        )
         pool.write(
             [_req(1), _req(2, penalty_index=3), _req(4), _req(5, penalty_index=0)]
         )
-        penalty_pool = SimpleNamespace(kinds=[1, 0, 0, 4])
 
-        rows = _gather(pool, [1, 2, 4, 5])
-        step = StepPenalties.build(
-            penalty_pool, rows.penalty_indices, rows.penalty_indices_host
-        )
+        step = _gather(pool, [1, 2, 4, 5]).step_penalties
 
-        self.assertEqual(rows.penalty_indices.tolist(), [-1, 3, -1, 0])
         self.assertEqual(step.batch_size, 4)
         self.assertEqual(step.batch_indices.tolist(), [1, 3])
         self.assertEqual(step.penalty_indices.tolist(), [3, 0])
         self.assertEqual(step.penalty_indices.dtype, torch.int64)
         self.assertEqual(step.kinds, 5)
+        self.assertIsNone(_gather(pool, [1, 4]).step_penalties)
 
-        rows = _gather(pool, [1, 4])
-        self.assertIsNone(
-            StepPenalties.build(
-                penalty_pool, rows.penalty_indices, rows.penalty_indices_host
-            )
-        )
-
-    def test_set_rows_builds_the_step_penalties_from_the_pool(self):
+    def test_set_rows_reads_the_step_penalties_from_the_pool(self):
         penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
         req = _req(2)
         req.sampling_params.frequency_penalty = 0.5
@@ -271,11 +261,13 @@ class TestPenaltyIndices(_PoolTestCase):
         req.sampling_params.repetition_penalty = 1.0
         req.sampling_params.min_new_tokens = 0
         penalty_pool.alloc([req])
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
+        )
         pool.write([req, _req(3)])
         info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
 
-        info.set_rows(_gather(pool, [3, 2]), penalty_pool)
+        info.set_rows(_gather(pool, [3, 2]))
 
         self.assertEqual(info.step_penalties.batch_indices.tolist(), [1])
         self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
@@ -285,7 +277,11 @@ class TestSlotLifecycle(_PoolTestCase):
     def test_readmission_after_retraction_keeps_the_penalty_index(self):
         """A retraction frees the slot and keeps the penalty index; the
         re-admission writes both to the request's new slot."""
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS,
+            device=DEVICE,
+            penalty_status_pool=SimpleNamespace(kinds=[0, 0, 1]),
+        )
         req = _req(1, seed=7, top_k=20, penalty_index=2)
         pool.write([req])
         req.kv.req_pool_idx = 6
@@ -293,25 +289,29 @@ class TestSlotLifecycle(_PoolTestCase):
 
         rows = _gather(pool, [6])
 
-        self.assertEqual(rows.penalty_indices.tolist(), [2])
-        self.assertEqual(rows.seeds.tolist(), [7])
-        self.assertEqual(rows.sampler_params.top_ks.tolist(), [20])
+        self.assertEqual(rows.step_penalties.penalty_indices.tolist(), [2])
+        self.assertEqual(rows.sampling_seed.tolist(), [7])
+        self.assertEqual(rows.top_ks.tolist(), [20])
 
     def test_reused_slot_reads_only_the_new_request(self):
         """A finished request leaves its entry behind; the next admission to the
         slot overwrites every field, host copies included."""
         self.exec_ns = _exec(watermark_algorithm="synthid")
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool = SamplingParamsPool(
+            num_rows=NUM_ROWS,
+            device=DEVICE,
+            penalty_status_pool=SimpleNamespace(kinds=[0, 1]),
+        )
         pool.write([_req(3, seed=5, top_k=50, penalty_index=1)])
         pool.write([_req(3, top_k=1, filler_seed=11)])
 
         rows = _gather(pool, [3])
 
-        self.assertEqual(rows.penalty_indices.tolist(), [-1])
-        self.assertEqual(rows.penalty_indices_host.tolist(), [-1])
-        self.assertIsNone(rows.seeds)
-        self.assertEqual(rows.watermark_candidates_host.tolist(), [False])
-        self.assertEqual(rows.watermark_values.tolist(), [[0]])
+        self.assertIsNone(rows.step_penalties)
+        self.assertIsNone(rows.sampling_seed)
+        self.assertIsNone(rows.watermark)
+        self.assertEqual(pool.table[pool.PENALTY_INDEX, 3].item(), -1)
+        self.assertEqual(pool.table[pool.WATERMARK, 3].item(), 0)
 
 
 class TestWatermarkFields(_PoolTestCase):
@@ -322,10 +322,7 @@ class TestWatermarkFields(_PoolTestCase):
         rows = _gather(pool, [1])
 
         self.assertEqual(pool.table.shape[0], SamplingParamsPool.WATERMARK)
-        self.assertIsNone(rows.watermark_values)
-        info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
-        info.set_rows(rows, None)
-        self.assertIsNone(info.watermark)
+        self.assertIsNone(rows.watermark)
 
     def test_gumbel_rows_read_back_each_request_value(self):
         """Keys (negative ones included) are rebuilt exactly from two int32
@@ -343,9 +340,7 @@ class TestWatermarkFields(_PoolTestCase):
             ]
         )
 
-        info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
-        info.set_rows(_gather(pool, [4, 3, 2, 1]), None)
-        rows = info.watermark
+        rows = _gather(pool, [4, 3, 2, 1]).watermark
 
         self.assertIsInstance(rows, gumbel_adapter.GumbelRows)
         default_key = 0xFEDCBA9876543210 - (1 << 64)
@@ -357,17 +352,14 @@ class TestWatermarkFields(_PoolTestCase):
         self.assertEqual(rows.enabled.tolist(), [False, True, True, True])
         self.assertEqual(rows.candidates_host, [False, False, True, True])
 
-        info.set_rows(_gather(pool, [4, 3]), None)
-        self.assertIsNone(info.watermark)
+        self.assertIsNone(_gather(pool, [4, 3]).watermark)
 
     def test_synthid_rows_index_the_candidates(self):
         self.exec_ns = _exec(watermark_algorithm="synthid")
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, top_k=50), _req(2, top_k=1), _req(3, top_k=50)])
 
-        info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
-        info.set_rows(_gather(pool, [2, 1, 3]), None)
-        rows = info.watermark
+        rows = _gather(pool, [2, 1, 3]).watermark
 
         self.assertIsInstance(rows, synthid_adapter.SynthIDRows)
         self.assertEqual(rows.indices.tolist(), [1, 2])

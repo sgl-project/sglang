@@ -516,8 +516,7 @@ def extend(reqs, model_runner):
     )
     sampling_params_pool.write(reqs)
     batch.sampling_info.set_rows(
-        sampling_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu),
-        None,
+        sampling_params_pool.gather(batch.req_pool_indices, batch.req_pool_indices_cpu)
     )
     batch.sampling_info.set_step_state(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)

@@ -17,9 +17,8 @@ from sglang.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
 )
 from sglang.srt.sampling.logit_bias import build_logit_bias
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
@@ -43,7 +42,7 @@ class ProcessorEntry:
 class SamplingBatchInfo:
     vocab_size: int
 
-    # The SamplerParams fields, set by the scheduler at each launch (set_rows).
+    # The sampler params, set by the scheduler at each launch (set_rows).
     temperatures: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -92,25 +91,11 @@ class SamplingBatchInfo:
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
-    def set_rows(
-        self, rows: SamplingRows, penalty_status_pool: Optional[PenaltyStatusPool]
-    ) -> None:
+    def set_rows(self, rows: SamplingRows) -> None:
         """Set the step's state read from its rows of `SamplingParamsPool`: the
         sampler params, the per-row seeds, the penalties, and the watermark rows."""
-        params = rows.sampler_params
-        for name, value in zip(params._fields, params):
+        for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
-        self.sampling_seed = rows.seeds
-        self.step_penalties = (
-            StepPenalties.build(
-                penalty_status_pool, rows.penalty_indices, rows.penalty_indices_host
-            )
-            if penalty_status_pool is not None
-            else None
-        )
-        self.watermark = build_watermark_rows(
-            rows.watermark_values, rows.watermark_candidates_host
-        )
 
     def set_step_state(self, reqs: List[Req]) -> None:
         """Build the stages' step state from the step's requests: logit_bias, the

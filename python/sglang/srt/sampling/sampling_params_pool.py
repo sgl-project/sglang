@@ -18,8 +18,10 @@ import numpy as np
 import torch
 
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.runtime import (
+    build_watermark_rows,
     num_watermark_fields,
     watermark_pool_values,
 )
@@ -28,10 +30,12 @@ from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.watermarking.interface import WatermarkRows
 
 
-class SamplerParams(NamedTuple):
-    """One launch's sampler params; field names match `SamplingBatchInfo`'s."""
+class SamplingRows(NamedTuple):
+    """One launch's state read from its rows of `SamplingParamsPool`, in batch
+    order; field names match `SamplingBatchInfo`'s."""
 
     temperatures: torch.Tensor  # [bs, 1] fp32
     top_ps: torch.Tensor  # [bs] fp32
@@ -46,10 +50,16 @@ class SamplerParams(NamedTuple):
     npu_top_k_top_p_eligible: bool
     # The largest top_k, or None when some row samples from the whole vocabulary.
     max_top_k: Optional[int]
+    # [bs] int64 seeds, or None to sample unseeded; deterministic mode seeds every row.
+    sampling_seed: Optional[torch.Tensor]
+    # The penalized rows, None when no row is penalized.
+    step_penalties: Optional[StepPenalties]
+    # The watermark policy, None unless some row is a candidate.
+    watermark: Optional[WatermarkRows]
 
     @classmethod
-    def empty(cls, device) -> SamplerParams:
-        """The params of a batch with no rows."""
+    def empty(cls, device) -> SamplingRows:
+        """The rows of a batch with no requests."""
         return cls(
             temperatures=torch.empty((0, 1), dtype=torch.float32, device=device),
             top_ps=torch.empty(0, dtype=torch.float32, device=device),
@@ -62,38 +72,14 @@ class SamplerParams(NamedTuple):
             need_min_p_sampling=False,
             npu_top_k_top_p_eligible=True,
             max_top_k=None,
-        )
-
-
-class SamplingRows(NamedTuple):
-    """One launch's rows of `SamplingParamsPool`, in batch order."""
-
-    sampler_params: SamplerParams
-    # [bs] int64 seeds, or None to sample unseeded; deterministic mode seeds every row.
-    seeds: Optional[torch.Tensor]
-    # [bs] int32 penalty index of each row, -1 for a row without one, and its host copy.
-    penalty_indices: torch.Tensor
-    penalty_indices_host: np.ndarray
-    # [k, bs] the watermark algorithm's values and [bs] whether each row is a
-    # candidate on the host; both None without watermarking.
-    watermark_values: Optional[torch.Tensor]
-    watermark_candidates_host: Optional[np.ndarray]
-
-    @classmethod
-    def empty(cls, device) -> SamplingRows:
-        """The rows of a batch with no requests."""
-        return cls(
-            sampler_params=SamplerParams.empty(device),
             # A deterministic idle batch still seeds, with no rows.
-            seeds=(
+            sampling_seed=(
                 torch.empty(0, dtype=torch.int64, device=device)
                 if _deterministic()
                 else None
             ),
-            penalty_indices=torch.empty(0, dtype=torch.int32, device=device),
-            penalty_indices_host=np.empty(0, dtype=np.int64),
-            watermark_values=None,
-            watermark_candidates_host=None,
+            step_penalties=None,
+            watermark=None,
         )
 
 
@@ -104,7 +90,14 @@ class SamplingParamsPool:
     # The first of the watermark algorithm's fields, which end the table.
     WATERMARK = 7
 
-    def __init__(self, num_rows: int, device):
+    def __init__(
+        self,
+        num_rows: int,
+        device,
+        penalty_status_pool: Optional[PenaltyStatusPool] = None,
+    ):
+        # The pool the penalty indices point into; None where no request takes one.
+        self.penalty_status_pool = penalty_status_pool
         self.num_watermark_fields = num_watermark_fields()
         self.table = torch.zeros(
             (self.WATERMARK + self.num_watermark_fields, num_rows),
@@ -168,7 +161,14 @@ class SamplingParamsPool:
         # Each row of the [rows, bs] result is a contiguous [bs] tensor.
         values = self.table.index_select(1, req_pool_indices)
         floats = values.view(torch.float32)
-        params = SamplerParams(
+        seeds = None
+        if _deterministic() or _any_row_with_seed(self.has_seed_host[slots], top_ks):
+            seeds = (
+                torch.stack((values[self.SEED_LO], values[self.SEED_HI]), dim=1)
+                .view(torch.int64)
+                .view(-1)
+            )
+        return SamplingRows(
             temperatures=floats[self.TEMPERATURE].view(-1, 1),
             top_ps=floats[self.TOP_P],
             top_ks=values[self.TOP_K],
@@ -180,23 +180,14 @@ class SamplingParamsPool:
             need_min_p_sampling=bool(self.uses_min_p_host[slots].any()),
             npu_top_k_top_p_eligible=lo >= 1 and hi <= 1024,
             max_top_k=hi if lo >= 1 and hi < TOP_K_ALL else None,
-        )
-        seeds = None
-        if _deterministic() or _any_row_with_seed(self.has_seed_host[slots], top_ks):
-            seeds = (
-                torch.stack((values[self.SEED_LO], values[self.SEED_HI]), dim=1)
-                .view(torch.int64)
-                .view(-1)
-            )
-        has_watermark = self.num_watermark_fields > 0
-        return SamplingRows(
-            sampler_params=params,
-            seeds=seeds,
-            penalty_indices=values[self.PENALTY_INDEX],
-            penalty_indices_host=self.penalty_indices_host[slots],
-            watermark_values=values[self.WATERMARK :] if has_watermark else None,
-            watermark_candidates_host=(
-                self.watermark_candidates_host[slots] if has_watermark else None
+            sampling_seed=seeds,
+            step_penalties=StepPenalties.build(
+                self.penalty_status_pool,
+                values[self.PENALTY_INDEX],
+                self.penalty_indices_host[slots],
+            ),
+            watermark=build_watermark_rows(
+                values[self.WATERMARK :], self.watermark_candidates_host[slots]
             ),
         )
 
