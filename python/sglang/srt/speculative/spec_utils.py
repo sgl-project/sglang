@@ -882,7 +882,7 @@ def needs_verify_tree(batch: ScheduleBatch) -> bool:
 
 class HostVerifyTree:
     """The verify tree on the host, for the grammar bitmask and the custom logit
-    processors' row prefixes (``VerifyStep.bind_target``).
+    processors' row prefixes (``VerifyStep.build_row_inputs``).
 
     ``from_device`` starts an async copy, so build it before the target verify
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).

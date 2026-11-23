@@ -8,10 +8,11 @@ Two entries run it:
 
 - decode: `SamplingPipeline.sample`, which binds, applies, samples, and commits
   in one call;
-- verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
+- verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch the verify worker calls `bind_target`, the stages (`VerifyStep.adjust`,
-  inside `eagle_sample` for a tree), its accept core, and `commit`.
+  launch the verify worker calls `build_row_inputs`, the stages
+  (`VerifyStep.adjust`, inside `eagle_sample` for a tree), its accept core,
+  and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
@@ -141,7 +142,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             sampling_info.step_penalties.commit(next_token_ids)
         return next_token_ids
 
-    def bind_verify(
+    def plan_verify(
         self, batch: ScheduleBatch, *, watermark_full_mask: bool
     ) -> VerifyStep:
         """Bind a target verify's sampling state: its route and its watermark.
@@ -302,7 +303,7 @@ class VerifyRoute(msgspec.Struct, frozen=True):
 
 
 class VerifyStep(msgspec.Struct):
-    """One target verify's sampling state, from `SamplingPipeline.bind_verify`:
+    """One target verify's sampling state, from `SamplingPipeline.plan_verify`:
     the route its fast paths read, the bound watermark, and what the stages read
     from the draft tree, bound after the target forward launches."""
 
@@ -319,21 +320,22 @@ class VerifyStep(msgspec.Struct):
     # (it does not support row prefixes): each commits one token.
     first_row_only_reqs: Optional[torch.Tensor] = None
 
-    def bind_target(
+    def build_row_inputs(
         self,
         logits_output: LogitsProcessorOutput,
         *,
         tree: Optional[HostVerifyTree],
         barrier: Optional[Callable[[], Dict[Req, List[int]]]],
     ) -> None:
-        """Each verify worker's one call after the target verify launches, so
-        the host work overlaps the forward: build the grammar mask and the
-        custom logit processors' row prefixes over `tree`, the verify tree's
-        host copy, which the worker builds when `needs_verify_tree`.
-        `logits_output` gives the grammar mask its device. Under overlap the
-        previous step's result is still queued; `barrier` advances the grammar
-        FSM over its tokens and returns them per request, as result processing
-        will append them to req.output_ids."""
+        """Build the stages' per-row inputs from `tree`, the verify tree's host
+        copy, which the worker builds when `needs_verify_tree`: the grammar mask,
+        the custom logit processors' row prefixes, and `first_row_only_reqs`.
+        Each verify worker calls it once after the target verify launches, so
+        the host work overlaps the forward. `logits_output` gives the grammar
+        mask its device. Under overlap the previous step's result is still
+        queued; `barrier` advances the grammar FSM over its tokens and returns
+        them per request, as result processing will append them to
+        req.output_ids."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.

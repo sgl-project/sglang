@@ -3561,7 +3561,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
-        verify = self.target_worker.model_runner.sampling_pipeline.bind_verify(
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
             batch, watermark_full_mask=False
         )
 
@@ -3652,7 +3652,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
+        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
         if sampling_info is not None and target_predict is None:
             # In place: DFlash refuses the watermark, the one stage that returns
             # new logits.

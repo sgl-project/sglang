@@ -1061,7 +1061,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_inputs_ready.record()
 
         sampling_info = batch.sampling_info
-        verify = self.target_worker.model_runner.sampling_pipeline.bind_verify(
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
             batch, watermark_full_mask=False
         )
         # Simulated acceptance overrides correct_len; the bonus is drawn at that row
@@ -1199,7 +1199,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
-        verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
+        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
         target_logits = logits_output.next_token_logits
         # Without sampling info (a simulated greedy accept drops it), nothing
         # adjusts the logits: the drop requires a route that adjusts nothing.

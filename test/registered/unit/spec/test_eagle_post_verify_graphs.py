@@ -184,7 +184,7 @@ def _eager(batch, verify_input, logits, sim_rng, graphs=None):
     )
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
-        SamplingPipeline(sampler=None, watermark=None).bind_verify(
+        SamplingPipeline(sampler=None, watermark=None).plan_verify(
             batch, watermark_full_mask=True
         ),
         SimpleNamespace(
