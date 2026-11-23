@@ -18,7 +18,7 @@ import os
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from functools import cache, partial
+from functools import cache, cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -154,6 +154,13 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
+
+    @cached_property
+    def supports_shared_read_events(self) -> bool:
+        attn = self._decode_runner.attn_backend
+        # The NPU enable flag lives on the full backend, not the hybrid wrapper.
+        full = getattr(attn, "full_attn_backend", attn)
+        return getattr(full, "shared_read_enabled", False)
 
     @property
     def cache_loc_dtype(self):
