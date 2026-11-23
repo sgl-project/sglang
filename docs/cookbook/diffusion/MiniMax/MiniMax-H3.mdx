@@ -43,7 +43,7 @@ For platform-specific installation details, see the
 
 [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) is a native joint video-and-audio model for text-to-video-and-audio, first/last-frame control, and multimodal reference conditioning. Its main strength is producing the picture and stereo soundtrack together, so speech, music, ambient sound, and visible events can stay aligned without a separate audio-generation pass.
 
-Choose H3 when synchronized audiovisual output or reference-driven generation matters more than a lightweight deployment. The released recipe targets a 768-pixel short edge at 24 fps for 4–15 seconds, and its capabilities are split across two checkpoint partitions; serving every mode therefore requires separate FL2VA and Ref2VA deployments.
+Choose H3 when synchronized audiovisual output or reference-driven generation matters more than a lightweight deployment. The released recipe targets a 768-pixel short edge at 24 fps for 4–15 seconds, and its capabilities are split across two checkpoint partitions; serving every mode therefore requires separate FL2VA and Ref2VA deployments, or [one server that loads both transformers](#one-server-for-both-partitions).
 
 | Task | `task` value | Conditioning |
 | --- | --- | --- |
@@ -60,7 +60,8 @@ reference condition.
 Use the selected Hub's root model ID: `MiniMaxAI/MiniMax-H3` on Hugging Face
 or `MiniMax/MiniMax-H3` on ModelScope. Select the checkpoint variant with
 `--model-variant`: `fl2va` serves both `t2va` and `fl2va`, while `ref2va`
-serves reference-conditioned requests. SGLang owns the checkpoint-directory
+serves reference-conditioned requests, and `fl2va+ref2va` loads both
+transformers into one server. SGLang owns the checkpoint-directory
 mapping; do not point `--model-path` at a manually downloaded subdirectory.
 The same FL2VA / Ref2VA split applies in
 [ComfyUI integrated mode](#comfyui-integrated-mode).
@@ -305,6 +306,54 @@ The current `torch.compile` path changes the model's numerical output, so no
 recommended lossless preset enables it implicitly. An explicit
 `--enable-torch-compile true` remains available for controlled experiments, but
 do not use it to generate consistency ground truth.
+
+### One server for both partitions
+
+`--model-variant fl2va+ref2va` keeps the FL2VA and the Ref2VA transformer in
+one server. The text encoder, both VAEs, the tokenizer and the processor are
+the same files in the two partitions and load once, from `FL2VA/`; the Ref2VA
+transformer loads beside the FL2VA one. Requests need no extra field: a
+`ref2va` request runs on the Ref2VA transformer, `t2va` and `fl2va` requests
+on the FL2VA one. Both partitions must declare the same sampling contract in
+`model_index.json`; the server checks this at load.
+
+```bash Command
+sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant fl2va+ref2va --port 30010
+```
+
+- **Memory.** Each GPU that holds the DiT holds both transformers (61.73 GiB
+  of weights each) beside one text encoder and one pair of VAEs. The automatic
+  memory policy places them at startup from the free memory of the least-free
+  GPU:
+  - from 181.7 GiB (the 120 GiB H3 keeps for one transformer and the rest of
+    the pipeline, plus the second transformer), both stay resident, as on
+    B300;
+  - from 120 GiB, as on H200, both use component offload: the transformer a
+    request runs moves onto the GPU and stays there, so only a request for the
+    other partition's tasks moves weights, and it waits for the swap;
+  - below 120 GiB the server does not start, and the error names the flags
+    that place the transformers explicitly.
+
+  Explicit placement (`--dit-cpu-offload`, `--component-residency`,
+  `--layerwise-offload-components`) replaces this choice; with
+  `--dit-cpu-offload true` every request moves its transformer onto the GPU
+  and back. Validated on 2× B300 and 2× H200 (Ulysses 2, 4 s at a 480 short
+  edge, MiniMax-H3 at 8 steps): on B300 a request after a switch denoises as
+  fast as one without; on H200 the denoise stage took 7.7–8.1 s after a swap
+  against 5.0–5.3 s without one, and 57.5 s and 46.6 s at the first swap to
+  each transformer.
+- **Adapters.** [Pika H3 Flex](#pika-h3-flex-six-step-adapters) applies each
+  partition's bundled adapter to its own transformer. `--lora-path` applies an
+  adapter to both; the [LoRA API](/docs/sglang-diffusion/api/openai_api#lora-management)
+  addresses one with `target`: `transformer` (FL2VA) or `transformer_2` (Ref2VA).
+- **Weights.** For `MiniMaxAI/MiniMax-H3` the server also downloads `Ref2VA/`
+  of the same revision. The Hub cache keeps one copy of the files the two
+  partitions share, so this adds the Ref2VA transformer (61.7 GiB). Pika H3
+  Flex materializes both. Component and weight overrides are **Unverified**
+  with this variant.
+- **Limits.** The startup warm-up request is `t2va`, so the first `ref2va`
+  request also warms the Ref2VA transformer. Cache-DiT, `quality: "high"` and
+  `--minimax-h3-adaln-cache-path` need a single-partition server.
 
 ### ComfyUI integrated mode
 
@@ -862,6 +911,9 @@ sglang serve --model-path Pika-Labs/Pika-H3-Flex --port 30010
 
 # ref2va
 sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant ref2va --port 30010
+
+# all three tasks from one server, see "One server for both partitions"
+sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant fl2va+ref2va --port 30010
 ```
 
 Use the requests in [Generate video and audio](#4-generate-video-and-audio)

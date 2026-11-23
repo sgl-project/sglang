@@ -299,6 +299,9 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             return
         self._begin_text_encoder_use(0)
         with set_forward_context(current_timestep=0, attn_metadata=None):
+            if batch.is_warmup:
+                # the warm-up request may carry no image
+                self.text_encoder.build_vision_attention_kernels()
             if plan.task == "ref2va":
                 embeddings = self._encode_ref2va(
                     batch,
