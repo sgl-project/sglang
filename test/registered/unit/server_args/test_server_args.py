@@ -5565,9 +5565,7 @@ class TestSchedulingArgValidation(CustomTestCase):
                     max_queued_requests=max_queued_requests,
                     enable_priority_scheduling=enable,
                 ):
-                    with self.assertRaisesRegex(
-                        ValueError, "max-queued-requests"
-                    ):
+                    with self.assertRaisesRegex(ValueError, "max-queued-requests"):
                         self.check(
                             enable_priority_scheduling=enable,
                             max_queued_requests=max_queued_requests,
@@ -5579,9 +5577,7 @@ class TestSchedulingArgValidation(CustomTestCase):
     def test_non_positive_max_running_requests_is_rejected(self):
         for max_running_requests in (0, -1):
             with self.subTest(max_running_requests=max_running_requests):
-                with self.assertRaisesRegex(
-                    ValueError, "max-running-requests"
-                ):
+                with self.assertRaisesRegex(ValueError, "max-running-requests"):
                     self.check(max_running_requests=max_running_requests)
 
     def test_positive_max_running_requests_is_accepted(self):
