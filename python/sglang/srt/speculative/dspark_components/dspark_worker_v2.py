@@ -1161,6 +1161,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
         )
+        if (
+            run_compact
+            and self._verify_epilogue is not None
+            and self._verify_epilogue.native_compact
+        ):
+            # These consumers still require fixed-stride logits. Their graph
+            # accept/commit is disarmed and the existing eager path runs below.
+            fold_eligible = fold_eligible and not (
+                batch.return_logprob
+                or (
+                    sampling_info is not None and sampling_info.has_watermark_candidates
+                )
+                or envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+                or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+                or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
+                or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get()
+            )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
@@ -1212,7 +1229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             watermark_full_mask=False,
         )
-        if sampling_info is not None:
+        if sampling_info is not None and not target_verify.native_compact:
             # run_compact scatters its rows back to (bs * chain_len), so the rows
             # line up with the verify ids on both verify paths.
             adjust_verify_logits(
@@ -1363,7 +1380,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             proposal_folded=proposal.folded,
             verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
+            target_logits=(
+                None
+                if target_verify.native_compact
+                else logits_output.next_token_logits
+            ),
             layout=layout,
             confidence=confidence,
             confidence_raw=proposal.confidence_raw,
