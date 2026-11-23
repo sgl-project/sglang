@@ -276,15 +276,10 @@ def _build_explicit_state_block_table(
 
 
 def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tensor:
-    """Build the Ascend 950 cache_mode=2 request-bank table.
-
-    Ascend 950 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the arch22 explicit
-    per-token location table.
-    """
+    """C2 takes one cycle-bank ID per request, not an explicit per-token table."""
     if req_pool_indices.ndim != 1:
         raise ValueError(
-            "Ascend 950 compressor requires a 1-D request-bank table, got "
+            "C2 compressor requires a 1-D request-bank table, got "
             f"shape={tuple(req_pool_indices.shape)}"
         )
     return req_pool_indices.to(dtype=torch.int32).contiguous()
@@ -361,7 +356,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35() or self._dsv4_has_low_ratio
+            if 2 in self._dsv4_compress_ratios
             else None
         )
         forward_mode = forward_batch.forward_mode
@@ -3465,42 +3460,22 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        if is_npu_arch35() or self._dsv4_has_low_ratio:
-            metadata.dsv4_cycle_state_block_table = torch.zeros(
-                bs, dtype=torch.int32, device=device
+        # C2 addresses a bank per request; C4/C128 use explicit token locations.
+        metadata.dsv4_cycle_state_block_table = (
+            torch.zeros(bs, dtype=torch.int32, device=device)
+            if 2 in self._dsv4_compress_ratios
+            else None
+        )
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (bs, (2 if ratio == 4 else 1) * ratio + tokens_per_req),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
             )
-            # The V4 compressor op consumes the explicit table on every arch,
-            # so seed it for the V4 ratios. The V4.1 ratio-2 pair pool is a
-            # plain CompressStatePool with no ``dummy_state_loc`` sentinel;
-            # its ds41.compressor addresses state through the cycle table
-            # above instead.
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-                if ratio in (4, 128)
-            }
-        else:
-            metadata.dsv4_cycle_state_block_table = None
-            metadata.dsv4_explicit_state_block_tables = {
-                ratio: torch.full(
-                    (
-                        bs,
-                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                    ),
-                    state_pool.dummy_state_loc,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-            }
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+            if ratio in (4, 128)
+        }
 
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
@@ -3915,10 +3890,9 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
         """Cycle request-bank table: one bank id per request."""
-        if is_npu_arch35() or self._dsv4_has_low_ratio:
-            ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices[: ctx.bs]
-            )
+        table = ctx.fm.dsv4_cycle_state_block_table
+        if table is not None:
+            table.copy_(ctx.forward_batch.req_pool_indices[: ctx.bs])
 
     def _refresh_graph_decode_rows(self, ctx) -> None:
         """Decode replay rows: shared seq scalars (start_pos = last live
