@@ -99,23 +99,6 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return None
 
 
-def needs_intermediate_states(
-    track_ssm: bool, track_ssm_h_src: Optional[torch.Tensor]
-) -> bool:
-    """Whether an extend batch must run a kernel that emits per-chunk states.
-
-    ``track_ssm_h_src`` carries one row per chunk-unaligned tracked sequence
-    (see ``MambaAttnBackendBase._init_track_ssm_indices``). Chunk-aligned
-    tracked sequences snapshot the final state from ``ssm_states`` instead, so
-    for them the intermediate states are never read and must not be requested
-    -- asking for them forces kernels that cannot emit ``h`` (e.g. the SAIL PLA
-    FlashKDA path) onto the Triton fallback.
-    """
-    return bool(
-        track_ssm and track_ssm_h_src is not None and track_ssm_h_src.numel() > 0
-    )
-
-
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -514,6 +497,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
+    def _needs_intermediate_states(self, track_ssm: bool) -> bool:
+        """Keep the default tracking schedule; platforms may specialize it."""
+        return track_ssm
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -1279,13 +1266,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        # Per-chunk states (h) are only read by chunk-unaligned tracked rows;
-        # every other tracked row snapshots h_track_buf or the final state.
-        # Requesting them unconditionally kept kernels that cannot emit h off
-        # the dense prefill path.
-        need_intermediate_states = needs_intermediate_states(
-            track_ssm, self.forward_metadata.track_ssm_h_src
-        )
+        need_intermediate_states = self._needs_intermediate_states(track_ssm)
         result = self.kernel_dispatcher.extend(
             q=q,
             k=k,
@@ -1329,9 +1310,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
-            # ping-pong track slots (see _init_track_ssm_indices). h is only
-            # meaningful for the rows that read it (see
-            # needs_intermediate_states).
+            # ping-pong track slots (see _init_track_ssm_indices).
             self._track_mamba_state_extend(
                 forward_batch,
                 h if need_intermediate_states else None,

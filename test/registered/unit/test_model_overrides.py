@@ -3757,6 +3757,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "get_platform",
             return_value=SimpleNamespace(is_sail=True, is_xpu=False),
         ):
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="flashkda"),
+                    SimpleNamespace(
+                        architectures=["Qwen3_5MoeForConditionalGeneration"]
+                    ),
+                )
+            )
             self.assertTrue(
                 supports_mamba_cache_extra_buffer(
                     SimpleNamespace(linear_attn_backend="flashkda"), kimi_k3

@@ -5,6 +5,8 @@ which mode, what the operators are handed, and when a batch stays on the
 community Triton implementation.
 """
 
+import builtins
+import inspect
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -13,6 +15,8 @@ from unittest.mock import Mock, patch, sentinel
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.linear import kda_replayssm_spec_decode as replayssm
+from sglang.kernels.ops.mamba import mamba_state_scatter_triton as scatter
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.sail.attention import gdn_backend as sail_gdn_backend
 from sglang.srt.hardware_backend.sail.attention import gdn_triton as sail_gdn_triton
@@ -26,6 +30,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
 )
 from sglang.srt.models import kimi_k3
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -454,8 +459,12 @@ class TestPLAKDADispatch(CustomTestCase):
                     weight = layer._k3_fused_decode_weight
                     self.assertEqual(weight.shape, (3, 4, num_heads * 128))
                     # A weight reload refreshes the buffer a captured graph reads.
+                    fused_args = layer._k3_fused_decode_args
+                    layer.conv_weights.fill_(0.75)
                     kimi_k3.KimiK3DeltaAttention._prepare_fused_decode(attention)
                     self.assertIs(layer._k3_fused_decode_weight, weight)
+                    self.assertIs(layer._k3_fused_decode_args, fused_args)
+                    self.assertTrue(torch.all(weight == 0.75))
 
     def test_community_preparation_keeps_its_head_limit(self):
         with (
@@ -472,6 +481,380 @@ class TestPLAKDADispatch(CustomTestCase):
             kimi_k3.KimiK3DeltaAttention._prepare_fused_decode(attention)
             self.assertTrue(attention._kda_fused_decode_ready)
             self.assertFalse(hasattr(layer, "_k3_fused_decode_weight"))
+
+    def test_mtp_override_preserves_the_parent_interface_and_ring_fallback(self):
+        parent = sail_kda_backend.KDAAttnBackend
+        override = sail_kda_backend.SailKDAAttnBackend._run_dspark_cutedsl_mtp
+        signature = inspect.signature(parent._run_dspark_cutedsl_mtp)
+        self.assertEqual(signature, inspect.signature(override, eval_str=True))
+        kwargs = {name: getattr(sentinel, name) for name in signature.parameters}
+        for enabled in (False, True):
+            for ring in (None, sentinel.ring):
+                with self.subTest(enabled=enabled, ring=ring):
+                    kwargs["replayssm_ring_indices"] = ring
+                    with (
+                        envs.SGLANG_SAIL_PLA.override(enabled),
+                        patch.object(parent, "_run_dspark_cutedsl_mtp") as native,
+                        patch.object(sail_kda, "decode_mtp") as pla,
+                    ):
+                        actual = override(**kwargs)
+                    if not enabled or ring is not None:
+                        self.assertIs(actual, native.return_value)
+                        native.assert_called_once_with(**kwargs)
+                        pla.assert_not_called()
+                    else:
+                        self.assertIs(actual, pla.return_value)
+                        pla.assert_called_once_with(
+                            **{
+                                k: v
+                                for k, v in kwargs.items()
+                                if k != "replayssm_ring_indices"
+                            }
+                        )
+                        native.assert_not_called()
+
+    def test_tracking_schedule_is_platform_specific(self):
+        for source in (None, torch.empty(0), torch.tensor([1])):
+            backend = SimpleNamespace(
+                forward_metadata=SimpleNamespace(track_ssm_h_src=source)
+            )
+            for track in (False, True):
+                self.assertEqual(
+                    sail_kda_backend.KDAAttnBackend._needs_intermediate_states(
+                        backend, track
+                    ),
+                    track,
+                )
+                self.assertEqual(
+                    sail_kda_backend.SailKDAAttnBackend._needs_intermediate_states(
+                        backend, track
+                    ),
+                    track and source is not None and source.numel() > 0,
+                )
+
+    def test_sail_prefill_default_is_per_runner_and_explicit_flags_win(self):
+        from sglang.srt.layers.attention.linear.utils import (
+            resolve_linear_attn_backends,
+        )
+
+        for enabled in (False, True):
+            for kda in (False, True):
+                runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=Mock()))
+                with (
+                    envs.SGLANG_SAIL_PLA.override(enabled),
+                    patch(
+                        "sglang.srt.configs.model_config.uses_kda_attention",
+                        return_value=kda,
+                    ),
+                ):
+                    default = sail_kda_backend.sail_pla_prefill_default(
+                        runner.model_config
+                    )
+                self.assertEqual(default, "flashkda" if enabled and kda else None)
+                for explicit in (None, "triton"):
+                    mamba = SimpleNamespace(
+                        linear_attn_backend="triton",
+                        linear_attn_decode_backend=None,
+                        linear_attn_prefill_backend=explicit,
+                        linear_attn_verify_backend=None,
+                    )
+                    with patch(
+                        "sglang.srt.layers.attention.linear.utils.get_exec",
+                        return_value=SimpleNamespace(mamba=mamba),
+                    ):
+                        actual = resolve_linear_attn_backends(prefill_default=default)
+                    self.assertEqual(
+                        actual.prefill.value, explicit or default or "triton"
+                    )
+                    self.assertIsNone(mamba.linear_attn_decode_backend)
+                    self.assertEqual(mamba.linear_attn_prefill_backend, explicit)
+
+    def test_sail_pla_configuration_respects_opt_out_and_missing_wheel(self):
+        with (
+            envs.SGLANG_SAIL_PLA.override(False),
+            patch.dict(sys.modules, {"pla": ModuleType("pla")}),
+        ):
+            sail_kda.configure_pla()
+            self.assertFalse(envs.SGLANG_SAIL_PLA.get())
+            envs.SGLANG_SAIL_PLA.clear()
+            sail_kda.configure_pla()
+            self.assertTrue(envs.SGLANG_SAIL_PLA.get())
+        with (
+            envs.SGLANG_SAIL_PLA.override(True),
+            patch.dict(sys.modules, {"pla": None}),
+        ):
+            sail_kda.configure_pla()
+            self.assertFalse(envs.SGLANG_SAIL_PLA.get())
+
+    def test_scatter_dispatch_preserves_imported_consumers(self):
+        for name in (
+            "fused_mamba_state_scatter_with_mask",
+            "fused_conv_window_scatter_with_mask",
+        ):
+            consumer = getattr(scatter, name)
+            vendor = Mock(return_value=sentinel.vendor)
+            fake_module = ModuleType(
+                "sglang.kernels.ops.mamba.mamba_state_scatter_sail"
+            )
+            setattr(fake_module, name, vendor)
+            with (
+                patch.object(scatter, "is_sail_runtime", return_value=False),
+                patch.dict(sys.modules, {fake_module.__name__: None}),
+            ):
+                consumer(
+                    sentinel.dst,
+                    sentinel.src,
+                    sentinel.dst_indices,
+                    torch.empty(0, dtype=torch.int32),
+                )
+                vendor.assert_not_called()
+            with (
+                patch.object(scatter, "is_sail_runtime", return_value=True),
+                patch.dict(sys.modules, {fake_module.__name__: fake_module}),
+            ):
+                self.assertIs(
+                    consumer(
+                        sentinel.dst,
+                        sentinel.src,
+                        sentinel.dst_indices,
+                        sentinel.steps,
+                        sentinel.src_indices,
+                    ),
+                    sentinel.vendor,
+                )
+            vendor.assert_called_once_with(
+                sentinel.dst,
+                sentinel.src,
+                sentinel.dst_indices,
+                sentinel.steps,
+                sentinel.src_indices,
+            )
+
+    def test_sail_backend_selection_needs_no_registration(self):
+        from sglang.srt.layers.attention import attention_registry
+
+        with (
+            patch.object(attention_registry, "_is_sail", True),
+            patch.dict(
+                attention_registry.OOT_LINEAR_ATTENTION_BACKENDS, {}, clear=True
+            ),
+            patch("sglang.srt.platforms.current_platform", SRTPlatform()),
+        ):
+            for base, module, name in (
+                (
+                    sail_kda_backend.KDAAttnBackend,
+                    sail_kda_backend,
+                    "SailKDAAttnBackend",
+                ),
+                (
+                    sail_gdn_backend.GDNAttnBackend,
+                    sail_gdn_backend,
+                    "SailGDNAttnBackend",
+                ),
+            ):
+                with patch.object(module, name) as factory:
+                    actual = attention_registry._create_linear_attention_backend(
+                        sentinel.runner, base
+                    )
+                    self.assertIs(actual, factory.return_value)
+                    factory.assert_called_once_with(sentinel.runner)
+            self.assertFalse(attention_registry.OOT_LINEAR_ATTENTION_BACKENDS)
+
+        class CustomKDA(sail_kda_backend.KDAAttnBackend):
+            pass
+
+        class CustomGDN(sail_gdn_backend.GDNAttnBackend):
+            pass
+
+        for backend in (CustomKDA, CustomGDN):
+            self.assertIs(
+                sail_kda_backend.get_linear_attention_backend(backend), backend
+            )
+
+    def test_cuda_backend_selection_does_not_import_sail_or_pla(self):
+        from sglang.srt.layers.attention import attention_registry
+
+        original_import = builtins.__import__
+
+        def import_without_sail(name, *args, **kwargs):
+            if name.startswith("sglang.srt.hardware_backend.sail") or name == "pla":
+                raise AssertionError(f"Unexpected CUDA import: {name}")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            envs.SGLANG_SAIL_PLA.override(True),
+            patch.object(attention_registry, "_is_sail", False),
+            patch("sglang.srt.platforms.current_platform", SRTPlatform()),
+            patch("builtins.__import__", side_effect=import_without_sail),
+        ):
+            for backend in (
+                sail_kda_backend.KDAAttnBackend,
+                sail_gdn_backend.GDNAttnBackend,
+            ):
+                with patch.object(
+                    backend, "__init__", return_value=None
+                ) as constructor:
+                    actual = attention_registry._create_linear_attention_backend(
+                        sentinel.runner, backend
+                    )
+                self.assertIsInstance(actual, backend)
+                constructor.assert_called_once_with(sentinel.runner)
+
+    def test_sail_commit_and_native_fallback_preserve_all_indices(self):
+        kwargs = dict(
+            spec_state=SimpleNamespace(
+                temporal=sentinel.temporal,
+                replayssm_rawv=torch.empty(1, 2, 1, 4, 128),
+                replayssm_rawk=torch.empty(1, 2, 1, 4, 128),
+                replayssm_g=sentinel.g,
+                replayssm_beta=sentinel.beta,
+                conv=[sentinel.conv0, sentinel.conv1],
+                intermediate_conv_window=[sentinel.window0, sentinel.window1],
+            ),
+            state_batch_indices=sentinel.slots,
+            accept_lens=sentinel.accept_lens,
+            last_correct_step_indices=sentinel.last_step,
+            mamba_track_indices=sentinel.track_slots,
+            mamba_steps_to_track=sentinel.track_steps,
+            ring_indices=sentinel.ring,
+            src_indices_raw=sentinel.source,
+            null_block_id=7,
+        )
+        for covered in (True, False):
+            with (
+                patch.object(
+                    sail_kda, "commit_after_verify", return_value=covered
+                ) as pla,
+                patch.object(replayssm, "commit_kda_replayssm_spec_all_layers") as fold,
+                patch.object(
+                    scatter, "fused_conv_window_scatter_with_mask"
+                ) as conv_scatter,
+            ):
+                sail_kda.commit_after_verify_or_fallback(**kwargs)
+            pla.assert_called_once_with(**kwargs)
+            if covered:
+                fold.assert_not_called()
+                conv_scatter.assert_not_called()
+            else:
+                fold.assert_called_once()
+                self.assertIs(fold.call_args.kwargs["ring_indices"], sentinel.ring)
+                self.assertIs(
+                    fold.call_args.kwargs["mamba_track_indices"], sentinel.track_slots
+                )
+                self.assertIs(
+                    fold.call_args.kwargs["accept_lens"], sentinel.accept_lens
+                )
+                self.assertEqual(conv_scatter.call_count, 4)
+                for i in range(2):
+                    for offset, slots, steps in (
+                        (0, sentinel.slots, sentinel.last_step),
+                        (1, sentinel.track_slots, sentinel.track_steps),
+                    ):
+                        self.assertEqual(
+                            conv_scatter.call_args_list[2 * i + offset].args,
+                            (
+                                kwargs["spec_state"].conv[i],
+                                kwargs["spec_state"].intermediate_conv_window[i],
+                                slots,
+                                steps,
+                                sentinel.source,
+                            ),
+                        )
+
+    def test_both_commit_callers_keep_cuda_and_sail_separate(self):
+        from sglang.srt.layers.attention import hybrid_linear_attn_backend as hybrid
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+        from sglang.srt.speculative import spec_utils
+
+        pool = SimpleNamespace(
+            replayssm_is_kda=True,
+            replayssm_spec_fold=True,
+            replayssm_request_ring=True,
+            replayssm_cache_base=None,
+            get_speculative_mamba2_params_all_layers=lambda: sentinel.state,
+        )
+        backend = hybrid.HybridLinearAttnBackend.__new__(hybrid.HybridLinearAttnBackend)
+        backend.linear_attn_backend = SimpleNamespace(state_pool=pool)
+        slots = ForwardStateSlots(
+            torch.tensor([3, 4]), torch.tensor([8, 9]), torch.tensor([1, 2])
+        )
+        steps, track_steps = torch.tensor([1, 0]), torch.tensor([0, -1])
+        request_rows = torch.tensor([11, 12])
+        target_worker = Mock()
+        target_worker.model_runner.token_to_kv_pool.layer_router.part_view.return_value = pool
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            req_pool_indices=request_rows,
+            mamba_track_indices=slots.track,
+        )
+        for sail in (False, True):
+            for direct in (False, True):
+                with (
+                    self.subTest(sail=sail, direct=direct),
+                    patch.object(hybrid, "is_sail", return_value=sail),
+                    patch.object(spec_utils, "is_sail", return_value=sail),
+                    patch.object(
+                        hybrid, "pp_spec_stable_rows_enabled", return_value=True
+                    ),
+                    patch.object(
+                        spec_utils, "pp_spec_stable_rows_enabled", return_value=True
+                    ),
+                    patch.object(spec_utils, "mambaish_config", return_value=True),
+                    patch.object(spec_utils, "built_megakernel", return_value=None),
+                    patch.object(
+                        replayssm, "commit_kda_replayssm_after_verify"
+                    ) as native,
+                    patch.object(sail_kda, "commit_after_verify_or_fallback") as pla,
+                ):
+                    if direct:
+                        backend.update_mamba_state_after_mtp_verify(
+                            steps,
+                            slots.track,
+                            track_steps,
+                            None,
+                            req_pool_indices=request_rows,
+                            state_slots=slots,
+                        )
+                    else:
+                        spec_utils.commit_mamba_states_after_verify(
+                            target_worker,
+                            batch,
+                            steps + 1,
+                            torch.tensor([[0, 1], [2, -1]]),
+                            2,
+                            prepared_step_indices=(steps, track_steps),
+                            state_slots=slots,
+                        )
+                selected, unused = (pla, native) if sail else (native, pla)
+                selected.assert_called_once()
+                unused.assert_not_called()
+                kwargs = selected.call_args.kwargs
+                self.assertIs(kwargs["spec_state"], sentinel.state)
+                for name, expected in (
+                    ("state_batch_indices", slots.working),
+                    ("mamba_track_indices", slots.track),
+                    ("ring_indices", slots.ring),
+                    ("src_indices_raw", request_rows),
+                    ("accept_lens", steps + 1),
+                    ("mamba_steps_to_track", track_steps),
+                ):
+                    torch.testing.assert_close(kwargs[name], expected)
+
+    def test_sail_commit_rejects_uncovered_indexing_before_mutation(self):
+        kwargs = dict(
+            spec_state=sentinel.spec_state,
+            state_batch_indices=sentinel.slots,
+            accept_lens=sentinel.accept_lens,
+            last_correct_step_indices=sentinel.last_step,
+        )
+        with envs.SGLANG_SAIL_PLA.override(True):
+            for extra in (
+                {"ring_indices": sentinel.ring},
+                {"src_indices_raw": sentinel.source},
+            ):
+                self.assertFalse(sail_kda.commit_after_verify(**kwargs, **extra))
+        with envs.SGLANG_SAIL_PLA.override(False):
+            self.assertFalse(sail_kda.commit_after_verify(**kwargs))
 
 
 if __name__ == "__main__":

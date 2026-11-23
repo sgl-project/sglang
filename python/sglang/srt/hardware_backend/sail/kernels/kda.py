@@ -10,12 +10,15 @@ this module is what lets the upstream kernel files stay platform-free.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 # The packed-decode operator hard-codes the community softplus constants.
 PLA_SOFT_BETA = 1.0
@@ -28,6 +31,21 @@ SUPPORTED_FUSED_DECODE_HEADS = {12, 24, 48, 96}
 def pla_enabled() -> bool:
     """Whether the PLA operator library may be used for this process."""
     return envs.SGLANG_SAIL_PLA.get()
+
+
+def configure_pla() -> None:
+    """Enable an available PLA wheel unless the user explicitly opted out."""
+    try:
+        import pla  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "PLA is not installed; SGLANG_SAIL_PLA stays off and the KDA "
+            "kernels use the community Triton implementations."
+        )
+        envs.SGLANG_SAIL_PLA.set(False)
+    else:
+        if not envs.SGLANG_SAIL_PLA.is_set():
+            envs.SGLANG_SAIL_PLA.set(True)
 
 
 def _load_decode():
@@ -440,3 +458,13 @@ def commit_after_verify(
         conv_state_layout="width_dim",
     )
     return True
+
+
+def commit_after_verify_or_fallback(**kwargs) -> None:
+    """Commit once through PLA, or use the unchanged community implementation."""
+    if not commit_after_verify(**kwargs):
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+            commit_kda_replayssm_after_verify,
+        )
+
+        commit_kda_replayssm_after_verify(**kwargs)

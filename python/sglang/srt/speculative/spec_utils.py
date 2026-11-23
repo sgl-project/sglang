@@ -1420,6 +1420,11 @@ def commit_mamba_states_after_verify(
             commit_kda_replayssm_after_verify,
         )
 
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.kernels.kda import (
+                commit_after_verify_or_fallback as commit_kda_replayssm_after_verify,
+            )
+
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
@@ -1437,13 +1442,6 @@ def commit_mamba_states_after_verify(
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             ring_indices=ring_indices,
         )
-        if is_sail():
-            # SAIL folds the accepted window and rolls back conv in one PLA
-            # launch; False hands the batch back to the Triton path below.
-            from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
-
-            if sail_kda.commit_after_verify(**commit_kwargs):
-                return
         commit_kda_replayssm_after_verify(**commit_kwargs)
         return
 

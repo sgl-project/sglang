@@ -12,7 +12,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.sail.attention.kda_flashkda import (
     SailFlashKDAKernel,
 )
@@ -27,32 +26,33 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_sail
 
 
 def sail_pla_prefill_default(model_config) -> Optional[str]:
-    """This runner's SAIL KDA prefill default: the PLA kernel.
-
-    Returned as a *per-runner default* (fed into
-    ``resolve_linear_attn_backends(prefill_default=...)``) rather than written
-    into the process-wide ``--linear-attn-prefill-backend`` value, because a
-    target and its speculative draft coexist in one process and can want
-    different prefill kernels. KDA target models opt in here; a draft runner
-    whose model is GDN keeps its own backend (GDNKernelDispatcher has no
-    FlashKDA prefill kernel and rejects it). An explicit
-    ``--linear-attn-prefill-backend`` still wins over this default.
-    """
-    if not is_sail() or not envs.SGLANG_SAIL_PLA.get():
-        return None
-    try:
-        hf_config = model_config.hf_config
-    except Exception:  # noqa: BLE001 - resolution must not fail on this probe
+    """Select PLA for a KDA runner without changing explicit backend flags."""
+    if not sail_kda.pla_enabled():
         return None
     from sglang.srt.configs.model_config import uses_kda_attention
 
-    if not uses_kda_attention(hf_config):
+    if not uses_kda_attention(model_config.hf_config):
         return None
     return "flashkda"
+
+
+def get_linear_attention_backend(backend):
+    """Select only the built-in KDA/GDN classes; leave external subclasses alone."""
+    if backend is KDAAttnBackend:
+        return SailKDAAttnBackend
+    if (
+        f"{backend.__module__}.{backend.__qualname__}"
+        == "sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend"
+    ):
+        from sglang.srt.hardware_backend.sail.attention.gdn_backend import (
+            SailGDNAttnBackend,
+        )
+
+        return SailGDNAttnBackend
+    return backend
 
 
 def _pla_prefill_backend(
@@ -107,6 +107,12 @@ class SailKDAAttnBackend(KDAAttnBackend):
         return SailKDAKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+
+    def _needs_intermediate_states(self, track_ssm: bool) -> bool:
+        # Chunk-aligned tracked rows read the final state, not per-chunk h.
+        # Avoid requesting h when the PLA prefill can serve the entire batch.
+        source = self.forward_metadata.track_ssm_h_src
+        return bool(track_ssm and source is not None and source.numel() > 0)
 
     def _fused_decode_covered(
         self,
@@ -323,8 +329,9 @@ class SailKDAAttnBackend(KDAAttnBackend):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        replayssm_ring_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not sail_kda.pla_enabled():
+        if not sail_kda.pla_enabled() or replayssm_ring_indices is not None:
             return KDAAttnBackend._run_dspark_cutedsl_mtp(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
@@ -341,6 +348,7 @@ class SailKDAAttnBackend(KDAAttnBackend):
                 replayssm_rawk=replayssm_rawk,
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
         return sail_kda.decode_mtp(
             layer=layer,
