@@ -228,11 +228,11 @@ class Memory(msgspec.Struct):
                 "namespace digest plus absolute layer and head-group indices), "
                 "so any topology whose shards tile the same grid shares one "
                 "cache. Implies --hicache-mem-layout page_unified and "
-                "--hicache-io-backend kernel. Currently supported by the file "
-                "backend for dense MHA/MLA, ordinary DSA KV + indexer, and "
-                "DeepSeek V4/V4.1 native pools. DSA and DeepSeek native pools "
-                "store complete pages per global owner layer; CP, DCP and "
-                "draft sidecars are unsupported for these pools."
+                "--hicache-io-backend kernel. For dense MHA/MLA, the file and "
+                "mooncake backends store one object per head/layer chunk. "
+                "Ordinary DSA KV + indexer and DeepSeek V4/V4.1 native pools "
+                "require the file backend and store complete pages per global "
+                "owner layer. These pools require CP=1, DCP=1 and no draft sidecars."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -294,10 +294,7 @@ class Memory(msgspec.Struct):
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "
-                "supplied while the linker is disabled. For built-in backends, "
-                "replaces --hicache-storage-backend-extra-config when provided. "
-                "The fallback to that flag for external linkers is deprecated; "
-                "ordinary HiCache use of that flag is unaffected."
+                "supplied while the linker is disabled."
             ),
             type_parser=json.loads,
         ),

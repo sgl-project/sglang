@@ -103,9 +103,18 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
     def test_unified_needs_a_supported_storage_backend(self):
         with self.assertRaisesRegex(ValueError, "needs"):
             _resolve(hicache_storage_backend=None)
-        for backend in ("hf3fs", "mooncake"):
+        for backend in ("hf3fs", "nixl"):
             with self.subTest(backend=backend), self.assertRaises(NotImplementedError):
                 _resolve(hicache_storage_backend=backend)
+
+    def test_unified_accepts_the_mooncake_backend(self):
+        args = _resolve(
+            hicache_storage_backend="mooncake",
+            hicache_storage_head_partition=2,
+            hicache_storage_layer_partition=8,
+        )
+        self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_unified")
+        self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
 
     def test_unified_refuses_speculative_decoding(self):
         # Draft layers sit on the host pool's layer axis but outside the grid.
@@ -133,6 +142,8 @@ class TestDSV4ControllerUnifiedKeys(CustomTestCase):
         device = object.__new__(DeepSeekV4TokenToKVPool)
         device.dtype = torch.float16
         device.page_size = 16
+        device.start_layer = 4
+        device.layer_num = 4
         device.index_pools = {}
         info = DevicePoolInfo(
             pool_name=PoolName.DEEPSEEK_V4_C4,
@@ -219,6 +230,15 @@ class TestDSV4ControllerUnifiedKeys(CustomTestCase):
                 self.assertRaisesRegex(NotImplementedError, "CP or DCP"),
             ):
                 self._config(**kwargs)
+
+    def test_mooncake_rejects_native_pool_plans(self):
+        """Native pool pages must never fall back to rank-based Mooncake keys."""
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "requires the file backend"):
+            MooncakeStore(self._config())
 
 
 class TestControllerUnifiedKeys(CustomTestCase):
@@ -442,13 +462,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 return_value=True,
             ),
             patch.object(controller, "get_attn_cp_rank_and_size", return_value=(1, 2)),
-            patch.object(
-                controller,
-                "_build_unified_plan",
-                return_value=SimpleNamespace(
-                    suffixes=["shared"], layer_ranges=[(0, 4)], head_group_num=1
-                ),
-            ),
+            patch.object(controller, "_build_unified_plan", return_value=None),
         ):
             config = controller._generate_storage_config("org/model")
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))

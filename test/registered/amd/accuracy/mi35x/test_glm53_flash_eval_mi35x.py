@@ -42,7 +42,7 @@ command the cookbook publishes for this model: 64 threads, 32768 max tokens,
 temperature 1.0, top_p 0.95, thinking on. The seed pins the sampling so a
 failure is a regression rather than a reroll.
 
-Registry: nightly-amd-8-gpu-mi35x-glm53-flash suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm53-flash suite
 """
 
 import unittest
@@ -66,7 +66,7 @@ from sglang.test.test_utils import (
 # 328 GB checkpoint plus the eval.
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-glm53-flash",
+    suite="nightly-test-8-gpu-amd-mi35x-glm53-flash",
     nightly=True,
 )
 

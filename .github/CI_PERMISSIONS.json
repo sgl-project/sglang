@@ -29,6 +29,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "AndyDai-nv": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "model express expert"
+    },
     "AniZpZ": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -105,12 +111,6 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override"
-    },
-    "DevashishLal-CB": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "Edwardf0t1": {
@@ -443,6 +443,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "akashpalla": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
+    },
     "akhilg-nv": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -599,6 +605,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "dlal-sgl": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "dongjiyingdjy": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -651,6 +663,12 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "gausah01": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
         "reason": "custom override"
     },
     "gilfordting": {
@@ -1020,6 +1038,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
+    "micyan01": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
+    },
     "milo-modal": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1235,6 +1259,12 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
+    },
+    "rumitdesai": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
     },
     "rwang5203": {
         "can_tag_run_ci_label": true,
