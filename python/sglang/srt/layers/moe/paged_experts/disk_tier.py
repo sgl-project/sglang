@@ -88,13 +88,14 @@ def _host_boot_id() -> Optional[str]:
 
 def _local_tp_size() -> int:
     """TP ranks sharing this host's RAM, measured once before allocating host stores."""
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_device, get_parallel
 
     model = current_model()
     if model.local_tp_size is None:
         parallel = get_parallel()
-        if parallel.tp_size == 1:
-            model.local_tp_size = 1
+        if parallel.tp_size == 1 or (parallel.nnodes == 1 and not get_device().use_ray):
+            # The native single-node launcher starts every TP rank locally.
+            model.local_tp_size = parallel.tp_size
         else:
             group = parallel.tp_group
             # Ray can place TP ranks on different hosts even with nnodes=1.

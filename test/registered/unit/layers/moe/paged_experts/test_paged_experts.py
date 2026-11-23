@@ -2731,7 +2731,9 @@ class TestDiskTierGuards(CustomTestCase):
 
 
 class TestTpHostBudget(CustomTestCase):
-    def _rows(self, hosts, rank, budget_gb, num_resident=K, *, nnodes=None):
+    def _rows(
+        self, hosts, rank, budget_gb, num_resident=K, *, nnodes=None, use_ray=False
+    ):
         from sglang.srt.layers.moe.paged_experts import method as method_module
 
         def gather(boot_id):
@@ -2749,6 +2751,10 @@ class TestTpHostBudget(CustomTestCase):
             patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
             patch.object(method_module, "get_exec", return_value=exec_ctx),
             patch("sglang.srt.runtime_context.get_exec", return_value=exec_ctx),
+            patch(
+                "sglang.srt.runtime_context.get_device",
+                return_value=SimpleNamespace(use_ray=use_ray),
+            ),
             get_parallel().override(tp_size=len(hosts), nnodes=nnodes, tp_group=group),
             patch(
                 "sglang.srt.runtime_context.process_model_config",
@@ -2791,15 +2797,29 @@ class TestTpHostBudget(CustomTestCase):
         # host while the logical launcher configuration still has nnodes=1.
         for rank in range(2):
             with self.subTest(rank=rank):
-                self.assertEqual(self._rows([0, 1], rank, budget_gb=2, nnodes=1), E)
+                self.assertEqual(
+                    self._rows([0, 1], rank, budget_gb=2, nnodes=1, use_ray=True), E
+                )
 
-    def test_missing_host_boot_id_fails_on_all_ranks(self):
+    def test_native_single_node_shares_budget_without_boot_id(self):
         for rank in range(2):
             with self.subTest(rank=rank):
-                with self.assertRaisesRegex(
-                    RuntimeError, "could not read its Linux kernel boot ID"
-                ):
-                    self._rows([0, None], rank, budget_gb=4, nnodes=2)
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([None, None], rank, budget_gb=2, nnodes=1)
+                self.assertEqual(
+                    self._rows([None, None], rank, budget_gb=4, nnodes=1), E
+                )
+
+    def test_missing_host_boot_id_fails_on_all_ranks(self):
+        for nnodes, use_ray in ((2, False), (1, True)):
+            for rank in range(2):
+                with self.subTest(nnodes=nnodes, use_ray=use_ray, rank=rank):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "could not read its Linux kernel boot ID"
+                    ):
+                        self._rows(
+                            [0, None], rank, budget_gb=4, nnodes=nnodes, use_ray=use_ray
+                        )
 
     def test_tp1_and_fully_resident_experts_obey_the_budget(self):
         for num_resident in (K, E):
