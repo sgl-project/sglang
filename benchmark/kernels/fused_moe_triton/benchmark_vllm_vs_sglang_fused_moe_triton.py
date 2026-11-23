@@ -1,4 +1,5 @@
-# python3 benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py --model /DeepSeek-V3/ --tp-size 8 --use-fp8-w8a8
+# Run from the repository root:
+# python3 -m benchmark.kernels.fused_moe_triton.benchmark_vllm_vs_sglang_fused_moe_triton --model /DeepSeek-V3/ --tp-size 8 --use-fp8-w8a8
 import argparse
 
 import torch
