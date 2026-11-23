@@ -12,6 +12,7 @@ import fastapi
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.update import check_lora_update_parallelism
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -705,6 +706,7 @@ class TokenizerControlMixin:
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
             )
+            check_lora_update_parallelism()
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -791,6 +793,7 @@ class TokenizerControlMixin:
             assert get_parallel().dp_size == 1, (
                 "data-parallel replicas are not supported for dynamic lora loading"
             )
+            check_lora_update_parallelism()
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
@@ -874,6 +877,7 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
+            check_lora_update_parallelism()
             assert obj.lora_name is not None, (
                 "lora_name must be provided to unload LoRA adapter"
             )

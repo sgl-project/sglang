@@ -214,9 +214,12 @@ class TestSchedulerLoRAUnload(CustomTestCase):
             events.append(("wait_stream", stream))
         )
         scheduler.tp_worker = Mock()
-        scheduler.tp_worker.unload_lora_adapter.side_effect = lambda req: events.append(
-            ("unload", req)
-        )
+
+        def unload(req):
+            events.append(("unload", req))
+            return LoRAUpdateOutput(success=True, loaded_adapters={})
+
+        scheduler.tp_worker.unload_lora_adapter.side_effect = unload
         request = UnloadLoRAAdapterReqInput(lora_name="a", lora_id="a-id")
 
         scheduler.unload_lora_adapter(request)

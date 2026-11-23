@@ -6947,7 +6947,14 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = run_lora_update(lambda: self.tp_worker.load_lora_adapter(recv_req))
+        result = run_lora_update(
+            lambda: self.tp_worker.load_lora_adapter(recv_req),
+            rollback=lambda: self._unload_lora_adapter_local(
+                UnloadLoRAAdapterReqInput(
+                    lora_name=recv_req.lora_name, lora_id=recv_req.lora_id
+                )
+            ),
+        )
         if result.success:
             self.kv_event_lora_names.register(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
@@ -6960,7 +6967,12 @@ class Scheduler(
         """In-place loading a new lora adapter from serialized tensors."""
 
         result = run_lora_update(
-            lambda: self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+            lambda: self.tp_worker.load_lora_adapter_from_tensors(recv_req),
+            rollback=lambda: self._unload_lora_adapter_local(
+                UnloadLoRAAdapterReqInput(
+                    lora_name=recv_req.lora_name, lora_id=recv_req.lora_id
+                )
+            ),
         )
         if result.success:
             self.kv_event_lora_names.register(
@@ -6973,14 +6985,14 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        def update():
-            if self.enable_overlap or get_parallel().pp_size > 1:
-                # The unload zeroes the adapter's pool slot on this stream; a step
-                # launched before this request may still run that adapter.
-                self.schedule_stream.wait_stream(self.forward_stream)
-            return self.tp_worker.unload_lora_adapter(recv_req)
+        return run_lora_update(lambda: self._unload_lora_adapter_local(recv_req))
 
-        return run_lora_update(update)
+    def _unload_lora_adapter_local(self, recv_req: UnloadLoRAAdapterReqInput):
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            # The unload zeroes the adapter's pool slot on this stream; a step
+            # launched before this request may still run that adapter.
+            self.schedule_stream.wait_stream(self.forward_stream)
+        return self.tp_worker.unload_lora_adapter(recv_req)
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
