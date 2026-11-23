@@ -417,7 +417,7 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
         import triton
 
         from sglang.srt.models.qwen4_exp import (
-            _gather_ple_embedding_from_pinned_kernel,
+            _gather_ple_embedding_kernel,
         )
 
         rows, dim = 4096, 160
@@ -426,7 +426,7 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
             table.copy_(torch.randn(rows, dim).to(torch.bfloat16))
             ids = torch.randint(0, rows, (2048,), device="cuda")
             out = torch.empty(2048, dim, dtype=torch.bfloat16, device="cuda")
-            _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+            _gather_ple_embedding_kernel[(ids.numel(),)](
                 table.data_ptr(),
                 ids,
                 out,
