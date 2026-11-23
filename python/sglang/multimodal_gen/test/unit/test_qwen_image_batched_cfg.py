@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -24,7 +25,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 _DEVICE = torch.device("cuda")
 requires_cuda = pytest.mark.skipif(
@@ -55,7 +59,7 @@ def _tiny_dit(dit_config):
     return model.to(device=_DEVICE, dtype=torch.bfloat16)
 
 
-def _request(cond_len, uncond_len, edit, dtype):
+def _request(cond_len, uncond_len, edit, dtype, quality=None, skip_softmax=None):
     generator = torch.Generator().manual_seed(1)
 
     def randn(*shape):
@@ -75,7 +79,9 @@ def _request(cond_len, uncond_len, edit, dtype):
         guidance_scale=4.0,
         cfg_normalization=0,
         guidance_rescale=0,
-        sampling_params=SimpleNamespace(quality=None),
+        sampling_params=SimpleNamespace(
+            quality=quality, skip_softmax_params=skip_softmax
+        ),
         extra={},
     )
     latent_input = batch.latents
@@ -112,9 +118,15 @@ def _denoise_step(
     stage=None,
     resident_layers=0,
     free_gib=1024.0,
+    quality=None,
+    skip_softmax=None,
+    steps=1,
+    memory_queries=None,
 ):
     dtype = next(model.parameters()).dtype
-    batch, latent_input = _request(cond_len, uncond_len, edit, dtype)
+    batch, latent_input = _request(
+        cond_len, uncond_len, edit, dtype, quality, skip_softmax
+    )
     branch_kwargs = []
     for embeds, prepare in (
         (batch.prompt_embeds, pipeline_config.prepare_pos_cond_kwargs),
@@ -137,10 +149,9 @@ def _denoise_step(
         enable_breakable_cuda_graph=False,
         pipeline_config=pipeline_config,
     )
+    free_memory = Mock(return_value=free_gib)
     with (
-        patch.object(
-            current_platform, "get_available_gpu_memory", return_value=free_gib
-        ),
+        patch.object(current_platform, "get_available_gpu_memory", free_memory),
         patch.object(model, "forward", counting_forward),
         patch.object(
             model,
@@ -154,21 +165,24 @@ def _denoise_step(
             ],
         ),
     ):
-        out = stage._predict_noise_with_cfg(
-            current_model=model,
-            latent_model_input=latent_input,
-            timestep=torch.tensor([500.0], device=_DEVICE, dtype=dtype),
-            batch=batch,
-            timestep_index=0,
-            attn_metadata=None,
-            target_dtype=dtype,
-            current_guidance_scale=4.0,
-            cfg_policy=policy,
-            cfg_gate_state=None,
-            server_args=server_args,
-            guidance=None,
-            latents=batch.latents,
-        )
+        for _ in range(steps):
+            out = stage._predict_noise_with_cfg(
+                current_model=model,
+                latent_model_input=latent_input,
+                timestep=torch.tensor([500.0], device=_DEVICE, dtype=dtype),
+                batch=batch,
+                timestep_index=0,
+                attn_metadata=None,
+                target_dtype=dtype,
+                current_guidance_scale=4.0,
+                cfg_policy=policy,
+                cfg_gate_state=None,
+                server_args=server_args,
+                guidance=None,
+                latents=batch.latents,
+            )
+    if memory_queries is not None:
+        memory_queries.append(free_memory.call_count)
     return out, widths
 
 
@@ -339,3 +353,88 @@ def test_tensor_parallel_runs_cfg_serially(single_process_model_parallel):
             QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=True
         )
     assert widths == [1, 1]
+
+
+@requires_cuda
+def test_exact_quality_runs_cfg_serially(single_process_model_parallel):
+    model = _tiny_dit(QwenImageDitConfig())
+    serial, _ = _denoise_step(
+        QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=False
+    )
+    out, widths = _denoise_step(
+        QwenImagePipelineConfig(),
+        model,
+        7,
+        3,
+        edit=False,
+        streamed=True,
+        quality="exact",
+    )
+    assert widths == [1, 1]
+    assert torch.equal(out, serial)
+
+
+@requires_cuda
+@pytest.mark.parametrize("cond_len,uncond_len,expected", [(7, 3, [1, 1]), (5, 5, [2])])
+def test_skip_softmax_keeps_unequal_prompts_serial(
+    single_process_model_parallel, cond_len, uncond_len, expected
+):
+    model = _tiny_dit(QwenImageDitConfig())
+    _, widths = _denoise_step(
+        QwenImagePipelineConfig(),
+        model,
+        cond_len,
+        uncond_len,
+        edit=False,
+        streamed=True,
+        skip_softmax=object(),
+    )
+    assert widths == expected
+
+
+@requires_cuda
+@pytest.mark.parametrize("cond_len,uncond_len,expected", [(7, 3, [1, 1]), (5, 5, [2])])
+def test_sparse_attention_keeps_unequal_prompts_serial(
+    single_process_model_parallel, cond_len, uncond_len, expected
+):
+    model = _tiny_dit(QwenImageDitConfig())
+    attention = [
+        m
+        for m in model.modules()
+        if isinstance(getattr(m, "backend", None), AttentionBackendEnum)
+    ]
+    assert attention
+    # only the enum the decision reads changes; attn_impl stays dense, so the
+    # serial forward still runs
+    with ExitStack() as stack:
+        for module in attention:
+            stack.enter_context(
+                patch.object(module, "backend", AttentionBackendEnum.SPARGE_ATTN)
+            )
+        _, widths = _denoise_step(
+            QwenImagePipelineConfig(),
+            model,
+            cond_len,
+            uncond_len,
+            edit=False,
+            streamed=True,
+        )
+    assert widths == expected
+
+
+@requires_cuda
+def test_batched_cfg_decides_once_per_request(single_process_model_parallel):
+    model = _tiny_dit(QwenImageDitConfig())
+    queries = []
+    _, widths = _denoise_step(
+        QwenImagePipelineConfig(),
+        model,
+        7,
+        3,
+        edit=False,
+        streamed=True,
+        steps=3,
+        memory_queries=queries,
+    )
+    assert widths == [2, 2, 2]
+    assert queries == [1]

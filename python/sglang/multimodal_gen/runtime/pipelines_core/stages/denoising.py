@@ -176,6 +176,7 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 logger = init_logger(__name__)
 
 _BATCHED_CFG_MARGIN_BYTES = 1 * 1024**3
+_CFG_BATCH_DECISION_KEY = "_batched_cfg_decision"
 
 # Request-gated DiT fusions and the lowest quality level that may mount each
 # one. A fusion belongs to "lossless" when it keeps the reference math and the
@@ -2201,25 +2202,41 @@ class DenoisingStage(PipelineStage):
         return {k: v for k, v in kwargs.items() if k in param_names}
 
     def _should_batch_cfg(
-        self, current_model, cfg_policy, latent_model_input, server_args
+        self, current_model, cfg_policy, latent_model_input, server_args, batch
     ) -> bool:
         # A streamed DiT is copied from host once per forward, so one batch-2
         # forward halves the copies per step. With the DiT resident in eager mode
         # one batch-2 forward was slightly slower than two serial ones.
         return (
-            type(cfg_policy) is CFGPolicy
+            self._dit_streams_when_serving(current_model)
+            and type(cfg_policy) is CFGPolicy
             and len(cfg_policy.branches) == 2
             and cfg_policy.branches[0].is_conditional
             and not cfg_policy.branches[1].is_conditional
             and isinstance(latent_model_input, torch.Tensor)
             and latent_model_input.shape[0] == 1
+            # Batching changes the reduction order, so the bit-exact tier stays serial.
+            and batch.sampling_params.quality != "exact"
             and not server_args.enable_breakable_cuda_graph
             and not self._cache_dit_enabled
             and self._sp_world_size() <= 1
             # Each rank checks its own free memory; under TP two ranks could pick
             # different paths and run mismatched collectives.
             and self._tp_world_size() <= 1
-            and self._dit_streams_when_serving(current_model)
+        )
+
+    def _cfg_mask_keeps_attention(self, current_model, batch) -> bool:
+        # Unequal prompt lengths add a padding mask. USPAttention serves a masked
+        # call with FA varlen or dense SDPA and refuses Skip Softmax, so any other
+        # selected backend (Sparge, Sage, ...) would be replaced or fail.
+        if batch.sampling_params.skip_softmax_params is not None:
+            return False
+        return all(
+            backend in (AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA)
+            for module in current_model.modules()
+            if isinstance(
+                (backend := getattr(module, "backend", None)), AttentionBackendEnum
+            )
         )
 
     def _batched_cfg_fits(self, need_bytes: int) -> bool:
@@ -2301,14 +2318,23 @@ class DenoisingStage(PipelineStage):
             )
             if kwargs is None:
                 return None
-            # The DiT activations of both rows are not allocated yet at this point,
-            # so the estimate covers both, not only the extra row.
-            row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
-                latent_model_input.shape[1],
-                kwargs["encoder_hidden_states"].shape[1],
-                target_dtype,
-            )
-            if not self._batched_cfg_fits(2 * row_bytes):
+            # Decided once per request: the shapes, attention mode and free memory
+            # it depends on do not change between denoising steps.
+            batch_ok = batch.extra.get(_CFG_BATCH_DECISION_KEY)
+            if batch_ok is None:
+                # The DiT activations of both rows are not allocated yet at this
+                # point, so the estimate covers both, not only the extra row.
+                row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
+                    latent_model_input.shape[1],
+                    kwargs["encoder_hidden_states"].shape[1],
+                    target_dtype,
+                )
+                batch_ok = (
+                    kwargs["encoder_hidden_states_mask"] is None
+                    or self._cfg_mask_keeps_attention(current_model, batch)
+                ) and self._batched_cfg_fits(2 * row_bytes)
+                batch.extra[_CFG_BATCH_DECISION_KEY] = batch_ok
+            if not batch_ok:
                 return None
 
             def twice(x):
@@ -2398,7 +2424,7 @@ class DenoisingStage(PipelineStage):
         else:
             predictions = None
             if self._should_batch_cfg(
-                current_model, cfg_policy, latent_model_input, server_args
+                current_model, cfg_policy, latent_model_input, server_args, batch
             ):
                 predictions = predict_batched_fn(*cfg_policy.branches)
             if predictions is None:
