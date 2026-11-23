@@ -1,9 +1,12 @@
 """Unlimited-OCR v2 processor with DASH image-mode semantics."""
 
+import base64
+import io
 import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
+from PIL import Image, ImageDraw
 
 from sglang.srt.configs.unlimited_ocr import merge_mm_processor_kwargs
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
@@ -127,11 +130,6 @@ class UnlimitedOCRV2Processor(UnlimitedOCRProcessor):
 
 def _drawn_page(title: str) -> str:
     """A white page with a title and numbered lines, as a PNG data URL."""
-    import base64
-    import io
-
-    from PIL import Image, ImageDraw
-
     image = Image.new("RGB", (980, 1400), "white")
     draw = ImageDraw.Draw(image)
     # Default font: a sized one needs Pillow 10.1, which the pin does not require.
@@ -143,8 +141,6 @@ def _drawn_page(title: str) -> str:
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
-# Registered when the TokenizerManager imports the multimodal processors.
-@warmup("unlimited_ocr_v2")
 async def unlimited_ocr_v2_warmup(
     disaggregation_mode: str, tokenizer_manager: "TokenizerManager"
 ):
@@ -164,3 +160,6 @@ async def unlimited_ocr_v2_warmup(
     async for _ in tokenizer_manager.generate_request(req, None):
         pass
     logger.info("Unlimited-OCR v2 warmup done.")
+
+
+warmup("unlimited_ocr_v2")(unlimited_ocr_v2_warmup)
