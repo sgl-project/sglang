@@ -45,6 +45,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -234,7 +235,6 @@ class TargetVerifyExecutor:
             simulated_correct_len=self._simulated_correct_len,
             target_logits=target_logits,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-            need_truncated_sampling=route.need_truncated_sampling,
             simulated_bonus_seed=self._simulated_bonus_seed,
         )
 
@@ -1152,31 +1152,24 @@ def build_accept_outs(
     simulated_correct_len: Optional[torch.Tensor] = None,
     target_logits: Optional[torch.Tensor] = None,
     simulate_bonus_sampling_info=None,
-    need_truncated_sampling: Optional[bool] = None,
     simulated_bonus_seed: Optional[int] = None,
     out: Optional[AcceptOuts] = None,
     block_accept_lens_out: Optional[torch.Tensor] = None,
 ) -> AcceptOuts:
     """``out``: static buffers (the in-graph accept's) to copy the results into;
     ``block_accept_lens_out`` (with ``out``) gets commit_lens + cap_trim_lens.
-    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus;
-    ``need_truncated_sampling`` (with ``simulate_bonus_sampling_info``) is that info's verify route bit."""
+    ``simulated_bonus_seed`` (with ``simulate_bonus_sampling_info``) seeds the bonus."""
     bs = correct_len.shape[0]
     if simulated_correct_len is not None:
         # The accept runs as served; only its length is replaced.
         correct_len = simulated_correct_len.repeat(bs).to(correct_len.dtype)
         if simulate_bonus_sampling_info is not None:
-            assert (
-                target_logits is not None
-                and simulated_bonus_seed is not None
-                and need_truncated_sampling is not None
-            )
+            assert target_logits is not None and simulated_bonus_seed is not None
             bonus = sample_simulated_bonus(
                 target_logits=target_logits,
                 correct_len=correct_len,
                 greedy_bonus=bonus,
                 sampling_info=simulate_bonus_sampling_info,
-                need_truncated_sampling=need_truncated_sampling,
                 bs=bs,
                 verify_num_draft_tokens=verify_num_draft_tokens,
                 seed=simulated_bonus_seed,
@@ -1236,14 +1229,13 @@ def sample_simulated_bonus(
     correct_len: torch.Tensor,
     greedy_bonus: torch.Tensor,
     sampling_info,
-    need_truncated_sampling: bool,
     bs: int,
     verify_num_draft_tokens: int,
     seed: int,
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
     distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
-    if need_truncated_sampling:
+    if need_truncated_sampling(sampling_info):
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1407,7 +1399,6 @@ def accept_draft_tokens(
                 draft_block, target_logits.shape[-1], target_logits.device
             ),
             sampling_info=sampling_info,
-            need_truncated_sampling=route.need_truncated_sampling,
             draft_input=draft_input,
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
