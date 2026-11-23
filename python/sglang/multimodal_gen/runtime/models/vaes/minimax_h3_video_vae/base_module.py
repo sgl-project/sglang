@@ -149,7 +149,9 @@ class RotaryEmbeddingND(nn.Module):
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
         autocast_context = (
-            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+            torch.autocast(img_ids.device.type, enabled=False)
+            if img_ids.device.type in ("cuda", "npu")
+            else nullcontext()
         )
         with autocast_context:
             angles = (

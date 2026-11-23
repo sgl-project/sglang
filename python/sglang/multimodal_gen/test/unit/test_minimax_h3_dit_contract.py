@@ -1550,3 +1550,19 @@ def test_adaln_graph_replay_uses_live_plan_slot(num_timesteps):
                 )
     finally:
         runner.reset()
+
+
+def test_fuses_gate_norm2_disabled_on_npu_without_eps(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_npu", lambda: True)
+    block = SimpleNamespace(
+        preserve_input_for_cache_dit=False,
+        mlp=SimpleNamespace(fc1=SimpleNamespace()),
+        norm2=SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-5),
+    )
+    dummy = torch.zeros(2, 4)
+    assert (
+        MiniMaxH3DiTBlock._fuses_gate_norm2(
+            block, dummy, dummy, dummy, dummy, dummy, dummy
+        )
+        is False
+    )

@@ -2277,8 +2277,11 @@ class MiniMaxH3DiTBlock(nn.Module):
     ) -> bool:
         """Whether the attention's gated residual (in place) and the fused
         norm2 modulation run as one kernel."""
+        # The fused kernel is CUDA-only; NPU's RMSNorm also exposes eps as
+        # variance_epsilon, so reading self.norm2.eps would fail there.
         return (
-            not self.preserve_input_for_cache_dit
+            not current_platform.is_npu()
+            and not self.preserve_input_for_cache_dit
             and not _accepts_mxfp8_input(self.mlp.fc1)
             and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
             and self.norm2.weight is not None

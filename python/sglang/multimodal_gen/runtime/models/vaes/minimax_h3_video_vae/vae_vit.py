@@ -27,8 +27,12 @@ def _linear_with_module_dtype(linear, tensor, out_dtype=None):
     return output
 
 
-def _cuda_autocast_disabled(tensor: torch.Tensor):
-    return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
+def _autocast_disabled(tensor: torch.Tensor):
+    return (
+        torch.autocast(tensor.device.type, enabled=False)
+        if tensor.device.type in ("cuda", "npu")
+        else nullcontext()
+    )
 
 
 def _fused_blocks_available(blocks, hidden_states) -> bool:
@@ -374,7 +378,7 @@ class ViT3DDecoder(ViTBase):
         hidden_states = self._pack_latents(x)
         latent_size = (latent_T, latent_H, latent_W)
 
-        with _cuda_autocast_disabled(hidden_states):
+        with _autocast_disabled(hidden_states):
             hidden_states = _linear_with_module_dtype(
                 self.x_embedder, hidden_states, hidden_states.dtype
             )
@@ -393,8 +397,9 @@ class ViT3DDecoder(ViTBase):
 
         patch_dims = [latent_T, latent_H, latent_W]
         rotary_dtype = (
-            torch.get_autocast_dtype("cuda")
-            if x.is_cuda and torch.is_autocast_enabled("cuda")
+            torch.get_autocast_dtype(x.device.type)
+            if x.device.type in ("cuda", "npu")
+            and torch.is_autocast_enabled(x.device.type)
             else hidden_states.dtype
         )
         cache_enabled = (
@@ -455,7 +460,7 @@ class ViT3DDecoder(ViTBase):
 
         hidden_states = self.apply_mask_postprocess(hidden_states, num_patches)
 
-        with _cuda_autocast_disabled(hidden_states):
+        with _autocast_disabled(hidden_states):
             output = _linear_with_module_dtype(
                 self.proj_out, hidden_states, hidden_states.dtype
             )

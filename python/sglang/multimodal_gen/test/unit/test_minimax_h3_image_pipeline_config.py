@@ -41,7 +41,9 @@ def cpu_config_policy(monkeypatch):
     # These admission tests must not inherit the test runner's GB10 memory policy.
     monkeypatch.setattr(
         "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image.current_platform",
-        SimpleNamespace(is_cuda=lambda: False, is_rocm=lambda: False),
+        SimpleNamespace(
+            is_cuda=lambda: False, is_rocm=lambda: False, is_npu=lambda: False
+        ),
     )
 
 
@@ -496,3 +498,32 @@ def test_image_release_without_pdd_heads_is_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="PDD releases only"):
         config.release_pdd_steps()
+
+
+def test_image_config_npu_laser_attn_and_ring_policy(monkeypatch):
+    with pytest.raises(ValueError, match="requires dense FlashAttention"):
+        MiniMaxH3ImagePipelineConfig().validate_server_args(
+            normalized_args(attention_backend="laser_attn")
+        )
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image.current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: False, is_rocm=lambda: False, is_npu=lambda: True
+        ),
+    )
+    for override in (
+        {"attention_backend": "laser_attn"},
+        {"component_attention_backends": {"transformer": "laser_attn"}},
+    ):
+        args = normalized_args(**override)
+        args.pipeline_config.validate_server_args(args)
+        assert args.component_attention_backends["transformer"] == "laser_attn"
+
+    fa_ring_args = normalized_args(ring_degree=2)
+    fa_ring_args.pipeline_config.validate_server_args(fa_ring_args)
+    assert fa_ring_args.component_attention_backends["transformer"] == "fa"
+
+    laser_ring_args = normalized_args(attention_backend="laser_attn", ring_degree=2)
+    with pytest.raises(ValueError, match="Ring parallelism requires FlashAttention"):
+        laser_ring_args.pipeline_config.validate_server_args(laser_ring_args)
