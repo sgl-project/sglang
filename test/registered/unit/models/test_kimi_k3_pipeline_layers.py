@@ -97,6 +97,8 @@ class TestKimiK3PipelineLayers(CustomTestCase):
                 model = kimi_k3.KimiK3ForConditionalGeneration(
                     SimpleNamespace(
                         encoder_only=False,
+                        language_only=False,
+                        language_model_only=False,
                         vision_config=SimpleNamespace(),
                         text_config=SimpleNamespace(),
                     )
@@ -113,12 +115,51 @@ class TestKimiK3PipelineLayers(CustomTestCase):
             model = kimi_k3.KimiK3ForConditionalGeneration(
                 SimpleNamespace(
                     encoder_only=True,
+                    language_only=False,
+                    language_model_only=False,
                     vision_config=SimpleNamespace(),
                     text_config=SimpleNamespace(num_hidden_layers=6),
                 )
             )
         self.assertIsNone(model.language_model)
         self.assertEqual((model.start_layer, model.end_layer), (0, 6))
+
+    def test_language_only_modes_preserve_the_pipeline_layer_range(self):
+        """Skipping vision must retain the text model's local layer range and buffers."""
+        for mode_name in ("language_only", "language_model_only"):
+            with (
+                self.subTest(mode=mode_name),
+                patch.object(
+                    kimi_k3,
+                    "KimiK3VisionTower",
+                    side_effect=AssertionError("Language-only mode constructed vision"),
+                ),
+                patch.object(
+                    kimi_k3,
+                    "KimiK3MultiModalProjector",
+                    side_effect=AssertionError(
+                        "Language-only mode constructed projector"
+                    ),
+                ),
+                patch.object(
+                    kimi_k3,
+                    "KimiK3LinearForCausalLM",
+                    return_value=self._build_text_model(3, 6),
+                ),
+            ):
+                model = kimi_k3.KimiK3ForConditionalGeneration(
+                    SimpleNamespace(
+                        encoder_only=False,
+                        language_only=mode_name == "language_only",
+                        language_model_only=mode_name == "language_model_only",
+                        vision_config=SimpleNamespace(),
+                        text_config=SimpleNamespace(),
+                    )
+                )
+                self.assertIsNone(model.vision_tower)
+                self.assertIsNone(model.mm_projector)
+                self.assertIsNotNone(model.language_model)
+                self._assert_runner_bank(model, "KimiK3ForConditionalGeneration", 3, 6)
 
 
 if __name__ == "__main__":
