@@ -16,11 +16,12 @@
 import json
 import logging
 from functools import cache
-from typing import Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 import torch
 from llguidance import LLExecutor, LLMatcher, LLTokenizer, StructTag, grammar_from
 from llguidance.hf import from_tokenizer
+from llguidance.tiktoken import lltokenizer_from_encoding
 from llguidance.torch import (
     allocate_token_bitmask,
     apply_token_bitmask_inplace,
@@ -36,11 +37,15 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.structural_tag_to_lark import structural_tag_to_lark
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.environ import envs
+from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils.patch_tokenizer import _is_kimi_tiktoken_tokenizer
 
 logger = logging.getLogger(__name__)
 _LLGUIDANCE_LOG_LEVEL = get_int_env_var("LLGUIDANCE_LOG_LEVEL", 1)
@@ -75,6 +80,15 @@ def _create_llguidance_tokenizer(
     n_vocab: Optional[int],
     eos_token: Optional[Union[int, List[int]]],
 ) -> LLTokenizer:
+    tiktoken_encoding = _tiktoken_encoding(tokenizer)
+    if tiktoken_encoding is not None:
+        # Building from the encoding declares its special tokens as such, so
+        # llguidance matches each one by id instead of as ordinary bytes.
+        return lltokenizer_from_encoding(
+            tiktoken_encoding,
+            n_vocab=n_vocab,
+            eos_token=(tokenizer.eos_token_id if eos_token is None else eos_token),
+        )
     if isinstance(tokenizer, PreTrainedTokenizerFast):
         backend_tokenizer = tokenizer.backend_tokenizer
         if backend_tokenizer.padding is None and backend_tokenizer.truncation is None:
@@ -84,6 +98,30 @@ def _create_llguidance_tokenizer(
                 eos_token=(tokenizer.eos_token_id if eos_token is None else eos_token),
             )
     return from_tokenizer(tokenizer, n_vocab, eos_token=eos_token)
+
+
+def _tiktoken_encoding(tokenizer):
+    """The ``tiktoken.Encoding`` behind a tiktoken-based tokenizer, else None.
+
+    ``from_tokenizer`` only accepts fast HF tokenizers, so these are built from
+    the encoding directly.
+    """
+    if isinstance(tokenizer, TiktokenTokenizer):
+        return tokenizer.tokenizer
+    if _is_kimi_tiktoken_tokenizer(tokenizer):
+        return tokenizer.model
+    return None
+
+
+def _special_token_ids(llguidance_tokenizer: LLTokenizer) -> Dict[str, int]:
+    """Map each special token's text to its id (the lowest id on a tie)."""
+    special_token_ids: Dict[str, int] = {}
+    for token_id in range(llguidance_tokenizer.vocab_size):
+        if llguidance_tokenizer.is_special_token(token_id):
+            text = llguidance_tokenizer.decode_str([token_id])
+            if text:
+                special_token_ids.setdefault(text, token_id)
+    return special_token_ids
 
 
 class GuidanceGrammar(BaseGrammarObject):
@@ -220,9 +258,25 @@ class GuidanceBackend(BaseGrammarBackend):
             n_vocab,
             eos_token=_normalize_eos_token_ids(eos_token_ids),
         )
+        self.special_token_ids = _special_token_ids(self.llguidance_tokenizer)
+        max_enforced = envs.SGLANG_LLGUIDANCE_MAX_ENFORCED_STRING_LENGTH.get()
+        self.max_enforced_string_length = None if max_enforced < 0 else max_enforced
         # Initialize the shared executor here so the first batched mask fill
         # does not pay its one-time setup cost on the request path.
         _get_or_init_mask_executor()
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return allocate_token_bitmask(batch_size, self.llguidance_tokenizer.vocab_size)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return GuidanceGrammar.move_vocab_mask(vocab_mask, device)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        GuidanceGrammar.apply_vocab_mask(logits, vocab_mask)
 
     def initialize_vocab_mask_buffer(
         self,
@@ -283,28 +337,40 @@ class GuidanceBackend(BaseGrammarBackend):
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             structural_tag = json.loads(key_string)
-            assert is_legacy_structural_tag(structural_tag)
-            # Pair each structure with a trigger that prefixes its own
-            # ``begin`` — StructTag asserts begin.startswith(trigger), and
-            # detectors with per-tool triggers (e.g. Inkling's
-            # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
-            # distinct trigger per tool, so triggers[0] matches only one of
-            # them and multi-tool grammars fail to compile.
-            triggers = structural_tag["triggers"]
-            tags = [
-                StructTag(
-                    begin=structure["begin"],
-                    grammar=structure["schema"],
-                    end=structure["end"],
-                    trigger=next(
-                        (t for t in triggers if structure["begin"].startswith(t)),
-                        triggers[0],
-                    ),
+            if is_legacy_structural_tag(structural_tag):
+                serialized_grammar = self._legacy_structural_tag_grammar(structural_tag)
+            else:
+                lark = structural_tag_to_lark(
+                    structural_tag,
+                    special_token_ids=self.special_token_ids,
+                    eos_token_ids=frozenset(self.llguidance_tokenizer.eos_tokens),
+                    max_enforced_string_length=self.max_enforced_string_length,
                 )
-                for structure in structural_tag["structures"]
-            ]
-            g = StructTag.to_grammar(tags)
-            return self._from_serialized(g)
+                serialized_grammar = grammar_from("lark", lark)
+            return self._from_serialized(serialized_grammar)
         except Exception as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
+
+    @staticmethod
+    def _legacy_structural_tag_grammar(structural_tag: dict) -> str:
+        # Pair each structure with a trigger that prefixes its own
+        # ``begin`` — StructTag asserts begin.startswith(trigger), and
+        # detectors with per-tool triggers (e.g. Inkling's
+        # <|message_model|>{name}<|content_invoke_tool_json|>) emit a
+        # distinct trigger per tool, so triggers[0] matches only one of
+        # them and multi-tool grammars fail to compile.
+        triggers = structural_tag["triggers"]
+        tags = [
+            StructTag(
+                begin=structure["begin"],
+                grammar=structure["schema"],
+                end=structure["end"],
+                trigger=next(
+                    (t for t in triggers if structure["begin"].startswith(t)),
+                    triggers[0],
+                ),
+            )
+            for structure in structural_tag["structures"]
+        ]
+        return StructTag.to_grammar(tags)
