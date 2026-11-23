@@ -605,8 +605,9 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # Optional compact verify input staging directly into decode graph buffers.
+    # Optional compact verify input staging and native accept.
     SGLANG_DSPARK_COMPACT_DIRECT_INPUTS = EnvBool(False)
+    SGLANG_DSPARK_COMPACT_NATIVE_ACCEPT = EnvBool(False)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(
