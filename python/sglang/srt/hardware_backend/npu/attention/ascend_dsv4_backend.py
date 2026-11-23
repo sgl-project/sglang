@@ -189,7 +189,11 @@ def _build_explicit_state_block_table(
     if compress_ratio == 4:
         # Masked history/ragged columns are still indexed before torch.where.
         safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
-        full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
+        # A single flat index avoids the broadcasted multi-index AI_CPU path on A3.
+        flat_indices = (
+            req_pool_indices[:, None] * req_to_token.shape[1] + safe_positions
+        )
+        full_locs = req_to_token.view(-1)[flat_indices]
         swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
         state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
     else:
@@ -729,17 +733,22 @@ class CompressorAscendBackendMixin:
         # The parent backend normalizes this to final KV lengths for every
         # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
         # already pass expanded lengths and are not incremented again.
-        verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
+        mirrorless = not self.needs_cpu_seq_lens
+        verify_seq_lens_cpu = (
+            fm.actual_seq_lengths_kv[:bs] if mirrorless else fm.seq_lens_cpu_int[:bs]
+        )
         if ragged_layout is not None:
-            verify_lens_cpu = ragged_layout.verify_lens.to("cpu").to(torch.int64)
-            live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
-                torch.int64
-            ).flatten()[:bs]
-            live_seq_lens_cpu = F.pad(
-                live_seq_lens_cpu,
-                (0, bs - live_seq_lens_cpu.numel()),
-            )
-            verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
+            verify_lens_cpu = ragged_layout.verify_lens
+            if not mirrorless:
+                verify_lens_cpu = verify_lens_cpu.to("cpu").to(torch.int64)
+                live_seq_lens_cpu = forward_batch.spec_info.live_seq_lens_cpu.to(
+                    torch.int64
+                ).flatten()[:bs]
+                live_seq_lens_cpu = F.pad(
+                    live_seq_lens_cpu,
+                    (0, bs - live_seq_lens_cpu.numel()),
+                )
+                verify_seq_lens_cpu = live_seq_lens_cpu + verify_lens_cpu
 
         padding_sizes = {}
         for ratio in (4, 128):
@@ -748,7 +757,15 @@ class CompressorAscendBackendMixin:
             padding_size = max(1, min(t, t // ratio + bs))
             padding_sizes[ratio] = padding_size
             padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
-            if ragged_layout is None:
+            if ragged_layout is None and mirrorless:
+                self._fill_verify_positions_cmp_padding_one_device(
+                    positions,
+                    padding,
+                    ratio,
+                    forward_batch.seq_lens[:bs],
+                    n_draft=n_draft,
+                )
+            elif ragged_layout is None:
                 self._fill_verify_positions_cmp_padding_one(
                     positions, padding, ratio, verify_seq_lens_cpu, n_draft=n_draft
                 )
@@ -2646,7 +2663,27 @@ class DeepseekV4AscendAttnBackend(
             and get_disagg().disaggregation_mode != "prefill"
         )
 
+        # The prefill graph records compressor / indexer kernels, so their
+        # metadata must live in stable, capacity-sized buffers.  See
+        # dsv4_prefill_graph.py for the refresh contract.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            self._supports_dsv4_prefill_graph_capture()
+        )
+        if self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            self.prefill_cuda_graph_max_batch_size = MAX_PREFILL_GRAPH_REQS
+            logger.info(
+                "DSV4 NPU breakable prefill graph: compressor/indexer captured, "
+                "max %d request(s) per replay.",
+                MAX_PREFILL_GRAPH_REQS,
+            )
+
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
+        # V4.1's low-ratio page/state planning is outside this V4 read-done path.
+        if any(
+            ratio in (1, 2)
+            for ratio in model_runner.model_config.hf_config.compress_ratios
+        ):
+            return False
         if not model_runner.spec_algorithm.is_dspark():
             return super()._supports_shared_read(model_runner)
         if model_runner.is_draft_worker or not is_deepseek_v4(
@@ -2673,20 +2710,6 @@ class DeepseekV4AscendAttnBackend(
         ):
             return SharedReadEnds.IN_REPLAY
         return end
-
-        # The prefill graph records compressor / indexer kernels, so their
-        # metadata must live in stable, capacity-sized buffers.  See
-        # dsv4_prefill_graph.py for the refresh contract.
-        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
-            self._supports_dsv4_prefill_graph_capture()
-        )
-        if self.use_captured_forward_metadata_for_breakable_cuda_graph:
-            self.prefill_cuda_graph_max_batch_size = MAX_PREFILL_GRAPH_REQS
-            logger.info(
-                "DSV4 NPU breakable prefill graph: compressor/indexer captured, "
-                "max %d request(s) per replay.",
-                MAX_PREFILL_GRAPH_REQS,
-            )
 
     def _supports_dsv4_prefill_graph_capture(self) -> bool:
         if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
@@ -3146,8 +3169,12 @@ class DeepseekV4AscendAttnBackend(
             fm.block_tables.shape[1],
             (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
         )
-        full_page_locs = self.req_to_token[
-            req_pool_indices, : pages * self.page_size : self.page_size
+        # Index only this batch's page starts, without slicing every request-pool row.
+        page_offsets = (
+            torch.arange(pages, dtype=torch.int64, device=self.device) * self.page_size
+        )
+        full_page_locs = self.req_to_token.view(-1)[
+            req_pool_indices[:, None] * self.req_to_token.shape[1] + page_offsets
         ]
         fm.block_tables[:, :pages].copy_(full_page_locs // self.page_size)
         fm.block_tables[:, pages:].zero_()
@@ -3631,6 +3658,10 @@ class DeepseekV4AscendAttnBackend(
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
             )
+        if ctx.mirrorless and not self._dsv4_is_v41_model:
+            # V4 needs no host mirror; copying into the V4.1 host buffer would sync D2H.
+            fm.seq_lens_cpu_int = None
+        elif ctx.graph_mode.is_target_verify():
             fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(
                 int(ctx.final_seq_lens_cpu.numel())
             )
@@ -3975,7 +4006,9 @@ class DeepseekV4AscendAttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         if not self.prepare_in_graph:
             seq_lens_cpu = (
-                forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+                forward_batch.seq_lens.cpu()
+                if in_capture
+                else forward_batch.seq_lens_cpu
             )
             forward_mode = forward_batch.forward_mode
             spec_info = forward_batch.spec_info
@@ -4155,11 +4188,37 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = None
             fm.actual_seq_lengths_q_pa_cpu = None
 
+        if (
+            not self._dsv4_is_v41_model
+            and self.is_hybrid_swa
+            and fm.block_tables_swa is None
+        ):
+            # The mirrorless base path builds full-pool pages; SWA needs its own ids.
+            fm.block_tables_swa = (
+                self.full_to_swa_index_mapping[fm.block_tables * self.page_size]
+                // self.page_size
+            ).to(torch.int32)
         fm.swa_page_table = (
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
 
-        if ragged_layout is not None:
+        if (
+            not self.needs_cpu_seq_lens
+            and not self._dsv4_is_v41_model
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # Mirrorless DSPARK passes live prefixes; attention includes this Q block.
+            live_lens = forward_batch.seq_lens.to(torch.int32)
+            query_lens = (
+                ragged_layout.verify_lens.to(torch.int32)
+                if ragged_layout is not None
+                else int(forward_batch.spec_info.draft_token_num)
+            )
+            fm.actual_seq_lengths_kv = torch.where(
+                live_lens > 0, live_lens + query_lens, 0
+            ).clamp_min_(1)
+            fm.seq_lens_cpu_int = None
+        elif ragged_layout is not None:
             fm.actual_seq_lengths_kv = (
                 (
                     forward_batch.seq_lens[: ragged_layout.bs]
@@ -4265,6 +4324,11 @@ class DeepseekV4AscendAttnBackend(
             live=self.forward_metadata,
             forward_batch=forward_batch,
         )
+        if self.shared_read_enabled:
+            # KV stores captured the snapshot's address; refresh it before read-done.
+            self._copy_1d_with_zero_tail(
+                capture_metadata.swa_loc, self.forward_metadata.swa_loc
+            )
         # The captured object owns every tensor the graph reads; eager
         # attention breaks read it too, so they see the refreshed values.
         self.forward_metadata = capture_metadata
