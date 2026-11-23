@@ -284,6 +284,8 @@ class TestRunningReqsHooks(CustomTestCase):
         running = _batch([done, kept], ForwardMode.DECODE)
         running.spec_algorithm = SpeculativeAlgorithm.NGRAM
         running.has_grammar = True
+        # No custom logit processor: under NGRAM one would process every result early.
+        running.sampling_info.has_custom_logit_processor = False
         s = Scheduler.__new__(Scheduler)
         empty_request_lists(s)
         s.running_batch = running
