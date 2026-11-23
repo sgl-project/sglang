@@ -535,6 +535,93 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         self.assertEqual(_get_k3_dense_weight(module).data_ptr(), weight.data_ptr())
 
+    def test_cuda_kda_inproj_merge_and_dispatch(self):
+        """CUDA merges [qkvg | f_a | b] into one view-backed buffer; side-stream
+        overlap stays active for small graphed M and falls over to the single
+        merged GEMM when side-stream overlap is inactive (M > limit or eager)."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(7)
+
+        def _randn(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.bfloat16)
+            )
+
+        class _CallableLinear:
+            def __init__(self, rows, cols):
+                self.weight = _randn(rows, cols)
+                self.bias = None
+                self.quant_method = qm
+
+            def __call__(self, x):
+                return qm.apply(self, x, None), None
+
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvg_gate_float_shard=False,
+            _bfa_uses_block_fp8=False,
+            _bfa_uses_mxfp8=False,
+            _kda_dwdp=False,
+            fused_qkvg_proj=_CallableLinear(_QKVG, _H),
+            f_a_proj=_CallableLinear(_N_FA, _H),
+            b_proj=_CallableLinear(_N_B, _H),
+            f_b_proj=_CallableLinear(1536, _N_FA),
+            split_sizes=[3 * 1536, 1536],
+            _bfa_w=None,
+            _bfa_f_b_w=None,
+            _qkvgbfa_layer=None,
+            _qkvgbfa_sizes=None,
+            _bfa_alt_stream=torch.cuda.Stream(),
+            _bfa_bs_limit=8,
+            _bfa_side_tgv_m_ranges=None,
+        )
+        ref_qkvg = owner.fused_qkvg_proj.weight.clone()
+        ref_fa = owner.f_a_proj.weight.clone()
+        ref_b = owner.b_proj.weight.clone()
+        ref_fb = owner.f_b_proj.weight.clone()
+
+        owner._may_fuse_kda_inproj = lambda: KimiK3DeltaAttention._may_fuse_kda_inproj(
+            owner
+        )
+        owner._merge_kda_inproj_weights = (
+            lambda: KimiK3DeltaAttention._merge_kda_inproj_weights(owner)
+        )
+        KimiK3DeltaAttention._merge_bfa_weights(owner)
+
+        self.assertIsNotNone(owner._qkvgbfa_layer)
+        self.assertEqual(owner._qkvgbfa_layer.weight.shape, (6288, _H))
+        self.assertEqual(owner._bfa_w.shape, (_BFA_W_ROWS, _H))
+        self.assertEqual(
+            owner.fused_qkvg_proj.weight.data_ptr(),
+            owner._qkvgbfa_layer.weight.data_ptr(),
+        )
+
+        # M > _bfa_bs_limit (and eager) must take the single merged GEMM and match
+        # the separate reference projections.
+        for T, capture_mode in ((4, False), (16, True)):
+            with (
+                self.subTest(T=T, capture_mode=capture_mode),
+                patch(
+                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                    return_value=capture_mode,
+                ),
+            ):
+                x = _randn(T, _H)
+                qkv, beta, fg, g = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
+                exp_qkvg = torch.nn.functional.linear(x, ref_qkvg)
+                exp_qkv, exp_g = exp_qkvg.split([3 * 1536, 1536], dim=-1)
+                exp_fa = torch.nn.functional.linear(x, ref_fa)
+                exp_b = torch.nn.functional.linear(x, ref_b)
+                exp_fg = torch.nn.functional.linear(exp_fa, ref_fb)
+                torch.testing.assert_close(qkv, exp_qkv, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(g, exp_g, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(beta, exp_b, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(fg, exp_fg, rtol=2e-2, atol=4e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2106,14 +2106,13 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
+            # Whole [q,k,v,g | f_a | b] view-merged in-proj buffer, built when
+            # eligible by _merge_kda_inproj_weights() (zero extra memory; the
+            # wide-only weight and _bfa_w stay live views into the same buffer).
+            # _qkvgbfa_sizes stays None when the fusion does not apply.
+            self._qkvgbfa_layer: Optional[SimpleNamespace] = None
+            self._qkvgbfa_sizes: Optional[list[int]] = None
             if _is_hip:
-                # ROCm only: _merge_kda_inproj_weights_hip() may merge the
-                # whole [q,k,v,g | f_a | b] in-proj instead, making _bfa_w a
-                # tail view of that buffer. _qkvgbfa_sizes is the split of the
-                # buffer, and stays None when the fusion does not apply. These
-                # attributes exist on ROCm only; every reader is _is_hip-gated.
-                self._qkvgbfa_layer: Optional[SimpleNamespace] = None
-                self._qkvgbfa_sizes: Optional[list[int]] = None
                 self._qkvgbfa_bs_limit = (
                     envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
@@ -2341,32 +2340,43 @@ class KimiK3DeltaAttention(nn.Module):
             # is above the token threshold.
             self._bfa_f_b_w = self.f_b_proj.weight
             return
-        mods = [self.f_a_proj, self.b_proj]
-        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
-            weights = [_get_k3_dense_weight(mod) for mod in mods]
-            sizes = [weight.shape[0] for weight in weights]
-            pad = (-sum(sizes)) % 8
-            if pad:
-                weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = bind_or_assign(
-                self._bfa_w, torch.cat(weights, dim=0).contiguous()
-            )
-            self._bfa_f_b_w = bind_or_assign(
-                self._bfa_f_b_w, _get_k3_dense_weight(self.f_b_proj).contiguous()
-            )
-        else:
-            if any(getattr(mod, "weight", None) is None for mod in mods):
-                return
-            # ROCm Quark checkpoints: leave per-channel FP8 / MXFP4 weights on
-            # the unfused b_proj/f_a_proj GEMVs; the merged buffer would drop
-            # their scales.
-            if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
-                return
-            self._bfa_w, sizes = _merge_weights_as_views(
-                mods, pad_rows_to=8, target=self._bfa_w
-            )
+        merge_inproj = getattr(
+            self,
+            "_merge_kda_inproj_weights",
+            lambda: KimiK3DeltaAttention._merge_kda_inproj_weights(self),
+        )
+        merged_inproj = not _is_hip and merge_inproj()
+        if merged_inproj:
             self._bfa_f_b_w = self.f_b_proj.weight
-        self._bfa_fa_size, self._bfa_b_size = sizes
+        else:
+            mods = [self.f_a_proj, self.b_proj]
+            if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
+                weights = [_get_k3_dense_weight(mod) for mod in mods]
+                sizes = [weight.shape[0] for weight in weights]
+                pad = (-sum(sizes)) % 8
+                if pad:
+                    weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+                self._bfa_w = bind_or_assign(
+                    self._bfa_w, torch.cat(weights, dim=0).contiguous()
+                )
+                self._bfa_f_b_w = bind_or_assign(
+                    self._bfa_f_b_w, _get_k3_dense_weight(self.f_b_proj).contiguous()
+                )
+            else:
+                if any(getattr(mod, "weight", None) is None for mod in mods):
+                    return
+                # ROCm Quark checkpoints: leave per-channel FP8 / MXFP4 weights on
+                # the unfused b_proj/f_a_proj GEMVs; the merged buffer would drop
+                # their scales.
+                if _is_hip and not _is_unquantized_mergeable(
+                    [mod.weight for mod in mods]
+                ):
+                    return
+                self._bfa_w, sizes = _merge_weights_as_views(
+                    mods, pad_rows_to=8, target=self._bfa_w
+                )
+                self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_fa_size, self._bfa_b_size = sizes
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
         if get_platform().device_sm == 103 and get_bf16_gemm_backend().is_cutedsl():
@@ -2379,33 +2389,41 @@ class KimiK3DeltaAttention(nn.Module):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
             self._bfa_side_tgv_m_ranges = m_ranges
 
-    def _merge_kda_inproj_weights_hip(self) -> bool:
-        """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
-        one GEMM covers the whole in-proj, and take _bfa_w as a tail view of
-        that buffer. The merge is view-only, so the wide-only and whole-buffer
-        weights both stay live and forward_qkvbfg_fused picks per batch size.
+    def _merge_kda_inproj_weights(self) -> bool:
+        """Append the [f_a | b] tail to the wide [q,k,v,g] buffer so one GEMM
+        covers the whole in-proj, and take _bfa_w as a tail view of that
+        buffer. The merge is view-only, so the wide-only and whole-buffer
+        weights both stay live: CUDA keeps side-stream overlap at small graphed
+        batches (M <= _bfa_bs_limit) and takes the merged GEMM whenever the
+        side stream is inactive (M > _bfa_bs_limit, eager, prefill); ROCm takes
+        the merged GEMM below _qkvgbfa_bs_limit.
 
         Returns False when the fusion does not apply, leaving the caller to do
         the plain [f_a | b] merge."""
-        if self._kda_dwdp or not self._may_fuse_kda_inproj():
+        may_fuse = getattr(
+            self,
+            "_may_fuse_kda_inproj",
+            lambda: KimiK3DeltaAttention._may_fuse_kda_inproj(self),
+        )
+        if getattr(self, "_kda_dwdp", None) or not may_fuse():
             return False
 
-        # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
-        # same pad (both widths are 4 short of a multiple of 8), so the tail
-        # view is byte-identical to the wide-only merge.
-        previous = self._qkvgbfa_layer
+        # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order. On CUDA
+        # pad to 16 rows (32B for bf16) so strided f_a satisfies SM100 32B vector
+        # alignment across all TP sizes (at TP8 6144+128+12 -> 6288, tail 144).
+        previous = getattr(self, "_qkvgbfa_layer", None)
         merged, sizes = _merge_weights_as_views(
             [self.fused_qkvg_proj, self.f_a_proj, self.b_proj],
-            pad_rows_to=8,
+            pad_rows_to=8 if _is_hip else 16,
             target=None if previous is None else previous.weight,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
         self._bfa_w = merged[sizes[0] :]
         # Stand-in "layer" so the fused GEMM goes through the same
         # quant_method.apply (and therefore the same backend choice) as the
-        # wide projection, whose own .weight stays the 6144-row view for the
-        # above-threshold split path. Not an nn.Module on purpose: this must
-        # not add a duplicate entry to state_dict.
+        # wide projection, whose own .weight stays the wide view for the split
+        # / side-stream path. Not an nn.Module on purpose: this must not add a
+        # duplicate entry to state_dict.
         self._qkvgbfa_layer = SimpleNamespace(weight=merged)
         self._qkvgbfa_sizes = [
             *self.split_sizes,  # q,k,v then g
@@ -2415,6 +2433,10 @@ class KimiK3DeltaAttention(nn.Module):
         ]
         return True
 
+    def _merge_kda_inproj_weights_hip(self) -> bool:
+        """ROCm entry point preserved for callers/tests."""
+        return KimiK3DeltaAttention._merge_kda_inproj_weights(self)
+
     def _may_fuse_kda_inproj(self) -> bool:
         """Whether the [f_a|b] tail can share the wide projection's buffer.
 
@@ -2422,22 +2444,48 @@ class KimiK3DeltaAttention(nn.Module):
         plain unquantized 2-D tensors of one dtype and width -- the checkpoint
         keeps attention in bf16, but a quantized variant would carry scales
         that a raw row-cat would silently drop."""
-        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
+        if _is_hip:
+            if not envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get():
+                return False
+            if not (
+                self.do_fuse_qkvbfg
+                or get_exec().kernel.enable_amd_monokernel
+                or _is_gfx95
+            ):
+                return False
+        elif not get_platform().is_cuda or _is_npu:
             return False
         if not self.use_full_rank_gate:
             return False
-        if self._qkvg_gate_float_shard:
+        if getattr(self, "_qkvg_gate_float_shard", False):
             # The BF16 g shard cannot join the int8/quantized merged-GEMM fusion.
-            return False
-        if not (
-            self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel or _is_gfx95
-        ):
             return False
         # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
-        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
+        if getattr(self, "_bfa_uses_block_fp8", False) or getattr(
+            self, "_bfa_uses_mxfp8", False
+        ):
             return False
-        ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
+        fused_qkvg = getattr(self, "fused_qkvg_proj", None)
+        if fused_qkvg is None:
+            return False
+        mods = (fused_qkvg, self.f_a_proj, self.b_proj)
+        if not _is_hip:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+            if not all(
+                isinstance(
+                    getattr(m, "quant_method", None), UnquantizedLinearMethod
+                )
+                and getattr(m, "bias", None) is None
+                and not hasattr(m, "weight_scale")
+                and not hasattr(m, "weight_scale_inv")
+                for m in mods
+            ):
+                return False
+        ws = [getattr(m, "weight", None) for m in mods]
+        if any(w is None for w in ws):
+            return False
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
             return False
         # Whitelist the dtype rather than only require the three to agree: the
@@ -2661,6 +2709,26 @@ class KimiK3DeltaAttention(nn.Module):
                         )
                         beta = bfa[..., n_fa : n_fa + n_b]
                     cur.wait_stream(alt)
+                    return qkv, beta, forget_gate, g_proj_states
+
+                qkvgbfa_layer = getattr(self, "_qkvgbfa_layer", None)
+                qkvgbfa_sizes = getattr(self, "_qkvgbfa_sizes", None)
+                if (
+                    not _is_hip
+                    and qkvgbfa_layer is not None
+                    and qkvgbfa_sizes is not None
+                    and hidden_states.shape[0] > 0
+                ):
+                    # CUDA fallback when side-stream overlap is inactive
+                    # (M > _bfa_bs_limit, eager, or prefill): read hidden_states
+                    # once through the merged [q,k,v,g | f_a | b] buffer.
+                    fused_states = self.fused_qkvg_proj.quant_method.apply(
+                        qkvgbfa_layer, hidden_states, None
+                    )
+                    qkv, g_proj_states, f_a, beta, _pad = torch.split(
+                        fused_states, qkvgbfa_sizes, dim=-1
+                    )
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 qkv, g_proj_states = _qkvg_forward(self, hidden_states)
