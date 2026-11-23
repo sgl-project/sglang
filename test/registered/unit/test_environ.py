@@ -1,5 +1,6 @@
 """Unit tests for sglang.srt.environ: EnvField semantics and the deprecated-env registry."""
 
+import json
 import os
 import re
 import subprocess
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -245,6 +246,40 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestImportTimeBooleanKnobs(unittest.TestCase):
+    """Modules that freeze a boolean at import must read it through the
+    registry: a second parser at the read site accepted fewer spellings than
+    the declaration, so `yes` set the knob for some readers and not for others."""
+
+    def test_frozen_module_flags_follow_the_registry(self):
+        deepgemm = "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
+        script = (
+            "import json\n"
+            "from sglang.srt.batch_invariant_ops import batch_invariant_ops as ops\n"
+            "from sglang.srt.batch_overlap import two_batch_overlap as tbo\n"
+            "print(json.dumps([ops._ENABLE_MM_DEEPGEMM, "
+            "ops._ENABLE_MM_FALLBACK_VARIANT, ops._ENABLE_MM_COMPARISON_TEST, "
+            "tbo._tbo_debug]))\n"
+        )
+        overrides = {
+            # The kill switch registered tests launch servers with.
+            deepgemm: "0",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST": "1",
+            "SGLANG_TBO_DEBUG": "yes",
+        }
+        # One interpreter: the flags are read once, when the modules load.
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, **overrides}, text=True
+        )
+        self.assertEqual(
+            json.loads(out.strip().splitlines()[-1]), [False, True, True, True]
+        )
+        with patch.dict(os.environ):
+            os.environ.pop(deepgemm, None)
+            self.assertIs(vars(type(envs))[deepgemm].get(), True)
 
 
 if __name__ == "__main__":

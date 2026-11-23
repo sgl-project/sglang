@@ -481,11 +481,10 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False):
+    def __init__(self, config: Gemma4VisionConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.root_hidden_size = self.hidden_size**0.5
-        self.mask_pad_before_pool = mask_pad_before_pool
 
     def _avg_pool_by_positions(
         self, x: torch.Tensor, patch_positions: torch.Tensor, length: int
@@ -529,16 +528,16 @@ class Gemma4VisionPooler(nn.Module):
         if isinstance(length, (list, tuple)):
             length = length[0]
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
-            if self.mask_pad_before_pool:
-                hidden_states = hidden_states.masked_fill(
-                    padding_positions.unsqueeze(-1), 0.0
-                )
+            hidden_states = hidden_states.masked_fill(
+                padding_positions.unsqueeze(-1), 0.0
+            )
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
             )
-        hidden_states = hidden_states * self.root_hidden_size
+        # Scaling can exceed the FP16 range before standardization.
+        hidden_states = hidden_states.float() * self.root_hidden_size
         return hidden_states, mask
 
 
@@ -555,7 +554,6 @@ class Gemma4VisionEncoder(nn.Module):
         config: Gemma4VisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        mask_pad_before_pool: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -568,9 +566,7 @@ class Gemma4VisionEncoder(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
-        self.pooler = Gemma4VisionPooler(
-            config, mask_pad_before_pool=mask_pad_before_pool
-        )
+        self.pooler = Gemma4VisionPooler(config)
 
         # Post-pooling standardization (normalizes vision tokens before projection)
         self.standardize = getattr(config, "standardize", False)
@@ -624,4 +620,4 @@ class Gemma4VisionEncoder(nn.Module):
         if self.standardize:
             pooled = (pooled - self.std_bias) * self.std_scale
 
-        return pooled, pooler_mask
+        return pooled.to(inputs_embeds.dtype), pooler_mask
