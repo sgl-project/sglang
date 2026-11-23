@@ -367,7 +367,11 @@ jobs:
           eval "${CMD}"
 
       - name: Collect node logs
-        if: steps.run_test.outcome == 'failure' || steps.run_test.outcome == 'cancelled'
+        # Must contain a status-check function: GitHub implicitly prepends
+        # success() to `if` expressions that use none, so a bare
+        # `steps.run_test.outcome == ...` check would be skipped exactly when
+        # the run failed or was cancelled.
+        if: ${{ always() && steps.run_test.outcome != 'success' }}
         continue-on-error: true
         run: |
           tc_name="${{ inputs.test_case }}"

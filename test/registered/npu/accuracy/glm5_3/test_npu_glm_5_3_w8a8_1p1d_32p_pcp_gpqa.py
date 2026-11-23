@@ -143,8 +143,12 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
-    "--hicache-size",
-    80,
+    # Ratio-based sizing keeps the L2 host pool proportional to the device pool.
+    # A fixed --hicache-size 80 allocated ~88 GB per PP2 rank, which exhausted
+    # the host huge pages and made the Mooncake store's HalMemCreate fall back
+    # to 2MB pages (12+ minutes per rank, or a hard hang).
+    "--hicache-ratio",
+    1.2,
     # L3 storage tier on top of the L2 host pool. MLA on NPU maps page_first
     # to page_first_kv_split, which the Mooncake backend's get_page_buffer_meta
     # supports (layer_first_kv_split does not).
