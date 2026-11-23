@@ -1,0 +1,115 @@
+---
+title: "Rust Frontend Server (Experimental)"
+description: "Enable SGLang's experimental Rust HTTP frontend and understand its supported scope and configuration limitations."
+---
+
+## Overview and experimental status
+
+The Rust frontend is an optional HTTP server and request-processing pipeline for online SGLang serving. It handles HTTP requests, tokenization, detokenization, and response streaming in Rust, while keeping the existing Python scheduler and inference engine.
+
+The Rust frontend is **disabled by default** and remains **experimental in SGLang 1.0**. It does not yet have complete feature or configuration parity with the default Python frontend. Check the restrictions below before using it for a workload.
+
+## Quick start
+
+Start with a supported SGLang installation on a Linux GPU host. See the [installation guide](/docs/get-started/install). Rust-server mode loads a Rust extension. If no prebuilt extension is available, a source checkout builds it with the Rust toolchain. `SGLANG_RUST_BUILD_MODE` controls this: `auto` (default) builds a missing extension, `never` requires a bundled or cached one, and `force` rebuilds it.
+
+Enable the Rust frontend for the model-server process:
+
+```bash
+SGLANG_RUST_SERVER=1 sglang serve Qwen/Qwen3-0.6B \
+  --host 127.0.0.1 --port 30000
+```
+
+After the server reports that it is ready, send a request from another terminal:
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "max_tokens": 32
+  }'
+```
+
+A successful response verifies this basic request path, not full compatibility with the Python frontend.
+
+## Supported features and scope
+
+The Rust frontend serves the following online-serving APIs, among others. **A served endpoint does not imply support for every request field or model feature available in Python mode.**
+
+| Capability | Current scope |
+| --- | --- |
+| Native generation API | `/generate`, including streaming. |
+| OpenAI-compatible APIs | `/v1/chat/completions` and `/v1/completions`, including streaming, with request-level limitations. `/v1/responses` is served without a response store. |
+| Other APIs | `/v1/messages` (Anthropic-compatible), `/v1/score`, `/v1/tokenize`, and `/v1/detokenize`. |
+| Model and server information | `/v1/models`, `/model_info`, `/server_info`, `/health`, and `/metrics`. |
+| Not served | `/v1/embeddings`, `/v1/realtime`, and `/v1/decisions` return 404. |
+| Model types | Generation models only. Embedding and reward models are refused at startup. |
+| Multimodal models | Image inputs only, for the Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5 families (including their MoE variants). Other multimodal models are refused at startup; pass `--disable-multimodal` to serve them text-only. |
+
+Rust-server mode applies to **online serving with `sglang serve`**. The offline `sgl.Engine` API refuses `SGLANG_RUST_SERVER=1`.
+
+## Unsupported flags and environment variables
+
+### Rejected command-line settings
+
+In Rust-server mode, the server refuses to start if any of the following arguments is set to a value other than its default. Leaving an argument at its default is accepted.
+
+| Area | Rejected CLI flags | Why |
+| --- | --- | --- |
+| TLS | `--ssl-keyfile`, `--ssl-certfile`, `--ssl-ca-certs`, `--ssl-keyfile-password`, `--enable-ssl-refresh` | Python HTTP server TLS configuration is not supported by the Rust frontend. |
+| Media fetching | `--allowed-media-domains`, `--media-url-max-file-size-mb` | The Rust media fetcher has no domain allowlist and always caps a download at the default 64 MiB. |
+| Tracing | `--enable-trace` | Python frontend request tracing is not available in this mode. |
+| Templates | `--completion-template`, `--hf-chat-template-name` | These Python frontend template overrides are not honored. |
+| Tokenization | `--tokenizer-mode`, `--tokenizer-backend`, `--tokenizer-metrics-allowed-custom-labels` | These Python tokenizer settings are not supported. |
+| Model features | `--enable-custom-logit-processor`, `--enable-return-routed-experts`, `--enable-lora`, `--lora-paths` | The corresponding frontend features are not supported. |
+| Multimodal / encoder | `--mm-preprocess-cache-size-mb`, `--language-only` | The Rust multimodal pipelines keep no preprocessing cache, and the Rust server has no encoder dispatch. |
+| Checkpoints | `--checkpoint-engine-wait-weights-before-ready`, `--delete-ckpt-after-loading` | The Rust listener reports ready without waiting for weight updates. |
+| Response extensions | `--return-input-ids`, `--return-output-ids` | These server-level response defaults are not supported. |
+
+This table follows [`RUST_SERVER_UNSUPPORTED_ARGS`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/arg_groups/validation_hook.py). Rust-server mode also refuses at startup:
+
+- `--enable-watermark`.
+- `--dp-size` greater than 1 on a prefill server (`--disaggregation-mode prefill`) without attention DP. Launch one prefill server per replica instead.
+- A `--warmups` name that is not registered or not marked as Rust-capable. Python mode only warns about an unregistered name.
+
+For example, passing `--enable-lora` with `SGLANG_RUST_SERVER=1` fails at startup with:
+
+```text
+ValueError: Rust-server mode (SGLANG_RUST_SERVER=1) does not support --enable-lora: the Rust server would silently ignore this setting. Remove it or unset SGLANG_RUST_SERVER.
+```
+
+### Rejected environment variables
+
+| Variable | Rejected condition | Reason |
+| --- | --- | --- |
+| `SGLANG_TOOL_STRICT_LEVEL` | Value greater than `0` | The Rust chat route applies only each tool's own `strict` value. |
+
+`SGLANG_RUST_SERVER` is the opt-in selector, not an unsupported variable.
+
+### Other settings
+
+Rust-server mode also accepts some Python frontend settings without honoring them. Some are ignored by design because they configure Python-only components, such as the Python HTTP server, tokenizer workers, or worker pools. Others are known parity gaps that are still being fixed. [`rust_server/parity.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/rust_server/parity.py) lists each of these settings and why it is not honored. **Do not assume that an accepted setting takes effect in Rust mode.**
+
+## Known limitations and fallback
+
+The Rust frontend is not a drop-in replacement for the Python frontend:
+
+- It serves generation models only, and multimodal input only for the model families listed above.
+- Request-field support and behavior can differ across the native and OpenAI-compatible APIs, particularly for advanced features and multimodal inputs.
+- Some Python frontend settings are accepted but not honored (see [Other settings](#other-settings)).
+- The offline `sgl.Engine` API does not use this frontend.
+
+If the server refuses a setting, remove the option named in the startup error or use the Python frontend. If the Rust extension cannot load, check your installation and `SGLANG_RUST_BUILD_MODE`.
+
+To restore the default Python frontend, **stop the Rust-mode server**, unset the environment variable, and restart:
+
+```bash
+unset SGLANG_RUST_SERVER
+sglang serve Qwen/Qwen3-0.6B --host 127.0.0.1 --port 30000
+```
+
+For implementation details, see the [Rust server source](https://github.com/sgl-project/sglang/tree/main/rust/sglang-server) and its [launch integration](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/rust_server/server.py).

@@ -953,6 +953,7 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
+              "docs/advanced_features/rust_frontend_server",
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hybrid_cache_checkpoints",
