@@ -1264,12 +1264,7 @@ class TestDisaggregationWire(unittest.TestCase):
             model_config=SimpleNamespace(vocab_size=32),
         )
 
-        with patch(
-            "sglang.srt.disaggregation.decode_schedule_batch_mixin."
-            "SamplingBatchInfo.from_schedule_batch",
-            return_value=Mock(),
-        ):
-            ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+        ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
 
         self.assertIsNone(batch.input_ids)
         self.assertEqual(batch.extend_num_tokens, 3)
@@ -2843,9 +2838,12 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
         manager.enable_custom_mem_pool = False
         manager.max_transfer_batch_indices = 0
         manager.pp_size = 2
-        manager._transfer_data = Mock(return_value=0)
+        writes = Mock(return_value=0)
         # Decode registered 4 target entries plus 1 draft entry.
         dst_ptrs = [10000, 20000, 30000, 40000, 50000]
+        attach_mooncake_transport(
+            manager, engine_writes(writes), kv=[1000, 2000], peer_kv=dst_ptrs
+        )
         with patch(
             "sglang.srt.disaggregation.mooncake.conn.get_memory",
             return_value=SimpleNamespace(enable_unified_memory=False),
@@ -2861,7 +2859,7 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
             )
 
         self.assertEqual(status, 0)
-        blocks = manager._transfer_data.call_args.args[1]
+        blocks = writes.call_args.args[1]
         self.assertEqual(
             blocks,
             [
