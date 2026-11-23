@@ -30,6 +30,10 @@ class DeviceTimer:
         self._intervals: Deque[_TimingInterval] = deque()
         self._reporters: List[Callable] = [] if reporter is None else [reporter]
         self._in_wrap = False
+        # Counted by DeviceTimer.wrap only. Intervals are reported in start
+        # order, so for a reporter added before the first wrap this is also the
+        # ordinal of the next segment it sees.
+        self.num_started = 0
         self._observer: Optional[TimingObserver] = None
 
     @contextmanager
@@ -66,6 +70,7 @@ class DeviceTimer:
         if interval.observer is not None:
             interval.observer.on_interval_start(interval)
         self._intervals.append(interval)
+        self.num_started += 1
         self._in_wrap = True
         try:
             yield
