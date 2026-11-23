@@ -1,5 +1,6 @@
 """CPU checks of the megakernel install, dispatch and capture check."""
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -126,6 +127,53 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
+
+    def test_a_draft_spec_this_server_does_not_meet_declines_on_every_rank(self):
+        """A draft spec is checked only at install, after the target's megakernel is
+        built; an unmet requirement or too few SMs for its grids must leave the draft
+        on its own forward, not refuse the server."""
+        registry.register(architecture="Draft", path="_fakes:DRAFT")
+        unmet = {
+            "tp_size 4 is not one of [8]": {"tp_sizes": frozenset({8})},
+            "config.num_hidden_layers None is not 3": {
+                "hf_config": {"num_hidden_layers": 3}
+            },
+            # the fake GPU has 160 SMs
+            "160 SMs, the persistent grids need 161": {"resident_blocks": 161},
+        }
+        for reason, requires in unmet.items():
+            spec = replace(DRAFT, requires=replace(DRAFT.requires, **requires))
+            with (
+                get_parallel().override(tp_rank=0),
+                self.assertLogs(binding.logger, "INFO") as logs,
+            ):
+                lm = self._install_spec(spec, archs=["Draft"], is_draft=True)
+            self.assertIsNone(binding.built_megakernel(lm))
+            self.assertNotIn("forward", lm.__dict__)
+            self.assertRegex(
+                "".join(logs.output),
+                rf"fake does not serve this setup \([^;]*{re.escape(reason)}\); the draft keeps "
+                "its own forward",
+            )
+
+        def unmet_on_rank_1(value, group=None):
+            return (
+                [value, ["rank-1 reason"]] if isinstance(value, list) else [value] * 2
+            )
+
+        # a reason on any rank declines every rank; only TP rank 0 logs it
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(binding.logger, "INFO"),
+        ):
+            lm = self._install_spec(
+                DRAFT, archs=["Draft"], is_draft=True, gathered=unmet_on_rank_1
+            )
+        self.assertIsNone(binding.built_megakernel(lm))
+        # the target still refuses on too few SMs
+        small_gpu = replace(SPEC, requires=replace(SPEC.requires, resident_blocks=161))
+        with self.assertRaisesRegex(ValueError, "persistent grids need 161"):
+            self._install_spec(small_gpu)
 
     def test_each_architecture_gets_its_registered_binding(self):
         with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
