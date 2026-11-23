@@ -976,7 +976,15 @@ class UMBPStore(HiCacheStorage):
             and not self._kv_anchor_is_logical
         ):
             keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
-            self._check_spdk_key_budget(keys, "anchor")
+            longest = max(len(key.encode("utf-8")) for key in keys)
+            if longest > self._SPDK_MAX_KEY_BYTES:
+                prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
+                raise ValueError(
+                    f"UMBP SPDK store: longest anchor key is {longest} UTF-8 bytes, "
+                    f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
+                    f"The namespace prefix is {prefix_bytes} bytes; "
+                    "shorten the served model name or extra_backend_tag."
+                )
 
         # ------------------------------------------------------------------
         # Optional KV events subscriber
@@ -1217,19 +1225,6 @@ class UMBPStore(HiCacheStorage):
             self._namespace_key(f"{key}{suffix}") for key in keys for suffix in suffixes
         ]
         return key_list, len(suffixes)
-
-    def _check_spdk_key_budget(self, keys: list[str], what: str) -> None:
-        """Startup-only check. MoRI's SPDK proxy clamps keys to 255 bytes, which
-        cuts off the rank and K/V suffix and lets keys collide."""
-        longest = max(len(key.encode("utf-8")) for key in keys)
-        if longest > self._SPDK_MAX_KEY_BYTES:
-            prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
-            raise ValueError(
-                f"UMBP SPDK store: longest {what} key is {longest} UTF-8 bytes, "
-                f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
-                f"The namespace prefix is {prefix_bytes} bytes; "
-                "shorten the served model name or extra_backend_tag."
-            )
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
