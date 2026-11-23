@@ -1,3 +1,5 @@
+import hashlib
+import json
 import math
 import pickle
 import random
@@ -139,13 +141,12 @@ def get_gen_prefix_cache_path(
     zipf_alpha: Optional[float] = None,
     input_ids: bool = False,
 ):
-    """Create cache directory under ~/.cache/sglang/benchmark.
-
-    The uniform-mode filename is preserved exactly as before so existing
-    on-disk caches remain valid. Non-default sampling modes get an extra
-    suffix encoding the parameters that affect the cached payload.
-    """
+    """Build a cache path from dataset parameters and tokenizer identity."""
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
+    tokenizer_identity = json.dumps(
+        [tokenizer.name_or_path, tokenizer.get_vocab()], sort_keys=True
+    )
+    tokenizer_hash = hashlib.sha256(tokenizer_identity.encode()).hexdigest()
 
     suffix = ""
     if group_distribution != "uniform":
@@ -158,7 +159,7 @@ def get_gen_prefix_cache_path(
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
         f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
-        f"{tokenizer.__class__.__name__}.pkl"
+        f"{tokenizer.__class__.__name__}_{tokenizer_hash}.pkl"
     )
     return cache_dir / cache_key
 
@@ -196,29 +197,26 @@ def sample_generated_shared_prefix_requests(
     if input_ids and num_turns > 1:
         raise ValueError("Token-id prompts require num_turns=1")
 
-    cache_path = get_gen_prefix_cache_path(
-        seed,
-        num_groups,
-        prompts_per_group,
-        system_prompt_len,
-        question_len,
-        output_len,
-        tokenizer,
-        group_distribution=group_distribution,
-        zipf_alpha=zipf_alpha,
-        input_ids=input_ids,
-    )
-    # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
-    # cache key; send_routing_key embeds a per-run uuid + timestamp that is
-    # meaningless to cache. Bypass for these pre-existing reasons only.
+    # Variable lengths, multiple turns and per-run routing keys bypass caching.
     should_cache = range_ratio == 1 and not send_routing_key and num_turns == 1
-
-    if should_cache and cache_path.exists():
-        print(f"\nLoading cached generated input data from {cache_path}")
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    if not should_cache:
+    if should_cache:
+        cache_path = get_gen_prefix_cache_path(
+            seed,
+            num_groups,
+            prompts_per_group,
+            system_prompt_len,
+            question_len,
+            output_len,
+            tokenizer,
+            group_distribution=group_distribution,
+            zipf_alpha=zipf_alpha,
+            input_ids=input_ids,
+        )
+        if cache_path.exists():
+            print(f"\nLoading cached generated input data from {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+    else:
         print(f"\nCache bypassed ({range_ratio=}, {send_routing_key=}, {num_turns=})")
 
     print(
