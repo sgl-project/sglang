@@ -980,6 +980,40 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
             (True, 16),
         )
 
+    def test_committed_rest_charges_the_total_and_one_chunk_of_window(self):
+        """The FULL total commits the whole rest, a window pool one more chunk's
+        peak, a ring's window nothing; none of it is allocated now."""
+        # 40-token rest + 2 decode tokens, window 8, chunk limit 16, page 4:
+        # one chunk's window peak is (16 - 8) + min(42, 8) + 4 = 20.
+        for cls, ring, total_rest, window_rest in (
+            (SWATokenToKVPoolAllocator, False, 42, 20),
+            (PureSWATokenToKVPoolAllocator, False, 20, 20),
+            (SWATokenToKVPoolAllocator, True, 42, 0),
+            (PureSWATokenToKVPoolAllocator, True, 0, 0),
+        ):
+            with self.subTest(allocator=cls.__name__, ring=ring):
+                offsets = []
+                for commit in (False, True):
+                    allocator = self._allocator(cls)
+                    allocator._swa_req_ring = ring
+                    allocator._swa_ring_cost = 32
+                    budget = create_prefill_budget(allocator, _cache())
+                    budget.reserve(
+                        8,
+                        0,
+                        chunk_limit=16,
+                        unfinished_input_len=40,
+                        deferred_max_new_tokens=2,
+                        commit_unfinished=commit,
+                    )
+                    offsets.append(
+                        (budget.total_offset, budget.swa_offset, budget.current_offset)
+                    )
+                (total_off, swa_off, cur_off), (total_on, swa_on, cur_on) = offsets
+                self.assertEqual(total_on - total_off, total_rest)
+                self.assertEqual(swa_on - swa_off, window_rest)
+                self.assertEqual(cur_on, cur_off)
+
     def test_pure_swa_budget_reads_swa_capacity(self):
         allocator = self._allocator(PureSWATokenToKVPoolAllocator)
         allocator.full_available_size = lambda: 0

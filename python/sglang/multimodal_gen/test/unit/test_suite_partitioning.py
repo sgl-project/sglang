@@ -6,6 +6,7 @@ who runs what without talking to each other.
 """
 
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
     build_local_partition_assignment,
 )
 from sglang.multimodal_gen.test.server.gpu_cases import (
+    CUDA_STANDALONE_FILES,
     PARAMETRIZED_CASE_GROUPS,
     STANDALONE_FILES,
     TWO_GPU_CASES,
@@ -48,6 +50,37 @@ def _expected_work(suite: str) -> tuple[list[str], list[str]]:
         for case in case_group
     ]
     return case_ids, list(STANDALONE_FILES.get(suite, []))
+
+
+@pytest.mark.parametrize("suite", ["1-gpu", "2-gpu"])
+def test_ci_plan_preserves_registered_standalone_files(tmp_path, suite):
+    """The CUDA CI planner must schedule every standalone file in its registry."""
+    repo_root = Path(__file__).resolve().parents[5]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root / "scripts/ci/utils/diffusion/compute_diffusion_partitions.py"
+            ),
+        ],
+        env={**os.environ, "GITHUB_OUTPUT": str(tmp_path / "outputs")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output_name = {"1-gpu": "1gpu", "2-gpu": "2gpu"}[suite]
+    prefix = f"plan-{output_name}="
+    plan = next(
+        json.loads(line.removeprefix(prefix))
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    )
+    scheduled = [
+        filename
+        for partition in plan["partitions"]
+        for filename in partition["standalone_files"]
+    ]
+    assert sorted(scheduled) == sorted(CUDA_STANDALONE_FILES[suite])
 
 
 def test_assign_partition_covers_every_item_once():
@@ -113,6 +146,34 @@ def test_file_suite_runs_each_file_once(monkeypatch, tmp_path, total_partitions)
         assert result == (1 if partition_id < len(files) else 0)
 
     assert sorted(executed) == sorted(str(tmp_path / filename) for filename in files)
+
+
+@pytest.mark.parametrize("num_gpus", [1, 2])
+def test_sharded_component_accuracy_launches_all_ranks(monkeypatch, num_gpus):
+    suite = f"{num_gpus}-gpu"
+    (rel,) = run_suite.FILE_SUITES[f"component-accuracy-{suite}"]
+    target_dir = Path(run_suite.__file__).resolve().parents[1] / "server"
+    calls = []
+
+    def fail_component(cmd):
+        calls.append(cmd)
+        return 1
+
+    monkeypatch.setattr(run_suite.subprocess, "call", fail_component)
+    code, executed, results, _ = run_suite._run_standalone_file(suite, rel, target_dir)
+    key = f"standalone:{rel}"
+    assert (code, executed, results) == (1, [key], {key: "fail"})
+    (cmd,) = calls
+    launcher = ["torch.distributed.run", "--standalone", "--nproc_per_node=2", "-m"]
+    assert cmd == [
+        sys.executable,
+        "-m",
+        *(launcher if num_gpus == 2 else []),
+        "pytest",
+        "-s",
+        "-v",
+        str(target_dir / rel),
+    ]
 
 
 def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_path):
@@ -272,6 +333,57 @@ def test_observed_suite_prefers_thirty_minutes_over_extra_short_shard(monkeypatc
     monkeypatch.syspath_prepend(str(_PLANNER_DIR))
     namespace = runpy.run_path(str(_PLANNER_DIR / "compute_diffusion_partitions.py"))
     assert namespace["compute_partition_count"](9255.4, 1200, 1800, 2400, 10) == 5
+
+
+@pytest.mark.parametrize("attempt_order", [(2, 10), (10, 2)])
+@pytest.mark.parametrize("old_status,new_status", [("error", "pass"), ("pass", "fail")])
+def test_coverage_uses_latest_partition_report(
+    tmp_path, monkeypatch, attempt_order, old_status, new_status
+):
+    monkeypatch.syspath_prepend(str(_PLANNER_DIR))
+    namespace = runpy.run_path(str(_PLANNER_DIR / "verify_diffusion_coverage.py"))
+    partitions = [
+        (
+            "1-gpu",
+            0,
+            2,
+            attempt,
+            {"lora": old_status, "old-only": "pass"}
+            if attempt == 2
+            else {"lora": new_status},
+        )
+        for attempt in attempt_order
+    ]
+    partitions.extend(
+        [("1-gpu", 1, 2, 1, {"carried": "pass"}), ("2-gpu", 0, 1, 1, {"tp2": "pass"})]
+    )
+    for suite, partition, total_partitions, attempt, results in partitions:
+        artifact = f"diffusion-report-diffusion-{suite}-h100-{partition}-{attempt}"
+        report_dir = tmp_path / artifact / "sglang/multimodal_gen/test"
+        report_dir.mkdir(parents=True)
+        monkeypatch.setattr(
+            run_suite, "__file__", str(report_dir / "runner/diffusion_suite_runner.py")
+        )
+        run_suite.write_execution_report(
+            suite,
+            partition,
+            total_partitions,
+            executed_cases=list(results),
+            case_results=results,
+        )
+
+    reports = namespace["load_execution_reports"](tmp_path)
+    assert len(reports) == 3
+    assert namespace["collect_case_results"](reports) == {
+        "1-gpu": {"lora": new_status, "carried": "pass"},
+        "2-gpu": {"tp2": "pass"},
+    }
+    executed = namespace["collect_executed_cases"](reports)
+    complete, missing = namespace["verify_coverage"](
+        {"1-gpu": {"lora", "carried", "old-only"}, "2-gpu": {"tp2"}}, executed
+    )
+    assert not complete
+    assert missing == {"1-gpu": {"old-only"}}
 
 
 def test_two_gpu_cases_have_h100_full_test_time_estimates():

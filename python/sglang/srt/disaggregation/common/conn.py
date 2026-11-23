@@ -2228,7 +2228,11 @@ class CommonKVManager(BaseKVManager):
                         response = session.get(
                             f"http://{bootstrap_addr}/health",
                             timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
+                            # The Rust server's /health skips its generation probe for this.
+                            headers={
+                                "Connection": "keep-alive",
+                                "X-SGLang-Bootstrap-Heartbeat": "1",
+                            },
                         )
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
