@@ -2884,8 +2884,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             # ([N, 1] scale, must use the plain bf16 path).
             # The scale may not be reshaped yet at __init__ time; return
             # "fp8_pending" so _resolve_gfx95_quant_format re-checks on first forward.
-            # Fp8LinearMethod stores block scales as `weight_scale_inv`, other
-            # methods as `weight_scale`; check both names.
             if not _has_fp8_weight_scale(proj):
                 return "fp8_pending"
             return "fp8" if _is_block_scale_fp8(proj) else ""
