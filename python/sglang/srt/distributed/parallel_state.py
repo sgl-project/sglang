@@ -438,6 +438,14 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        self._npu_graph_staging = None
+        if _is_npu:
+            from sglang.srt.distributed.device_communicators.npu_tms_collectives import (
+                GraphCollectiveStaging,
+            )
+
+            self._npu_graph_staging = GraphCollectiveStaging(self.device_group)
+
         # Import communicators
         self.use_pynccl = use_pynccl
         self.use_mscclpp = use_mscclpp
@@ -1158,6 +1166,9 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        if self._npu_graph_staging is not None:
+            self._npu_graph_staging.reduce_scatter_tensor(output, input)
+            return output
         pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
@@ -1325,6 +1336,9 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self._npu_graph_staging is not None:
+            self._npu_graph_staging.all_gather_into_tensor(output, input)
+            return
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
