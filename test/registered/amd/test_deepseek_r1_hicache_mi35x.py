@@ -12,7 +12,7 @@ Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93,
 matching ``test_deepseek_r1_eval_mi35x.py`` /
 ``test_deepseek_r1_eval_amd.py``.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-hicache suite.
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-hicache suite.
 """
 
 import os
@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 # DSR1-0528 can spend 20+ min in weight loading on MI35x before warmup.
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-hicache",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-hicache",
     nightly=True,
 )
 

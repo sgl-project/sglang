@@ -57,9 +57,10 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 class _FakeReq(SimpleNamespace):
@@ -158,6 +159,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         return scheduler
 
@@ -497,6 +499,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING
         )
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -545,6 +548,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req.hisparse_staging = True
             move([HiSparseAct(None, MagicMock(), req)], coordinator.ack_staging_queue)
         scheduler.hisparse_coordinator = coordinator
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         prefill = self._make_batch(
@@ -906,6 +910,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
@@ -934,6 +939,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
