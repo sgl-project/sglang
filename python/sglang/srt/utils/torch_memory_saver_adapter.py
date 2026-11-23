@@ -2,6 +2,8 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 
+import torch
+
 from sglang.srt.utils.device import is_xpu
 
 try:
@@ -126,6 +128,9 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return _memory_saver.disable()
 
     def pause(self, tag: str):
+        if self.enabled:
+            # Finish asynchronous device work before unmapping its backing pages.
+            torch.get_device_module().synchronize()
         return _memory_saver.pause(tag=tag)
 
     def resume(self, tag: str):

@@ -1,8 +1,10 @@
-"""``release_memory_occupation`` must drain the device before each memory-saver
-pause: pause() unmaps without waiting, so in-flight kernels (kv_cache) or the
-async D2H clones from ``_export_static_state`` (weights) would fault or corrupt
-once their pages are released. The cases assert the recorded call order."""
+"""Check that each memory-saver unmap follows a device drain.
 
+The weights export enqueues on-device buffer clones that must finish before
+their source pages are unmapped.
+"""
+
+import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +25,7 @@ from sglang.srt.managers.scheduler_components import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.utils import torch_memory_saver_adapter as adapter_module
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -36,7 +39,7 @@ ALL_TAGS = [
 class TestReleaseMemoryOccupationSynchronize(CustomTestCase):
     def _release(self, tags):
         events = []
-        memory_saver = MagicMock()
+        memory_saver = MagicMock(enabled=True)
         memory_saver.pause.side_effect = lambda tag: events.append(("pause", tag))
         with patch.object(
             weight_updater_module,
@@ -46,11 +49,22 @@ class TestReleaseMemoryOccupationSynchronize(CustomTestCase):
             manager = SchedulerWeightUpdaterManager(
                 tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
                 draft_worker=None,
-                memory_saver_adapter=memory_saver,
+                memory_saver_adapter=adapter_module._TorchMemorySaverAdapterReal(),
                 flush_cache=lambda **kwargs: events.append(("flush", None)) or True,
                 is_fully_idle=lambda **kwargs: True,
+                scheduler=SimpleNamespace(
+                    pause_state=SimpleNamespace(paused=False),
+                    request_lists=dict,
+                    disaggregation_mode=weight_updater_module.DisaggregationMode.DECODE,
+                    disagg_decode_prealloc_queue=SimpleNamespace(
+                        release_memory_occupation=lambda: events.append(
+                            ("release_queue", None)
+                        ),
+                    ),
+                ),
             )
         with (
+            patch.object(adapter_module, "_memory_saver", memory_saver, create=True),
             patch.object(
                 weight_updater_module,
                 "_export_static_state",
@@ -79,34 +93,45 @@ class TestReleaseMemoryOccupationSynchronize(CustomTestCase):
             )
         return out, events
 
-    def test_full_release_order(self):
-        out, events = self._release(ALL_TAGS)
+    def test_release_order(self):
+        sync = ("sync", None)
+        barrier = ("barrier", None)
+        kv = [
+            ("release_queue", None),
+            sync,
+            ("pause", GPU_MEMORY_TYPE_KV_CACHE),
+            ("flush", None),
+        ]
+        weights = [("export", None), barrier, sync, ("pause", GPU_MEMORY_TYPE_WEIGHTS)]
+        graph = [sync, ("pause", GPU_MEMORY_TYPE_CUDA_GRAPH)]
+        for tags, expected in (
+            (ALL_TAGS, kv + weights + graph),
+            ([GPU_MEMORY_TYPE_KV_CACHE], kv),
+            ([GPU_MEMORY_TYPE_WEIGHTS], weights),
+            ([GPU_MEMORY_TYPE_CUDA_GRAPH], graph),
+        ):
+            with self.subTest(tags=tags):
+                out, events = self._release(tags)
+                self.assertTrue(out.success)
+                self.assertEqual(events, expected + [sync, barrier])
 
-        self.assertTrue(out.success)
-        self.assertEqual(
-            events,
-            [
-                ("sync", None),
-                ("pause", GPU_MEMORY_TYPE_KV_CACHE),
-                ("flush", None),
-                ("export", None),
-                ("sync", None),
-                ("barrier", None),
-                ("pause", GPU_MEMORY_TYPE_WEIGHTS),
-                ("pause", GPU_MEMORY_TYPE_CUDA_GRAPH),
-                ("sync", None),
-                ("barrier", None),
-            ],
-        )
+    def test_disabled_adapter_does_not_synchronize(self):
+        adapter = adapter_module.TorchMemorySaverAdapter.create(enable=False)
+        with patch.object(adapter_module.torch, "get_device_module") as get_device:
+            adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+        get_device.assert_not_called()
 
-    def test_every_pause_is_preceded_by_a_sync(self):
-        _, events = self._release(ALL_TAGS)
+    def test_disabled_backend_preserves_pause_delegation(self):
+        adapter = adapter_module._TorchMemorySaverAdapterReal()
+        memory_saver = MagicMock(enabled=False)
+        with (
+            patch.object(adapter_module, "_memory_saver", memory_saver, create=True),
+            patch.object(adapter_module.torch, "get_device_module") as get_device,
+        ):
+            adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+        get_device.assert_not_called()
+        memory_saver.pause.assert_called_once_with(tag=GPU_MEMORY_TYPE_WEIGHTS)
 
-        last_sync = -1
-        for index, (kind, payload) in enumerate(events):
-            if kind == "sync":
-                last_sync = index
-            elif kind == "pause":
-                self.assertGreater(
-                    last_sync, -1, f"pause({payload}) happened before any sync"
-                )
+
+if __name__ == "__main__":
+    unittest.main()
