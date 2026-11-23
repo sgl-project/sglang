@@ -840,16 +840,26 @@ def scaled_mm_kernel(
     scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
     accumulator = scale_b.T * accumulator.to(tl.float32)
 
-    # Convert to output format.
-    c = accumulator.to(c_ptr.type.element_ty)
+    if ACCUMULATOR_DTYPE == tl.int32:
+        # Integer inputs: add the bias in fp32 so the output is rounded only once.
+        if bias_ptr:
+            offsets_bias = offsets_bn
+            bias_ptrs = bias_ptr + offsets_bias
+            bias_mask = offsets_bias < N
+            bias = tl.load(bias_ptrs, bias_mask)
+            accumulator += bias.to(tl.float32)[None, :]
+        c = accumulator.to(c_ptr.type.element_ty)
+    else:
+        # Convert to output format.
+        c = accumulator.to(c_ptr.type.element_ty)
 
-    # Add bias, it's already in output format, so add it after conversion.
-    if bias_ptr:
-        offsets_bias = offsets_bn
-        bias_ptrs = bias_ptr + offsets_bias
-        bias_mask = offsets_bias < N
-        bias = tl.load(bias_ptrs, bias_mask)
-        c += bias
+        # Add bias, it's already in output format, so add it after conversion.
+        if bias_ptr:
+            offsets_bias = offsets_bn
+            bias_ptrs = bias_ptr + offsets_bias
+            bias_mask = offsets_bias < N
+            bias = tl.load(bias_ptrs, bias_mask)
+            c += bias
 
     # Save output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)

@@ -5,6 +5,7 @@ import torch
 import torch.testing
 
 from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils.device import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -107,6 +108,69 @@ class TestScaledMM(CustomTestCase):
                 torch.testing.assert_close(
                     triton_out_row_scale, ref_out, rtol=rtol, atol=atol
                 )
+
+    def test_int8_matches_int32_reference(self):
+        """W8A8 INT8 layout: per-token activations, per-channel weights, K x N weight view."""
+        mantissa_bits = {torch.bfloat16: 7, torch.float16: 10}
+        for M, N, K in [
+            (1, 1152, 896),
+            (7, 896, 896),
+            (33, 4864, 896),
+            (300, 896, 4864),
+        ]:
+            for out_dtype in (torch.bfloat16, torch.float16):
+                for with_bias in (False, True):
+                    with self.subTest(
+                        M=M, N=N, K=K, out_dtype=out_dtype, bias=with_bias
+                    ):
+                        torch.manual_seed(0)
+                        x = torch.randn((M, K), dtype=out_dtype, device=self._device)
+                        w = torch.randint(
+                            -127, 128, (N, K), dtype=torch.int8, device=self._device
+                        )
+                        w_scale = 1e-4 + 1e-3 * torch.rand(
+                            (N, 1), dtype=torch.float32, device=self._device
+                        )
+                        bias = (
+                            4 * torch.randn((N,), dtype=out_dtype, device=self._device)
+                            if with_bias
+                            else None
+                        )
+                        x_q, x_scale = per_token_quant_int8(x)
+
+                        out = triton_scaled_mm(
+                            x_q, w.t(), x_scale, w_scale, out_dtype, bias
+                        ).double()
+
+                        # fp64 holds the INT32 accumulator exactly (|acc| < 2^53).
+                        ref = (x_q.double() @ w.double().t()) * x_scale.double()
+                        ref = ref * w_scale.double().t()
+                        magnitude = ref.abs()
+                        if bias is not None:
+                            ref = ref + bias.double()
+                            magnitude = magnitude + bias.double().abs()
+                        # Half an ulp of out_dtype at the larger of out and ref,
+                        # never below half the smallest subnormal.
+                        exponent = torch.frexp(
+                            torch.maximum(out.abs(), ref.abs())
+                        ).exponent
+                        half_ulp = torch.ldexp(
+                            torch.full_like(ref, 0.5),
+                            exponent - 1 - mantissa_bits[out_dtype],
+                        ).clamp_min(
+                            torch.finfo(out_dtype).smallest_normal
+                            * 2.0 ** -mantissa_bits[out_dtype]
+                            / 2
+                        )
+                        # Slack for the fp32 epilogue (int32 to fp32, two scales, bias).
+                        bound = half_ulp + magnitude * 2.0**-20
+                        excess = (out - ref).abs() - bound
+                        self.assertLessEqual(
+                            excess.max().item(),
+                            0.0,
+                            f"{(excess > 0).float().mean().item():.4f} of outputs "
+                            "are more than 1/2 ulp from the reference",
+                        )
 
 
 if __name__ == "__main__":
