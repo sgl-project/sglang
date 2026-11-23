@@ -43,6 +43,8 @@ class RolloutStreamData:
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
     dit_trajectory: RolloutDitTrajectory | None = None
+    # The SDE kernel the stream was rolled out with, keyed like the request fields.
+    rollout_sde_kernel: dict[str, Any] | None = None
 
 
 @dataclass
@@ -78,6 +80,7 @@ def map_per_sample_tensors(
             if dit_trajectory is not None
             else None
         ),
+        rollout_sde_kernel=stream_data.rollout_sde_kernel,
     )
 
 
@@ -116,6 +119,7 @@ def _concat_stream_data(per_output: list[RolloutStreamData]) -> RolloutStreamDat
         ),
         rollout_debug_tensors=debug_tensors,
         dit_trajectory=dit_trajectory,
+        rollout_sde_kernel=per_output[0].rollout_sde_kernel,
     )
 
 

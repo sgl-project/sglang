@@ -438,6 +438,10 @@ class SamplingParams:
     return_frames: bool = field(default=False, metadata={"batch_sig_exclude": True})
     rollout: bool = False
     rollout_extra_streams: tuple[str, ...] = ()
+    # Per extra stream, the SDE kernel fields that differ from the top-level ones.
+    rollout_extra_stream_sde_args: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
