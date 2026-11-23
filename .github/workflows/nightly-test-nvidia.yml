@@ -32,7 +32,9 @@ on:
         default: false
   workflow_call:
     inputs:
-      ref:
+      # Named git_ref, not ref: the stages read it back out of
+      # toJson(inputs) as `.git_ref`, the same contract pr-test.yml uses.
+      git_ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
         type: string
@@ -49,7 +51,7 @@ on:
         default: false
 
 concurrency:
-  group: nightly-test-nvidia-${{ inputs.ref || github.ref }}
+  group: nightly-test-nvidia-${{ inputs.git_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
@@ -66,7 +68,7 @@ jobs:
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
-      git_ref: ${{ inputs.ref || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
       pr_test_yml: '.github/workflows/nightly-test-nvidia.yml'
       run_all_tests: true
       force_continue_on_error: true
@@ -120,7 +122,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ inputs.git_ref || github.sha }}
 
       - name: Install dependencies
         run: |
@@ -187,7 +189,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.git_ref || github.ref }}
 
       - name: Download all partition metrics
         uses: actions/download-artifact@v4

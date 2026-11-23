@@ -13,7 +13,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 SWA_LOC_OFFSET = 5000
 
@@ -171,6 +171,36 @@ class TestHipPrefillGraphTail(CustomTestCase):
         torch.testing.assert_close(tail.token_indices, want)
         self.assertEqual(metadata.low_ratio_req_indices.shape[0], want.shape[0])
         self.assertIsNone(backend._bcg_tail_buffers)
+
+    def test_graph_tail_caps_the_non_padded_counts(self):
+        """Inside a padded graph tail block the late layers must count only the real
+        tail rows as non-padded, and the full counts must come back after the tail."""
+        backend = self._backend()
+        full_metadata = object()
+        backend.forward_metadata = full_metadata
+        backend.tail_forward_metadata = SimpleNamespace(
+            late_layer_tail=SimpleNamespace(real_rows_count=128)
+        )
+        backend.candidate_masks = None
+        backend.tail_source_kv_layer_id = 20
+        backend._bcg_tail_num_token_non_padded = None
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        non_padded = torch.tensor(900)
+        # A 900-token request in a 1024-token graph shape.
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=900,
+            global_num_token_non_padded=non_padded,
+            num_token_non_padded=non_padded,
+        )
+        saved = backend.enter_late_layer_tail(batch)
+        self.assertEqual(batch.global_num_token_non_padded_cpu, 128)
+        self.assertEqual(int(batch.global_num_token_non_padded), 128)
+        self.assertEqual(int(batch.num_token_non_padded), 128)
+        backend.exit_late_layer_tail(saved, batch)
+        self.assertIs(backend.forward_metadata, full_metadata)
+        self.assertEqual(batch.global_num_token_non_padded_cpu, 900)
+        self.assertIs(batch.global_num_token_non_padded, non_padded)
+        self.assertIs(batch.num_token_non_padded, non_padded)
 
     def _can_run(self, backend, attn_dp_size):
         batch = object()
