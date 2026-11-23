@@ -1369,15 +1369,17 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
                 options = body.get("stream_options") or {}
                 options.setdefault("include_usage", True)
                 body["stream_options"] = options
-            output = await request_func(
-                inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
-            )
+            output = await request_func(inner_input)
             outputs.append(output)
+            if not output.success:
+                break
 
             prev_messages.append(
                 {"role": "assistant", "content": output.generated_text}
             )
 
+        if pbar and outputs:
+            pbar.update(1)
         return outputs
 
     return f
