@@ -358,47 +358,43 @@ class TestUMBPStore(unittest.TestCase):
         )
         real = umbp_module._import_umbp_client()
         imported = (FakeUMBPClient, FakeUMBPConfig, fake_role, *real[3:])
-        with patch.dict(os.environ):
-            os.environ.pop("UMBP_STANDALONE_ADDRESS", None)
-            os.environ.pop("UMBP_STANDALONE_AUTO_START", None)
-            os.environ.pop("UMBP_MASTER_ADDRESS", None)
-            long_model = "m" * 200
-            embedded_spdk = MockStorageConfig(
-                model_name=long_model,
-                extra_config={
-                    "dram_capacity_bytes": 1024,
-                    "ssd_enabled": True,
-                    "ssd_backend": "spdk",
-                },
-            )
-            standalone_spdk = MockStorageConfig(
-                model_name=long_model,
-                extra_config={
-                    **embedded_spdk.extra_config,
-                    "standalone_address": "unix:///tmp/umbp-test.sock",
-                    "standalone_auto_start": True,
-                },
-            )
-            standalone_external_spdk = MockStorageConfig(
-                model_name=long_model,
-                extra_config={
-                    **standalone_spdk.extra_config,
-                    "standalone_auto_start": False,
-                },
-            )
-            dram = MockStorageConfig(
-                model_name=long_model,
-                extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
-            )
+        long_model = "m" * 200
+        embedded_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                "dram_capacity_bytes": 1024,
+                "ssd_enabled": True,
+                "ssd_backend": "spdk",
+            },
+        )
+        standalone_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                **embedded_spdk.extra_config,
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+                "standalone_auto_start": True,
+            },
+        )
+        standalone_external_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                **standalone_spdk.extra_config,
+                "standalone_auto_start": False,
+            },
+        )
+        dram = MockStorageConfig(
+            model_name=long_model,
+            extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
+        )
 
-            with patch.object(
-                umbp_module, "_import_umbp_client", return_value=imported
-            ):
-                umbp_module.UMBPStore(standalone_external_spdk).close()
-                with self.assertRaisesRegex(ValueError, "longest anchor key"):
-                    umbp_module.UMBPStore(standalone_spdk)
-                umbp_module.UMBPStore(dram).close()
-                umbp_module.UMBPStore(embedded_spdk).close()
+        with patch.object(
+            umbp_module, "_import_umbp_client", return_value=imported
+        ):
+            umbp_module.UMBPStore(standalone_external_spdk).close()
+            with self.assertRaisesRegex(ValueError, "longest anchor key"):
+                umbp_module.UMBPStore(standalone_spdk)
+            umbp_module.UMBPStore(dram).close()
+            umbp_module.UMBPStore(embedded_spdk).close()
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
