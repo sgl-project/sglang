@@ -1,4 +1,5 @@
 import os
+import shlex
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
@@ -152,7 +153,13 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "--sp-degree",
                 "1",
                 "--attention-backend",
-                "laser_attn",
+                "ascend_sparse_attn",
+                "--attention-backend-config",
+                shlex.quote(
+                    '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,'
+                    '"skip_first_steps":10,"skip_last_steps":5,'
+                    '"dense_kwargs":{"precision":"bf16"}}'
+                ),
                 "--component-residency",
                 "text_encoder=layerwise-offload",
             ],
