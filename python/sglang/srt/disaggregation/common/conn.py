@@ -367,8 +367,7 @@ class CommonKVManager(BaseKVManager):
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
-        # The sampling-mask buffers differ across builds; with them on, item lengths
-        # are exchanged so validate_aux_buffers refuses a peer with another layout.
+        # Sampling-mask buffer layout differs across builds, so exchange item lengths.
         self.exchange_aux_item_lens = (
             self.customized_info_enabled
             or (
