@@ -32,7 +32,7 @@ from pathlib import Path
 import aiohttp
 import numpy as np
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 
 
 def build_payload(args: argparse.Namespace) -> dict:
