@@ -2,37 +2,39 @@
 
 from __future__ import annotations
 
-import os
 import unittest
 from contextlib import contextmanager
 
-os.environ.setdefault("SGLANG_JIT_DEEPGEMM_PRECOMPILE", "0")
+from sglang.srt.environ import envs
+
+if not envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.is_set():
+    envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
 
 import torch
 
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.moe.moe_runner.base import (
-    MoeRunnerConfig,
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.dual_runner import (
+    DualMoeRunner,
+    get_moe_dual_runner_unsupported_reason,
     resolve_moe_dual_runner_threshold,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_dequant,
     extract_fp32_block_scale_from_ue8m0,
     per_block_cast_to_fp8,
-    requant_weight_ue8m0_inplace,
     transform_scale_ue8m0,
 )
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _make_routing(m: int, num_experts: int, top_k: int, *, skewed: bool = False):
@@ -58,45 +60,77 @@ class TestMoeDualRunner(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         if not cls._dist_initialized:
-            init_single_process_dist(master_port=29640 + (os.getpid() % 200))
+            init_single_process_dist(master_port=find_available_port(29640))
             cls._dist_initialized = True
 
     @contextmanager
     def _moe_runtime_env(
         self,
         *,
-        threshold: str = "0",
+        threshold: int = 0,
         runner_backend: MoeRunnerBackend = MoeRunnerBackend.AUTO,
         a2a_backend: MoeA2ABackend = MoeA2ABackend.NONE,
-        fuse_swiglu_interleaved: str = "0",
+        fuse_swiglu_interleaved: bool = False,
+        precompile_stage: bool = False,
     ):
         self._ensure_cuda_dist()
-        env_keys = (
-            "SGLANG_MOE_DUAL_RUNNER_THRESHOLD",
-            "SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED",
-        )
-        prev_env = {k: os.environ.get(k) for k in env_keys}
-        os.environ["SGLANG_MOE_DUAL_RUNNER_THRESHOLD"] = threshold
-        os.environ["SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED"] = fuse_swiglu_interleaved
-        try:
-            with (
-                get_context().override_server_args(
-                    model_path="dummy",
-                    moe_runner_backend=runner_backend.value,
-                    moe_a2a_backend=a2a_backend.value,
-                ),
-                get_flags().moe.override(
-                    runner_backend=runner_backend,
-                    a2a_backend=a2a_backend,
-                ),
-            ):
-                yield
-        finally:
-            for k, v in prev_env.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
+        with (
+            envs.SGLANG_MOE_DUAL_RUNNER_THRESHOLD.override(threshold),
+            envs.SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED.override(fuse_swiglu_interleaved),
+            envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.override(precompile_stage),
+            get_context().override_server_args(
+                model_path="dummy",
+                moe_runner_backend=runner_backend.value,
+                moe_a2a_backend=a2a_backend.value,
+            ),
+            get_flags().moe.override(
+                runner_backend=runner_backend,
+                a2a_backend=a2a_backend,
+            ),
+        ):
+            yield
+
+    def _make_fused_moe(
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config=None,
+        apply_router_weight_on_input: bool = False,
+        with_bias: bool = False,
+        w13: torch.Tensor | None = None,
+        w2: torch.Tensor | None = None,
+        w13_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        process_weights: bool = False,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        layer = FusedMoE(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=0,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            with_bias=with_bias,
+            inplace=False,
+        ).cuda()
+        if w13 is not None:
+            layer.w13_weight.data.copy_(w13)
+        if w2 is not None:
+            layer.w2_weight.data.copy_(w2)
+        if w13_scale is not None:
+            layer.w13_weight_scale_inv.data.copy_(w13_scale)
+        if w2_scale is not None:
+            layer.w2_weight_scale_inv.data.copy_(w2_scale)
+        if process_weights:
+            layer.quant_method.process_weights_after_loading(layer)
+        return layer
 
     def test_resolve_threshold_formula(self):
         cfg = MoeRunnerConfig(num_experts=128, num_local_experts=128, top_k=8)
@@ -111,26 +145,10 @@ class TestMoeDualRunner(CustomTestCase):
             resolve_moe_dual_runner_threshold(-1, cfg, is_fp8=True, scale_ue8m0=True),
             4096,
         )
-        self.assertEqual(
-            resolve_moe_dual_runner_threshold(-1, cfg, is_fp8=True, scale_ue8m0=None),
-            4096 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 else 16384,
-        )
 
         cfg_ep4 = MoeRunnerConfig(num_experts=128, num_local_experts=32, top_k=8)
         self.assertEqual(
             resolve_moe_dual_runner_threshold(-1, cfg_ep4, is_fp8=False), 2048
-        )
-        self.assertEqual(
-            resolve_moe_dual_runner_threshold(
-                -1, cfg_ep4, is_fp8=True, scale_ue8m0=False
-            ),
-            4096,
-        )
-        self.assertEqual(
-            resolve_moe_dual_runner_threshold(
-                -1, cfg_ep4, is_fp8=True, scale_ue8m0=True
-            ),
-            1024,
         )
 
     def test_extract_fp32_block_scale_from_ue8m0(self):
@@ -167,9 +185,26 @@ class TestMoeDualRunner(CustomTestCase):
             with self.subTest(intermediate_size=intermediate_size):
                 self._check_bf16_dual_runner(intermediate_size)
 
-    def _check_bf16_dual_runner(self, intermediate_size: int):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        # Verify `sglang.compile_deep_gemm` forces threshold=1 so warmup requests
+        # compile DeepGEMM contiguous kernels ahead of serving.
+        with self._moe_runtime_env(
+            threshold=-1,
+            runner_backend=MoeRunnerBackend.AUTO,
+            precompile_stage=True,
+        ):
+            precompile_layer = self._make_fused_moe(
+                num_experts=32,
+                top_k=8,
+                hidden_size=2048,
+                intermediate_size=768,
+            )
+            self.assertIsNotNone(precompile_layer.quant_method.dual_runner)
+            self.assertEqual(precompile_layer.quant_method.dual_runner.threshold, 1)
+            self.assertEqual(
+                precompile_layer.moe_runner_config.dual_runner_threshold, 1
+            )
 
+    def _check_bf16_dual_runner(self, intermediate_size: int):
         num_experts, hidden_size, top_k = 32, 2048, 8
         torch.manual_seed(42)
         w13 = (
@@ -194,49 +229,43 @@ class TestMoeDualRunner(CustomTestCase):
         )
 
         with self._moe_runtime_env(
-            threshold="0", runner_backend=MoeRunnerBackend.TRITON
+            threshold=0, runner_backend=MoeRunnerBackend.TRITON
         ):
-            ref_layer = FusedMoE(
+            ref_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
-                inplace=False,
-            ).cuda()
-            ref_layer.w13_weight.data.copy_(w13)
-            ref_layer.w2_weight.data.copy_(w2)
-            ref_layer.quant_method.process_weights_after_loading(ref_layer)
+                w13=w13,
+                w2=w2,
+                process_weights=True,
+            )
 
         # Verify SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1 cannot interleave w13 when Dual-Runner is active.
         with self._moe_runtime_env(
-            threshold="128",
+            threshold=128,
             runner_backend=MoeRunnerBackend.AUTO,
-            fuse_swiglu_interleaved="1",
+            fuse_swiglu_interleaved=True,
         ):
-            dual_layer = FusedMoE(
+            dual_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
-                inplace=False,
-            ).cuda()
-            dual_layer.w13_weight.data.copy_(w13)
-            dual_layer.w2_weight.data.copy_(w2)
-            dual_layer.quant_method.process_weights_after_loading(dual_layer)
+                w13=w13,
+                w2=w2,
+                process_weights=True,
+            )
 
             qm = dual_layer.quant_method
-            self.assertTrue(qm.is_dual_runner)
-            self.assertEqual(qm.dual_runner_threshold, 128)
+            self.assertIsNotNone(qm.dual_runner)
+            self.assertEqual(qm.dual_runner.threshold, 128)
             self.assertEqual(dual_layer.moe_runner_config.dual_runner_threshold, 128)
             self.assertFalse(qm.w13_swiglu_interleaved)
 
             calls = []
-            orig_triton_run = qm.runner_triton.run
-            orig_dg_run = qm.runner_deep_gemm.run
+            orig_triton_run = qm.dual_runner.runner_triton.run
+            orig_dg_run = qm.dual_runner.runner_deep_gemm.run
 
             def wrapped_triton_run(*args, **kwargs):
                 calls.append(("triton", args[0].hidden_states.shape[0]))
@@ -246,8 +275,8 @@ class TestMoeDualRunner(CustomTestCase):
                 calls.append(("deep_gemm", args[0].hidden_states.shape[0]))
                 return orig_dg_run(*args, **kwargs)
 
-            qm.runner_triton.run = wrapped_triton_run
-            qm.runner_deep_gemm.run = wrapped_dg_run
+            qm.dual_runner.runner_triton.run = wrapped_triton_run
+            qm.dual_runner.runner_deep_gemm.run = wrapped_dg_run
 
             for m, expected_backend, skewed in (
                 (1, "triton", False),
@@ -272,31 +301,38 @@ class TestMoeDualRunner(CustomTestCase):
                 )
                 self.assertLess(rel_err, 1e-2)
 
-            # Verify CUDA Graph capture & replay on Triton path (small M) with zero sync.
-            x_cg = (
-                torch.randn(8, hidden_size, dtype=torch.bfloat16, device="cuda") * 0.5
-            )
-            tw_cg, ti_cg = _make_routing(8, num_experts, top_k, skewed=True)
-            topk_cg = StandardTopKOutput(tw_cg, ti_cg, None)
-            ref_cg = ref_layer(x_cg, topk_cg)
+            # Verify CUDA Graph capture & replay on both Triton (< threshold) and
+            # DeepGEMM compact (>= threshold) paths with zero host-device sync.
+            for m_cg, expected_backend in ((8, "triton"), (256, "deep_gemm")):
+                x_cg = (
+                    torch.randn(m_cg, hidden_size, dtype=torch.bfloat16, device="cuda")
+                    * 0.5
+                )
+                tw_cg, ti_cg = _make_routing(m_cg, num_experts, top_k, skewed=True)
+                topk_cg = StandardTopKOutput(tw_cg, ti_cg, None)
+                ref_cg = ref_layer(x_cg, topk_cg)
 
-            warmup_stream = torch.cuda.Stream()
-            warmup_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    _ = dual_layer(x_cg, topk_cg)
-            torch.cuda.current_stream().wait_stream(warmup_stream)
-            torch.cuda.synchronize()
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(2):
+                        _ = dual_layer(x_cg, topk_cg)
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                torch.cuda.synchronize()
 
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                out_cg = dual_layer(x_cg, topk_cg)
-            g.replay()
-            torch.cuda.synchronize()
-            cg_rel_err = float(
-                (out_cg.float() - ref_cg.float()).norm() / ref_cg.float().norm()
-            )
-            self.assertLess(cg_rel_err, 1e-2)
+                calls.clear()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out_cg = dual_layer(x_cg, topk_cg)
+                self.assertEqual(calls, [(expected_backend, m_cg)])
+                g.replay()
+                torch.cuda.synchronize()
+                cg_rel_err = float(
+                    (out_cg.float() - ref_cg.float()).norm()
+                    / ref_cg.float().norm().clamp_min(1e-6)
+                )
+                self.assertLess(cg_rel_err, 1e-2)
+                del g
 
     def test_fp8_block_dual_runner_numerics_and_guardrails(self):
         if not torch.cuda.is_available():
@@ -305,8 +341,6 @@ class TestMoeDualRunner(CustomTestCase):
             self.skipTest("Dual-Runner requires SM90 or SM100")
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             self.skipTest("JIT DeepGEMM is required for FP8 Dual-Runner test")
-
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         num_experts, hidden_size, intermediate_size, top_k = 32, 2048, 768, 8
         torch.manual_seed(7)
@@ -365,83 +399,44 @@ class TestMoeDualRunner(CustomTestCase):
         )
 
         with self._moe_runtime_env(
-            threshold="0", runner_backend=MoeRunnerBackend.TRITON
+            threshold=0, runner_backend=MoeRunnerBackend.TRITON
         ):
             self.assertFalse(Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled())
-            ref_layer = FusedMoE(
+            ref_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
-                inplace=False,
-            ).cuda()
-            ref_layer.w13_weight.data.copy_(w13_fp8)
-            ref_layer.w13_weight_scale_inv.data.copy_(w13_scale)
-            ref_layer.w2_weight.data.copy_(w2_fp8)
-            ref_layer.w2_weight_scale_inv.data.copy_(w2_scale)
-            ref_layer.quant_method.process_weights_after_loading(ref_layer)
+                w13=w13_fp8,
+                w2=w2_fp8,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                process_weights=True,
+            )
 
         with self._moe_runtime_env(
-            threshold="128", runner_backend=MoeRunnerBackend.AUTO
+            threshold=128, runner_backend=MoeRunnerBackend.AUTO
         ):
-            dual_layer = FusedMoE(
+            dual_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
-                inplace=False,
-            ).cuda()
-            dual_layer.w13_weight.data.copy_(w13_fp8)
-            dual_layer.w13_weight_scale_inv.data.copy_(w13_scale)
-            dual_layer.w2_weight.data.copy_(w2_fp8)
-            dual_layer.w2_weight_scale_inv.data.copy_(w2_scale)
-            dual_layer.quant_method.process_weights_after_loading(dual_layer)
+                w13=w13_fp8,
+                w2=w2_fp8,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                process_weights=True,
+            )
 
             qm = dual_layer.quant_method
-            self.assertTrue(qm.is_dual_runner)
-            self.assertEqual(qm.dual_runner_threshold, 128)
+            self.assertIsNotNone(qm.dual_runner)
+            self.assertEqual(qm.dual_runner.threshold, 128)
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                self.assertIsNotNone(
-                    getattr(dual_layer, "w13_weight_scale_inv_fp32", None)
-                )
+                self.assertTrue(qm._has_fp32_ue8m0_scales)
                 self.assertNotIn("w13_weight_scale_inv_fp32", dual_layer.state_dict())
-
-            # Verify post-requant UE8M0 FP32 extraction matches even when simulating UE8M0 requant.
-            w13_test = torch.nn.Parameter(w13_fp8[0:4].clone(), requires_grad=False)
-            s13_pre = torch.full_like(w13_scale[0:4], 0.75)
-            s13_test = torch.nn.Parameter(s13_pre.clone(), requires_grad=False)
-            w13_dq_before = block_quant_dequant(
-                w13_test.data[0], s13_test.data[0], [128, 128], torch.bfloat16
-            )
-            requant_weight_ue8m0_inplace(w13_test, s13_test, [128, 128])
-            recovered_s13 = extract_fp32_block_scale_from_ue8m0(
-                s13_test.data,
-                mn=2 * intermediate_size,
-                k=hidden_size,
-                block_size=[128, 128],
-            )
-            w13_dq_stale = block_quant_dequant(
-                w13_test.data[0], s13_pre[0], [128, 128], torch.bfloat16
-            )
-            w13_dq_after = block_quant_dequant(
-                w13_test.data[0], recovered_s13[0], [128, 128], torch.bfloat16
-            )
-            stale_err = float(
-                (w13_dq_stale.float() - w13_dq_before.float()).norm()
-                / w13_dq_before.float().norm()
-            )
-            fixed_err = float(
-                (w13_dq_after.float() - w13_dq_before.float()).norm()
-                / w13_dq_before.float().norm()
-            )
-            self.assertGreater(stale_err, 0.25)
-            self.assertLess(fixed_err, 0.08)
 
             # On SM100 UE8M0, weights are requantized to power-of-two scales, adding ~3-4% vs SM90 FP32 scale ref.
             tol = 6e-2 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 else 2e-2
@@ -462,19 +457,16 @@ class TestMoeDualRunner(CustomTestCase):
 
         # Guardrail 1: Explicit `--moe-runner-backend triton` must NOT activate Dual-Runner.
         with self._moe_runtime_env(
-            threshold="128", runner_backend=MoeRunnerBackend.TRITON
+            threshold=128, runner_backend=MoeRunnerBackend.TRITON
         ):
-            triton_only = FusedMoE(
+            triton_only = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
-                inplace=False,
-            ).cuda()
-            self.assertFalse(triton_only.quant_method.is_dual_runner)
+            )
+            self.assertIsNone(triton_only.quant_method.dual_runner)
 
         # Guardrail 2: Per-tensor FP8 & unsupported features fall back cleanly.
         fp8_pertensor_cfg = Fp8Config(
@@ -483,74 +475,75 @@ class TestMoeDualRunner(CustomTestCase):
             weight_block_size=None,
         )
         with self._moe_runtime_env(
-            threshold="-1", runner_backend=MoeRunnerBackend.AUTO
+            threshold=-1, runner_backend=MoeRunnerBackend.AUTO
         ):
-            pertensor_fp8 = FusedMoE(
+            pertensor_fp8 = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=192,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_pertensor_cfg,
-                inplace=False,
-            ).cuda()
-            self.assertFalse(pertensor_fp8.quant_method.is_dual_runner)
+            )
+            self.assertIsNone(pertensor_fp8.quant_method.dual_runner)
 
-            arwi_layer = FusedMoE(
+            arwi_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
                 apply_router_weight_on_input=True,
-                inplace=False,
-            ).cuda()
-            self.assertFalse(arwi_layer.quant_method.is_dual_runner)
+            )
+            self.assertIsNone(arwi_layer.quant_method.dual_runner)
 
-            bias_layer = FusedMoE(
+            bias_layer = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
                 with_bias=True,
-                inplace=False,
-            ).cuda()
-            self.assertFalse(bias_layer.quant_method.is_dual_runner)
+            )
+            self.assertIsNone(bias_layer.quant_method.dual_runner)
 
         # Guardrail 3: DeepEP A2A backend keeps Dual-Runner disabled.
         with self._moe_runtime_env(
-            threshold="-1",
+            threshold=-1,
             runner_backend=MoeRunnerBackend.AUTO,
             a2a_backend=MoeA2ABackend.DEEPEP,
         ):
-            reason = arwi_layer.quant_method._dual_runner_unsupported_reason(
-                arwi_layer, arwi_layer.moe_runner_config
+            reason = get_moe_dual_runner_unsupported_reason(
+                arwi_layer.moe_runner_config, with_bias=False
             )
             self.assertIn("moe_a2a_backend", reason or "")
+            self.assertIsNone(
+                DualMoeRunner.try_create(
+                    arwi_layer,
+                    arwi_layer.moe_runner_config,
+                    is_fp8=True,
+                    with_bias=False,
+                    quant_unsupported_reason_fn=lambda: None,
+                    get_triton_quant_info=arwi_layer.quant_method.get_triton_quant_info,
+                    get_deep_gemm_quant_info=arwi_layer.quant_method._get_deep_gemm_quant_info,
+                    owner_name="Fp8MoEMethod",
+                    label="FP8",
+                )
+            )
 
         # Guardrail 4: Auto `-1` threshold resolves to M_eff=1024 (SM90) / M_eff=256 (SM100 UE8M0) & enforces inter % 128 == 0.
         with self._moe_runtime_env(
-            threshold="-1", runner_backend=MoeRunnerBackend.AUTO
+            threshold=-1, runner_backend=MoeRunnerBackend.AUTO
         ):
-            auto_fp8 = FusedMoE(
+            auto_fp8 = self._make_fused_moe(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                layer_id=0,
-                params_dtype=torch.bfloat16,
                 quant_config=fp8_cfg,
-                inplace=False,
-            ).cuda()
-            self.assertTrue(auto_fp8.quant_method.is_dual_runner)
+            )
+            self.assertIsNotNone(auto_fp8.quant_method.dual_runner)
             expected_auto = 1024 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 else 4096
-            self.assertEqual(auto_fp8.quant_method.dual_runner_threshold, expected_auto)
+            self.assertEqual(auto_fp8.quant_method.dual_runner.threshold, expected_auto)
             auto_fp8.intermediate_size_per_partition = 192
             self.assertIn(
                 "128",

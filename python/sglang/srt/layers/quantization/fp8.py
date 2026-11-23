@@ -30,11 +30,8 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.base import (
-    get_moe_dual_runner_unsupported_reason,
-    resolve_moe_dual_runner_threshold,
-)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.dual_runner import DualMoeRunner
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
@@ -1687,6 +1684,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
         self._moe_runner_backend = None
+        self.dual_runner: Optional[DualMoeRunner] = None
+        self._has_fp32_ue8m0_scales = False
         if get_moe_runner_backend().is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -2506,7 +2505,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = (
-                getattr(self, "is_dual_runner", False)
+                self.dual_runner is not None
                 or self.is_deepgemm_moe_runner_backend_enabled()
             )
 
@@ -2616,9 +2615,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         grouped_moe=True,
                     )
 
-                if getattr(self, "is_dual_runner", False):
+                self._has_fp32_ue8m0_scales = False
+                if self.dual_runner is not None:
                     # Extract float32 scales from the post-requant UE8M0 scales so
                     # Triton and DeepGEMM read identical quantized weights and scales.
+                    extracted_count = 0
                     for attr_name, weight, weight_scale, block_size in (
                         (
                             "w13_weight_scale_inv_fp32",
@@ -2643,6 +2644,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             layer.register_buffer(
                                 attr_name, fp32_scale, persistent=False
                             )
+                            extracted_count += 1
+                    self._has_fp32_ue8m0_scales = extracted_count == 2
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp8_block_convert import (
@@ -3317,8 +3320,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self._owns_moe_runner = False
-        self.is_dual_runner = False
-        self.dual_runner_threshold = 0
+        self.dual_runner = None
         self.moe_runner_config = moe_runner_config
 
         # MXFP4 experts on NPU run through the ASCEND runner, which
@@ -3339,45 +3341,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return
 
-        configured_backend = get_moe_runner_backend()
-        threshold = envs.SGLANG_MOE_DUAL_RUNNER_THRESHOLD.get()
-        if (
-            threshold != 0
-            and configured_backend.is_auto()
-            and get_moe_a2a_backend().is_none()
-        ):
-            unsupported_reason = self._dual_runner_unsupported_reason(
+        self.dual_runner = DualMoeRunner.try_create(
+            layer,
+            moe_runner_config,
+            is_fp8=True,
+            with_bias=self.with_bias or getattr(layer, "with_bias", False),
+            quant_unsupported_reason_fn=lambda: self._dual_runner_unsupported_reason(
                 layer, moe_runner_config
-            )
-            if unsupported_reason is None:
-                resolved_threshold = resolve_moe_dual_runner_threshold(
-                    threshold, moe_runner_config, is_fp8=True
-                )
-                self.is_dual_runner = True
-                self.dual_runner_threshold = resolved_threshold
-                moe_runner_config.dual_runner_threshold = resolved_threshold
-                self.runner_triton = MoeRunner(
-                    MoeRunnerBackend.TRITON, moe_runner_config
-                )
-                self.runner_deep_gemm = MoeRunner(
-                    MoeRunnerBackend.DEEP_GEMM, moe_runner_config
-                )
-                self.runner = self.runner_triton
-                self._owns_moe_runner = True
-                logger.info_once(
-                    "Enabled Routing-Aware Dual-Runner MoE (FP8): "
-                    "threshold=%d (raw=%d, num_local_experts=%s, top_k=%s).",
-                    resolved_threshold,
-                    threshold,
-                    moe_runner_config.num_local_experts,
-                    moe_runner_config.top_k,
-                )
-                return
-            logger.info_once(
-                "Fp8MoEMethod dual-runner disabled on this layer (%s); "
-                "falling back to single MoE runner.",
-                unsupported_reason,
-            )
+            ),
+            get_triton_quant_info=self.get_triton_quant_info,
+            get_deep_gemm_quant_info=self._get_deep_gemm_quant_info,
+            owner_name="Fp8MoEMethod",
+            label="FP8",
+        )
+        if self.dual_runner is not None:
+            self.runner = self.dual_runner
+            self._owns_moe_runner = True
+            return
+
+        configured_backend = get_moe_runner_backend()
 
         moe_runner_backend = self._resolve_moe_runner_backend()
         if (
@@ -3407,18 +3389,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _dual_runner_unsupported_reason(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ) -> Optional[str]:
-        if layer is None:
-            return "layer is None"
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
-        reason = get_moe_dual_runner_unsupported_reason(
-            moe_runner_config,
-            with_bias=getattr(self, "with_bias", False)
-            or getattr(layer, "with_bias", False),
-        )
-        if reason is not None:
-            return reason
         if self.is_fp4_expert or self.use_mxfp8:
             return "FP4/MXFP8 experts are unsupported by FP8 dual-runner"
         if _is_fp8_fnuz or _use_aiter or _is_cpu or _is_xpu:
@@ -3474,18 +3447,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
-        w13_scale = getattr(layer, "w13_weight_scale_inv_fp32", None)
-        if w13_scale is None:
-            w13_scale = (
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            )
-        w2_scale = getattr(layer, "w2_weight_scale_inv_fp32", None)
-        if w2_scale is None:
-            w2_scale = (
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            )
+        if self._has_fp32_ue8m0_scales:
+            w13_scale = layer.w13_weight_scale_inv_fp32
+            w2_scale = layer.w2_weight_scale_inv_fp32
+        elif self.block_quant:
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+        else:
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -3681,15 +3651,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if getattr(self, "is_dual_runner", False):
-            # shape[0] is a static Python int during CUDA graph capture (zero GPU-CPU sync)
-            if x.shape[0] < self.dual_runner_threshold:
-                return self.runner_triton.run(
-                    dispatch_output, self.get_triton_quant_info(layer)
-                )
-            return self.runner_deep_gemm.run(
-                dispatch_output, self._get_deep_gemm_quant_info(layer)
-            )
+        if self.dual_runner is not None:
+            return self.dual_runner.run(dispatch_output, layer)
 
         if self.runner.runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (

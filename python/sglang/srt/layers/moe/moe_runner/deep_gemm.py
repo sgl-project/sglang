@@ -238,10 +238,7 @@ def _should_use_masked_standard_layout(
         return mode == "masked"
 
     # Dual-Runner only enters DeepGEMM at high token counts; force compact layout.
-    if (
-        runner_config.dual_runner_threshold > 0
-        and hidden_states.shape[0] >= runner_config.dual_runner_threshold
-    ):
+    if runner_config.dual_runner_threshold > 0:
         return False
 
     global _masked_standard_layout_memory_budget_bytes
