@@ -275,33 +275,6 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
 
 
-def dcp_crop_free_extend(forward_batch, index_topk: Optional[int]) -> bool:
-    """May this extend forward drop the operator's causal crop (sparse_mode 0)?
-
-    Only if every prefix reaches ``index_topk``: below it the top-k takes every
-    key, so the crop is what keeps the result causal. Cached per forward on the
-    DCP metadata, and the FIRST caller's ``index_topk`` wins -- the cache does
-    not key on it.
-    """
-    md = forward_batch.attn_dcp_metadata
-    cached = md.crop_free_extend
-    if cached is not None:
-        return cached
-    prefix_lens = forward_batch.extend_prefix_lens_cpu
-    ok = bool(
-        index_topk is not None
-        and prefix_lens
-        and all(dcp_packed_causal_crop_is_dead(p, index_topk) for p in prefix_lens)
-    )
-    if not ok and index_topk is not None and prefix_lens:
-        print_info_once(
-            f"DCP extend keeps the operator's causal crop: a request here has a "
-            f"prefix under index_topk={index_topk} (shortest {min(prefix_lens)})"
-        )
-    md.crop_free_extend = ok
-    return ok
-
-
 class DcpPackedReadPlan(NamedTuple):
     """Where each KV position of a ONE-REQUEST extend lives in the packed buffer.
 
@@ -471,26 +444,6 @@ class _PackedMissing:
 _PACKED_MISSING = _PackedMissing()
 
 
-def dcp_packed_read_enabled() -> bool:
-    """Whether the packed rank-major read is on for this process."""
-    return _enable_dcp_packed_read
-
-
-def dcp_packed_causal_crop_is_dead(prefix_len: int, index_topk: int) -> bool:
-    """Whether the operator's causal crop can be dropped for this chunk.
-
-    THE PACKED READ NEEDS ``sparse_mode = 0``: the crop aligns query i to key
-    ``K - Q + i``, which means nothing once the keys are in rank-major order.
-    The top-k is causal only where there is something to select FROM. At or
-    below ``index_topk`` the top-k is not a selection, it is everything, and the
-    crop is the only thing making the result causal. Above it, every query in
-    the chunk has at least ``index_topk`` keys strictly before it, the scores of
-    later keys are -inf, and a top-k of that can only name causal keys. The bound
-    is on the FIRST query in the chunk, which is the one with the least context.
-    """
-    return prefix_len + 1 >= index_topk
-
-
 def _dsa_kv_store_is_fp8() -> bool:
     """Whether the active DSA KV pool stores FP8 (``dsa_kv_cache_store_fp8`` /
     MXFP8). The packed single-record read does not support it: under the FP8
@@ -565,8 +518,9 @@ def dcp_packed_read_plan(
             f"({len(extend_lens)} requests here); the all-gather is rank-major "
             "over the whole send, so no request is contiguous in it"
         )
-    elif not dcp_crop_free_extend(forward_batch, index_topk):
-        # dcp_crop_free_extend has already logged which request fell short.
+    elif not md.extend_crop_free:
+        # Computed once at prepare (dcp_extend_crop_free); it has already
+        # logged which request fell short.
         print_info_once(
             "DCP packed read is off: this chunk needs the operator's causal "
             "crop, and the packed layout cannot use one"

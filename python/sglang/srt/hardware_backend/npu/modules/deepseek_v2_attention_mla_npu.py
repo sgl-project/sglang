@@ -45,12 +45,9 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    is_dcp_mla_decode_phase,
-)
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
-from sglang.srt.utils.common import print_info_once
+from sglang.srt.utils import print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -452,7 +449,7 @@ def forward_dsa_prepare_npu(
     # on every prepare and only the first layer actually gathers. It needs the
     # packed-read plan, so it is a no-op (the permuting path takes over) for
     # multi-request / sub-index_topk extends.
-    if _enable_dcp_gather_prefetch and _dcp_extend_active(forward_batch):
+    if _enable_dcp_gather_prefetch and _dcp_extend_active(m, forward_batch):
         packed_plan = dcp_packed_read_plan(
             forward_batch, _dcp_sfa_gather_topk_width(m, prev_topk_indices)
         )
@@ -612,7 +609,7 @@ def forward_dsa_prepare_npu(
             # a no-op except a one-request crop-free DCP extend with the flag on.
             # Remapped HERE (where the indexer produces it) so it runs once per
             # indexer-layer, not at the operator on all 78 layers.
-            if _dcp_extend_active(forward_batch):
+            if _dcp_extend_active(m, forward_batch):
                 packed_plan = dcp_packed_read_plan(
                     forward_batch, topk_indices.shape[-1]
                 )
@@ -1024,7 +1021,9 @@ def _dcp_gather_prefetcher_get() -> "_DcpGatherPrefetcher":
     return _dcp_gather_prefetcher
 
 
-def _dcp_extend_active(forward_batch: "ForwardBatch") -> bool:
+def _dcp_extend_active(
+    m: "DeepseekV2AttentionMLA", forward_batch: "ForwardBatch"
+) -> bool:
     """Whether this forward's DCP extend gather runs, per layer.
 
     prepare and core must agree on exactly this, so the expression lives in one
@@ -1034,7 +1033,7 @@ def _dcp_extend_active(forward_batch: "ForwardBatch") -> bool:
     return (
         get_parallel().dcp_enabled
         and forward_batch.forward_mode.is_extend()
-        and not is_dcp_mla_decode_phase(forward_batch)
+        and not m.is_dcp_mla_decode_phase(forward_batch)
         and forward_batch.attn_dcp_metadata is not None
     )
 

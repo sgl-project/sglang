@@ -1,4 +1,4 @@
-"""CPU checks for the runtime headroom port from glm52-a3-optimizations."""
+"""CPU checks for the bounded DCP runtime headroom."""
 
 import ast
 import unittest
