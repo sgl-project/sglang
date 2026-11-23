@@ -161,16 +161,17 @@ GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     # dumping thread stacks instead of letting startup finish.
     "--watchdog-timeout",
     9000,
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    16,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    50,
+    # EPLB is disabled for now: the community build rejects EPLB when pp-size > 1,
+    # and the prefill side runs pp-size=4. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 16,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 50,
 ]
 
 GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
@@ -229,25 +230,26 @@ GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    32,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    1000,
+    # EPLB is disabled for now, matching the prefill side: the community build
+    # rejects EPLB when pp-size > 1. Restore this block once that conflict is resolved.
+    # "--enable-eplb",
+    # "--expert-distribution-recorder-mode",
+    # "stat",
+    # "--ep-num-redundant-experts",
+    # 32,
+    # "--eplb-rebalance-num-iterations",
+    # 100000,
+    # "--expert-distribution-recorder-buffer-size",
+    # 1000,
 ]
 
 
-# PCP variant with EPLB and L3 Mooncake store
+# PCP variant with L3 Mooncake store (EPLB currently disabled, see the commented blocks above)
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
-# decode tp32/dp32/ep32, EPLB enabled on both P and D with GLM-5.3-w8a8
+# decode tp32/dp32/ep32, GLM-5.3-w8a8
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with PCP and EPLB on gpqa_diamond"""
+    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
 
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
@@ -317,7 +319,7 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         super().setUpClass()
 
     def test_npu_glm_5_3_w8a8_1p1d_pcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP and EPLB on gpqa_diamond"""
+        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
         self.run_accuracy()
 
 
