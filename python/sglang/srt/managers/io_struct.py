@@ -1794,7 +1794,10 @@ def flat_top_logprobs_layout(
     """
     num_rows = len(top_logprobs_val)
     null_prefix = 0
-    while null_prefix < num_rows and not top_logprobs_val[null_prefix]:
+    # Rows may be lists or numpy views of dense decode chunks.
+    while null_prefix < num_rows and (
+        top_logprobs_val[null_prefix] is None or len(top_logprobs_val[null_prefix]) == 0
+    ):
         null_prefix += 1
     val_rows = top_logprobs_val[null_prefix:]
     k = len(val_rows[0]) if val_rows else top_logprobs_num

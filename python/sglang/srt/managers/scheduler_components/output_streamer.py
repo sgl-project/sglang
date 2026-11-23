@@ -15,6 +15,7 @@ from typing import (
     Optional,
 )
 
+import numpy as np
 import torch
 import zmq
 
@@ -63,6 +64,25 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
+_USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
+
+
+def _pack_top_logprob_rows(rows: list):
+    """Send dense decode top-logprob rows as one [rows, k] array.
+
+    Dense decode batches store per-token numpy row views. One contiguous array
+    pickles as a buffer instead of thousands of small objects; the tokenizer
+    manager converts it back to nested lists for nested responses. Ragged or
+    list-only rows keep the original list format.
+    """
+    if not rows or not isinstance(rows[-1], np.ndarray):
+        return rows
+    try:
+        packed = np.array(rows, dtype=rows[-1].dtype)
+    except ValueError:
+        return [np.asarray(row).tolist() for row in rows]
+    # The typed msgpack IPC schema carries nested lists only.
+    return packed if _USE_PICKLE_IPC else packed.tolist()
 
 
 class OutputSink(Enum):
@@ -792,14 +812,18 @@ class _GenerationStreamAccumulator:
                     ]
                 )
                 self.output_top_logprobs_val.append(
-                    req.logprob.output_top_logprobs_val[
-                        send_output_token_logprobs_offset:logprob_end
-                    ]
+                    _pack_top_logprob_rows(
+                        req.logprob.output_top_logprobs_val[
+                            send_output_token_logprobs_offset:logprob_end
+                        ]
+                    )
                 )
                 self.output_top_logprobs_idx.append(
-                    req.logprob.output_top_logprobs_idx[
-                        send_output_token_logprobs_offset:logprob_end
-                    ]
+                    _pack_top_logprob_rows(
+                        req.logprob.output_top_logprobs_idx[
+                            send_output_token_logprobs_offset:logprob_end
+                        ]
+                    )
                 )
                 self.output_token_ids_logprobs_val.append(
                     req.logprob.output_token_ids_logprobs_val[

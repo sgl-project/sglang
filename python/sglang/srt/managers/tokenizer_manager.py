@@ -558,6 +558,13 @@ def _build_top_logprobs_weights_fields(
     return {"input_top_logprobs_weights_flat": weights.reshape(-1).tolist()}
 
 
+def _rows_to_lists(rows: list) -> None:
+    """Replace numpy row views with lists before building nested records."""
+    for i, row in enumerate(rows):
+        if isinstance(row, np.ndarray):
+            rows[i] = row.tolist()
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -3437,6 +3444,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         e,
                     )
             if not use_flat_output:
+                if state.obj.return_flat_raw_output_top_logprobs:
+                    _rows_to_lists(state.output_top_logprobs_val)
+                    _rows_to_lists(state.output_top_logprobs_idx)
                 if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
                     state.output_top_logprobs.extend(
                         self.detokenize_top_logprobs_tokens(
@@ -3550,12 +3560,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj_index
                 ]
             if recv_obj.output_top_logprobs_val is not None:
-                state.output_top_logprobs_val.extend(
-                    recv_obj.output_top_logprobs_val[recv_obj_index]
-                )
-                state.output_top_logprobs_idx.extend(
-                    recv_obj.output_top_logprobs_idx[recv_obj_index]
-                )
+                values = recv_obj.output_top_logprobs_val[recv_obj_index]
+                indices = recv_obj.output_top_logprobs_idx[recv_obj_index]
+                if isinstance(values, np.ndarray):
+                    # Dense decode chunk [rows, k] from the scheduler. Flat
+                    # output stacks the row views once at finish; nested
+                    # output needs Python numbers.
+                    if state.obj.return_flat_raw_output_top_logprobs:
+                        values, indices = list(values), list(indices)
+                    else:
+                        values, indices = values.tolist(), indices.tolist()
+                state.output_top_logprobs_val.extend(values)
+                state.output_top_logprobs_idx.extend(indices)
 
         if token_ids_logprob is not None:
             if (
