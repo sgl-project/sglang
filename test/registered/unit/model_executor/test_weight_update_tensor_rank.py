@@ -135,7 +135,12 @@ class TestTensorUpdateRebuildsEachIpcTensorOnce(CustomTestCase):
         )
         with (
             get_parallel().override(
-                tp_rank=1, tp_size=2, attn_tp_size=2, moe_tp_size=2
+                tp_rank=1,
+                tp_size=2,
+                attn_tp_size=2,
+                moe_tp_size=2,
+                attn_dp_enabled=False,
+                tp_group=SimpleNamespace(cpu_group=None, world_size=2),
             ),
             patch(
                 "torch.distributed.all_gather_object",

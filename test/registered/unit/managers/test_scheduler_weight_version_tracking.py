@@ -6,6 +6,7 @@ from unittest.mock import DEFAULT, MagicMock, Mock, patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.distributed.communication_op import control_request_all_gather_object
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -452,6 +453,72 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
     _routes = ("disk", "distributed", "tensor", "ipc")
 
+    def test_staggered_attention_dp_updates_do_not_wait_for_other_shards(self):
+        """A shard receiving control early must finish its update while another
+        shard is still in batch sync, including reporting its own peer's refusal."""
+        for route in self._routes:
+            for attn_tp_size, attn_cp_size in ((2, 1), (1, 2), (2, 2)):
+                for peer_failure in (False, True):
+                    with self.subTest(
+                        route=route,
+                        attn_tp_size=attn_tp_size,
+                        attn_cp_size=attn_cp_size,
+                        peer_failure=peer_failure,
+                    ):
+                        self.recorded.clear()
+                        full_tp = SimpleNamespace(cpu_group=object())
+                        attn_tp = SimpleNamespace(
+                            cpu_group=object(), world_size=attn_tp_size
+                        )
+                        attn_cp = SimpleNamespace(
+                            cpu_group=object(), world_size=attn_cp_size
+                        )
+                        peer_failed = False
+
+                        def gather(outputs, value, group):
+                            nonlocal peer_failed
+                            if group is full_tp.cpu_group:
+                                raise RuntimeError(
+                                    "Other DP shard is still in batch synchronization"
+                                )
+                            peer = [None] * len(value)
+                            if peer_failure and not peer_failed:
+                                peer[0] = "TP rank 1: local shard refused the update"
+                                peer_failed = True
+                            outputs[:] = [value, peer]
+
+                        with (
+                            get_parallel().override(
+                                tp_rank=0,
+                                tp_size=2 * attn_tp_size * attn_cp_size,
+                                attn_tp_size=attn_tp_size,
+                                attn_cp_size=attn_cp_size,
+                                attn_dp_size=2,
+                                attn_dp_enabled=True,
+                                enable_dp_attention_local_control_broadcast=True,
+                                tp_group=full_tp,
+                                attn_tp_group=attn_tp,
+                                attn_cp_group=attn_cp,
+                            ),
+                            patch(
+                                "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+                                control_request_all_gather_object,
+                            ),
+                            patch(
+                                "torch.distributed.all_gather_object",
+                                side_effect=gather,
+                            ),
+                        ):
+                            manager = self._build_manager(_runner(), None)
+                            manager._session = _WeightUpdateSession(selector="all")
+                            output = getattr(manager, f"update_weights_from_{route}")(
+                                _request()
+                            )
+                        self.assertEqual(output.success, not peer_failure)
+                        self.assertEqual(self.recorded, [] if peer_failure else ["v2"])
+                        if peer_failure:
+                            self.assertIn("local shard refused", output.message)
+
     def _case(
         self,
         route,
@@ -493,7 +560,7 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
         manager.flush_cache = flush
         failed = False
 
-        def gather(outputs, value, group):
+        def gather(value):
             nonlocal failed
             events.append("agree")
             error = None
@@ -506,11 +573,14 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
                 elif not peer_flush_error and "load" in events:
                     error = "TP rank 1: peer loader failed"
                 failed = error is not None
-            outputs[:] = [value, (0, error)]
+            return [value, error]
 
         with (
             get_parallel().override(tp_rank=0, tp_size=2),
-            patch("torch.distributed.all_gather_object", side_effect=gather),
+            patch(
+                "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+                side_effect=gather,
+            ),
         ):
             output = getattr(manager, f"update_weights_from_{route}")(_request())
         return output, manager, draft, events
@@ -576,7 +646,9 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
                 )
                 with (
                     get_parallel().override(tp_rank=0, tp_size=tp_size),
-                    patch("torch.distributed.all_gather_object") as gather,
+                    patch(
+                        "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object"
+                    ) as gather,
                     self.assertRaisesRegex(ValueError, "invalid tensor payload"),
                 ):
                     manager.update_weights_from_tensor(_request())

@@ -183,11 +183,16 @@ class SchedulerWeightUpdaterManager:
         parallel = get_parallel()
         if parallel.tp_size == 1:
             return success, message
-        agreed, error, _ = self._agree_across_tp_ranks(
-            error=None if success else f"TP rank {parallel.tp_rank}: {message}",
-            count=0,
-        )
-        return (True, message) if agreed else (False, error)
+        # With local control broadcast, other attention-DP shards may still be
+        # running batch synchronization. Only the ranks handling this request
+        # can participate in its outcome agreement.
+        error = None if success else f"TP rank {parallel.tp_rank}: {message}"
+        errors = [
+            error
+            for error in control_request_all_gather_object(error)
+            if error is not None
+        ]
+        return (False, " | ".join(dict.fromkeys(errors))) if errors else (True, message)
 
     def _run_native_update(
         self, update: Callable[[], Tuple[bool, str]]
