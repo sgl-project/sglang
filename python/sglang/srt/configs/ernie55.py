@@ -31,8 +31,6 @@ applied to the attention output, *SiTU* the gated activation
 projection, and ``multimax`` a four-segment transform of the logits.
 """
 
-import json
-import os
 from typing import Optional, Tuple
 
 from transformers import PretrainedConfig
@@ -78,6 +76,12 @@ _REQUIRED_CHECKPOINT_VALUES = {
 }
 
 
+def renders_chat_natively(tokenizer) -> bool:
+    """Whether ``tokenizer`` is ErnieChatTokenizer, whose Python renderer builds
+    the prompt; without it chat falls back to a Jinja template."""
+    return tokenizer is not None and hasattr(type(tokenizer), "render_chat")
+
+
 # The SiTU constants DeepGEMM's MegaMoE kernel computes with.
 MEGAMOE_SITU_BETAS = (4.0, 25.0)
 
@@ -91,83 +95,6 @@ def check_megamoe_situ_betas(config) -> None:
             "--moe-a2a-backend megamoe bakes SiTU beta/linear_beta "
             f"{MEGAMOE_SITU_BETAS}; this checkpoint uses {betas}"
         )
-
-
-def detect_fp4_routed_experts(
-    model_path: str, revision: Optional[str], download_dir: Optional[str]
-) -> bool:
-    """Whether the routed experts of ``revision`` are stored as MXFP4, read from
-    one expert's safetensors header before the experts are built. A hub ID is
-    looked up in the weight loader's caches first, then read over HTTP."""
-    from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
-    from sglang.srt.utils import find_local_repo_dir
-
-    if os.path.isdir(model_path):
-        # None: no routed expert in the index; the experts are not MXFP4.
-        return bool(try_detect_fp4_experts(model_path))
-    detected = None
-    # The cache dirs the weight loader checks, in its order.
-    for cache_dir in dict.fromkeys((download_dir, None)):
-        local = find_local_repo_dir(model_path, revision, cache_dir=cache_dir)
-        detected = try_detect_fp4_experts(local) if local else None
-        if detected is not None:
-            break
-    if detected is None:
-        detected = _remote_fp4_routed_experts(model_path, revision)
-    if detected is None:
-        raise ValueError(
-            f"cannot tell whether the routed experts of {model_path} "
-            f"(revision {revision or 'main'}) are MXFP4: no expert header is "
-            "readable locally or from the hub. Set quantization_config."
-            "routed_experts_quant_method in config.json."
-        )
-    return detected
-
-
-def _remote_expert_shard(repo_id: str, revision: Optional[str]) -> Optional[str]:
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
-
-    from sglang.srt.model_loader.weight_utils import _ROUTED_EXPERT_KEY_RE
-
-    try:
-        index = hf_hub_download(
-            repo_id, "model.safetensors.index.json", revision=revision
-        )
-    except EntryNotFoundError:
-        # A single-file checkpoint has no shard index.
-        return "model.safetensors"
-    with open(index) as f:
-        weight_map = json.load(f)["weight_map"]
-    return next(
-        (v for k, v in weight_map.items() if _ROUTED_EXPERT_KEY_RE.search(k)), None
-    )
-
-
-def _remote_fp4_routed_experts(repo_id: str, revision: Optional[str]) -> Optional[bool]:
-    from huggingface_hub import HfApi
-
-    from sglang.srt.model_loader.weight_utils import _ROUTED_EXPERT_KEY_RE
-
-    try:
-        shard = _remote_expert_shard(repo_id, revision)
-        if shard is None:
-            return None
-        header = HfApi().parse_safetensors_file_metadata(
-            repo_id, shard, revision=revision
-        )
-    except Exception:  # noqa: BLE001 - offline, gated, or no such file
-        return None
-    expert = next(
-        (t for n, t in header.tensors.items() if _ROUTED_EXPERT_KEY_RE.search(n)), None
-    )
-    if expert is None:
-        return None
-    if expert.dtype in ("U8", "I8", "F4"):
-        return True
-    if expert.dtype in ("F8_E4M3", "BF16", "F16", "F32"):
-        return False
-    return None
 
 
 def to_dspark_draft_config(hf_config) -> None:

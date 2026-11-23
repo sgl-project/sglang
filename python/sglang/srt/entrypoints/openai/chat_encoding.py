@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.configs.ernie55 import renders_chat_natively
+
 
 def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
     """Check model_type before matching the DeepseekV4 architecture substring;
@@ -59,9 +61,9 @@ def resolve_chat_encoding_spec(
     # Jinja, so prompts go through the tokenizer rather than apply_chat_template
     # on a Jinja string. A tokenizer without that renderer (loaded without
     # --trust-remote-code, or a base checkpoint's) keeps the default path.
-    if ("Ernie5_5" in arch or hf_config.model_type == "ernie5_5_moe") and hasattr(
-        type(tokenizer), "render_chat"
-    ):
+    if (
+        "Ernie5_5" in arch or hf_config.model_type == "ernie5_5_moe"
+    ) and renders_chat_natively(tokenizer):
         return "ernie5_5"
 
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None

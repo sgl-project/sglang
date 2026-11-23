@@ -719,12 +719,10 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
-        download_dir: Optional[str] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
-        self.download_dir = download_dir
         self.quantization = quantization
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
@@ -923,18 +921,14 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
-        # ERNIE 5.5 carries no marker key either; the routed-expert dtype in the
-        # safetensors header tells mxfp4 from fp8 or bf16 experts.
-        if is_ernie5_5(self.hf_config) and routed_experts_quant_method is None:
-            from sglang.srt.configs.ernie55 import detect_fp4_routed_experts
-
-            self.is_fp4_experts = detect_fp4_routed_experts(
-                self.model_path, self.revision, self.download_dir
-            )
-            logger.info(
-                "Detected ERNIE 5.5 routed-expert layout: is_fp4_experts=%s",
-                self.is_fp4_experts,
-            )
+        # ERNIE 5.5 mxfp4 ckpts may declare the routed-expert layout via expert_dtype.
+        if (
+            not self.is_fp4_experts
+            and is_ernie5_5(self.hf_config)
+            and str(quantization_config.get("expert_dtype") or "").lower() == "mxfp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info("Detected ERNIE 5.5 mxfp4 routed-expert layout.")
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
@@ -1155,7 +1149,6 @@ class ModelConfig:
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
-            download_dir=cfg.download_dir,
             **kwargs,
         )
 

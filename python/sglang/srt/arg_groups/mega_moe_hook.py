@@ -10,7 +10,12 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    attn_tp_size_of,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -157,13 +162,49 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
         )
 
 
-def _ernie_moe_rows_per_rank(cfg, rows: int) -> int:
-    # Under split heads ERNIE routes only its rows / attn_tp_size slice of a
-    # sequence-sharded batch (Ernie5_5DecoderLayer._forward_moe_attn_tp_shard).
-    attn_tp_size = cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size
-    if attn_tp_size <= 1 or cfg.disable_attn_tp_gather:
+def _gathered_buffer_required_of(cfg) -> bool:
+    """Config-time mirror of dp_attention.require_gathered_buffer under the
+    megamoe backend: the runner shards the attn-TP sequence iff this holds."""
+    attn_dp = attn_dp_enabled_of(cfg)
+    num_dp_ranks = num_dp_ranks_of(cfg)
+    mlp_gather = attn_dp and (
+        cfg.moe_dense_tp_size is None
+        or not cfg.enable_dp_lm_head
+        or cfg.moe_dense_tp_size > cfg.tp_size // num_dp_ranks
+    )
+    attn_gather = not cfg.disable_attn_tp_gather and (
+        not attn_dp or num_dp_ranks < cfg.tp_size
+    )
+    return mlp_gather or attn_gather
+
+
+def _ernie_moe_rows_per_rank(cfg, rows: int, *, sharded: bool) -> int:
+    """Rows one rank's MegaMoE call routes when its DP group runs ``rows`` rows
+    (Ernie5_5DecoderLayer._forward_ffn)."""
+    attn_tp_size = attn_tp_size_of(cfg)
+    if attn_tp_size == 1:
         return rows
-    return -(-rows // attn_tp_size)
+    if sharded:
+        # _forward_moe_attn_tp_shard routes this rank's rows / attn_tp_size slice.
+        return -(-rows // attn_tp_size)
+    if attn_dp_enabled_of(cfg):
+        # Unsharded split heads gather every DP group's rows before the MoE.
+        return rows * cfg.attn_dp_size
+    return rows
+
+
+def _ernie_moe_decode_rows_per_rank(cfg, decode_tokens: int) -> int:
+    rows = _ernie_moe_rows_per_rank(
+        cfg, decode_tokens, sharded=_gathered_buffer_required_of(cfg)
+    )
+    if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
+        # The EAGLE draft-extend graph leaves its batch unsharded, so the MTP
+        # layer routes every captured row: graph bucket x draft tokens.
+        draft_extend_rows = _ernie_moe_rows_per_rank(
+            cfg, mega_moe_decode_tokens_per_rank(cfg), sharded=False
+        )
+        rows = max(rows, draft_extend_rows)
+    return rows
 
 
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
@@ -196,7 +237,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             )
             decode_tokens = max(decode_tokens, eager_requests * tokens_per_request)
         if model_label == "Ernie5_5_MoeForCausalLM":
-            decode_tokens = _ernie_moe_rows_per_rank(cfg, decode_tokens)
+            decode_tokens = _ernie_moe_decode_rows_per_rank(cfg, decode_tokens)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "
