@@ -741,11 +741,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         fork_in_graph_metadata_prep(stream=stream, done=done, prep=prep)
 
     def _record_in_graph_metadata_prep_done(self):
-        if (
-            not self.backend.supports_shared_read_events
-            or self.attn_backend.shared_read_ends(self.capture_forward_mode)
-            is not SharedReadEnds.IN_REPLAY
-        ):
+        if not self.backend.supports_shared_read_events:
             return
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.

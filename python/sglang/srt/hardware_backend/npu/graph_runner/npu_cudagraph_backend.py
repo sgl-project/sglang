@@ -18,7 +18,7 @@ import os
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from functools import cache, cached_property, partial
+from functools import cache, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -33,7 +33,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -155,19 +154,6 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
-
-    @cached_property
-    def supports_shared_read_events(self) -> bool:
-        runner = self._decode_runner
-        attn = runner.attn_backend
-        full = getattr(attn, "full_attn_backend", attn)
-        if not getattr(full, "shared_read_enabled", False):
-            return False
-        # A hybrid runner can only publish once every child has finished its reads.
-        return attn.shared_read_ends(runner.capture_forward_mode) in (
-            SharedReadEnds.PRE_REPLAY,
-            SharedReadEnds.IN_REPLAY,
-        )
 
     @property
     def cache_loc_dtype(self):
