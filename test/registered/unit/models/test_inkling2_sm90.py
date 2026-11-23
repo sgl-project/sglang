@@ -30,6 +30,7 @@ def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
     qlen = tokens // batch
     page, heads_k = kc.shape[1], kc.shape[2]
     group = heads // heads_k
+    extent = rel.shape[-1]
     out = torch.empty(tokens, heads, d, dtype=torch.float64, device=q.device)
     lse = torch.empty(tokens, heads, dtype=torch.float64, device=q.device)
     for b in range(batch):
@@ -40,8 +41,8 @@ def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
         vals = vc.view(-1, heads_k, d)[slot].double().repeat_interleave(group, 1)
         rows = slice(b * qlen, (b + 1) * qlen)
         dist = (n - qlen + torch.arange(qlen, device=q.device))[:, None] - pos
-        index = dist.clamp(0, EXTENT - 1)[:, None, :].expand(qlen, heads, n)
-        bias = torch.gather(rel[rows].double(), 2, index) * (dist < EXTENT)[:, None]
+        index = dist.clamp(0, extent - 1)[:, None, :].expand(qlen, heads, n)
+        bias = torch.gather(rel[rows].double(), 2, index) * (dist < extent)[:, None]
         s = torch.einsum("thd,khd->thk", q[rows].double(), keys) * scale + bias
         hidden = dist < 0
         if window is not None:
@@ -138,18 +139,22 @@ def test_decode_partials_matches_reference(heads_q, heads_k, qlen, window, page)
 
 @hopper
 @pytest.mark.parametrize(
-    "interior,interior_cost,masked_cost,max_splits",
+    "interior,interior_cost,masked_cost,splits",
     [(128, 2, 1, 1), (128, 3, 4, 7), (64, 8, 9, 64)],
 )
 def test_interior_split_partition(
-    monkeypatch, interior, interior_cost, masked_cost, max_splits
+    monkeypatch, interior, interior_cost, masked_cost, splits
 ):
     """On global-layer verify, any split count and tile costs partition the
     interior tiles and the masked tail into disjoint ranges that cover every key
     once, including splits left without keys."""
     from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
-    monkeypatch.setattr(attn, "MAX_SPLITS", max_splits)
+    # Enough SMs for any batch, so MAX_SPLITS alone sets the split count.
+    monkeypatch.setattr(
+        attn, "current_arch", lambda: types.SimpleNamespace(num_sms=1 << 16)
+    )
+    monkeypatch.setattr(attn, "MAX_SPLITS", splits)
     monkeypatch.setattr(
         attn,
         "_global_verify_tiles",
@@ -157,6 +162,7 @@ def test_interior_split_partition(
     )
     inputs = _attention_inputs(6, 1, 8, None, 128)
     partials = attn.decode_partials(*inputs, HEAD_DIM**-0.5)
+    assert partials[0].shape[0] == splits
     _check_partials(partials, inputs, None)
 
 

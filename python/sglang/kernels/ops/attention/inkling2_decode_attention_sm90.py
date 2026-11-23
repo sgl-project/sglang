@@ -5,11 +5,11 @@ sequence (MTP verify). Each split takes an equal share of the sequence's own key
 on a global layer's verify, an equal share of their cost, where the keys at least
 the bias extent behind every query run as larger tiles without bias or masks."""
 
-import functools
-
 import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.arch import current_arch
 
 MAX_SPLITS = 64
 
@@ -52,10 +52,10 @@ def _interior_tile(
         )
     k = tl.load(K + kv_offset)
     s = tl.dot(q, tl.trans(k)) * scale
+    # Real keys, no mask: s is finite (padded rows have q = 0), so m_new is never -inf.
     m_new = tl.maximum(m, tl.max(s, 1))
-    m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
-    alpha = tl.exp2((m - m_ref) * 1.4426950408889634)
-    p = tl.exp2((s - m_ref[:, None]) * 1.4426950408889634)
+    alpha = tl.exp2((m - m_new) * 1.4426950408889634)
+    p = tl.exp2((s - m_new[:, None]) * 1.4426950408889634)
     l = l * alpha + tl.sum(p, 1)
     v = tl.load(V + kv_offset)
     acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
@@ -152,6 +152,8 @@ def _decode_partials(
                 q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
                 SK0, SK1, SK2, SP, PAGE, INTERIOR,
             )  # fmt: skip
+    # Keep inline rather than share a helper with _interior_tile:
+    # a helper changes the sliding-window verify SASS (1.7% slower at qlen 5 on H200).
     for tile in range(tile_lo, tile_hi):
         pos = tile * BLOCK_N + cols
         valid = (pos < seqlen) & (pos >= first)
@@ -194,11 +196,6 @@ def _decode_partials(
     tl.store(OPartial + stat[:, None] * D + d[None, :], acc, head_mask[:, None])
 
 
-@functools.cache
-def _sm_count(device_index):
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def decode_partials(
     q,
     k_cache,
@@ -220,12 +217,13 @@ def decode_partials(
     qlen = tokens // max(batch, 1)
     assert qlen * batch == tokens
     _, page_size, heads_k, _ = k_cache.shape
+    group = heads_q // heads_k
     span = (
         window_size_left + qlen
         if window_size_left is not None
         else page_table.shape[1] * page_size
     )
-    sms = _sm_count(q.device.index)
+    sms = current_arch().num_sms
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
@@ -234,7 +232,6 @@ def decode_partials(
         interior, interior_cost, masked_cost, num_stages = _global_verify_tiles(
             batch * heads_k
         )
-    group = heads_q // heads_k
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -282,7 +279,7 @@ def decode_partials(
 def _global_verify_tiles(units):
     """(interior tile, its cost, masked tile cost, pipeline stages) for global-layer
     verify, by sequences x KV heads. Measured on H200 with 2- to 8-token blocks, 2K
-    to 128K keys and main's split counts; re-tune when the kernel changes."""
+    to 128K keys and the launcher's split counts; re-tune when the kernel changes."""
     if units < 4:
         return 128, 2, 1, 2
     if units < 16:
