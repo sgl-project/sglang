@@ -345,9 +345,35 @@ jobs:
           docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
+      - name: Route checkout through the GitHub mirror
+        env:
+          SGLANG_MUSA_GIT_PROXY: ${{ vars.SGLANG_MUSA_GIT_PROXY || 'https://gh-proxy.org/' }}
+        run: |
+          if [ "${SGLANG_MUSA_GIT_PROXY}" = "direct" ]; then
+            exit 0
+          fi
+          if ! [[ "${SGLANG_MUSA_GIT_PROXY}" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::error::SGLANG_MUSA_GIT_PROXY must be an HTTPS URL or 'direct'"
+            exit 1
+          fi
+          mirror="${SGLANG_MUSA_GIT_PROXY%/}/"
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=url.${mirror}https://github.com/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=https://github.com/"
+            echo "CHECKOUT_MIRROR_CONFIGURED=1"
+          } >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+
+      - name: Restore Git config after checkout
+        run: |
+          # Do not rewrite setup_musa.py's direct fallback after checkout.
+          if [ "${CHECKOUT_MIRROR_CONFIGURED:-}" = "1" ]; then
+            echo "GIT_CONFIG_COUNT=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Clean stale torchada extension locks
         run: |
