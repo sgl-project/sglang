@@ -12,6 +12,7 @@ import functools
 import logging
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -19,6 +20,7 @@ import torch
 from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.encoder.native_handoff import GLM_VIDEO_MODEL_TYPES
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
@@ -176,12 +178,21 @@ class EncoderPreprocessor:
             else {"backend": image_processor_backend}
         )
         try:
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=get_model().trust_remote_code,
-                revision=get_model().revision,
-                **image_processor_kwargs,
-            )
+            if self.model_type == "dots3_note":
+                from sglang.srt.models.dots3_common.dots_omni_towers import (
+                    DotsNoteOmniImagePreprocessor,
+                )
+
+                self.image_processor = DotsNoteOmniImagePreprocessor(
+                    self.model_config.hf_config._name_or_path
+                )
+            else:
+                self.image_processor = AutoImageProcessor.from_pretrained(
+                    get_serving().tokenizer_path or get_model().model_path,
+                    trust_remote_code=get_model().trust_remote_code,
+                    revision=get_model().revision,
+                    **image_processor_kwargs,
+                )
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
             self.image_processor = None
@@ -197,7 +208,28 @@ class EncoderPreprocessor:
             self.video_processor = None
 
         try:
-            _audio_proc = AutoProcessor.from_pretrained(
+            if self.model_type == "dots3_note":
+                from sglang.srt.models.dots3_common.dots_omni_audio import (
+                    OmniAudioConfig,
+                )
+                from sglang.srt.models.dots3_common.dots_omni_towers import (
+                    load_omni_component_config,
+                )
+
+                self.audio_processor = OmniAudioConfig(
+                    **load_omni_component_config(
+                        Path(self.model_config.hf_config._name_or_path), "audio"
+                    )
+                )
+                return
+            from sglang.srt.multimodal.customized_mm_processor_utils import (
+                _CUSTOMIZED_MM_PROCESSOR,
+            )
+
+            audio_processor_cls = _CUSTOMIZED_MM_PROCESSOR.get(
+                self.model_type, AutoProcessor
+            )
+            _audio_proc = audio_processor_cls.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=get_model().trust_remote_code,
                 revision=get_model().revision,
@@ -239,10 +271,16 @@ class EncoderPreprocessor:
                         self.vision_config["video"].setdefault(k, v)
 
             if modality_str == "audio":
+                if self.model_type in {"qwen2_audio", "qwen3_asr", "qwen3_omni_moe"}:
+                    # Qwen2-Audio has a fixed 30-second window. Qwen3-ASR's
+                    # Whisper processor also pads to that window, with no truncation.
+                    self.vision_config["audio"].setdefault(
+                        "truncation", self.model_type == "qwen2_audio"
+                    )
                 if "return_attention_mask" not in self.vision_config["audio"]:
                     self.vision_config["audio"]["return_attention_mask"] = True
                 if "padding" not in self.vision_config["audio"]:
-                    if self.model_type == "qwen2_audio":
+                    if self.model_type in {"qwen2_audio", "qwen3_asr"}:
                         self.vision_config["audio"]["padding"] = "max_length"
                     else:
                         self.vision_config["audio"]["padding"] = True
@@ -274,6 +312,8 @@ class EncoderPreprocessor:
         if sr:
             return int(sr)
 
+        if self.model_type == "dots3_note" and self.audio_processor is not None:
+            return self.audio_processor.sampling_rate
         hf_cfg = self.model_config.hf_config
         thinker_cfg = _read(hf_cfg, "thinker_config")
         pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
@@ -538,7 +578,7 @@ class EncoderPreprocessor:
         video_items = await asyncio.gather(*async_futures)
 
         video_processor_kwargs = {}
-        if "qwen" in self.model_type:
+        if "qwen" in self.model_type or self.model_type == "intern_s2_preview":
             video_processed = [
                 await preprocess_video(
                     video, video_config=self.vision_config.get("video", {})
@@ -593,6 +633,9 @@ class EncoderPreprocessor:
                     )
                 if (
                     self.server_args.mm_enable_dp_encoder
+                    # A staged video carries the full clip's grid and timestamps
+                    # on rank zero. The HTTP shard path returns local frames only.
+                    and not get_serving().grpc_mode
                     and tp_size > 1
                     and sampled is not None
                     and len(sampled) >= max(32, tp_size * 2)
@@ -698,7 +741,7 @@ class EncoderPreprocessor:
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
         images = await self._flatten_and_load_images(mm_items)
-        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
+        if self.model_type in ["kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
@@ -735,7 +778,7 @@ class EncoderPreprocessor:
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
         )
-        if self.model_type == "kimi_k3":
+        if self.model_type in {"kimi_k3", "kimi_k31"}:
             processor_input["original_image_sizes"] = original_image_sizes
         return processor_input
 
@@ -796,6 +839,26 @@ class EncoderPreprocessor:
                 video_timestamps.append(timestamps)
             processor_input["video_timestamps"] = video_timestamps
         elif (
+            self.model_type in GLM_VIDEO_MODEL_TYPES
+            and (video_metadata := video_processor_kwargs.get("video_metadata"))
+            is not None
+        ):
+            # The native HF GLM prompt uses every other sampled timestamp,
+            # truncated or padded with the last timestamp to the temporal grid.
+            times = []
+            for grid, metadata in zip(
+                processor_input["video_grid_thw"], video_metadata, strict=True
+            ):
+                fps = metadata["fps"] or 24
+                if not np.isfinite(fps) or fps <= 0:
+                    raise ValueError("GLM video FPS must be finite and positive")
+                t = int(grid[0])
+                sampled = [i / fps for i in metadata["frames_indices"][::2][:t]]
+                times.append(
+                    sampled + [sampled[-1] if sampled else 0.0] * (t - len(sampled))
+                )
+            processor_input["video_timestamps"] = times
+        elif (
             self.model_type in ["qwen2_5_vl", "qwen2_5_omni", "qwen3_omni_moe"]
             and processor_input.get("video_grid_thw", None) is not None
         ):
@@ -831,8 +894,48 @@ class EncoderPreprocessor:
 
         if not self.audio_processor:
             raise ValueError("No audio processor available")
+        if self.model_type == "dots3_note":
+            from sglang.srt.managers.req_types import MultimodalDataItem
+            from sglang.srt.models.dots3_common.dots_omni_audio import (
+                compute_audio_token_length,
+            )
+            from sglang.srt.multimodal.processors.dots_note_omni import (
+                DotsNoteOmniProcessor,
+            )
 
-        audio_config = self.vision_config.get("audio", {})
+            config = self.audio_processor
+            features = [
+                DotsNoteOmniProcessor._normalize_audio(audio) for audio in audios
+            ]
+            rows = [
+                compute_audio_token_length(
+                    waveform.numel(),
+                    chunk_seconds=config.chunk_seconds,
+                    conv_temporal_stride=config.conv_temporal_stride,
+                    merge_factor=config.merge_factor,
+                )
+                for waveform in features
+            ]
+            return EncoderPreprocessOutput(
+                {
+                    "input_features": features,
+                    "audio_feature_lens_raw": torch.tensor(rows, dtype=torch.long),
+                },
+                mm_items=[
+                    MultimodalDataItem(
+                        modality=Modality.AUDIO,
+                        feature=waveform,
+                        offsets=[(0, count - 1)],
+                    )
+                    for waveform, count in zip(features, rows)
+                ],
+            )
+
+        audio_config = {
+            "return_tensors": "pt",
+            "sampling_rate": self.model_audio_sr,
+            **self.vision_config.get("audio", {}),
+        }
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(
@@ -842,9 +945,9 @@ class EncoderPreprocessor:
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
-        input_lengths = torch.tensor(
-            processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
-        )
+        input_lengths = torch.as_tensor(
+            processor_input["feature_attention_mask"], dtype=torch.long
+        ).sum(-1)
         processor_input["audio_feature_lens_raw"] = input_lengths
         output_lengths = self._get_feat_extract_output_lengths(input_lengths)
         processor_input["audio_feature_lens"] = output_lengths
@@ -865,7 +968,7 @@ class EncoderPreprocessor:
                 ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
             )
             return output_lengths
-        elif self.model_type == "mimo_v2":
+        elif self.model_type in {"dots3_note", "mimo_v2"}:
             return feature_lens
         else:
             logger.warning(
@@ -882,7 +985,7 @@ class EncoderPreprocessor:
         if modality == Modality.IMAGE:
             # Kimi K2.5/K3 emit grid_thws, while Kimi-VL emits image_grid_hws.
             # Other model types keep the generic attr order above.
-            if model_type in ("kimi_k25", "kimi_k3"):
+            if model_type in ("kimi_k25", "kimi_k3", "kimi_k31"):
                 attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
             elif model_type == "kimi_vl":
                 attrs = ("image_grid_hws", "image_grid_thw", "grid_thws")
@@ -899,7 +1002,7 @@ class EncoderPreprocessor:
     ) -> int:
         """Calculate number of raw patches (before merge/sampling). Used for pixel_values slicing."""
         if modality == Modality.AUDIO:
-            return int(grid.item())
+            return int(grid)
         if self.model_type == "kimi_vl" and modality == Modality.IMAGE:
             h, w = self._kimi_hw_from_patch_grid(grid)
             return h * w
@@ -949,7 +1052,7 @@ class EncoderPreprocessor:
             return self._get_feat_extract_output_lengths(input_length)
         else:
             if (
-                self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]
+                self.model_type in ["kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl"]
                 and modality == Modality.IMAGE
             ):
                 return self._kimi_tokens_from_patch_grid(grid)
@@ -1053,7 +1156,7 @@ class EncoderPreprocessor:
         a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids.
         """
         if (
-            self.model_type not in ("kimi_k25", "kimi_k3", "kimi_vl")
+            self.model_type not in ("kimi_k25", "kimi_k3", "kimi_k31", "kimi_vl")
             or modality != Modality.IMAGE
         ):
             return [1] * len(leaves)

@@ -233,6 +233,8 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
+    /// This language worker receives staged embeddings from an external encoder.
+    pub external_encoder_handoff: bool,
     /// The resolved `--enable-return-hidden-states`;
     /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
@@ -330,6 +332,7 @@ impl ServerArgs {
         enable_strict_thinking,
         limit_mm_data_per_request,
         allow_auto_truncate,
+        external_encoder_handoff,
         enable_return_hidden_states,
         return_hidden_states_mode,
         num_reserved_tokens,
@@ -397,6 +400,7 @@ impl ServerArgs {
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
+        external_encoder_handoff: bool,
         enable_return_hidden_states: bool,
         return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
@@ -462,6 +466,7 @@ impl ServerArgs {
             enable_strict_thinking,
             limit_mm_data_per_request,
             allow_auto_truncate,
+            external_encoder_handoff,
             enable_return_hidden_states,
             return_hidden_states_mode,
             num_reserved_tokens,
@@ -534,6 +539,7 @@ impl Default for ServerArgs {
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
+            external_encoder_handoff: false,
             enable_return_hidden_states: false,
             return_hidden_states_mode: None,
             num_reserved_tokens: 0,

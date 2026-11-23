@@ -153,8 +153,14 @@ class Disagg(msgspec.Struct):
     encoder_transfer_backend: A[
         str,
         Arg(
-            help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
-            choices=["auto", "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"],
+            help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend. NIXL writes staged images to an external language worker's CPU buffer.",
+            choices=[
+                "auto",
+                "zmq_to_scheduler",
+                "zmq_to_tokenizer",
+                "mooncake",
+                "nixl",
+            ],
         ),
     ] = "auto"
     encoder_urls: A[List[str], "List of encoder server urls."] = msgspec.field(

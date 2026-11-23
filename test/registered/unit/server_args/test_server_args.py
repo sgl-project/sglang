@@ -5850,6 +5850,40 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 self._resolve([])
             self._resolve([], rust_server=False)
 
+    def test_external_handoff_requires_a_language_only_rust_server(self):
+        with (
+            patch.dict(os.environ),
+            envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+        ):
+            self._resolve(
+                ["--language-only", "--encoder-transfer-backend", "zmq_to_scheduler"]
+            )
+            for flags, rust, error in (
+                ([], True, "requires SGLANG_RUST_SERVER"),
+                (["--language-only"], False, "requires SGLANG_RUST_SERVER"),
+                (["--language-only", "--pp-size", "2"], True, "PP=1"),
+                (["--language-only", "--dp-size", "2"], True, "one DP rank"),
+                (
+                    [
+                        "--language-only",
+                        "--encoder-transfer-backend",
+                        "zmq_to_tokenizer",
+                    ],
+                    True,
+                    "zmq_to_scheduler or nixl",
+                ),
+                (
+                    ["--language-only", "--enable-adaptive-dispatch-to-encoder"],
+                    True,
+                    "incompatible",
+                ),
+            ):
+                with (
+                    self.subTest(flags=flags, rust=rust),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    self._resolve(flags, rust_server=rust)
+
     def test_args_a_model_package_honors_are_not_refused(self):
         args = prepare_server_args(
             [

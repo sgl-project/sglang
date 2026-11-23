@@ -3,7 +3,7 @@ from typing import Union
 
 import torch
 
-from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -56,6 +56,29 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         positions = torch.arange(seq_len, dtype=torch.long)
         mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
         return mrope_positions, torch.tensor([0], dtype=torch.long)
+
+    def get_staged_media_layout(self, prompt, audio_feature_lens):
+        from sglang.srt.multimodal.mrope_rope_index import (
+            _get_feat_extract_output_lengths,
+        )
+
+        ids, offsets, _ = self.build_input_ids(
+            prompt, audio_seq_lens=_get_feat_extract_output_lengths(audio_feature_lens)
+        )
+        items = [
+            MultimodalDataItem(modality=Modality.AUDIO, offsets=[span])
+            for span in offsets
+        ]
+        positions, delta = self.compute_mrope_positions(ids, items)
+        return MultimodalProcessorOutput(
+            input_ids=ids,
+            mm_items=items,
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+            mrope_positions=positions,
+            mrope_position_delta=delta,
+        )
 
     async def process_mm_data_async(
         self,

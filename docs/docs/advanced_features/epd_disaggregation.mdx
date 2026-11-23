@@ -15,9 +15,48 @@ To address these challenges, we introduce Encoder–Prefill–Decode (EPD) Disag
 ### Usage
 
 You can launch a language-only model using `--language-only`, or an encoder-only model using `--encoder-only`.
-When launching a language-only model, you must additionally specify the encoder service endpoints via `--encoder-urls`.
+For Python language-only workers, configure encoder endpoints with `--encoder-urls` or register them dynamically.
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
+
+### External encoder selection
+
+An external router such as Dynamo selects E and calls its `Stage` RPC. It
+passes the returned descriptor to the selected P/PD in the `encoder_handoff`
+field of a tokenized `/generate` request. Start E with `--encoder-only --grpc-mode`.
+On the Rust language workers, use `--language-only` with
+`SGLANG_RUST_SERVER=1` and `SGLANG_EXTERNAL_ENCODER_HANDOFF=1`. The worker
+uses the encoder identified by the descriptor, so you can omit `--encoder-urls`.
+Use the same `--encoder-transfer-backend nixl` or
+`--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
+the UCX plugin on both ends.
+
+| Model family | Image | Video | Separate audio input |
+|---|---|---|---|
+| Qwen2-VL, Qwen2.5-VL, Qwen3-VL/MoE, Qwen3.5/MoE, Intern-S2 Preview | Yes | Yes | — |
+| GLM-5-Next (GLM-5.3-Flash), GLM-4V/MoE, MiniMax-M3 | Yes | Yes | — |
+| Qwen3-Omni-MoE | Yes | Yes | Yes |
+| Muse Spark | Yes | Yes | With a tokenizer that defines the soft-audio delimiters |
+| MiMo-V2 with the corresponding towers | Yes | Clips without an audio track | Yes |
+| Dots3-Note | Yes | Image items only | Yes |
+| Kimi-VL, Kimi K2.5, K3, K3.1, Inkling2 | Yes | Image items only | — |
+| Qwen2-Audio, Qwen3-ASR | — | — | Yes |
+
+Use PP=DP=1. Each encoder replica can use tensor parallelism within one node.
+All media in a request go to one replica. On P/PD, TP rank 0 receives the
+embeddings and broadcasts them to its peers. In E/P/D, D reconstructs the token
+positions from the descriptor. Configure P→D KV transfer independently.
+
+Qwen-family image and video handoffs use v1 and v2 respectively. Other model
+families use v3 to carry the native model type, tensor width and per-item row
+counts, plus the grids, dimensions or timing their processors need.
+Requests containing separate audio items use v4. E records the native feature
+length, embedding rows, width and identity for each audio input. The language
+processor uses these lengths to reconstruct audio token spans and positions.
+Use the same audio-capable model on both E and P/PD (and D in a split
+deployment). Independent audio items may share a prompt with images or videos
+when the checkpoint supports those modalities. Video requires a compatible
+decoder on E. Embedded soundtracks are outside this protocol.
 
 ### Encoder transfer with Mooncake
 

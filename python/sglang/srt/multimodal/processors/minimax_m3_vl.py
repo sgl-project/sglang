@@ -472,6 +472,7 @@ def _media_token_runs(input_ids: List[int], token_id: int) -> List[Tuple[int, in
 
 
 class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
+    accepts_staged_expanded_spans = True
     models = [MiniMaxM3SparseForConditionalGeneration]
 
     gpu_image_decode = False
@@ -806,9 +807,11 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                     MultimodalDataItem(
                         modality=modality,
                         offsets=offsets,
-                        precomputed_embeddings=embeddings[modality][
-                            row_start : row_start + num_rows
-                        ],
+                        precomputed_embeddings=(
+                            embeddings[modality][row_start : row_start + num_rows]
+                            if embeddings is not None
+                            else None
+                        ),
                     )
                 )
                 run_start += run_count

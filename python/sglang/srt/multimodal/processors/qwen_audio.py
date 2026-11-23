@@ -101,6 +101,21 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
                     feature_extractor.chunk_length,
                 )
 
+    @staticmethod
+    def _bind_audio_feature_lengths(items, lengths):
+        # The common processor splits a batch into independently cacheable
+        # audio items. Keep each clip's encoder length on its own item, also
+        # accepting bundled items with multiple offset spans.
+        first = 0
+        for item in items:
+            end = first + len(item.offsets)
+            item.audio_feature_lens = lengths[first:end]
+            first = end
+        if first != len(lengths):
+            raise ValueError(
+                "Qwen2-Audio placeholder count differs from audio feature lengths"
+            )
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
 
@@ -124,9 +139,11 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
             embedding_start = consumed_per_modality.get(modality, 0)
-            embedding_slice = embeddings[modality][
-                embedding_start : embedding_start + num_tokens
-            ]
+            embedding_slice = (
+                embeddings[modality][embedding_start : embedding_start + num_tokens]
+                if embeddings is not None
+                else None
+            )
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(
@@ -136,8 +153,8 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
                 )
             )
 
-        if mm_items:
-            mm_items[0].audio_feature_lens = output_lengths
+        if output_lengths is not None:
+            self._bind_audio_feature_lengths(mm_items, output_lengths)
 
         return MultimodalProcessorOutput(
             mm_items=mm_items,
@@ -175,7 +192,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         input_lengths = (input_lengths - 1) // 2 + 1
         output_lengths = (input_lengths - 2) // 2 + 1
 
-        mm_items[0].audio_feature_lens = output_lengths
+        self._bind_audio_feature_lengths(mm_items, output_lengths)
 
         return MultimodalProcessorOutput(
             mm_items=mm_items,

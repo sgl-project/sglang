@@ -633,10 +633,11 @@ def build_rust_customized_info_fixture() -> dict:
 
 
 @contextmanager
-def launch_context(server_cls, cores=(None, None)):
+def launch_context(server_cls, cores=(None, None), disagg=None):
     """Patch what `launch` reads so it runs as DP rank 1 of a two-rank node,
     with `cores` as the `(launch_cores, server_cores)` partition (unpinned by
-    default); yields the `_build_server_args` mock."""
+    default) and `disagg` as `get_disagg()` (no disaggregation by default);
+    yields the `_build_server_args` mock."""
     with (
         patch.object(
             server_module,
@@ -665,7 +666,9 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_mm",
-            return_value=SimpleNamespace(mm_processor_worker_num=8),
+            return_value=SimpleNamespace(
+                mm_processor_worker_num=8, limit_mm_data_per_request=None
+            ),
         ),
         patch.object(
             server_module,
@@ -677,7 +680,7 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_disagg",
-            return_value=SimpleNamespace(disaggregation_mode="null"),
+            return_value=disagg or SimpleNamespace(disaggregation_mode="null"),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
@@ -1272,6 +1275,45 @@ class TestRustServerExtension(CustomTestCase):
             self.assertEqual(json.load(f), build_rust_frame_metadata_fixture())
         with open(RUST_CUSTOMIZED_INFO_FIXTURE) as f:
             self.assertEqual(json.load(f), build_rust_customized_info_fixture())
+
+    def test_external_handoff_starts_a_language_worker_without_an_mm_pool(self):
+        extension = ModuleType("server")
+        extension.Server = Mock()
+        scheduler = SimpleNamespace(
+            server_args=sentinel.server_args,
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True,
+                is_generation=True,
+                hf_config=SimpleNamespace(model_type="qwen3_vl"),
+                model_path="test/model",
+            ),
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="null", encoder_transfer_backend="zmq_to_tokenizer"
+        )
+        with (
+            server_module.envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True),
+            launch_context(RustServer, disagg=disagg),
+            patch.object(RustServer, "_load_extension", return_value=extension),
+            patch.object(RustServer, "_resolve_multimodal") as resolve_mm,
+        ):
+            # auto backend and DP can resolve after command-line validation.
+            with self.assertRaisesRegex(RuntimeError, "zmq_to_scheduler or nixl"):
+                RustServer.launch(scheduler)
+            disagg.encoder_transfer_backend = "nixl"
+            with self.assertRaisesRegex(RuntimeError, "one DP rank"):
+                RustServer.launch(scheduler)
+            extension.Server.assert_not_called()
+
+            server_module.get_parallel.return_value.num_dp_ranks = 1
+            for backend in ("nixl", "zmq_to_scheduler"):
+                with self.subTest(backend=backend):
+                    disagg.encoder_transfer_backend = backend
+                    instance = RustServer.launch(scheduler)
+                    self.assertFalse(instance._multimodal_enabled)
+                    instance.server.start_mm_workers.assert_not_called()
+            resolve_mm.assert_not_called()
 
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so a model

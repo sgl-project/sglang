@@ -1543,6 +1543,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
+    encoder_handoff: Optional[Any] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -4274,6 +4275,11 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     skip_tokenizer_init: bool = False
     num_reserved_tokens: int = 0
     instance_id: str = ""
+    accepts_encoder_handoff: bool = False
+    supports_staged_video: bool = False
+    native_model_type: str = ""
+    staged_audio_model_type: str = ""
+    supports_staged_images: Optional[bool] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -7086,6 +7092,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
+        elif key == "encoder_handoff":
+            kw["encoder_handoff"] = x
     return GenerateRequest(**kw)
 
 
@@ -7167,6 +7175,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
         d["modalities"] = encode_OptionalStringList(v.modalities)
+    if v.encoder_handoff is not None:
+        d["encoder_handoff"] = v.encoder_handoff
     return d
 
 
@@ -12130,6 +12140,16 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
         elif key == "instance_id":
             kw["instance_id"] = _expect_str(x, expected="a string")
+        elif key == "accepts_encoder_handoff":
+            kw["accepts_encoder_handoff"] = _expect_bool(x, expected="a boolean")
+        elif key == "supports_staged_video":
+            kw["supports_staged_video"] = _expect_bool(x, expected="a boolean")
+        elif key == "native_model_type":
+            kw["native_model_type"] = _expect_str(x, expected="a string")
+        elif key == "staged_audio_model_type":
+            kw["staged_audio_model_type"] = _expect_str(x, expected="a string")
+        elif key == "supports_staged_images":
+            kw["supports_staged_images"] = None if x is None else _expect_bool(x, expected="a boolean")
     return GetServerInfoResponse(**kw)
 
 
@@ -12154,6 +12174,12 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["skip_tokenizer_init"] = v.skip_tokenizer_init
     d["num_reserved_tokens"] = v.num_reserved_tokens
     d["instance_id"] = v.instance_id
+    d["accepts_encoder_handoff"] = v.accepts_encoder_handoff
+    d["supports_staged_video"] = v.supports_staged_video
+    d["native_model_type"] = v.native_model_type
+    d["staged_audio_model_type"] = v.staged_audio_model_type
+    if v.supports_staged_images is not None:
+        d["supports_staged_images"] = v.supports_staged_images
     return d
 
 

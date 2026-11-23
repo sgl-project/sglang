@@ -87,6 +87,9 @@ message GenerateRequest {
   int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
+  // Private language-only ingress. A versioned staged media descriptor from
+  // the selected native encoder, consumed alongside unexpanded token IDs.
+  optional string encoder_handoff = 41 [(sglang.json.v1.field_json).raw_json = true];
 }
 
 // Per-request Unlimited-OCR options. The processor owns mode validation and

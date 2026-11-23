@@ -89,13 +89,16 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = Qwen2Config(self.config._name_or_path)
 
-        self.audio_tower = Qwen2AudioEncoder(
-            config.audio_config,
-        )
-        self.multi_modal_projector = Qwen2AudioMultiModalProjector(config)
-        self.language_model = Qwen2ForCausalLM(
-            config.text_config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.audio_tower = None
+        self.multi_modal_projector = None
+        self.language_model = None
+        if not getattr(config, "language_only", False):
+            self.audio_tower = Qwen2AudioEncoder(config.audio_config)
+            self.multi_modal_projector = Qwen2AudioMultiModalProjector(config)
+        if not getattr(config, "encoder_only", False):
+            self.language_model = Qwen2ForCausalLM(
+                config.text_config, quant_config, prefix=add_prefix("model", prefix)
+            )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
@@ -147,6 +150,13 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            is_encoder_weight = name.startswith(
+                ("audio_tower.", "multi_modal_projector.")
+            )
+            if (self.audio_tower is None and is_encoder_weight) or (
+                self.language_model is None and not is_encoder_weight
+            ):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

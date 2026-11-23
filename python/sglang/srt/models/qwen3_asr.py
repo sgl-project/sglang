@@ -56,12 +56,16 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         if getattr(thinker_config, "audio_config", None) is None:
             thinker_config.audio_config = Qwen3OmniMoeAudioEncoderConfig()
 
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
-        self.language_model = Qwen3ForCausalLM(
-            thinker_config.text_config,
-            quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+        self.audio_tower = None
+        self.language_model = None
+        if not getattr(config, "language_only", False):
+            self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
+        if not getattr(config, "encoder_only", False):
+            self.language_model = Qwen3ForCausalLM(
+                thinker_config.text_config,
+                quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)

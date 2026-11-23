@@ -1457,6 +1457,7 @@ class MiMoProcessor:
 
 
 class MiMoV2Processor(BaseMultimodalProcessor):
+    accepts_staged_expanded_spans = True
     models = [MiMoV2ForCausalLM]
 
     @staticmethod
@@ -2196,7 +2197,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             (Modality.VIDEO, mp.video_token_id),
             (Modality.AUDIO, mp.audio_token_id),
         ]:
-            if mod not in embeddings:
+            if embeddings is not None and mod not in embeddings:
                 continue
             for offset in self.get_mm_items_offset(input_ids_tensor, token_id):
                 n = offset[1] - offset[0] + 1
@@ -2205,7 +2206,11 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                     MultimodalDataItem(
                         modality=mod,
                         offsets=[offset],
-                        precomputed_embeddings=embeddings[mod][s : s + n],
+                        precomputed_embeddings=(
+                            embeddings[mod][s : s + n]
+                            if embeddings is not None
+                            else None
+                        ),
                     )
                 )
                 consumed[mod] = s + n

@@ -1283,6 +1283,10 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+    /// Private language-only ingress. A versioned staged media descriptor from
+    /// the selected native encoder, consumed alongside unexpanded token IDs.
+    #[prost(string, optional, tag = "41")]
+    pub encoder_handoff: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
 /// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.
@@ -3920,6 +3924,21 @@ pub struct GetServerInfoResponse {
     /// cluster-wide epoch, health check, or request-cleanup proof.
     #[prost(string, tag = "16")]
     pub instance_id: ::prost::alloc::string::String,
+    /// This private language listener accepts version-1 staged image descriptors.
+    #[prost(bool, tag = "17")]
+    pub accepts_encoder_handoff: bool,
+    /// Accepts version-2 encoder handoffs containing video layouts.
+    #[prost(bool, tag = "18")]
+    pub supports_staged_video: bool,
+    /// Native model type accepted by this listener's version-3 handoff.
+    #[prost(string, tag = "19")]
+    pub native_model_type: ::prost::alloc::string::String,
+    /// Nonempty when this language worker accepts v4 audio layouts for the model.
+    #[prost(string, tag = "20")]
+    pub staged_audio_model_type: ::prost::alloc::string::String,
+    /// Older staged listeners that do not set this field are image-capable.
+    #[prost(bool, optional, tag = "21")]
+    pub supports_staged_images: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

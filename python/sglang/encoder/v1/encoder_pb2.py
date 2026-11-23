@@ -24,25 +24,55 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fsglang/encoder/v1/encoder.proto\x12\x13sglang.grpc.encoder\"\x84\x01\n\rEncodeRequest\x12\x10\n\x08mm_items\x18\x01 \x03(\t\x12\x0e\n\x06req_id\x18\x02 \x01(\t\x12\x11\n\tnum_parts\x18\x03 \x01(\r\x12\x10\n\x08part_idx\x18\x04 \x01(\r\x12\x14\n\x0cprefill_host\x18\x05 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x06 \x03(\r\"V\n\x0e\x45ncodeResponse\x12\x16\n\x0e\x65mbedding_size\x18\x01 \x01(\x04\x12\x15\n\rembedding_len\x18\x02 \x01(\x04\x12\x15\n\rembedding_dim\x18\x03 \x01(\x04\"w\n\x0bSendRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x14\n\x0cprefill_host\x18\x02 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x03 \x01(\r\x12\x12\n\nsession_id\x18\x04 \x01(\t\x12\x16\n\x0e\x62uffer_address\x18\x05 \x01(\x04\"\x0e\n\x0cSendResponse\"X\n\x1aSchedulerReceiveUrlRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\x12\x15\n\rreceive_count\x18\x03 \x01(\r\"\x1d\n\x1bSchedulerReceiveUrlResponse2\xa9\x02\n\rSglangEncoder\x12Q\n\x06\x45ncode\x12\".sglang.grpc.encoder.EncodeRequest\x1a#.sglang.grpc.encoder.EncodeResponse\x12K\n\x04Send\x12 .sglang.grpc.encoder.SendRequest\x1a!.sglang.grpc.encoder.SendResponse\x12x\n\x13SchedulerReceiveUrl\x12/.sglang.grpc.encoder.SchedulerReceiveUrlRequest\x1a\x30.sglang.grpc.encoder.SchedulerReceiveUrlResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fsglang/encoder/v1/encoder.proto\x12\x13sglang.grpc.encoder\"\x17\n\x15GetEncoderInfoRequest\"\xd4\x02\n\x16GetEncoderInfoResponse\x12\x12\n\nmodel_path\x18\x01 \x01(\t\x12\x16\n\x0etokenizer_path\x18\x02 \x01(\t\x12\x19\n\x11served_model_name\x18\x03 \x01(\t\x12\x1d\n\x15supports_staged_video\x18\x04 \x01(\x08\x12\x43\n\x13staged_media_policy\x18\x05 \x01(\x0b\x32&.sglang.grpc.encoder.StagedMediaPolicy\x12\x19\n\x11native_model_type\x18\x06 \x01(\t\x12\x1f\n\x17staged_audio_model_type\x18\x07 \x01(\t\x12#\n\x16supports_staged_images\x18\x08 \x01(\x08H\x00\x88\x01\x01\x12\x13\n\x0binstance_id\x18\t \x01(\x0c\x42\x19\n\x17_supports_staged_images\"k\n\x11StagedMediaPolicy\x12\x17\n\x0f\x61llowed_domains\x18\x01 \x03(\t\x12\x11\n\tmax_bytes\x18\x02 \x01(\x04\x12\x19\n\x0ctimeout_secs\x18\x03 \x01(\x01H\x00\x88\x01\x01\x42\x0f\n\r_timeout_secs\"\\\n\x0cStageRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x10\n\x08mm_items\x18\x02 \x03(\t\x12\x12\n\nvideo_urls\x18\x03 \x03(\t\x12\x12\n\naudio_urls\x18\x04 \x03(\t\"o\n\x0bImageLayout\x12\t\n\x01t\x18\x01 \x01(\r\x12\t\n\x01h\x18\x02 \x01(\r\x12\t\n\x01w\x18\x03 \x01(\r\x12\x10\n\x08identity\x18\x04 \x01(\t\x12\x16\n\x0e\x65mbedding_rows\x18\x05 \x01(\r\x12\x15\n\roriginal_size\x18\x06 \x03(\r\"\xa6\x01\n\x0bVideoLayout\x12\t\n\x01t\x18\x01 \x01(\r\x12\t\n\x01h\x18\x02 \x01(\r\x12\t\n\x01w\x18\x03 \x01(\r\x12\x12\n\nidentities\x18\x04 \x03(\t\x12\x12\n\ntimestamps\x18\x05 \x03(\x01\x12\x1f\n\x12second_per_grid_ts\x18\x06 \x01(\x01H\x00\x88\x01\x01\x12\x16\n\x0e\x65mbedding_rows\x18\x07 \x01(\rB\x15\n\x13_second_per_grid_ts\"h\n\x0b\x41udioLayout\x12\x10\n\x08identity\x18\x01 \x01(\t\x12\x16\n\x0e\x66\x65\x61ture_length\x18\x02 \x01(\r\x12\x16\n\x0e\x65mbedding_rows\x18\x03 \x01(\r\x12\x17\n\x0f\x65mbedding_width\x18\x04 \x01(\r\"\xe4\x02\n\x13StagedImageTransfer\x12\x0f\n\x07version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x13\n\x0btransfer_id\x18\x03 \x01(\t\x12\x0f\n\x07part_id\x18\x04 \x01(\t\x12\x10\n\x08part_idx\x18\x05 \x01(\r\x12\x11\n\tnum_parts\x18\x06 \x01(\r\x12\x13\n\x0bimage_count\x18\x07 \x01(\r\x12\x30\n\x06images\x18\x08 \x03(\x0b\x32 .sglang.grpc.encoder.ImageLayout\x12\x30\n\x06videos\x18\t \x03(\x0b\x32 .sglang.grpc.encoder.VideoLayout\x12\x19\n\x11native_model_type\x18\n \x01(\t\x12\x17\n\x0f\x65mbedding_width\x18\x0b \x01(\r\x12\x30\n\x06\x61udios\x18\x0c \x03(\x0b\x32 .sglang.grpc.encoder.AudioLayout\"`\n\rStageResponse\x12:\n\x08transfer\x18\x01 \x01(\x0b\x32(.sglang.grpc.encoder.StagedImageTransfer\x12\x13\n\x0binstance_id\x18\x02 \x01(\x0c\"M\n\x0f\x44\x65scribeRequest\x12:\n\x08transfer\x18\x01 \x01(\x0b\x32(.sglang.grpc.encoder.StagedImageTransfer\"0\n\x10\x44\x65scribeResponse\x12\r\n\x05shape\x18\x01 \x03(\x04\x12\r\n\x05\x64type\x18\x02 \x01(\t\"v\n\x0e\x44\x65liverRequest\x12:\n\x08transfer\x18\x01 \x01(\x0b\x32(.sglang.grpc.encoder.StagedImageTransfer\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\x12\x13\n\x0bnixl_target\x18\x03 \x01(\x0c\"\x11\n\x0f\x44\x65liverResponse\"%\n\x0eReleaseRequest\x12\x13\n\x0btransfer_id\x18\x01 \x01(\t\"\x11\n\x0fReleaseResponse\"\x84\x01\n\rEncodeRequest\x12\x10\n\x08mm_items\x18\x01 \x03(\t\x12\x0e\n\x06req_id\x18\x02 \x01(\t\x12\x11\n\tnum_parts\x18\x03 \x01(\r\x12\x10\n\x08part_idx\x18\x04 \x01(\r\x12\x14\n\x0cprefill_host\x18\x05 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x06 \x03(\r\"V\n\x0e\x45ncodeResponse\x12\x16\n\x0e\x65mbedding_size\x18\x01 \x01(\x04\x12\x15\n\rembedding_len\x18\x02 \x01(\x04\x12\x15\n\rembedding_dim\x18\x03 \x01(\x04\"w\n\x0bSendRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x14\n\x0cprefill_host\x18\x02 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x03 \x01(\r\x12\x12\n\nsession_id\x18\x04 \x01(\t\x12\x16\n\x0e\x62uffer_address\x18\x05 \x01(\x04\"\x0e\n\x0cSendResponse\"X\n\x1aSchedulerReceiveUrlRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\x12\x15\n\rreceive_count\x18\x03 \x01(\r\"\x1d\n\x1bSchedulerReceiveUrlResponse2\xe9\x05\n\rSglangEncoder\x12Q\n\x06\x45ncode\x12\".sglang.grpc.encoder.EncodeRequest\x1a#.sglang.grpc.encoder.EncodeResponse\x12K\n\x04Send\x12 .sglang.grpc.encoder.SendRequest\x1a!.sglang.grpc.encoder.SendResponse\x12x\n\x13SchedulerReceiveUrl\x12/.sglang.grpc.encoder.SchedulerReceiveUrlRequest\x1a\x30.sglang.grpc.encoder.SchedulerReceiveUrlResponse\x12i\n\x0eGetEncoderInfo\x12*.sglang.grpc.encoder.GetEncoderInfoRequest\x1a+.sglang.grpc.encoder.GetEncoderInfoResponse\x12N\n\x05Stage\x12!.sglang.grpc.encoder.StageRequest\x1a\".sglang.grpc.encoder.StageResponse\x12W\n\x08\x44\x65scribe\x12$.sglang.grpc.encoder.DescribeRequest\x1a%.sglang.grpc.encoder.DescribeResponse\x12T\n\x07\x44\x65liver\x12#.sglang.grpc.encoder.DeliverRequest\x1a$.sglang.grpc.encoder.DeliverResponse\x12T\n\x07Release\x12#.sglang.grpc.encoder.ReleaseRequest\x1a$.sglang.grpc.encoder.ReleaseResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'sglang.encoder.v1.encoder_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_ENCODEREQUEST']._serialized_start=57
-  _globals['_ENCODEREQUEST']._serialized_end=189
-  _globals['_ENCODERESPONSE']._serialized_start=191
-  _globals['_ENCODERESPONSE']._serialized_end=277
-  _globals['_SENDREQUEST']._serialized_start=279
-  _globals['_SENDREQUEST']._serialized_end=398
-  _globals['_SENDRESPONSE']._serialized_start=400
-  _globals['_SENDRESPONSE']._serialized_end=414
-  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_start=416
-  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_end=504
-  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_start=506
-  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_end=535
-  _globals['_SGLANGENCODER']._serialized_start=538
-  _globals['_SGLANGENCODER']._serialized_end=835
+  _globals['_GETENCODERINFOREQUEST']._serialized_start=56
+  _globals['_GETENCODERINFOREQUEST']._serialized_end=79
+  _globals['_GETENCODERINFORESPONSE']._serialized_start=82
+  _globals['_GETENCODERINFORESPONSE']._serialized_end=422
+  _globals['_STAGEDMEDIAPOLICY']._serialized_start=424
+  _globals['_STAGEDMEDIAPOLICY']._serialized_end=531
+  _globals['_STAGEREQUEST']._serialized_start=533
+  _globals['_STAGEREQUEST']._serialized_end=625
+  _globals['_IMAGELAYOUT']._serialized_start=627
+  _globals['_IMAGELAYOUT']._serialized_end=738
+  _globals['_VIDEOLAYOUT']._serialized_start=741
+  _globals['_VIDEOLAYOUT']._serialized_end=907
+  _globals['_AUDIOLAYOUT']._serialized_start=909
+  _globals['_AUDIOLAYOUT']._serialized_end=1013
+  _globals['_STAGEDIMAGETRANSFER']._serialized_start=1016
+  _globals['_STAGEDIMAGETRANSFER']._serialized_end=1372
+  _globals['_STAGERESPONSE']._serialized_start=1374
+  _globals['_STAGERESPONSE']._serialized_end=1470
+  _globals['_DESCRIBEREQUEST']._serialized_start=1472
+  _globals['_DESCRIBEREQUEST']._serialized_end=1549
+  _globals['_DESCRIBERESPONSE']._serialized_start=1551
+  _globals['_DESCRIBERESPONSE']._serialized_end=1599
+  _globals['_DELIVERREQUEST']._serialized_start=1601
+  _globals['_DELIVERREQUEST']._serialized_end=1719
+  _globals['_DELIVERRESPONSE']._serialized_start=1721
+  _globals['_DELIVERRESPONSE']._serialized_end=1738
+  _globals['_RELEASEREQUEST']._serialized_start=1740
+  _globals['_RELEASEREQUEST']._serialized_end=1777
+  _globals['_RELEASERESPONSE']._serialized_start=1779
+  _globals['_RELEASERESPONSE']._serialized_end=1796
+  _globals['_ENCODEREQUEST']._serialized_start=1799
+  _globals['_ENCODEREQUEST']._serialized_end=1931
+  _globals['_ENCODERESPONSE']._serialized_start=1933
+  _globals['_ENCODERESPONSE']._serialized_end=2019
+  _globals['_SENDREQUEST']._serialized_start=2021
+  _globals['_SENDREQUEST']._serialized_end=2140
+  _globals['_SENDRESPONSE']._serialized_start=2142
+  _globals['_SENDRESPONSE']._serialized_end=2156
+  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_start=2158
+  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_end=2246
+  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_start=2248
+  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_end=2277
+  _globals['_SGLANGENCODER']._serialized_start=2280
+  _globals['_SGLANGENCODER']._serialized_end=3025
 # @@protoc_insertion_point(module_scope)

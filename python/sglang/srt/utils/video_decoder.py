@@ -2,6 +2,7 @@
 
 import logging
 import os
+from functools import cache
 
 import numpy as np
 
@@ -13,6 +14,27 @@ try:
     _BACKEND = "torchcodec"
 except (ImportError, RuntimeError):
     _BACKEND = "decord"
+
+
+@cache
+def video_decoder_available() -> bool:
+    try:
+        if _BACKEND == "torchcodec":
+            # Importing VideoDecoder succeeds even if FFmpeg could not be linked.
+            # Querying the library versions exercises the native decoder ops.
+            from torchcodec._core import get_ffmpeg_library_versions
+
+            get_ffmpeg_library_versions()
+        else:
+            from decord import VideoReader
+
+            return callable(VideoReader)
+    except (ImportError, OSError, RuntimeError):
+        logger.warning(
+            "Staged video is unavailable: cannot load %s decoder libraries", _BACKEND
+        )
+        return False
+    return True
 
 
 _cuda_backend_enabled: bool | None = None

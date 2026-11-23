@@ -31,7 +31,7 @@ import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
+from sglang.srt.managers.io_struct import AbortReq, GenerateReqInput, ShutdownReq
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -83,7 +83,7 @@ from sglang.srt.utils.json_response import ORJSON_RESPONSE_OPTIONS
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
+    from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.req_types import MultimodalProcessorOutput
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -101,6 +101,10 @@ _EXTRAS_HEADER_COLS = 12
 DRAIN_DRAINING = 1
 DRAIN_FORCE_REQUESTED = 2
 DRAIN_CLOSED = 4
+
+
+class MissingEncoderHandoff(RuntimeError):
+    pass
 
 
 def _is_loopback(host: str) -> bool:
@@ -250,6 +254,8 @@ class RustServer:
         # The launching process, which `_fail_startup` signals; looked up now,
         # so a failure after it died cannot signal whoever adopted this one.
         self._launcher = psutil.Process().parent()
+        self._external_media_markers = None
+        self._external_media_limits = {}
 
     @classmethod
     def _request_input_class(cls) -> type:
@@ -481,10 +487,15 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
+        external_handoff = envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+        if external_handoff:
+            cls._check_external_encoder_handoff(scheduler)
+        rust_mm = scheduler.model_config.is_multimodal and not external_handoff
+
         _, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
-                if scheduler.model_config.is_multimodal
+                if rust_mm
                 else 0
             ),
             cpu_share=frontend_cpu_share,
@@ -494,11 +505,7 @@ class RustServer:
         # fallback. The listener answers as soon as the server is constructed
         # (a multimodal one admits generation requests once `_start_multimodal`
         # starts its pool), so refuse a model without one first.
-        mm_spec = (
-            cls._resolve_multimodal(scheduler)
-            if scheduler.model_config.is_multimodal
-            else None
-        )
+        mm_spec = cls._resolve_multimodal(scheduler) if rust_mm else None
         mm_cache_namespace = (
             build_processor_fingerprint(
                 scheduler.processor,
@@ -508,7 +515,7 @@ class RustServer:
                     "rust_spec": mm_spec.rust_json() if mm_spec is not None else None,
                 },
             )
-            if scheduler.model_config.is_multimodal
+            if rust_mm
             else None
         )
 
@@ -533,7 +540,10 @@ class RustServer:
         instance.server_args = scheduler.server_args
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
-        if scheduler.model_config.is_multimodal:
+        if external_handoff:
+            instance._external_media_limits = get_mm().limit_mm_data_per_request or {}
+
+        if rust_mm:
             # New threads inherit the spawning thread's affinity, and this launch
             # thread holds the full mask. Narrow it while the MM threads are
             # created below (the Rust MM workers, and any a model package's
@@ -590,6 +600,37 @@ class RustServer:
         )
 
         return instance
+
+    @staticmethod
+    def _check_external_encoder_handoff(scheduler: Scheduler) -> None:
+        from sglang.srt.disaggregation.encoder.native_handoff import (
+            NATIVE_IMAGE_MODEL_TYPES,
+            STAGED_AUDIO_MODEL_TYPES,
+            STAGED_VIDEO_MODEL_TYPES,
+        )
+
+        # The effective backend and DP size can be resolved after argument validation.
+        backend = get_disagg().encoder_transfer_backend
+        if backend not in ("zmq_to_scheduler", "nixl"):
+            raise RuntimeError(
+                "External encoder handoff requires --encoder-transfer-backend "
+                f"zmq_to_scheduler or nixl, got {backend}."
+            )
+        if get_parallel().num_dp_ranks != 1:
+            raise RuntimeError("External encoder handoff requires one DP rank.")
+        model_type = scheduler.model_config.hf_config.model_type
+        if model_type not in (
+            STAGED_VIDEO_MODEL_TYPES
+            | NATIVE_IMAGE_MODEL_TYPES
+            | STAGED_AUDIO_MODEL_TYPES
+        ):
+            raise RuntimeError(f"No staged encoder layout for {model_type!r}")
+
+    def bind_external_encoder_processor(self, processor):
+        """Use the same raw prompt markers as the receiver that expands them."""
+        from sglang.srt.disaggregation.encoder.handoff import StagedPromptMarkers
+
+        self._external_media_markers = StagedPromptMarkers.from_processor(processor)
 
     def _fail_startup(self, error: str) -> None:
         """Take the server down after a failed startup warmup, as Python's
@@ -918,7 +959,28 @@ class RustServer:
                 type(e).__name__,
                 e,
             )
-            self.server.push_error(obj.rid, f"invalid request: {e}")
+            if isinstance(e, MissingEncoderHandoff):
+                status = 503
+            elif "epd.handoff" in buffers and isinstance(
+                e, (ValueError, msgspec.DecodeError)
+            ):
+                status = 400
+            else:
+                self.server.push_error(obj.rid, f"invalid request: {e}")
+                raise
+            self._push_abort_frame(
+                AbortReq(
+                    rid=obj.rid,
+                    finished_reason={
+                        "type": "abort",
+                        "message": str(e),
+                        "status_code": status,
+                    },
+                ),
+                prompt_tokens=len(obj.input_ids),
+                cached_tokens=0,
+                reasoning_tokens=0,
+            )
             raise
         return obj
 
@@ -950,6 +1012,41 @@ class RustServer:
                 obj.mm_inputs.padded_input_ids = obj.mm_inputs.build_padded_input_ids(
                     obj.mm_inputs.input_ids, obj.mm_inputs.mm_items
                 )
+        handoff = buffers.get("epd.handoff")
+        markers = self._external_media_markers
+        if handoff is not None:
+            from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
+
+            if markers is None:
+                raise ValueError(
+                    "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
+                )
+            obj.encoder_handoff = EncoderHandoff.parse(
+                memoryview(handoff),
+                *markers.counts(obj.input_ids),
+            )
+            for modality, count in (
+                ("image", obj.encoder_handoff.image_count),
+                ("video", len(obj.encoder_handoff.videos)),
+                ("audio", len(obj.encoder_handoff.audios)),
+            ):
+                limit = self._external_media_limits.get(modality)
+                if limit is not None and count > limit:
+                    raise ValueError(
+                        f"staged {modality} count exceeds --limit-mm-data-per-request"
+                    )
+            hashes = buffers.get("epd.hashes")
+            if hashes is not None:
+                obj.encoder_routing_hashes = msgspec.msgpack.decode(memoryview(hashes))
+            obj.need_wait_for_mm_inputs = True
+        elif (
+            markers is not None
+            and ids is not None
+            and markers.contains_media(obj.input_ids)
+        ):
+            raise MissingEncoderHandoff(
+                "A media prompt requires a staged encoder_handoff"
+            )
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
@@ -990,6 +1087,20 @@ class RustServer:
         reset the ones a stream already reported. The frame is marked as ended
         outside the stream: like ``_handle_abort_req``, the frontend records no
         request metrics for it."""
+        self._push_abort_frame(
+            abort,
+            prompt_tokens=len(req.origin_input_ids),
+            cached_tokens=req.cached_tokens,
+            reasoning_tokens=req.reasoning_tokens,
+        )
+
+    def _push_abort_frame(
+        self,
+        abort: AbortReq,
+        prompt_tokens: int,
+        cached_tokens: int,
+        reasoning_tokens: int,
+    ) -> None:
         finish_reason = abort.finished_reason or {
             "type": "abort",
             "message": abort.abort_message or "Abort in waiting queue",
@@ -997,10 +1108,10 @@ class RustServer:
         header_cols = [
             [abort.rid],
             [finish_reason],
-            [len(req.origin_input_ids)],
+            [prompt_tokens],
             [0],
-            [req.cached_tokens],
-            [req.reasoning_tokens],
+            [cached_tokens],
+            [reasoning_tokens],
         ]
         header_cols += [[]] * _EXTRAS_HEADER_COLS
         header_cols += [

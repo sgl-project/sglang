@@ -50,16 +50,21 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         if self.num_fused_shared_experts:
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+        self.visual = None
+        if not getattr(config, "language_only", False):
+            self.visual = Glm4vVisionModel(
+                config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
+        if getattr(config, "encoder_only", False):
+            return
+
         self.model = Glm4MoeModel(
             config,
             quant_config,
             prefix=add_prefix("language_model", prefix),
-        )
-        self.visual = Glm4vVisionModel(
-            config.vision_config,
-            quant_config=quant_config,
-            prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
         )
 
         if self.pp_group.is_last_rank:

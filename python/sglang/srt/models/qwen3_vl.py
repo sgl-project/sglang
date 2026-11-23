@@ -1273,6 +1273,9 @@ def check_not_image_generation_head(name: str) -> None:
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    # The Omni thinker installs its own visual encoder and merger.
+    build_default_vision_encoder = True
+
     supports_cuda_vmm_feature_transport = True
 
     # To ensure correct weight loading and mapping.
@@ -1304,7 +1307,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        if self.language_model_only:
+        if self.language_model_only or not self.build_default_vision_encoder:
             self.visual = None
         else:
             vision_quant_config = None

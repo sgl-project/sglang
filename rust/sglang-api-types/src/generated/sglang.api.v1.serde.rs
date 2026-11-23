@@ -7533,6 +7533,14 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.modalities {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
         }
+        if let Some(v) = &self.encoder_handoff {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "encoder_handoff",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -7588,6 +7596,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_routed_experts_start_len = None;
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
+                let mut f_encoder_handoff = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -7872,6 +7881,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
                         }
+                        "encoder_handoff" => {
+                            if f_encoder_handoff.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("encoder_handoff"));
+                            }
+                            f_encoder_handoff = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -7917,6 +7935,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                    encoder_handoff: f_encoder_handoff.flatten(),
                 })
             }
         }
@@ -24475,6 +24494,29 @@ impl ::serde::Serialize for GetServerInfoResponse {
             &self.num_reserved_tokens,
         )?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "instance_id", &self.instance_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "accepts_encoder_handoff",
+            &self.accepts_encoder_handoff,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "supports_staged_video",
+            &self.supports_staged_video,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "native_model_type",
+            &self.native_model_type,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "staged_audio_model_type",
+            &self.staged_audio_model_type,
+        )?;
+        if let Some(v) = &self.supports_staged_images {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "supports_staged_images", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24507,6 +24549,11 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_skip_tokenizer_init = None;
                 let mut f_num_reserved_tokens = None;
                 let mut f_instance_id = None;
+                let mut f_accepts_encoder_handoff = None;
+                let mut f_supports_staged_video = None;
+                let mut f_native_model_type = None;
+                let mut f_staged_audio_model_type = None;
+                let mut f_supports_staged_images = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24632,6 +24679,48 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             f_instance_id =
                                 Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
+                        "accepts_encoder_handoff" => {
+                            if f_accepts_encoder_handoff.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "accepts_encoder_handoff",
+                                ));
+                            }
+                            f_accepts_encoder_handoff = Some(map.next_value::<bool>()?);
+                        }
+                        "supports_staged_video" => {
+                            if f_supports_staged_video.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "supports_staged_video",
+                                ));
+                            }
+                            f_supports_staged_video = Some(map.next_value::<bool>()?);
+                        }
+                        "native_model_type" => {
+                            if f_native_model_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "native_model_type",
+                                ));
+                            }
+                            f_native_model_type =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "staged_audio_model_type" => {
+                            if f_staged_audio_model_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "staged_audio_model_type",
+                                ));
+                            }
+                            f_staged_audio_model_type =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "supports_staged_images" => {
+                            if f_supports_staged_images.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "supports_staged_images",
+                                ));
+                            }
+                            f_supports_staged_images = Some(map.next_value::<Option<bool>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24655,6 +24744,11 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     skip_tokenizer_init: f_skip_tokenizer_init.unwrap_or_default(),
                     num_reserved_tokens: f_num_reserved_tokens.unwrap_or_default(),
                     instance_id: f_instance_id.unwrap_or_default(),
+                    accepts_encoder_handoff: f_accepts_encoder_handoff.unwrap_or_default(),
+                    supports_staged_video: f_supports_staged_video.unwrap_or_default(),
+                    native_model_type: f_native_model_type.unwrap_or_default(),
+                    staged_audio_model_type: f_staged_audio_model_type.unwrap_or_default(),
+                    supports_staged_images: f_supports_staged_images.flatten(),
                 })
             }
         }
