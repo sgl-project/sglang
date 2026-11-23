@@ -4,6 +4,7 @@ import functools
 import logging
 import math
 from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -26,6 +27,8 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
+from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1283,6 +1286,21 @@ class C4IndexerAscendBackendMixin:
         return local if local is not None else forward_batch.positions
 
 
+@dataclass(frozen=True)
+class _DSV41CPReadView:
+    """Query geometry for one CP rank, separate from the cache-write layout."""
+
+    metadata: ForwardMetadata
+    positions: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    forward_mode: ForwardMode
+
+    @property
+    def batch_size(self) -> int:
+        return self.seq_lens.numel()
+
+
 class LowRatioCompressAscendBackendMixin:
     """NPU implementation of the DeepSeek-V4.1 low-ratio (1 / 2) source path.
 
@@ -1301,6 +1319,52 @@ class LowRatioCompressAscendBackendMixin:
     # Read by ``_low_ratio_compress`` below; still unset on NPU because the
     # replay-tail path that writes it is CUDA-only, so it stays None.
     tail_source_kv_layer_id: Optional[int] = None
+
+    def _dsv41_read_view(
+        self, forward_batch: ForwardBatch | _DSV41CPReadView
+    ) -> tuple[ForwardBatch | _DSV41CPReadView, ForwardMetadata]:
+        metadata = self.forward_metadata
+        cp_read = getattr(metadata, "dsv41_cp_read", None)
+        if cp_read is not None:
+            return cp_read, cp_read.metadata
+        return forward_batch, metadata
+
+    def _prepare_dsv41_cp_read_metadata(self, forward_batch: ForwardBatch) -> None:
+        strategy = get_cp_strategy()
+        cp = forward_batch.attn_cp_metadata
+        assert isinstance(cp, ZigzagContextParallelMetadata) and strategy is not None
+        fm = self.forward_metadata
+        positions = forward_batch.positions
+        local_rows = strategy.local_q_indices(cp.total_seq_lens, forward_batch)
+        cp.moe_local_token_count = positions.new_tensor(
+            local_rows.numel(), dtype=torch.int32
+        )
+        # Each virtual request is a contiguous Q segment. Its KV length ends
+        # at that segment's last absolute position for right-aligned masking.
+        request_rows = positions.new_tensor(
+            [segment // (2 * strategy.cp_size) for segment in cp.zigzag_index],
+            dtype=torch.long,
+        )
+        seq_lens = cp.kv_len_combined_tensor
+        read = ForwardMetadata(
+            actual_seq_lengths_q_pa=cp.cu_seqlens_q_combined_tensor,
+            actual_seq_lengths_kv=seq_lens,
+        )
+        read.kernel_metadata = {}
+        read.swa_page_table = fm.swa_page_table.index_select(0, request_rows)
+        for ratio in self._dsv41_low_ratios():
+            for field in (f"c{ratio}_page_table", f"c{ratio}_index_page_table"):
+                setattr(read, field, getattr(fm, field).index_select(0, request_rows))
+        fm.dsv41_cp_read = _DSV41CPReadView(
+            metadata=read,
+            positions=positions.index_select(0, local_rows),
+            seq_lens=seq_lens,
+            out_cache_loc=forward_batch.out_cache_loc.index_select(0, local_rows),
+            forward_mode=forward_batch.forward_mode,
+        )
+        read.kernel_metadata = self._dsv41_attention_kernel_metadata(
+            forward_batch
+        ) | self._dsv41_index_kernel_metadata(forward_batch)
 
     def forward_low_ratio_sources(
         self,
@@ -1328,14 +1392,33 @@ class LowRatioCompressAscendBackendMixin:
             x = x[:query_tokens]
             q_lora = None if q_lora is None else q_lora[:query_tokens]
             positions = positions[:query_tokens]
-        pos = positions
+        read_batch, _ = self._dsv41_read_view(forward_batch)
+        cp_active = read_batch is not forward_batch
         latent = None
         if run_compressor and layer.compressor is not None:
-            latent = self._low_ratio_compress(layer, x, pos, forward_batch)
+            compress_x, compress_pos = x, positions
+            if cp_active:
+                # Completed C2 groups and the next chunk's ring state require
+                # the full extend in request order on every CP rank.
+                compress_x = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch
+                )
+                compress_pos = forward_batch.positions[: compress_x.shape[0]]
+            latent = self._low_ratio_compress(
+                layer, compress_x, compress_pos, forward_batch
+            )
         if run_indexer and layer.indexer is not None:
             # latent may be None here: the index step checks it (a tail layer
             # whose compressor was skipped only scores against the stored K).
-            self._low_ratio_index_topk(layer, latent, x, q_lora, pos, forward_batch)
+            if cp_active:
+                live_rows = read_batch.positions.numel()
+                x = x[:live_rows]
+                if q_lora is not None:
+                    q_lora = q_lora[:live_rows]
+                positions = read_batch.positions
+            self._low_ratio_index_topk(
+                layer, latent, x, q_lora, positions, forward_batch
+            )
 
     def _low_ratio_compress(self, layer, x, pos, forward_batch):
         """Project, normalize and RoPE one ratio-1/2 compressed latent, then
@@ -1420,7 +1503,7 @@ class LowRatioCompressAscendBackendMixin:
         pos,
         forward_batch,
         *,
-        rows_per_request=None,  # NOTE: only used under CP (unsupported here)
+        rows_per_request=None,
     ) -> None:
         """Store the indexer K from ``latent`` and score it with QLI.
 
@@ -1429,9 +1512,9 @@ class LowRatioCompressAscendBackendMixin:
         """
         indexer = layer.indexer
         ratio = layer.compress_ratio
-        fm = self.forward_metadata
         if indexer.owns_k:
             self._dsv41_index_k_store(layer, latent)
+        _, fm = self._dsv41_read_view(forward_batch)
         if indexer.is_candidate_source:
             # Level one: the plain top-k this layer attends with, plus the
             # block candidates later indexer layers rescore inside.
@@ -1586,7 +1669,7 @@ class LowRatioCompressAscendBackendMixin:
         """
         indexer = layer.indexer
         ratio = layer.compress_ratio
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         pool = self.token_to_kv_pool
         t = int(q_lora.shape[0])
         packed_dim = indexer.index_head_dim // 2
@@ -1677,14 +1760,13 @@ class LowRatioCompressAscendBackendMixin:
         return scored, (candidate_indices, candidate_lengths)
 
     def _dsv41_a3_index_kwargs(self, forward_batch, ratio):
-        seq_lens = self._dsv41_a3_kv_lengths(forward_batch)
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
+        seq_lens = self._dsv41_a3_kv_lengths(forward_batch, metadata=fm)
         return dict(
-            cu_seqlens_q=self.forward_metadata.actual_seq_lengths_q_pa,
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_k=seq_lens // ratio,
             cmp_residual_k=seq_lens % ratio if ratio > 1 else None,
-            block_table=getattr(self.forward_metadata, f"c{ratio}_index_page_table").to(
-                torch.int32
-            ),
+            block_table=getattr(fm, f"c{ratio}_index_page_table").to(torch.int32),
             layout_q="TND",
             layout_k="PA_BBND",
             mask_mode=3,
@@ -1735,7 +1817,7 @@ class LowRatioCompressAscendBackendMixin:
         """
         indexer = layer.indexer
         ratio = layer.compress_ratio
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         t = int(q_lora.shape[0])
         blocks = getattr(fm, "dsv41_candidate_blocks", None)
         if blocks is None:
@@ -1842,7 +1924,7 @@ class LowRatioCompressAscendBackendMixin:
         if not is_npu_arch35():
             # arch22 LI V2/V3 and SLI do not consume a metadata tensor.
             return {}
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
         if cu_seqlens_q is None:
@@ -2018,7 +2100,7 @@ class LowRatioCompressAscendBackendMixin:
         Pure device arithmetic (aclgraph-safe); results are written into
         stable buffers because the captured graph holds their addresses.
         """
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         positions = forward_batch.positions.reshape(-1)
         t = int(positions.numel())
         topk = int(self._dsv4_sliding_window_size)
@@ -2048,7 +2130,7 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_cmp_topk_length(self, forward_batch: ForwardBatch, ratio: int):
         """Per-query valid compressed top-k length, ``min((p+1)//ratio, index_topk)``."""
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         positions = forward_batch.positions.reshape(-1)
         t = int(positions.numel())
         buf = getattr(fm, f"dsv41_cmp_topk_length_c{ratio}", None)
@@ -2066,7 +2148,7 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_attention_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """MQSMLA dispatch tables: ``win`` (ratio 0) plus ``c{r}a`` (ratio 1/2)."""
-        fm = self.forward_metadata
+        forward_batch, fm = self._dsv41_read_view(forward_batch)
         if not is_npu_arch35():
             out = {}
             for ratio in (0, *self._dsv41_low_ratios()):
@@ -2079,7 +2161,9 @@ class LowRatioCompressAscendBackendMixin:
                     has_ori_kv=True,
                     has_cmp_kv=ratio > 0,
                     cmp_topk=self._dsv4_index_topk if ratio else 0,
-                    **self._dsv41_a3_attention_kwargs(forward_batch, ratio),
+                    **self._dsv41_a3_attention_kwargs(
+                        forward_batch, ratio, metadata=fm
+                    ),
                 )
                 buf = fm.kernel_metadata.get(key)
                 if buf is not None:
@@ -2187,7 +2271,11 @@ class LowRatioCompressAscendBackendMixin:
         """The V4.1 attention body: window side always, compressed side when
         ``compress_ratio > 0``.
         """
-        fm = self.forward_metadata
+        output_rows = q.shape[0]
+        read_batch, fm = self._dsv41_read_view(forward_batch)
+        if read_batch is not forward_batch:
+            q = q[: read_batch.positions.numel()]
+            forward_batch = read_batch
         pool = self.token_to_kv_pool
         metadata = fm.kernel_metadata.get(
             "win_metadata" if compress_ratio == 0 else f"c{compress_ratio}a_metadata"
@@ -2201,7 +2289,9 @@ class LowRatioCompressAscendBackendMixin:
         if not is_npu_arch35():
             query_tokens = self._dsv41_a3_query_tokens(forward_batch)
             attention_q = q if query_tokens is None else q[:query_tokens]
-            kwargs = self._dsv41_a3_attention_kwargs(forward_batch, compress_ratio)
+            kwargs = self._dsv41_a3_attention_kwargs(
+                forward_batch, compress_ratio, metadata=fm
+            )
             if compress_ratio:
                 topk = getattr(fm, f"c{compress_ratio}_topk_indices")
                 kwargs.update(
@@ -2227,9 +2317,9 @@ class LowRatioCompressAscendBackendMixin:
                 >= self.page_size
             )
             attn_out = attn_out.masked_fill(~live[:, None, None], 0)
-            if attn_out.shape[0] < q.shape[0]:
+            if attn_out.shape[0] < output_rows:
                 attn_out = F.pad(
-                    attn_out, (0, 0, 0, 0, 0, q.shape[0] - attn_out.shape[0])
+                    attn_out, (0, 0, 0, 0, 0, output_rows - attn_out.shape[0])
                 )
             return attn_out
         # The metadata pass owns A5's explicit window geometry.
@@ -2287,6 +2377,8 @@ class LowRatioCompressAscendBackendMixin:
         _ds41_ops().mixed_quant_sparse_flash_mla_dsl(
             q, out=attn_out, lse=lse, **attn_kwargs
         )
+        if attn_out.shape[0] < output_rows:
+            attn_out = F.pad(attn_out, (0, 0, 0, 0, 0, output_rows - attn_out.shape[0]))
         return attn_out
 
     # ---- V4.1 metadata assembly ------------------------------------------------
@@ -3137,6 +3229,9 @@ class DeepseekV4AscendAttnBackend(
         return indices, torch.where(row_valid, lengths, 0)
 
     def prepare_dsv4_cp_metadata(self, forward_batch: ForwardBatch) -> None:
+        # V4.1 has already built a separate read view in init_forward_metadata.
+        if self._dsv4_has_low_ratio:
+            return
         if getattr(forward_batch, "dsv4_cp_metadata_prepared", False):
             return
         if getattr(forward_batch, "attn_cp_metadata", None) is None:
@@ -4432,6 +4527,15 @@ class DeepseekV4AscendAttnBackend(
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
         self._init_dspark_sparse_metadata(forward_batch)
+        if (
+            self._dsv4_has_low_ratio
+            and forward_batch.forward_mode is ForwardMode.EXTEND
+            and getattr(forward_batch, "attn_cp_metadata", None) is not None
+        ):
+            fm.kernel_metadata = {}
+            self._build_npu_compress_metadata(forward_batch)
+            self._prepare_dsv41_cp_read_metadata(forward_batch)
+            return
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
         if self._dsv4_compress_ratios:

@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.padding import (
     pad_logical_token_to_physical,
 )
 from sglang.srt.layers.cp.utils import (
+    cp_interleave_input_ids,
     cp_split_before_forward,
     is_cp_active,
     prepare_cp_forward,
@@ -938,6 +939,29 @@ class TestCPZigzagStrategy(CustomTestCase):
                     local_hidden.new_zeros(physical_len - logical_len, 2),
                 )
             )
+
+    def test_zigzag_packs_moe_token_ids_in_gather_order(self):
+        metadata = self._metadata_for_rank(
+            0, cp_size=4, seq_lens=[9, 10], extend_seq_lens=[9, 10]
+        )
+        batch = self._forward_batch(metadata, [9, 10])
+        input_ids = torch.arange(1, 20)
+        with (
+            get_context().override_server_args(device="cpu", moe_a2a_backend="none"),
+            get_parallel().override(attn_cp_size=4),
+        ):
+            pad_logical_token_to_physical(metadata)
+            packed = cp_interleave_input_ids(input_ids, batch)
+        rows = packed.view(4, 8).tolist()
+        self.assertEqual(
+            rows,
+            [
+                [1, 2, 10, 11, 9, 19, 0, 0],
+                [3, 12, 13, 8, 18, 0, 0, 0],
+                [4, 14, 7, 17, 0, 0, 0, 0],
+                [5, 15, 6, 16, 0, 0, 0, 0],
+            ],
+        )
 
     def test_zigzag_materialize_full_kv_gathers_once_and_preserves_swa_location(self):
         key = torch.arange(6).view(3, 2)

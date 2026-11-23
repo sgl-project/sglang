@@ -1395,6 +1395,13 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
+        elif (
+            get_device().device == "npu"
+            and get_exec().offload.engram_config is not None
+        ):
+            # The TP-sharded Engram lookup needs every DP group's row counts
+            # even when the experts and LM head only consume local rows.
+            return True
         elif moe_a2a_backend.is_none():
             return True
         elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():

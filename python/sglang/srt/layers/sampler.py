@@ -121,11 +121,12 @@ class Sampler(nn.Module):
         super().__init__()
         self.tp_sync_group = get_parallel().tp_group.device_group
         self.cp_sync_group = None
-        if is_dp_attention_enabled():
+        dp_attention_enabled = is_dp_attention_enabled()
+        if dp_attention_enabled:
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
-            # Single-shard drafts may have no context-parallel group.
-            if get_parallel().attn_cp_size > 1:
-                self.cp_sync_group = get_parallel().attn_cp_group.device_group
+        # Single-shard drafts may have no context-parallel group.
+        if (dp_attention_enabled or is_npu()) and get_parallel().attn_cp_size > 1:
+            self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -303,6 +304,7 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        cp_token_ids_synced = self._broadcast_npu_cp_token_ids(batch_next_token_ids)
         if return_logprob:
             if target_logprobs is not None:
                 logprobs = target_logprobs
@@ -332,7 +334,11 @@ class Sampler(nn.Module):
                 )
             else:
                 assert sampling_mask_capture is not None
-                if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+                if (
+                    cp_token_ids_synced
+                    or SYNC_TOKEN_IDS_ACROSS_TP
+                    or sampling_info.grammars
+                ):
                     # Token synchronization can replace the producer-selected token.
                     sampling_mask_capture = sampling_mask_capture._replace(
                         selected_weight=None
@@ -733,6 +739,18 @@ class Sampler(nn.Module):
             selected_weight=None,
             batch_rows=capture_rows,
         )
+
+    def _broadcast_npu_cp_token_ids(self, batch_next_token_ids: torch.Tensor) -> bool:
+        if (
+            not is_npu()
+            or self.cp_sync_group is None
+            or batch_next_token_ids.numel() == 0
+        ):
+            return False
+        # The CP ranks run replicated schedulers. Use the CP leader's tokens
+        # so rounding differences cannot make their finished requests diverge.
+        dist.broadcast(batch_next_token_ids, group=self.cp_sync_group, group_src=0)
+        return True
 
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo

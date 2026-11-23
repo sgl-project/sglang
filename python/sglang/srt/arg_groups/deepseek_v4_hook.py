@@ -228,6 +228,37 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
             "reindex with interleave order."
         )
+    is_dsv41 = model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+    if is_npu() and is_dsv41:
+        if cfg.cp_strategy != "zigzag":
+            raise ValueError(
+                "DeepSeek-V4.1 prefill CP on NPU requires --cp-strategy zigzag."
+            )
+        if attention_backends_of(resolved_view(server_args)) != ("dsv4", "dsv4"):
+            raise ValueError(
+                "DeepSeek-V4.1 prefill CP on NPU requires the dsv4 attention backend."
+            )
+        unsupported = (
+            ("multiple nodes", cfg.nnodes > 1),
+            ("decode context parallelism", cfg.dcp_size > 1),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("decoder SWA bounded replay", cfg.enable_decoder_swa_bounded_replay),
+            (
+                "prefill graphs (set --cuda-graph-backend-prefill disabled)",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+            (
+                "attention DP with TP MoE (select a MoE A2A backend)",
+                cfg.attn_dp_size > 1 and cfg.moe_a2a_backend == "none",
+            ),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeek-V4.1 prefill CP on NPU does not support {feature}."
+                )
     if get_platform().is_hip:
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
@@ -240,10 +271,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             )
         unsupported = (
             ("multiple nodes", cfg.nnodes > 1),
-            (
-                "DeepSeek-V4.1",
-                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
-            ),
+            ("DeepSeek-V4.1", is_dsv41),
             (
                 "decoder SWA bounded replay",
                 cfg.enable_decoder_swa_bounded_replay,
@@ -276,7 +304,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."
         )
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+    if not is_dsv41:
         # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "

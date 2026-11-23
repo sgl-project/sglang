@@ -101,6 +101,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
     kv_len_prev_tensor: Optional[Any] = None
@@ -150,6 +151,12 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         default one such request runs the whole batch without CP.
         """
         self._short_requests_allowed = True
+
+    def moe_num_token_non_padded(self, forward_batch):
+        local_count = forward_batch.attn_cp_metadata.moe_local_token_count
+        if local_count is not None:
+            return local_count
+        return super().moe_num_token_non_padded(forward_batch)
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:

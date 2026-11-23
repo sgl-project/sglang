@@ -116,6 +116,18 @@ The server requires `--tp` to be divisible by `--dp × --attn-cp-size`. The atte
 For DSA models, such as the GLM-5 series and DeepSeek V3.2, use `interleave`; `zigzag` is currently unavailable. Do not use a smaller `--attn-cp-size` to request hybrid attention TP/CP for DSA models. Broader compatibility is planned for future support.
 </Warning>
 
+### DeepSeek-V4.1 on Ascend
+
+On a single A3 or A5 node, use the `dsv4` backend with
+`--enable-prefill-cp --cp-strategy zigzag --cuda-graph-backend-prefill disabled`.
+The prefill path uses eager execution and replicated KV caches. Decode can
+continue to use its existing graph configuration. Use a compatible CANN and
+sgl-kernel-npu build for the checkpoint on your platform.
+
+Attention CP is `--tp-size / --attn-dp-size`, with one attention TP rank per
+CP rank. When combining attention DP with prefill CP, use a supported MoE A2A
+backend. This path supports colocated, non-speculative serving with DCP size 1.
+
 ### Zigzag example: GQA with attention TP and CP
 
 This Qwen3 configuration uses four Hopper GPUs, with attention TP=2, CP=2, and EP=4 for the MoE layers. The model is a Hugging Face repository ID passed to `--model-path`.

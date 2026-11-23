@@ -393,8 +393,24 @@ def cp_interleave_input_ids(input_ids: Any, forward_batch):
     if not get_moe_a2a_backend().is_none():
         return cp_shard_hidden_states(input_ids, forward_batch)
 
-    physical_tokens = sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+    metadata = forward_batch.attn_cp_metadata
+    physical_tokens = sum(metadata.per_rank_actual_token)
     padded_input_ids = input_ids.new_zeros(physical_tokens)
+    if isinstance(metadata, ZigzagContextParallelMetadata):
+        # TP MoE gathers the padded activations in CP rank order, so hash
+        # routing needs the same order for the corresponding token IDs.
+        chunks = input_ids[: metadata.total_seq_lens].split(metadata.split_list)
+        rank_major = [None] * len(chunks)
+        for chunk, rank_major_index in zip(chunks, metadata.cp_reverse_index):
+            rank_major[rank_major_index] = chunk
+        segments_per_rank = 2 * metadata.bs
+        offset = 0
+        for rank, physical_rows in enumerate(metadata.per_rank_actual_token):
+            start = rank * segments_per_rank
+            ids = torch.cat(rank_major[start : start + segments_per_rank])
+            padded_input_ids[offset : offset + ids.numel()] = ids
+            offset += physical_rows
+        return padded_input_ids
     padded_input_ids[: input_ids.shape[0]] = input_ids
     return padded_input_ids.view(-1, get_parallel().attn_cp_size).T.flatten()
 

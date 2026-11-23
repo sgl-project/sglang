@@ -81,6 +81,9 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
+from sglang.srt.layers import dp_attention
+from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
@@ -88,6 +91,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.registry import create_unified_radix_cache
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.test.test_utils import CustomTestCase
 
 
 class _Ds41Stub(ModuleType):
@@ -1152,6 +1158,251 @@ class TestIndexerRopeSource(unittest.TestCase):
         self.assertEqual(seen["qli_kwargs"]["seqused_k"].tolist(), [3])
         self.assertEqual(seen["qli_kwargs"]["cmp_residual_k"].tolist(), [1])
         self.assertEqual(seen["qli_kwargs"]["cmp_ratio"], 2)
+
+
+class TestDSV41PrefillCP(CustomTestCase):
+    def test_npu_engram_keeps_dp_counts_with_a2a_and_dp_lm_head(self):
+        parallel = SimpleNamespace(
+            attn_dp_enabled=True,
+            num_dp_ranks=8,
+            tp_size=16,
+            moe_dense_tp_size=1,
+            enable_dp_lm_head=True,
+        )
+        exec_config = SimpleNamespace(
+            moe=SimpleNamespace(elastic_ep_backend=None),
+            offload=SimpleNamespace(engram_config=object()),
+        )
+        with (
+            patch.object(dp_attention, "get_parallel", return_value=parallel),
+            patch.object(dp_attention, "get_exec", return_value=exec_config),
+            patch.object(
+                dp_attention, "get_device", return_value=SimpleNamespace(device="npu")
+            ),
+        ):
+            self.assertTrue(
+                dp_attention.require_mlp_tp_gather(moe_a2a_backend="deepep")
+            )
+
+    def test_engram_uses_the_dp_lookup_on_cp_and_idle_ranks(self):
+        lookup = MagicMock()
+        embed = SimpleNamespace(
+            peer=None, _shared=False, tp_size=4, _dp_sharded_lookup=lookup
+        )
+        indices = torch.zeros(3, 24, dtype=torch.long)
+        cp_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_logical_token=[3, 2], per_rank_actual_token=[3, 3]
+            )
+        )
+        idle_batch = SimpleNamespace(attn_cp_metadata=None)
+        with patch(
+            "sglang.srt.layers.engram.get_parallel",
+            return_value=SimpleNamespace(attn_dp_size=2),
+        ):
+            EngramEmbedding.forward(embed, indices, cp_batch, cp_all_tokens=True)
+            lookup.assert_called_once_with(indices, cp_batch, [3, 2])
+            lookup.reset_mock()
+            idle_indices = indices[:0]
+            EngramEmbedding.forward(embed, idle_indices, idle_batch)
+            lookup.assert_called_once_with(idle_indices, idle_batch, None)
+
+    def _init_cp_batch(self):
+        backend = _low_ratio_backend(window=4)
+        backend._dsv4_has_c4 = backend._dsv4_has_c128 = False
+        backend._is_dspark_draft_worker = False
+        backend.tail_source_kv_layer_id = None
+        page_tables = torch.tensor([[1, 2], [5, 6]], dtype=torch.int32)
+        backend.forward_metadata = dsv4_backend.ForwardMetadata(
+            block_tables=page_tables, block_tables_swa=page_tables + 10
+        )
+        batch = _batch(
+            positions=[*range(5, 14), *range(128, 133)],
+            out_cache_loc=[*range(133, 142), *range(768, 773)],
+            seq_lens=[14, 133],
+            batch_size=2,
+        )
+        batch.input_ids = torch.arange(14)
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.extend_seq_lens_cpu = [9, 5]
+        batch.extend_seq_lens = torch.tensor([9, 5], dtype=torch.int32)
+        batch.extend_prefix_lens_cpu = [5, 128]
+        batch.extend_prefix_lens = torch.tensor([5, 128], dtype=torch.int32)
+        batch.seq_lens_cpu = batch.seq_lens
+        batch.req_pool_indices = torch.tensor([1, 3])
+        batch.encoder_swa_replay = False
+        batch.spec_algorithm = None
+        strategy = ZigzagCPStrategy(cp_size=2)
+        with (
+            get_context().override_server_args(device="cpu", tp_size=2, attn_cp_size=2),
+            get_parallel().override(attn_cp_rank=1),
+            patch.object(dsv4_backend, "get_cp_strategy", return_value=strategy),
+            patch.object(dsv4_backend.AscendAttnBackend, "init_forward_metadata"),
+        ):
+            batch.attn_cp_metadata = strategy.build_metadata(14, [14, 133], [9, 5])
+            backend.init_forward_metadata(batch)
+        return backend, batch
+
+    def test_causal_metadata_and_attention_follow_local_zigzag_segments(self):
+        def a5_attention(q, *, out, **kwargs):
+            out.copy_(q + 1)
+
+        for arch35 in (False, True):
+            with self.subTest(arch35=arch35):
+                a3 = SimpleNamespace(
+                    metadata=MagicMock(return_value=torch.zeros(48, dtype=torch.int32)),
+                    attention=MagicMock(side_effect=lambda q, **kw: (q + 1, None)),
+                )
+                with (
+                    patch.object(dsv4_backend, "is_npu_arch35", return_value=arch35),
+                    patch.object(dsv4_backend, "_dsv41_a3_ops", return_value=a3),
+                    patch.object(
+                        DS41,
+                        "mixed_quant_sparse_flash_mla_dsl",
+                        side_effect=a5_attention,
+                    ) as a5,
+                ):
+                    backend, batch = self._init_cp_batch()
+                    fm = backend.forward_metadata
+                    read = fm.dsv41_cp_read
+                    self.assertEqual(read.positions.tolist(), [8, 9, 130, 10, 11, 131])
+                    self.assertEqual(read.seq_lens.tolist(), [10, 131, 12, 132])
+                    self.assertEqual(
+                        read.metadata.actual_seq_lengths_q_pa.tolist(), [0, 2, 3, 5, 6]
+                    )
+                    self.assertEqual(
+                        read.metadata.swa_page_table.tolist(), [[11, 12], [15, 16]] * 2
+                    )
+                    self.assertEqual(fm.actual_seq_lengths_q_pa.tolist(), [0, 9, 14])
+                    self.assertEqual(fm.start_pos.tolist(), [5, 128])
+                    self.assertEqual(
+                        fm.positions_cmp_padding_c2.tolist(),
+                        [4, 6, 8, 10, 12, 128, 130, 0, 0],
+                    )
+                    self.assertEqual(batch.seq_lens.tolist(), [14, 133])
+                    self.assertEqual(
+                        batch.attn_cp_metadata.moe_local_token_count.item(), 6
+                    )
+
+                    backend.prepare_dsv4_cp_metadata(batch)
+                    read.metadata.c2_topk_indices = torch.zeros(
+                        (6, 512), dtype=torch.int32
+                    )
+                    backend.token_to_kv_pool = SimpleNamespace(
+                        get_swa_buffer=lambda _: torch.zeros(1, dtype=torch.bfloat16),
+                        get_compress_buffer=lambda *_: torch.zeros(
+                            1, dtype=torch.bfloat16
+                        ),
+                    )
+                    out = backend._forward_low_ratio_attention(
+                        torch.zeros(8, 1, 4, dtype=torch.bfloat16),
+                        SimpleNamespace(layer_id=2, scaling=0.1),
+                        batch,
+                        None,
+                        2,
+                    )
+                    op = a5 if arch35 else a3.attention
+                    q = op.call_args.args[0]
+                    kwargs = op.call_args.kwargs
+                    self.assertEqual(q.shape[0], 6)
+                    self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 2, 3, 5, 6])
+                    self.assertEqual(kwargs["seqused_cmp_kv"].tolist(), [5, 65, 6, 66])
+                    if arch35:
+                        self.assertEqual(
+                            kwargs["ori_sparse_indices"][2, 0].tolist(),
+                            [127, 128, 129, 130],
+                        )
+                        self.assertEqual(
+                            kwargs["cmp_topk_length"].flatten().tolist(),
+                            [4, 5, 65, 5, 6, 66],
+                        )
+                        self.assertIn("c2a_qli_metadata", read.metadata.kernel_metadata)
+                    else:
+                        self.assertEqual(
+                            kwargs["cmp_residual_kv"].tolist(), [0, 1, 0, 0]
+                        )
+                        index = backend._dsv41_a3_index_kwargs(batch, 2)
+                        self.assertTrue(
+                            torch.equal(index["seqused_k"], kwargs["seqused_cmp_kv"])
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                index["cmp_residual_k"], kwargs["cmp_residual_kv"]
+                            )
+                        )
+                    self.assertEqual(out[:, 0, 0].tolist(), [1] * 6 + [0] * 2)
+
+    def test_compressor_receives_full_extend_and_writes_global_c2_slots(self):
+        a3 = SimpleNamespace(
+            metadata=lambda *args, **kwargs: torch.zeros(48, dtype=torch.int32)
+        )
+        with (
+            patch.object(dsv4_backend, "is_npu_arch35", return_value=False),
+            patch.object(dsv4_backend, "_dsv41_a3_ops", return_value=a3),
+        ):
+            backend, batch = self._init_cp_batch()
+            fm = backend.forward_metadata
+            state = torch.zeros(4, 2, 4)
+            cache = torch.full((512, 4), -1.0)
+
+            def write_slots(_layer, slots, values, *_):
+                valid = slots >= 0
+                cache[slots[valid].long()] = values[valid]
+
+            backend.token_to_kv_pool = SimpleNamespace(
+                _get_state_pool=lambda *_: SimpleNamespace(state_cache_3d=state),
+                set_compress_buffer=write_slots,
+            )
+            global_x = torch.arange(14.0).view(-1, 1).expand(-1, 4).contiguous()
+
+            def compress(**kwargs):
+                self.assertTrue(torch.equal(kwargs["x"], global_x))
+                self.assertEqual(kwargs["start_pos"].tolist(), [5, 128])
+                self.assertEqual(kwargs["cu_seqlens"].tolist(), [0, 9, 14])
+                self.assertIs(kwargs["state_cache"], state)
+                # Return one known payload per completed group and two pad rows.
+                return global_x[[0, 2, 4, 6, 8, 10, 12, 0, 0]]
+
+            layer = SimpleNamespace(
+                layer_id=2,
+                compress_ratio=2,
+                indexer=None,
+                freqs_cis=torch.empty(1, 1),
+                compressor=SimpleNamespace(
+                    use_fused_gate=False,
+                    wkv=SimpleNamespace(weight=None),
+                    wgate=SimpleNamespace(weight=None),
+                    norm=SimpleNamespace(weight=None, eps=1e-6),
+                ),
+            )
+            with (
+                patch.object(
+                    dsv4_backend,
+                    "cp_materialize_global_token_order",
+                    return_value=global_x,
+                ),
+                patch.object(
+                    dsv4_backend, "_dsv41_a3_compressor", side_effect=compress
+                ),
+                patch.object(
+                    dsv4_backend.torch_npu,
+                    "npu_rms_norm",
+                    side_effect=lambda x, *_: (x, None),
+                ),
+                patch.object(dsv4_backend.Dsv4NpuRoPE, "for_freqs") as rope,
+                patch.object(dsv4_backend.Dsv4NpuRoPE, "apply_rotary_mul_inplace"),
+            ):
+                rope.return_value.get_cos_sin.return_value = (None, None)
+                backend.forward_low_ratio_sources(
+                    layer=layer,
+                    x=torch.zeros(8, 4),
+                    q_lora=None,
+                    positions=fm.dsv41_cp_read.positions,
+                    forward_batch=batch,
+                )
+            written_slots = cache[:, 0].ne(-1).nonzero().flatten().tolist()
+            self.assertEqual(written_slots, [66, 67, 68, 69, 70, 384, 385])
+            self.assertEqual(cache[written_slots, 0].tolist(), [0, 2, 4, 6, 8, 10, 12])
 
 
 class TestLowRatioAttentionBody(unittest.TestCase):
