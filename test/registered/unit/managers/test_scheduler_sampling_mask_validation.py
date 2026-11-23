@@ -17,6 +17,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -45,6 +46,7 @@ def _handle_pd_request(mode, req):
     scheduler.hisparse_coordinator = None
     scheduler.uocr_runtime = None
     scheduler.send_abort_output = MagicMock()
+    scheduler.penalty_status_pool = idle_penalty_status_pool()
     scheduler.init_request_retirer()
     recv_req = MagicMock(
         session_params=None,
@@ -140,6 +142,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.beam_coordinator = MagicMock()
                 scheduler.hisparse_coordinator = None
                 scheduler.uocr_runtime = None
+                scheduler.penalty_status_pool = idle_penalty_status_pool()
                 scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)

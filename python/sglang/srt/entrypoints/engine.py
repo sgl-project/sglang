@@ -49,7 +49,6 @@ from typing import (
 import msgspec
 import torch
 import uvloop
-import zmq
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -94,14 +93,11 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
-    RpcReqOutput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    sock_recv,
-    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -142,7 +138,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -163,11 +159,11 @@ from sglang.srt.utils import (
     numa_utils,
     set_ulimit,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_free_port,
-    get_zmq_socket,
     is_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -392,15 +388,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args, port_args, scheduler_info
             )
             self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-
-        # Initialize ZMQ sockets
-        context = zmq.Context(2)
-        if get_parallel().node_rank == 0:
-            self.send_to_rpc = get_zmq_socket(
-                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-            )
-        else:
-            self.send_to_rpc = None
 
         # Enable tracing
         if get_observability().enable_trace:
@@ -937,6 +924,9 @@ class Engine(EngineScoreMixin, EngineBase):
         prelaunched_schedulers = {}
         rust_listener_procs = []
 
+        # Foundry (--cuda-graph-persistence) is activated here at the latest;
+        # it wraps every spawn below with its hook preload and environment pins.
+        foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -951,10 +941,13 @@ class Engine(EngineScoreMixin, EngineBase):
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
-                    gpu_id = (
-                        get_device().base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=get_device().base_gpu_id,
+                        gpu_id_step=get_device().gpu_id_step,
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -975,6 +968,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
+                            foundry_adapter.configure_subprocess(server_args),
                             numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
@@ -1006,7 +1000,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 ),
             )
             try:
-                proc.start()
+                # The controller passes the hook preload on to its schedulers.
+                with foundry_adapter.configure_subprocess(server_args):
+                    proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
@@ -1518,7 +1514,6 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_infos=[scheduler_info], all_child_pids=[]
         )
         self._weight_cache_daemon_procs = []
-        self.send_to_rpc = None
         self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
             server_args, port_args, scheduler_info
         )
@@ -1552,11 +1547,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
-
-            send_to_rpc = getattr(self, "send_to_rpc", None)
-            if send_to_rpc is not None:
-                send_to_rpc.close(linger=0)
-                self.send_to_rpc = None
 
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
@@ -1942,10 +1932,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        sock_send(self.send_to_rpc, obj)
-        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        result = self.loop.run_until_complete(
+            self.tokenizer_manager.collective_rpc(obj)
+        )
+        if not result.success:
+            raise RuntimeError(f"collective_rpc {method!r} failed: {result.message}")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)

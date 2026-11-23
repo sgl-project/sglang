@@ -27,6 +27,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
@@ -42,7 +43,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -125,8 +126,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
         self._reuse_output_buffer = reuse_output_buffer
         self._output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
 
     @contextmanager
@@ -147,6 +147,21 @@ class FullCudaGraphBackend(BaseGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        foundry = get_foundry_adapter()
+        if foundry.enabled:
+            # CUDA graph persistence: SAVE captures and archives this shape;
+            # LOAD restores it. None: Foundry fell back, capture natively.
+            persisted = foundry.capture_one(
+                shape_key=shape_key,
+                forward_fn=forward_fn,
+                pool=self._pool,
+                stream=self._capture_stream,
+            )
+            if persisted is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = persisted
+                # Restored kernels read the same dummy-batch tensors as captured ones.
+                self._capture_inputs[shape_key] = capture_inputs
+                return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()

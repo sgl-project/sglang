@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     _cached_latent_mean_std,
     minimax_h3_scoped_encode_rng,
 )
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
@@ -360,7 +361,9 @@ def _load_waveform(
     if max_duration_seconds is not None:
         command += ["-t", f"{max_duration_seconds:.9g}"]
     command += ["-f", "f32le", "pipe:1"]
-    decoded = subprocess.run(command, check=True, capture_output=True)
+    decoded = subprocess.run(
+        command, env=local_media_subprocess_env(), check=True, capture_output=True
+    )
     payload = decoded.stdout
     if not isinstance(payload, bytes):
         raise TypeError("ffmpeg float PCM output must be bytes")
@@ -568,6 +571,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     else:
         decoded = subprocess.run(
             [*command, "pipe:1"],
+            env=local_media_subprocess_env(),
             check=True,
             capture_output=True,
         )
@@ -581,6 +585,7 @@ def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
 def _write_reference_video_to_fd(command: list[str], output_fd: int) -> int:
     subprocess.run(
         [*command, f"pipe:{output_fd}"],
+        env=local_media_subprocess_env(),
         check=True,
         pass_fds=(output_fd,),
         stdout=subprocess.DEVNULL,

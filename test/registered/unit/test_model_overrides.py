@@ -210,6 +210,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dcp_replicate_q_proj",
                     "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
+                    "num_continuous_decode_steps",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
                     "decode_state_free_radix_default",
@@ -255,6 +256,11 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "watermark_key_b",
                     "watermark_max_probability",
                     "watermark_mixing_probability",
+                    "watermark_keys",
+                    "watermark_ngram_len",
+                    "watermark_num_candidates",
+                    "watermark_context_history_size",
+                    "watermark_skip_first_ngram_calls",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
@@ -2091,6 +2097,46 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+
+    def test_exaone_and_olmo2_default_to_fa3_only_on_sm8x_and_sm9x(self):
+        """The fa3 backend is built for SM 8.x and 9.x and refuses any other
+        device at construction, so the default on SM110 / SM120 / SM121 must be
+        triton, as it is on a platform that is not CUDA."""
+        from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
+        from sglang.srt.arg_groups.model_overrides.olmo2 import _olmo2_overrides
+
+        exaone_config = SimpleNamespace(
+            sliding_window_pattern="LLLG", architectures=["Exaone4ForCausalLM"]
+        )
+        args = SimpleNamespace(attention_backend=None)
+        cases = (
+            (True, 80, "fa3"),
+            (True, 89, "fa3"),
+            (True, 90, "fa3"),
+            (True, 100, "trtllm_mha"),
+            (True, 103, "trtllm_mha"),
+            (True, 110, "triton"),
+            (True, 120, "triton"),
+            (True, 121, "triton"),
+            # gfx950 reports capability (9, 5) through torch.cuda.
+            (False, 95, "triton"),
+        )
+        for is_cuda, device_sm, expected in cases:
+            with (
+                self.subTest(is_cuda=is_cuda, device_sm=device_sm),
+                override_platform(
+                    is_cuda=is_cuda,
+                    is_sm100=is_cuda and device_sm // 10 == 10,
+                    device_sm=device_sm,
+                ),
+            ):
+                self.assertEqual(
+                    _exaone_overrides(args, exaone_config),
+                    {"attention_backend": expected},
+                )
+                self.assertEqual(
+                    _olmo2_overrides(args, None), {"attention_backend": expected}
+                )
 
     def test_exaone_without_pattern_declares_nothing(self):
         from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
@@ -4550,6 +4596,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
+
+    def test_qwen3_moe_family_covers_text_only_qwen3_5(self):
+        """Text-only Qwen3.5 checkpoints (Qwen3.8-2.4T-A95B ships as
+        Qwen3_5MoeForCausalLM) take the family's SM100 MoE runner rule, as their
+        multimodal siblings do. Under auto, ModelOpt NVFP4 MoE weights were
+        otherwise prepared for another runner than the kernel takes (#48108)."""
+        args = SimpleNamespace(
+            quantization="modelopt_mixed",
+            _quantization_explicitly_unset=False,
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+        )
+        for arch in ("Qwen3_5MoeForCausalLM", "Qwen3_5ForCausalLM"):
+            hf_config = SimpleNamespace(
+                architectures=[arch],
+                quantization_config={
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}
+                    },
+                },
+            )
+            with self.subTest(arch=arch), override_platform(is_sm100=True):
+                self.assertEqual(
+                    collect_model_override_declarations(arch, args, hf_config),
+                    [
+                        (
+                            "_qwen3_moe_family_overrides",
+                            {"moe_runner_backend": "flashinfer_trtllm"},
+                        )
+                    ],
+                )
 
     def test_qwen3_moe_family_mixed_precision_moe_runner(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_moe import (

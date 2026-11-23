@@ -9,9 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_gfx95_supported, is_npu
-from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.common import calc_diff
 from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
@@ -22,15 +23,14 @@ if _is_npu:
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
-_ENABLE_MM_DEEPGEMM = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
-)
+_ENABLE_MM_DEEPGEMM = envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM.get()
 # If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
-_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0"
+_ENABLE_MM_FALLBACK_VARIANT = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT.get()
 )
-_ENABLE_MM_COMPARISON_TEST = get_bool_env_var(
-    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST"
+# Cross-checks DeepGEMM against the Triton kernel on every call.
+_ENABLE_MM_COMPARISON_TEST = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST.get()
 )
 
 if not _ENABLE_MM_DEEPGEMM:
@@ -390,11 +390,11 @@ def _segmented_matmul_launch(M: int, N: int) -> tuple:
     """
     if N < 1024:
         return 32, 64, 4, 2, True
+    if M <= 32:
+        return 32, 128, 4, 3, True
+    if M <= 64:
+        return 64, 128, 8, 3, True
     if N <= 8192:
-        if M <= 32:
-            return 32, 64, 4, 2, True
-        if M <= 64:
-            return 64, 64, 4, 2, True
         if M <= 256:
             return 128, 128, 8, 3, True
         if M <= 1024:
@@ -402,10 +402,6 @@ def _segmented_matmul_launch(M: int, N: int) -> tuple:
         if M <= 2048:
             return 128, 128, 8, 1, False
         return 128, 256, 8, 1, False
-    if M <= 32:
-        return 32, 64, 4, 2, True
-    if M <= 64:
-        return 64, 64, 4, 2, True
     if M <= 128:
         return 128, 128, 8, 2, True
     return 256, 128, 8, 1, False
@@ -458,7 +454,8 @@ def _matmul_segmented_triton(
         matrix_instr_nonkdim=16,
     )
     if split:
-        block = 4096
+        # Measured on MI350X: the smaller block is faster up to M = 64.
+        block = 1024 if M <= 64 else 4096
         _segment_reduce_kernel[(triton.cdiv(M * N, block),)](
             partial,
             c,
@@ -650,7 +647,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
+
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
