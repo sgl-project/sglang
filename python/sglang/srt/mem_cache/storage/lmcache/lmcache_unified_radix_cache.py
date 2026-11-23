@@ -841,10 +841,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 prev_prefix_len=prev_prefix_len,
                 component_evicted_seqlens=self.insert_window_cursors(req.kv),
                 inserted_len=len(key),
-                priority=min(
-                    (req.priority or 0) * self.priority_sign,
-                    torch.iinfo(torch.int64).max,
-                ),
+                priority=self._priority_sort_key(req.priority),
             )
         )
 

@@ -489,6 +489,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Priority scheduling direction: -1 when lower values mean higher
+    # priority (--schedule-low-priority-values-first), 1 otherwise. Used by
+    # _priority_sort_key to convert business priority into a sort key.
+    priority_sign: int = 1
+
+    def _priority_sort_key(self, priority: Optional[int]) -> int:
+        """Convert a request's business priority into an eviction sort key
+        (larger = evicted later), negating it when lower values mean higher
+        priority. Clamped to int64 max — the flip can push INT64_MIN one past
+        the upper bound — following the prompt boost's clamp style.
+
+        The ``or 0`` fallback only covers priority scheduling being disabled
+        (every key is 0 and the policy reduces to LRU): with scheduling
+        enabled the scheduler replaces None with a direction-aware sentinel
+        at intake, so None never reaches the tree.
+        """
+        return min((priority or 0) * self.priority_sign, torch.iinfo(torch.int64).max)
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
