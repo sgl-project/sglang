@@ -471,6 +471,17 @@ def check_server_args(server_args: Any):
             "--max-queued-requests must be positive when set, got "
             f"{cfg.max_queued_requests}. Omit the flag for no limit."
         )
+    # 0 or a negative value has no valid meaning but is accepted: pool
+    # sizing silently clamps it to 1 request per worker (max(1, ...)), so
+    # the server runs at concurrency 1 with no warning, masking the
+    # misconfiguration instead of surfacing it.
+    # Model-resolved defaults (DeepSeek-V4's) and the speculative-decoding
+    # fallback (48) are positive and pass.
+    if cfg.max_running_requests is not None and cfg.max_running_requests <= 0:
+        raise ValueError(
+            "--max-running-requests must be positive when set, got "
+            f"{cfg.max_running_requests}. Omit the flag for no limit."
+        )
     halving_chunks = cfg.shortest_prefill_boundary_halving_chunks
     budget_min_ratio = cfg.shortest_prefill_budget_min_ratio
     doubling_chunks = cfg.shortest_prefill_budget_doubling_chunks

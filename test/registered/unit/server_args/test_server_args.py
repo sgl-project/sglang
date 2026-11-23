@@ -5523,12 +5523,13 @@ class TestShortestPrefillLoadScalingArgs(CustomTestCase):
         )
 
 
-class TestPrioritySchedulingArgValidation(CustomTestCase):
-    """Startup validation of priority-scheduling arguments whose invalid
-    values previously failed late or silently: a negative preemption
-    threshold livelocks same-priority requests, and a non-positive queue
-    limit rejects every request — crashing the scheduler under priority
-    scheduling on max() over an empty waiting queue."""
+class TestSchedulingArgValidation(CustomTestCase):
+    """Startup validation of scheduling arguments whose invalid values
+    previously failed late or silently: a negative preemption threshold
+    livelocks same-priority requests; a non-positive queue limit rejects
+    every request — crashing the scheduler under priority scheduling on
+    max() over an empty waiting queue; a non-positive running limit never
+    admits a request, so the server idles silently."""
 
     def check(self, **kwargs):
         ServerArgs(
@@ -5574,6 +5575,17 @@ class TestPrioritySchedulingArgValidation(CustomTestCase):
 
     def test_positive_max_queued_requests_is_accepted(self):
         self.check(enable_priority_scheduling=True, max_queued_requests=1)
+
+    def test_non_positive_max_running_requests_is_rejected(self):
+        for max_running_requests in (0, -1):
+            with self.subTest(max_running_requests=max_running_requests):
+                with self.assertRaisesRegex(
+                    ValueError, "max-running-requests"
+                ):
+                    self.check(max_running_requests=max_running_requests)
+
+    def test_positive_max_running_requests_is_accepted(self):
+        self.check(max_running_requests=1)
 
 
 class TestRadixEvictionPolicyPriorityArgs(CustomTestCase):
