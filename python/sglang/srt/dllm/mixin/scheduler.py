@@ -189,7 +189,12 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
+            req.finish_outside_step(
+                FINISH_LENGTH(
+                    length=len(req.output_ids),
+                    ignored_stop_position=req.ignored_stop_token_len,
+                )
+            )
 
         if req.finished():
             self.request_retirer.release(
@@ -360,6 +365,7 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
         )
         new_batch.prepare_for_extend()
+        self.sampler_params_pool.write(new_batch.reqs)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
