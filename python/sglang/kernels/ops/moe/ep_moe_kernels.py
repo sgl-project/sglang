@@ -1740,6 +1740,8 @@ def moe_ep_deepgemm_preprocess(
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
     expert_start: int = 0,
+    *,
+    use_mn_major_fp32_scales: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -1809,8 +1811,16 @@ def moe_ep_deepgemm_preprocess(
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
     elif is_fp8:
         hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        # m_max is a multiple of 256, so the physical [E, G, M] buffer
+        # is already TMA-aligned for the masked GEMM's MN-major FP32 scales.
+        mn_major = (
+            use_mn_major_fp32_scales and deep_gemm_wrapper.DEEPGEMM_MASKED_FP32_MN_MAJOR
+        )
+        num_groups = scale.size(1)
         gateup_input_scale = torch.empty(
-            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+            (num_local_experts, num_groups, m_max)
+            if mn_major
+            else (num_local_experts, m_max, num_groups),
             device=hidden_states.device,
             dtype=scale.dtype,
         )
@@ -1829,8 +1839,10 @@ def moe_ep_deepgemm_preprocess(
             scale.stride(1),
             BLOCK_SIZE=1024,
             IS_FP8=True,
-            SCALE_MN_MAJOR=False,
+            SCALE_MN_MAJOR=mn_major,
         )
+        if mn_major:
+            gateup_input_scale = gateup_input_scale.transpose(1, 2)
     else:
         scale = None
         gateup_input_scale = None

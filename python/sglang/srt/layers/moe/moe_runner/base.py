@@ -73,6 +73,9 @@ class MoeRunnerConfig:
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
+    # The GLM-5.3-Flash target opts into fused expert IDs and direct FP32
+    # scale writes on its own routed layers; draft and other models stay off.
+    enable_glm5_next_moe_kernels: bool = False
 
     # The MoE placement a fused func needs is the layer's own, not the
     # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a

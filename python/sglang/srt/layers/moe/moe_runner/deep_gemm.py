@@ -858,6 +858,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
                 num_real_tokens=num_real_tokens,
                 silu_mul_keep_fp32=self.config.silu_mul_keep_fp32,
+                use_mn_major_fp32_scales=self.config.enable_glm5_next_moe_kernels,
             )
         if trace_deepep_v2_masked:
             torch.cuda.synchronize()
@@ -1062,6 +1063,7 @@ def pre_permute_standard_to_deep_gemm(
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
                 expert_start=expert_start,
+                use_mn_major_fp32_scales=runner_config.enable_glm5_next_moe_kernels,
             )
         )
         # Use the global expert count because expected_m is a tuning hint, not
@@ -1579,6 +1581,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     gemm1_clamp_limit: Optional[float] = None,
     num_real_tokens: Optional[int] = None,
     silu_mul_keep_fp32: bool = False,
+    *,
+    use_mn_major_fp32_scales: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert masked_m is not None
     hidden_states_device = gateup_output.device
@@ -1641,11 +1645,15 @@ def _varlen_deep_gemm_silu_mul_quant(
             f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
         )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        mn_major = packed_ue8m0 or (
+            use_mn_major_fp32_scales and deep_gemm_wrapper.DEEPGEMM_MASKED_FP32_MN_MAJOR
+        )
+        scale_groups = G // 4 if packed_ue8m0 else G
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )
         down_input_scale = torch.empty(
-            (E, G // 4, N) if packed_ue8m0 else (E, N, G),
+            (E, scale_groups, N) if mn_major else (E, N, scale_groups),
             device=hidden_states_device,
             dtype=torch.int32 if packed_ue8m0 else torch.float32,
         )
@@ -1657,11 +1665,11 @@ def _varlen_deep_gemm_silu_mul_quant(
             masked_m,
             scale_ue8m0=packed_ue8m0,
             topk=topk,
-            transposed=packed_ue8m0,
+            transposed=mn_major,
             swiglu_limit=swiglu_limit,
             swizzle=swizzle,
         )
-        if packed_ue8m0:
+        if mn_major:
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 

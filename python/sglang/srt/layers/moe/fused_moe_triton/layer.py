@@ -412,6 +412,7 @@ class FusedMoE(torch.nn.Module):
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
         allow_fp8_blockwise_tail: bool = False,
+        enable_glm5_next_moe_kernels: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -526,6 +527,8 @@ class FusedMoE(torch.nn.Module):
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
             layer=self,
+            enable_glm5_next_moe_kernels=enable_glm5_next_moe_kernels
+            and not self.is_draft,
         )
 
         self.quant_method = quant_method

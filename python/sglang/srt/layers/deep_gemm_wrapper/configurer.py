@@ -59,6 +59,10 @@ DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     get_platform().is_sm100 or get_device_sm() in (120, 121)
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+# Only SM90's FP32 masked scale layout is validated for direct producer stores.
+DEEPGEMM_MASKED_FP32_MN_MAJOR = (
+    ENABLE_JIT_DEEPGEMM and _is_cuda and get_device_sm() == 90
+)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:

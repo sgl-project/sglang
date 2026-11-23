@@ -834,6 +834,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
                 reduce_results=False,
+                enable_glm5_next_moe_kernels=not is_nextn,
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
