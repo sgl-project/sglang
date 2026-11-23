@@ -35,6 +35,9 @@ from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
 from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
     FusedPostNormResidualPreNorm,
 )
+from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
+    fused_norm_residual,
+)
 from sglang.kernels.ops.moe.muse_spark_routing import (
     FusedMuseSparkRouting,
 )
@@ -69,12 +72,19 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.muse_spark import muse_spark_sp_experts
 from sglang.srt.layers.muse_spark.fused import glue
 from sglang.srt.layers.muse_spark.muse_spark_bf16_moe import (
     MuseSpark1xBf16Experts,
     expert_stack_in_layout,
 )
-from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+from sglang.srt.layers.muse_spark.muse_spark_dynamic_guests import (
+    maybe_prepare_dynamic_guests,
+)
+from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
+    MuseSpark1xFp4Experts,
+    _pre_expert_rms_norm,
+)
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNorm,
@@ -200,6 +210,77 @@ def _use_split_bf16_router(num_tokens: int) -> bool:
     return True
 
 
+@functools.cache
+def _hopper_kernels_enabled() -> bool:
+    return glue.hopper_kernels_enabled()
+
+
+# Measured on H200 TP8: SP sizes for async-TP GEMMs / the o_proj all-to-all
+_SP_ASYNC_TP_MIN_TOKENS = 4096
+_SP_O_PROJ_A2A_MIN_TOKENS = 256
+
+
+@torch.no_grad()
+def _replicate_sp_o_proj(layers) -> None:
+    group = get_parallel().tp_group
+    if group.world_size == 1:
+        return
+    for layer in layers:
+        o_proj = layer.self_attn.o_proj
+        shard = o_proj.weight.data
+        gathered = shard.new_empty((group.world_size, *shard.shape))
+        group.all_gather_into_tensor(gathered, shard.contiguous())
+        o_proj._sp_full_weight = (
+            gathered.permute(1, 0, 2).reshape(shard.shape[0], -1).contiguous()
+        )
+        o_proj._sp_full_weight_min_tokens = _SP_O_PROJ_A2A_MIN_TOKENS
+        del gathered
+
+
+def _sp_gather_routing(
+    topk_scores: torch.Tensor, topk_ids: torch.Tensor, num_tokens: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    top_k = topk_ids.shape[1]
+    packed = torch.cat(
+        [topk_ids.to(torch.int32), topk_scores.float().view(torch.int32)], dim=1
+    )
+    packed = layernorm_sp.sp_exit_gather(packed, num_tokens)
+    scores = packed[:, top_k:].contiguous().view(torch.float32)
+    return scores, packed[:, :top_k].contiguous().to(topk_ids.dtype)
+
+
+def _sp_gathered_experts(
+    run_experts,
+    shard: torch.Tensor,
+    topk_scores: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_tokens: int,
+    buffers=None,
+) -> torch.Tensor:
+    if (
+        buffers is not None
+        and (
+            out := buffers.gathered_experts(
+                lambda x: run_experts(x, topk_scores, topk_ids),
+                shard.contiguous(),
+                num_tokens,
+            )
+        )
+        is not None
+    ):
+        return out
+    experts_input = (
+        g[:num_tokens]
+        if buffers is not None
+        and (g := buffers.push_all_gather(shard.contiguous())) is not None
+        else layernorm_sp.sp_exit_gather(shard, num_tokens)
+    )
+    return layernorm_sp.sp_reduce_scatter(
+        run_experts(experts_input, topk_scores, topk_ids)
+    )
+
+
 def _fused_norm_boundary(
     post_norm: nn.Module, residual_add: nn.Module, pre_norm: nn.Module
 ) -> FusedPostNormResidualPreNorm:
@@ -238,18 +319,43 @@ class MuseSpark1xRouter(nn.Module):
         key = (w.data_ptr(), w.shape, w._version)
         if self._split2_key == key:
             return
+        e, k = w.shape
         hi = w.to(torch.bfloat16)
         lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
-        self._split2_hi = hi.t().contiguous()
-        self._split2_lo = lo.t().contiguous()
+        # [hidden, 2E]: per 16 columns 8 experts' hi then their lo; one GEMM, logits = hi + lo (fp32)
+        g = self._split2_g = 8 if e % 8 == 0 else e
+        self._split2_hilo = (
+            torch.stack([hi.view(e // g, g, k), lo.view(e // g, g, k)], 1)
+            .reshape(2 * e, k)
+            .t()
+            .contiguous()
+        )
         self._split2_key = key
 
-    def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_split2(
+        self, hidden_states: torch.Tensor, sp: bool = False
+    ) -> torch.Tensor:
         self._build_split2()
-        x = hidden_states.to(torch.bfloat16)
-        acc = torch.mm(x, self._split2_hi, out_dtype=torch.float32)
-        acc += torch.mm(x, self._split2_lo, out_dtype=torch.float32)
-        return acc
+        x, w = hidden_states.to(torch.bfloat16), self._split2_hilo
+        if _hopper_kernels_enabled():
+            from sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv import (
+                _GWR,
+                _GWS,
+                gemv,
+                use,
+            )
+
+            tab = _GWS if sp else _GWR
+            if use(x.shape[0], *w.shape[::-1], tab):
+                return gemv(
+                    x,
+                    w,
+                    x.new_empty((x.shape[0], w.shape[1] // 2), dtype=torch.float32),
+                    tab,
+                )
+        both = torch.mm(x, w, out_dtype=torch.float32)
+        both = both.view(x.shape[0], -1, 2, self._split2_g)
+        return (both[:, :, 0] + both[:, :, 1]).flatten(1)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
@@ -418,8 +524,15 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
-        attn_out = glue.run_attention(self, qkv, positions, forward_batch)
+        push = glue.sp_o_proj_push_plan(self, qkv.shape[0])
+        attn_out = glue.run_attention(self, qkv, positions, forward_batch, push)
         if attn_out is not None:
+            if push:
+                return bf16_gemm_dispatch(
+                    self.o_proj._sp_a2a_push.pushed_input(push),
+                    self.o_proj._sp_full_weight,
+                    None,
+                )
             return self.o_proj(attn_out)[0]
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
@@ -637,6 +750,7 @@ class MuseSpark1xMoE(nn.Module):
         self.experts.post_expert_norm = post_expert_norm
         self.experts.use_megamoe = self.use_megamoe
         self.sp_dispatcher = None
+        self.sp_gathers, self.sp_buffers = False, None
         self.finalize_ar_workspace = None
         self.unpool_gather_boundary: Optional[FusedPostNormResidualPreNorm] = None
         self.side_stream = None
@@ -826,6 +940,15 @@ class MuseSpark1xMoE(nn.Module):
         use_side_stream = not _is_cpu and torch.cuda.is_available()
         main_stream = torch.cuda.current_stream() if use_side_stream else None
         side_stream = self._side_stream() if use_side_stream else None
+        sp_gather = sp_active and self.sp_gathers
+        num_tokens = (
+            layernorm_sp.sp_num_tokens() if sp_gather else hidden_states.shape[0]
+        )
+        router_logits = (
+            self.gate.forward_split2(hidden_states, sp=True)
+            if sp_gather and use_split2 and hidden_states.shape[0] <= 256
+            else None
+        )
         if use_side_stream:
             side_stream.wait_stream(main_stream)
         # nn.Linear bypasses the bf16 GEMM dispatcher.
@@ -862,11 +985,12 @@ class MuseSpark1xMoE(nn.Module):
             if use_side_stream
             else contextlib.nullcontext()
         ):
-            router_logits = (
-                self.gate.forward_split2(hidden_states)
-                if use_split2
-                else self.gate(router_input)
-            )
+            if router_logits is None:
+                router_logits = (
+                    self.gate.forward_split2(hidden_states)
+                    if use_split2
+                    else self.gate(router_input)
+                )
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
@@ -882,32 +1006,106 @@ class MuseSpark1xMoE(nn.Module):
                 if tensor is not None:
                     tensor.record_stream(main_stream)
 
+        rows = expert_input.shape[0]
+        fits = self.sp_buffers is not None and rows <= self.sp_buffers.rows
+        sp_exchange = (
+            sp_gather
+            and self.nvfp4_checkpoint
+            and fits
+            and self.experts.sp_exchange_ready(rows * self.sp_buffers.tp)
+        )
+        if sp_exchange:
+            shard = self.sp_buffers.shard[:rows]
+            if self.pre_expert_norm is not None:
+                expert_input = _pre_expert_rms_norm(
+                    self.pre_expert_norm, expert_input, out=shard
+                )
+            else:
+                shard.copy_(expert_input)
+        own_scores = topk_scores
+        if sp_gather:
+            routes = (
+                self.sp_buffers.gather_routing(topk_scores, topk_ids) if fits else None
+            )
+            if routes and not sp_exchange:
+                routes = (routes[0][:num_tokens], routes[1][:num_tokens])
+            topk_scores, topk_ids = routes or _sp_gather_routing(
+                topk_scores,
+                topk_ids,
+                rows * self.sp_buffers.tp if sp_exchange else num_tokens,
+            )
         if (capturer := get_global_experts_capturer()) is not None:
             # Capture on main after the router join, in full unpadded token order.
             # SP experts below still consume the local ids.
             capture_topk_ids = topk_ids
-            if sp_active:
+            if sp_gather:
+                capture_topk_ids = topk_ids[:num_tokens]
+            elif sp_active:
                 capture_topk_ids = layernorm_sp.sp_exit_gather(
                     topk_ids, num_tokens=layernorm_sp.sp_num_tokens()
                 )
             capturer.capture(layer_id=self.layer_idx, topk_indices=capture_topk_ids)
+        if sp_exchange:
+            self.experts.forward_sp_exchange(
+                topk_scores, topk_ids, self.sp_buffers, rows
+            )
+            self.sp_buffers.recv_hdl.barrier(channel=0)
+            return self.sp_buffers.sum_received(rows, own_scores)
+        if sp_gather:
+            pre_normed = self.pre_expert_norm is not None and (
+                not self.nvfp4_checkpoint or getattr(self.experts, "use_marlin", False)
+            )
+            if pre_normed:
+                expert_input = (
+                    _pre_expert_rms_norm(self.pre_expert_norm, expert_input)
+                    if self.nvfp4_checkpoint
+                    else self.pre_expert_norm(expert_input)
+                )
+            return _sp_gathered_experts(
+                functools.partial(self._run_local_experts, pre_normed=pre_normed),
+                expert_input,
+                topk_scores,
+                topk_ids,
+                num_tokens=num_tokens,
+                buffers=self.sp_buffers,
+            )
         if getattr(get_forward(), "sp_active", False):
             return self._forward_sp_experts(
                 expert_input, topk_scores, topk_ids, router_logits
             )
+        return self._run_local_experts(
+            expert_input,
+            topk_scores,
+            topk_ids,
+            prepared_input=prepared_input,
+            packed_topk_ids=packed_topk_ids,
+            ar_workspace=ar_workspace,
+        )
+
+    def _run_local_experts(
+        self,
+        expert_input: torch.Tensor,
+        topk_scores: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        prepared_input=None,
+        packed_topk_ids: Optional[torch.Tensor] = None,
+        ar_workspace=None,
+        pre_normed: bool = False,
+    ) -> torch.Tensor:
         if self.nvfp4_checkpoint:
             output = self.experts(
                 expert_input,
                 topk_scores,
                 topk_ids,
                 self.experts.post_expert_norm,
-                pre_expert_norm=self.pre_expert_norm,
+                pre_expert_norm=None if pre_normed else self.pre_expert_norm,
                 prepared_input=prepared_input,
                 packed_topk_ids=packed_topk_ids,
                 ar_workspace=ar_workspace,
             )
         else:
-            if self.pre_expert_norm is not None:
+            if self.pre_expert_norm is not None and not pre_normed:
                 expert_input = self.pre_expert_norm(expert_input)
             output = self.experts(
                 expert_input,
@@ -1075,6 +1273,21 @@ class MuseSpark1xDecoderLayer(nn.Module):
             return self.post_feedforward_residual_gate(
                 stream, self.post_feedforward_layernorm(ffn_output)
             ), None
+        ag = getattr(self, "_sp_ag_next", None)
+        if (
+            ag
+            and getattr(get_forward(), "sp_active", False)
+            and self._fused_ffn_boundary.jit_selected()
+        ):
+            staged = ag[0].stage(ffn_output, ag[1])
+            if staged is not None:
+                next_attn_input, stream, _ = fused_norm_residual(
+                    ffn_output,
+                    stream,
+                    **self._fused_ffn_boundary.jit_kernel_kwargs(),
+                    output=staged,
+                )
+                return stream, next_attn_input
         next_attn_input, stream, _ = self._fused_ffn_boundary(
             stream, ffn_output, branch_dtype=self.operator_dtype
         )
@@ -1208,7 +1421,38 @@ class MuseSpark1xModel(nn.Module):
                     "FlashInfer TP MoE finalize is unavailable; expert TP uses a "
                     "separate all-reduce and finalize."
                 )
-        if layernorm_sp.layernorm_sp_enabled():
+        self.hopper_kernels = _hopper_kernels_enabled()
+        if layernorm_sp.layernorm_sp_enabled() and self.hopper_kernels:
+            moe_layers = [layer.mlp for layer in self.layers if layer.is_moe_layer]
+            self.sp_buffers = sp_buffers = (
+                muse_spark_sp_experts.prepare(
+                    get_parallel().tp_group,
+                    torch.device("cuda", torch.cuda.current_device()),
+                    moe_layers[0].expert_hidden_size,
+                )
+                if moe_layers
+                else None
+            )
+            sp_ag = sp_buffers and muse_spark_sp_experts.SPAllGatherMatmul(
+                get_parallel().tp_group, sp_buffers.recv.device, config.hidden_size
+            )
+            for i, layer in enumerate(self.layers):
+                qkv, o = linears = [layer.self_attn.qkv_proj, layer.self_attn.o_proj]
+                # small SP forwards reuse the experts' receive buffers; never set with _sp_use_cutlass (elif below)
+                (
+                    qkv._sp_ag_matmul,
+                    qkv._sp_ag_parity,
+                    qkv._sp_ag_push,
+                    o._sp_a2a_push,
+                ) = sp_ag, i % 2, sp_buffers, sp_buffers
+                layer._sp_ag_next = sp_ag and (sp_ag, (i + 1) % 2)
+                if layer.is_moe_layer:
+                    layer.mlp.sp_gathers, layer.mlp.sp_buffers = True, sp_buffers
+                else:
+                    linears.extend([layer.mlp.gate_up_proj, layer.mlp.down_proj])
+                for linear in linears:
+                    linear._sp_fused_min_tokens = _SP_ASYNC_TP_MIN_TOKENS
+        elif layernorm_sp.layernorm_sp_enabled():
             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
             # path unchanged. Decode never calls the SP participant hooks.
             for layer in self.layers:
@@ -1247,6 +1491,9 @@ class MuseSpark1xModel(nn.Module):
         )
         # Layer indices whose output residual stream feeds the DFLASH draft context.
         self.layers_to_capture: List[int] = []
+        if self.hopper_kernels:
+            # the last layer has no next attention input to stage
+            self.layers[-1]._sp_ag_next = None
 
     def forward(
         self,
@@ -1695,6 +1942,8 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        if layernorm_sp.layernorm_sp_enabled() and _hopper_kernels_enabled():
+            _replicate_sp_o_proj(self.model.language_model.layers)
         for layer in self.model.language_model.layers:
             for residual in (
                 layer.post_attention_residual_gate,
@@ -1713,6 +1962,22 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+        # lazily built, they would fragment the prefill graph pool
+        if _split_bf16_router_supported():
+            for module in self.modules():
+                if (
+                    isinstance(module, MuseSpark1xMoE)
+                    and module.router_in_fp32
+                    and module.gate.weight.dtype == torch.float32
+                ):
+                    with torch.cuda.device(module.gate.weight.device):
+                        module.gate._build_split2()
+        experts = [
+            m.mlp.experts for m in self.model.language_model.layers if m.is_moe_layer
+        ]
+        maybe_prepare_dynamic_guests(
+            [e for e in experts if isinstance(e, MuseSpark1xFp4Experts)]
+        )
 
 
 # Preserve the CUDA implementation and its FlashInfer/JIT optimizations.

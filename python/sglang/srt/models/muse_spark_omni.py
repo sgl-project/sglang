@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import sglang.srt.managers.mm_utils as mm_utils
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
@@ -28,6 +29,9 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.muse_spark import MuseSparkTextForCausalLM
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
@@ -118,6 +122,29 @@ class _RMSNormWithoutScale(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return F.rms_norm(value, (value.shape[-1],), None, self.eps)
+
+
+def _sp_embed_rows(lm, ids: torch.Tensor) -> torch.Tensor:
+    """Embeddings with only this rank's SP rows filled (the SP body reads no others)."""
+    g = get_parallel().tp_group
+    r = -(-ids.shape[0] // g.world_size)
+    e, p = lm.embed_tokens, F.pad(ids, (0, r * g.world_size - ids.shape[0]), value=-1)
+    if (b := getattr(lm, "sp_buffers", None)) and (
+        x := b.push_embed(
+            p.long(),
+            e.weight,
+            e.shard_indices.org_vocab_start_index,
+            e.shard_indices.org_vocab_end_index,
+        )
+    ) is not None:
+        out = x.new_empty((p.shape[0], x.shape[1]))
+        out[g.rank_in_group * r :][:r] = lm.embed_norm(x)
+        return out[: ids.shape[0]]
+    partial = e._embed_local_shard(p)
+    out = partial.new_empty(partial.shape)
+    g.reduce_scatter_tensor(shard := out[g.rank_in_group * r :][:r], partial)
+    shard.copy_(lm.embed_norm(shard))
+    return out[: ids.shape[0]]
 
 
 class _NormalizedEmbedding(nn.Module):
@@ -263,6 +290,14 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
                 positions=positions,
             )
 
+        if (
+            input_embeds is None
+            and layernorm_sp.runs_sp(forward_batch.forward_mode, input_ids.shape[0])
+            and self.model.language_model.embed_tokens.tp_size > 1
+            and not is_in_full_prefill_graph()
+            and self.model.language_model.hopper_kernels
+        ):
+            input_embeds = _sp_embed_rows(self.model.language_model, input_ids)
         if input_embeds is None:
             # Breakable prefill graphs capture the multimodal model's inner
             # transformer against a stable input_embeds buffer.  The eager

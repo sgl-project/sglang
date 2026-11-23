@@ -49,6 +49,12 @@ SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   }
 }
 
+// Lamport check of a received 16B or 8B vector, per 4B word like the producer's clear.
+template <typename V>
+SGL_DEVICE bool vector_pending(const V& raw) {
+  return device::distributed::LamportTrait<bf16_t, sizeof(V) / sizeof(bf16_t), /*kAtom=*/4>::has_pos_zero(&raw);
+}
+
 // Spins until every rank's copy of the vector at (row, col) arrived, then clears the slot.
 template <uint32_t kNLocal>
 SGL_DEVICE uint4 take_gathered(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col) {
@@ -65,29 +71,31 @@ SGL_DEVICE uint4 take_gathered(bf16_t* gathered, uint32_t num_rows, uint32_t row
   return raw;
 }
 
-template <int kPacks, int kVectorStride, uint32_t kNLocal>
-SGL_DEVICE uint4
-receive_pack(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col, int pack, uint4 (&cache)[2]) {
-  if (pack % 2 == 0) {
-    if (pack + 1 < kPacks) {
-      const uint32_t next_col = col + kVectorStride * kVec;
-      bf16_t* src0 = gathered + ((col / kNLocal) * num_rows + row) * kNLocal + col % kNLocal;
-      bf16_t* src1 = gathered + ((next_col / kNLocal) * num_rows + row) * kNLocal + next_col % kNLocal;
-      bool pending;
-      do {
-        device::ptx::ld_relaxed_16B(cache[0], src0, 0);
-        device::ptx::ld_relaxed_16B(cache[1], src1, 0);
-        pending = Lamport::has_pos_zero(&cache[0]) | Lamport::has_pos_zero(&cache[1]);
-      } while (pending);
-      device::AlignedVector<uint32_t, 4> zero;
-      zero.fill(0);
-      zero.store(src0);
-      zero.store(src1);
-    } else {
-      cache[0] = take_gathered<kNLocal>(gathered, num_rows, row, col);
+// Pack 0 polls every pack of the row at once
+template <int kPacks, int kVectorStride, uint32_t kNLocal, typename V>
+SGL_DEVICE V
+receive_pack(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col, int pack, V (&cache)[kPacks]) {
+  if (pack == 0) {
+    bf16_t* src[kPacks];
+    for (int p = 0; p < kPacks; ++p) {
+      const uint32_t c = col + p * kVectorStride * (sizeof(V) / 2);
+      src[p] = gathered + ((c / kNLocal) * num_rows + row) * kNLocal + c % kNLocal;
     }
+    bool pending;
+    do {
+      pending = false;
+      for (int p = 0; p < kPacks; ++p) {
+        if constexpr (sizeof(V) == 16)
+          device::ptx::ld_relaxed_16B(cache[p], src[p], 0);
+        else
+          device::ptx::ld_relaxed_8B(cache[p], src[p], 0);
+        pending |= vector_pending(cache[p]);
+      }
+    } while (pending);
+    for (int p = 0; p < kPacks; ++p)
+      *reinterpret_cast<V*>(src[p]) = V{};
   }
-  return cache[pack % 2];
+  return cache[pack];
 }
 
 }  // namespace muse_ag_norm
@@ -295,6 +303,8 @@ __global__ void __launch_bounds__(kNumThreads)
     muse_spark_all_gather_norm_residual_row_kernel(const __grid_constant__ muse_ag_norm::Params params) {
   using namespace device;
   using namespace device::norm_residual;
+  // One fp32 vector per thread and pack (Hopper: 4 elements, whole sectors)
+  constexpr int kVec = kFVec, kPairs = kVec / 2, kFParts = 1, kFPairs = kPairs;
 
   constexpr int kPacks = kHidden / (kNumThreads * kVec);
   constexpr int kNumWarps = kNumThreads / kWarpThreads;
@@ -336,7 +346,7 @@ __global__ void __launch_bounds__(kNumThreads)
     F32Vec stream_v[kPacks][kFParts];
     F32Vec alpha_pf[kPreSlots][kFParts], beta_pf[kPreSlots][kFParts];
     BF16Vec pre_w_pf[kPreSlots];
-    uint4 receive_cache[2];
+    std::conditional_t<kVec == 8, uint4, uint2> receive_cache[kPacks];
 
     float sum_sq = 0.0f;
 #pragma unroll
@@ -364,7 +374,12 @@ __global__ void __launch_bounds__(kNumThreads)
         for (int q = 0; q < kPairs; ++q)
           post_w[p][q] = cast<fp32x2_t>(weight_v[q]);
       }
-      const uint4 raw = muse_ag_norm::receive_pack<kPacks, kNumThreads, kNLocal>(
+    }
+    // all local operands are in flight before the first poll
+#pragma unroll
+    for (int p = 0; p < kPacks; ++p) {
+      const int idx = threadIdx.x + p * kNumThreads;
+      const auto raw = muse_ag_norm::receive_pack<kPacks, kNumThreads, kNLocal>(
           gathered, params.num_rows, row, idx * kVec, p, receive_cache);
       const auto& branch_v = *reinterpret_cast<const BF16Vec*>(&raw);
 #pragma unroll
