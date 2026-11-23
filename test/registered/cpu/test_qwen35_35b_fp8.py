@@ -24,7 +24,7 @@ BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 BASE_ARGS = CPU_BASE_ARGS
 
 
-class TestQwen35_35BFPS8Xeon(unittest.TestCase):
+class TestQwen35_35BFP8Xeon(unittest.TestCase):
     """Qwen3.5-35B-A3B-FP8 on Xeon."""
 
     def test_qwen35_35b_fp8(self):

@@ -77,7 +77,7 @@ def generate_markdown_report(
     summary = f"### {model_header}\n"
 
     if include_latency_breakdown:
-        summary += "| batch size | input len | output len | perf latency (s) | FTL (s) | ITL (ms) | first token throughput (tok/s) | next token throughput (tok/s) | acc latency (s) |\n"
+        summary += "| batch size | input len | output len | perf latency (s) | FTL (s) | ITL (ms) | input throughput (tok/s) | next token throughput (tok/s) | acc latency (s) |\n"
         summary += "| ---------- | --------- | ---------- | ---------------- | ------- | -------- | ------------------------------ | ----------------------------- | --------------- |\n"
     else:
         summary += "| batch size | input len | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |\n"
