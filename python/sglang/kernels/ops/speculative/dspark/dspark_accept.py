@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _dflash_top_p_renorm_prob,
@@ -122,9 +123,7 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    plain = (
-        not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
-    )
+    plain = not need_truncated_sampling(sampling_info)
     if (
         _SPLIT_ACCEPT
         and plain
@@ -168,7 +167,7 @@ def _accept_sampling_core(
         else:
             cap_trim_lens = torch.zeros_like(correct_len)
         return correct_len, cap_trim_lens, accept_index, predicts
-    if not sampling_info.need_top_k_sampling:
+    if not sampling_info.need_top_k_sampling and not sampling_info.need_min_p_sampling:
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
@@ -610,7 +609,7 @@ def softmax_temp_flashinfer(
             "softmax_temp_flashinfer requires flashinfer.sampling.softmax, "
             "which is unavailable in this environment"
         )
-    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    num_rows = logits.shape[0]
     bs = num_rows // rows_per_request
     assert bs * rows_per_request == num_rows, (
         f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
