@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
+logger = logging.getLogger(__name__)
+
 _PARAMS_BYTES = 2  # bf16 — Ascend's Dispatch & Combine does not support fp16
 
 
@@ -107,7 +109,7 @@ def forward_fuseep(
 
 @lru_cache(maxsize=128)
 def _log_mega_moe_geometry(rows: int, hidden: int, capacity: int, ep: int, tp: int):
-    logging.getLogger(__name__).info(
+    logger.info(
         "A3 MegaMoE input_shape=(%d, %d) dispatch_capacity=%d ep_size=%d moe_tp_size=%d",
         rows,
         hidden,
@@ -209,7 +211,7 @@ def _check_mega_moe_support():
         from deep_ep.buffer import FuseMode
         from deep_ep.strategies import fused_strategy
 
-        arguments = inspect.signature(Buffer.fused_deep_moe).parameters
+        buffer_signature = inspect.signature(Buffer.fused_deep_moe)
         for name, module, package in (
             ("deep_ep", deep_ep, "deep-ep"),
             ("cann_ops_transformer", cann_ops_transformer, "cann-ops-transformer"),
@@ -218,14 +220,9 @@ def _check_mega_moe_support():
                 version = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 version = getattr(module, "__version__", None)
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "MegaMoE package %s: path=%s version=%s", name, module.__file__, version
             )
-        logging.getLogger(__name__).warning(
-            "MegaMoE signatures: fused_deep_moe%s mega_moe%s",
-            inspect.signature(Buffer.fused_deep_moe),
-            inspect.signature(mega_moe),
-        )
         required = {
             "fuse_mode",
             "quant_mode",
@@ -235,7 +232,9 @@ def _check_mega_moe_support():
             "l1_bias",
             "l2_bias",
         }
-        if int(FuseMode.MEGA_MOE) != 3 or not required.issubset(arguments):
+        if int(FuseMode.MEGA_MOE) != 3 or not required.issubset(
+            buffer_signature.parameters
+        ):
             raise RuntimeError("DeepEP does not expose the current MegaMoE API")
         if not callable(mega_moe) or not callable(get_symm_buffer_for_mega_moe):
             raise RuntimeError("ops-transformer does not expose MegaMoE")
@@ -254,15 +253,13 @@ def _check_mega_moe_support():
                 "path": cann_ops_transformer.__file__,
                 "version": getattr(cann_ops_transformer, "__version__", None),
             },
-            "fused_deep_moe_signature": str(inspect.signature(Buffer.fused_deep_moe)),
+            "fused_deep_moe_signature": str(buffer_signature),
             "mega_moe_signature": str(operator_signature),
             "strategy_path": fused_strategy.__file__,
-            "operator_keywords": sorted(keywords),
+            "operator_keywords": keywords,
             "legacy_swiglu_adapter": compatible_operator is not mega_moe,
         }
-        logging.getLogger(__name__).warning(
-            "MegaMoE dependencies: %s", json.dumps(diagnostic)
-        )
+        logger.warning("MegaMoE dependencies: %s", json.dumps(diagnostic))
     except (
         ImportError,
         AttributeError,
@@ -357,7 +354,8 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
             source[prefix] = weight.data, None, None
             continue
         if (
-            scale.dtype != torch.float32
+            scale is None
+            or scale.dtype != torch.float32
             or tuple(scale.shape) != (experts, channels, 1)
             or scale.device != weight.device
             or not torch.isfinite(scale).all().item()
@@ -488,10 +486,11 @@ def _scale_from_float_to_int64(scale: torch.Tensor) -> torch.nn.Parameter:
 
 def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
     """Prepare a FuseEP projection; mode 3 converts both projections together."""
-    if get_exec().moe.fuseep_mode == 3:
+    mode = get_exec().moe.fuseep_mode
+    if mode == 3:
         _process_mega_moe_weights(layer)
         return
-    if get_exec().moe.fuseep_mode == 1:
+    if mode == 1:
         # -- The fused MoE optimization mode "1": dispatch_gmm_combine_decode --
         if weight_prefix == "w13":
             cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
@@ -508,7 +507,7 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
             layer.w2_weight_scale = torch.nn.Parameter(
                 w2_scale.to(torch.float32), requires_grad=False
             )
-    elif get_exec().moe.fuseep_mode == 2:
+    elif mode == 2:
         # -- The fused MoE optimization mode "2": dispatch_ffn_combine --
         if weight_prefix == "w13":
             w13_weight = _release_weight_cache(layer.w13_weight)
