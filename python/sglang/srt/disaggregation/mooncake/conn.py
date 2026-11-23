@@ -377,11 +377,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        enable_custom_mem_pool, custom_mem_pool_type = (
+        self.enable_custom_mem_pool, self.custom_mem_pool_type = (
             check_mooncake_custom_mem_pool_enabled()
         )
         _validate_efa_allocator_compatibility(
-            enable_custom_mem_pool, custom_mem_pool_type
+            self.enable_custom_mem_pool, self.custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
@@ -468,9 +468,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for _ in range(transfer_queue_size)
             ]
-            self.enable_custom_mem_pool, self.custom_mem_pool_type = (
-                check_mooncake_custom_mem_pool_enabled()
-            )
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -519,6 +516,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    def _uses_tcp_for_aux(self) -> bool:
+        return (
+            self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
+        ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get()
+
     def _kv_args_registrations(self) -> List[Registration]:
         """KV, aux and state buffers; the transport dedups regions the unified
         pool reports as both KV and mamba state."""
@@ -534,6 +536,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.kv_args.state_data_lens or [],
             )
         )
+        aux_over_tcp = self._uses_tcp_for_aux()
         return [
             Registration(
                 key=key,
@@ -542,6 +545,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 device=-1 if key.kind == BufferKind.AUX else self.kv_args.gpu_id,
             )
             for key, ptr in keyed_ptrs
+            if key.kind != BufferKind.AUX or not aux_over_tcp
         ]
 
     def register_buffer_to_engine(self):
@@ -2349,9 +2353,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_aux_item_lens: Optional[List[int]],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-        if (
-            self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"
-        ) or envs.SGLANG_MOONCAKE_SEND_AUX_TCP.get():
+        if self._uses_tcp_for_aux():
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         prefill_aux_item_lens = self.kv_args.aux_item_lens
