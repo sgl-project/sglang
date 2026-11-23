@@ -33,7 +33,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsUnifiedActionContract,
     load_unified_normalizer,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -48,7 +47,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_decode_quality,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -860,7 +861,7 @@ class CausalDecodeQueue:
         self, vae: Any, *, device: torch.device, quality: str = "exact"
     ) -> None:
         self.vae = vae
-        self.fast_path = quality_allows(quality, "lossless")
+        self.quality = quality
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
@@ -898,7 +899,7 @@ class CausalDecodeQueue:
         with (
             torch.cuda.stream(self.stream),
             torch.no_grad(),
-            use_vae_fast_path(self.vae, self.fast_path),
+            use_vae_decode_quality(self.vae, self.quality),
         ):
             video = self.vae.causal_decode(self._denormalize(latents))
             host = torch.empty(

@@ -71,13 +71,14 @@ decode. A plain fp32 single-pass norm fusion looks harmless and is not: on
 ERNIE-Image it moved the 50-step trajectory to PSNR 18.83 dB, which is what
 motivated the bit-exact rewrite.
 
+The Wan2.2/Cosmos3 Winograd Conv3D is approximate: only `quality="high"`
+can use it. See the [CLI reference](../../../../../docs/docs/sglang-diffusion/api/cli.mdx)
+for `--enable-vae-conv3d-winograd` and its hardware defaults.
+
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators,
 and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
-
-`--enable-vae-conv3d-winograd` replaces eligible Conv3D operations with Winograd
-convolution in the VAE decoder shared by Wan2.2 and Cosmos3.
 
 Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
 also enables it for default-stream inference, retaining the same per-signature

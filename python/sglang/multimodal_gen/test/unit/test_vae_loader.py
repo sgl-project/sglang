@@ -57,6 +57,8 @@ from sglang.test.test_utils import CustomTestCase
 class _FakeServerArgs:
     def __init__(self, pipeline_config, num_gpus=1):
         self.pipeline_config = pipeline_config
+        self.enable_vae_conv3d_winograd = None
+        self.performance_mode = "auto"
         self.num_gpus = num_gpus
         self.model_paths = {}
         self.revision = "test-revision"
@@ -733,6 +735,37 @@ class TestVAELoader(unittest.TestCase):
 
         self.assertNotIn("latents_mean", loaded)
         self.assertNotIn("latents_std", loaded)
+
+    def test_winograd_auto_policy_and_overrides(self):
+        fast = FastWan2_2_TI2V_5B_Config
+        cases = (
+            (fast, 1, "speed", True, 140, None, True),
+            (fast, 1, "speed", True, 80, None, False),
+            (fast, 1, "speed", False, 180, None, False),
+            (fast, 2, "speed", True, 140, None, False),
+            (fast, 1, "memory", True, 140, None, False),
+            (Cosmos3Config, 1, "speed", True, 140, None, False),
+            (fast, 1, "speed", True, 140, False, False),
+            (Cosmos3Config, 2, "speed", False, 96, True, True),
+        )
+        for config, gpus, mode, hopper, gib, override, expected in cases:
+            args = _FakeServerArgs(config(), gpus)
+            args.performance_mode = mode
+            args.enable_vae_conv3d_winograd = override
+            with (
+                self.subTest(
+                    config=config, gpus=gpus, mode=mode, gib=gib, override=override
+                ),
+                patch.object(
+                    vae_loader.current_platform, "is_hopper", return_value=hopper
+                ),
+                patch.object(torch.cuda, "current_device", return_value=0),
+                patch.object(torch.cuda, "get_device_properties") as props,
+            ):
+                props.return_value.total_memory = gib * 1024**3
+                self.assertEqual(
+                    vae_loader._should_enable_vae_conv3d_winograd(args), expected
+                )
 
     def test_channels_last_3d_cuda_model_defaults(self):
         cases = [

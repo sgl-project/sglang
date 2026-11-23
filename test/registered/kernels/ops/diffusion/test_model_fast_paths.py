@@ -155,6 +155,7 @@ from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
+    use_vae_decode_quality,
     use_vae_fast_path,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
@@ -1372,9 +1373,12 @@ def test_wan_winograd_conv3d_dispatch():
     layer = vae.decoder.mid_block.resnets[0].conv1.to(
         device="cuda", dtype=torch.bfloat16, memory_format=torch.channels_last_3d
     )
-    with patch.object(
-        diffusion, "try_winograd_conv3d", wraps=diffusion.try_winograd_conv3d
-    ) as run:
+    with (
+        use_vae_decode_quality(vae, "high"),
+        patch.object(
+            diffusion, "try_winograd_conv3d", wraps=diffusion.try_winograd_conv3d
+        ) as run,
+    ):
         for width, offloaded, expected_paths in [
             (10, True, []),
             (10, False, [False, True]),
@@ -1408,7 +1412,10 @@ def test_wan_winograd_conv3d_weight_reload():
     with torch.inference_mode(False), torch.no_grad():
         layer.weight.data = layer.weight.clone()
     x = torch.randn((1, 16, 1, 8, 12), device="cuda", dtype=torch.bfloat16)
-    with patch.object(winograd, "_pack_weight", wraps=winograd._pack_weight) as pack:
+    with (
+        use_vae_decode_quality(layer, "high"),
+        patch.object(winograd, "_pack_weight", wraps=winograd._pack_weight) as pack,
+    ):
         before = layer(x, skip_bias=True)
         assert torch.equal(layer(x, skip_bias=True), before)
         assert pack.call_count == 1
@@ -1416,6 +1423,46 @@ def test_wan_winograd_conv3d_weight_reload():
         _load_weights_into_module(layer, [("weight", torch.zeros_like(layer.weight))])
         assert not layer(x, skip_bias=True).count_nonzero()
         assert pack.call_count == 2
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Winograd Conv3D requires CUDA")
+@torch.inference_mode()
+def test_wan_winograd_decode_frame_and_temporal_accuracy():
+    torch.manual_seed(42)
+    config = wanvae.WanVAEConfig()
+    config.update_model_arch({"base_dim": 8, "is_residual": True})
+    vae = wanvae.AutoencoderKLWan(config).eval().to("cuda", torch.bfloat16)
+    for m in vae.modules():
+        if isinstance(m, nn.Conv3d):
+            m.weight.data = m.weight.data.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+    wan_vae_cuda_opt.maybe_optimize_wan_vae(vae)
+    z = _wan_cl3d((1, vae.z_dim, 5, 4, 6), torch.bfloat16)
+    z[:, :, 1] = z[:, :, 0]  # stationary segment, followed by motion
+    ref = {}
+    for quality in ("exact", "lossless", "high"):
+        with use_vae_decode_quality(vae, quality):
+            ref[quality] = vae.decode(z)
+
+    vae.enable_conv3d_winograd()
+    probe = vae.decoder.mid_block.resnets[0].conv1
+    for index, quality in enumerate(("exact", "lossless", "high", "lossless", "exact")):
+        with use_vae_decode_quality(vae, quality):
+            actual = vae.decode(z)
+        if quality != "high":
+            if index < 2:
+                assert not hasattr(probe.weight, "_winograd_weights")
+            assert torch.equal(actual, ref[quality])
+            continue
+        assert probe.weight._winograd_weights  # no silent fallback
+        # RGB is in [-1, 1]. Bound the worst frame and the change in the
+        # error between every adjacent pair, including causal chunk edges.
+        error = (actual.float() - ref[quality].float()) / 2
+        assert error.shape[2] == 17
+        for residual in (error, error.diff(dim=2)):
+            rmse = residual.square().mean(dim=(0, 1, 3, 4)).sqrt()
+            assert rmse.max() < 0.01, rmse  # 40 dB relative to full RGB range
 
 
 @torch.no_grad()

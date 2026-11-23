@@ -58,6 +58,9 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    approximate_decode_enabled,
+)
 from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -349,6 +352,7 @@ class WanCausalConv3d(nn.Conv3d):
         weight = self.weight
         if (
             self._use_winograd
+            and approximate_decode_enabled()
             and not getattr(weight, "_sglang_layerwise_offloaded", False)
             and torch.version.cuda is not None
             and weight.is_cuda

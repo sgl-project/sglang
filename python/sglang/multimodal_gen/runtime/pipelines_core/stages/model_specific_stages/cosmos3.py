@@ -26,7 +26,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
-from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.conditioning import (
     _inference_cache,
@@ -51,7 +50,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
-    use_vae_fast_path,
+    use_vae_decode_quality,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
@@ -2750,10 +2749,7 @@ class Cosmos3DecodingStage(PipelineStage):
             with self.use_declared_component(component_name="vae", module=self.vae):
                 with (
                     torch.no_grad(),
-                    use_vae_fast_path(
-                        self.vae,
-                        quality_allows(batch.sampling_params.quality, "lossless"),
-                    ),
+                    use_vae_decode_quality(self.vae, batch.sampling_params.quality),
                 ):
                     try:
                         decoded = self._decode_latents(batch.latents, on_frames=stream)

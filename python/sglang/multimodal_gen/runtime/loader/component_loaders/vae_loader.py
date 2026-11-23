@@ -15,7 +15,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineCon
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_2_TI2V_5B_Config,
+    WanT2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -132,6 +135,20 @@ def _convert_conv3d_weights_to_channels_last_3d(
                 # Best-effort; skip unsupported cases.
                 continue
     return num_converted
+
+
+def _should_enable_vae_conv3d_winograd(server_args: ServerArgs) -> bool:
+    if server_args.enable_vae_conv3d_winograd is not None:
+        return server_args.enable_vae_conv3d_winograd
+    # Only auto-enable the measured FastWan deployment: Winograd costs extra VRAM.
+    return (
+        isinstance(server_args.pipeline_config, FastWan2_2_TI2V_5B_Config)
+        and server_args.num_gpus == 1
+        and server_args.performance_mode != "memory"
+        and current_platform.is_hopper()
+        and torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        >= 128 * 1024**3
+    )
 
 
 def _should_use_channels_last_3d(
@@ -717,10 +734,11 @@ class VAELoader(WeightOverrideComponentLoader):
             vae_dtype,
             torch.device("meta") if stream_checkpoint else None,
         )
-        if getattr(server_args, "enable_vae_conv3d_winograd", False):
-            enable_winograd = getattr(vae, "enable_conv3d_winograd", None)
-            if enable_winograd is not None:
-                enable_winograd()
+        enable_winograd = getattr(vae, "enable_conv3d_winograd", None)
+        if enable_winograd is not None and _should_enable_vae_conv3d_winograd(
+            server_args
+        ):
+            enable_winograd()
         if configure_checkpoint is not None:
             configure_checkpoint(vae)
         if not stream_checkpoint:
