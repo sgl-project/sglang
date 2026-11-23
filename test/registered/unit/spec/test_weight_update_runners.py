@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -9,6 +10,11 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 maybe_stub_sgl_kernel()
 
+from sglang.srt.speculative import eagle_worker_v2
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
@@ -95,6 +101,51 @@ class TestWeightUpdateRunners(CustomTestCase):
                 self.assertEqual(
                     [(role, runners.index(r)) for role, r in got], expected
                 )
+
+
+class TestEagleAdaptiveGraphRelease(CustomTestCase):
+    def test_every_adaptive_state_is_released_once(self):
+        """Each adaptive step state captures its own draft, verify and
+        draft-extend graphs, and only the active verify runner is the target's.
+        Releasing just the target's runners left the other states' graphs alive
+        past the distributed teardown."""
+        released = []
+        runners = {}
+
+        def state(steps):
+            names = [f"draft{steps}", f"verify{steps}", f"extend{steps}"]
+            for name in names:
+                runners[name] = SimpleNamespace(name=name)
+            return SpecRuntimeState(
+                speculative_num_steps=steps,
+                speculative_num_draft_tokens=steps + 1,
+                draft_attn_backend=None,
+                cuda_graph_runner=runners[names[0]],
+                target_attn_backend=None,
+                target_graph_runner=runners[names[1]],
+                draft_extend_attn_backend=None,
+                cuda_graph_runner_for_draft_extend=runners[names[2]],
+            )
+
+        controller = AdaptiveController(worker=None, policy=None)
+        controller.register(state(1))
+        controller.register(state(3))
+        target = SimpleNamespace(
+            model_runner=SimpleNamespace(decode_cuda_graph_runner=runners["verify1"])
+        )
+        target.release_cuda_graphs = lambda: released.append("verify1")
+        worker = _bare(
+            EAGLEWorkerV2, _target_worker=target, adaptive_controller=controller
+        )
+
+        with patch.object(
+            eagle_worker_v2,
+            "release_graph_runners",
+            lambda runners: released.extend(r.name for r in runners),
+        ):
+            worker.release_cuda_graphs()
+
+        self.assertCountEqual(released, list(runners))
 
 
 if __name__ == "__main__":

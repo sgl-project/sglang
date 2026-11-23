@@ -42,6 +42,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+    release_graph_runners,
+)
 from sglang.srt.model_executor.runner import (
     BaseRunner,
     DecodeCudaGraphRunner,
@@ -2161,6 +2164,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
         return state
+
+    def release_cuda_graphs(self) -> None:
+        active_verify_runner = self._target_worker.model_runner.decode_cuda_graph_runner
+        super().release_cuda_graphs()
+        if self.adaptive_controller is not None:
+            # Every adaptive step keeps its own draft and verify graphs; the
+            # active verify runner was the target's and is already freed.
+            release_graph_runners(
+                runners=[
+                    runner
+                    for runner in self.adaptive_controller.graph_runners()
+                    if runner is not active_verify_runner
+                ]
+            )
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""

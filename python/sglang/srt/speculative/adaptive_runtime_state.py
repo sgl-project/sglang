@@ -100,6 +100,18 @@ class AdaptiveController:
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
 
+    def graph_runners(self) -> list:
+        """The graph runners of every registered state, active or not."""
+        return [
+            runner
+            for state in self._states.values()
+            for runner in (
+                state.cuda_graph_runner,
+                state.target_graph_runner,
+                state.cuda_graph_runner_for_draft_extend,
+            )
+        ]
+
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps."""
         self.params.set_cuda_graph_bs(cuda_graph_bs)

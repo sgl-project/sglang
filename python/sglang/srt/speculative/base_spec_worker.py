@@ -290,6 +290,11 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
+    def release_cuda_graphs(self) -> None:
+        """Free the captured graphs this worker replays, before distributed
+        teardown. Default: the target's."""
+        self.target_worker.release_cuda_graphs()
+
     def clear_cache_pool(self):
         """Default no-op: the allocator and kv cache pool are shared with the
         target worker and cleared by the scheduler."""
