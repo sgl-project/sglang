@@ -20,6 +20,8 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -54,6 +56,8 @@ logger = init_logger(__name__)
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
+    StartProfileReq,
+    StopProfileReq,
     SetLoraReq,
     MergeLoraWeightsReq,
     UnmergeLoraWeightsReq,
@@ -378,6 +382,8 @@ class AsyncSchedulerClient:
                 endpoints[replica], batch, timeout_ms
             )
         self.request_logger.log_finished_request(batch, output_batch)
+        if isinstance(output_batch, OutputBatch) and output_batch.fatal_error:
+            self.mark_failed(output_batch.fatal_error)
         return output_batch
 
     async def _forward_one(

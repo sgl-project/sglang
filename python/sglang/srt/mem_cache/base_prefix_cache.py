@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (
@@ -37,6 +38,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -580,6 +582,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """A context in which checkpointing the unfinished ``reqs`` takes the
+        state slots it needs from one take made ahead; nothing here."""
+        return nullcontext()
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
@@ -927,6 +934,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Whether a request's prefix stays in the cache for other requests to
         share, including after the request finishes."""
         return True
+
+    def forwards_kv_hints(self) -> bool:
+        """Whether request ``kv_hints`` reach an attached storage backend."""
+        return False
+
+    def forwards_kv_hint_actions(self, kv_hints: Optional[KvHintsEnvelope]) -> bool:
+        """Whether this request's ``kv_hints`` would reach the storage backend."""
+        return (
+            kv_hints is not None and bool(kv_hints.actions) and self.forwards_kv_hints()
+        )
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()

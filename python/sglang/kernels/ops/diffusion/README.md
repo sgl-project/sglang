@@ -41,6 +41,7 @@ quantization/ FP8 rowwise producers fused into the GEMM input path
 attention/   sparse linear attention, gated delta-net
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
+conv/        convolutions in a library solver's accumulation order (MIOpen replicas)
 common/      platform predicates, non-Triton fallbacks, cached Triton launches (numerics: kernels/numerics.py)
 sites/       request-scoped mount policy — NOT kernels (see below)
 ext/         JIT C++/CUDA extensions (Hunyuan3D raster/inpaint) — NOT kernels
@@ -168,6 +169,7 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
+| `rmsnorm_mean_square_bitexact` | Triton | ATen-ordered `x.float().square().mean(-1, keepdim=True)` | BF16 head-64/128 views or contiguous width 4096, at least 16 rows and fewer than 2^29 elements; Nomas DiT/VAE, verified against the live reference per reduction layout |
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
 | `wan_rmsnorm_silu` | Triton | close | dense `channels_last_3d` 5D (`stride(C) == 1`), Wan VAE channel-first RMSNorm + SiLU; `[ROWS, C]` tiles (~3 TB/s at C = 96); optional `conv_bias` folds the preceding conv's bias with aten `add_` arithmetic |
