@@ -191,7 +191,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
@@ -556,7 +555,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             fly=self._fly,
         )
 
-        self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
 
         self._observers = DsparkStepObservers(
@@ -754,7 +752,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
             return
-        self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
