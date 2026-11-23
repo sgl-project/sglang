@@ -4,7 +4,7 @@ from typing import Any, List, Optional, Union
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field
 
-from sglang.multimodal_gen.registry import get_model_info, get_pipeline_class
+from sglang.multimodal_gen.registry import get_served_pipeline_class
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -46,18 +46,6 @@ class DiffusionModelCard(ModelCard):
     vae_precision: Optional[str] = None
     pipeline_name: Optional[str] = None
     pipeline_class: Optional[str] = None
-
-
-def get_served_pipeline_class(server_args: ServerArgs):
-    """Resolve discovery metadata using the same explicit pipeline as serving."""
-    if server_args.pipeline_class_name:
-        return get_pipeline_class(server_args.pipeline_class_name)
-    model_info = get_model_info(
-        server_args.model_path,
-        backend=server_args.backend,
-        model_id=server_args.model_id,
-    )
-    return model_info.pipeline_cls if model_info else None
 
 
 def _build_model_card(

@@ -9,9 +9,11 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutStreamData,
     RolloutTrajectoryData,
 )
 
@@ -220,18 +222,22 @@ class MiniMaxH3RolloutCollector:
             per_step = sums.squeeze(-1) / counts.squeeze(-1).clamp(min=1.0)
             log_probs = per_step.unsqueeze(0)
         return RolloutTrajectoryData(
-            rollout_log_probs=log_probs,
             denoising_env=RolloutDenoisingEnv(
                 pos_cond_kwargs=self.pos_cond_kwargs,
             ),
-            dit_trajectory=RolloutDitTrajectory(
-                latents=stacked,
-                timesteps=timesteps,
-                sigmas=sigmas,
-                latent_step_indices=torch.tensor(
-                    self.latent_step_indices, dtype=torch.long
-                ),
-            ),
+            streams={
+                PRIMARY_STREAM: RolloutStreamData(
+                    rollout_log_probs=log_probs,
+                    dit_trajectory=RolloutDitTrajectory(
+                        latents=stacked,
+                        timesteps=timesteps,
+                        sigmas=sigmas,
+                        latent_step_indices=torch.tensor(
+                            self.latent_step_indices, dtype=torch.long
+                        ),
+                    ),
+                )
+            },
         )
 
 

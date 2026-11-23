@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
 )
+from sglang.multimodal_gen.configs.post_training.rl_rollout import AUDIO_STREAM
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23HQSamplingParams
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -444,6 +445,7 @@ class _BaseLTX2Pipeline(LoRAPipeline):
 class LTX2Pipeline(_BaseLTX2Pipeline):
     # Must match model_index.json `_class_name`.
     pipeline_name = "LTX2Pipeline"
+    supported_rollout_extra_streams = frozenset({AUDIO_STREAM})
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         _add_ltx2_front_stages(self)

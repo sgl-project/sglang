@@ -259,9 +259,7 @@ async def get_models(request: Request):
         Use /v1/models instead for OpenAI-compatible model discovery.
         This endpoint will be removed in a future version.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
-        get_served_pipeline_class,
-    )
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     server_args: ServerArgs = request.app.state.server_args
     pipeline_cls = get_served_pipeline_class(server_args)
@@ -310,9 +308,7 @@ async def model_info_endpoint(request: Request):
     Returns fields compatible with the LLM engine's /model_info so that
     the model gateway can detect capabilities for diffusion workers.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
-        get_served_pipeline_class,
-    )
+    from sglang.multimodal_gen.registry import get_served_pipeline_class
 
     server_args: ServerArgs = request.app.state.server_args
     task_type = server_args.pipeline_config.task_type

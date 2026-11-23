@@ -2,6 +2,7 @@ import dataclasses
 from dataclasses import field
 from typing import Any
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import AUDIO_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
@@ -42,6 +43,11 @@ class LTX2SamplingParams(SamplingParams):
         "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
         "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
+
+    def _validate(self) -> None:
+        super()._validate()
+        if AUDIO_STREAM in self.rollout_extra_streams and not self.generate_audio:
+            raise ValueError("Audio rollout requires generate_audio=True")
 
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
