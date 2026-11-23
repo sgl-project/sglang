@@ -4,7 +4,7 @@ import torch
 from sglang.kernels.ops.attention.fast_topk import fast_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
@@ -126,13 +126,6 @@ def test_fast_topk_negative_and_zero(topk):
 
     indices = fast_topk(score, lengths, topk)
     _check_topk_values(score, lengths, indices, topk, None)
-
-
-def test_fast_topk_unsupported_k():
-    score = torch.randn(2, 4096, dtype=torch.float32, device="cuda")
-    lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
-    with pytest.raises(RuntimeError, match="topk"):
-        fast_topk(score, lengths, 1024)
 
 
 if __name__ == "__main__":

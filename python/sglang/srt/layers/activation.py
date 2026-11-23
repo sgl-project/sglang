@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -43,9 +44,8 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
-    set_weight_attrs,
 )
-from sglang.utils import resolve_obj_by_qualname
+from sglang.srt.utils.common import dynamic_import
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -212,7 +212,7 @@ class SituAndMul(BaseFusedOp):
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        from sgl_kernel_npu.activation.situ import situ_and_mul
+        from sgl_kernel_npu.operators.activation import situ_and_mul
 
         return situ_and_mul(x)
 
@@ -289,6 +289,10 @@ class ReLU2(BaseFusedOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return relu2(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # The JIT relu2 kernel is CUDA-only and not imported on ROCm.
+        return self.forward_native(x)
 
 
 class QuickGELU(BaseFusedOp):
@@ -499,7 +503,7 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
             "Loading of activation functions is restricted to "
             "torch.nn.modules for security reasons"
         )
-        return resolve_obj_by_qualname(function_name)()
+        return dynamic_import(function_name)()
     else:
         # adapt bge-reranker
         return nn.Identity()

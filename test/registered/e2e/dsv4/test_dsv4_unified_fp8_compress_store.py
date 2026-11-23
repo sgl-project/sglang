@@ -16,12 +16,12 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV4_FP8_NOPE_ROW_BYTES,
     DSV4_FP8_QUANT_TILE,
@@ -32,7 +32,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # the kernel takes E4M3FN vs E4M3FNUZ from the arch and the two-pool layout is only
 # ever allocated on gfx95, so on the default mi300 runner every case here would skip
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = torch.device("cuda")
 

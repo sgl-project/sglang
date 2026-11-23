@@ -8,32 +8,40 @@
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
-// DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
-// enabled on this model. EP is set equal to TP on every shape except MI355X.
+// DP-Attention, DeepEP and MegaMoE are absent by design. DeepEP and MegaMoE have
+// never been enabled on this model; DP-Attention runs in the MI355X agentic recipe
+// (cookbook §3.6). EP is set equal to TP on every shape except MI355X.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtx6000"],
 
-  // Hardware is the implicit first match dim; Strategy is the only other one.
-  // Declaring matchDims replaces variants / quantizations / nodesOptions
-  // wholesale, which drops three rows that each had exactly one option.
-  matchDims: [
-    {
-      id: "strategy",
-      title: "Strategy",
-      options: [
-        { id: "low-latency",     label: "Low-Latency"     },
-        { id: "high-throughput", label: "High-Throughput" },
-      ],
-    },
+  // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared catalog.
+  hardware: [
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+  ],
+
+  variants: [
+    { id: "flash", label: "DeepSeek-V4.1-Flash" },
+    { id: "flash-1017", label: "DeepSeek-V4.1-Flash-1017" },
+  ],
+  quantizations: [
+    { id: "fp4", label: "FP4" },
+  ],
+  strategies: [
+    { id: "low-latency", label: "Low-Latency" },
+    { id: "high-throughput", label: "High-Throughput" },
+  ],
+  nodesOptions: [
+    { id: "single", label: "Single Node" },
   ],
 
   modelNames: {
-    default: "deepseek-ai/DeepSeek-V4.1-Flash",
+    "flash|fp4": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "flash-1017|fp4": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
   },
 
   placeholders: {
@@ -49,13 +57,13 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
-    // DeepSeek-V4.1 support has not shipped in a CUDA release yet; the ROCm
-    // images carry it from v0.5.21.
-    h200:  "lmsysorg/sglang:dev-dsv41",
-    b200:  "lmsysorg/sglang:dev-dsv41",
-    b300:  "lmsysorg/sglang:dev-dsv41",
-    gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006",
+    h200:  "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
+    // First nightly with #45261, which SM120 needs to start this model.
+    rtx6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
   },
 
   github: {
@@ -97,7 +105,6 @@ export const config = {
     },
 
     pdDisagg: {
-      incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -114,10 +121,10 @@ export const config = {
       router: {
         port: 8000,
         command:
-`sglang-router launch \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}}`,
       },
     },
@@ -157,7 +164,8 @@ export const config = {
         options: [
           { id: "off", label: "Off (default)" },
           { id: "on", label: "On (larger KV pool)",
-            env: ["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"] },
+            stripPrefixes: ["--engram-config"],
+            flags: ["--engram-config '{\"placement\": \"cpu\"}'"] },
         ],
       },
       {
@@ -165,9 +173,9 @@ export const config = {
         title: "Decoder SWA Bounded Replay",
         control: "select",
         options: [
-          { id: "off", label: "Off (default)" },
-          { id: "on", label: "On (faster prefill)",
-            flags: ["--enable-decoder-swa-bounded-replay"] },
+          { id: "on", label: "Automatic (default)" },
+          { id: "off", label: "Off (full prefill)",
+            flags: ["--no-enable-decoder-swa-bounded-replay"] },
         ],
       },
     ],
@@ -177,7 +185,7 @@ export const config = {
 
     // ---------- GB300: 4x GB300 (SM103), TP4 + EP4. Reference platform. ----------
     {
-      match: { hw: "gb300", strategy: "low-latency" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -198,7 +206,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "gb300", strategy: "high-throughput" },
+      match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -222,7 +230,7 @@ export const config = {
     // tightest board here at 140 GiB, so both cells also need the memory
     // fraction pulled back; the cap alone still leaves the graphs short. ------
     {
-      match: { hw: "h200", strategy: "low-latency" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -233,7 +241,6 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--attention-backend dsv4",
         "--moe-runner-backend flashinfer_mxfp4",
-        "--enable-decoder-swa-bounded-replay",
         // Decode CUDA graphs: the derived batch list does not fit here.
         "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
@@ -243,7 +250,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "h200", strategy: "high-throughput" },
+      match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -267,7 +274,7 @@ export const config = {
     // ---------- B200: 4x B200, TP4 + EP4. Mirrors the GB300 recipe — the
     // kernels dispatch by architecture family. ----------
     {
-      match: { hw: "b200", strategy: "low-latency" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -287,7 +294,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "b200", strategy: "high-throughput" },
+      match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -306,7 +313,7 @@ export const config = {
     // ---------- B300: 4x B300, TP4 + EP4. Same recipe as GB300 — the kernels
     // dispatch by architecture family. ----------
     {
-      match: { hw: "b300", strategy: "low-latency" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -326,7 +333,7 @@ export const config = {
       ],
     },
     {
-      match: { hw: "b300", strategy: "high-throughput" },
+      match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       nnodes: 1,
       verified: true,
       flags: [
@@ -344,17 +351,241 @@ export const config = {
 
     // ---------- MI355X: 2x MI355X (gfx950), TP2 + EP1.
     {
-      match: { hw: "mi355x", strategy: "low-latency" },
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
       verified: true,
       env: [
-        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
-        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
-        "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--ep-size 1",
+        "--mem-fraction-static 0.85",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        // The monokernel refuses SGLANG_HIP_DSV41_INDEX_K_PAGE8.
+        "--enable-amd-monokernel",
+        "--enforce-shared-experts-fusion",
+        // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
+        // automatic selection resolves to for this model's 32-wide ue8m0 blocks.
+        "--fp8-gemm-backend aiter",
+        "--enable-decoder-swa-bounded-replay",
+        // Decode CUDA graphs: the derived batch list does not fit here; a cap of 64
+        // fits and keeps 64-request decode batches on the graph.
+        "--cuda-graph-max-bs-decode 64",
+        "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "flash", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: true,
+      env: [
+        "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
+        // Non-monokernel point. The monokernel refuses this layout.
+        "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--ep-size 1",
+        "--mem-fraction-static 0.85",
+        // DSpark with graphs up to the running-request cap: 47% more throughput
+        // than plain decode at 256 concurrent requests.
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--enforce-shared-experts-fusion",
+        "--fp8-gemm-backend aiter",
+        "--enable-decoder-swa-bounded-replay",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 128",
+        "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // 1017 reuses the original recipes; GPU validation is pending.
+    {
+      match: { hw: "gb300", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        // The derived value OOMs at 128K shapes while capturing the verify graphs.
+        "--mem-fraction-static 0.8",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        // No speculation: the DSpark step has a fixed cost over a plain decode
+        // step, so it stops paying for itself once the batch is large.
+        "--max-running-requests 256",
+        // Leave the backends alone — they resolve to dsv4 / flashinfer_mxfp4 /
+        // flashinfer_cutedsl. Overriding them is the usual cause of slow decode.
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep-size 8",
+        "--mem-fraction-static 0.8",
+        "--attention-backend dsv4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--enable-decoder-swa-bounded-replay",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep-size 8",
+        "--mem-fraction-static 0.8",
+        "--attention-backend dsv4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--max-running-requests 256",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        "--mem-fraction-static 0.8",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        "--max-running-requests 256",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        "--mem-fraction-static 0.8",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        // Decode CUDA graphs: the derived batch list does not fit here.
+        "--cuda-graph-max-bs-decode 64",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--ep-size 4",
+        "--max-running-requests 256",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: false,
+      env: [
+        "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -375,6 +606,7 @@ export const config = {
         "--cuda-graph-max-bs-decode 64",
         "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -382,15 +614,13 @@ export const config = {
       ],
     },
     {
-      match: { hw: "mi355x", strategy: "high-throughput" },
+      match: { hw: "mi355x", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       nnodes: 1,
-      verified: true,
+      verified: false,
       env: [
-        "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -408,6 +638,44 @@ export const config = {
         "--max-running-requests 128",
         "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ---------- RTX PRO 6000: 8x RTX PRO 6000 Blackwell Server Edition (SM120,
+    // 96 GB, PCIe only), TP8 + EP8. Verified on the 1017 checkpoint only.
+    {
+      match: { hw: "rtx6000", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: true,
+      env: [
+        // No NVLink: let NCCL use PCIe peer-to-peer across the CPU sockets.
+        "NCCL_P2P_LEVEL=SYS",
+        "NCCL_MIN_NCHANNELS=16",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep-size 8",
+        // One host copy of the engram tables per node; the freed HBM goes to KV.
+        "--engram-config '{\"placement\": \"cpu\", \"replication\": \"per_node\"}'",
+        "--enable-deepseek-v4-fp4-indexer",
+        "--context-length 262144",
+        "--mem-fraction-static 0.70",
+        // Faster here than the automatic choice: 21-22% more output tokens/s at
+        // 32 and 128 concurrent requests, 1K in / 1K out.
+        "--fp8-gemm-backend flashinfer_cutlass",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 128",
+        "--chunked-prefill-size 8192",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",

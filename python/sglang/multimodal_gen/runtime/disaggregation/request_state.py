@@ -23,6 +23,9 @@ class RequestState(enum.Enum):
     ENCODER_WAITING = "encoder_waiting"
     ENCODER_RUNNING = "encoder_running"
     ENCODER_DONE = "encoder_done"
+    IMAGE_ENCODER_WAITING = "image_encoder_waiting"
+    IMAGE_ENCODER_RUNNING = "image_encoder_running"
+    IMAGE_ENCODER_DONE = "image_encoder_done"
     DENOISING_WAITING = "denoising_waiting"
     DENOISING_RUNNING = "denoising_running"
     DENOISING_DONE = "denoising_done"
@@ -43,9 +46,13 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     RequestState.ENCODER_WAITING: {RequestState.ENCODER_RUNNING},
     RequestState.ENCODER_RUNNING: {RequestState.ENCODER_DONE},
     RequestState.ENCODER_DONE: {
+        RequestState.IMAGE_ENCODER_WAITING,
         RequestState.DENOISING_WAITING,
         RequestState.DENOISING_RUNNING,
     },
+    RequestState.IMAGE_ENCODER_WAITING: {RequestState.IMAGE_ENCODER_RUNNING},
+    RequestState.IMAGE_ENCODER_RUNNING: {RequestState.IMAGE_ENCODER_DONE},
+    RequestState.IMAGE_ENCODER_DONE: {RequestState.DENOISING_WAITING},
     RequestState.DENOISING_WAITING: {RequestState.DENOISING_RUNNING},
     RequestState.DENOISING_RUNNING: {
         RequestState.DENOISING_WAITING,
@@ -66,14 +73,10 @@ class RequestRecord:
     request_id: str
     state: RequestState = RequestState.PENDING
     submit_time: float = field(default_factory=time.monotonic)
-    last_transition_time: float = field(default_factory=time.monotonic)
     encoder_instance: int | None = None
     denoiser_instance: int | None = None
     decoder_instance: int | None = None
     error: str | None = None
-
-    def elapsed_s(self) -> float:
-        return time.monotonic() - self.submit_time
 
     def is_terminal(self) -> bool:
         return self.state in _TERMINAL_STATES
@@ -130,7 +133,6 @@ class RequestTracker:
                 )
 
             record.state = new_state
-            record.last_transition_time = time.monotonic()
             if self._metrics is not None:
                 if new_state == RequestState.ENCODER_RUNNING:
                     self._metrics.dispatch(request_id)

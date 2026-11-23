@@ -6,6 +6,10 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
+    mqa_logits_static_budget_bytes,
+)
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -20,7 +24,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.common import ceil_div
 
 logger = logging.getLogger(__name__)
@@ -69,9 +73,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     """Whether this runtime can serve the gfx950 fused indexer: aiter with
     preshuffled paged MQA, and kernels that build.
 
-    Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
-    first. Every decline here is therefore a configuration or toolchain error;
-    it is logged, as a warning when the path was asked for by name."""
+    Reached only on gfx950, since gfx950_fused_indexer.supported_hardware() is
+    evaluated first. Every decline here is therefore a configuration or toolchain
+    error; it is logged, as a warning when the path was asked for by name."""
     from sglang.srt.runtime_context import get_exec
 
     requested = get_exec().kernel.enable_dsa_fused_indexer
@@ -87,9 +91,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
         log("gfx950 fused DSA indexer disabled: %s", reason)
         return False
 
-    # No hardware term here: fused_decode.supported_hardware() is the hardware
-    # half of the gate and runs first, so anything reaching this point is
-    # already on gfx950. What is left is what a deployment can get wrong.
+    # No hardware term here: gfx950_fused_indexer.supported_hardware() is the
+    # hardware half of the gate and runs first, so anything reaching this point
+    # is already on gfx950. What is left is what a deployment can get wrong.
     if not get_bool_env_var("SGLANG_USE_AITER"):
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
@@ -106,7 +110,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
 def gfx950_model_shape_supported(**kwargs) -> bool:
     """Static per-model half of the gate: shapes and dtypes that cannot change
     after load."""
-    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+    from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
+        model_shape_supported,
+    )
 
     return model_shape_supported(**kwargs)
 
@@ -220,7 +226,7 @@ def is_dsa_prefill_cp_interleave():
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        is_cuda()
+        (is_cuda() or is_hip())
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
@@ -269,11 +275,17 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     return tokens
 
 
-def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
+def dsa_cache_seqlens_may_be_padded(forward_batch: "ForwardBatch") -> bool:
+    """Whether pad_dsa_cache_seqlens may append zero-length metadata rows: the
+    interleave CP physical shard or the DP / MLP-sync padded token count."""
     attn_cp_size = get_parallel().attn_cp_size
     needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
-    if not needs_cp_pad and not needs_dp_pad:
+    return needs_cp_pad or needs_dp_pad
+
+
+def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
+    if not dsa_cache_seqlens_may_be_padded(forward_batch):
         return dsa_cache_seqlens
     tokens = cal_padded_tokens(forward_batch)
     pad_len = tokens - dsa_cache_seqlens.shape[0]
@@ -300,6 +312,32 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return False
 
 
+def _dsa_split_row_bound(forward_batch: "ForwardBatch") -> Optional[int]:
+    """Row-space broadcast bound: the highest first-row of the batch's
+    request chunks (pool ROWS, not prefix tokens).
+    """
+    bound = getattr(forward_batch, "_dsa_split_row_bound", None)
+    if bound is not None:
+        return bound
+    loc = getattr(forward_batch, "out_cache_loc", None)
+    lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if loc is None or not lens:
+        return None
+    starts = []
+    acc = 0
+    for n in lens:
+        starts.append(acc)
+        acc += int(n)
+    if acc <= 0 or acc > loc.shape[0]:
+        return None
+    bound = int(loc[starts].max())
+    try:
+        forward_batch._dsa_split_row_bound = bound
+    except Exception:
+        pass
+    return bound
+
+
 def maybe_prefetch_next_full_attention_kv(
     forward_batch: "ForwardBatch",
     next_full_attention_layer_id: Optional[int],
@@ -307,16 +345,45 @@ def maybe_prefetch_next_full_attention_kv(
     """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
 
     No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
+    a layer-sharded pool exposing ``prefetch_kv_buffer``. Kicking the broadcast
+    off one layer ahead overlaps it with the current layer's attention compute.
     """
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
-    if prefetch_kv_buffer is not None:
-        prefetch_kv_buffer(next_full_attention_layer_id)
+    if is_npu():
+        # NPU: no cached prefix -> the set-path store seeds the remote
+        # scratch itself, so a kick would only be discarded by the next
+        # layer's set. With a prefix the broadcast delivers the immutable
+        # prefix rows and the layer's set_kv_buffer(cp_gathered_chunk=True)
+        # appends the CP-gathered new rows on top, letting the get skip the
+        # broadcast entirely. The indexer scratch is patch-written the same
+        # way, so its one-layer-ahead prefix broadcast kicks here too.
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens is not None and all(n == 0 for n in prefix_lens):
+            return
+        # Radix-cache prefixes are inherited from other requests and can live
+        # at arbitrary pool rows, so the row-space slice — which assumes a
+        # contiguous prefix below the new rows — is only valid without radix.
+        # Under radix, fall back to the full-capacity broadcast so every
+        # inherited prefix row is covered.
+        used_bound = (
+            None
+            if not get_memory().disable_radix_cache
+            else _dsa_split_row_bound(forward_batch)
+        )
+        prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+        if prefetch_kv_buffer is not None:
+            prefetch_kv_buffer(next_full_attention_layer_id, used_bound=used_bound)
+        prefetch_index_k = getattr(
+            get_token_to_kv_pool(), "prefetch_index_k_buffer", None
+        )
+        if prefetch_index_k is not None:
+            prefetch_index_k(next_full_attention_layer_id, used_bound=used_bound)
+    else:
+        prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+        if prefetch_kv_buffer is not None:
+            prefetch_kv_buffer(next_full_attention_layer_id)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
@@ -343,3 +410,179 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
+
+
+def _use_torch_mqa_logits() -> bool:
+    return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+
+
+@lru_cache(maxsize=1)
+def resolve_num_sms() -> int:
+    """SM count used to size the paged-MQA-logits schedule.
+
+    DeepGEMM exposes this as ``get_num_sms()``, but on the torch fallback path
+    DeepGEMM may not be installed at all, so read it off the device instead.
+    Both consumers only use it to shape the schedule metadata buffer, so the
+    raw device SM count is an acceptable stand-in.
+    """
+    if not _use_torch_mqa_logits():
+        import deep_gemm
+
+        return deep_gemm.get_num_sms()
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+@lru_cache(maxsize=1)
+def resolve_paged_mqa_logits_metadata_fn():
+    if _use_torch_mqa_logits():
+        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+
+        return get_paged_mqa_logits_metadata
+    import deep_gemm
+
+    return deep_gemm.get_paged_mqa_logits_metadata
+
+
+def _fp8_paged_mqa_logits_torch(
+    q_fp8,
+    kv_cache_fp8,
+    weights,
+    context_lens,
+    block_table,
+    schedule_metadata,
+    max_seq_len,
+    clean_logits=False,
+    indices=None,
+):
+    from sglang.srt.layers.attention.dsv4.indexer import fp8_paged_mqa_logits_torch
+
+    assert indices is None, "torch paged MQA logits does not take an index tensor"
+    if context_lens.dim() == 2:
+        assert context_lens.shape[1] == 1, (
+            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH does not support next_n > 1 "
+            f"(got {context_lens.shape[1]}); disable speculative decoding."
+        )
+        context_lens = context_lens[:, 0]
+    batch_size = q_fp8.shape[0]
+    block_size = kv_cache_fp8.shape[1]
+    head_dim = q_fp8.shape[-1]
+    padded_seq_len = block_table.shape[1] * block_size
+    per_token_work_bytes = 2 * (head_dim + 4) + 2 * head_dim + 4
+    per_row_bytes = padded_seq_len * per_token_work_bytes + max_seq_len * 4
+    if (
+        q_fp8.is_cuda
+        and per_row_bytes > 0
+        and mqa_logits_needs_budget_check(
+            num_rows=batch_size, num_cols=max(max_seq_len, padded_seq_len)
+        )
+    ):
+        device_index = q_fp8.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        budget_bytes = mqa_logits_static_budget_bytes(device_index=device_index)
+        rows_per_chunk = max(budget_bytes // per_row_bytes, 1)
+    else:
+        rows_per_chunk = batch_size
+    if rows_per_chunk < batch_size:
+        logits_chunks = []
+        for start in range(0, batch_size, rows_per_chunk):
+            end = min(start + rows_per_chunk, batch_size)
+            logits_chunks.append(
+                fp8_paged_mqa_logits_torch(
+                    q_fp8[start:end],
+                    kv_cache_fp8,
+                    weights[start:end],
+                    context_lens[start:end],
+                    block_table[start:end],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+            )
+        return torch.cat(logits_chunks, dim=0)
+    return fp8_paged_mqa_logits_torch(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_seq_len,
+        clean_logits=clean_logits,
+    )
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_paged_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_paged_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_paged_mqa_logits
+
+
+def _fp8_mqa_logits_torch(
+    q_fp8, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0
+):
+    """Pure-torch prefill indexer fallback (no DeepGEMM).
+
+    Accumulates per-head relu(q·k) weighted by gate, then applies fp8 scale.
+    Iterates over heads to keep the [num_q, num_kv] intermediate small.
+    """
+    assert not clean_logits, "torch fp8_mqa_logits only implements clean_logits=False"
+    k_fp8, k_scale = kv
+    num_q, num_heads, head_dim = q_fp8.shape
+    num_kv = k_fp8.shape[0]
+
+    q = q_fp8.to(torch.bfloat16)
+    k_t = k_fp8.reshape(num_kv, head_dim).to(torch.bfloat16).t()
+
+    # Pad rows to a multiple of 4: topk_v2 needs an aligned score_stride.
+    num_kv_padded = (num_kv + 3) // 4 * 4
+    logits_storage = torch.zeros(
+        num_q, num_kv_padded, dtype=torch.float32, device=q_fp8.device
+    )
+    logits = logits_storage[:, :num_kv]
+    w = weights.float()
+    for h in range(num_heads):
+        scores = torch.mm(q[:, h], k_t).float()
+        logits.addcmul_(torch.relu(scores), w[:, h : h + 1])
+    logits *= k_scale.reshape(1, num_kv).float()
+
+    positions = torch.arange(num_kv, device=logits.device).unsqueeze(0)
+    valid = (positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))
+    return logits.masked_fill_(~valid, 0.0)
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_mqa_logits
+
+
+def use_bf16_indexer_logits() -> bool:
+    return envs.SGLANG_DSA_INDEXER_BF16_LOGITS.get() and is_cuda()
+
+
+def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
+    import deep_gemm
+
+    schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
+        ks, ke, kv_fp8[0].shape[0], q_fp8.shape[1]
+    )
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(
+        q_fp8,
+        kv_fp8,
+        weights.to(torch.bfloat16),
+        ks,
+        ke,
+        False,
+        0,
+        torch.bfloat16,
+        schedule_meta,
+    )

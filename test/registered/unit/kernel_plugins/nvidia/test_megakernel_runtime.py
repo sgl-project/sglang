@@ -1,0 +1,406 @@
+"""CPU checks of the megakernel install, dispatch and capture check."""
+
+import re
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+from msgspec.structs import replace
+
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding, kimi_k31_dflash_binding
+from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fakes  # noqa: E402
+from _fakes import (  # noqa: E402
+    ANY_TP,
+    ARCH,
+    DRAFT,
+    ISA,
+    SPEC,
+    FakeDFlashRuntime,
+    Lm,
+    batch,
+    server_args,
+)
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+class OtherBinding:
+    def __init__(self, *, model):
+        self.model = model
+
+
+def install(
+    *,
+    archs=(ARCH,),
+    gathered=None,
+    tokens=2,
+    hooks=None,
+    is_draft=False,
+):
+    """install_megakernel on an Lm as rank 0 of the published server; gathered maps
+    a gathered value to what the other ranks report, default the same as this rank."""
+    lm, hooks = Lm(), [] if hooks is None else hooks
+    gpu = SimpleNamespace(multi_processor_count=160)
+    with (
+        patch.object(binding, "device_isa", return_value=ISA),
+        patch.object(binding, "deadline_s", return_value=30.0),
+        patch.object(
+            binding,
+            "_gather_tp",
+            side_effect=gathered or (lambda x, group=None: [x]),
+        ),
+        patch.object(binding, "_tokens_per_request", return_value=tokens),
+        patch.object(binding, "_decode_graphs_enabled", return_value=True),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_properties", return_value=gpu),
+        patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
+    ):
+        binding.install_megakernel(
+            model=lm,
+            hf_config=SimpleNamespace(architectures=list(archs)),
+            capture_tail_hooks=hooks,
+            is_draft=is_draft,
+        )
+    return lm
+
+
+class TestMegakernelRuntime(CustomTestCase):
+    def setUp(self):
+        registry_patch = patch.dict(registry._REGISTRY, clear=True)
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
+        registry.register(architecture=ARCH, path="_fakes:SPEC")
+        publish(server_args(enable_nvidia_megakernel=True), role="test")
+        self.addCleanup(reset_context)
+        # forward_view and finish_step read the attention backend, which tests lack
+        view_patch = patch.object(
+            MegakernelBinding, "forward_view", return_value="view"
+        )
+        view_patch.start()
+        self.addCleanup(view_patch.stop)
+        finish_patch = patch.object(MegakernelBinding, "finish_step")
+        finish_patch.start()
+        self.addCleanup(finish_patch.stop)
+
+    def _install_spec(self, spec, **kw):
+        with patch.object(binding, "find_spec", return_value=(spec, "")):
+            return install(**kw)
+
+    def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
+        lm = install(tokens=1)
+        built = binding.built_megakernel(lm)
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            self.assertEqual(lm(batch(4).input_ids, None, batch(4)), "megakernel")
+            self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
+        # only a covered step runs the megakernel, with the running forward's view
+        self.assertEqual((built.steps, built.views), ([4], ["view"]))
+
+    def test_a_target_without_a_usable_spec_is_refused_and_a_draft_keeps_its_forward(
+        self,
+    ):
+        # the flag must not silently run the model's own forward
+        with self.assertRaisesRegex(ValueError, "in the model workers"):
+            install(archs=["TargetWithoutSpec"])
+        tp8 = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset({8})))
+        with self.assertRaisesRegex(ValueError, "tp_size 4"):
+            self._install_spec(tp8)
+        # an empty field accepts any value
+        self.assertIsNotNone(binding.built_megakernel(self._install_spec(ANY_TP)))
+        with self.assertLogs(binding.logger, "INFO") as logs:
+            lm = install(archs=["DraftWithoutSpec"], is_draft=True)
+        self.assertNotIn("forward", lm.__dict__)
+        self.assertIn("keeps its own forward", "".join(logs.output))
+        registry.register(architecture="Draft", path="_fakes:DRAFT")
+        # a draft spec offers only its draft sampler
+        lm = install(archs=["Draft"], is_draft=True)
+        self.assertNotIn("forward", lm.__dict__)
+        self.assertIs(binding.megakernel_draft_sampler(lm), print)
+
+    def test_a_draft_spec_this_server_does_not_meet_declines_on_every_rank(self):
+        """A draft spec is checked only at install, after the target's megakernel is
+        built; an unmet requirement or too few SMs for its grids must leave the draft
+        on its own forward, not refuse the server."""
+        registry.register(architecture="Draft", path="_fakes:DRAFT")
+        unmet = {
+            "tp_size 4 is not one of [8]": {"tp_sizes": frozenset({8})},
+            "config.num_hidden_layers None is not 3": {
+                "hf_config": {"num_hidden_layers": 3}
+            },
+            # the fake GPU has 160 SMs
+            "160 SMs, the persistent grids need 161": {"resident_blocks": 161},
+        }
+        for reason, requires in unmet.items():
+            spec = replace(DRAFT, requires=replace(DRAFT.requires, **requires))
+            with (
+                get_parallel().override(tp_rank=0),
+                self.assertLogs(binding.logger, "INFO") as logs,
+            ):
+                lm = self._install_spec(spec, archs=["Draft"], is_draft=True)
+            self.assertIsNone(binding.built_megakernel(lm))
+            self.assertNotIn("forward", lm.__dict__)
+            self.assertRegex(
+                "".join(logs.output),
+                rf"fake does not serve this setup \([^;]*{re.escape(reason)}\); the draft keeps "
+                "its own forward",
+            )
+
+        def unmet_on_rank_1(value, group=None):
+            return (
+                [value, ["rank-1 reason"]] if isinstance(value, list) else [value] * 2
+            )
+
+        # a reason on any rank declines every rank; only TP rank 0 logs it
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(binding.logger, "INFO"),
+        ):
+            lm = self._install_spec(
+                DRAFT, archs=["Draft"], is_draft=True, gathered=unmet_on_rank_1
+            )
+        self.assertIsNone(binding.built_megakernel(lm))
+        # the target still refuses on too few SMs
+        small_gpu = replace(SPEC, requires=replace(SPEC.requires, resident_blocks=161))
+        with self.assertRaisesRegex(ValueError, "persistent grids need 161"):
+            self._install_spec(small_gpu)
+
+    def test_each_architecture_gets_its_registered_binding(self):
+        with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
+            lm = install(tokens=1)
+        self.assertIsInstance(lm.context.binding, OtherBinding)
+        self.assertIs(lm.context.binding.model, lm)
+
+    def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
+        registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
+        lm = install(archs=["EagleDraft"], is_draft=True)
+        self.assertIs(binding.megakernel_entry(lm, "draft_loop"), print)
+        self.assertIsNone(binding.megakernel_entry(lm, "draft_extend"))
+        self.assertIsNone(binding.megakernel_entry(Lm(), "draft_loop"))
+
+        def fewer_entries_on_rank_1(value, group=None):
+            entries = value == ("draft_loop", "begin_draft_round")
+            return [value, value[:1]] if entries else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "entries fake offers differ"):
+            install(
+                archs=["EagleDraft"], is_draft=True, gathered=fewer_entries_on_rank_1
+            )
+
+    def test_graph_variants_reach_a_runner_only_when_every_rank_offers_the_same(self):
+        """A runner captures one graph per label of the variants offered it, so ranks
+        offering other runners or labels would wait in different collectives."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+
+        def offering(graph_variants):
+            return replace(
+                DRAFT,
+                build=lambda model, hf, ctx: SimpleNamespace(
+                    widths=(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=graph_variants,
+                ),
+            )
+
+        lm = self._install_spec(offering({"draft_loop": labels}))
+        served = binding.megakernel_graph_variants(lm, "draft_loop", batch_sizes={1})
+        self.assertIs(served, labels)
+        # one graph per batch size: another runner, no batch size the megakernel
+        # serves, a built object offering none, no megakernel
+        for model, runner, sizes in (
+            (lm, "draft_extend", {1}),
+            (lm, "draft_loop", frozenset()),
+            (self._install_spec(offering(None)), "draft_loop", {1}),
+            (Lm(), "target_verify", {1}),
+        ):
+            with self.subTest(runner=runner, sizes=sizes):
+                self.assertIsNone(
+                    binding.megakernel_graph_variants(model, runner, batch_sizes=sizes)
+                )
+
+        def fewer_labels_on_rank_1(value, group=None):
+            offered = value == [("draft_loop", ("short", "long"))]
+            return [value, [("draft_loop", ("short",))]] if offered else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "graph variants fake offers differ"):
+            self._install_spec(
+                offering({"draft_loop": labels}), gathered=fewer_labels_on_rank_1
+            )
+        with self.assertRaisesRegex(ValueError, "graph_variants names 'verify'"):
+            self._install_spec(offering({"verify": labels}))
+
+    def test_the_verify_graphs_capture_the_variants_where_the_megakernel_runs(self):
+        """A target's verify step runs the megakernel only at the rows it built, so
+        the batch sizes that capture its variants are those rows over the width."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+        lm = Lm()
+        lm.__dict__["_megakernel"] = binding._InstalledMegakernel(
+            built=SimpleNamespace(
+                widths=(7, 14), graph_variants={"target_verify": labels}
+            ),
+            binding=None,
+            prepare=None,
+        )
+        self.assertEqual(
+            binding.megakernel_verify_variants(
+                lm, capture_bs=[1, 2, 4, 8], tokens_per_request=7
+            ),
+            (labels, frozenset({1, 2})),
+        )
+
+    def test_ranks_that_disagree_are_refused_on_every_rank(self):
+        """A rank that differs would wait in a different collective."""
+
+        def no_spec_on_rank_1(value, group=None):
+            return [value, (value[0], "rank-1 reason", None)]
+
+        def fewer_widths_on_rank_1(value, group=None):
+            widths = isinstance(value, tuple) and all(isinstance(w, int) for w in value)
+            return [value, value[:1]] if widths else [value]
+
+        with self.assertRaisesRegex(ValueError, "rank 1: rank-1 reason"):
+            install(gathered=no_spec_on_rank_1)
+        with self.assertRaisesRegex(RuntimeError, "widths fake built differ"):
+            install(gathered=fewer_widths_on_rank_1)
+
+    def test_capture_check_refuses_when_no_graph_runs_the_megakernel(self):
+        def capture(sizes, capture_bs):
+            hooks = []
+            lm = install(tokens=1, hooks=hooks)
+            runner = SimpleNamespace(capture_bs=capture_bs)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                for bs in sizes:
+                    lm(batch(bs).input_ids, None, batch(bs))
+                    hooks[0](runner, None, batch(bs), bs)
+
+        capture([2, 8], capture_bs=[2, 8, 16])  # not all captured yet: no verdict
+        capture([2, 8], capture_bs=[2, 8])
+        with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
+            capture([8, 16], capture_bs=[8, 16])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class _DFlashWorker:
+    """The DFLASH worker's guarded fields; like DFlashWorkerV2, an unknown name falls
+    back to its target worker."""
+
+    block_size = 8
+    _selector_sampling_enabled = True
+
+    def __getattr__(self, name):
+        return f"target worker's {name}"
+
+
+class TestDFlashBinding(CustomTestCase):
+    """bind_dflash_runtime: the runtime a target build names, checked by the guard."""
+
+    def setUp(self):
+        publish(server_args(enable_nvidia_megakernel=True), role="test")
+        self.addCleanup(reset_context)
+        rank = get_parallel().override(tp_rank=0)
+        rank.__enter__()
+        self.addCleanup(rank.__exit__, None, None, None)
+
+    def _bind(self, built, *, runtime=FakeDFlashRuntime, ranks=1, **attrs):
+        worker = _DFlashWorker()
+        worker.__dict__.update(attrs)
+        gathered = lambda value, group=None: [value] * ranks  # noqa: E731
+        with (
+            patch.object(
+                kimi_k31_dflash_binding, "built_megakernel", return_value=built
+            ),
+            patch.object(binding, "_gather_tp", side_effect=gathered),
+            patch.object(_fakes, "FakeDFlashRuntime", runtime),
+        ):
+            return kimi_k31_dflash_binding.bind_dflash_runtime(worker, Lm())
+
+    def test_only_a_build_naming_a_runtime_binds_one(self):
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+        with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
+            self.assertIsNone(self._bind(SimpleNamespace()))
+        self.assertIn("offers no DFlash runtime", "".join(logs.output))
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
+        ):
+            self.assertIsNone(self._bind(SimpleNamespace()))
+        with self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"):
+            self.assertIsNone(self._bind(None))
+            self.assertIsNone(self._bind(SimpleNamespace(dflash_runtime="")))
+        runtime = self._bind(names, _mask_token_id=3)
+        self.assertIsInstance(runtime, FakeDFlashRuntime)
+        self.assertIs(runtime.built, names)
+        self.assertEqual(runtime.binding.pull("mask_token_id"), 3)
+        with self.assertRaisesRegex(KeyError, "without declaring it"):
+            runtime.binding.pull("draft_model")
+        # an unset binding must fail, not fall back to the target worker
+        runtime = self._bind(names)
+        with self.assertRaises(AttributeError):
+            runtime.binding.pull("mask_token_id")
+        publish(server_args(enable_nvidia_megakernel=False), role="test")
+        self.assertIsNone(self._bind(names))
+
+    def test_a_setup_the_runtime_does_not_serve_runs_stock(self):
+        """A guard value mismatch declines the runtime on every rank: SGLang's round
+        runs, and TP rank 0 names each key once."""
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+        wrong_tp = type(
+            "Runtime",
+            (FakeDFlashRuntime,),
+            {"guards": {"tp_size": 16, "block_size": 8}},
+        )
+        with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
+            self.assertIsNone(self._bind(names, runtime=wrong_tp, block_size=5))
+        (warning,) = logs.output
+        self.assertRegex(warning, r"does not serve this DFLASH setup \(block_size is 5")
+        self.assertRegex(warning, r"tp_size is 4, expected 16\)")
+        self.assertIn("DFlash phases run stock", warning)
+        with (
+            get_parallel().override(tp_rank=1),
+            self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
+        ):
+            self.assertIsNone(self._bind(names, _selector_sampling_enabled=False))
+
+    def test_names_sglang_lacks_and_disagreeing_ranks_raise(self):
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+
+        def runtime(**attrs):
+            return type("Runtime", (FakeDFlashRuntime,), attrs)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"binding has no name \['draft_kv'\]"
+        ):
+            self._bind(names, runtime=runtime(bindings=frozenset({"draft_kv"})))
+        unknown_key = runtime(guards={"draft_kv": 1})
+        with self.assertRaisesRegex(RuntimeError, r"guard has no key \['draft_kv'\]"):
+            self._bind(names, runtime=unknown_key)
+
+        def guard_differs_on_rank_1(value, group=None):
+            return [value, "other"] if isinstance(value, list) else [value, value]
+
+        with (
+            patch.object(
+                kimi_k31_dflash_binding, "built_megakernel", return_value=names
+            ),
+            patch.object(binding, "_gather_tp", side_effect=guard_differs_on_rank_1),
+            self.assertRaisesRegex(RuntimeError, "guard values differ"),
+        ):
+            kimi_k31_dflash_binding.bind_dflash_runtime(_DFlashWorker(), Lm())

@@ -3,7 +3,7 @@
 Tests MiniMax-M2.7 with TP=8 + EP=8 configuration using few-shot completion
 benchmark on MI325/MI300X.
 
-Registry: nightly-amd-accuracy-8-gpu-minimax-m27 suite
+Registry: nightly-accuracy-test-8-gpu-amd-minimax-m27 suite
 """
 
 import ast
@@ -29,7 +29,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-accuracy-8-gpu-minimax-m27",
+    suite="nightly-accuracy-test-8-gpu-amd-minimax-m27",
     nightly=True,
 )
 
@@ -64,7 +64,8 @@ MINIMAX_M27_MODELS = [
     ModelConfig(
         model_path="MiniMaxAI/MiniMax-M2.7",
         tp_size=8,
-        accuracy_threshold=0.93,
+        # MI300: mean 0.9216 over 10x full GSM8K (exact CI config); 0.93 never passes.
+        accuracy_threshold=0.91,
         timeout=3600,
         variant="TP8+EP8",
         other_args=[

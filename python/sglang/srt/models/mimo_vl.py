@@ -18,13 +18,13 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VisionPatchMerger,
     Qwen2_5_VisionRotaryEmbedding,
     Qwen2_5_VLMLP,
 )
 from sglang.srt.runtime_context import get_mm, get_server_args
-from sglang.srt.utils import add_prefix
 
 
 class MiMoVLVisionConfig(PretrainedConfig):
