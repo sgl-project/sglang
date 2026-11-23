@@ -673,7 +673,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let m = LoadMonitor::new(cfg(10_000, 30_000), EngineLoadTable::new());
+        // A loaded test runner (full parallel `cargo test`) can push this one
+        // pull past the default 500 ms request timeout, which would read as
+        // Unreachable instead of Stale. Give it room; the assertion is about
+        // the zero-capacity verdict, not latency.
+        let mut c = cfg(10_000, 30_000);
+        c.request_timeout = Duration::from_secs(5);
+        let m = LoadMonitor::new(c, EngineLoadTable::new());
         m.track(&url);
         wait_until(|| m.snapshot(&url).sequence >= 1, "pull").await;
         assert_eq!(m.snapshot(&url).freshness, Freshness::Stale);
