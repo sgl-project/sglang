@@ -58,10 +58,8 @@ class SchedulerActor:
 
         # Declared, not copied: Ray deserializes the argument per call, so this
         # record is the actor's own and nothing else in the process holds it.
-        # The fields stay the operator's input; `PortArgs.init_new` and the bags
+        # The field stays the operator's input; `PortArgs.init_new` and the bags
         # this actor publishes read the decision.
-        # RayEngine can be used directly without the --use-ray CLI flag.
-        declare_resolution(server_args, "ray.scheduler_actor", use_ray=True)
         if dist_init_addr:
             declare_resolution(
                 server_args, "ray.scheduler_actor", dist_init_addr=dist_init_addr
