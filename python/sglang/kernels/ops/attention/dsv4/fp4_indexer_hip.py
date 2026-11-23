@@ -23,6 +23,7 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_row,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -535,11 +536,6 @@ def rowgroup_paged_mqa_logits(
     return logits
 
 
-@functools.cache
-def _is_gfx942() -> bool:
-    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx942"
-
-
 def aiter_fp4_paged_mqa_logits(
     *,
     q_fp4: torch.Tensor,
@@ -562,7 +558,7 @@ def aiter_fp4_paged_mqa_logits(
     """Compute FP4 Q/K indexer logits with the decode or prefill FlyDSL kernel. A page8 pool
     is read by the row-group kernel only: without a row-group decode workspace every row
     scores as its own sequence, on a table of ``rowgroup_table_columns`` columns."""
-    if _is_gfx942():
+    if is_gfx942_supported():
         # The gfx950 kernels use the scaled FP4 MFMA, which gfx942 lacks.
         from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_gfx942 import (
             flydsl_pa_mqa_logits_fp4_gfx942 as flydsl_pa_mqa_logits_fp4,
@@ -606,9 +602,9 @@ def aiter_fp4_paged_mqa_logits(
             table_columns=rowgroup_table_columns,
         )
     if rowgroup_ws is not None:
-        assert not _is_gfx942(), (
+        assert not is_gfx942_supported(), (
             "the row-group FP4 indexer has no gfx942 kernel; set "
-            "SGLANG_HIP_FP4_INDEXER_ROWGROUP=0 and SGLANG_HIP_DSV41_INDEX_K_PAGE8=0"
+            "SGLANG_HIP_DSV41_INDEX_K_PAGE8=0"
         )
         return _rowgroup_decode_logits(
             q_fp4=q_fp4,
