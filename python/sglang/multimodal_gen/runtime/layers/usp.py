@@ -10,6 +10,9 @@ import torch.distributed as dist
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+    flashinfer_ulysses,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -367,6 +370,13 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange(
+            x, get_sp_group().ulysses_group, scatter=True, head_dim=head_dim
+        )
+        if fast is not None:
+            return fast
+
     if world_size == 2 and head_dim == 2:
         fast = _ipc_varlen_fast(x, [x.shape[1], x.shape[1]], 2, "input")
         if fast is not None:
@@ -419,6 +429,11 @@ def _usp_input_all_to_all_packed_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange_qkv(q, k, v, get_sp_group().ulysses_group)
+        if fast is not None:
+            return fast
 
     assert q.ndim == 3 and q.shape == k.shape == v.shape
     s_local, h_global, head_size = q.shape
@@ -575,6 +590,11 @@ def _usp_input_all_to_all_qkv(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
+
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange_qkv(q, k, v, get_sp_group().ulysses_group)
+        if fast is not None:
+            return fast
     if not _can_use_packed_qkv_a2a_4d(q, k, v, world_size):
         return (
             _usp_input_all_to_all(q, head_dim=2),
@@ -636,6 +656,14 @@ def _usp_input_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if (
+        flashinfer_ulysses.enabled()
+        and len(seq_lens) == world_size
+        and len(set(seq_lens)) == 1
+        and x.shape[3 - head_dim] == seq_lens[0]
+    ):
+        return _usp_input_all_to_all(x, head_dim=head_dim)
 
     if world_size == 2:
         fast = _ipc_varlen_fast(x, seq_lens, head_dim, "input")
@@ -715,6 +743,13 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     if world_size <= 1:
         return x
 
+    if not _UNCACHED_STAGING:
+        fast = flashinfer_ulysses.exchange(
+            x, get_sp_group().ulysses_group, scatter=False, head_dim=head_dim
+        )
+        if fast is not None:
+            return fast
+
     if world_size == 2 and head_dim == 2 and x.shape[1] % 2 == 0:
         half_len = x.shape[1] // 2
         fast = _ipc_varlen_fast(x, [half_len, half_len], 2, "output")
@@ -780,6 +815,14 @@ def _usp_output_all_to_all_varlen(
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return x
+
+    if (
+        flashinfer_ulysses.enabled()
+        and len(seq_lens) == world_size
+        and len(set(seq_lens)) == 1
+        and x.shape[3 - head_dim] == seq_lens[0] * world_size
+    ):
+        return _usp_output_all_to_all(x, head_dim=head_dim)
 
     if world_size == 2:
         fast = _ipc_varlen_fast(x, seq_lens, head_dim, "output")

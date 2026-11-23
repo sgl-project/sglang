@@ -28,9 +28,12 @@ class TestLiveSchedulePolicy(CustomTestCase):
         rc.publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(rc.reset_context)
 
-    def _scheduler(self, *, cache_disabled=False, priority_scheduling=False):
+    def _scheduler(
+        self, *, cache_disabled=False, priority_scheduling=False, policy="fcfs"
+    ):
         s = Scheduler.__new__(Scheduler)
-        s.schedule_policy = "fcfs"
+        s.schedule_policy = policy
+        s.chunked_prefill_size = 8192
         s.tree_cache = RadixCache.create_simulated()
         s.tree_cache.disable = cache_disabled
         s.enable_hierarchical_cache = False
@@ -74,6 +77,29 @@ class TestLiveSchedulePolicy(CustomTestCase):
         before = s.policy
         self.assertTrue(self._set(schedule_policy="fcfs"))
         self.assertIs(s.policy, before)
+
+    def test_load_scaling_follows_shortest_prefill_first(self):
+        rc.reset_context()
+        rc.publish(
+            ServerArgs(
+                model_path="dummy",
+                schedule_policy="shortest-prefill-first",
+                shortest_prefill_boundary_halving_chunks=2,
+            ),
+            role="test",
+        )
+        s = self._scheduler(policy="shortest-prefill-first")
+        self.assertIsNotNone(s.policy.shortest_prefill_load_scaling)
+        startup = s.policy.shortest_prefill_load_scaling
+
+        # Another policy must not keep the budget, which only
+        # shortest-prefill-first updates.
+        self.assertTrue(self._set(schedule_policy="fcfs"))
+        self.assertIsNone(s.policy.shortest_prefill_load_scaling)
+        self.assertIsNone(s.policy.prefill_token_budget(page_size=1, align=None))
+
+        self.assertTrue(self._set(schedule_policy="shortest-prefill-first"))
+        self.assertEqual(s.policy.shortest_prefill_load_scaling, startup)
 
     def _assert_rejected(self, s, **server_args):
         before = s.policy
