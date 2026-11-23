@@ -341,11 +341,10 @@ class TestCopyForForward(CustomTestCase):
 class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # These read two flags from the exec bag; give
-        # each test a mutable stand-in so it does not depend on a published
-        # (or leaked) process context.
+        # These read a flag from the exec bag; give each test a mutable
+        # stand-in so it does not depend on a published (or leaked) process
+        # context.
         self._exec_ns = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=False),
             features=SimpleNamespace(enable_custom_logit_processor=False),
         )
         exec_patch = patch(
@@ -354,13 +353,6 @@ class TestStepBuilds(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
-        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
-        spec_patch = patch(
-            "sglang.srt.sampling.sampling_batch_info.get_spec",
-            return_value=self._spec_ns,
-        )
-        spec_patch.start()
-        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -368,24 +360,20 @@ class TestStepBuilds(CustomTestCase):
         freq=0.0,
         presence=0.0,
         min_tokens=0,
-        seed=None,
         stop_ids=None,
         eos_id=2,
         mask_mode=None,
-        filler_seed=0,
     ):
         req = MagicMock()
         req.sampling_params.top_k = top_k
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
-        req.sampling_params.sampling_seed = seed
         req.sampling_params.logit_bias = None
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
         req.grammar = None
-        req.filler_seed = filler_seed
         req.return_sampling_mask = mask_mode is not None
         req.sampling_logprobs_mode = mask_mode
         req.tokenizer.additional_stop_token_ids = None
