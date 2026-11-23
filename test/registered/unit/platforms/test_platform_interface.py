@@ -12,6 +12,7 @@ import torch
 from sglang import _platform_stubs
 from sglang.kernels.jit.utils.arch import _sail_arch_suffix
 from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
+from sglang.srt.platforms import xpu as xpu_mod
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -23,6 +24,7 @@ from sglang.srt.platforms.device_mixin import (
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.sail import SailSRTPlatform
@@ -30,7 +32,7 @@ from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1059,179 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
         with self.assertRaises(AttributeError):
             _ = plat_mod.nonexistent_attribute
+
+
+_TRANSPORT_PLATFORMS = (
+    CudaSRTPlatform,
+    RocmSRTPlatform,
+    MusaSRTPlatform,
+    SailSRTPlatform,
+    NPUSRTPlatform,
+)
+_NO_TRANSPORT_PLATFORMS = (
+    XpuSRTPlatform,
+    CpuSRTPlatform,
+    MluSRTPlatform,
+    MpsSRTPlatform,
+)
+
+
+class TestWeightCachePlatformHooks(CustomTestCase):
+    def test_platforms_the_daemon_served_before_still_declare_a_transport(self):
+        for platform_cls in _TRANSPORT_PLATFORMS:
+            self.assertTrue(
+                platform_cls().weight_cache_transports(),
+                f"{platform_cls.__name__} would lose the weight cache daemon",
+            )
+
+    def test_platforms_without_a_transport_declare_none(self):
+        for platform_cls in _NO_TRANSPORT_PLATFORMS:
+            self.assertEqual(platform_cls().weight_cache_transports(), ())
+
+    def test_a_device_opts_in_by_overriding_the_hook(self):
+        class FakeXpu(XpuSRTPlatform):
+            def weight_cache_transports(self):
+                return ("torch_ipc",)
+
+        self.assertEqual(XpuSRTPlatform().weight_cache_transports(), ())
+        self.assertEqual(FakeXpu().weight_cache_transports(), ("torch_ipc",))
+
+    def test_cuda_alike_platforms_reject_expandable_segments(self):
+        for platform_cls in _TRANSPORT_PLATFORMS:
+            for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+                with self.subTest(platform=platform_cls.__name__, var=var):
+                    with patch.dict(
+                        "os.environ",
+                        {var: "max_split_size_mb:128,expandable_segments:True"},
+                        clear=True,
+                    ):
+                        with self.assertRaises(RuntimeError) as ctx:
+                            platform_cls().validate_weight_cache_allocator()
+                        self.assertIn("expandable_segments", str(ctx.exception))
+
+    def test_allocator_check_accepts_exportable_configs(self):
+        for conf in (
+            {},
+            {"PYTORCH_CUDA_ALLOC_CONF": ""},
+            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"},
+            {"PYTORCH_ALLOC_CONF": "max_split_size_mb:128"},
+        ):
+            with self.subTest(conf=conf):
+                with patch.dict("os.environ", conf, clear=True):
+                    CudaSRTPlatform().validate_weight_cache_allocator()
+
+    def test_allocator_check_is_overridable(self):
+        class FakeXpu(XpuSRTPlatform):
+            def validate_weight_cache_allocator(self):
+                pass
+
+        with patch.dict(
+            "os.environ", {"PYTORCH_ALLOC_CONF": "expandable_segments:True"}, clear=True
+        ):
+            with self.assertRaises(RuntimeError):
+                XpuSRTPlatform().validate_weight_cache_allocator()
+            FakeXpu().validate_weight_cache_allocator()
+
+
+class TestWeightCacheMemoryAccounting(CustomTestCase):
+    def test_platforms_without_an_override_read_the_active_accelerator(self):
+        for platform_cls in _TRANSPORT_PLATFORMS:
+            with self.subTest(platform=platform_cls.__name__):
+                with (
+                    patch(
+                        "torch.accelerator.memory_reserved", return_value=4096
+                    ) as mock_acc,
+                    patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+                ):
+                    self.assertEqual(platform_cls().memory_reserved(3), 4096)
+                mock_acc.assert_called_once_with(3)
+                mock_cuda.assert_not_called()
+
+    def test_xpu_reads_the_xpu_allocator_and_not_cuda(self):
+        with (
+            patch("torch.xpu.memory_reserved", return_value=2048) as mock_xpu,
+            patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+        ):
+            self.assertEqual(XpuSRTPlatform().memory_reserved(1), 2048)
+        mock_xpu.assert_called_once_with(1)
+        mock_cuda.assert_not_called()
+
+    def test_zero_is_never_substituted_for_an_unavailable_allocator(self):
+        with patch(
+            "torch.accelerator.memory_reserved", side_effect=RuntimeError("no acc")
+        ):
+            with self.assertRaises(RuntimeError):
+                DeviceMixin().memory_reserved(0)
+
+
+class TestXpuWeightCacheEnvStamp(CustomTestCase):
+    CAPS = {
+        "architecture": 21479031808,
+        "device_id": 57873,
+        "driver_version": "1.15.39122+11",
+    }
+
+    def _stamp(self, caps=None, pkg_version="0.5.0"):
+        with (
+            patch("torch.xpu.current_device", return_value=0),
+            patch(
+                "torch.xpu.get_device_capability",
+                return_value=self.CAPS if caps is None else caps,
+            ),
+            patch.object(xpu_mod, "_sgl_kernel_xpu_version", return_value=pkg_version),
+        ):
+            return XpuSRTPlatform().weight_cache_env_stamp()
+
+    def test_stamp_carries_architecture_driver_and_kernel_version(self):
+        self.assertEqual(
+            self._stamp(),
+            {
+                "xpu_architecture": "21479031808",
+                "xpu_device_id": "57873",
+                "xpu_driver_version": "1.15.39122+11",
+                "sgl_kernel_xpu_version": "0.5.0",
+            },
+        )
+
+    def test_stamp_does_not_depend_on_the_optional_kernel_op(self):
+        with patch.object(
+            XpuSRTPlatform,
+            "get_device_capability",
+            side_effect=AttributeError("query_device absent"),
+        ) as mock_cap:
+            stamp = self._stamp()
+        self.assertEqual(stamp["xpu_architecture"], "21479031808")
+        mock_cap.assert_not_called()
+
+    def test_missing_identity_fails_explicitly(self):
+        for field in ("architecture", "device_id", "driver_version"):
+            with self.subTest(missing=field):
+                caps = {k: v for k, v in self.CAPS.items() if k != field}
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._stamp(caps=caps)
+                self.assertIn(f"xpu_{field}", str(ctx.exception))
+
+    def test_absent_kernel_package_fails_explicitly(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._stamp(pkg_version="")
+        self.assertIn("sgl_kernel_xpu_version", str(ctx.exception))
+
+    def test_different_architecture_or_runtime_changes_the_stamp(self):
+        base = self._stamp()
+        for label, caps, pkg in (
+            ("architecture", {**self.CAPS, "architecture": 11476656128}, "0.5.0"),
+            ("driver", {**self.CAPS, "driver_version": "1.14.38000+5"}, "0.5.0"),
+            ("kernel", self.CAPS, "0.6.0"),
+        ):
+            with self.subTest(differs=label):
+                self.assertNotEqual(base, self._stamp(caps=caps, pkg_version=pkg))
+
+    def test_platforms_needing_no_extra_identity_contribute_nothing(self):
+        for platform_cls in _TRANSPORT_PLATFORMS + _NO_TRANSPORT_PLATFORMS:
+            if platform_cls is XpuSRTPlatform:
+                continue
+            with self.subTest(platform=platform_cls.__name__):
+                self.assertEqual(platform_cls().weight_cache_env_stamp(), {})
 
 
 if __name__ == "__main__":
