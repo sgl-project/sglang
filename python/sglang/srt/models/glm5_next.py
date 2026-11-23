@@ -1018,6 +1018,9 @@ class Glm5NextModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        from sglang.srt.true_on_policy.glm5_next import validate_top_glm5_next
+
+        validate_top_glm5_next(config, quant_config)
         self.config = config
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
