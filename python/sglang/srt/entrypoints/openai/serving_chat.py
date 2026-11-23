@@ -3177,6 +3177,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request._response_parser_answer_excludes_calls
                     ),
                     response_unwrapped=response_unwrapped,
+                    json_answer_channel=request._response_parser_json_answer_channel,
                 )
 
             # Extract prompt_token_ids if requested
@@ -3396,6 +3397,7 @@ class OpenAIServingChat(OpenAIServingBase):
         keep_thinking_before_calls: bool = False,
         answer_excludes_calls: bool = False,
         response_unwrapped: bool = False,
+        json_answer_channel: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3475,7 +3477,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(None, text, finish_reason)
 
             if isinstance(parser.detector, KimiK3Detector) and not response_unwrapped:
-                text = strip_response_markers(text)
+                text = strip_response_markers(text, json_answer_channel)
 
         # json_schema constraint → JSON array output for required/named
         if is_required:

@@ -3404,6 +3404,99 @@ class ServingChatTestCase(CustomTestCase):
                         )
                         self.assertEqual(served, ("", prefix + answer, []))
 
+    def test_kimi_k3_json_answer_opener_only_at_the_channel_boundary(self):
+        """Only the opener that starts the output or follows the think closer
+        opens the answer: one mentioned in unseparated thinking, or quoted in a
+        JSON answer whose channel the prompt opened, is text."""
+        self.chat.tool_call_parser = "kimi_k3"
+        opener, closer = "<|open|>response<|sep|>", "<|close|>response<|sep|>"
+        ending = closer + "<|close|>message<|sep|>"
+        thinking = "I mention " + opener + " here<|close|>think<|sep|>"
+        quoted = '{"word": "' + opener + '"}'
+        quoted_pair = '{"word": "<|close|>think<|sep|>' + opener + 'x"}'
+        cases = (
+            (
+                None,
+                thinking + opener + '{"word": "hi"}' + ending,
+                thinking + '{"word": "hi"}',
+            ),
+            (
+                "kimi_k3",
+                thinking + opener + '{"word": "hi"}' + ending,
+                thinking + '{"word": "hi"}',
+            ),
+            (None, quoted + ending, quoted),
+            # Only the first think closer ends the thinking; a quoted pair is text.
+            (
+                None,
+                "Plan.<|close|>think<|sep|>" + quoted_pair + ending,
+                "Plan.<|close|>think<|sep|>" + quoted_pair,
+            ),
+        )
+        for reasoning_parser, raw, content in cases:
+            self.chat.reasoning_parser = reasoning_parser
+            self.template_manager.force_reasoning = reasoning_parser is not None
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    parser=reasoning_parser,
+                    raw=raw,
+                    stream=stream,
+                    incremental=incremental,
+                ):
+                    served = self._served(
+                        self._stopped_on_token(raw, 1),
+                        stream,
+                        incremental=incremental,
+                        separate_reasoning=False,
+                        **self._json_answer_fields(),
+                    )
+                    self.assertEqual(served, ("", content, []))
+
+    def test_kimi_k3_answer_without_json_format_keeps_the_first_opener_rule(self):
+        """Without the JSON-answer grammar the opener is not pinned to the
+        channel boundary: a response opened without closing the thinking still
+        loses its opener, as before."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tool_calls, text, _ = self.chat._process_tool_calls(
+            text="Plan.<|open|>response<|sep|>hi<|close|>response<|sep|>",
+            tools=[{"type": "function", "function": {"name": "read_file"}}],
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice="auto",
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(text, "Plan.hi")
+
+    def test_kimi_k3_json_answer_channel_holds_a_closer_before_tools(self):
+        """An empty answer closed right before a tools channel streams no
+        closer, however the tools opener is split across chunks."""
+        raw = (
+            "<|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>"
+            '<|open|>call tool="read_file" index="1"<|sep|><|close|>call<|sep|>'
+            "<|close|>tools<|sep|>"
+        )
+        split = raw.index("tools<|sep|>")
+        for chunks in (
+            [raw[:split], raw[split:]],
+            [raw[: split - 3], raw[split - 3 : split], raw[split:]],
+            list(raw),
+        ):
+            with self.subTest(chunks=len(chunks)):
+                parser = FunctionCallParser(
+                    [Tool.model_validate(self._READ_FILE_TOOL)],
+                    "kimi_k3",
+                    json_answer_channel=True,
+                )
+                text, names = "", []
+                for chunk in chunks:
+                    normal, calls = parser.parse_stream_chunk(chunk)
+                    text += normal
+                    names += [call.name for call in calls if call.name]
+                normal, calls = parser.parse_stream_end()
+                text += normal
+                names += [call.name for call in calls if call.name]
+                self.assertEqual((text, names), ("", ["read_file"]))
+
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

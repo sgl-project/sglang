@@ -1253,7 +1253,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and isinstance(parser.detector, KimiK3Detector)
                 and not response_unwrapped
             ):
-                content = strip_response_markers(content)
+                content = strip_response_markers(
+                    content, request._response_parser_json_answer_channel
+                )
 
         if (
             content

@@ -16,6 +16,8 @@ from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_THEN_RESPONSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
     closing_markers_len,
@@ -83,10 +85,7 @@ class KimiK3Detector(BaseFormatDetector):
         self._argument_value = ""
         self._argument_count = 0
         self.incomplete_tool_call_indices: set[int] = set()
-        # The response channel holds a JSON answer, so only its own opener and
-        # the closers that end it are markers; any others are quoted text.
-        self.keep_quoted_markers = False
-        self._response_opened = False
+        self._answer_opener_seen = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -352,9 +351,13 @@ class KimiK3Detector(BaseFormatDetector):
         pending = self._emit_normal_text(limit=len(self._buffer))
         return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))
 
+    def use_json_answer_channel(self) -> None:
+        """The response channel holds a JSON answer, so only its own opener and
+        the closers that end it are markers; any others are quoted text."""
+        # Bound once so streams without a JSON answer run the plain emit.
+        self._emit_normal_text = self._emit_answer_text
+
     def _emit_normal_text(self, limit: int | None = None) -> str:
-        if self.keep_quoted_markers:
-            return self._emit_answer_text(limit)
         if limit is None:
             holdback = partial_suffix_len(
                 self._buffer,
@@ -370,25 +373,33 @@ class KimiK3Detector(BaseFormatDetector):
         self._sent_normal_idx = limit
         return pending
 
-    def _emit_answer_text(self, limit: int | None) -> str:
+    def _emit_answer_text(self, limit: int | None = None) -> str:
         # A given limit ends the text, so closers there end the answer; until
-        # then they are held, since quoted text may still follow them.
+        # then they are held, with any marker they run into, since quoted text
+        # may still follow them.
+        start = self._sent_normal_idx
         end = len(self._buffer) if limit is None else limit
-        pending = self._buffer[self._sent_normal_idx : end]
+        pending = self._buffer[start:end]
         if limit is None:
-            holdback = max(
-                partial_suffix_len(pending, [self.bot_token, RESPONSE_OPEN]),
-                closing_markers_len(pending),
+            partial = partial_suffix_len(
+                pending, [self.bot_token, RESPONSE_OPEN, THINK_THEN_RESPONSE]
             )
+            holdback = partial + closing_markers_len(pending[: len(pending) - partial])
             pending = pending[: len(pending) - holdback]
+            self._sent_normal_idx = start + len(pending)
         else:
             pending = pending[: len(pending) - closing_markers_len(pending)]
-        self._sent_normal_idx = (
-            end if limit is not None else (self._sent_normal_idx + len(pending))
-        )
-        if not self._response_opened:
-            head, opener, answer = pending.partition(RESPONSE_OPEN)
-            if opener:
-                self._response_opened = True
-                pending = head + answer
-        return pending
+            self._sent_normal_idx = end
+        if self._answer_opener_seen:
+            return pending
+        if start == 0 and pending.startswith(RESPONSE_OPEN):
+            self._answer_opener_seen = True
+            return pending[len(RESPONSE_OPEN) :]
+        idx = pending.find(THINK_CLOSE)
+        if idx == -1:
+            return pending
+        self._answer_opener_seen = True
+        idx += len(THINK_CLOSE)
+        if not pending.startswith(RESPONSE_OPEN, idx):
+            return pending
+        return pending[:idx] + pending[idx + len(RESPONSE_OPEN) :]
