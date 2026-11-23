@@ -174,7 +174,8 @@ def _warm_flydsl_sparse_prefill(heads, kv_heads, head_dim, scale, width, device)
     process, through the served call."""
 
     def run(q, indices, query_lens, prefix_lens):
-        k = q.new_zeros(q.shape[0], kv_heads, head_dim)
+        # K/V of each request's prefix and query tokens.
+        k = q.new_zeros(q.shape[0] + sum(prefix_lens), kv_heads, head_dim)
         out = _flydsl_sparse_prefill(
             q, k, torch.zeros_like(k), indices, query_lens, prefix_lens, scale
         )
@@ -189,7 +190,7 @@ def _warm_flydsl_sparse_prefill(heads, kv_heads, head_dim, scale, width, device)
     )
     logger.info(
         "QSA FlyDSL sparse prefill warmed for %d query heads, %d KV heads, head dim "
-        "%d, selection width %d: request lengths %s",
+        "%d, selection width %d: (query, prefix) lengths %s",
         heads,
         kv_heads,
         head_dim,
