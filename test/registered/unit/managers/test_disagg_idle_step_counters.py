@@ -227,6 +227,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         for idle_iterations in (0, 1, 2):
             with self.subTest(idle_iterations=idle_iterations):
                 batches = self.make_batches(mode)
+                for batch in batches:
+                    batch.sampling_info = Mock()
                 if chained:
                     # Finishing the request drains its already-launched lookahead
                     # before scheduling fresh work, allowing the loop to go idle.

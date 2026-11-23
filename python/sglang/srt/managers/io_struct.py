@@ -1324,6 +1324,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
     # See GenerateReqInput.token_ids_logprob_rows.
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
+    filler_seed: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
