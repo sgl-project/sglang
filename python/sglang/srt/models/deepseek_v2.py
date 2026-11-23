@@ -221,6 +221,18 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.true_on_policy import fp8 as top_fp8
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy.dsv4 import validate_top_dsv4_topk
+from sglang.srt.true_on_policy.glm_moe import (
+    configure_top_glm_moe,
+    top_allows_min_latency_q_b_gemm,
+    top_glm_combine,
+    top_glm_gate_enabled,
+    top_glm_gate_logits,
+    top_glm_router_cls,
+    validate_top_glm,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -345,6 +357,10 @@ class DeepseekV2MLP(nn.Module):
     ):
         if self.is_replicated and x.shape[0] == 0:
             return x
+        # The stock fused SwiGLU + clamp + FP8 quant runs only when down_proj needs no all-reduce; TOP runs one
+        # clamped-SwiGLU FP8 program at every layout, the one the trainer calls.
+        if (top_out := top_fp8.maybe_clamped_mlp(self, x)) is not None:
+            return top_out
 
         if (
             getattr(self, "_enable_nvfp4_gemm_swiglu_fusion", False)
@@ -543,6 +559,7 @@ class MoEGate(nn.Module):
             )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
+        self._top_glm_router = top_glm_gate_enabled(is_deepseek_v4=is_deepseek_v4)
         self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
@@ -559,6 +576,11 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        # GLM's gate rounds its logits to BF16 before the sigmoid, as the trainer's router; the deterministic
+        # stock gate keeps FP32 logits.
+        if self._top_glm_router:
+            return top_glm_gate_logits(hidden_states, self.weight)
+
         if self.weight.dtype == torch.float32:
             return F.linear(hidden_states.float(), self.weight)
 
@@ -825,7 +847,11 @@ class DeepseekV2MoE(nn.Module):
                         else self.experts.should_fuse_routed_scaling_factor_in_topk
                     ),
                 )
-            self.topk = TopK(**topk_kwargs)
+            # FlashInfer's fused_topk_deepseek refuses GLM-5.2's single-group top-8 (topk_group * n_group < topk);
+            # TopGLMRouter is the router the trainer shares.
+            self.topk = (top_glm_router_cls(is_deepseek_v4=is_deepseek_v4) or TopK)(
+                **topk_kwargs
+            )
             self.topk.bind_runner_backend(
                 self.experts.runner_backend,
                 routing_method_type=self.experts.routing_method_type,
@@ -851,6 +877,13 @@ class DeepseekV2MoE(nn.Module):
                         else 1.0
                     )
                 )
+        validate_top_dsv4_topk(
+            self.topk,
+            is_deepseek_v4=is_deepseek_v4,
+            is_deepseek_v41=getattr(config, "model_type", None) == "deepseek_v41",
+        )
+        # TOP V4.1 with a vision tower ranks every row through the VL-biased gate, image rows by the VL bias.
+        self.top_vision_routing = vl_correction_bias and is_true_on_policy_enabled()
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -970,6 +1003,9 @@ class DeepseekV2MoE(nn.Module):
                     )
                     self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
+        self._top_slot_combine = configure_top_glm_moe(
+            experts=self.experts, num_fused_shared_experts=self.num_fused_shared_experts
+        )
         self.top_k = config.num_experts_per_tok
 
         if (
@@ -1560,11 +1596,14 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                **topk_kwargs,
-            )
+            if self.top_vision_routing:
+                topk_output = vision_topk(self, router_logits, input_ids_global)
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device,
@@ -1728,6 +1767,11 @@ class DeepseekV2MoE(nn.Module):
             and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
+
+        if self._top_slot_combine:
+            # The stock path scales the BF16 routed sum after the combine; TOP's slot combine folded the routed
+            # scaling into its FP32 weights.
+            return top_glm_combine(final_hidden_states, shared_output)
 
         return _scale_routed_and_add_shared(
             final_hidden_states,
@@ -1998,6 +2042,12 @@ class DeepseekV2MoE(nn.Module):
         if get_moe_a2a_backend().is_mori():
             num_tokens = state.pop("num_tokens")
             final_hidden_states = final_hidden_states[:num_tokens]
+
+        if self._top_slot_combine:
+            state.hidden_states_mlp_output = top_glm_combine(
+                final_hidden_states, state.pop("shared_output")
+            )
+            return
 
         state.hidden_states_mlp_output = _scale_routed_and_add_shared(
             final_hidden_states,
@@ -2566,7 +2616,8 @@ class DeepseekV2AttentionMLA(
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
-                self._q_b_proj_verified_shape
+                top_allows_min_latency_q_b_gemm()
+                and self._q_b_proj_verified_shape
                 and fused_a_gemm_weight_eligible(self.q_b_proj)
             )
         if self._use_min_latency_q_b_gemm:
@@ -2940,6 +2991,7 @@ class DeepseekV2Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        validate_top_glm(config, quant_config)
         self.use_dsa = is_deepseek_dsa(config)
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size

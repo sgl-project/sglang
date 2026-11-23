@@ -57,7 +57,14 @@ if _is_cuda or _is_hip:
         softmax_scale: float,
         q_scale: torch.Tensor,
     ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+        from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+        if is_true_on_policy_enabled():
+            from sglang.srt.true_on_policy.dsa_head_gate import project_head_gate
+
+            out = project_head_gate(x, weight)
+        else:
+            out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
