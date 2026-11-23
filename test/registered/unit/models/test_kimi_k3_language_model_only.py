@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.models import kimi_k3
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +52,28 @@ class TestKimiK3LanguageModelOnly(CustomTestCase):
                 projector.assert_not_called()
                 self.assertIsNone(model.vision_tower)
                 self.assertIsNone(model.mm_projector)
+
+    def test_either_flag_skips_vision_precompile_and_weights(self):
+        """Text-only serving must not touch the absent vision modules after loading,
+        and must drop vision checkpoint tensors without treating them as unmapped."""
+        weight = torch.zeros(1)
+        checkpoint = [
+            ("vision_tower.patch_embed.proj.weight", weight),
+            ("mm_projector.proj.0.weight", weight),
+            ("language_model.model.norm.weight", weight),
+        ]
+        for flags in (
+            dict(language_only=False, language_model_only=True),
+            dict(language_only=True, language_model_only=False),
+        ):
+            with self.subTest(**flags):
+                model, _, _ = self._build(**flags)
+                model.precompile_kernels_after_loading()
+                streamed = []
+                model.language_model.load_weights.side_effect = streamed.extend
+                with self.assertNoLogs(kimi_k3.logger, level="WARNING"):
+                    model.load_weights(iter(checkpoint))
+                self.assertEqual([name for name, _ in streamed], ["model.norm.weight"])
 
     def test_multimodal_serving_still_builds_vision_modules(self):
         model, tower, projector = self._build(
