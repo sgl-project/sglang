@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
+    has_sampling_handoff_row,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -1242,7 +1243,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 sampling_mask_finish_reason = None
-                if req.captures_sampling:
+                if req.captures_sampling and not req.is_prefill_only:
                     assert logits_output is not None
                     statuses = logits_output.next_token_sampling_mask_status
                     status = None if statuses is None else statuses[i]
@@ -1317,7 +1318,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                if req.captures_sampling:
+                if has_sampling_handoff_row(req):
                     self.batch_result_processor.add_sampling_mask_return_values(
                         i, req, logits_output
                     )

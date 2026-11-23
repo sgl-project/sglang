@@ -3382,6 +3382,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         sampling_logprob=None,
         sampling_mask=(),
         sampling_mask_logprobs=(),
+        max_new_tokens=8,
     ):
         sampling_mask_rows = None
         if sampling_logprob is not None:
@@ -3403,6 +3404,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             multimodal_inputs=None,
             return_logprob=False,
             captures_sampling=sampling_logprob is not None,
+            sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
             sampling_mask_rows=sampling_mask_rows,
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
@@ -3625,6 +3627,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     require_reasoning=False,
                     return_logprob=False,
                     captures_sampling=True,
+                    sampling_params=SimpleNamespace(max_new_tokens=8),
                     sampling_mask_rows=SamplingMaskRows(),
                     time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
                 )
@@ -3643,6 +3646,64 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     (chunk.selected_logprobs.tolist(), *chunk.support_rows()),
                     ([logprob], [mask], [mask_logprobs]),
                 )
+
+    def test_prefill_only_request_skips_sampling_handoff_row(self):
+        """A max_new_tokens=0 request has no sampled token, so set_buf must not
+        require a row and decode must not read stale bytes or queue a row."""
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=4,
+            )
+            # Populate slot 0 with a previous request's sampling data.
+            buffers.set_buf(
+                self._make_req(
+                    None,
+                    sampling_logprob=-1.5,
+                    sampling_mask=[7, 8],
+                    sampling_mask_logprobs=[-1.5, -2.0],
+                )
+            )
+            prefill_req = self._make_req(None, max_new_tokens=0)
+            prefill_req.captures_sampling = True
+            prefill_req.sampling_mask_rows = SamplingMaskRows()
+            buffers.set_buf(prefill_req)
+
+            fields = dict.fromkeys(
+                f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+            )
+            fields["model_config"] = SimpleNamespace(self_opened_think_start_ids=None)
+            queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            queue.scheduler = SimpleNamespace(
+                kv_checksum_computer=None,
+                batch_result_processor=SchedulerBatchResultProcessor(**fields),
+            )
+            queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+            queue.metadata_buffers = buffers
+            decode_req = SimpleNamespace(
+                rid="r0",
+                bootstrap_host="127.0.0.1",
+                bootstrap_room=9,
+                output_ids=[],
+                require_reasoning=False,
+                return_logprob=False,
+                captures_sampling=True,
+                sampling_params=SimpleNamespace(max_new_tokens=0),
+                sampling_mask_rows=SamplingMaskRows(),
+                time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+            )
+            queue._commit_transfer_to_req(
+                DecodeRequest(
+                    req=decode_req,
+                    kv_receiver=SimpleNamespace(clear=lambda: None),
+                    metadata_buffer_index=0,
+                )
+            )
+            chunk = decode_req.sampling_mask_rows.take()
+            self.assertEqual(chunk.selected_logprobs.tolist(), [])
+            self.assertEqual(chunk.lengths.tolist(), [])
 
     def test_rebootstrap_commit_keeps_emitted_output(self):
         """A PD rebootstrap with output keeps its output ids and their sampling-mask

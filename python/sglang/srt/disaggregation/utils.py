@@ -336,6 +336,11 @@ def pre_alloc_fill_len(req: Req) -> int:
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
+def has_sampling_handoff_row(req: Req) -> bool:
+    """Whether PD prefill and decode hand off a first-token sampling row."""
+    return req.captures_sampling and req.sampling_params.max_new_tokens > 0
+
+
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
@@ -969,7 +974,7 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if req.captures_sampling:
+        if has_sampling_handoff_row(req):
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()

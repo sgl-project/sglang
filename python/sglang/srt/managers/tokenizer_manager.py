@@ -1616,14 +1616,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if (
-                returns_sampling_output(obj)
+                obj.return_sampling_mask
                 and obj.custom_logit_processor
                 and not supports_sampling_mask(obj.custom_logit_processor)
             ):
                 # Reject before scheduling so aborted requests cannot execute
                 # unsupported processors during sampling batch preparation.
                 raise ValueError(
-                    "return_sampling_logprobs or return_sampling_mask only supports "
+                    "return_sampling_mask only supports "
                     "DisallowedTokensLogitsProcessor among custom logit processors."
                 )
             if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:

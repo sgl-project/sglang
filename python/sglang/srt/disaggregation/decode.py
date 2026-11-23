@@ -78,6 +78,7 @@ from sglang.srt.disaggregation.utils import (
     end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
+    has_sampling_handoff_row,
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
     get_qsa_pending_state_indices,
@@ -3507,7 +3508,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 top_logprobs_val = output_top_logprobs_val[:top_logprobs_num].tolist()
                 top_logprobs_idx = output_top_logprobs_idx[:top_logprobs_num].tolist()
             sampling_logprob = sampling_mask_idx = sampling_mask_logprobs = None
-            if req.captures_sampling:
+            if has_sampling_handoff_row(req):
                 assert output_token_sampling_mask_idx is not None, (
                     "sampling mask buffer disabled on decode side"
                 )
