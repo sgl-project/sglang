@@ -1973,6 +1973,8 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        if block_table is None:
+            block_table = self.forward_metadata.block_tables
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
             return self._forward_fp8_sparse(
                 q_nope,
@@ -1998,11 +2000,7 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            block_table=(
-                self.forward_metadata.block_tables
-                if block_table is None
-                else block_table
-            ),
+            block_table=block_table,
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
@@ -2022,7 +2020,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
         *,
-        block_table: Optional[torch.Tensor] = None,
+        block_table: torch.Tensor,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
         packed = packed_kv.view(torch.float8_e4m3fn)
@@ -2042,11 +2040,7 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            block_table=(
-                self.forward_metadata.block_tables
-                if block_table is None
-                else block_table
-            ),
+            block_table=block_table,
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
@@ -2304,6 +2298,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     actual_seq_qlen,
                     actual_seq_lengths_kv,
+                    block_table=self.forward_metadata.block_tables,
                 )
             else:
                 # npu_sparse_flash_attention requires the GQA group size
