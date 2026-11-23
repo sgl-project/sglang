@@ -11,8 +11,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.device import get_nvidia_driver_version, is_cpu, is_mps
-from sglang.srt.utils.triton_utils import is_triton_kernels_available
+from sglang.srt.utils.device import is_cpu, is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +68,12 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Detected SM120 and MXFP4 quantization format for GPT-OSS model, "
                 "enabling FlashInfer CUTLASS MXFP4 MOE kernel."
             )
+        elif get_platform().is_sm90 and is_mxfp4_quant_format:
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+            logger.warning(
+                "Detected SM90 and MXFP4 quantization format for GPT-OSS model, "
+                "enabling FlashInfer CUTLASS MXFP4 MOE kernel."
+            )
         elif (
             get_platform().is_hip and envs.SGLANG_USE_AITER.get()
         ) and is_mxfp4_quant_format:
@@ -97,21 +102,9 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         elif (
             cfg.ep_size == 1
-            and is_triton_kernels_available()
             and cfg.quantization is None
             and not (is_cpu() and get_platform().has_amx)
         ):
-            # The triton_kernels package segfaults on Blackwell (B200)
-            # with NVIDIA driver >= 595. Fall back to triton backend.
-            if get_platform().is_blackwell and get_nvidia_driver_version() >= (595,):
-                overrides["moe_runner_backend"] = "triton"
-                logger.warning(
-                    "Detected GPT-OSS model on Blackwell with driver >= 595, "
-                    "using triton MOE kernel to avoid triton_kernels SIGSEGV."
-                )
-            else:
-                overrides["moe_runner_backend"] = "triton_kernel"
-                logger.warning(
-                    "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                )
+            overrides["moe_runner_backend"] = "triton"
+            logger.warning("Detected GPT-OSS model, enabling triton MOE kernel.")
     return overrides

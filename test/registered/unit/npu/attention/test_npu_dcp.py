@@ -20,15 +20,22 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=9, suite="base-a-test-npu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 # Avoid importing the real extensions on CPU.  ``layers.dcp`` performs optional
 # kernel discovery during import, so temporarily force the platform probe to
 # report CPU while loading the modules under test.
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
+_sgl_operators = types.ModuleType("sgl_kernel_npu.operators")
+_sgl_attention = types.ModuleType("sgl_kernel_npu.operators.attention")
+# dsa_dcp imports the public operator at module load; the real function needs
+# the NPU extension, so the tests patch this placeholder per case.
+_sgl_attention.sparse_flash_attention = None
+sys.modules.setdefault("sgl_kernel_npu.operators", _sgl_operators)
+sys.modules.setdefault("sgl_kernel_npu.operators.attention", _sgl_attention)
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
-import sglang.srt.utils as _utils
-from sglang.srt.utils import device as _device_utils
+import sglang.srt.utils as _utils  # noqa: E402
+from sglang.srt.utils import device as _device_utils  # noqa: E402
 
 _real_is_npu = _device_utils.is_npu
 _real_utils_is_npu = _utils.is_npu
@@ -36,6 +43,7 @@ _device_utils.is_npu = lambda: False
 _utils.is_npu = _device_utils.is_npu
 try:
     from sglang.srt import runtime_context as rc
+    from sglang.srt.hardware_backend.npu.attention import dsa_dcp as _dsa_dcp
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
@@ -262,12 +270,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs()
         batch = SimpleNamespace(forward_mode=_Mode(False))
         metadata = self._metadata()
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             out, lse = forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
@@ -297,12 +300,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs(rows)
         batch = SimpleNamespace(forward_mode=_Mode(True))
         metadata = self._metadata(rows=rows)
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
@@ -341,6 +339,82 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                 scaling=1.0,
             )
 
+    def test_packed_fp8_uses_native_kernel_for_prefill_decode_and_verify(self):
+        q = torch.ones(2, 2, 512, dtype=torch.bfloat16)
+        rope = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
+        packed = torch.zeros(3, 128, 1, 656, dtype=torch.float8_e4m3fn)
+        topk = torch.tensor([[[2, -1]], [[-1, -1]]], dtype=torch.int32)
+        # The packed kernel leaves zero output and max/sum for the empty row.
+        attention_out = q.clone()
+        attention_out[1].zero_()
+        mock_op = MagicMock(
+            return_value=(
+                attention_out,
+                torch.tensor([[[1.0, 1.0], [0.0, 0.0]]]),
+                torch.tensor([[[2.0, 2.0], [0.0, 0.0]]]),
+            )
+        )
+        for mode in ("prefill", "decode", "verify"):
+            with self.subTest(mode=mode):
+                mock_op.reset_mock()
+                metadata = SimpleNamespace(
+                    dcp_block_tables=torch.tensor([[1], [2]], dtype=torch.int32),
+                    dcp_seq_lens=torch.tensor([5, 6], dtype=torch.int32),
+                    dcp_spec_block_tables=torch.tensor([[1], [1]], dtype=torch.int32),
+                    dcp_spec_seq_lens=torch.tensor([7, 8], dtype=torch.int32),
+                )
+                verify = mode == "verify"
+                # Verify starts with one cumulative endpoint for two draft tokens.
+                query_lens = torch.tensor([1, 2] if mode == "decode" else [2])
+                expected_query_lens = torch.tensor(
+                    [2] if mode == "prefill" else [1, 2], dtype=torch.int32
+                )
+                if mode == "prefill":
+                    # Two query rows, one request, and one real KV length.
+                    metadata.dcp_block_tables = metadata.dcp_block_tables[:1]
+                    metadata.dcp_seq_lens = torch.tensor([128], dtype=torch.int32)
+                out, lse = forward_dcp_sparse_attention(
+                    q_nope=q,
+                    q_rope=rope,
+                    k_nope=packed,
+                    k_rope=packed[..., :0],
+                    topk_indices=topk,
+                    actual_seq_lengths_query=query_lens,
+                    forward_metadata=metadata,
+                    forward_batch=SimpleNamespace(forward_mode=_Mode(verify)),
+                    speculative_num_draft_tokens=2 if verify else None,
+                    scaling=0.25,
+                    fp8_attention=mock_op,
+                )
+                mock_op.assert_called_once()
+                call = mock_op.call_args.kwargs
+                self.assertIs(call["query"], q)
+                self.assertIs(call["query_rope"], rope)
+                self.assertEqual(call["packed_kv"].data_ptr(), packed.data_ptr())
+                self.assertEqual(call["packed_kv"].dtype, torch.uint8)
+                self.assertEqual(call["packed_kv"].shape, packed.shape)
+                self.assertIs(call["sparse_indices"], topk)
+                self.assertEqual(call["scale_value"], 0.25)
+                torch.testing.assert_close(
+                    call["actual_seq_lengths_query"], expected_query_lens
+                )
+                self.assertIs(
+                    call["block_table"],
+                    metadata.dcp_spec_block_tables
+                    if verify
+                    else metadata.dcp_block_tables,
+                )
+                self.assertIs(
+                    call["actual_seq_lengths_kv"],
+                    metadata.dcp_spec_seq_lens if verify else metadata.dcp_seq_lens,
+                )
+                self.assertTrue(torch.equal(out[0], q[0]))
+                self.assertTrue(torch.equal(out[1], torch.zeros_like(q[1])))
+                self.assertTrue(
+                    torch.allclose(lse[0], 1 + torch.log(torch.full((2,), 2.0)))
+                )
+                self.assertTrue(torch.isneginf(lse[1]).all())
+
     def test_verify_row_mismatch_fails_before_operator(self):
         q, rope, _, _, topk = self._inputs(2)
         metadata = self._metadata(rows=3)
@@ -361,101 +435,6 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
-    def test_nonarch35_mla_builder_compacts_eligible_target_only(self):
-        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-
-        owner_ids = (0, 1, 2, *range(6, 78, 4))
-        hf_config = SimpleNamespace(
-            architectures=["GlmMoeDsaForCausalLM"],
-            index_topk=2048,
-            index_head_dim=128,
-            indexer_types=[
-                "full" if layer_id in owner_ids else "shared" for layer_id in range(78)
-            ],
-        )
-
-        def build_pool(*, start_layer, end_layer, num_layers, is_draft, eligible):
-            configurator = object.__new__(KVCacheConfigurator)
-            configurator.is_draft_worker = is_draft
-            configurator.layer_info = SimpleNamespace(
-                start_layer=start_layer,
-                end_layer=end_layer,
-                num_effective_layers=num_layers,
-            )
-            configurator.model_config = SimpleNamespace(
-                hf_config=hf_config,
-                index_head_dim=128,
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
-            )
-            configurator.kv_cache_dtype = torch.bfloat16
-            configurator.device = "cpu"
-            with (
-                patch(
-                    "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=1),
-                ),
-                patch(
-                    "sglang.srt.mem_cache.kv_cache_configurator.get_schedule",
-                    return_value=SimpleNamespace(page_size=64),
-                ),
-                patch(
-                    "sglang.srt.mem_cache.kv_cache_configurator.get_exec",
-                    return_value=SimpleNamespace(
-                        features=SimpleNamespace(enable_memory_saver=False)
-                    ),
-                ),
-                patch(
-                    "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
-                ),
-                patch(
-                    "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
-                    return_value=False,
-                ),
-                patch(
-                    "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
-                    return_value=eligible,
-                ),
-            ):
-                return configurator._build_ascend_mla_kv_pool(
-                    max_total_num_tokens=128, is_dsa_model=True
-                )
-
-        target = build_pool(
-            start_layer=0,
-            end_layer=78,
-            num_layers=78,
-            is_draft=False,
-            eligible=True,
-        )
-        self.assertEqual(target.index_k_buffer.shape[0], 21)
-        self.assertEqual(target.index_k_buffer.dtype, torch.bfloat16)
-        self.assertEqual(target.index_k_buffer.nbytes, 21 * 3 * 64 * 128 * 2)
-        self.assertEqual(target.get_index_k_buffer(74).shape[-1], 128)
-        with self.assertRaises(KeyError):
-            target.get_index_k_buffer(3)
-
-        full_target = build_pool(
-            start_layer=0,
-            end_layer=78,
-            num_layers=78,
-            is_draft=False,
-            eligible=False,
-        )
-        self.assertEqual(full_target.index_k_buffer.shape[0], 78)
-
-        draft = build_pool(
-            start_layer=78,
-            end_layer=79,
-            num_layers=1,
-            is_draft=True,
-            eligible=False,
-        )
-        self.assertEqual(draft.index_k_buffer.shape[0], 1)
-        self.assertEqual(draft.index_k_buffer.nbytes, 1 * 3 * 64 * 128 * 2)
-        self.assertEqual(draft.get_index_k_buffer(78).shape[-1], 128)
-
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
         indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)

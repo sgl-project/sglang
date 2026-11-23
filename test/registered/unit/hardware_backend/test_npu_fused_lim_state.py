@@ -137,17 +137,12 @@ class TestLIMState(CustomTestCase):
             )
         )
         self.assertEqual(fitting.prefill_workspace_tokens, 129)
-        with self.assertLogs(
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget",
-            level="WARNING",
-        ) as logs:
-            fallback = resolve_sparse_kv_budget(
-                **self.options(
-                    prefill_workspace_tokens=129,
-                    hbm_budget_bytes=base.managed_hbm_bytes,
-                )
+        fallback = resolve_sparse_kv_budget(
+            **self.options(
+                prefill_workspace_tokens=129,
+                hbm_budget_bytes=base.managed_hbm_bytes,
             )
-        self.assertIn("129 tokens", logs.output[0])
+        )
         self.assertEqual(fallback.prefill_workspace_tokens, 0)
         self.assertEqual(fallback.managed_hbm_bytes, base.managed_hbm_bytes)
         with self.assertRaisesRegex(ValueError, "exceeding"):

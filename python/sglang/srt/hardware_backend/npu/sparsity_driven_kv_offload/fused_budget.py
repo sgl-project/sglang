@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from copy import copy
 from dataclasses import dataclass
 from math import prod
@@ -16,8 +15,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 # Fixed native LIM ABI dimensions, independent of model geometry.
-logger = logging.getLogger(__name__)
-
 MISS_CAPACITY = 32768
 MAX_QUERY_WIDTH = 14
 
@@ -294,13 +291,6 @@ def resolve_sparse_kv_budget(
         and hbm_budget_bytes
         and planned_bytes > hbm_budget_bytes
     ):
-        logger.warning(
-            "Disabling sparse prefill workspace (%d tokens): planned HBM %d bytes "
-            "exceeds budget %d bytes.",
-            prefill_workspace_tokens,
-            planned_bytes,
-            hbm_budget_bytes,
-        )
         prefill_workspace_tokens = 0
     result = (
         BudgetPlan(**plan_options, prefill_workspace_tokens=prefill_workspace_tokens)

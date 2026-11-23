@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -29,8 +28,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
-
-logger = logging.getLogger(__name__)
 
 
 class FusedSparseKVCacheManager:
@@ -64,19 +61,6 @@ class FusedSparseKVCacheManager:
         self.max_query_width = self.budget.max_query_width
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
-        logger.info(
-            "Sparse KV: K=%d C=%d, managed HBM/rank=%.2f MiB, shared host payload=%.2f MiB, host_layout=paged_split",
-            self.sparse_topk,
-            self.device_cache_size,
-            self.budget.managed_hbm_bytes / 1024**2,
-            self.budget.host_kv_bytes / 1024**2,
-        )
-        logger.info(
-            "Sparse KV prefill workspace: enabled=%s capacity_tokens=%d persistent_bytes=%d",
-            bool(self.budget.prefill_workspace_tokens),
-            self.budget.prefill_workspace_tokens,
-            self.budget.prefill_workspace_bytes,
-        )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = load_copy_sfa_operator()
 
@@ -121,58 +105,7 @@ class FusedSparseKVCacheManager:
             [x.data_ptr() for x in component] for component in self.host_pool.buffers
         )
         self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
-        logger.info(
-            "Sparse KV host buffers: layout=split, CKV=%s, KPE=%s, pool=%s",
-            tuple(self.host_k_buffer[0].shape),
-            tuple(self.host_v_buffer[0].shape),
-            type(self.host_pool).__name__,
-        )
-        # Log allocation metadata once, before any graph capture or forward.
-        logger.info(
-            "Sparse split C allocation: capacity=%d resident_rows=%d request_rows=%d "
-            "layers=%d bytes=%d ckv_spec=%s rope_spec=%s",
-            self.device_cache_size,
-            self.budget.resident_rows,
-            self.size,
-            self.layer_num,
-            self.budget.device_kv_bytes,
-            self.budget.manager_buffers["device_k_buffer"],
-            self.budget.manager_buffers["device_v_buffer"],
-        )
-        for layer_idx in range(self.layer_num):
-            ckv = self.device_k_buffer[layer_idx]
-            rope = self.device_v_buffer[layer_idx]
-            host_ckv = self.host_k_buffer[layer_idx]
-            host_rope = self.host_v_buffer[layer_idx]
-            logger.debug(
-                "Sparse split layout layer=%d host_ckv_shape=%s host_ckv_stride=%s "
-                "host_ckv_registered_ptr=%#x host_rope_shape=%s host_rope_stride=%s "
-                "host_rope_registered_ptr=%#x hbm_ckv_shape=%s hbm_ckv_stride=%s "
-                "hbm_ckv_storage_ptr=%#x hbm_rope_shape=%s hbm_rope_stride=%s "
-                "hbm_rope_storage_ptr=%#x hbm_bytes=%d",
-                layer_idx,
-                tuple(host_ckv.shape),
-                tuple(host_ckv.stride()),
-                self.dev_ptr_list[layer_idx],
-                tuple(host_rope.shape),
-                tuple(host_rope.stride()),
-                self.rope_dev_ptr_list[layer_idx],
-                tuple(ckv.shape),
-                tuple(ckv.stride()),
-                ckv.untyped_storage().data_ptr(),
-                tuple(rope.shape),
-                tuple(rope.stride()),
-                rope.untyped_storage().data_ptr(),
-                ckv.nbytes + rope.nbytes,
-            )
-        logger.info(
-            "Sparse split HBM layout: start_layer=%d layers=%d C=%d CKV=%d RoPE=%d",
-            self.start_layer,
-            self.layer_num,
-            self.device_cache_size,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-        )
+
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             LIMDecodeAdapter,
         )

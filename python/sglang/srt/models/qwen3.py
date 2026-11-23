@@ -48,7 +48,8 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import (
-    apply_qk_norm,
+    apply_qk_norm_rope,
+    can_use_jit_qk_norm_rope,
     maybe_enable_silu_fp4_quant_fusion,
 )
 from sglang.srt.platforms import current_platform
@@ -97,7 +98,7 @@ if _use_aiter:
         pass
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
@@ -280,7 +281,20 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
         self.alt_stream = alt_stream
+        self.use_jit_qk_norm_rope = can_use_jit_qk_norm_rope(
+            self.q_norm,
+            self.k_norm,
+            self.rotary_emb,
+            self.head_dim,
+            torch.get_default_dtype(),
+        )
 
         # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
         # CUDA head sizes also select the non-fallback RoPE implementation.
@@ -409,15 +423,17 @@ class Qwen3Attention(nn.Module):
                 eps=self.q_norm.variance_epsilon,
             )
         else:
-            q, k = apply_qk_norm(
+            q, k = apply_qk_norm_rope(
                 q=q,
                 k=k,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                rotary_emb=self.rotary_emb,
+                positions=positions,
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
+                use_jit=self.use_jit_qk_norm_rope,
             )
-            q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -595,8 +611,9 @@ class Qwen3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
-        # Resolved on the first decode: the bpreshuffle happens at weight load.
-        self._decode_quant_formats = None
+        # Only aiter on gfx95 needs detection after weight loading.
+        # Other platforms can resolve the empty formats before tracing forward.
+        self._decode_quant_formats = None if (_use_aiter and _is_gfx95) else ("", "")
 
     @staticmethod
     def stage_facts(config: Qwen3Config, layer_id: int):
@@ -908,7 +925,7 @@ class Qwen3ForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            if "scale" in name:
+            if "scale" in name or (_is_npu and ".fa_" in name):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue

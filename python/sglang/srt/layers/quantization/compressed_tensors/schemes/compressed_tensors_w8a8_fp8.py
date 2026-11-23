@@ -29,12 +29,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -148,6 +149,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
         if self.strategy == QuantizationStrategy.TENSOR:
             max_w_scale, weight = requantize_with_max_scale(
                 weight=layer.weight,
@@ -245,11 +251,50 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        return self._apply_weights(layer, x, bias)
+
+    def apply_weights_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``apply_weights`` into the caller-owned ``output`` (RowParallelLinear's
+        ``output_tensor``). The DeepGEMM block-FP8 linear writes it directly;
+        every other path computes normally and copies."""
+        return self._apply_weights(layer, x, bias, output)
+
+    def _block_fp8_linear_into(self, output: Optional[torch.Tensor], **kwargs):
+        if output is None:
+            return self.w8a8_block_fp8_linear(**kwargs)
+        fn = self.w8a8_block_fp8_linear
+        # only the DeepGEMM linear takes the storage (and copies when its own
+        # fallbacks run); the dispatcher may hand it back as a partial
+        if getattr(fn, "func", fn) is deepgemm_w8a8_block_fp8_linear_with_fallback:
+            return fn(**kwargs, output=output)
+        return output.copy_(fn(**kwargs))
+
+    def _apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if _is_cpu:
+            raise NotImplementedError(
+                "CPU compressed-tensors W8A8 FP8 linear is not supported; CPU FP8 kernels are W8A16."
+            )
+
+        if self.weight_block_size is None and output is not None:
+            return output.copy_(self._apply_weights(layer, x, bias))
         if isinstance(x, tuple) and self.weight_block_size is not None:
             # Pre-quantized per-token-group activation (fp8 [M, K], fp32 scales
             # [M, K / block_k]) from the fused all-reduce epilogue
             # (layers/communication/gemma4_ar_fusion.py).
-            return self.w8a8_block_fp8_linear(
+            return self._block_fp8_linear_into(
+                output,
                 input=x[0],
                 weight=layer.weight,
                 block_size=self.weight_block_size,
@@ -275,7 +320,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 pre_quant_output_dtype=out_dtype,
             )
         if self.weight_block_size is not None:
-            return self.w8a8_block_fp8_linear(
+            return self._block_fp8_linear_into(
+                output,
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
