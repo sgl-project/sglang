@@ -16,7 +16,7 @@ class TestKvCacheDtype(CustomTestCase):
     def _resolve(self, dtype, *, is_draft=False, draft_dtype=None):
         return kv_cache_dtype.configure_kv_cache_dtype(
             server_args_kv_cache_dtype=dtype,
-            model=None,
+            quant_config=None,
             model_dtype=torch.bfloat16,
             is_draft_worker=is_draft,
             is_dflash=False,
