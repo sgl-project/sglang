@@ -1875,6 +1875,11 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+    kv_args.mla_kv_source_layers = (
+        list(owner_view.kv_source_layers)
+        if isinstance(owner_view, DeepSeekV4TokenToKVPool)
+        else None
+    )
     kv_args.kv_packable = _nixl_kv_packable(owner_view, draft_token_to_kv_pool)
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)

@@ -30,6 +30,33 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
     BF16_KV_LEN = 7
     FP8_KV_LEN = 11
 
+    def test_v41_producer_groups_tile_decode_without_exporting_replicas(self):
+        ratios = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
+        layout = VPPLayout(40, 2, virtual_stages=2, partition=(9, 12, 8, 11))
+        ownership = vpp_transfer_layers(SimpleNamespace(vpp_layout=layout))
+        for state, groups in (
+            (None, [[20], [20], [2, 8, 14], [2, 8, 14]]),
+            (StateType.DSV4_REQUEST_STATE, [[2, 8, 14]]),
+            (StateType.SWA, [list(range(40))]),
+        ):
+            full = [layer for group in groups for layer in group]
+            covered = []
+            for rank in range(2):
+                mgr = _pp_mgr(0, 40, ratios)
+                mgr.kv_args.vpp_layers = ownership
+                mgr.kv_args.pp_rank = rank
+                mgr.kv_args.mla_kv_source_layers = [2, 8, 14, 20]
+                expected = [
+                    i for i, layer in enumerate(full) if layer in ownership[rank]
+                ]
+                _, selected, count = mgr.get_mla_kv_ptrs_with_pp(
+                    [100 + rank] * len(expected), list(range(len(full))), state
+                )
+                self.assertEqual(selected, expected)
+                self.assertEqual(count, len(expected))
+                covered.extend(selected)
+            self.assertEqual(sorted(covered), list(range(len(full))))
+
     def _slice(self, dst, start, end, state_type=None, src=None):
         mgr = _pp_mgr(start, end, self.RATIOS)
         if src is None:
@@ -112,6 +139,47 @@ class TestDSV4UnifiedFp8PpSlice(CustomTestCase):
                 decode_tp=1,
                 decode_pp_size=1,
             )
+
+    def test_vpp_target_buffers_exclude_extra_mtp_ratio_entries(self):
+        # The real Flash 0731 configuration has 43 target layers and 3 MTP
+        # entries. SWA has 85 target regions, split into 39 and 46 locally.
+        ratios = [0, 0] + [4, 128] * 20 + [4] + [0, 0, 0]
+        layout = VPPLayout(43, 2, virtual_stages=2)
+        ownership = vpp_transfer_layers(SimpleNamespace(vpp_layout=layout))
+        layers = list(range(43))
+        c4 = [layer for layer in layers if ratios[layer] == 4]
+        c128 = [layer for layer in layers if ratios[layer] == 128]
+        for state, groups in (
+            (None, [c4, c4, c128]),
+            (None, [c4, c4, c4, c128, c128]),
+            (StateType.SWA, [layers, c4, c4]),
+            (StateType.SWA_RING, [layers]),
+            (StateType.SWA_RING, [layers, layers]),
+            (StateType.DSV4_REQUEST_STATE, [c128]),
+        ):
+            with self.subTest(state=state, groups=len(groups)):
+                full = [layer for group in groups for layer in group]
+                selected_by_rank = []
+                for rank in range(2):
+                    mgr = _pp_mgr(0, 43, ratios)
+                    mgr.kv_args.vpp_layers = ownership
+                    mgr.kv_args.pp_rank = rank
+                    expected = [
+                        index
+                        for index, layer in enumerate(full)
+                        if layer in ownership[rank]
+                    ]
+                    src = [1000 + rank] * len(expected)
+                    actual_src, selected, count = mgr.get_mla_kv_ptrs_with_pp(
+                        src, list(range(len(full))), state
+                    )
+                    self.assertEqual(actual_src, src)
+                    self.assertEqual(selected, expected)
+                    self.assertEqual(count, len(expected))
+                    if state == StateType.SWA:
+                        self.assertEqual(count, (39, 46)[rank])
+                    selected_by_rank.extend(selected)
+                self.assertEqual(sorted(selected_by_rank), list(range(len(full))))
 
     def test_bootstrap_rejects_same_size_different_layer_ownership(self):
         """The decoded HTTP schema must retain ownership through peer validation."""

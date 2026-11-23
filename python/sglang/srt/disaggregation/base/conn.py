@@ -71,6 +71,7 @@ class KVArgs:
     # Full model layer ownership on every physical VPP rank, also advertised
     # at bootstrap so equal buffer counts cannot hide a different partition.
     vpp_layers: Optional[List[List[int]]] = None
+    mla_kv_source_layers: Optional[List[int]] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
