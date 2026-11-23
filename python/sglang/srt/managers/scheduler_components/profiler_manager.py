@@ -10,6 +10,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     List,
     Optional,
 )
@@ -77,6 +78,7 @@ class SchedulerProfilerManager:
         self.profile_in_progress: bool = False
         self.merge_profiles = False
         self.detailed_annotations: bool = False
+        self.profiler_kwargs: Optional[Dict[str, Any]] = None
 
         # For ROCM
         self.rpd_profiler = None
@@ -95,8 +97,16 @@ class SchedulerProfilerManager:
         profile_prefix: str = "",
         detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
+        profiler_kwargs: Optional[Dict[str, Any]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
+            if profiler_kwargs:
+                # ProfileManager (V2) does not wire experimental_config or OOT
+                # startup errors; reject explicitly rather than ignoring options.
+                return ProfileReqOutput(
+                    success=False,
+                    message="profiler_kwargs is not supported with SGLANG_PROFILE_V2.",
+                )
             self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
                 output_dir=output_dir,
@@ -119,21 +129,46 @@ class SchedulerProfilerManager:
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
 
-        self.profile_by_stage = profile_by_stage
-        self.merge_profiles = merge_profiles
+        if profiler_kwargs is not None and not isinstance(profiler_kwargs, dict):
+            return ProfileReqOutput(
+                success=False,
+                message=f"profiler_kwargs must be a dict, got {type(profiler_kwargs).__name__}.",
+            )
 
         if output_dir is None:
             output_dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
+        resolved_output_dir = Path(output_dir).expanduser()
 
-        self.torch_profiler_output_dir = Path(output_dir).expanduser()
+        if (
+            profiler_kwargs is not None
+            and not _is_npu
+            and current_platform.is_out_of_tree()
+            and "RPD" not in activities
+        ):
+            try:
+                current_platform.get_torch_profiler_experimental_config(
+                    profiler_kwargs=profiler_kwargs,
+                    with_cpu="CPU" in activities,
+                    output_dir=str(resolved_output_dir),
+                    profile_id=profile_id,
+                    profile_prefix=profile_prefix,
+                )
+            except ValueError as e:
+                logger.error("Invalid profiler configuration: %s", e)
+                return ProfileReqOutput(success=False, message=str(e))
+
+        self.profile_by_stage = profile_by_stage
+        self.merge_profiles = merge_profiles
+        self.torch_profiler_output_dir = resolved_output_dir
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
         self.detailed_annotations = detailed_annotations
+        self.profiler_kwargs = profiler_kwargs
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -155,6 +190,14 @@ class SchedulerProfilerManager:
             self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _reset_armed_profile_state(self) -> None:
+        self.profile_in_progress = False
+        self.profiler_start_forward_ct = None
+        self.profiler_target_forward_ct = None
+        # Keep profiler_target_{prefill,decode}_ct non-None: _profile_batch_predicate
+        # compares against them on the current batch right after _start_profile returns.
+        self.profile_by_stage = False
 
     def _apply_detailed_annotations(self, enabled: bool) -> None:
         # Toggle the process-wide flag read by build_step_span_name; folds the
@@ -230,6 +273,23 @@ class SchedulerProfilerManager:
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
         elif torchprof_activities:
+            oot_experimental_config = None
+            if not _is_npu and current_platform.is_out_of_tree():
+                try:
+                    oot_experimental_config = (
+                        current_platform.get_torch_profiler_experimental_config(
+                            profiler_kwargs=self.profiler_kwargs,
+                            with_cpu="CPU" in activities,
+                            output_dir=str(self.torch_profiler_output_dir),
+                            profile_id=self.profile_id,
+                            profile_prefix=self.profile_prefix,
+                            stage=stage.name if stage else None,
+                        )
+                    )
+                except ValueError as e:
+                    logger.error("Invalid profiler configuration: %s", e)
+                    self._reset_armed_profile_state()
+                    return ProfileReqOutput(success=False, message=str(e))
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
@@ -242,7 +302,7 @@ class SchedulerProfilerManager:
                     else None
                 ),
                 experimental_config=(
-                    None
+                    oot_experimental_config
                     if not _is_npu
                     else torch_npu.profiler._ExperimentalConfig(
                         export_type=torch_npu.profiler.ExportType.Text,
@@ -259,8 +319,10 @@ class SchedulerProfilerManager:
             )
             try:
                 self.torch_profiler.start()
-            except RuntimeError as e:
+            except (ValueError, RuntimeError) as e:
+                logger.error("Failed to start torch profiler: %s", e)
                 self.torch_profiler = None
+                self._reset_armed_profile_state()
                 return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
 
@@ -469,9 +531,10 @@ class SchedulerProfilerManager:
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
                     recv_req.profile_stages,
+                    profiler_kwargs=recv_req.profiler_kwargs,
                 )
             else:
-                self._init_profile(
+                result = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -483,7 +546,10 @@ class SchedulerProfilerManager:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                     recv_req.detailed_annotations,
+                    profiler_kwargs=recv_req.profiler_kwargs,
                 )
+                if result is not None and not result.success:
+                    return result
                 return self._start_profile()
         else:
             return self._stop_profile()

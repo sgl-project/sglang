@@ -11,13 +11,27 @@ import os
 import time
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from sglang.srt.environ import envs
 
 PROFILER_DIR = envs.SGLANG_TORCH_PROFILER_DIR.get()
+
+
+def _parse_profiler_kwargs(raw: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON for --profiler-kwargs: {e}"
+        ) from e
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError(
+            f"--profiler-kwargs must be a JSON object (dict), got {type(value).__name__}"
+        )
+    return value
 
 
 def run_profile(
@@ -30,7 +44,12 @@ def run_profile(
     profile_prefix: Optional[str] = None,
     start_step: Optional[int] = None,
     admin_api_key: Optional[str] = None,
+    profiler_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
+    if profiler_kwargs is not None and not isinstance(profiler_kwargs, dict):
+        raise TypeError(
+            f"profiler_kwargs must be a dict, got {type(profiler_kwargs).__name__}"
+        )
     if output_dir is None:
         output_dir = PROFILER_DIR
     admin_api_key = admin_api_key or envs.SGLANG_ADMIN_API_KEY.get()
@@ -64,6 +83,8 @@ def run_profile(
     }
     if start_step is not None:
         json_data["start_step"] = str(start_step)
+    if profiler_kwargs is not None:
+        json_data["profiler_kwargs"] = profiler_kwargs
 
     response = requests.post(
         url=url + "/start_profile",
@@ -145,6 +166,12 @@ if __name__ == "__main__":
         default=None,
         help="The server's --admin-api-key, which /start_profile requires (default: SGLANG_ADMIN_API_KEY).",
     )
+    parser.add_argument(
+        "--profiler-kwargs",
+        type=_parse_profiler_kwargs,
+        default=None,
+        help="JSON dictionary of extra backend-specific profiler options.",
+    )
 
     args = parser.parse_args()
     activities = []
@@ -166,4 +193,5 @@ if __name__ == "__main__":
         profile_prefix=args.profile_prefix,
         merge_profiles=args.merge_profiles,
         admin_api_key=args.admin_api_key,
+        profiler_kwargs=args.profiler_kwargs,
     )

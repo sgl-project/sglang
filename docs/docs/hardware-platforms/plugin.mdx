@@ -509,6 +509,12 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
       <td>Planned</td>
       <td>Detect CPU architecture (<code>CpuArchEnum</code>)</td>
     </tr>
+    <tr>
+      <td><code>get_torch_profiler_experimental_config(...)</code></td>
+      <td><code>None</code></td>
+      <td><strong>Active</strong></td>
+      <td>Build backend-specific <code>experimental_config</code> for <code>torch.profiler.profile</code> from <code>profiler_kwargs</code> and capture context; raise <code>ValueError</code> on invalid options</td>
+    </tr>
   </tbody>
 </table>
 

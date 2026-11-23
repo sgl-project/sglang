@@ -29,7 +29,7 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -278,6 +278,27 @@ class DeviceMixin:
     def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
         """[Active] Return the torch profiler activity."""
         raise NotImplementedError
+
+    def get_torch_profiler_experimental_config(
+        self,
+        *,
+        profiler_kwargs: dict[str, Any] | None = None,
+        with_cpu: bool = True,
+        output_dir: str | None = None,
+        profile_id: str | None = None,
+        profile_prefix: str | None = None,
+        stage: str | None = None,
+    ) -> Any:
+        """[Active] Return backend-specific experimental_config for torch.profiler.
+
+        Called by ``SchedulerProfilerManager`` on out-of-tree platforms both at
+        profile initialization (with ``stage=None``, when ``profiler_kwargs`` is
+        provided, to reject invalid options upfront) and when starting each
+        capture (with ``stage`` populated during staged captures). Subclasses
+        should keep this method side-effect-free and raise ``ValueError`` on
+        invalid configuration.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Dunder helpers
