@@ -112,6 +112,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _log_internal_state_task_error(task: asyncio.Task) -> None:
+    """Surface an internal-state query failure even if every waiter timed out."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("internal-state query failed: %s", exc, exc_info=exc)
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -1004,14 +1013,34 @@ class TokenizerControlMixin:
             safe_to_restore=safe_to_restore,
         )
 
-    async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
-        self.auto_create_handle_loop()
+    async def _get_internal_state_uncached(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
         req = GetInternalStateReq()
         responses: List[
             GetInternalStateReqOutput
         ] = await self.get_internal_state_communicator(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        # A caller timeout (for example /server_info's wait_for) must not
+        # cancel the fan-out query: late replies would otherwise be counted
+        # against the next query and produce a mixed snapshot. Reuse the
+        # in-flight task and let the timeout cancel only this caller's wait.
+        task = getattr(self, "_internal_state_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._get_internal_state_uncached())
+            task.add_done_callback(_log_internal_state_task_error)
+            self._internal_state_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            # Another waiter may already have installed a newer task while this
+            # one was waking up; only clear the cache entry we created/joined.
+            if task.done() and getattr(self, "_internal_state_task", None) is task:
+                self._internal_state_task = None
 
     async def get_hicache_l3_cache_layout(
         self: TokenizerManager,

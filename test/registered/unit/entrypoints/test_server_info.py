@@ -113,6 +113,7 @@ def _call_server_info_with(
     config_updates: dict | None = None,
     scheduler_info: dict | None = None,
     supports_inline_system: bool = False,
+    internal_states_fn=None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -130,6 +131,8 @@ def _call_server_info_with(
     """
 
     async def _fake_internal_state():
+        if internal_states_fn is not None:
+            return await internal_states_fn()
         return internal_states or [{"max_req_input_len": 1024}]
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
@@ -158,6 +161,21 @@ def _call_server_info_with(
         http_server._global_state = prior_state
         if published:
             reset_context()
+
+
+class TestServerInfoTimeout(CustomTestCase):
+    def test_timeout_returns_empty_internal_states(self):
+        async def slow_internal_state():
+            await asyncio.sleep(1)
+            return [{"rank": 0}]
+
+        with envs.SGLANG_SERVER_INFO_TIMEOUT.override(0.01):
+            info = _call_server_info_with(
+                ServerArgs(model_path="dummy"),
+                internal_states_fn=slow_internal_state,
+            )
+
+        self.assertEqual(info["internal_states"], [])
 
 
 class TestServerInfoTransportParity(CustomTestCase):

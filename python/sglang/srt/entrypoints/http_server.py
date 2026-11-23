@@ -911,9 +911,19 @@ async def server_info(request: Request):
     HiCache mirror by `GET /hicache/storage-backend`.
     """
     # Returns internal states per DP.
-    internal_states: List[
-        Dict[Any, Any]
-    ] = await _global_state.tokenizer_manager.get_internal_state()
+    server_info_timeout = envs.SGLANG_SERVER_INFO_TIMEOUT.get()
+    try:
+        internal_states: List[Dict[Any, Any]] = await asyncio.wait_for(
+            _global_state.tokenizer_manager.get_internal_state(),
+            timeout=server_info_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out getting internal state for /server_info after %.1fs; "
+            "returning empty internal_states",
+            server_info_timeout,
+        )
+        internal_states = []
 
     server_args = _global_state.tokenizer_manager.server_args
 
