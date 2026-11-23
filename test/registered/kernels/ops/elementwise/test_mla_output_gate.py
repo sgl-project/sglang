@@ -33,6 +33,30 @@ class TestMlaOutputGate(CustomTestCase):
         expected = x * torch.sigmoid(gate).to(torch.bfloat16)
         self.assertTrue(torch.equal(kimi_k3_mla_output_gate(x, gate), expected))
 
+    def test_mla_output_gate_strided(self):
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        qkv_a_dim = 2112
+        g_dim = 1536
+        for num_tokens in (1, 7, 64, 512, 4096):
+            with self.subTest(num_tokens=num_tokens):
+                x = torch.randn(
+                    (num_tokens, g_dim),
+                    generator=generator,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                merged = torch.randn(
+                    (num_tokens, qkv_a_dim + g_dim),
+                    generator=generator,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                gate = merged[:, qkv_a_dim:]
+                self.assertTrue(covered(x, gate))
+                expected = x * torch.sigmoid(gate.contiguous()).to(torch.bfloat16)
+                out = kimi_k3_mla_output_gate(x, gate)
+                self.assertTrue(torch.equal(out, expected))
+
 
 if __name__ == "__main__":
     unittest.main()

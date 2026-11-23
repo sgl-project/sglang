@@ -28,13 +28,16 @@ def _jit_mla_output_gate_module() -> Module:
         "kimi_k3_mla_output_gate_" + str(_THREADS),
         *args,
         cuda_files=["kimi_k3/mla_output_gate.cuh"],
-        cuda_wrappers=[("run", f"MlaOutputGateKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"MlaOutputGateKernel<{args}>::run"),
+            ("run_strided", f"MlaOutputGateKernel<{args}>::run_strided"),
+        ],
         extra_cuda_cflags=["-O3"],
     )
 
 
 def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
-    return (
+    if not (
         x.is_cuda
         and gate.is_cuda
         and not _is_npu
@@ -42,9 +45,19 @@ def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
         and gate.dtype == torch.bfloat16
         and x.shape == gate.shape
         and x.is_contiguous()
-        and gate.is_contiguous()
-        and x.numel() % 8 == 0
         and x.numel() > 0
+    ):
+        return False
+    if gate.is_contiguous():
+        return x.numel() % 8 == 0
+    return (
+        x.ndim == 2
+        and gate.ndim == 2
+        and gate.stride(1) == 1
+        and x.shape[1] % 8 == 0
+        and gate.stride(0) >= x.shape[1]
+        and gate.stride(0) % 8 == 0
+        and gate.data_ptr() % 8 == 0
     )
 
 
@@ -53,5 +66,9 @@ def kimi_k3_mla_output_gate(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor
     """out = bf16(x * bf16(sigmoid(gate))); double rounding matches the
     unfused torch.sigmoid + mul pair bit-for-bit. Caller checks covered()."""
     out = torch.empty_like(x)
-    _jit_mla_output_gate_module().run(x.view(-1), gate.view(-1), out.view(-1))
+    mod = _jit_mla_output_gate_module()
+    if gate.is_contiguous():
+        mod.run(x.view(-1), gate.view(-1), out.view(-1))
+    else:
+        mod.run_strided(x, gate, out)
     return out

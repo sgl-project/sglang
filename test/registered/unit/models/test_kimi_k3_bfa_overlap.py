@@ -622,6 +622,93 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                 torch.testing.assert_close(beta, exp_b, rtol=1e-2, atol=2e-3)
                 torch.testing.assert_close(fg, exp_fg, rtol=2e-2, atol=4e-3)
 
+    def test_cuda_mla_qkv_a_gate_merge_and_strided_gate(self):
+        """CUDA merges [fused_qkv_a_proj_with_mqa | g_proj] into one view-backed
+        buffer for breakable prefill graphs / eager / M > limit, and strided
+        mla_output_gate matches torch.sigmoid + mul bit-for-bit."""
+        from sglang.kernels.ops.elementwise import mla_output_gate
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(11)
+
+        def _randn(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.bfloat16)
+            )
+
+        qkv_a_w = _randn(2112, _H)
+        gate_w = _randn(1536, _H)
+        ref_qkv_a_w = qkv_a_w.clone()
+        ref_gate_w = gate_w.clone()
+
+        owner = SimpleNamespace(
+            use_output_gate=True,
+            has_fused_proj=True,
+            _kimi_split_gguf_kv_b=False,
+            fused_qkv_a_proj_with_mqa=SimpleNamespace(
+                weight=qkv_a_w, bias=None, quant_method=qm
+            ),
+            g_proj=SimpleNamespace(weight=gate_w, bias=None, quant_method=qm),
+            _qkv_a_gate_layer=None,
+            _qkv_a_gate_sizes=None,
+            _gate_alt_stream=torch.cuda.Stream(),
+            _gate_bs_limit=8,
+            _gate_pending_stream=None,
+            _gate_hidden_states=None,
+            _use_merged_qkv_a_gate=False,
+            _precomputed_output_gate=None,
+        )
+        self.assertTrue(KimiK3MLAAttention._merge_qkv_a_gate_weights(owner))
+        self.assertEqual(owner._qkv_a_gate_layer.weight.shape, (3648, _H))
+        self.assertEqual(
+            owner.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
+            owner._qkv_a_gate_layer.weight.data_ptr(),
+        )
+        self.assertEqual(
+            owner.g_proj.weight.data_ptr(),
+            owner._qkv_a_gate_layer.weight[2112:].data_ptr(),
+        )
+
+        # In breakable prefill graph or M > _gate_bs_limit, _fork_output_gate
+        # stays inactive and prepare_qkv_latent computes both in one GEMM.
+        x = _randn(16, _H)
+        attn_out = _randn(16, 1536)
+        owner._gate_hidden_states = x
+        with (
+            patch(
+                "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.kimi_k3.is_in_breakable_cuda_graph",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.layer_boundary.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+        ):
+            KimiK3MLAAttention._fork_output_gate(owner, x)
+            self.assertIsNone(owner._gate_pending_stream)
+            owner._use_merged_qkv_a_gate = True
+            qkv_a = KimiK3MLAAttention.prepare_qkv_latent(owner, x, None)
+            gate = KimiK3MLAAttention._compute_output_gate(owner, x)
+
+        self.assertFalse(gate.is_contiguous())
+        self.assertTrue(mla_output_gate.covered(attn_out, gate))
+        gated = mla_output_gate.kimi_k3_mla_output_gate(attn_out, gate)
+        expected_gated = attn_out * torch.sigmoid(gate.contiguous())
+        self.assertTrue(torch.equal(gated, expected_gated))
+        torch.testing.assert_close(
+            qkv_a, torch.nn.functional.linear(x, ref_qkv_a_w), rtol=1e-2, atol=2e-3
+        )
+        torch.testing.assert_close(
+            gate, torch.nn.functional.linear(x, ref_gate_w), rtol=1e-2, atol=2e-3
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

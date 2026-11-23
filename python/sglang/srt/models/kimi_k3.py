@@ -2978,6 +2978,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_bs_limit = (
                 _k3_side_stream_max_tokens() if self._gate_alt_stream is not None else 0
             )
+            # View-merged [fused_qkv_a_proj_with_mqa | g_proj] buffer on CUDA
+            # (built post-load by _merge_qkv_a_gate_weights); used whenever
+            # side-stream overlap is inactive (breakable prefill graphs, eager,
+            # or M > _gate_bs_limit) so hidden_states is read once.
+            self._qkv_a_gate_layer: Optional[SimpleNamespace] = None
+            self._qkv_a_gate_sizes: Optional[list[int]] = None
+            self._use_merged_qkv_a_gate = False
+            self._precomputed_output_gate: Optional[torch.Tensor] = None
             self._pre_o_proj_out: Optional[torch.Tensor] = None
             self._return_pre_o_proj = False
             _orig_o_proj_forward = self.o_proj.forward
@@ -3043,6 +3051,102 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
+    def _may_fuse_qkv_a_gate(self) -> bool:
+        """Whether fused_qkv_a_proj_with_mqa and g_proj can share one merged
+        unquantized CUDA buffer (each rank concatenates the replicated qkv_a
+        rows with its own attn_tp shard of g_proj, zero extra comm)."""
+        if not (get_platform().is_cuda and not _is_hip and not _is_npu):
+            return False
+        if not getattr(self, "use_output_gate", False):
+            return False
+        if (
+            not getattr(self, "has_fused_proj", False)
+            or getattr(self, "_kimi_split_gguf_kv_b", False)
+            or hasattr(self, "q_a_proj")
+        ):
+            return False
+        qkv_a = getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        g_proj = getattr(self, "g_proj", None)
+        if qkv_a is None or g_proj is None:
+            return False
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        mods = (qkv_a, g_proj)
+        if not all(
+            isinstance(getattr(m, "quant_method", None), UnquantizedLinearMethod)
+            and getattr(m, "bias", None) is None
+            and not hasattr(m, "weight_scale")
+            and not hasattr(m, "weight_scale_inv")
+            for m in mods
+        ):
+            return False
+        ws = [getattr(m, "weight", None) for m in mods]
+        if any(w is None for w in ws):
+            return False
+        if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
+            return False
+        if not _is_unquantized_mergeable(ws):
+            return False
+        if len({(w.dtype, w.shape[1]) for w in ws}) != 1:
+            return False
+        # Both slices must stay 8-elem (16B) aligned for strided mla_output_gate.
+        return ws[0].shape[0] % 8 == 0 and ws[1].shape[0] % 8 == 0
+
+    def _merge_qkv_a_gate_weights(self) -> bool:
+        """View-merge [fused_qkv_a_proj_with_mqa | g_proj] in place (~0 extra
+        memory, CUDA-graph reload safe). Individual weights stay live views for
+        the small-M side-stream path and external bindings."""
+        may_fuse = getattr(
+            self,
+            "_may_fuse_qkv_a_gate",
+            lambda: KimiK3MLAAttention._may_fuse_qkv_a_gate(self),
+        )
+        if not may_fuse():
+            return False
+        previous = getattr(self, "_qkv_a_gate_layer", None)
+        merged, sizes = _merge_weights_as_views(
+            [self.fused_qkv_a_proj_with_mqa, self.g_proj],
+            pad_rows_to=16,
+            target=None if previous is None else previous.weight,
+        )
+        self._qkv_a_gate_layer = SimpleNamespace(weight=merged)
+        self._qkv_a_gate_sizes = [
+            sizes[0],
+            sizes[1],
+            merged.shape[0] - sum(sizes),
+        ]
+        return True
+
+    # Above 8192 tokens on B300, N=3648 loses ~7% cuBLASLt efficiency vs split
+    # 2112+1536 and holds a >24 MB transient gate buffer across MLA attention.
+    _MERGED_QKV_A_GATE_MAX_TOKENS = 8192
+
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        qkv_a_gate_layer = getattr(self, "_qkv_a_gate_layer", None)
+        max_tokens = getattr(
+            self,
+            "_MERGED_QKV_A_GATE_MAX_TOKENS",
+            KimiK3MLAAttention._MERGED_QKV_A_GATE_MAX_TOKENS,
+        )
+        if (
+            getattr(self, "_use_merged_qkv_a_gate", False)
+            and qkv_a_gate_layer is not None
+            and hidden_states is getattr(self, "_gate_hidden_states", None)
+            and 0 < hidden_states.shape[0] <= max_tokens
+        ):
+            from sglang.srt.layers.layer_boundary import get_attn_tp_context
+
+            if not get_attn_tp_context().input_scattered:
+                merged = self.fused_qkv_a_proj_with_mqa.quant_method.apply(
+                    qkv_a_gate_layer, hidden_states, None
+                )
+                qkv_a, gate, _pad = merged.split(self._qkv_a_gate_sizes, dim=-1)
+                self._precomputed_output_gate = gate
+                return qkv_a
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
+
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
@@ -3060,6 +3164,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
+        precomputed = getattr(self, "_precomputed_output_gate", None)
+        if precomputed is not None:
+            self._precomputed_output_gate = None
+            return precomputed
         pre = self.__dict__.get("_mono_pre") if _is_gfx95 else None
         if pre is not None and "gate" in pre:
             return mono_output_gate_hip(pre, alt)
@@ -3080,10 +3188,21 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
+            self._precomputed_output_gate = None
             self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+            self._use_merged_qkv_a_gate = (
+                self._gate_pending_stream is None
+                and getattr(self, "_qkv_a_gate_layer", None) is not None
+            )
+        try:
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
+        finally:
+            if self.use_output_gate:
+                self._use_merged_qkv_a_gate = False
+                self._precomputed_output_gate = None
+                self._gate_hidden_states = None
 
     def forward_pre_o_proj(
         self,
@@ -4354,13 +4473,14 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
-            if (
-                isinstance(layer.self_attn, KimiK3MLAAttention)
-                and layer.self_attn.indexer is not None
-            ):
-                layer.self_attn.indexer.prepare_merged_k_gate()
-                # MI355X, 140k keys: ~0.6 ms/layer unsplit at 512 rows vs ~0.16 ms at 64
-                layer.self_attn.indexer.tp_split_min_rows = 64 if _is_gfx95 else 1024
+            if isinstance(layer.self_attn, KimiK3MLAAttention):
+                layer.self_attn._merge_qkv_a_gate_weights()
+                if layer.self_attn.indexer is not None:
+                    layer.self_attn.indexer.prepare_merged_k_gate()
+                    # MI355X, 140k keys: ~0.6 ms/layer unsplit at 512 rows vs ~0.16 ms at 64
+                    layer.self_attn.indexer.tp_split_min_rows = (
+                        64 if _is_gfx95 else 1024
+                    )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
