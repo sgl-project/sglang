@@ -357,9 +357,15 @@ class CommonKVManager(BaseKVManager):
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
-        self.exchange_aux_item_lens = self.customized_info_enabled or (
-            get_disagg().disaggregation_max_top_logprobs_num
-            != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+        # The sampling-mask buffers differ across builds; with them on, item lengths
+        # are exchanged so validate_aux_buffers refuses a peer with another layout.
+        self.exchange_aux_item_lens = (
+            self.customized_info_enabled
+            or (
+                get_disagg().disaggregation_max_top_logprobs_num
+                != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+            )
+            or envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
@@ -2817,6 +2823,14 @@ class CommonKVReceiver(BaseKVReceiver):
             return self._poll()
 
     def _poll(self) -> KVPoll:
+        if (
+            self.conclude_state == KVPoll.Success
+            and self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed
+        ):
+            # Success is cached before the request commits; the manager failed
+            # the room since (a metadata item it dropped). The metadata gate
+            # polls again for this.
+            self.conclude_state = KVPoll.Failed
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
