@@ -91,9 +91,16 @@ on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
 {/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
 ```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   NAME: container name
+# ============================================================
+
+NAME=sglang-qwen3-32b
+
 docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
-docker run -itd --shm-size=16g --name ${NAME} \
+docker run -itd --shm-size=16g --name "$NAME" \
 --privileged=true --net=host \
 -e ASCEND_VISIBLE_DEVICES=0-15 \
 -v /etc/ascend_install.info:/etc/ascend_install.info \
@@ -107,7 +114,7 @@ quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
   container, for example: `-v /path/to/models:/models`.
-- Replace `${NAME}` with your own container name or remove `--name` to use default name.
+- Set `NAME` at the top of the script to your own container name.
 </Tip>
 
 ## Online service deployment
