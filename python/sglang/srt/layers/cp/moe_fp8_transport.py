@@ -50,6 +50,8 @@ def resolve_cp_moe_fp8_transport() -> bool:
         and p.moe_dp_size == 1
         and p.moe_ep_size == 1
         and p.pp_size == 1
+        and not p.enable_cp_decode_attn_tp
+        and not p.enable_attn_tp_input_scattered
         and not layernorm_sp.layernorm_sp_enabled()
         and get_moe_a2a_backend().is_none()
         and (runner.is_triton() or runner.is_deep_gemm())

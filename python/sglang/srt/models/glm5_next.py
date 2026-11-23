@@ -1109,17 +1109,6 @@ class Glm5NextDecoderLayer(nn.Module):
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
-        # The boundary already selected the batch variant and bound exactly
-        # one transport. Do not re-derive CP activity here.
-        if self.ffn_boundary.declaration.row_transport is not None:
-            invocation = self.ffn_boundary.transport_context(forward_batch)
-            with self.ffn_boundary.exit(forward_batch) as output:
-                hidden_states = invocation.forward(
-                    forward_batch, gemm_output_zero_allocator
-                )
-                hidden_states = output.finish(hidden_states)
-            return (hidden_states, topk_indices)
-
         if sp_active:
             hidden_states = layernorm_sp.run_replicated_token_rows(
                 hidden_states,
@@ -1130,6 +1119,17 @@ class Glm5NextDecoderLayer(nn.Module):
                 total_rows=positions.shape[-1],
             )
             return self.ffn_boundary.finish(hidden_states, forward_batch), topk_indices
+
+        # The boundary already selected the batch variant and bound exactly
+        # one transport. Do not re-derive CP activity here.
+        if self.ffn_boundary.declaration.row_transport is not None:
+            invocation = self.ffn_boundary.transport_context(forward_batch)
+            with self.ffn_boundary.exit(forward_batch) as output:
+                hidden_states = invocation.forward(
+                    forward_batch, gemm_output_zero_allocator
+                )
+                hidden_states = output.finish(hidden_states)
+            return (hidden_states, topk_indices)
 
         if (
             isinstance(self.mlp, Glm5NextMoE)
