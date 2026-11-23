@@ -212,6 +212,31 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
     return (has_double_blocks or has_single_blocks) and has_lora_ab
 
 
+# FLUX BFL-layout attention keys (`double_blocks.N.img_attn.qkv`); HunyuanVideo's
+# `img_attn_qkv` also lives under `double_blocks.` but uses underscores.
+_BFL_FLUX_ATTN_KEY = re.compile(
+    r"(?:^|\.)double_blocks\.\d+\.(?:img|txt)_attn\.(?:qkv|proj)\."
+)
+_DOWN_UP_SUFFIX = re.compile(r"\.lora_(down|up)(?=\.weight$|$)")
+
+
+def _bfl_flux_down_up_as_a_b(
+    state_dict: Mapping[str, torch.Tensor],
+) -> Mapping[str, torch.Tensor]:
+    """Rename `lora_down`/`lora_up` to `lora_A`/`lora_B` in a BFL-layout FLUX
+    LoRA, so it is detected and converted like its `lora_A`/`lora_B` twin."""
+    if not any(
+        _BFL_FLUX_ATTN_KEY.search(k) and _DOWN_UP_SUFFIX.search(k) for k in state_dict
+    ):
+        return state_dict
+    return {
+        _DOWN_UP_SUFFIX.sub(
+            lambda m: ".lora_A" if m.group(1) == "down" else ".lora_B", k
+        ): v
+        for k, v in state_dict.items()
+    }
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
 ) -> LoRAFormat:
@@ -645,7 +670,7 @@ def normalize_lora_state_dict(
     """Normalize any supported LoRA format into a single canonical layout."""
     log = logger or globals()["logger"]
 
-    state_dict = normalize_peft_keys(state_dict)
+    state_dict = _bfl_flux_down_up_as_a_b(normalize_peft_keys(state_dict))
     keys = list(state_dict.keys())
     log.info(
         "[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=%d",
@@ -660,8 +685,14 @@ def normalize_lora_state_dict(
     fmt = detect_lora_format_from_state_dict(state_dict)
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
+    peft_config = dict(adapter_config or {})
+    if fmt == LoRAFormat.AI_TOOLKIT_FLUX:
+        # alpha_pattern names the checkpoint's modules, which the conversion
+        # renames; resolve it first, and the conversion carries each `.alpha`.
+        state_dict = apply_peft_config(dict(state_dict), peft_config)
+        peft_config = {}
     normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
-    normalized = apply_peft_config(normalized, adapter_config or {})
+    normalized = apply_peft_config(normalized, peft_config)
 
     norm_keys = list(normalized.keys())
     if norm_keys:
