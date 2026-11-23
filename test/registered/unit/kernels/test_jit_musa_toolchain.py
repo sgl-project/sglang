@@ -98,7 +98,9 @@ def test_musa_explicit_arch_wins_over_environment_and_cache_tag(monkeypatch):
     assert toolchain.gpu_arch_name.__wrapped__(explicit) == "mp_40a"
     assert toolchain.gpu_arch_name.__wrapped__() == "mp_31"
     assert toolchain.target_flags(explicit) == ["--offload-arch=mp_40a"]
+    assert toolchain.target_flags() == ["--offload-arch=mp_31"]
     assert cache._target_tag.__wrapped__(explicit) == "mp_40a"
+    assert cache._target_tag.__wrapped__() == "mp_31"
 
 
 def test_musa_checks_preserve_existing_platform_precedence(monkeypatch):
