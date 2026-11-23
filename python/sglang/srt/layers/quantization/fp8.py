@@ -3769,9 +3769,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if getattr(layer.w13_weight, "is_shuffled", False):
                     w13_weight.is_shuffled = True
                     w2_weight.is_shuffled = True
-                gate_up_interleaved = getattr(layer, "_aiter_gate_up_interleaved", None)
-                if gate_up_interleaved is not None:
-                    w13_weight.gate_up_interleave = bool(gate_up_interleaved)
             w13_scale = layer.w13_weight_scale_inv
             w2_scale = layer.w2_weight_scale_inv
         else:
@@ -3803,7 +3800,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
             fp8_activations=(
-                self.is_fp4_expert and getattr(layer, "fp8_activations", False)
+                self.is_fp4_expert
+                and (
+                    getattr(layer, "fp8_activations", False)
+                    or (_is_shuffle_moe_mxfp4 and gate_up_interleaved is True)
+                )
             ),
             fused_moe_kwargs=fused_moe_kwargs,
         )

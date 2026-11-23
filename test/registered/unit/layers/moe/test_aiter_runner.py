@@ -44,6 +44,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.dtypes = SimpleNamespace(fp8=torch.float8_e4m3fn)
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -90,25 +91,27 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["custom_fused_moe_kwarg"] == "enabled"
 
 
-def test_aiter_runner_attaches_effective_gate_layout_to_fp4_weight(monkeypatch):
+def test_aiter_runner_pins_interleaved_fp4_activations_to_fp8(monkeypatch):
     captured = {}
 
     def fused_moe(**kwargs):
-        captured["gate_up_interleave"] = getattr(
-            kwargs["w1"], "gate_up_interleave", None
-        )
+        captured.update(kwargs)
         return kwargs["hidden_states"]
 
     _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(aiter_runner, "is_gfx95_supported", lambda: True)
     runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
 
     runner.run(
         _runner_input(),
-        _quant_info(fused_moe_kwargs={"gate_mode": "interleave"}),
+        _quant_info(
+            fp8_activations=True,
+            fused_moe_kwargs={"gate_mode": "INTERLEAVE"},
+        ),
         running_state={},
     )
 
-    assert captured["gate_up_interleave"] is True
+    assert captured["quant_dtype_a"] == torch.float8_e4m3fn
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
