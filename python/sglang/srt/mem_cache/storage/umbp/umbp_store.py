@@ -245,6 +245,9 @@ class UMBPStore(HiCacheStorage):
     Compatible with the zero-copy v1 interface used by CacheController.
     """
 
+    # MoRI's SPDK proxy clamps keys to kMaxKeyLen - 1 = 255 bytes.
+    _SPDK_MAX_KEY_BYTES = 255
+
     def __init__(
         self,
         storage_config: HiCacheStorageConfig = None,
@@ -956,6 +959,17 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.ssd_backend,
         )
 
+        # Anchor keys are the only key shape this change lengthens. Check the
+        # final backend (after the MLA and DP rewrites above) once, here, before
+        # the KV events thread starts.
+        if (
+            cfg.ssd.enabled
+            and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
+            and not self._kv_anchor_is_logical
+        ):
+            keys, _ = self._anchor_keys(["f" * 64])
+            self._check_spdk_key_budget(keys, "anchor")
+
         # ------------------------------------------------------------------
         # Optional KV events subscriber
         # Enabled via extra_config["kv_events_subscriber"] = True/1/"true".
@@ -1195,6 +1209,21 @@ class UMBPStore(HiCacheStorage):
             self._namespace_key(f"{key}{suffix}") for key in keys for suffix in suffixes
         ]
         return key_list, len(suffixes)
+
+    def _check_spdk_key_budget(self, keys: list[str], what: str) -> None:
+        """Startup-only check. MoRI's SPDK proxy clamps keys to 255 bytes, which
+        cuts off the rank and K/V suffix and lets keys collide."""
+        if not keys:
+            return
+        longest = max(len(key.encode("utf-8")) for key in keys)
+        if longest > self._SPDK_MAX_KEY_BYTES:
+            prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
+            raise ValueError(
+                f"UMBP SPDK store: longest {what} key is {longest} UTF-8 bytes, "
+                f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
+                f"The namespace prefix is {prefix_bytes} bytes; "
+                "shorten the served model name or extra_backend_tag."
+            )
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
