@@ -169,8 +169,25 @@ class TestMediaArtifactProcessor(CustomTestCase):
                         self.assertEqual(actual.tobytes(), expected.tobytes())
                         self.assertEqual(snapshot.content_digest, digest)
                         self.assertEqual(image.mode, mode)
-                        if mode == "RGB" and source is image:
+                        if mode == "RGB" and source is image and not smart:
                             self.assertIs(actual, snapshot.data)
+
+    def test_smart_decoder_applies_exif_orientation_to_rgb_images(self):
+        """Smart conversion transposes RGB like the legacy loader does."""
+        image = Image.new("RGB", (40, 20), (80, 160, 240))
+        exif = image.getexif()
+        exif[0x0112] = 6
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", exif=exif.tobytes())
+        processor = MediaArtifactCacheMixin()
+        processor.gpu_image_decode = False
+        for smart, size in ((False, (40, 20)), (True, (20, 40))):
+            with self.subTest(smart=smart):
+                processor.smart_rgb_conversion = smart
+                snapshot = snapshot_media(buf.getvalue())
+                actual = processor.decode_media_snapshot(snapshot, Modality.IMAGE)
+                self.assertEqual(actual.mode, "RGB")
+                self.assertEqual(actual.size, size)
 
     def test_unknown_model_option_is_part_of_artifact_identity(self):
         processor = _Processor()

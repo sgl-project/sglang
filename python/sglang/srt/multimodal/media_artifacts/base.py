@@ -173,14 +173,16 @@ class MediaArtifactCacheMixin:
 
     def _ensure_rgb_image(self, image: Any) -> Any:
         """Match the default legacy loader RGB conversion before processing."""
-        if (
-            not self.artifact_discard_alpha_channel
-            or not isinstance(image, Image.Image)
-            or image.mode == "RGB"
+        if not self.artifact_discard_alpha_channel or not isinstance(
+            image, Image.Image
         ):
             return image
+        # NOTE: smart_to_rgb also applies EXIF orientation, so RGB images take
+        # it too, as in MultimodalProcessorMixin._load_single_item.
         if self.smart_rgb_conversion:
             return smart_to_rgb(image)
+        if image.mode == "RGB":
+            return image
         return image.convert("RGB")
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:
