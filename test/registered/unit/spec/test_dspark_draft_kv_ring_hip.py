@@ -1,0 +1,129 @@
+"""ROCm GQA DSpark draft KV ring: what the DSpark worker writes is what the window reads."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from sglang.kernels.ops.attention.dspark_ring_window_hip import (
+    fill_dspark_ring_window_buffer_hip,
+)
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_rows_per_req,
+)
+from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    TargetHiddenKvInjector,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    TargetVerifyExecutor,
+)
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm-only draft KV ring")
+
+POOL, WINDOW, BLOCK = 16, 64, 6
+
+
+def _value(slots: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    return slots.to(torch.float64) * 1e5 + positions.to(torch.float64)
+
+
+def test_window_reads_what_the_dspark_worker_wrote():
+    """Prefill through place_prefill and a partially accepted verify block through
+    commit_hidden write the draft KV; the ring window must read back exactly those
+    keys, across ring wraps, as an independent per-position store would hold them."""
+    device = torch.device("cuda")
+    rows = draft_kv_ring_rows_per_req(window_left=WINDOW, block_size=BLOCK, dcp_size=1)
+    ring = DFlashDraftKVRing(
+        rows_per_req=rows,
+        dcp_size=1,
+        req_to_token_rows=POOL,
+        device=device,
+        window_left=WINDOW,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+    )
+    kv = torch.full((1 + POOL * rows,), -1.0, dtype=torch.float64, device=device)
+    slots = torch.tensor([3, 9], dtype=torch.int64, device=device)
+    # Request 3's prefill wraps the ring twice; request 9's does not wrap.
+    prefill_lens = [2 * rows + 17, 40]
+
+    injector = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            device=device,
+            prefill_attention_backend_str="triton",
+            runner_ids=SimpleNamespace(own_plan=lambda batch: MagicMock()),
+        ),
+        draft_model_runner=SimpleNamespace(token_to_kv_pool=object(), runner_ids=None),
+        swa_ring_size=None,
+        draft_kv_ring=ring,
+    )
+    prefill = SimpleNamespace(
+        extend_lens=prefill_lens,
+        prefix_lens=[0, 0],
+        out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
+        req_pool_indices=slots,
+    )
+    placement = TargetHiddenKvInjector.place_prefill(injector, prefill)
+    token_slots = torch.repeat_interleave(
+        slots, torch.tensor(prefill_lens, device=device)
+    )
+    kv[placement.cache_loc] = _value(token_slots, placement.positions)
+
+    # A verify block past each prefill, of which the first 2 tokens commit.
+    seq_lens = torch.tensor(prefill_lens, dtype=torch.int64, device=device)
+    positions_2d = seq_lens[:, None] + torch.arange(BLOCK, device=device)
+    commit_lens = torch.tensor([2, 2], dtype=torch.int64, device=device)
+
+    def inject_target_hidden(*, target_hidden, cache_loc_2d, commit_lens, **_):
+        hidden = target_hidden.view(2, BLOCK)
+        for b in range(2):
+            kv[cache_loc_2d[b, : commit_lens[b]]] = hidden[b, : commit_lens[b]]
+
+    executor = SimpleNamespace(
+        kv_injector=SimpleNamespace(
+            swa_ring_size=None,
+            draft_kv_ring=ring,
+            inject_target_hidden=inject_target_hidden,
+        ),
+        verify_num_draft_tokens=BLOCK,
+    )
+    hidden = _value(slots[:, None].expand(2, BLOCK), positions_2d)
+    TargetVerifyExecutor.commit_hidden(
+        executor,
+        batch=SimpleNamespace(req_pool_indices=slots),
+        layout=None,
+        hidden_strided=None,
+        verify_window=SimpleNamespace(
+            positions_2d=positions_2d,
+            verify_cache_loc_2d=torch.empty(2, BLOCK, device=device),
+            iteration_ids=None,
+        ),
+        logits_output=SimpleNamespace(hidden_states=hidden.reshape(-1, 1)),
+        commit_lens=commit_lens,
+        bs=2,
+        run_compact=False,
+    )
+
+    seq_lens = seq_lens + commit_lens
+    indptr, indices, _, starts = fill_dspark_ring_window_buffer_hip(
+        min_pos=ring.min_pos,
+        rows_per_req=ring.rows_per_req,
+        dcp_size=1,
+        window_kv_indptr=torch.zeros(3, dtype=torch.int32, device=device),
+        req_pool_indices=slots,
+        seq_lens=seq_lens,
+        bs=2,
+        sliding_window_size=WINDOW,
+    )
+    for b in range(2):
+        positions = torch.arange(int(starts[b]), int(seq_lens[b]), device=device)
+        assert positions.numel() == min(WINDOW, int(seq_lens[b]))
+        read = kv[indices[indptr[b] : indptr[b + 1]]]
+        expected = _value(slots[b].expand(positions.numel()), positions)
+        assert torch.equal(read, expected)

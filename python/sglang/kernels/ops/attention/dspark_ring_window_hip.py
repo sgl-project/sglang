@@ -65,6 +65,16 @@ def fill_dspark_ring_window_buffer_hip(
         )
     # Shapes only, so this holds under CUDA graph capture: a window is at most
     # sliding_window_size keys, and the kernel stores without a bound check.
+    if window_kv_indices is not None and (
+        window_kv_indices.dim() != 1
+        or not window_kv_indices.is_contiguous()
+        or window_kv_indices.dtype != torch.int64
+    ):
+        raise ValueError(
+            "window_kv_indices must be a contiguous 1-D int64 tensor, got "
+            f"shape {tuple(window_kv_indices.shape)}, stride "
+            f"{window_kv_indices.stride()}, {window_kv_indices.dtype}"
+        )
     if window_kv_indices is not None and window_kv_indices.numel() < bs * int(
         sliding_window_size
     ):

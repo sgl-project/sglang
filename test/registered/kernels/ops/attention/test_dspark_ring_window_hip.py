@@ -143,6 +143,23 @@ def test_short_graph_buffer_is_rejected() -> None:
         )
 
 
+def test_non_contiguous_graph_buffer_is_rejected() -> None:
+    """numel() counts an expanded buffer's logical elements, not its writable slots."""
+    expanded = torch.empty(1, dtype=torch.int64, device="cuda").expand(256)
+    with pytest.raises(ValueError, match="contiguous 1-D int64"):
+        fill_dspark_ring_window_buffer_hip(
+            min_pos=torch.zeros(POOL, dtype=torch.int32, device="cuda"),
+            rows_per_req=64,
+            dcp_size=1,
+            window_kv_indptr=torch.zeros(3, dtype=torch.int32, device="cuda"),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64, device="cuda"),
+            seq_lens=torch.ones(2, dtype=torch.int64, device="cuda"),
+            bs=2,
+            sliding_window_size=64,
+            window_kv_indices=expanded,
+        )
+
+
 def test_window_reads_the_rows_the_ring_wrote() -> None:
     """Reader and writer must agree across the ring seam and a partially accepted
     verify block: every key the window reads is the row the ring wrote for it."""
