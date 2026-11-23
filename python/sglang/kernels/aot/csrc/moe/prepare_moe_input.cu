@@ -331,6 +331,12 @@ void get_apply_shuffle_mul_sum_caller(
   TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
 
   int m = output_tensor.size(0);
+  if (m == 0) {
+    TORCH_CHECK(
+        input_tensor.size(0) == 0 && permutation.numel() == 0, "Empty output requires empty input and permutation");
+    TORCH_CHECK(!factors_opt.has_value() || factors_opt->numel() == 0, "Empty output requires empty factors");
+    return;
+  }
   int topk = int(permutation.size(0) / m);
   int row_stride = output_tensor.size(1);
 
