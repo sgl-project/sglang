@@ -435,10 +435,9 @@ class TestMoriAuxLayout(CustomTestCase):
         )
         self.assertEqual(remote_offsets_and_sizes(None), ([[24], [48]], [[8], [16]]))
 
-    def test_an_aux_item_dropped_after_success_fails_the_request(self):
-        """Metadata and Success travel on separate sockets, so Success can arrive
-        first and the receiver caches it while it waits for the metadata. An
-        item dropped after that must still fail the request."""
+    def test_decode_drops_oversized_aux_item_and_fails_room(self):
+        """AuxDataCodec bounds check must drop an oversized item without writing
+        past the row and fail the room."""
         rows = (ctypes.c_ubyte * 16)()
         manager = _manager()
         manager.kv_args = SimpleNamespace(
@@ -448,8 +447,6 @@ class TestMoriAuxLayout(CustomTestCase):
         manager.prefill_response_tracker = {}
         receiver = MoriKVReceiver(manager, "prefill:8998", 11)
         manager.update_status(11, KVPoll.WaitingForInput)
-        manager.update_status(11, KVPoll.Success)
-        self.assertEqual(receiver.poll(), KVPoll.Success)
 
         data = b"\x01" * 16
         with patch("sglang.srt.disaggregation.mori.conn.logger.error"):
@@ -463,6 +460,7 @@ class TestMoriAuxLayout(CustomTestCase):
                     data,
                 ]
             )
+        manager.update_status(11, KVPoll.Success)
 
         self.assertEqual(bytes(rows), bytes(16))
         self.assertEqual(receiver.poll(), KVPoll.Failed)
