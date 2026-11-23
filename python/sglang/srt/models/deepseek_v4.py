@@ -5373,7 +5373,17 @@ class DeepseekV4ForCausalLM(
 
         from safetensors import safe_open
 
-        model_path = getattr(self.config, "_name_or_path", None)
+        from sglang.srt.runtime_context import get_context, get_model
+
+        if get_context().is_config_namespace_published("model"):
+            from sglang.srt.model_loader.loader import loaded_checkpoint_files
+
+            # A checkpoint's config can still name a different, existing directory.
+            config = get_model()
+            loaded = loaded_checkpoint_files(config.model_path, config.revision)
+            model_path = loaded[0] if loaded is not None else config.model_path
+        else:
+            model_path = getattr(self.config, "_name_or_path", None)
         if not model_path:
             raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
         path = Path(model_path) / "optional" / "quarot.safetensors"
