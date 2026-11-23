@@ -54,6 +54,10 @@ def _compact_width(max_pages: int, *, cp_size: int) -> int:
 def _symmetric_empty(numel: int, *, dtype: torch.dtype, device, group_name: str):
     import torch.distributed._symmetric_memory as symm_mem
 
+    if hasattr(
+        symm_mem, "is_symm_mem_enabled_for_group"
+    ) and not symm_mem.is_symm_mem_enabled_for_group(group_name):
+        symm_mem.enable_symm_mem_for_group(group_name)
     # Outside inference mode: an inference tensor rejects the in-graph writes.
     with torch.inference_mode(False):
         tensor = symm_mem.empty(numel, dtype=dtype, device=device)
@@ -259,23 +263,29 @@ def make_msa_v1_indexer_decode_cp(
     max_rows: int,
     max_pages: int,
     qmul4_available: bool,
-    device: torch.device,
+    device: torch.device | str,
 ) -> MSAV1IndexerDecodeCP | None:
     parallel = get_parallel()
     group = parallel.attn_tp_group
+    resolved_device = torch.device(device)
     why = None
-    if group.world_size not in _SUPPORTED_CP_SIZES:
-        why = f"attention TP size {group.world_size} (needs {_SUPPORTED_CP_SIZES})"
-    elif num_local_index_heads * group.world_size != NUM_INDEX_HEADS:
-        why = f"{num_local_index_heads} local index heads"
-    elif not qmul4_available:
-        why = "the Q8KV4 decode indexer is unavailable"
-    elif _MSA_IMPORT_ERROR is not None:
-        why = f"MSA score-only entry points are missing ({_MSA_IMPORT_ERROR})"
-    elif max_rows <= 0:
-        why = "no decode CUDA graph batch size to size the buffers"
-    elif not in_one_nvlink_domain(group.cpu_group, device):
-        why = "the attention TP ranks are not in one NVLink domain"
+    if resolved_device.type != "cuda":
+        why = f"device {resolved_device} is not CUDA"
+    else:
+        if resolved_device.index is None:
+            resolved_device = torch.device("cuda", torch.cuda.current_device())
+        if group.world_size not in _SUPPORTED_CP_SIZES:
+            why = f"attention TP size {group.world_size} (needs {_SUPPORTED_CP_SIZES})"
+        elif num_local_index_heads * group.world_size != NUM_INDEX_HEADS:
+            why = f"{num_local_index_heads} local index heads"
+        elif not qmul4_available:
+            why = "the Q8KV4 decode indexer is unavailable"
+        elif _MSA_IMPORT_ERROR is not None:
+            why = f"MSA score-only entry points are missing ({_MSA_IMPORT_ERROR})"
+        elif max_rows <= 0:
+            why = "no decode CUDA graph batch size to size the buffers"
+        elif not in_one_nvlink_domain(group.cpu_group, resolved_device):
+            why = "the attention TP ranks are not in one NVLink domain"
     if why is not None:
         logger.warning("MSA-v1 indexer decode CP disabled: %s", why)
         return None
@@ -284,7 +294,7 @@ def make_msa_v1_indexer_decode_cp(
         max_rows=max_rows,
         max_pages=max_pages,
         num_local_heads=num_local_index_heads,
-        device=device,
+        device=resolved_device,
     )
     logger.info(
         "MSA-v1 indexer decode CP: %d ranks score 1/%d of the index pages for all "

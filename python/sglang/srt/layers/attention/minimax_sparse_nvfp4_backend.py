@@ -92,9 +92,13 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
         graph_config = get_exec().graph.cuda_graph_config
         self._msa_v1_indexer_cp = make_msa_v1_indexer_decode_cp(
             num_local_index_heads=self._msa_v1_num_index_heads,
-            max_rows=(graph_config.decode.max_bs if graph_config is not None else 0)
+            max_rows=(
+                (graph_config.decode.max_bs if graph_config is not None else 0) or 0
+            )
             * (self.speculative_num_draft_tokens or 1),
-            max_pages=(self.max_context_len + self.page_size - 1) // self.page_size,
+            max_pages=max(
+                1, (self.max_context_len + self.page_size - 1) // self.page_size
+            ),
             qmul4_available=self._msa_v1_qmul4_available,
             device=runner.device,
         )

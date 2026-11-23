@@ -492,7 +492,12 @@ class MSAV1DecodeIndexerPlan:
                     "MSA-v1 indexer out must match the topk shape, device and int32 dtype"
                 )
             result = out
-        if self.indexer_cp_plan is not None and self.use_qmul4 and out is not None:
+        if (
+            self.indexer_cp_plan is not None
+            and self.use_qmul4
+            and out is not None
+            and result.permute(1, 0, 2).is_contiguous()
+        ):
             self.indexer_cp_plan.run(
                 q=q,
                 packed_k_cache=packed_k_cache,

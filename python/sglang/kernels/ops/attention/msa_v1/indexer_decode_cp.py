@@ -243,12 +243,16 @@ def exchange_index_q(
     cp_rank: int,
 ) -> None:
     rows, heads_local, dim = q.shape
-    assert dim == _HEAD_DIM and q.stride(2) == 1 and q.stride(1) == _HEAD_DIM
+    assert (
+        dim == _HEAD_DIM
+        and q.stride(2) == 1
+        and (heads_local == 1 or q.stride(1) == _HEAD_DIM)
+    )
     _q_exchange_kernel[(rows,)](
         q.view(torch.uint8),
         q.stride(0),
         stage_ptrs,
-        tile,
+        tile.view(torch.uint8),
         epoch,
         tile.numel(),
         H=NUM_INDEX_HEADS,

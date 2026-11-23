@@ -711,6 +711,60 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
         # One refresh per prepare, on the cached plan.
         self.assertEqual((first.refreshes, decode.refreshes), (2, 1))
 
+    def test_make_msa_v1_indexer_decode_cp_resolves_string_cuda_device(self):
+        from sglang.srt.layers.attention.minimax_sparse_ops import (
+            msa_indexer_decode_cp,
+        )
+
+        seen_devices = []
+        fake_group = SimpleNamespace(world_size=2, cpu_group=object())
+        fake_parallel = SimpleNamespace(attn_tp_group=fake_group)
+        sentinel = SimpleNamespace(cp_size=2)
+
+        with (
+            patch.object(
+                msa_indexer_decode_cp, "get_parallel", return_value=fake_parallel
+            ),
+            patch.object(msa_indexer_decode_cp, "_MSA_IMPORT_ERROR", None),
+            patch.object(torch.cuda, "current_device", return_value=1),
+            patch.object(
+                msa_indexer_decode_cp,
+                "in_one_nvlink_domain",
+                side_effect=lambda cpu_group, dev: seen_devices.append(dev) or True,
+            ),
+            patch.object(
+                msa_indexer_decode_cp,
+                "MSAV1IndexerDecodeCP",
+                side_effect=lambda **kw: seen_devices.append(kw["device"]) or sentinel,
+            ),
+        ):
+            # Non-CUDA device cleanly disables without touching NVLink checks.
+            self.assertIsNone(
+                msa_indexer_decode_cp.make_msa_v1_indexer_decode_cp(
+                    num_local_index_heads=2,
+                    max_rows=16,
+                    max_pages=64,
+                    qmul4_available=True,
+                    device="cpu",
+                )
+            )
+            self.assertEqual(seen_devices, [])
+
+            # Bare "cuda" string (as passed by ModelRunner.device) must resolve
+            # to an indexed torch.device("cuda", current_device).
+            cp = msa_indexer_decode_cp.make_msa_v1_indexer_decode_cp(
+                num_local_index_heads=2,
+                max_rows=16,
+                max_pages=64,
+                qmul4_available=True,
+                device="cuda",
+            )
+            self.assertIs(cp, sentinel)
+            self.assertEqual(
+                seen_devices,
+                [torch.device("cuda", 1), torch.device("cuda", 1)],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
