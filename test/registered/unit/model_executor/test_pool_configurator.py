@@ -1508,7 +1508,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertEqual(cfg._cell_size, 4 * (64 + 64) * 32 * KV_SIZE)
 
-    def _ring_target_configurator(self, *, page_size, **publish):
+    def _ring_target_configurator(self, *, page_size, mha=False, **publish):
         import torch
 
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -1536,6 +1536,20 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 "sliding_window": 1024,
             },
         )
+        if mha:
+            draft = SimpleNamespace(
+                dtype=torch.bfloat16,
+                head_dim=128,
+                v_head_dim=128,
+                get_num_kv_heads=lambda tp: 8 // tp,
+                attention_arch=AttentionArch.MHA,
+                hf_config={
+                    "architectures": ["DFlashDraftModel"],
+                    "num_hidden_layers": 5,
+                    "layer_types": ["sliding_attention"] * 5,
+                    "sliding_window": 2048,
+                },
+            )
         return KVCacheConfigurator(
             device="cpu",
             gpu_id=0,
@@ -1604,6 +1618,35 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     charged,
                     (rows + page_size) * config.dflash_draft_cell_size_per_token,
                 )
+
+    def test_paged_mha_draft_kv_ring_charge_matches_the_ring_pool(self):
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_paged_rows_per_req,
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        page_size = 64
+        with mock_cpu_env(tp_size=4):
+            config = self._ring_target_configurator(
+                page_size=page_size, mha=True, max_running_requests=32
+            )
+            with get_spec().override(speculative_dflash_draft_kv_ring=True):
+                charged = config._dflash_draft_kv_ring_bytes()
+            req_rows = config._build_req_to_token_pool(
+                max_num_reqs=config._req_pool_rows(32)
+            ).req_to_token.shape[0]
+            rows = draft_kv_ring_pool_rows_from_config(
+                config.spec_aux_config.draft_model_config.hf_config,
+                req_to_token_rows=req_rows,
+                page_size=page_size,
+            )
+        rows_per_req = draft_kv_ring_paged_rows_per_req(
+            window_left=2047, block_size=8, page_size=page_size
+        )
+        self.assertEqual(rows, page_size + req_rows * rows_per_req)
+        self.assertEqual(
+            charged, (rows + page_size) * config.dflash_draft_cell_size_per_token
+        )
 
     def test_draft_kv_ring_charges_nothing_when_off(self):
         with mock_cpu_env(tp_size=8):

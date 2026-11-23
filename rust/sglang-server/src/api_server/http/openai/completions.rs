@@ -14,13 +14,12 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use sglang_processor::dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
+    Choice, CompletionFinishReason, CompletionTokensDetails, CompletionUsage,
+    CreateCompletionRequest, CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
 };
 
 use super::super::auth::DeclaredRoute;
-use super::super::dp_relay::HintRoute;
-use super::pd_routing::PDRoutingFields;
+use super::pd_routing::{HintRoute, PDRoutingFields};
 use super::{
     AppState, LoggedJson, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
@@ -29,7 +28,7 @@ use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, PromptTokenIdsSlot};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -46,6 +45,10 @@ struct CompletionRequest {
     /// Python's `skip_special_tokens` request extension; absent keeps the
     /// sampling default (drop them).
     skip_special_tokens: Option<bool>,
+    /// Python's `return_token_ids` extension: each choice reports its
+    /// `token_ids` and, on its first chunk, the prompt's `prompt_token_ids`.
+    #[serde(default)]
+    return_token_ids: bool,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -68,6 +71,8 @@ pub(super) struct ChoiceExtensions {
     /// Dynamo's enum covers the standard values. Python additionally exposes
     /// `abort`; unrecognized scheduler finish types are preserved as well.
     finish_reason_override: Option<String>,
+    token_ids: Option<Vec<i64>>,
+    prompt_token_ids: Option<Arc<[i64]>>,
 }
 
 async fn completions(
@@ -78,6 +83,7 @@ async fn completions(
     let CompletionRequest {
         request,
         skip_special_tokens,
+        return_token_ids,
         routing,
     } = match body {
         Ok(Json(request)) => request,
@@ -98,7 +104,7 @@ async fn completions(
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if let Some(message) = model_error(&model, &state.server_args.served_model_name) {
+    if let Some(message) = model_error(&model, &state.core.served_model_name().await) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
 
@@ -210,7 +216,7 @@ async fn completions(
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
+                sampling_params: sampling.for_sample(sample_index),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {
@@ -225,6 +231,7 @@ async fn completions(
                 bootstrap_room,
                 routed_dp_rank: routing.routed_dp_rank,
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
+                prompt_token_ids: return_token_ids.then(PromptTokenIdsSlot::default),
                 ..Default::default()
             };
             let call = match submit_generation(&state, &headers, native, stream).await {
@@ -258,6 +265,7 @@ async fn completions(
             created,
             echo,
             want_logprobs,
+            return_token_ids,
             include_usage,
             continuous_usage,
             state.server_args.enable_cache_report,
@@ -272,6 +280,7 @@ async fn completions(
             created,
             echo,
             request.logprobs.is_some(),
+            return_token_ids,
             state.server_args.enable_cache_report,
         )
         .await
@@ -401,6 +410,7 @@ fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<Sampl
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_completion(
     submitted: Vec<SubmittedChoice>,
     response_id: String,
@@ -408,6 +418,7 @@ pub(super) async fn unary_completion(
     created: u32,
     echo: bool,
     want_logprobs: bool,
+    return_token_ids: bool,
     cache_report: bool,
 ) -> Response {
     // Every request is already submitted, so draining in choice order does not
@@ -418,6 +429,7 @@ pub(super) async fn unary_completion(
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut cached_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for choice in submitted {
         let output = match collect_output(choice.call).await {
@@ -436,6 +448,7 @@ pub(super) async fn unary_completion(
             .entry(choice.prompt_index)
             .or_insert(output.cached_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
             if echo {
@@ -446,6 +459,8 @@ pub(super) async fn unary_completion(
             &output,
             want_logprobs,
             echo,
+            return_token_ids,
+            true,
         );
         choices.push(response_choice);
         extensions.push(extension);
@@ -458,6 +473,7 @@ pub(super) async fn unary_completion(
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+        reasoning_tokens,
         cache_report.then(|| cached_tokens.values().copied().fold(0, u32::saturating_add)),
     );
 
@@ -476,12 +492,16 @@ pub(super) async fn unary_completion(
     .into_response()
 }
 
+/// `first` marks a choice's first chunk (a unary choice's only one), which
+/// alone reports the prompt's ids.
 fn completion_choice(
     index: usize,
     text: String,
     output: &CoreOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
+    return_token_ids: bool,
+    first: bool,
 ) -> (Choice, ChoiceExtensions) {
     let reason = output.finish_reason.as_ref();
     let (finish_reason, finish_reason_override) = {
@@ -513,6 +533,10 @@ fn completion_choice(
         ChoiceExtensions {
             matched_stop,
             finish_reason_override,
+            token_ids: return_token_ids.then(|| output.token_ids.clone()),
+            prompt_token_ids: (return_token_ids && first)
+                .then(|| output.prompt_token_ids.clone())
+                .flatten(),
         },
     )
 }
@@ -550,6 +574,12 @@ pub(super) fn completion_response_value(
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
         );
+        if let Some(ids) = &extension.token_ids {
+            choice.insert("token_ids".into(), serde_json::json!(ids));
+        }
+        if let Some(ids) = &extension.prompt_token_ids {
+            choice.insert("prompt_token_ids".into(), serde_json::json!(ids));
+        }
         if let Some(logprobs) = choice
             .get_mut("logprobs")
             .and_then(serde_json::Value::as_object_mut)
@@ -572,6 +602,7 @@ pub(super) fn completion_event_stream(
     created: u32,
     echo: bool,
     want_logprobs: bool,
+    return_token_ids: bool,
     include_usage: bool,
     continuous_usage: bool,
     cache_report: bool,
@@ -584,6 +615,7 @@ pub(super) fn completion_event_stream(
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut cached_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut completion_tokens_by_choice = vec![0u64; count];
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
         for choice in submitted {
@@ -613,6 +645,7 @@ pub(super) fn completion_event_stream(
             }
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let first = std::mem::replace(&mut first_chunks[index], false);
             let text = if echo && first {
                 echoes[index].clone() + &output.text
@@ -624,6 +657,7 @@ pub(super) fn completion_event_stream(
                 completion_usage(
                     output.prompt_tokens,
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                    reasoning_tokens_by_choice[index],
                     None,
                 )
             });
@@ -633,6 +667,8 @@ pub(super) fn completion_event_stream(
                 &output,
                 want_logprobs,
                 echo && first,
+                return_token_ids,
+                first,
             );
             let chunk = CreateCompletionResponse {
                 id: response_id.clone(),
@@ -654,6 +690,9 @@ pub(super) fn completion_event_stream(
             let completion_tokens = completion_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
+            let reasoning_tokens = reasoning_tokens_by_choice
+                .into_iter()
+                .fold(0u64, u64::saturating_add);
             let cached_tokens = cache_report.then(|| {
                 cached_tokens_by_prompt
                     .values()
@@ -670,6 +709,7 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    reasoning_tokens,
                     cached_tokens,
                 )),
             };
@@ -684,6 +724,7 @@ pub(super) fn completion_event_stream(
 pub(super) fn completion_usage(
     prompt_tokens: u32,
     completion_tokens: u32,
+    reasoning_tokens: u64,
     cached_tokens: Option<u32>,
 ) -> CompletionUsage {
     CompletionUsage {
@@ -694,7 +735,10 @@ pub(super) fn completion_usage(
             cached_tokens: Some(cached),
             ..Default::default()
         }),
-        ..Default::default()
+        completion_tokens_details: Some(CompletionTokensDetails {
+            reasoning_tokens: Some(u32::try_from(reasoning_tokens).unwrap_or(u32::MAX)),
+            ..Default::default()
+        }),
     }
 }
 
@@ -895,6 +939,7 @@ mod tests {
                 1,
                 false,
                 false,
+                false,
                 cache_report,
             )
             .await;
@@ -908,6 +953,10 @@ mod tests {
             assert_eq!(value["choices"][0]["matched_stop"], "</s>");
             assert_eq!(value["usage"]["prompt_tokens"], 5);
             assert_eq!(value["usage"]["completion_tokens"], 4);
+            assert_eq!(
+                value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                0
+            );
             // A prompt's cached tokens are its first choice's, as on Python.
             let details = &value["usage"]["prompt_tokens_details"];
             match cache_report {
@@ -929,6 +978,7 @@ mod tests {
                 "cmpl-test".into(),
                 "model".into(),
                 1,
+                false,
                 false,
                 false,
                 true,

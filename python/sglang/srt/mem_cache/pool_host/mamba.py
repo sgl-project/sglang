@@ -8,9 +8,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
-from sglang.srt.mem_cache.pool_host import slot_state_copy
 from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
@@ -30,8 +28,8 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 # XPU ops only when no CUDA/ROCm backend is present, matching the imports below.
 _use_xpu_mamba_ops = _is_xpu and not (_is_cuda or _is_hip)
-transfer_state_per_layer_direct_pf_lf = None
-transfer_state_all_layer_direct_lf_pf = None
+transfer_kv_per_layer_direct_pf_lf = None
+transfer_kv_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
@@ -42,7 +40,6 @@ if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
-        warm_up_mamba_split_kernels,
     )
 elif _is_xpu:
     from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -52,16 +49,16 @@ elif _is_xpu:
         transfer_kv_per_layer_direct_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection
+    from sgl_kernel_npu.operators.data_move import TransferDirection
 
     try:
-        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+        from sgl_kernel_npu.operators.data_move import transfer_mamba_state
     except ImportError:
         transfer_mamba_state = None
     try:
-        from sgl_kernel_npu.kvcacheio import (
-            transfer_state_all_layer_direct_lf_pf,
-            transfer_state_per_layer_direct_pf_lf,
+        from sgl_kernel_npu.operators.data_move import (
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
         )
     except ImportError:
         pass
@@ -212,6 +209,12 @@ class MambaPoolHost(HostKVCache):
             self.allocator,
             self._buffer_device,
         )
+        from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_mamba_pool
+
+        # gfx950 shrinks a ratio-sized pool to fit the pinnable budget; no-op elsewhere
+        allocation_bytes, available_bytes = clamp_mamba_pool(
+            self, host_size, allocation_bytes, available_bytes
+        )
         if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -243,16 +246,8 @@ class MambaPoolHost(HostKVCache):
         self.kv_buffer = self.init_kv_buffer()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
-        self._warm_up_split_copies()
         self.lock = threading.RLock()
         self.clear()
-
-    def _warm_up_split_copies(self) -> None:
-        if not _is_cuda or self.layout != "page_first":
-            return
-        load_quota = warm_up_mamba_split_kernels()
-        if load_quota is not None:
-            logger.info("HiCache Mamba split load kernel built: quota=%s", load_quota)
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()
@@ -261,8 +256,8 @@ class MambaPoolHost(HostKVCache):
             return
 
         required_ops = (
-            transfer_state_per_layer_direct_pf_lf,
-            transfer_state_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_all_layer_direct_lf_pf,
         )
         required_torch_ops = (
             "transfer_state_per_layer_direct_pf_lf",
@@ -361,7 +356,6 @@ class MambaPoolHost(HostKVCache):
             )
             for state in self.slot_state_device_tensors
         ]
-        slot_state_copy.warm(self.slot_state_device_tensors, self.slot_state_buffers)
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -548,7 +542,7 @@ class MambaPoolHost(HostKVCache):
             )
         elif io_backend == "kernel_ascend":
             if _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_per_layer_direct_pf_lf(
+                transfer_kv_per_layer_direct_pf_lf(
                     src=src,
                     dst=dst,
                     src_indices=src_indices,
@@ -691,7 +685,7 @@ class MambaPoolHost(HostKVCache):
                     values = src.index_select(0, device_indices).to(device=dst.device)
                     dst[:, layer_id, 0].index_copy_(0, host_indices, values)
             elif _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_all_layer_direct_lf_pf(
+                transfer_kv_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],
                     device_indices=src_indices,
@@ -849,24 +843,8 @@ class MambaPoolHost(HostKVCache):
         """Copy the registered side-state rows for these slots, one leg or the
         other. Blocking copies: the rows are a few hundred KB per checkpoint and
         correctness of the ordering against the completion event matters more
-        than the microseconds. Under SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC the
-        backup leg (and, under host-only checkpoints, the load leg) is instead a
-        kernel queued on the current stream, ahead of that event."""
+        than the microseconds."""
         if not self.slot_state_device_tensors:
-            return
-        copy = slot_state_copy.load_rows if to_device else slot_state_copy.backup_rows
-        if (
-            (not to_device or envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get())
-            and slot_state_copy.applies(
-                self.slot_state_device_tensors, self.slot_state_buffers
-            )
-            and copy(
-                self.slot_state_device_tensors,
-                self.slot_state_buffers,
-                device_indices=device_indices,
-                host_indices=host_indices,
-            )
-        ):
             return
         for state, host_buf in zip(
             self.slot_state_device_tensors, self.slot_state_buffers

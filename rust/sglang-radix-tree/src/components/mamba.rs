@@ -238,10 +238,10 @@ impl MambaComponent {
         if tree_core.enable_hicache
             && tree_core.is_write_back
             && !node.has_host_value(MAMBA)
-            && !node.backuped()
             && node.has_device_value(FULL)
         {
-            // Keep the state live until the controller finishes D->H I/O.
+            // Keep the state live until the controller finishes D->H I/O
+            // (backuped covers Full KV only).
             // Native code never calls Python while holding the tree lock.
             let node_id = node.id;
             tree_core
@@ -619,7 +619,6 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if !host_lru.in_list(Some(node_id)) {
                 host_lru.insert_mru(node_id);
             }
-            tree_core.place_host_evict_first_state_(node_id);
         }
 
         (freed, host_freed)
@@ -1051,9 +1050,6 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let x_next = tree_core
                 .host_lru_list(MAMBA)
                 .get_prev_no_lock(cur, &tree_core.arena);
-            if tree_core.is_host_evict_first_(tree_core.arena.node(cur)) {
-                tree_core.note_host_evict_first_eviction_(MAMBA, 1);
-            }
             // The host LRU filters Mamba's own locks. A Full load-back pin may
             // cover an ancestor whose Mamba state is not being transferred.
             if tree_core.evictable_host_leaves.contains(cur) {

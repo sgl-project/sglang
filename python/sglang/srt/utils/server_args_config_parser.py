@@ -38,6 +38,12 @@ def _is_boolean_flag(action: argparse.Action) -> bool:
     )
 
 
+def _is_removed_flag(action: argparse.Action) -> bool:
+    from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
+
+    return isinstance(action, DeprecatedAction) and action.error_message is not None
+
+
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
@@ -177,6 +183,9 @@ class ConfigArgumentMerger:
             key_norm = key.replace("-", "_")
             if key_norm in self.unsupported_actions:
                 action = self.unsupported_actions[key_norm]
+                if _is_removed_flag(action):
+                    # Say what to use instead, as the command line does.
+                    raise ValueError(action.error_message)
                 msg = f"Unsupported config option '{key_norm}' with action '{action.__class__.__name__}'"
                 raise ValueError(msg)
             if isinstance(value, bool):

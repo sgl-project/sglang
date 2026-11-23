@@ -24,6 +24,7 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -44,6 +45,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.model_interfaces import prepare_language_model_inputs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
@@ -275,6 +277,11 @@ class EagerRunner(BaseRunner):
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
                 and forward_batch.extend_prefix_lens is not None
+                # MLA target verify reads rank-local decode KV, not the gathered layout.
+                and not (
+                    forward_batch.forward_mode.is_target_verify()
+                    and model_runner.model_config.attention_arch == AttentionArch.MLA
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
@@ -345,14 +352,19 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
+            # Prepare multimodal embeddings and model IDs in global token order.
+            input_ids, input_embeds = prepare_language_model_inputs(
+                model, input_ids, forward_batch, input_embeds
+            )
             if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+                input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -362,7 +374,7 @@ class EagerRunner(BaseRunner):
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
             body = model.model
@@ -411,7 +423,7 @@ class EagerRunner(BaseRunner):
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
-            forward_batch.input_ids,
+            input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
