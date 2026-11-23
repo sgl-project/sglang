@@ -42,6 +42,49 @@ python -m sglang.launch_server \
   --port 30002
 ```
 
+### Intel XPU
+
+On Intel XPU, the Mooncake encoder transfer runs on Mooncake's TENT engine, which copies the embedding card to card through Level Zero IPC, so no RDMA NIC is needed. This needs a Mooncake transfer engine built with `-DUSE_XPU=ON -DUSE_TENT=ON` (`docker/xpu.Dockerfile` installs one).
+
+Both servers must see both cards: list them in `ZE_AFFINITY_MASK` and pick each server's card with `--base-gpu-id`. A server that sees only its own card cannot map the other card's buffer, and the transfer falls back to TCP.
+
+Inside a container, also run with `--cap-add SYS_PTRACE` (or `--privileged`): TENT maps the peer's buffer through `pidfd_getfd()`, which Docker blocks by default, and without it the copy quietly takes another route. See the [Mooncake backend note for P/D on Intel XPU](/docs/hardware-platforms/xpu#mooncake-backend).
+
+Run each server in its own terminal, and set the `export` line in both: without it, the language server does not use TENT and cannot see the encoder's card.
+
+```bash Command
+export MC_USE_TENT=1 ZE_AFFINITY_MASK=0,1 TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0
+
+# encoder on card 0
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+  --device xpu \
+  --attention-backend intel_xpu \
+  --page-size 64 \
+  --encoder-only \
+  --encoder-transfer-backend mooncake \
+  --base-gpu-id 0 \
+  --port 30000
+
+# language-only server on card 1
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-VL-3B-Instruct \
+  --device xpu \
+  --attention-backend intel_xpu \
+  --page-size 64 \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30000 \
+  --encoder-transfer-backend mooncake \
+  --base-gpu-id 1 \
+  --port 30002
+```
+
+<Note>
+`TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0` works around an inductor static Triton launcher issue on torch 2.14+xpu that crashes the encoder on its first image. Drop it once your torch build includes the fix (likely pytorch/pytorch#199511).
+</Note>
+
+The encoder preprocesses images on CPU by default, while a colocated server runs the image processor on the device, so the two produce slightly different image embeddings. Set `SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU=1` on the encoder to preprocess on the device and get the same embeddings as colocated serving.
+
 ### Global multimodal embedding cache with Mooncake
 
 SGLang also supports a Mooncake-backed **global multimodal embedding cache** for EPD workloads. When enabled on encoder servers, repeated image inputs can reuse previously computed ViT embeddings across instances instead of running the vision encoder again.

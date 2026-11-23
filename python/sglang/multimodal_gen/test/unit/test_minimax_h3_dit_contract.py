@@ -153,6 +153,25 @@ def test_pruned_adaln_lora_projection_preserves_affine_term():
     )
 
 
+def test_pruned_adaln_lora_projection_keeps_the_adapter_dtype():
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
+        adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
+        adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+        _adaln_precomputed=False,
+    )
+    prefix = "blocks.0.adaln_proj.linear."
+    a = torch.tensor([[2.0, 3.0, 4.0]], dtype=torch.bfloat16)
+    b = torch.tensor([[5.0], [6.0]], dtype=torch.bfloat16)
+    actual = MiniMaxH3DiTModel.prepare_lora_adapter(
+        model, {prefix + "lora_A": a, prefix + "lora_B": b}
+    )
+    # The folded linear multiplies by the raw activation dtype, so a float32
+    # projection aborts the AdaLN LoRA delta on a BF16 adapter.
+    assert actual[prefix + "lora_A"].dtype == torch.bfloat16
+    assert actual[prefix + "lora_output_offset"].dtype == torch.bfloat16
+
+
 def test_native_weight_names_and_grouped_qkv_reorder():
     arch = MiniMaxH3DiTArchConfig()
     assert arch.reverse_param_names_mapping == {}
@@ -680,7 +699,9 @@ def test_npu_falls_back_from_pipelined_attention(monkeypatch):
     from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
 
     monkeypatch.setattr(envs, "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 2)
-    monkeypatch.setattr(platforms, "current_platform", NPUPlatformBase())
+    # The public name is resolved by module __getattr__. Patching it would
+    # leave a concrete attribute behind when monkeypatch restores its value.
+    monkeypatch.setattr(platforms, "_current_platform", NPUPlatformBase())
     monkeypatch.setattr(
         parallel_state, "get_sp_group", lambda: SimpleNamespace(ulysses_group=object())
     )

@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -50,6 +50,18 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+# Async copy of the top logprobs to the host: one copy for the [rows, k] tensor
+# (every row asks the same k), or one batched copy for the per-row list.
+def _async_d2h_top_logprobs(
+    rows: Optional[Union[torch.Tensor, List]],
+) -> Optional[Union[torch.Tensor, List]]:
+    if rows is None:
+        return None
+    if torch.is_tensor(rows):
+        return _async_d2h(rows)
+    return _async_d2h_rows(rows)
 
 
 def allocate_distinct_stream(device_module, avoid_streams):
@@ -74,6 +86,30 @@ def is_war_barrier_enabled() -> bool:
         or get_memory().enable_unified_memory
         or envs.SGLANG_ENABLE_WAR_BARRIER.get()
     )
+
+
+def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+    """`_async_d2h` over per-request rows with one host buffer and one copy.
+
+    The rows come back as host views with their shapes, in order; entries that
+    are not tensors pass through.
+    """
+    tensors = [row for row in rows if torch.is_tensor(row)]
+    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
+        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    flat = torch.cat([row.reshape(-1) for row in tensors])
+    device = flat.device
+    if device.type != "cpu" and is_pin_memory_available(device):
+        # use record_stream so rows don't get reused before torch.cat finished
+        stream = torch.get_device_module(device).current_stream()
+        for row in tensors:
+            row.record_stream(stream)
+    host = _async_d2h(flat)
+    host_rows = iter(
+        chunk.view(row.shape)
+        for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
+    )
+    return [next(host_rows) if torch.is_tensor(row) else row for row in rows]
 
 
 @dataclasses.dataclass
@@ -212,21 +248,16 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
-            if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+            self.logits_output.next_token_top_logprobs_val = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_val
+            )
+            self.logits_output.next_token_top_logprobs_idx = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_idx
+            )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_token_ids_logprobs_val
+                )
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
@@ -276,8 +307,42 @@ class GenerationBatchResult:
             self.forward_auxiliary_output = None
 
 
+def get_preserve_last_token_id(tokenizer, is_generation: bool) -> Optional[int]:
+    """Token to keep last when auto-truncating: the separator for embedding models."""
+    if is_generation or tokenizer is None:
+        return None
+    # Non-HF tokenizers (e.g. TiktokenTokenizer) have no sep_token_id.
+    return getattr(tokenizer, "sep_token_id", None)
+
+
+def truncate_input_ids(
+    input_ids: List[int],
+    max_len: int,
+    preserve_last_token_id: Optional[int] = None,
+) -> List[int]:
+    """Head-truncate ``input_ids`` to ``max_len`` tokens.
+
+    If the input ended with ``preserve_last_token_id`` (e.g. a BERT ``[SEP]``),
+    that token stays last, as with Hugging Face ``truncation=True``; encoder
+    embedding models depend on it. ``None`` gives a plain head slice.
+    """
+    truncated = input_ids[:max_len]
+    if (
+        preserve_last_token_id is not None
+        and input_ids
+        and input_ids[-1] == preserve_last_token_id
+        and truncated
+        and truncated[-1] != preserve_last_token_id
+    ):
+        truncated[-1] = preserve_last_token_id
+    return truncated
+
+
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    preserve_last_token_id: Optional[int] = None,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -285,6 +350,7 @@ def validate_input_length(
         req: The request containing input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        preserve_last_token_id: See ``truncate_input_ids``.
 
     Returns:
         Error message if validation fails, None if successful
@@ -296,7 +362,11 @@ def validate_input_length(
                 "the max context length. Truncated. "
                 f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.origin_input_ids = truncate_input_ids(
+                req.origin_input_ids,
+                max_len=max_req_input_len,
+                preserve_last_token_id=preserve_last_token_id,
+            )
             return None
         else:
             # OpenAI-compatible clients (e.g. LiteLLM) recognize a context

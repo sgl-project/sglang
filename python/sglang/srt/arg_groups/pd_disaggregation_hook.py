@@ -385,20 +385,22 @@ def handle_encoder_disaggregation(server_args: Any):
         "MuseSparkForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "DeepseekV41ForCausalLM",
+        "Inkling2ForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
             f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, "
-            f"MiniMax-M3, MuseSpark, DeepSeek-V4."
+            f"MiniMax-M3, MuseSpark, DeepSeek-V4, Inkling2."
         )
 
     if (
-        model_arch == "MuseSparkForConditionalGeneration"
+        model_arch
+        in ("MuseSparkForConditionalGeneration", "Inkling2ForConditionalGeneration")
         and cfg.language_only
         and cfg.enable_adaptive_dispatch_to_encoder
     ):
         raise ValueError(
-            "Muse language-only servers do not load local encoders; "
+            f"{model_arch} language-only servers do not load local encoders; "
             "--enable-adaptive-dispatch-to-encoder is not supported."
         )
