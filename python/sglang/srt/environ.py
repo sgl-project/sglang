@@ -963,10 +963,11 @@ class Envs:
     # and Mamba state are put when they leave the host tier, with the root path's
     # host-resident nodes closed into storage), plus pinned restores, a hit-span
     # prefetch budget and a measured wait bound; same keys and bytes
-    # (hybrid_cache/l3_victim_tier.py). The constants below size it.
-    SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    # (hybrid_cache/l3_victim_tier.py). The constants below size it. Opt-in, not a
+    # child of SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: it pays only where the
+    # usable storage pool is smaller than the summed host tiers of the servers that
+    # write to it, which one worker cannot see (nv_mega_runtime_opt_ins).
+    SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(False)
     # Host KV pool share (tokens) and host state pool share (slots) kept free or in
     # flight to storage; they also cap the pages / slots held for puts.
     SGLANG_OPT_HICACHE_L3_VICTIM_TIER_KV_MARGIN = EnvFloat(0.05)
@@ -2790,6 +2791,13 @@ def nv_mega_runtime_switches() -> tuple[EnvField, ...]:
         if isinstance(field, EnvField) and field.default == master.get
     )
     return (master,) + children
+
+
+def nv_mega_runtime_opt_ins() -> tuple[EnvField, ...]:
+    """Opt-in NVIDIA runtime pieces: off unless set, whatever the master says. Each
+    runs a collective across ranks when on, so the startup agreement check covers
+    them with the master and its children."""
+    return (envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER,)
 
 
 class _DeprecatedEnv:

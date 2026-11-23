@@ -1010,14 +1010,11 @@ class TestL3VictimTierUnits(unittest.TestCase):
         host_pool.dcp_size = 2
         self.assertEqual(c._l3vt_unsupported(), "shared or DCP host layout")
 
-    def test_env_switch_follows_the_runtime_master(self):
+    def test_env_switch_is_an_opt_in(self):
+        """Off unless set: not a child of the NVIDIA runtime master."""
         with open(os.path.join(_SRT, "environ.py")) as f:
             src = f.read()
-        self.assertIn(
-            "SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(\n"
-            "        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get\n    )",
-            src,
-        )
+        self.assertIn("    SGLANG_OPT_HICACHE_L3_VICTIM_TIER = EnvBool(False)\n", src)
         for name, default in (
             ("KV_MARGIN", "EnvFloat(0.05)"),
             ("STATE_MARGIN", "EnvFloat(0.05)"),

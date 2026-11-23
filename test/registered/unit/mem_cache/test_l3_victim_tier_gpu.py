@@ -8,6 +8,7 @@ unit fixtures; test_l3_victim_tier.py drives it through the served hook code):
   puts it when it leaves host; a fresh tree restores it with the KV bytes the
   producer wrote; the producer itself restores it and records the promoted copy;
 * stock path with the switch off: the landing is put (inclusive), unchanged;
+* an opt-in: the NVIDIA runtime master alone leaves it off (the stock path);
 * pin: a span restored from storage survives host pressure until released;
 * detach: held victim pages are freed and the tier turns off;
 * a PD decode: the tier declines.
@@ -24,6 +25,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, EvictParams
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -163,6 +165,37 @@ class TestL3VictimTierReal(UnifiedRadixCacheStorageFixtures, CustomTestCase):
         prod.evict(EvictParams(num_tokens=len(seq)))
         self._flush_l3_backups(prod)
         # Inclusive: the landing is put while the host still holds it.
+        self.assertEqual(match_prefix(prod, seq).host_hit_length, len(seq))
+        self.assertEqual(self._stored_pages(prod, keys), len(keys))
+
+    def test_runtime_master_alone_leaves_the_tier_off(self):
+        """The tier is an opt-in: with SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION on
+        and the switch unset it stays off without a line, and the stock inclusive
+        path runs."""
+        d = self._make_storage_dir()
+        switch = envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER
+        log = unified_radix_cache.logger
+        with switch.override(False):
+            switch.clear()
+            with mock.patch.object(log, "info", wraps=log.info) as info:
+                prod, palloc, prtp = self._cache(
+                    d, SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=True
+                )
+            self.assertTrue(envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get())
+            self.assertFalse(switch.is_set())
+            self.assertIs(switch.get(), False)
+        self.assertFalse(prod._l3vt_cfg.any_on)
+        self.assertIsNone(prod._l3vt_cfg.decline)
+        self.assertIsNone(prod._l3vt)
+        self.assertFalse(prod.l3vt_pin_active)
+        self.assertEqual(
+            [c for c in info.call_args_list if switch.name in str(c.args)], []
+        )
+        seq = self._make_seq(1, 3)
+        self._insert(prod, palloc, prtp, seq)
+        keys = self._path_keys(prod, match_prefix(prod, seq).last_device_node)
+        prod.evict(EvictParams(num_tokens=len(seq)))
+        self._flush_l3_backups(prod)
         self.assertEqual(match_prefix(prod, seq).host_hit_length, len(seq))
         self.assertEqual(self._stored_pages(prod, keys), len(keys))
 

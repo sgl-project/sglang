@@ -4,7 +4,7 @@ import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.environ import envs, nv_mega_runtime_opt_ins, nv_mega_runtime_switches
 from sglang.srt.managers.scheduler_components import runtime_switch_agreement
 from sglang.srt.managers.scheduler_components.runtime_switch_agreement import (
     agree_runtime_switches,
@@ -17,12 +17,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _MASTER = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
 _CHILD = envs.SGLANG_OPT_SCHEDULER_SHM_SYNC
+_OPT_IN = envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER
 
 
 def _rank_env(values: dict) -> ExitStack:
     """Every switch unset except this rank's explicit values."""
     stack = ExitStack()
-    for field in nv_mega_runtime_switches():
+    for field in nv_mega_runtime_switches() + nv_mega_runtime_opt_ins():
         stack.enter_context(field.override(False))
         field.clear()
     for field, value in values.items():
@@ -61,6 +62,17 @@ class TestRuntimeSwitchAgreement(CustomTestCase):
                 self.assertEqual(len(lines), 1)
                 self.assertTrue(lines[0].strip().startswith(_CHILD.name + ":"))
 
+    def test_opt_in_set_on_one_rank_fails_every_rank_naming_only_it(self):
+        """An opt-in is off the master but runs its own collective when on, so a
+        rank that set it alone fails startup instead of waiting there."""
+        ranks = [{_MASTER: True, _OPT_IN: "1"}, {_MASTER: True}]
+        for rank in range(len(ranks)):
+            with self.subTest(rank=rank):
+                lines = self._failure_lines(rank=rank, ranks=ranks)
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].strip().startswith(_OPT_IN.name + ":"))
+        self._agree(rank=0, ranks=[{_MASTER: True, _OPT_IN: "1"}] * 2)
+
     def test_master_missing_on_one_rank_is_named_first(self):
         # Unset children follow the master, so each of them differs too.
         lines = self._failure_lines(rank=1, ranks=[{_MASTER: True}, {}])
@@ -75,6 +87,8 @@ class TestRuntimeSwitchAgreement(CustomTestCase):
         names = set(line.rsplit(": ", 1)[1].split(", "))
         self.assertIn(_MASTER.name, names)
         self.assertNotIn(_CHILD.name, names)
+        # The master alone leaves an opt-in off, so the agreed line does not name it.
+        self.assertNotIn(_OPT_IN.name, names)
         with self.assertNoLogs(runtime_switch_agreement.logger, level="INFO"):
             self._agree(rank=1, ranks=ranks)
             self._agree(rank=0, ranks=[{}, {}])

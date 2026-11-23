@@ -9,7 +9,13 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs, nv_mega_runtime_switches
+from sglang.srt.environ import (
+    EnvField,
+    _DeprecatedEnv,
+    envs,
+    nv_mega_runtime_opt_ins,
+    nv_mega_runtime_switches,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -58,8 +64,9 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_KV_SEND_SHARD_BY_ROOM",
     "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM",
     "SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB",
-    "SGLANG_OPT_HICACHE_L3_VICTIM_TIER",
 )
+# Opt-in pieces kept off the master: off unless set, whatever the master says.
+NV_MEGA_RUNTIME_OPT_INS = ("SGLANG_OPT_HICACHE_L3_VICTIM_TIER",)
 
 
 class TestEnvField(unittest.TestCase):
@@ -193,6 +200,31 @@ class TestEnvField(unittest.TestCase):
         names = [field.name for field in nv_mega_runtime_switches()]
         self.assertEqual(names[0], envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.name)
         self.assertCountEqual(names[1:], NV_MEGA_RUNTIME_CHILDREN)
+
+    def test_mega_runtime_opt_ins_stay_off_with_the_master_on(self):
+        """An opt-in is not a child: the master alone leaves it off, and only an
+        explicit value turns it on, with the master on or off."""
+        self.assertEqual(
+            [field.name for field in nv_mega_runtime_opt_ins()],
+            list(NV_MEGA_RUNTIME_OPT_INS),
+        )
+        children = {field.name for field in nv_mega_runtime_switches()}
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for name in NV_MEGA_RUNTIME_OPT_INS:
+            self.assertNotIn(name, children)
+            opt_in = self.env_fields[name]
+            for master_value in (True, False):
+                with (
+                    self.subTest(opt_in=name, master=master_value),
+                    ExitStack() as stack,
+                ):
+                    stack.enter_context(master.override(master_value))
+                    stack.enter_context(opt_in.override(False))
+                    opt_in.clear()
+                    self.assertIs(opt_in.get(), False)
+                    self.assertFalse(opt_in.is_set())
+                    with opt_in.override("1"):
+                        self.assertIs(opt_in.get(), True)
 
     def test_mega_runtime_does_not_override_explicit_none(self):
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):

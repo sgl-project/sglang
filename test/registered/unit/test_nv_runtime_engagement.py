@@ -5,7 +5,9 @@ server topology of each deployment shape: the PD decode, PD prefill and aggregat
 shapes of the Qwen3.5 GB300 megakernel layouts, plus other shapes that set the master.
 Where a child reads a runtime fact instead of a server argument (hosts per TP group, a
 user-set env, the platform), the shape states it. Each child names itself in the INFO
-line of its decision, so a server log can be checked against the same table.
+line of its decision, so a server log can be checked against the same table. The
+opt-in pieces kept off the master (OPT_INS) are resolved the same way, and engage only
+on a shape that sets them.
 
 Most resolvers call the child's own decision helper. Where that decision is inline in
 a builder or a loop, the resolver models it instead, and a change there does not change
@@ -29,7 +31,7 @@ from sglang.srt.disaggregation import (
     pp_early_finish,
 )
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
-from sglang.srt.environ import envs, nv_mega_runtime_switches
+from sglang.srt.environ import envs, nv_mega_runtime_opt_ins, nv_mega_runtime_switches
 from sglang.srt.layers import lm_head_all_to_all
 from sglang.srt.layers.moe.moe_runner import flashinfer_cutedsl
 from sglang.srt.layers.moe.token_dispatcher import flashinfer as a2a_dispatcher
@@ -243,6 +245,14 @@ SHAPES = {
     ),
 }
 
+# The same prefill with the opt-in L3 victim tier set, as where its storage pool is
+# smaller than the summed host tiers of the prefills that write to it.
+_L3_VICTIM_TIER = {"SGLANG_OPT_HICACHE_L3_VICTIM_TIER": "1"}
+SHAPES["prefill-tp1-pp2-l3-victim-tier"] = msgspec.structs.replace(
+    SHAPES["prefill-tp1-pp2"],
+    envs={**SHAPES["prefill-tp1-pp2"].envs, **_L3_VICTIM_TIER},
+)
+
 
 # Runtime facts the children read besides the server arguments.
 def _exchange_hosts(shape: Shape) -> int:
@@ -437,18 +447,21 @@ RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
     "SGLANG_OPT_HICACHE_WB_SETTLED_STATE_VICTIM": _settled_state_victim,
-    "SGLANG_OPT_HICACHE_L3_VICTIM_TIER": _l3_victim_tier,
     "SGLANG_OPT_SPEC_DP_POST_VERIFY_GRAPHS": _dp_post_verify_graphs,
     "SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE": _a2a_output_in_workspace,
     "SGLANG_OPT_TP_LM_HEAD_ALL_TO_ALL_FP32": _tp_lm_head_fp32,
     "SGLANG_OPT_PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB": _pd_prefill_cutedsl_moe_no_swap_ab,
+}
+# The opt-in pieces: off unless the shape sets them, whatever the master says.
+OPT_INS: Dict[str, Callable[[Shape], bool]] = {
+    "SGLANG_OPT_HICACHE_L3_VICTIM_TIER": _l3_victim_tier,
 }
 
 
 @contextmanager
 def _deployed(shape: Shape, *, master: bool = True):
     """The shape's server topology published, the runtime master set, its user envs
-    set and every other runtime child unset."""
+    (and the opt-ins it sets) set and every other runtime child unset."""
     environ = {
         k: v
         for k, v in os.environ.items()
@@ -507,7 +520,8 @@ _UNTABLED = frozenset(
 
 def engaged(shape: Shape, *, master: bool = True) -> FrozenSet[str]:
     with _deployed(shape, master=master):
-        return frozenset(name for name, on in RESOLVERS.items() if on(shape))
+        resolvers = {**RESOLVERS, **OPT_INS}
+        return frozenset(name for name, on in resolvers.items() if on(shape))
 
 
 def _children(*names: str) -> FrozenSet[str]:
@@ -533,9 +547,13 @@ _TRTLLM_CHAIN = _children()
 _QWEN35_CHAIN = _children()
 _QWEN35_TP_SPEC = _CHAIN | _TRTLLM_CHAIN | _QWEN35_CHAIN
 # A PD prefill with pipeline parallelism; the proxy receive with
-# SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back, the L3
-# victim tier with write_back and a storage backend.
+# SGLANG_PP_COMM_OVERLAP, the state victims with HiCache write_back.
 _PP_PREFILL = _children("PP_EARLY_RELAY", "PP_PREFILL_EARLY_FINISH")
+_QWEN35_PP_PREFILL = _PP_PREFILL | _children(
+    "PP_PROXY_RECV_AFTER_FORWARD",
+    "HICACHE_WB_SETTLED_STATE_VICTIM",
+    "PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB",
+)
 
 EXPECTED = {
     "decode-dep4": _PD_DECODE | _NO_STAGING | _PD_DECODE_DP | _DP_EXCHANGE | _DP_GRAPHS,
@@ -545,13 +563,11 @@ EXPECTED = {
     | _QWEN35_TP_SPEC
     | _children(),
     "decode-tp8-one-request": _PD_DECODE | _PD_DECODE_TP | _TWO_HOSTS | _QWEN35_TP_SPEC,
-    "prefill-tp1-pp2": _PP_PREFILL
-    | _children(
-        "PP_PROXY_RECV_AFTER_FORWARD",
-        "HICACHE_WB_SETTLED_STATE_VICTIM",
-        "PD_PREFILL_CUTEDSL_MOE_NO_SWAP_AB",
-        "HICACHE_L3_VICTIM_TIER",
-    ),
+    # The master alone leaves the L3 victim tier off.
+    "prefill-tp1-pp2": _QWEN35_PP_PREFILL,
+    # Set, it engages: write_back, a storage backend, the Python TreeCore.
+    "prefill-tp1-pp2-l3-victim-tier": _QWEN35_PP_PREFILL
+    | _children("HICACHE_L3_VICTIM_TIER"),
     "aggregated-tp4": _QWEN35_TP_SPEC,
     "aggregated-tp8": _QWEN35_TP_SPEC,
     "decode-tp2": _PD_DECODE | _PD_DECODE_TP | _NO_STAGING | _QWEN35_TP_SPEC,
@@ -591,7 +607,7 @@ class TestRuntimeChildEngagement(CustomTestCase):
     def test_every_child_engages_somewhere(self):
         """A child no shape engages would be inert on every shape that sets the
         master."""
-        self.assertEqual(set().union(*EXPECTED.values()), set(RESOLVERS))
+        self.assertEqual(set().union(*EXPECTED.values()), set(RESOLVERS) | set(OPT_INS))
 
     def test_every_child_of_the_master_has_a_resolver(self):
         """A new child of the master needs a resolver and table rows, or an entry in
@@ -599,13 +615,37 @@ class TestRuntimeChildEngagement(CustomTestCase):
         children = {field.name for field in nv_mega_runtime_switches()[1:]}
         self.assertEqual(set(RESOLVERS) | _UNTABLED, children)
         self.assertFalse(set(RESOLVERS) & _UNTABLED)
+        self.assertEqual(
+            set(OPT_INS), {field.name for field in nv_mega_runtime_opt_ins()}
+        )
+        self.assertFalse(set(OPT_INS) & children)
+
+    def test_l3_victim_tier_is_an_opt_in(self):
+        """The master alone does not engage the L3 victim tier on the prefill where
+        it engages once set; set, it engages with the master on or off, and an
+        explicit 0 keeps it off."""
+        name = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
+        unset = SHAPES["prefill-tp1-pp2"]
+        self.assertNotIn(name, unset.envs)
+        with _deployed(unset):
+            self.assertTrue(envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get())
+            self.assertFalse(envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.is_set())
+            self.assertIs(envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get(), False)
+        self.assertNotIn(name, engaged(unset))
+        on = SHAPES["prefill-tp1-pp2-l3-victim-tier"]
+        self.assertIn(name, engaged(on))
+        self.assertIn(name, engaged(on, master=False))
+        off = msgspec.structs.replace(on, envs={**on.envs, name: "0"})
+        self.assertNotIn(name, engaged(off))
+        # Nothing else moves with it.
+        self.assertEqual(engaged(on) - {name}, engaged(unset))
 
     def test_l3_victim_tier_needs_python_tree_core_and_prefill_admission(self):
         """The L3 victim tier engages only where the prefill admission loop
         releases its pins: never on a PD decode with HiCache storage, on a server
         that can switch roles, or on the Rust TreeCore."""
         name = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
-        prefill = SHAPES["prefill-tp1-pp2"]
+        prefill = SHAPES["prefill-tp1-pp2-l3-victim-tier"]
         self.assertIn(name, engaged(prefill))
         storage = {
             k: prefill.args[k]
@@ -630,6 +670,7 @@ class TestRuntimeChildEngagement(CustomTestCase):
                     disaggregation_decode_enable_radix_cache=True,
                     **storage,
                 ),
+                envs={**SHAPES["decode-tep8"].envs, **_L3_VICTIM_TIER},
                 tree_core="python",
             ),
             "PD role switch": msgspec.structs.replace(
@@ -646,10 +687,12 @@ class TestRuntimeChildEngagement(CustomTestCase):
             with self.subTest(variant=label):
                 self.assertNotIn(name, engaged(shape))
 
-    def test_nothing_engages_with_the_master_off(self):
+    def test_only_set_opt_ins_engage_with_the_master_off(self):
         for name, shape in SHAPES.items():
             with self.subTest(shape=name):
-                self.assertEqual(engaged(shape, master=False), frozenset())
+                self.assertEqual(
+                    engaged(shape, master=False), EXPECTED[name] & set(OPT_INS)
+                )
 
 
 if __name__ == "__main__":

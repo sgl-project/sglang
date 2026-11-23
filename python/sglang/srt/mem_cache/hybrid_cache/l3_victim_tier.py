@@ -1,8 +1,10 @@
 """HiCache L3 victim tier: bookkeeping for the cache-mode storage tier.
 
-Switch (environ.py): ``SGLANG_OPT_HICACHE_L3_VICTIM_TIER``, a child of
-``SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`` (unset follows the master, an
-explicit 0 or 1 wins). Cache policy only: every key and byte written or read is
+Switch (environ.py): ``SGLANG_OPT_HICACHE_L3_VICTIM_TIER``, opt-in: off unless
+set, and ``SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`` does not turn it on. It
+pays where the usable storage pool is smaller than the summed host tiers of all
+servers that write to it; one worker cannot see that sum, so the operator sets
+it. Cache policy only: every key and byte written or read is
 the one the stock path writes for that node. All parts below engage together,
 each only where its own precondition holds; a part that does not is named in
 the engaged line with its reason. The tier runs on a PD prefill or an
