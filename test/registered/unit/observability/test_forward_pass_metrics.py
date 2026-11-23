@@ -1743,6 +1743,29 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
         reporter._init_estimated_perf_constants()
         return reporter
 
+    def test_all_attention_labels_with_no_dedicated_ffn_labels_still_charge_mlp_everywhere(
+        self,
+    ):
+        # A Qwen3.5-style config with full_attention_interval=1 produces a
+        # layers_block_type of all "attention" labels -- no "linear_attention"
+        # (since every layer is full attention), and, like Jamba/Bamba, no
+        # separate "mlp"/"moe" label at all (every layer's FFN is bundled into
+        # the same layer as its attention mixer). {"attention"} is a subset of
+        # NemotronH's exclusive vocabulary, so this takes the literal-count
+        # branch -- the regression this guards against: counting "mlp"/"moe"
+        # unconditionally against a vocabulary that never contains those
+        # labels finds zero, silently charging zero FFN FLOPs/bytes despite
+        # every layer retaining its FFN.
+        layers_block_type = ["attention"] * self.NUM_ATTENTION_LAYERS
+        reporter = self._constants(layers_block_type=layers_block_type)
+        expected_linear = (
+            self._attn_linear_flops() + self._mlp_flops()
+        ) * self.NUM_ATTENTION_LAYERS
+        wrong_zeroed_mlp = self._attn_linear_flops() * self.NUM_ATTENTION_LAYERS
+        self.assertNotEqual(reporter._linear_flops_per_token, wrong_zeroed_mlp)
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertGreater(reporter._ffn_act_bytes_per_token, 0.0)
+
     def test_layers_block_type_splits_attention_mlp_moe_and_ignores_mamba(self):
         # 10 layers: 2 attention, 3 mlp, 2 moe, 3 mamba (left uncosted).
         layers_block_type = (
