@@ -51,8 +51,14 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
             self.comm.world_size = tp
             self.assertFalse(self.supported(9))
             self.assertTrue(self.supported(8))
+        for tp in (4, 8):  # SM90 pooler projections
+            self.comm.world_size = tp
+            for n in (2048, 4096, 8192):
+                self.assertTrue(self.supported(512, n, capability=(9, 0)))
+            self.assertFalse(self.supported(513, capability=(9, 0)))
+            self.assertFalse(self.supported(9, 1024, capability=(9, 0)))
         self.comm.world_size = 8
-        for capability in ((9, 0), (10, 1), (12, 0)):
+        for capability in ((10, 1), (12, 0)):
             self.assertFalse(self.supported(9, capability=capability))
 
     def test_dtype_shape_and_layout_fallbacks(self):
