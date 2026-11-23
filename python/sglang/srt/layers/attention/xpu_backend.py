@@ -20,6 +20,12 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
     make_local_attention_virtual_batches,
 )
+from sglang.srt.layers.attention.xpu_tree_verify import (
+    TREE_EXPAND_MAX_DRAFT_TOKENS,
+    tree_expand_attention,
+    tree_expand_scratch_page,
+    tree_verify_expand_metadata,
+)
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -204,6 +210,21 @@ class XPUAttentionBackend(AttentionBackend):
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
+        # topk > 1 target verify: expand-pass scratch pages, one per query row,
+        # sized for every request at once and allocated on first use. Never
+        # reallocated, since captured graphs keep their addresses.
+        self._tree_expand_uses_scratch = (
+            self.topk > 1
+            and self.speculative_num_draft_tokens <= TREE_EXPAND_MAX_DRAFT_TOKENS
+        )
+        self._tree_expand_rows_cap = (
+            self.req_to_token.shape[0] * self.speculative_num_draft_tokens
+            if self.topk > 1
+            else 0
+        )
+        self._tree_expand_scratch_buffers = None
+        self.tree_verify_expand_cuda_graph_buffers = None
+        self.tree_verify_expand_cuda_graph_metadata = {}
 
         # Local attention settings
         self.attention_chunk_size = (
@@ -544,7 +565,6 @@ class XPUAttentionBackend(AttentionBackend):
                 ]
 
                 metadata_expand = FlashAttentionMetadata()
-
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = torch.arange(
                     0,
@@ -553,59 +573,16 @@ class XPUAttentionBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=device,
                 )
-
-                # create expand page table
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
-                cols = offsets.expand(
-                    forward_batch.seq_lens.numel(), -1
-                ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
-
-                # shift table indices to avoid padding
-                # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
-                #                        [8, 9, 10],                                   [1, 1, 0],
-                #                        [8, 9, 10]]                                   [1, 0, 1]]
-                # if masked with padding [[8, 0, 0],   our mask without padding       [[8, 9, 10],
-                #                        [8, 9, 0],                                    [8, 9, 10],
-                #                        [8, 0, 10]]                                   [8, 10, 9]]
-                # note here cache_seqlens_int32 is [1, 2, 2] so extra page indices will be ignored in each row
-                col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                (
+                    metadata_expand.page_table,
+                    metadata_expand.cache_seqlens_int32,
+                ) = tree_verify_expand_metadata(
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    custom_mask=forward_batch.spec_info.custom_mask,
+                    num_draft_tokens=self.speculative_num_draft_tokens,
                 )
-                # Build keys: if an entry is valid (mask==True), keep its original index;
-                # if not, add self.speculative_num_draft_tokens so that it sorts after all valid entries.
-                keys = torch.where(
-                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
-                )
-                _, sort_order = torch.sort(keys, dim=1)
-                non_masked_page_table = (
-                    self.req_to_token_pool.req_to_token[
-                        forward_batch.req_pool_indices, :
-                    ]
-                    .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                )  # (bsz, draft_num)
-                metadata_expand.page_table = non_masked_page_table.gather(1, sort_order)
-                metadata_expand.cache_seqlens_int32 = mask.sum(dim=1).to(torch.int32)
                 metadata_expand.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(
                         metadata_expand.cache_seqlens_int32, dim=0, dtype=torch.int32
@@ -992,20 +969,13 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                expand = self.forward_metadata_spec_decode_expand
-                o_expand, lse_expand, *_ = self._forward_attn_flat_page_table(
+                o_expand, lse_expand = self._forward_tree_verify_expand(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    page_table=expand.page_table,
-                    cache_seqlens=expand.cache_seqlens_int32,
-                    cu_seqlens_q=expand.cu_seqlens_q,
-                    max_seqlen_q=expand.max_seq_len_q,
-                    scale=layer.scaling,
-                    softcap=layer.logit_cap,
+                    layer=layer,
                     window_size=window_size,
                     sinks=sinks,
-                    return_softmax_lse=True,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
@@ -1116,6 +1086,75 @@ class XPUAttentionBackend(AttentionBackend):
         if layer.is_cross_attention:
             return metadata.encoder_page_table, metadata.encoder_lens_int32, False
         return metadata.page_table, metadata.cache_seqlens_int32, True
+
+    def _tree_expand_scratch(
+        self, key_cache: torch.Tensor, value_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Persistent scratch for tree_expand_attention, allocated on first use.
+
+        Zero-filled: page entries past a row's branch are never written, and
+        a masked entry must hold a finite value, since the kernel multiplies
+        it by a zero probability.
+        """
+        if self._tree_expand_scratch_buffers is None:
+            rows = self._tree_expand_rows_cap
+            page = tree_expand_scratch_page(self.speculative_num_draft_tokens)
+            self._tree_expand_scratch_buffers = (
+                key_cache.new_zeros(rows, page, *key_cache.shape[-2:]),
+                value_cache.new_zeros(rows, page, *value_cache.shape[-2:]),
+                torch.arange(rows, dtype=torch.int32, device=key_cache.device)[:, None],
+            )
+        return self._tree_expand_scratch_buffers
+
+    def _forward_tree_verify_expand(
+        self,
+        *,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        layer: RadixAttention,
+        window_size: tuple[int, int],
+        sinks: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expand half of the topk > 1 target-verify cascade: ``(out, lse)``
+        over each query row's tree branch."""
+        expand = self.forward_metadata_spec_decode_expand
+        # The scratch pass has no sink logits; the flat page_size=1 path is
+        # eager-only (graph capture rejects these configs at init).
+        if self._tree_expand_uses_scratch and sinks is None:
+            scratch_k, scratch_v, scratch_page_table = self._tree_expand_scratch(
+                key_cache, value_cache
+            )
+            out, lse, *_ = tree_expand_attention(
+                q=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                page_table=expand.page_table,
+                cache_seqlens=expand.cache_seqlens_int32,
+                cu_seqlens_q=expand.cu_seqlens_q,
+                scratch_k=scratch_k,
+                scratch_v=scratch_v,
+                scratch_page_table=scratch_page_table,
+                scale=layer.scaling,
+                softcap=layer.logit_cap,
+                window_size=window_size,
+            )
+            return out, lse
+        out, lse, *_ = self._forward_attn_flat_page_table(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            page_table=expand.page_table,
+            cache_seqlens=expand.cache_seqlens_int32,
+            cu_seqlens_q=expand.cu_seqlens_q,
+            max_seqlen_q=expand.max_seq_len_q,
+            scale=layer.scaling,
+            softcap=layer.logit_cap,
+            window_size=window_size,
+            sinks=sinks,
+            return_softmax_lse=True,
+        )
+        return out, lse
 
     def _forward_attn_flat_page_table(
         self,
@@ -1727,6 +1766,65 @@ class XPUAttentionBackend(AttentionBackend):
             }
         else:
             self.encoder_metadata = {}
+        if self.topk > 1:
+            if self.has_swa or not self._tree_expand_uses_scratch:
+                raise NotImplementedError(
+                    "intel_xpu graphs support topk > 1 target verify only without "
+                    f"sliding-window layers and with at most "
+                    f"{TREE_EXPAND_MAX_DRAFT_TOKENS} draft tokens."
+                )
+            rows = max_bs * self.speculative_num_draft_tokens
+            self.tree_verify_expand_cuda_graph_buffers = {
+                "page_table": torch.zeros(
+                    rows,
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cache_seqlens": torch.ones(
+                    rows, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.arange(
+                    0, rows + 1, dtype=torch.int32, device=self.device
+                ),
+            }
+            self.tree_verify_expand_cuda_graph_metadata = {}
+            # Graph rows must fit the scratch, which is sized before first use.
+            assert self._tree_expand_scratch_buffers is None
+            self._tree_expand_rows_cap = max(self._tree_expand_rows_cap, rows)
+
+    def _init_full_cg_tree_verify_expand_metadata(
+        self,
+        *,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        in_capture: bool,
+    ) -> None:
+        """Capture/replay counterpart of the eager topk > 1 target-verify
+        expand metadata, filled into the graph's static buffers."""
+        if in_capture:
+            rows = bs * self.speculative_num_draft_tokens
+            buffers = self.tree_verify_expand_cuda_graph_buffers
+            expand = FlashAttentionMetadata()
+            expand.max_seq_len_q = 1
+            expand.cu_seqlens_q = buffers["cu_seqlens_q"][: rows + 1]
+            expand.page_table = buffers["page_table"][:rows]
+            expand.cache_seqlens_int32 = buffers["cache_seqlens"][:rows]
+            self.tree_verify_expand_cuda_graph_metadata[bs] = expand
+
+        expand = self.tree_verify_expand_cuda_graph_metadata[bs]
+        page_table, cache_seqlens = tree_verify_expand_metadata(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            custom_mask=custom_mask,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+        )
+        expand.page_table.copy_(page_table)
+        expand.cache_seqlens_int32.copy_(cache_seqlens)
+        self.forward_metadata_spec_decode_expand = expand
 
     def _spec_query_kv_offsets(
         self,
@@ -1739,6 +1837,10 @@ class XPUAttentionBackend(AttentionBackend):
         past ``seq_lens`` for each spec mode.
         """
         if is_verify:
+            if self.topk > 1:
+                # Tree verify cascade: the paged pass covers only the committed
+                # prefix; the expand pass supplies the tree tokens.
+                return spec_info.num_tokens_per_req, 0
             # DSpark's draft block reuses TARGET_VERIFY but packs
             # spec_info.num_tokens_per_req rows/req (gamma), not the gamma+1 the
             # real target verify packs; segment by the width spec_info carries so
@@ -1917,6 +2019,15 @@ class XPUAttentionBackend(AttentionBackend):
                 )
             )
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
+
+        if is_verify and self.topk > 1:
+            self._init_full_cg_tree_verify_expand_metadata(
+                bs=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                custom_mask=spec_info.custom_mask,
+                in_capture=in_capture,
+            )
 
         self.forward_metadata = metadata
 
