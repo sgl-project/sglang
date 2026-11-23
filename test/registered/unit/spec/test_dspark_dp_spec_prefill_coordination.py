@@ -5,13 +5,19 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_v4_dspark import DSparkAttention
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
-from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    DSparkWorkerV2,
+    _draft_requires_dp_sync,
+    _validate_dp_deepep_draft,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -164,6 +170,45 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     ]
                     self.assertEqual(plan.draft_width, 6)
                     self.assertEqual(plan.verify_width, 7)
+
+
+_TARGET_LAYOUT = DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+_SINGLE_GROUP = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
+
+class TestDSparkDPDraftContracts(CustomTestCase):
+    def test_draft_dp_sync_requires_attention_dp(self):
+        """Gathered-buffer layouts without attention DP keep unsynced drafts."""
+        with patch(
+            "sglang.srt.layers.dp_attention.require_gathered_buffer", return_value=True
+        ):
+            with get_parallel().override(attn_dp_enabled=False):
+                self.assertFalse(_draft_requires_dp_sync(_TARGET_LAYOUT))
+            with get_parallel().override(attn_dp_enabled=True):
+                self.assertTrue(_draft_requires_dp_sync(_TARGET_LAYOUT))
+                self.assertFalse(_draft_requires_dp_sync(_SINGLE_GROUP))
+
+    def test_dp_deepep_requires_a_declaring_draft(self):
+        """DeepEP under attention DP admits only drafts that declare it."""
+        from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+        from sglang.srt.models.ling_v3_dspark import LingV3ForCausalLMDSparkMLA
+
+        deepep = SimpleNamespace(is_deepep=lambda: True)
+        with patch(f"{MODULE}.get_moe_a2a_backend", return_value=deepep):
+            with get_parallel().override(attn_dp_enabled=True):
+                _validate_dp_deepep_draft(
+                    LingV3ForCausalLMDSparkMLA.draft_parallel_spec
+                )
+                for spec in (
+                    DeepseekV4ForCausalLMDSpark.draft_parallel_spec,
+                    _TARGET_LAYOUT,
+                    _SINGLE_GROUP,
+                ):
+                    with self.subTest(spec=spec):
+                        with self.assertRaisesRegex(ValueError, "DeepEP"):
+                            _validate_dp_deepep_draft(spec)
+            with get_parallel().override(attn_dp_enabled=False):
+                _validate_dp_deepep_draft(_SINGLE_GROUP)
 
 
 if __name__ == "__main__":

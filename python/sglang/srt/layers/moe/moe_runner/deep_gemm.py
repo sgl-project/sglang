@@ -86,6 +86,16 @@ else:
     _legacy_silu_and_mul = None
 
 
+def _silu_and_mul_clamp(
+    input: torch.Tensor, out: torch.Tensor, gemm1_clamp_limit: float
+) -> torch.Tensor:
+    gate, up = input.chunk(2, dim=-1)
+    gate = torch.nn.functional.silu(gate).clamp(max=gemm1_clamp_limit)
+    up = up.clamp(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+    torch.mul(gate, up, out=out)
+    return out
+
+
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
 
 
@@ -372,6 +382,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.use_swizzle = (
             get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
         )
+        if (
+            config.gemm1_alpha is None
+            and config.gemm1_clamp_limit is not None
+            and self.swiglu_limit is None
+        ):
+            if config.silu_mul_keep_fp32:
+                raise ValueError("limit-only clamp does not support silu_mul_keep_fp32")
+            if self.use_swizzle:
+                raise ValueError("swizzle is not supported with gemm1_clamp_limit")
 
     def run(
         self,
@@ -539,6 +558,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
+        elif (
+            self.config.gemm1_alpha is None
+            and self.config.gemm1_clamp_limit is not None
+            and self.swiglu_limit is None
+        ):
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            down_input = torch.empty(
+                (all_tokens, N // 2),
+                device=gateup_output.device,
+                dtype=torch.bfloat16,
+            )
+            _silu_and_mul_clamp(
+                gateup_output.view(-1, N), down_input, self.config.gemm1_clamp_limit
+            )
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del gateup_output
+            del down_input
         elif self.use_swizzle or self.config.silu_mul_keep_fp32:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
@@ -1590,15 +1635,19 @@ def _varlen_deep_gemm_silu_mul_quant(
     if silu_mul_keep_fp32 and gemm1_alpha is not None:
         raise ValueError("silu_mul_keep_fp32 does not support gemm1_alpha")
 
-    # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
-    # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
-    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
-    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
-    if gemm1_alpha is not None:
+    # GPT-OSS alpha and post-SiLU clamps share the Triton quantizer. Keep
+    # swiglu_limit on its existing pre-activation clamp path when both limits
+    # are set (some callers add gemm1_clamp_limit after runner construction).
+    post_silu_clamp = (
+        gemm1_alpha is None and gemm1_clamp_limit is not None and swiglu_limit is None
+    )
+    if gemm1_alpha is not None or post_silu_clamp:
         assert swiglu_limit is None, (
             "swiglu_limit and gemm1_alpha are mutually exclusive"
         )
-        assert not swizzle, "swizzle is not supported with gemm1_alpha"
+        assert not swizzle, "swizzle is not supported with alpha or post-SiLU clamp"
+        if post_silu_clamp and silu_mul_keep_fp32:
+            raise ValueError("limit-only clamp does not support silu_mul_keep_fp32")
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
@@ -1625,9 +1674,10 @@ def _varlen_deep_gemm_silu_mul_quant(
             masked_m,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             gemm1_alpha=gemm1_alpha,
-            gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             num_real_tokens=num_real_tokens,
             topk=topk,
+            post_silu_clamp=post_silu_clamp,
         )
         if use_packed:
             down_input_scale = down_input_scale.transpose(-1, -2)

@@ -18,6 +18,8 @@ class DraftTPExecution(Enum):
 
 class DraftParallelSpec(msgspec.Struct, frozen=True, kw_only=True):
     tp_execution: DraftTPExecution
+    # The draft's MoE layers run the target's DeepEP dispatch under attention DP.
+    dp_deepep: bool = False
 
 
 class DraftParallelLayout(msgspec.Struct, frozen=True, kw_only=True):

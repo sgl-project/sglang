@@ -29,6 +29,8 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 )
 from sglang.srt.managers.mm_utils import (  # noqa: E402
     ShmPointerMMData,
+    TransportProxyTensor,
+    _wrap_shm_or_inline,
     strip_mm_features_for_pp_relay,
     wrap_shm_features,
 )
@@ -290,6 +292,40 @@ class TestShmStorageOwnership(unittest.TestCase):
                     parent.close()
                 for pointer in allocated:
                     pointer.close_and_unlink()
+
+
+class TestInlineFallbackSize(CustomTestCase):
+    def test_exhausted_shm_sends_each_view_at_its_logical_size(self):
+        """Inline fallback must not pickle the whole batch storage per image."""
+        batch = torch.arange(16 * 1024, dtype=torch.float32).reshape(16, 1024)
+        compact = torch.ones(1024)
+        with patch(
+            "sglang.srt.managers.mm_utils.ShmPointerMMData",
+            side_effect=OSError("No space left on device"),
+        ):
+            inline = [_wrap_shm_or_inline(row) for row in batch.unbind(0)]
+            self.assertIs(_wrap_shm_or_inline(compact), compact)
+
+        logical_nbytes = 1024 * batch.element_size()
+        for row, sent in zip(batch.unbind(0), inline):
+            self.assertTrue(torch.equal(sent, row))
+            self.assertLess(len(pickle.dumps(sent)), 2 * logical_nbytes)
+
+    def test_exhausted_shm_keeps_a_transport_proxy_picklable(self):
+        """Inline fallback must keep a TransportProxyTensor's metadata."""
+        batch = torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
+        proxy = TransportProxyTensor(batch[1], name="image", fields={"marker": 1})
+        with patch(
+            "sglang.srt.managers.mm_utils.ShmPointerMMData",
+            side_effect=OSError("No space left on device"),
+        ):
+            sent = _wrap_shm_or_inline(proxy)
+
+        received = pickle.loads(pickle.dumps(sent))
+        self.assertIsInstance(received, TransportProxyTensor)
+        self.assertTrue(torch.equal(received.as_subclass(torch.Tensor), batch[1]))
+        self.assertEqual(received.name, "image")
+        self.assertEqual(received.fields, {"marker": 1})
 
 
 class TestShmPointerFailureCleanup(CustomTestCase):

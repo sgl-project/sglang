@@ -19,9 +19,8 @@ from sglang.srt.layers.rotary_embedding.utils import (
 )
 from sglang.srt.layers.rotary_embedding.yarn import (
     _extend_yarn_cache,
-    yarn_find_correction_range,
-    yarn_get_mscale,
-    yarn_linear_ramp_mask,
+    deepseek_yarn_inv_freq,
+    deepseek_yarn_mscale,
 )
 from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
 
@@ -361,10 +360,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
-        self.mscale = float(
-            yarn_get_mscale(self.scaling_factor, float(mscale))
-            / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
-            * attn_factor
+        self.mscale = deepseek_yarn_mscale(
+            self.scaling_factor, mscale, mscale_all_dim, attn_factor
         )
         self.cos_cached_total = None
         self.sin_cached_total = None
@@ -378,30 +375,16 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
-            / self.rotary_dim
+        return deepseek_yarn_inv_freq(
+            base=self.base,
+            rotary_dim=self.rotary_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            scaling_factor=scaling_factor,
+            beta_fast=self.beta_fast,
+            beta_slow=self.beta_slow,
+            extrapolation_factor=self.extrapolation_factor,
+            device=self.device,
         )
-        inv_freq_extrapolation = 1.0 / pos_freqs
-        inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-        low, high = yarn_find_correction_range(
-            self.beta_fast,
-            self.beta_slow,
-            self.rotary_dim,
-            self.base,
-            self.max_position_embeddings,
-        )
-        inv_freq_mask = (
-            1
-            - yarn_linear_ramp_mask(
-                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
-            )
-        ) * self.extrapolation_factor
-        inv_freq = (
-            inv_freq_interpolation * (1 - inv_freq_mask)
-            + inv_freq_extrapolation * inv_freq_mask
-        )
-        return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)

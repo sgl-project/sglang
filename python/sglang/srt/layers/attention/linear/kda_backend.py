@@ -671,6 +671,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             flashinfer_wrapper_cls=getattr(
                 self.kernel_dispatcher.extend_kernel, "prefill_graph_wrapper_cls", None
             ),
+            flashinfer_num_heads=self.state_pool.mamba_cache.temporal.shape[-3],
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices

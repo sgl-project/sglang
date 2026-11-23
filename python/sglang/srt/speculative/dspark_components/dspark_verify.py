@@ -428,6 +428,7 @@ class TargetVerifyExecutor:
             commit_lens=commit_lens,
             state_slot=state_slot,
             iteration_ids=verify_window.iteration_ids,
+            batch=batch,
         )
 
     def _run_ragged(

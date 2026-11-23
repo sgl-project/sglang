@@ -63,6 +63,47 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+def deepseek_yarn_inv_freq(
+    *,
+    base: float,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    scaling_factor: float,
+    beta_fast: int,
+    beta_slow: int,
+    extrapolation_factor: float,
+    device: torch.device = None,
+) -> torch.Tensor:
+    pos_freqs = base ** (
+        torch.arange(0, rotary_dim, 2, dtype=torch.float, device=device) / rotary_dim
+    )
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+    low, high = yarn_find_correction_range(
+        beta_fast, beta_slow, rotary_dim, base, max_position_embeddings
+    )
+    inv_freq_mask = (
+        1
+        - yarn_linear_ramp_mask(
+            low, high, rotary_dim // 2, dtype=torch.float, device=device
+        )
+    ) * extrapolation_factor
+    return (
+        inv_freq_interpolation * (1 - inv_freq_mask)
+        + inv_freq_extrapolation * inv_freq_mask
+    )
+
+
+def deepseek_yarn_mscale(
+    scaling_factor: float, mscale: float, mscale_all_dim: float, attn_factor: float
+) -> float:
+    return float(
+        yarn_get_mscale(scaling_factor, float(mscale))
+        / yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+        * attn_factor
+    )
+
+
 def _extend_yarn_cache(
     cache: torch.Tensor,
     compute_inv_freq: Callable[[], torch.Tensor],

@@ -885,11 +885,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
+        from sglang.srt.configs.draft_parallel import DraftTPExecution
+        from sglang.srt.speculative.draft_parallel import model_draft_parallel_spec
         from sglang.srt.speculative.dspark_components.dspark_config import (
             draft_uses_compressed_kv_attention,
         )
 
-        return not draft_uses_compressed_kv_attention()
+        draft_spec = model_draft_parallel_spec(
+            getattr(model_runner, "model_config", None),
+            spec_algorithm=model_runner.spec_algorithm,
+            dspark_is_moe=draft_uses_compressed_kv_attention(),
+        )
+        return draft_spec.tp_execution is DraftTPExecution.SINGLE_GROUP
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():

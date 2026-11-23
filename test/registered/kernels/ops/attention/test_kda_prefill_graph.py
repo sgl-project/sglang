@@ -21,6 +21,9 @@ from sglang.srt.layers.attention.linear.kda_backend import (
     KDAKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillGraphMetadata
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+    flashinfer_kda_min_engine_seqs,
+)
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -65,7 +68,10 @@ def _layer():
 def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = KDAAttnBackend.__new__(KDAAttnBackend)
-    backend.state_pool = None
+    backend.state_pool = SimpleNamespace(
+        mamba_cache=SimpleNamespace(temporal=ssm_pool.unsqueeze(0)),
+        replayssm_request_ring=False,
+    )
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.state_layer_cache = lambda layer_id: cache
     backend.req_to_token_pool = SimpleNamespace(
@@ -215,7 +221,9 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.ssm_pool.copy_(snapshot[1])
         return meta, graph, out
 
-    def _check_replay(self, meta, graph, out, *, lens, prefixes, track, seed):
+    def _check_replay(
+        self, meta, graph, out, *, lens, prefixes, track, seed, bitwise=False
+    ):
         batch = _batch(lens, prefixes, track=track)
         total = sum(batch.extend_seq_lens_cpu)
         g = torch.Generator(device="cuda").manual_seed(seed)
@@ -249,7 +257,8 @@ class TestKDAPrefillGraph(CustomTestCase):
         torch.cuda.synchronize()
 
         different_kernel_schedule = (
-            self.prefill_backend == LinearAttnKernelBackend.FLASHINFER
+            not bitwise
+            and self.prefill_backend == LinearAttnKernelBackend.FLASHINFER
             and (max(lens) == 1 or meta.num_tokens <= meta.max_seqs)
         )
         if different_kernel_schedule:
@@ -341,8 +350,45 @@ class TestKDAPrefillGraph(CustomTestCase):
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
 
+    def test_padded_plan_matches_eager_at_route_boundary(self):
+        with (
+            patch(f"{__name__}.HEADS", 16),
+            patch(f"{__name__}.DIM", 3 * 16 * HEAD_DIM),
+        ):
+            self.setUp()
+            with self.subTest(case="route_boundary"):
+                meta, graph, out = self._capture(track=True, num_tokens=24, max_seqs=4)
+                self._check_replay(
+                    meta,
+                    graph,
+                    out,
+                    lens=[23],
+                    prefixes=[448],
+                    track=None,
+                    seed=424,
+                    bitwise=True,
+                )
+                self.assertEqual(meta.max_seqs, 4)
+                self.assertEqual(
+                    meta.flashinfer.route_seqs,
+                    flashinfer_kda_min_engine_seqs(16, torch.device("cuda")),
+                )
+                self.assertTrue(bool((meta.flashinfer.cache_indices[1:] == 0).all()))
+            with self.subTest(case="checkpoints"):
+                meta, graph, out = self._capture(track=True)
+                self._check_replay(
+                    meta,
+                    graph,
+                    out,
+                    lens=[37, 100, 5, 192],
+                    prefixes=[0, 64, 130, 0],
+                    track={1: 70, 3: 192},
+                    seed=425,
+                    bitwise=True,
+                )
+
     def test_small_buckets_with_padded_sequences(self):
-        for num_tokens in (1, 8, 16, 128):
+        for num_tokens in (1, 2, 8, 16, 128):
             with self.subTest(num_tokens=num_tokens):
                 meta, graph, out = self._capture(num_tokens=num_tokens, max_seqs=128)
                 for lens in ([num_tokens], [1] * min(num_tokens, MAX_SEQS)):

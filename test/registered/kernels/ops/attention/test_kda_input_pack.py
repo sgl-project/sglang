@@ -127,11 +127,19 @@ class TestKDAInputPack(CustomTestCase):
             wrapper_cls=kernel.prefill_graph_wrapper_cls,
             num_tokens=257,
             max_seqs=1,
+            num_heads=6,
             track=False,
             device="cuda",
         )
-        adapter.cu_seqlens.copy_(torch.tensor([0, 257], device="cuda"))
-        adapter.cache_indices.fill_(1)
+        adapter.fill(
+            SimpleNamespace(
+                max_seqs=1,
+                cu_seqlens=torch.tensor([0, 257], device="cuda"),
+                cache_indices=torch.tensor([1], device="cuda"),
+            ),
+            [257],
+            None,
+        )
 
         def run():
             return adapter.run(

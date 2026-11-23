@@ -8,7 +8,10 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
+from sglang.srt.layers.rotary_embedding.bailing_mrope import (
+    BailingMRotaryEmbedding,
+    YaRNScalingBailingMRotaryEmbedding,
+)
 from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -209,7 +212,6 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     video_rope=True,
-                    **_bailing_yarn_kwargs(rope_scaling, max_position),
                 )
             elif "mrope_section" in rope_scaling:
                 rotary_emb = MRotaryEmbedding(
@@ -361,16 +363,36 @@ def get_rope(
                     "mscale_all_dim",
                 )
             }
-            rotary_emb = DeepseekScalingRotaryEmbedding(
-                head_size,
-                rotary_dim,
-                original_max_position,
-                base,
-                is_neox_style,
-                scaling_factor,
-                dtype,
-                **extra_kwargs,
-            )
+            # The MLA parent retags all rope dicts, including unscaled VL ones.
+            if (
+                "factor" in rope_scaling
+                and "mrope_section" in rope_scaling
+                and rope_scaling.get("video_rope", False)
+            ):
+                rotary_emb = YaRNScalingBailingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    video_rope=True,
+                    cache_max_position_embeddings=max_position,
+                    **extra_kwargs,
+                )
+            else:
+                rotary_emb = DeepseekScalingRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    **extra_kwargs,
+                )
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]

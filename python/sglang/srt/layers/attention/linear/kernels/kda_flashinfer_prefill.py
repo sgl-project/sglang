@@ -68,6 +68,13 @@ def build_flashinfer_kda_checkpoint_plan(
     ).to(device, non_blocking=True)
 
 
+def flashinfer_kda_min_engine_seqs(num_heads: int, device: torch.device) -> int:
+    # FlashInfer 0.7.2 selects decomp while nseq * 2 * heads <= SM count.
+    # Eager and BCG pad independently to this shared occupancy contract.
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    return sm_count // (2 * num_heads) + 1
+
+
 class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     """Execute KDA prefill; FlashInfer validates the tensor contract."""
 
@@ -123,9 +130,38 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             if needs_checkpoint
             else None
         )
-        q, k, v, g, beta = contiguous_kda_inputs(
-            q, k, v, g[:, : q.shape[1]], beta[:, : q.shape[1]]
+        num_tokens = q.shape[1]
+        cu_seqlens = (
+            query_start_loc if query_start_loc_i64 is None else query_start_loc_i64
         )
+        nseq = cu_seqlens.numel() - 1
+        route_seqs = max(
+            nseq, min(num_tokens, flashinfer_kda_min_engine_seqs(q.shape[2], q.device))
+        )
+        if route_seqs > nseq:
+            cu_seqlens = torch.cat(
+                (cu_seqlens, cu_seqlens[-1:].expand(route_seqs - nseq))
+            )
+            # Empty route rows use SGLang's reserved dummy write sink, slot 0.
+            cache_indices = torch.cat(
+                (cache_indices, cache_indices.new_zeros(route_seqs - nseq))
+            )
+            if state_checkpoint_cu_starts is not None:
+                state_checkpoint_cu_starts = torch.cat(
+                    (
+                        state_checkpoint_cu_starts,
+                        state_checkpoint_cu_starts[-1:].expand(route_seqs - nseq),
+                    )
+                )
+        q, k, v, g, beta = contiguous_kda_inputs(
+            q, k, v, g[:, :num_tokens], beta[:, :num_tokens]
+        )
+        if num_tokens <= route_seqs:
+            # Plain prefill requires T > route_seqs; this token is outside every row.
+            q, k, v, g, beta = (
+                torch.nn.functional.pad(x, (0, 0) * (x.ndim - 2) + (0, 1))
+                for x in (q, k, v, g, beta)
+            )
         result = self._recurrent_kda(
             q=q,
             k=k,
@@ -141,9 +177,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
-            cu_seqlens=(
-                query_start_loc if query_start_loc_i64 is None else query_start_loc_i64
-            ),
+            cu_seqlens=cu_seqlens,
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,
@@ -160,5 +194,5 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         )
         if needs_checkpoint:
             kwargs["track_state"][track_ssm_h_batch_src] = checkpoints.float()
-        output = result[0]
+        output = result[0][:, :num_tokens]
         return (output, None) if return_intermediate_states else output

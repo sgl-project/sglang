@@ -16,7 +16,7 @@ register_cuda_ci(est_time=600, stage="extra-b", runner_config="2-gpu-gb300")
 class TestDSV41FlashDP2EP2DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
     """DP attention and EP MoE using the built-in gather/reduce path.
 
-    DSPARK with DP attention does not support the DeepEP backend.
+    This recipe intentionally uses A2A none; CUDA DeepEP requires STATIC verify.
     """
 
     parallel_args = [

@@ -6,11 +6,19 @@ from typing import Any
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     model_config_of,
+    register_dspark_dp_a2a_backends,
     resolving_view,
 )
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+register_dspark_dp_a2a_backends(
+    "BailingMoeV3ForCausalLM", ("none", "megamoe", "mori", "deepep")
+)
+register_dspark_dp_a2a_backends(
+    "BailingMoeV3VLForConditionalGeneration", ("none", "megamoe", "mori", "deepep")
+)
 
 
 @_register_for(

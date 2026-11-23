@@ -6,9 +6,11 @@ import torch
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
     make_rejection_noise,
 )
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -154,6 +156,27 @@ def _configure_target_hidden_projection(
     )
 
 
+def _draft_requires_dp_sync(draft_spec: DraftParallelSpec) -> bool:
+    return (
+        get_parallel().attn_dp_enabled
+        and draft_spec.tp_execution is DraftTPExecution.TARGET_LAYOUT
+    )
+
+
+def _validate_dp_deepep_draft(draft_spec: DraftParallelSpec) -> None:
+    if (
+        get_parallel().attn_dp_enabled
+        and not _is_npu
+        and get_moe_a2a_backend().is_deepep()
+        and not draft_spec.dp_deepep
+    ):
+        raise ValueError(
+            "DSpark + dp attention with DeepEP requires a draft model that "
+            "declares DeepEP support; use --moe-a2a-backend none, megamoe, or "
+            "mori for this draft."
+        )
+
+
 def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> bool:
     """SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD, only under simulated acceptance: with
     real acceptance there is no draw, so the step order stays as it was."""
@@ -204,13 +227,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         self._draft_is_moe = draft_uses_compressed_kv_attention()
-        self.draft_parallel_layout = resolve_draft_parallel_layout(
-            model_draft_parallel_spec(
-                target_worker.model_runner.spec_aux_config.draft_model_config,
-                spec_algorithm=target_worker.model_runner.spec_algorithm,
-                dspark_is_moe=self._draft_is_moe,
-            )
+        draft_spec = model_draft_parallel_spec(
+            target_worker.model_runner.spec_aux_config.draft_model_config,
+            spec_algorithm=target_worker.model_runner.spec_algorithm,
+            dspark_is_moe=self._draft_is_moe,
         )
+        _validate_dp_deepep_draft(draft_spec)
+        self._draft_requires_dp_sync = _draft_requires_dp_sync(draft_spec)
+        self.draft_parallel_layout = resolve_draft_parallel_layout(draft_spec)
         self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -400,7 +424,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
             sharded_accept=self._sharded_accept,
-            dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+            dp_moe_sync=self._draft_requires_dp_sync,
             acceptance_estimator=self._acceptance_estimator,
         )
         self._verify_epilogue = None
@@ -1015,7 +1039,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_idle():
             self._observers.note_idle_decode_step()
             if get_parallel().attn_dp_enabled:
-                if self._draft_is_moe:
+                if self._draft_requires_dp_sync:
                     self._proposer.run_idle_participation(batch)
                 if coordination_plan is not None:
                     coordination_plan.apply(

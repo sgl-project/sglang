@@ -33,7 +33,11 @@ def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
 
 def hybrid_lightning_config(model_config: ModelConfig):
     config = model_config.hf_config
-    if isinstance(config, BailingHybridConfig) and not config.use_kda:
+    if (
+        isinstance(config, BailingHybridConfig)
+        and not config.use_kda
+        and config.linear_layer_ids
+    ):
         return config
     if isinstance(config, MiniCPMHybridConfig) and config.has_lightning_layers:
         return config
@@ -100,10 +104,18 @@ def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, KimiLinearConfig):
         return config
-    if isinstance(config, BailingHybridConfig) and config.use_kda:
+    if (
+        isinstance(config, BailingHybridConfig)
+        and config.use_kda
+        and config.linear_layer_ids
+    ):
         return config
     text_config = get_hf_text_config(config)
-    if isinstance(text_config, BailingHybridConfig) and text_config.use_kda:
+    if (
+        isinstance(text_config, BailingHybridConfig)
+        and text_config.use_kda
+        and text_config.linear_layer_ids
+    ):
         return text_config
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):

@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     model_config_of,
+    register_dspark_dp_a2a_backends,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -13,6 +14,10 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+register_dspark_dp_a2a_backends(
+    "DeepseekV4ForCausalLM", ("none", "megamoe", "mori", "deepep")
+)
 
 # The compressed-KV pool's page; its C128 sub-pool hardcodes 256-token pages.
 DSV4_PAGE_SIZE = 256
