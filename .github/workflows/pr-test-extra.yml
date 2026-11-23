@@ -1,15 +1,7 @@
 name: PR Test Extra
-# Label-gated extra CI workflow opted into per-PR via labels.
-#
-# Adds runtime to a PR only when the author asks for it: the PR's head commit
-# must carry a run-ci approval (basic-CI prerequisite, see pr-test-approve.yml)
-# and the PR the `run-ci-nv-extra` label (explicit opt-in to this workflow).
-# Both are checked at runtime in pr-gate.yml (approval-mode commit) through
-# the API, so reruns after an approval or a label added by slash command pick
-# them up (workflow-level `if` checks would read the frozen event payload,
-# which never updates on rerun). The same
-# job graph runs unconditionally on workflow_dispatch / workflow_call so it
-# can be triggered manually or chained from another workflow.
+# Extra CI, opted into per PR: needs a run-ci approval of the head commit
+# (pr-gate-approve.yml) and the run-ci-nv-extra label. pr-gate.yml reads both from the API,
+# because an event payload does not refresh on rerun.
 #
 # Stages: extra-a (1-/2-gpu) and extra-b (4-/8-gpu) caller stubs reuse
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
@@ -19,12 +11,11 @@ on:
   # cancel the run in progress. Adding `run-ci-nv-extra` after a push takes a
   # rerun (/run-extra-ci nv, or a manual rerun), which the live label
   # gate in pr-gate.yml then passes.
-  # The workflow file comes from the default branch, never the PR, so a PR
-  # can't edit the gate or the jobs; pr-gate.yml (approval-mode commit) lets
-  # a run through only for a head commit a maintainer approved (see
-  # pr-test-approve.yml, which also re-runs this workflow's gated run when
-  # `run-ci-nv-extra` is on the PR).
+  # Workflow file from the base branch, never the PR. pr-gate-approve.yml also reruns this
+  # workflow's gated run when run-ci-nv-extra is on the PR.
   pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, 'release/**']
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -73,8 +64,7 @@ env:
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
-# Read-only for every job that runs PR code, including the called workflows,
-# which inherit it; jobs that write ask for it themselves.
+# Read-only for every job that runs PR code; called workflows inherit it.
 permissions:
   actions: read
   contents: read
@@ -84,17 +74,8 @@ permissions:
 
 jobs:
   # =============================================== check changes ====================================================
-  # The actual run-ci approval + `run-ci-nv-extra` label gate now lives in the
-  # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
-  # the PR's current labels and its head's approval at runtime, so a rerun (e.g. via
-  # /run-extra-ci nv, which adds labels via GITHUB_TOKEN — these
-  # don't cascade-trigger labeled events) picks up the new label set and
-  # passes. The previous workflow-level `if` checked the frozen event
-  # payload, which never updates on rerun and made the slash-add-label flow
-  # impossible to recover.
   check-changes:
-    # PR runs: nothing from the PR checkout runs until the gate approved
-    # this commit. Scheduled runs skip the gate.
+    # PR runs: nothing from the PR checkout runs until the gate approved this commit.
     needs: call-gate
     if: >-
       always() && !cancelled() && (needs.call-gate.result == 'skipped'
@@ -112,11 +93,12 @@ jobs:
   # opts in on `run-ci-nv-extra`. Without it the gate passes with
   # opted-in=false and every test job skips, so the run is green and
   # consumes no runner.
+  #
+  # Reads the live labels and head approval from the API: labels added with GITHUB_TOKEN
+  # fire no labeled event, so a rerun after /run-extra-ci must see them.
   call-gate:
-    # Runs first, on API metadata only.
     if: github.event_name != 'schedule'
-    # Reads the run-ci approval of the head commit (statuses: read, from the
-    # top-level permissions).
+    # statuses: read (top-level permissions) lets it read the head's approval.
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-nv-extra

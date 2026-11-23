@@ -36,10 +36,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # SECURITY: This workflow runs on issue_comment trigger with elevated permissions
-      # (pull-requests: write, actions: write). For non-fork PRs, we can safely checkout
-      # the PR branch to allow testing changes to this handler. For fork PRs, we MUST
-      # stay on main to prevent untrusted code execution with these elevated permissions.
+      # SECURITY: issue_comment runs with elevated permissions. Check out the PR branch only
+      # for non-fork PRs; fork PRs stay on main to keep untrusted code out.
       - name: Get PR details
         id: pr
         shell: bash
@@ -50,10 +48,9 @@ jobs:
             echo "::error::Failed to fetch PR data"
             exit 1
           }
-          # Use 'empty' filter to handle null/missing values (e.g., deleted forks)
           HEAD_OWNER=$(echo "$PR_DATA" | jq -r '.headRepositoryOwner.login // empty')
           REPO_OWNER="${{ github.repository_owner }}"
-          # Treat missing/null owner as fork for security (fail-safe)
+          # Missing owner counts as a fork (fail-safe)
           if [[ -z "$HEAD_OWNER" || "$HEAD_OWNER" != "$REPO_OWNER" ]]; then
             IS_FORK="true"
           else
@@ -85,9 +82,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # For non-fork PRs: checkout PR branch by name
-          # For fork PRs with trusted commenter: checkout via refs/pull/N/head
-          # For fork PRs with untrusted commenter: stay on main for security
+          # Untrusted fork commenter: stay on main.
           ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || (steps.perm.outputs.safe_to_checkout_pr == 'true' && steps.pr.outputs.pr_ref || '') }}
 
       - name: Set up Python
@@ -105,6 +100,7 @@ jobs:
           REPO_FULL_NAME: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.issue.number }}
           COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_ACTION: ${{ github.event.action }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           USER_LOGIN: ${{ github.event.comment.user.login }}
         run: |

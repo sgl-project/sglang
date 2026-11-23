@@ -10,14 +10,14 @@ run-name: >-
 on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
-  # The workflow file comes from the default branch, never the PR, so a PR
-  # can't edit the gate or the jobs; pr-gate.yml (approval-mode commit) lets
-  # a run through only for a head commit a maintainer approved (see
-  # pr-test-approve.yml). No `labeled` type: a label event would join the
-  # concurrency group below and cancel the run in progress; the approval
-  # workflow re-runs the gated run instead.
+  # The workflow file comes from the PR's base branch, never the PR, so a PR can't edit the
+  # gate; pr-gate.yml (approval-mode commit) passes only a head commit a maintainer approved
+  # (pr-gate-approve.yml). Only PRs into main and release branches: base-branch workflows run
+  # with secrets. No `labeled` type: a label event would join the concurrency group below and
+  # cancel the run in progress; the approval workflow re-runs the gated run instead.
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main, 'release/**']
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -66,13 +66,11 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
-  # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main. PR runs
-  # (pull_request_target) do too, but test PR code, so they never bypass.
+  # PR runs (pull_request_target) also have refs/heads/main but test PR code, so they never bypass.
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
-# Read-only for every job that runs PR code, including the called workflows,
-# which inherit it; jobs that write ask for it themselves.
+# Read-only for every job that runs PR code; called workflows inherit it.
 permissions:
   actions: read
   contents: read
@@ -82,9 +80,8 @@ permissions:
 
 jobs:
   # =============================================== check changes ====================================================
-  # Which parts of the tree the PR changes, from main's code and the GitHub
-  # API alone, so call-gate can be skipped for a PR that needs no tests before
-  # anything from the PR runs.
+  # From the base branch's code and the GitHub API alone, so call-gate can be skipped
+  # before anything from the PR runs.
   detect-changes:
     uses: ./.github/workflows/_pr-test-detect-changes.yml
     with:
@@ -92,12 +89,11 @@ jobs:
       run_all_tests: ${{ inputs.run_all_tests == true }}
 
   check-changes:
-    # PR runs: nothing from the PR checkout runs until the gate approved
-    # this commit, and nothing at all when the gate is skipped (no relevant
-    # change). Scheduled and parallel-dispatch runs skip the gate.
-    needs: call-gate
+    # PR runs: nothing from the PR checkout runs until the gate approved this commit, and
+    # nothing at all when the gate is skipped.
+    needs: [detect-changes, call-gate]
     if: >-
-      always() && !cancelled() && (
+      always() && !cancelled() && needs.detect-changes.result == 'success' && (
         needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false'
         || needs.call-gate.result == 'skipped' && github.event_name != 'pull_request_target')
     uses: ./.github/workflows/_pr-test-check-changes.yml
@@ -105,12 +101,12 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      changes: ${{ toJson(needs.detect-changes.outputs) }}
     secrets: inherit
 
   call-pr-test-extra:
     if: github.event_name == 'schedule' || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true
-    # What pr-test-extra.yml asks for: its read-only set, and actions: write
-    # for its notify-pr-states job.
+    # actions: write for pr-test-extra.yml's notify-pr-states job.
     permissions:
       actions: write
       contents: read
@@ -195,8 +191,6 @@ jobs:
 
   # =============================================== PR Gate ====================================================
   call-gate:
-    # Runs before anything from the PR, on API metadata only. Skip for
-    # scheduled runs (they run all tests) and when no relevant change.
     needs: detect-changes
     if: |
       github.event_name != 'schedule' &&
@@ -209,8 +203,7 @@ jobs:
         needs.detect-changes.outputs.processor == 'true' ||
         needs.detect-changes.outputs.server_args_docs == 'true'
       )
-    # Reads the run-ci approval of the head commit (statuses: read, from the
-    # top-level permissions).
+    # statuses: read (top-level permissions) lets it read the head's approval.
     uses: ./.github/workflows/pr-gate.yml
     with:
       approval-mode: commit
@@ -265,8 +258,7 @@ jobs:
     # every PR only if it was written from the default branch's ref, so every
     # main-ref run - schedule, dispatch, workflow_call - has to seed it.
     #
-    # !cancelled() so a skipped call-gate does not take this job with it, since a
-    # docs-only PR still installs sglang in every stage.
+    # !cancelled() so a skipped call-gate does not take this job with it.
     if: &build-gate |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
@@ -367,7 +359,7 @@ jobs:
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ (!failure() && !cancelled()) && needs.call-gate.outputs.opted-in != 'false' }}
+    if: ${{ (!failure() && !cancelled()) && needs.check-changes.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -408,7 +400,7 @@ jobs:
     name: base-b-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
     # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
-    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled') && needs.check-changes.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -458,7 +450,7 @@ jobs:
     # wait-for-base-a is listed only to read its result: when it is cancelled,
     # wait-for-base-b ends `skipped`, which alone would let this stage through.
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
-    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.check-changes.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -484,7 +476,7 @@ jobs:
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64, sgl-router-build-aarch64]
-    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
+    if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.check-changes.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -548,13 +540,12 @@ jobs:
             exit 1
           fi
 
-      # The required check: a draft or a PR whose head commit has no run-ci
-      # approval skipped every test above, so fail here rather than pass with
-      # nothing run.
+      # The required check: fail here when the gate skipped every test above, rather than
+      # pass with nothing run.
       - name: Require that tests ran
         if: needs.call-gate.outputs.opted-in == 'false'
         run: |
-          echo "::error::Tests were skipped: the PR is a draft, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer approve this commit: comment /tag-and-rerun-ci, or remove and re-add the 'run-ci' label. A push needs a new approval; /rerun-failed-ci and 'Re-run all jobs' do not approve."
+          echo "::error::Tests were skipped: the PR is a draft, lacks the 'run-ci' label, or its head commit has no run-ci approval. Mark the PR ready, then have a maintainer approve this commit: comment /tag-and-rerun-ci, or add the 'run-ci' label (remove and re-add it if it is on). Every push, a maintainer's included, needs a new approval; /rerun-failed-ci and 'Re-run all jobs' do not approve."
           exit 1
 
   # =============================================== notify pr-states ====================================================

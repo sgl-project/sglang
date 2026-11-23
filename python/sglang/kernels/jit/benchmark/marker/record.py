@@ -29,6 +29,7 @@ _GITHUB_EVENT_TO_RUN_KIND = {
     "schedule": "nightly",
     "push": "main",
     "pull_request": "pr",
+    "pull_request_target": "pr",
     "workflow_dispatch": "manual",
 }
 

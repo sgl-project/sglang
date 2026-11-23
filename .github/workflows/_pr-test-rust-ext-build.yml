@@ -187,7 +187,8 @@ jobs:
               echo "key=${PREFIX}${LOCKS}"
               # Only main saves, so PRs add no multi-GB entries; a PR falls back to
               # main's entry for an older lock, while main starts clean on a miss.
-              if [ "${GITHUB_REF}" = refs/heads/main ]; then
+              # A pull_request_target run's GITHUB_REF is main too, so test the event.
+              if [ "${GITHUB_EVENT_NAME}" != pull_request_target ] && [ "${GITHUB_REF}" = refs/heads/main ]; then
                   echo "save=true"
               else
                   echo "restore-prefix=${PREFIX}"
@@ -397,7 +398,6 @@ jobs:
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
       - name: Save built modules
-        # Not from pull_request_target runs: their caches count as the default branch's.
         if: github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:

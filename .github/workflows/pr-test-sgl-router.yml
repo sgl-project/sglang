@@ -67,9 +67,8 @@ jobs:
     with:
       runs_on: ubuntu-22.04
 
-  # The HF_TOKEN download in a job of its own: the job below restores
-  # rust-cache and sccache entries, which a pull_request_target run (PR code)
-  # can write into the default branch's cache, so it holds no secret.
+  # The HF_TOKEN download in a job of its own: the job below restores rust-cache and
+  # sccache entries that a pull_request_target run could write, so it holds no secret.
   sgl-router-tokenizers:
     name: fetch tokenizers
     needs: sgl-router-gate
@@ -82,8 +81,6 @@ jobs:
           persist-credentials: false
           sparse-checkout: sgl-router/tests/fixtures/tokenizer_parity
 
-      # The tokenizer parity matrix reads each fixture model's tokenizer.json
-      # from the HuggingFace cache.
       - name: Fetch the parity matrix tokenizers
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -239,8 +236,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # This job holds HF_TOKEN, so it builds both from source rather than run
-      # what a pull_request_target run (PR code) could have put in the cache.
+      # Holds HF_TOKEN: build from source, since a pull_request_target run could have
+      # written the cache.
       - uses: ./.github/actions/download-rust-ext
         with:
           from_source: ${{ secrets.HF_TOKEN != '' }}

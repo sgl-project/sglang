@@ -120,7 +120,6 @@ jobs:
 
       # After the glibc check, so a rejected build cannot poison this key.
       - name: Save built binary
-        # Not from pull_request_target runs: their caches count as the default branch's.
         if: github.event_name != 'pull_request_target'
         uses: actions/cache/save@v4
         with:

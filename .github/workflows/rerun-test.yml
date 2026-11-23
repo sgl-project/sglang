@@ -162,9 +162,8 @@ jobs:
     env:
       RUNNER_LABELS: ${{ inputs.runs_on }}
       SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.rdma_devices }}
-      # The two main-dispatch cases whose Run test gets a secret. Only they
-      # build the Rust extensions and sgl-router from source instead of
-      # taking the cache, which a pull_request_target run (PR code) can write.
+      # The two main-dispatch cases whose Run test gets a secret: they build the Rust
+      # extensions and sgl-router from source, since a pull_request_target run can write the cache.
       MUSE_SPARK_RUN: ${{ inputs.pr_head_sha == '' && inputs.runs_on == '8-gpu-b300' && (contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_12_b300_pd.py') || contains(matrix.test_command, 'registered/e2e/models/test_muse_spark_unified_memory.py')) }}
       PRECISION_STORE_RUN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' }}
     steps:
@@ -488,7 +487,7 @@ jobs:
 
       # Not through setup-amd-ci's sgl_router input: a local action that
       # another action uses resolves against the workspace, the PR checkout.
-      # A job that holds the Docker Hub credentials builds it from source.
+      # Credentialed job: build from source; the cache may hold a pull_request_target run's files.
       - uses: ./trusted-ci/.github/actions/download-sgl-router
         if: needs.prepare-partitions.outputs.sgl_router == 'true'
         with:

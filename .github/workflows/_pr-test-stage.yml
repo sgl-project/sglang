@@ -124,12 +124,8 @@ jobs:
     # below in a setup step via $GITHUB_ENV.
     runs-on: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
     timeout-minutes: ${{ fromJson(inputs.job_timeout_minutes) }}
-    # The only stages that get a secret besides GITHUB_TOKEN: b300's tests read
-    # HF_MUSE_SPARK_TOKEN, and the scheduled 8-gpu-h200 stage runs the one test
-    # that writes with HF_TOKEN_PRECISION_STORE. They build the Rust extensions
-    # and sgl-router from source rather than run cached code: a
-    # pull_request_target run (PR code) can write into the default branch's
-    # cache, and a same-run artifact may have come from that cache.
+    # Only these stages get a secret, so they build the Rust extensions and sgl-router
+    # from source: a pull_request_target run can write the default branch's cache.
     env:
       MUSE_SPARK_STAGE: ${{ github.event_name != 'pull_request_target' && inputs.runner_config == '8-gpu-b300' }}
       PRECISION_STORE_STAGE: ${{ github.event_name != 'pull_request_target' && inputs.scheduled && inputs.runner_config == '8-gpu-h200' }}
@@ -290,8 +286,7 @@ jobs:
           retention-days: 5
           if-no-files-found: ignore
 
-      # cuda-coredump-tracker.yml signals the tracker issue from these
-      # artifacts, so the bot token never shares a job with the tests.
+      # cuda-coredump-tracker.yml signals from these artifacts, keeping the bot token out of the test job.
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:

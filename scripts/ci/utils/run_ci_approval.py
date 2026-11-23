@@ -1,16 +1,6 @@
-"""Per-commit run-ci approval for the workflows whose pr-gate.yml call uses
-`approval-mode: commit` (pr-test.yml, pr-test-extra.yml).
-
-Approving records a `ci/run-ci-approved` commit status on the PR head; the
-gate lets a run through only for a head that carries it, so every new push
-needs a new approval. Two paths approve, and both go through this module:
-
-- pr-test-approve.yml, when someone adds the `run-ci` label (main() below);
-- the slash command handler, for /tag-and-rerun-ci, /run-ci and the commands
-  that add `run-ci`.
-
-Run as a script, it is the label path. It loads only PyGithub and the
-standard library, so that workflow installs nothing else.
+"""Per-commit run-ci approval: a ci/run-ci-approved status on the PR head, required by
+pr-gate.yml (approval-mode commit) besides the run-ci label. Needs only PyGithub, so the
+approve workflow installs nothing else.
 """
 
 import json
@@ -21,32 +11,37 @@ import time
 from github import Auth, Github, GithubException
 
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+# CI selections: name -> workflow files and an optional opt-in label (null selects existing
+# workflows without a new hardware gate); scripts/lint/check_opt_in_ci_tiers.py keeps it in sync.
 OPT_IN_TIERS_FILE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "opt_in_ci_tiers.json"
 )
 
-# The status pr-gate.yml checks in approval-mode commit. It counts only when
-# github-actions[bot] created it, i.e. a workflow's GITHUB_TOKEN wrote it.
+# Counts only when github-actions[bot] created it (a workflow's GITHUB_TOKEN).
 APPROVAL_CONTEXT = "ci/run-ci-approved"
 APPROVAL_CREATOR = "github-actions[bot]"
+APPROVAL_LABEL = "run-ci"
 APPROVER_REPO_PERMISSIONS = ("write", "maintain", "admin")
+# An approver from CI_PERMISSIONS.json without write access needs a PR merged within this many days.
+APPROVER_ACTIVITY_DAYS = 90
 # The callers of pr-gate.yml with `approval-mode: commit`.
 APPROVAL_WORKFLOWS = (
     ".github/workflows/pr-test.yml",
     ".github/workflows/pr-test-extra.yml",
 )
-# The job pr-gate.yml runs, as it appears after the caller's job name.
+APPROVE_WORKFLOW = ".github/workflows/pr-gate-approve.yml"
+# pr-test.yml runs on every push to a PR, so its newest run at a commit postdates the
+# latest push. GitHub stamps created_at; a commit's own dates are the pusher's.
+PUSH_CLOCK_WORKFLOW = ".github/workflows/pr-test.yml"
+# A reusable workflow's job is named "<caller job> / pr-gate".
 GATE_JOB = "pr-gate"
-# How rerun_gated_runs waits for a gate to decide and a skipped run to end.
 GATE_POLL_SECONDS = 20
 GATE_MAX_WAIT_SECONDS = 900
+# The pr-gate.yml step that runs only when it skips the caller's tests.
+GATE_SKIP_STEP = "Skip tests"
 
 
 def load_permissions(user_login):
-    """
-    Reads the permissions JSON from the local file system and returns
-    the permissions dict for the specific user.
-    """
     try:
         print(f"Loading permissions from {PERMISSIONS_FILE_PATH}...")
         if not os.path.exists(PERMISSIONS_FILE_PATH):
@@ -69,15 +64,17 @@ def load_permissions(user_login):
         sys.exit(1)
 
 
-def _latest_run_per_workflow(runs):
+def load_opt_in_tiers():
+    with open(OPT_IN_TIERS_FILE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def latest_run_per_workflow(runs):
     """
     Collapse a head_sha's workflow runs to the newest run per workflow.
 
-    GitHub can have several runs of the *same* workflow at one commit — a
-    `synchronize` run superseded by a `labeled` run, or a run cancelled by
-    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
-    already in flight. Only the newest one reflects current state; rerunning
-    the older ones spawns duplicates that fight the live run for runners.
+    Older runs (superseded, or cancelled by cancel-in-progress) are not rerun: they would
+    duplicate the live run.
     """
     latest = {}
     for run in runs:
@@ -87,11 +84,8 @@ def _latest_run_per_workflow(runs):
     return list(latest.values())
 
 
-def _pr_workflow_runs(gh_repo, pr, head_sha=None):
-    """Keep target-event runs scoped to this PR's source repository and branch.
-
-    head_sha defaults to the PR's current head.
-    """
+def pr_workflow_runs(gh_repo, pr, head_sha=None):
+    """Runs of this PR; target-event runs must match its source repository and branch."""
     for run in gh_repo.get_workflow_runs(head_sha=head_sha or pr.head.sha):
         if run.event == "pull_request_target" and (
             run.head_branch != pr.head.ref
@@ -103,40 +97,69 @@ def _pr_workflow_runs(gh_repo, pr, head_sha=None):
         yield run
 
 
-def _workflow_file(run):
+def workflow_file(run):
     # The runs API may suffix `path` with `@<ref>`.
     return run.path.split("@", 1)[0]
 
 
-# The pr-gate.yml step that runs only when it skips the caller's tests: a draft
-# PR, or one missing `run-ci` (in approval-mode commit, a head with no
-# approval) or the workflow's opt-in label.
-GATE_SKIP_STEP = "Skip tests"
-
-
-def _skipped_at_gate(run):
-    """True if pr-gate skipped this run's tests."""
+def job_skipped_tests(job):
     return any(
         step.name == GATE_SKIP_STEP and step.conclusion == "success"
-        for job in run.jobs()
         for step in job.steps
     )
 
 
+def skipped_at_gate(run):
+    return any(job_skipped_tests(job) for job in run.jobs())
+
+
 def can_approve(gh_repo, user_login, user_perms):
     """
-    The one rule for who may approve a commit for CI: write access to the
-    repository, or `can_tag_run_ci_label` in CI_PERMISSIONS.json.
+    The one rule for who may approve a commit for CI. Returns (ok, reason).
+
+    Write access approves; `can_tag_run_ci_label` in CI_PERMISSIONS.json approves only
+    with a PR merged within APPROVER_ACTIVITY_DAYS.
     """
-    if (user_perms or {}).get("can_tag_run_ci_label", False):
-        return True
     try:
         permission = gh_repo.get_collaborator_permission(user_login)
     except GithubException as e:
-        if e.status in (403, 404):
-            return False
-        raise
-    return permission in APPROVER_REPO_PERMISSIONS
+        if e.status not in (403, 404):
+            raise
+        permission = None
+    if permission in APPROVER_REPO_PERMISSIONS:
+        return True, ""
+    if not (user_perms or {}).get("can_tag_run_ci_label", False):
+        return False, (
+            f"{user_login} has neither write access nor can_tag_run_ci_label "
+            f"in {PERMISSIONS_FILE_PATH}"
+        )
+    since = time.strftime(
+        "%Y-%m-%d", time.gmtime(time.time() - APPROVER_ACTIVITY_DAYS * 86400)
+    )
+    query = (
+        f"repo:{gh_repo.full_name} is:pr is:merged author:{user_login} merged:>={since}"
+    )
+    _, found = gh_repo.requester.requestJsonAndCheck(
+        "GET", "/search/issues", parameters={"q": query, "per_page": 1}
+    )
+    if found["total_count"] > 0:
+        return True, ""
+    return False, (
+        f"{user_login} has can_tag_run_ci_label in {PERMISSIONS_FILE_PATH} but "
+        f"no PR merged into {gh_repo.full_name} since {since} (an approver "
+        f"without write access needs one within {APPROVER_ACTIVITY_DAYS} days)"
+    )
+
+
+def head_seen_by(gh_repo, pr, sha, seen_at):
+    """True if sha was already the PR's head at seen_at: no pr-test.yml run at sha is newer.
+    False while no such run exists yet."""
+    pushed = [
+        run.created_at
+        for run in pr_workflow_runs(gh_repo, pr, sha)
+        if workflow_file(run) == PUSH_CLOCK_WORKFLOW
+    ]
+    return bool(pushed) and max(pushed) <= seen_at
 
 
 def record_approval(gh_repo, sha, user_login):
@@ -148,9 +171,9 @@ def record_approval(gh_repo, sha, user_login):
     print(f"Approved {sha} for CI on behalf of {user_login}.")
 
 
-def is_approved(gh_repo, sha):
-    """The check pr-gate.yml makes, for the handler's replies."""
-    return any(
+def is_approved(gh_repo, sha, labels):
+    """Python twin of pr-gate.yml's "Check run-ci approval" step; keep the two in step."""
+    return APPROVAL_LABEL in labels and any(
         status.context == APPROVAL_CONTEXT
         and status.state == "success"
         and status.creator is not None
@@ -160,10 +183,8 @@ def is_approved(gh_repo, sha):
 
 
 def approval_workflows_for(labels):
-    """The approval workflows that run on a PR with these labels: those whose
-    opt-in label, if they have one, is on it."""
-    with open(OPT_IN_TIERS_FILE_PATH, encoding="utf-8") as f:
-        tiers = json.load(f).values()
+    """The approval workflows that run on a PR with these labels."""
+    tiers = load_opt_in_tiers().values()
     return [
         path
         for path in APPROVAL_WORKFLOWS
@@ -176,33 +197,27 @@ def approval_workflows_for(labels):
 
 
 def _gate_state(run):
-    """'pending' until the run's pr-gate.yml job ends, then 'skipped' or 'passed'."""
     for job in run.jobs():
         if job.name.split(" / ")[-1] != GATE_JOB:
             continue
         if job.status != "completed":
             return "pending"
-        return (
-            "skipped"
-            if any(
-                step.name == GATE_SKIP_STEP and step.conclusion == "success"
-                for step in job.steps
-            )
-            else "passed"
-        )
-    # No gate job yet, or none at all (a run the gate is skipped for).
-    return "pending" if run.status != "completed" else "passed"
+        if job.conclusion != "success":
+            return "failed"
+        return "skipped" if job_skipped_tests(job) else "passed"
+    # No gate job yet, or none (the gate was skipped: no change needed tests).
+    return "pending" if run.status != "completed" else "ungated"
 
 
 def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
     """
-    Make the newest run of each workflow at head_sha run its tests, now that
-    head_sha is approved.
+    Re-run the newest run of each workflow at head_sha whose gate skipped its tests, now
+    that head_sha is approved.
 
-    The gate reads the approval once, in its own job, so this waits for that
-    job to end. A run whose gate passed needs nothing. One whose gate skipped
-    the tests is re-run once it has completed, since GitHub rejects a re-run
-    of a run in progress. The wait is bounded by GATE_MAX_WAIT_SECONDS.
+    Waits (up to GATE_MAX_WAIT_SECONDS) for each gate job to end, and re-runs only a
+    completed run (GitHub rejects re-running one in progress) while head_sha is still the
+    PR's head: an older commit's re-run would cancel the newer head's run through the
+    concurrency group.
 
     Returns one (acted, message) per workflow file.
     """
@@ -212,10 +227,10 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
     while True:
         runs = [
             run
-            for run in _pr_workflow_runs(gh_repo, pr, head_sha)
-            if _workflow_file(run) in pending
+            for run in pr_workflow_runs(gh_repo, pr, head_sha)
+            if workflow_file(run) in pending
         ]
-        latest = {_workflow_file(run): run for run in _latest_run_per_workflow(runs)}
+        latest = {workflow_file(run): run for run in latest_run_per_workflow(runs)}
         for path in list(pending):
             name = os.path.basename(path)
             run = latest.get(path)
@@ -230,23 +245,38 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
             if gate == "pending" or (gate == "skipped" and run.status != "completed"):
                 continue
             pending.remove(path)
+            link = f"[`{run.name}`]({run.html_url})"
             if gate == "passed":
+                results[path] = (False, f"{link} already passed its gate.")
+                continue
+            if gate == "failed":
                 results[path] = (
                     False,
-                    f"[`{run.name}`]({run.html_url}) already passed its gate.",
+                    f"{link}: its gate failed or was cancelled, so nothing was re-run.",
+                )
+                continue
+            if gate == "ungated":
+                results[path] = (False, f"{link} has no gate: no change needs tests.")
+                continue
+            current_head = gh_repo.get_pull(pr.number).head.sha
+            if current_head != head_sha:
+                results[path] = (
+                    False,
+                    f"Not re-running {link}: the PR head moved from {head_sha[:8]} "
+                    f"to {current_head[:8]}, which needs its own approval.",
                 )
                 continue
             try:
-                run.rerun()
+                accepted = run.rerun()
+                error = "GitHub refused the re-run"
             except Exception as e:
-                results[path] = (
-                    False,
-                    f"Failed to re-run [`{run.name}`]({run.html_url}): {e}",
-                )
+                accepted, error = False, e
+            if not accepted:
+                results[path] = (False, f"Failed to re-run {link}: {error}")
                 continue
             results[path] = (
                 True,
-                f"Re-running [`{run.name}`]({run.html_url}), whose gate skipped the tests before the approval.",
+                f"Re-running {link}, whose gate skipped the tests before the approval.",
             )
         if not pending:
             break
@@ -263,7 +293,6 @@ def rerun_gated_runs(gh_repo, pr, head_sha, workflow_files):
 
 
 def main():
-    """The label path: pr-test-approve.yml, on a `run-ci` label."""
     gh_repo = Github(auth=Auth.Token(os.environ["GITHUB_TOKEN"])).get_repo(
         os.environ["REPO_FULL_NAME"]
     )
@@ -271,11 +300,11 @@ def main():
     head_sha = os.environ["HEAD_SHA"]
     sender = os.environ["SENDER_LOGIN"]
 
-    if not can_approve(gh_repo, sender, load_permissions(sender)):
+    ok, reason = can_approve(gh_repo, sender, load_permissions(sender))
+    if not ok:
         print(
-            f"::warning::{sender} added run-ci but may not approve CI (that takes "
-            f"write access or can_tag_run_ci_label in {PERMISSIONS_FILE_PATH}), "
-            f"so {head_sha} is not approved."
+            f"::warning::{sender} added run-ci but may not approve CI: {reason}. "
+            f"{head_sha} is not approved."
         )
         return
 

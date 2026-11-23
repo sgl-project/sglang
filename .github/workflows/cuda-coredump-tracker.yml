@@ -1,8 +1,6 @@
 name: CUDA Coredump Tracker
-# Signals the coredump tracker issue when a CUDA test run uploaded coredumps
-# (.github/actions/upload-cuda-coredumps). A workflow of its own so the bot
-# token never shares a job with test code or with Rust modules restored from
-# the cache: this job checks nothing out and restores nothing.
+# A workflow of its own so the bot token never shares a job with test code or cache-restored
+# Rust modules: it checks nothing out.
 
 on:
   workflow_run:
@@ -24,10 +22,12 @@ jobs:
           TRACKER_ISSUE: "26340"
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          # When this attempt started, so an earlier attempt's artifacts don't count.
           STARTED_AT: ${{ github.event.workflow_run.run_started_at }}
           PR_NUM: ${{ github.event.workflow_run.pull_requests[0].number }}
           EVENT_NAME: ${{ github.event.workflow_run.event }}
+          # pull_requests is empty for a fork PR; pr-test.yml's run-name is "PR #<n> - <title>".
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
         run: |
           count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --paginate \
             --jq ".artifacts[] | select((.name | startswith(\"cuda-coredumps-\")) and .created_at >= \"${STARTED_AT}\") | .name" \
@@ -35,6 +35,10 @@ jobs:
           echo "Coredump artifacts in this attempt: ${count}"
           if [ "${count}" -eq 0 ]; then
             exit 0
+          fi
+          if [ -z "${PR_NUM}" ] && [ "${WORKFLOW_NAME}" = "PR Test Base" ] \
+              && [[ "${RUN_TITLE}" =~ ^PR\ \#([0-9]+) ]]; then
+            PR_NUM="${BASH_REMATCH[1]}"
           fi
           if [ -n "${PR_NUM}" ]; then
             ref_label="PR #${PR_NUM}"

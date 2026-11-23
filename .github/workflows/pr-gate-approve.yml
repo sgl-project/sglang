@@ -1,18 +1,11 @@
-name: PR Test Approve
-# Adding `run-ci` approves the PR's head commit for pr-test.yml and
-# pr-test-extra.yml, whose gate (pr-gate.yml, approval-mode commit) passes a
-# run only when its head carries the ci/run-ci-approved status recorded here.
-# The approval binds to the head at the moment the label is added, so a later
-# push needs a new one. The slash command handler approves through the same
-# module (scripts/ci/utils/run_ci_approval.py).
-#
-# A separate workflow rather than a `labeled` trigger on pr-test.yml: there a
-# label event would join the run's concurrency group and cancel a GPU run in
-# progress, whatever the label.
+name: PR Gate Approve
+# Its own workflow, not a labeled trigger on pr-test.yml: a label event there would join
+# the run's concurrency group and cancel a GPU run in progress.
 
 on:
   pull_request_target:
     types: [labeled]
+    branches: [main, 'release/**']
 
 permissions:
   contents: read
@@ -28,8 +21,7 @@ jobs:
       pull-requests: read
       statuses: write # record ci/run-ci-approved
     steps:
-      # The default ref of pull_request_target, main: the PR is never checked
-      # out, and CI_PERMISSIONS.json is main's.
+      # The default ref of pull_request_target is the base branch; the PR is never checked out.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false

@@ -1,12 +1,6 @@
 name: Detect Changes
-# Which parts of the tree a run changes. The one definition of the path
-# filters: pr-test.yml calls this before its gate, and _pr-test-check-changes.yml
-# calls it for every other reader.
-#
-# On a PR event, dorny/paths-filter lists the PR's files through the GitHub API
-# and needs no checkout, so nothing here runs PR code: this workflow comes from
-# the caller's commit (main, under pull_request_target). Other events diff a
-# checkout of the tested ref.
+# Path filters, defined once. On a PR event dorny/paths-filter lists files through the
+# API and needs no checkout, so no PR code runs; other events diff a checkout of the tested ref.
 
 on:
   workflow_call:
@@ -58,8 +52,7 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
-          # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.git_ref
+          # Under workflow_call, github.event_name is the caller's event.
           if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
             echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
@@ -68,11 +61,10 @@ jobs:
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
           fi
 
-      # A PR event reads the API instead (see the header).
       - name: Checkout code
         if: >-
           steps.run-mode.outputs.run_all_tests != 'true'
-          && github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+          && github.event_name != 'pull_request_target'
         uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -92,8 +84,7 @@ jobs:
               - "python/pyproject.toml"
               - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
-              # Diffusion-only kernels and tests are left to multimodal_gen and
-              # jit_kernel; ops/diffusion/common stays since kda_kernels (an srt path) imports it.
+              # ops/diffusion/common stays since kda_kernels (an srt path) imports it.
               - "python/sglang/kernels/{,ops/,jit/,jit/csrc/}!(*.md)"
               - "python/sglang/kernels/!(aot|ops|jit)/**/!(*.md)"
               - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
@@ -107,11 +98,8 @@ jobs:
               - "test/registered/kernels/!(ops|benchmark)/**/!(*.md)"
               - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(*.md)"
               - "test/registered/{kernels/ops,kernels/benchmark,unit,e2e}/!(diffusion)/**/!(*.md)"
-              # rust/Cargo.lock is shared by the whole workspace, so processor-only
-              # dependency edits rewrite it too; it gates the processor filter
-              # instead. A dependency change for a shipped crate also edits its
-              # Cargo.toml, which still matches here. `/**/*` (not `/**`) keeps
-              # the per-crate glob from matching rust/Cargo.lock itself.
+              # rust/Cargo.lock also changes for processor-only edits, so it gates the processor
+              # filter; `/**/*` keeps the per-crate glob from matching it.
               - "rust/!(Cargo.lock)"
               - "rust/!(sglang-processor)/**/*"
               - "proto/**"
@@ -119,10 +107,8 @@ jobs:
               - "rust/sglang-processor/**"
               - "rust/Cargo.lock"
             server_args_docs:
-              # test_server_args_docs_coverage.py diffs this doc and its allowlist
-              # against the CLI, so a docs only edit can break that test. Kept out
-              # of main_package which also gates every GPU stage. Only the CPU
-              # stage reads this.
+              # Only the CPU stage reads this: test_server_args_docs_coverage.py diffs these
+              # against the CLI, and main_package would gate every GPU stage.
               - "docs/docs/advanced_features/server_arguments.mdx"
               - "docs/docs/advanced_features/server_arguments_undocumented.txt"
             simulator:
@@ -152,9 +138,7 @@ jobs:
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
-            # multimodal_gen minus the ComfyUI plugin and its unit tests: nothing in
-            # the server, runtime or GPU suites imports the plugin, so a plugin-only
-            # change runs the diffusion unit suite but not the server suites.
+            # multimodal_gen minus the ComfyUI plugin: no server, runtime or GPU suite imports it.
             multimodal_gen_server:
               - ".github/actions/**"
               - ".github/workflows/pr-test.yml"
@@ -182,8 +166,6 @@ jobs:
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
-            # SM103 bit-exact coverage is needed for runtime/kernel changes, not
-            # unrelated diffusion test fixtures, baselines, or documentation.
             diffusion_sm103:
               - ".github/workflows/{pr-test*,_pr-test*,_diffusion*}.yml"
               - ".github/actions/**"
@@ -201,11 +183,9 @@ jobs:
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "test/registered/kernels/**"
-              # sglang.kernels is the migrated kernel namespace (RFC #29630 / #30044); the
-              # base-b-kernel suites import it directly, so kernel edits must run them.
+              # The base-b-kernel suites import sglang.kernels directly.
               - "python/sglang/kernels/!(*.md)"
               - "python/sglang/kernels/!(aot)/**"
             sgl_kernel:
-              # Intentionally excludes ".github/workflows/pr-test-sgl-kernel.yml" —
-              # see API-side detector below for rationale.
+              # Excludes pr-test-sgl-kernel.yml: an edit there would force a 20-30 min wheel rebuild.
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"

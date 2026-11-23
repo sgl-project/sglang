@@ -60,11 +60,8 @@ jobs:
               prNumber = context.payload.pull_request.number;
             } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
-              // Only PR-event runs are the PR gate (pull_request_target for the
-              // NVIDIA workflows, pull_request for AMD). The AMD workflow also
-              // accepts workflow_dispatch for a single stage, and such a run on
-              // a PR branch is PR-associated; refreshing off it would rewrite
-              // the block from a run the rows below deliberately ignore.
+              // Only PR-event runs are the PR gate; a workflow_dispatch run on a PR branch is
+              // PR-associated but ignored by the rows below.
               if (wr.event !== 'pull_request' && wr.event !== 'pull_request_target') {
                 core.info(`Triggering run event '${wr.event}' is not a PR event; skipping.`);
                 return;
@@ -169,13 +166,10 @@ jobs:
               findRun('pr-test-amd.yml', 'pull_request', labelOffOpts),
             ]);
 
-            // Skipped run = "no real run" -- happens when a label is added
-            // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
             // pr-gate.yml runs its "Skip tests" step when a draft, a missing
-            // `run-ci` (for the NVIDIA rows, an unapproved head commit), or a
-            // missing opt-in label skips the caller's tests, so
+            // `run-ci` (or approval), or a missing opt-in label skips the caller's tests, so
             // such a run is green (or, for Base, red) with nothing tested.
             async function skippedAtGate(run) {
               // A skipped run ends failed (Base) or green; notify-pr-states
@@ -199,11 +193,9 @@ jobs:
             const skipMark = '\u2298 **Skipped**';
             const missingCIText = `${skipMark} -- a maintainer adds the \`run-ci\` label (or comments \`/tag-and-rerun-ci\`) to run CI tests.`;
             const stalePushText = ':warning: **Not run on latest push** -- push again to dispatch.';
-            const draftText = `${skipMark} -- the PR is a draft; mark it ready, then \`/rerun-failed-ci\`.`;
+            const draftText = `${skipMark} -- the PR is a draft; marking it ready starts a new run (AMD: then \`/rerun-failed-ci\`).`;
             const noTestsText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- it predates the labels or the PR leaving draft; \`/rerun-failed-ci\` reruns it.`;
-            // pr-test.yml and pr-test-extra.yml run only on a head commit a
-            // maintainer approved (pr-test-approve.yml), so a push needs a new approval.
-            const unapprovedText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- its commit has no run-ci approval, or it predates the labels or the PR leaving draft; a maintainer's \`/tag-and-rerun-ci\` approves this commit and reruns it.`;
+            const unapprovedText = (run) => `${skipMark} in [Run #${run.id}](${run.html_url}) -- its commit has no run-ci approval, or the run predates the labels; a maintainer's \`/tag-and-rerun-ci\` approves this commit and reruns it.`;
             // A missing run usually means the paths filter excluded the PR,
             // but pull_request workflows can also be suppressed by GitHub
             // (for example, for merge conflicts or skip annotations).

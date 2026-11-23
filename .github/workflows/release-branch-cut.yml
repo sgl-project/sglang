@@ -165,8 +165,7 @@ jobs:
 
   run-pr-tests-nvidia:
     needs: cut-release-branch
-    # What pr-test.yml asks for, which this workflow's top level lacks
-    # (statuses: read for its gate).
+    # What pr-test.yml asks for (statuses: read for its gate).
     permissions:
       actions: write
       contents: read

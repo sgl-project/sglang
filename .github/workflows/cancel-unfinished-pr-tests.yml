@@ -145,8 +145,7 @@ jobs:
               continue
             fi
 
-            # Count runs by event type. PR runs are pull_request, or
-            # pull_request_target for pr-test.yml and pr-test-extra.yml.
+            # pr-test.yml and pr-test-extra.yml runs are pull_request_target.
             is_pr='def is_pr: .event == "pull_request" or .event == "pull_request_target";'
             total_runs=$(echo "$all_runs" | wc -l)
             pr_runs=$(echo "$all_runs" | jq -s "$is_pr"' [.[] | select(is_pr)] | length')
