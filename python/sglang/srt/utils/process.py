@@ -224,7 +224,8 @@ def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
 
     A scheduler starts from the launcher's CPUs, narrowed to its GPU's NUMA node when
     NUMA binding places it there. The schedulers that start from the same CPUs split
-    them by physical core. Run in the launcher, before any scheduler narrows the
+    them by physical core, leaving out the cores a group with fewer CPUs already holds
+    unless no other core is left. Run in the launcher, before any scheduler narrows the
     visible devices."""
     from sglang.srt.environ import envs
 
@@ -241,10 +242,13 @@ def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
             cpus = numa_utils.numa_bound_cpus(server_args, device_id, launcher_cpus)
         groups.setdefault(frozenset(cpus), []).append(gpu_id)
     plan = {}
-    for cpus, members in groups.items():
-        cores = _cores(cpus)
+    taken = set()
+    for cpus in sorted(groups, key=lambda cpus: (len(cpus), min(groups[cpus]))):
+        members = groups[cpus]
+        cores = _cores(cpus - taken) or _cores(cpus)
         for rank, gpu_id in enumerate(members):
             plan[gpu_id] = _share(cores, rank, len(members))
+            taken.update(plan[gpu_id])
     return plan
 
 
@@ -261,7 +265,7 @@ def gpu_proc_affinity_env(plan: dict[int, list[int]], gpu_id: int):
         yield
 
 
-def set_gpu_proc_affinity(gpu_id: int):
+def set_gpu_proc_affinity(gpu_id: int, server_args=None):
     from sglang.srt.environ import envs
 
     # current process
@@ -273,14 +277,30 @@ def set_gpu_proc_affinity(gpu_id: int):
         bind_cpu_ids = [int(c) for c in planned.split(",")]
     else:
         # A launcher without a plan (e.g. Ray): split the CPUs this process may use (a
-        # container's CPU slice may hold only part of the host) among the node's ranks.
+        # container's CPU slice may hold only part of the host) among the node's ranks,
+        # within the NUMA node the binding after this one moves it to.
+        cpus = set(p.cpu_affinity())
+        if server_args is not None:
+            from sglang.srt.utils import numa_utils
+
+            cpus = numa_utils.numa_bound_cpus(server_args, gpu_id, cpus)
         parallel = get_parallel()
         nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
         tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
-        bind_cpu_ids = _share(_cores(p.cpu_affinity()), gpu_id, tp_size_per_node)
+        bind_cpu_ids = _share(_cores(cpus), gpu_id, tp_size_per_node)
 
     # set cpu_affinity to current process
-    p.cpu_affinity(bind_cpu_ids)
+    try:
+        p.cpu_affinity(bind_cpu_ids)
+    except (psutil.AccessDenied, PermissionError) as e:
+        # as for a NUMA bind the container denies
+        if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
+            raise
+        logger.warning(
+            f"Process {pid} gpu_id {gpu_id} may not set its CPU affinity ({e}); "
+            f"keeping CPUs {p.cpu_affinity()}"
+        )
+        return
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
 
 

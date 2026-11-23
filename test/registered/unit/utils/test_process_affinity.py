@@ -17,13 +17,16 @@ class _FakeProcess:
     """psutil.Process stand-in with sched_setaffinity's semantics: a mask is clipped to
     the cpuset, and one with no CPU inside it is rejected."""
 
-    def __init__(self, allowed):
+    def __init__(self, allowed, denied=False):
         self.allowed = list(allowed)
         self.bound = list(allowed)
+        self.denied = denied
 
     def cpu_affinity(self, cpus=None):
         if cpus is None:
             return list(self.bound)
+        if self.denied:
+            raise process.psutil.AccessDenied()
         inside = sorted(c for c in cpus if c in self.allowed)
         if not inside:
             raise ValueError(f"CPU number {max(cpus)} is not eligible")
@@ -40,25 +43,32 @@ def _adjacent_siblings(cpu):
     return f"{cpu - cpu % 2}-{cpu - cpu % 2 + 1}"
 
 
-def _bind(gpu_id, *, allowed, siblings, tp_size=8, plan=None):
-    """set_gpu_proc_affinity in a scheduler spawned with ``plan`` (none: no plan)."""
-    proc = _FakeProcess(allowed)
-    parallel = SimpleNamespace(nnodes=1, pp_size=1, tp_size=tp_size)
-    with (
-        mock.patch.object(process.psutil, "Process", return_value=proc),
-        mock.patch.object(process, "get_parallel", return_value=parallel),
-        mock.patch.object(process, "_thread_siblings", side_effect=siblings),
-        process.gpu_proc_affinity_env(plan or {}, gpu_id),
-    ):
-        process.set_gpu_proc_affinity(gpu_id)
-    return proc.bound
-
-
 # A two-socket host: 128 cores, core c's threads c and c + 128.
 _NODE_CPUS = {
     0: set(range(64)) | set(range(128, 192)),
     1: set(range(64, 128)) | set(range(192, 256)),
 }
+
+
+def _bind(
+    gpu_id, *, allowed, siblings, tp_size=8, plan=None, numa_node=None, denied=False
+):
+    """set_gpu_proc_affinity in a scheduler spawned with ``plan`` (none: no plan), its
+    GPU on ``numa_node`` of the two-socket host below."""
+    proc = _FakeProcess(allowed, denied)
+    parallel = SimpleNamespace(nnodes=1, pp_size=1, tp_size=tp_size)
+    with (
+        mock.patch.object(process.psutil, "Process", return_value=proc),
+        mock.patch.object(process, "get_parallel", return_value=parallel),
+        mock.patch.object(process, "_thread_siblings", side_effect=siblings),
+        mock.patch.object(
+            numa_utils, "get_numa_node_if_available", return_value=numa_node
+        ),
+        mock.patch.object(numa_utils, "_node_cpus", side_effect=_NODE_CPUS.get),
+        process.gpu_proc_affinity_env(plan or {}, gpu_id),
+    ):
+        process.set_gpu_proc_affinity(gpu_id, SimpleNamespace())
+    return proc.bound
 
 
 def _plan(gpu_ids, *, launcher, gpu_nodes, reindex=None):
@@ -121,6 +131,13 @@ class TestPlanGpuProcAffinity(CustomTestCase):
             self.assertEqual(len(plan[gpu]), 64)
             self.assertTrue(set(plan[gpu]) <= _NODE_CPUS[node])
         self.assertTrue(_disjoint(plan.values()))
+
+    def test_a_gpu_without_a_node_takes_the_cores_left(self):
+        """TP2 with GPU 0 on node 0 and GPU 1 on no node: GPU 1 starts from every CPU
+        but takes node 1's cores, which GPU 0 does not hold."""
+        plan = _plan([0, 1], launcher=range(256), gpu_nodes=[0, None])
+        self.assertEqual(set(plan[0]), _NODE_CPUS[0])
+        self.assertEqual(set(plan[1]), _NODE_CPUS[1])
 
     def test_splits_the_launchers_cpus_without_numa_nodes(self):
         """A container granted CPUs 0-95 and no NUMA node: eight disjoint 12-CPU slices."""
@@ -189,6 +206,36 @@ class TestSetGpuProcAffinity(CustomTestCase):
         for s in slices:
             self.assertEqual(len(s), 16)
         self.assertEqual(sorted(set().union(*map(set, slices))), allowed)
+
+    def test_splits_within_the_numa_node_the_rank_is_bound_to_next(self):
+        """Without a plan (Ray), GPU 0 on node 1 slices node 1's CPUs, so the NUMA bind
+        that follows has CPUs to keep."""
+        bound = _bind(0, allowed=range(256), siblings=_split_siblings(128), numa_node=1)
+        self.assertTrue(bound and set(bound) <= _NODE_CPUS[1])
+
+    def test_keeps_the_mask_when_the_cpu_bind_is_denied(self):
+        allowed = list(range(256))
+        bound = _bind(
+            1,
+            allowed=allowed,
+            siblings=_split_siblings(128),
+            plan={1: [16, 17]},
+            denied=True,
+        )
+        self.assertEqual(bound, allowed)
+
+    def test_a_denied_cpu_bind_raises_in_strict_mode(self):
+        with (
+            envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.override(True),
+            self.assertRaises(process.psutil.AccessDenied),
+        ):
+            _bind(
+                1,
+                allowed=range(256),
+                siblings=_split_siblings(128),
+                plan={1: [16, 17]},
+                denied=True,
+            )
 
     def test_groups_adjacent_smt_siblings_by_the_kernel_topology(self):
         """An 8-core host numbering core k's threads 2k and 2k + 1, TP2 with CPUs 0-3, 12
