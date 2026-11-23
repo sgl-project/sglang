@@ -290,6 +290,11 @@ jobs:
             node_size: 2
             test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
             test_type: 'accuracy'
+          # deepseek_v4_pro performance tests
+          - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_20ms
+            node_size: 2
+            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
+            test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4

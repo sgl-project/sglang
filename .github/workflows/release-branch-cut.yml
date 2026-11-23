@@ -205,11 +205,35 @@ jobs:
       run_all_tests: true
     secrets: inherit
 
+  run-pr-tests-arm64:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-arm64.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-musa:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-musa.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
+  run-pr-tests-ppu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      run_all_tests: true
+    secrets: inherit
+
   run-nightly-tests-nvidia:
     needs: cut-release-branch
     uses: ./.github/workflows/nightly-test-nvidia.yml
     with:
-      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit
 
   run-nightly-tests-amd:
@@ -239,4 +263,25 @@ jobs:
     uses: ./.github/workflows/nightly-test-intel-wheel.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-nightly-tests-musa:
+    needs: cut-release-branch
+    uses: ./.github/workflows/nightly-test-musa.yml
+    with:
+      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-weekly-tests-nvidia:
+    needs: cut-release-branch
+    uses: ./.github/workflows/weekly-test-nvidia.yml
+    with:
+      git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+    secrets: inherit
+
+  run-weekly-tests-cpu:
+    needs: cut-release-branch
+    uses: ./.github/workflows/weekly-test-cpu.yml
+    with:
+      git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit

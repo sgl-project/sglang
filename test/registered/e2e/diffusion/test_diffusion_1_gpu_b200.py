@@ -5,7 +5,7 @@ from sglang.test.ci.diffusion_suite_bridge import run_diffusion_suite
 register_cuda_ci(
     est_time=14400,
     stage="base-b-diffusion",
-    runner_config="1-gpu-b200",
+    runner_config="4-gpu-b200",
 )
 
 
