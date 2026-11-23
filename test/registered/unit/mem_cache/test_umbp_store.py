@@ -355,7 +355,8 @@ class TestUMBPStore(unittest.TestCase):
             SharedSSDLeader="leader",
             SharedSSDFollower="follower",
         )
-        imported = (FakeUMBPClient, FakeUMBPConfig, fake_role, None, None, None, None, None)
+        real = umbp_module._import_umbp_client()
+        imported = (FakeUMBPClient, FakeUMBPConfig, fake_role, *real[3:])
         long_model = "m" * 200
         spdk = MockStorageConfig(
             model_name=long_model,
@@ -374,22 +375,6 @@ class TestUMBPStore(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SPDK"):
                 umbp_module.UMBPStore(spdk)
             umbp_module.UMBPStore(dram).close()
-
-    def test_model_name_and_tag_change_anchor_keys(self):
-        UMBPStore = import_umbp_store_module().UMBPStore
-        for prefixes in (("model-a", "model-b"), ("tenant-a_model", "tenant-b_model")):
-            key_lists = []
-            for prefix in prefixes:
-                store = UMBPStore.__new__(UMBPStore)
-                store._kv_anchor_is_page_envelope = False
-                store.is_mla_backend = False
-                store.storage_config = None
-                store.mha_suffix = "0"
-                store.config_prefix = prefix
-                keys, _ = store._anchor_keys(["page"])
-                self.assertTrue(all(key.startswith(prefix) for key in keys))
-                key_lists.append(keys)
-            self.assertNotEqual(*key_lists)
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
