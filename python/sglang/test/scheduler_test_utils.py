@@ -34,6 +34,8 @@ class FakeReq(SimpleNamespace):
     # Req's exit_ledger fields.
     exit_via = None
     send_via = None
+    # Saved and restored around the send by `stream_then_release`.
+    finished_len = None
 
 
 def idle_penalty_status_pool() -> PenaltyStatusPool:
