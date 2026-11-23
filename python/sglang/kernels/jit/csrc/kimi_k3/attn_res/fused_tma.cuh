@@ -292,9 +292,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             const auto row = base_row + r;
             const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
                                              : params.bank + token * params.stride_bm + row * kDim;
-            // Only prefix_sum is written by the immediately-preceding kernel;
-            // one wait before the first token's prefix load covers the rest.
-            if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
+            // The immediately-preceding kernel may write the bank too (a PP stage's entry copies the inherited rows
+            // into it), so wait before this CTA's first load of anything; one wait covers the later tokens.
+            if (token == blockIdx.x && row == 0) PDLWaitPrimary<true>();
             ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
