@@ -248,6 +248,13 @@ def main():
         initialize_model_parallel()
 
         shape_configs = get_model_config(args.model, args.tp_size, args.ep_size)
+        # Both providers run the default gated SiLU MoE, with w2 sized for it.
+        if not shape_configs["is_gated"]:
+            raise ValueError(
+                f"{args.model} has a non-gated "
+                f"{shape_configs['activation']} MoE; this benchmark only "
+                "supports gated SiLU MoE models."
+            )
         benchmark.run(
             show_plots=True,
             print_data=True,
