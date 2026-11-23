@@ -20,7 +20,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.sampling.sampling_pipeline import detect_nan_logits
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
@@ -466,7 +465,6 @@ class NGRAMWorker(BaseSpecWorker):
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
-            detect_nan_logits(logits_output.next_token_logits, "verify")
 
             verify_input: NgramVerifyInput = batch.spec_info
             host_tree = None

@@ -23,7 +23,8 @@ per-request state, so each commits the sampled tokens or the verify's
 and the grammar mask.
 
 Each entry probes the model's logits for NaN before the stages
-(`detect_nan_logits`). The sanitize, which heals NaN and inf only under
+(`detect_nan_logits`): decode in `SamplingPipeline.sample`, verify in
+`VerifyStep.bind_target`. The sanitize, which heals NaN and inf only under
 SGLANG_SANITIZE_NAN_LOGITS, ends the stages on every path; a verify's route turns
 off the fast paths that skip the stages in that mode.
 """
@@ -360,14 +361,15 @@ class VerifyStep(msgspec.Struct):
         tree: Optional[HostVerifyTree],
         barrier: Optional[Callable[[], Dict[Req, List[int]]]],
     ) -> None:
-        """Each verify worker's one call after the target verify launches, so
-        the host work overlaps the forward: build the grammar mask and the
-        custom logit processors' row prefixes over `tree`, the verify tree's
-        host copy, which the worker builds when `needs_verify_tree`.
-        `logits_output` gives the grammar mask its device. Under overlap the
-        previous step's result is still queued; `barrier` advances the grammar
-        FSM over its tokens and returns them per request, as result processing
-        will append them to req.output_ids."""
+        """Each verify worker's one call after the target verify launches:
+        probe the target's logits for NaN, then, so the host work overlaps the
+        forward, build the grammar mask and the custom logit processors' row
+        prefixes over `tree`, the verify tree's host copy, which the worker
+        builds when `needs_verify_tree`. Under overlap the previous step's
+        result is still queued; `barrier` advances the grammar FSM over its
+        tokens and returns them per request, as result processing will append
+        them to req.output_ids."""
+        detect_nan_logits(logits_output.next_token_logits, "verify")
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.

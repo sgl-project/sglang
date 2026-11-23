@@ -143,7 +143,11 @@ def _bound_verify(batch, layout, barrier=None):
         watermark=None,
         watermark_full_mask=True,
     )
-    verify.bind_target(None, tree=_host_tree(layout, 2), barrier=barrier)
+    verify.bind_target(
+        SimpleNamespace(next_token_logits=None),
+        tree=_host_tree(layout, 2),
+        barrier=barrier,
+    )
     return verify
 
 

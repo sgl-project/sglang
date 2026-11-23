@@ -25,7 +25,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, detect_nan_logits
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -1198,7 +1198,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
-        detect_nan_logits(logits_output.next_token_logits, "verify")
         can_run_cuda_graph = target_verify.can_run_cuda_graph
         verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
         target_logits = logits_output.next_token_logits

@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
-from sglang.srt.sampling.sampling_pipeline import detect_nan_logits
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -870,7 +869,6 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
-    detect_nan_logits(logits_output.next_token_logits, "verify")
 
     verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
     kvcache = token_to_kv_pool_allocator.get_kvcache()

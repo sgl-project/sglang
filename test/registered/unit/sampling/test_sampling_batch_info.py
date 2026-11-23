@@ -23,6 +23,7 @@ from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
+    VerifyStep,
     _adjust_after_watermark,
     _adjust_before_watermark,
     adjust_verify_logits,
@@ -315,6 +316,17 @@ class TestNanLogits(CustomTestCase):
                 detect_nan_logits(self._logits(), "verify")
             with self.assertRaises(RuntimeError):
                 self._verify(self._logits())
+            # Every verify worker probes through bind_target, with or without a
+            # host tree.
+            verify = VerifyStep(
+                batch=None, route=None, watermark=None, watermark_full_mask=True
+            )
+            with self.assertRaises(RuntimeError):
+                verify.bind_target(
+                    SimpleNamespace(next_token_logits=self._logits()),
+                    tree=None,
+                    barrier=None,
+                )
             detect_nan_logits(torch.zeros(1, VOCAB_SIZE), "verify")
 
 
