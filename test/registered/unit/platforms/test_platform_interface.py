@@ -5,6 +5,7 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+from typing import get_args
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -459,18 +460,24 @@ class TestLegacyKvPoolHookDeprecation(CustomTestCase):
         mock_warning.assert_not_called()
 
     def test_kinds_without_a_legacy_hook_stay_none(self):
+        """Kinds added after the legacy hooks have no hook to look up; a
+        legacy-only platform must get the in-tree default, not a KeyError."""
+
         class LegacyPlatform(SRTPlatform):
             def get_mha_kv_pool_cls(self):
                 return type("VendorMHAPool", (), {})
 
         platform = LegacyPlatform()
-        self.assertIsNone(platform.get_kv_pool_cls(kind="mla"))
-        self.assertIsNone(platform.get_kv_pool_cls(kind="dsa"))
+        for kind in get_args(interface.KVPoolKind):
+            if kind != "mha":
+                with self.subTest(kind=kind):
+                    self.assertIsNone(platform.get_kv_pool_cls(kind=kind))
 
     def test_platform_on_neither_api_gets_the_in_tree_pool(self):
         base = SRTPlatform()
-        for kind in ("mha", "mla", "dsa"):
-            self.assertIsNone(base.get_kv_pool_cls(kind=kind))
+        for kind in get_args(interface.KVPoolKind):
+            with self.subTest(kind=kind):
+                self.assertIsNone(base.get_kv_pool_cls(kind=kind))
 
 
 class TestMpsDeviceMixin(CustomTestCase):

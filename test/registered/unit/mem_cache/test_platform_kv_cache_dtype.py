@@ -1,6 +1,7 @@
-"""KV cache dtypes that out-of-tree platform plugins register."""
+"""KV pools and KV cache dtypes that out-of-tree platform plugins supply."""
 
 import argparse
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,10 +11,12 @@ import torch
 from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import platform_kv_cache_dtype
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
+    MHATokenToKVPoolMXFP8,
     MLATokenToKVPool,
 )
 from sglang.srt.server_args import ServerArgs
@@ -189,32 +192,10 @@ class TestPlatformKVCacheDtype(CustomTestCase):
         configurator.layer_info = SimpleNamespace(
             full_attention_layer_ids=[0], swa_attention_layer_ids=[1]
         )
-        with (
-            patch.object(kcc, "current_platform", platform),
-            patch.object(
-                kcc,
-                "get_memory",
-                return_value=SimpleNamespace(
-                    enable_page_major_kv_layout=False, enable_unified_memory=False
-                ),
-            ),
-            patch.object(
-                kcc,
-                "get_exec",
-                return_value=SimpleNamespace(
-                    kernel=SimpleNamespace(
-                        attention_backend=attention_backend, enable_fp4_indexer=False
-                    ),
-                    features=SimpleNamespace(enable_memory_saver=False),
-                ),
-            ),
-            patch.object(
-                kcc, "get_schedule", return_value=SimpleNamespace(page_size=1)
-            ),
-            patch.object(kcc, "is_minimax_sparse", return_value=False),
-            patch.object(kcc, "is_unlimited_ocr_v2", return_value=is_unlimited_ocr_v2),
-            patch.object(kcc, "get_dsa_index_head_dim", return_value=8),
-            patch.object(kcc, "calculate_mla_kv_cache_dim", return_value=24),
+        with _dispatch_env(
+            platform,
+            attention_backend=attention_backend,
+            is_unlimited_ocr_v2=is_unlimited_ocr_v2,
         ):
             configurator._build_token_to_kv_pool(
                 sizes=SimpleNamespace(
@@ -239,12 +220,196 @@ class TestPlatformKVCacheDtype(CustomTestCase):
         )
 
 
+class TestPlatformKVPoolKinds(CustomTestCase):
+    """Pool families whose in-tree class assumes CUDA come from the platform."""
+
+    def test_mxfp8_builds_the_platform_mxfp8_pool(self):
+        """mxfp8 builds the platform's mha_mxfp8 pool, never its mha pool; without
+        one, construction (not resolution) refuses, and in tree mxfp8 keeps the
+        block-scaled pool even under page-major layout."""
+        built = []
+        mxfp8_pool = _sub_pool_recorder(MHATokenToKVPool, "mha_mxfp8", built)
+        platform = _platform(mha=_PlatformMHAPool, mha_mxfp8=mxfp8_pool)
+        with self.assertRaises(_Built):
+            _build_mha_swa_pool(platform, kv_cache_dtype_str="mxfp8")
+        self.assertEqual(built, [("mha_mxfp8", "Full"), ("mha_mxfp8", "SWA")])
+
+        with self.assertRaisesRegex(ValueError, "pool of kind 'mha_mxfp8'"):
+            _build_mha_swa_pool(
+                _platform(mha=_PlatformMHAPool), kv_cache_dtype_str="mxfp8"
+            )
+
+        in_tree = _platform()
+        in_tree.is_out_of_tree.return_value = False
+        configurator = _configurator(kv_cache_dtype_str="mxfp8")
+        with patch.object(kcc, "current_platform", in_tree):
+            self.assertIs(
+                configurator._resolve_mha_pool_class(enable_page_major=True),
+                MHATokenToKVPoolMXFP8,
+            )
+
+    def test_swa_sub_pool_takes_mha_swa_else_the_platform_mha_pool(self):
+        """mha_swa replaces only the sliding-window sub-pool; without it that
+        sub-pool falls back to the platform's mha pool, not the in-tree one."""
+        built = []
+        mha_pool = _sub_pool_recorder(MHATokenToKVPool, "mha", built)
+        mha_swa_pool = _sub_pool_recorder(MHATokenToKVPool, "mha_swa", built)
+        for platform, expected in (
+            (
+                _platform(mha=mha_pool, mha_swa=mha_swa_pool),
+                [("mha", "Full"), ("mha_swa", "SWA")],
+            ),
+            (_platform(mha=mha_pool), [("mha", "Full"), ("mha", "SWA")]),
+        ):
+            built.clear()
+            with self.subTest(expected=expected):
+                with self.assertRaises(_Built):
+                    _build_mha_swa_pool(platform, kv_cache_dtype_str="auto")
+                self.assertEqual(built, expected)
+
+    def test_dsv4_pool_comes_from_the_platform(self):
+        """Without a platform dsv4 pool the refusal precedes the page-size and
+        layout checks, which assume CUDA; with one, that class is built."""
+        layout = MagicMock(side_effect=AssertionError("layout probed"))
+        with self.assertRaisesRegex(
+            NotImplementedError, r"get_kv_pool_cls\(kind='dsv4'\)"
+        ):
+            _build_dsv4_pool(_platform(), page_size=1, select_layout=layout)
+        layout.assert_not_called()
+
+        built = []
+        dsv4_pool = _recording_pool(DeepSeekV4TokenToKVPool, "dsv4", built, stop=True)
+        with self.assertRaises(_Built):
+            _build_dsv4_pool(
+                _platform(dsv4=dsv4_pool),
+                page_size=256,
+                select_layout=MagicMock(return_value=(None, None)),
+            )
+        self.assertEqual(built, ["dsv4"])
+
+
 def _configurator(*, kv_cache_dtype_str):
     configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
     configurator.is_draft_worker = False
     configurator.kv_cache_dtype = torch.uint8
     configurator.kv_cache_dtype_str = kv_cache_dtype_str
     return configurator
+
+
+@contextlib.contextmanager
+def _dispatch_env(
+    platform, *, page_size=1, attention_backend="triton", is_unlimited_ocr_v2=False
+):
+    """Patch the runtime context the pool dispatch reads, with nothing allocated."""
+    with (
+        patch.object(kcc, "current_platform", platform),
+        patch.object(
+            kcc,
+            "get_memory",
+            return_value=SimpleNamespace(
+                enable_page_major_kv_layout=False,
+                enable_unified_memory=False,
+                enable_hisparse=False,
+            ),
+        ),
+        patch.object(
+            kcc,
+            "get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(
+                    attention_backend=attention_backend, enable_fp4_indexer=False
+                ),
+                features=SimpleNamespace(enable_memory_saver=False),
+            ),
+        ),
+        patch.object(
+            kcc, "get_schedule", return_value=SimpleNamespace(page_size=page_size)
+        ),
+        patch.object(
+            kcc, "get_spec", return_value=SimpleNamespace(speculative_algorithm=None)
+        ),
+        patch.object(
+            kcc,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=1, attn_dcp_size=1),
+        ),
+        patch.object(kcc, "is_minimax_sparse", return_value=False),
+        patch.object(kcc, "is_unlimited_ocr_v2", return_value=is_unlimited_ocr_v2),
+        patch.object(kcc, "get_dsa_index_head_dim", return_value=8),
+        patch.object(kcc, "calculate_mla_kv_cache_dim", return_value=24),
+    ):
+        yield
+
+
+def _build_mha_swa_pool(platform, *, kv_cache_dtype_str):
+    """Run the real pool dispatch for an MHA model with sliding-window layers."""
+    configurator = _configurator(kv_cache_dtype_str=kv_cache_dtype_str)
+    configurator.use_mla_backend = False
+    configurator.is_hybrid_swa = True
+    configurator.is_hybrid_swa_compress = False
+    configurator.draft_swa_full_capacity = False
+    configurator.post_capture_kv_active = False
+    configurator.mambaish_config = None
+    configurator.device = "cpu"
+    configurator.model_config = SimpleNamespace(
+        hf_config=None, head_dim=8, get_num_kv_heads=lambda *_: 2
+    )
+    configurator.layer_info = SimpleNamespace(
+        full_attention_layer_ids=[0], swa_attention_layer_ids=[1]
+    )
+    with _dispatch_env(platform):
+        configurator._build_token_to_kv_pool(
+            sizes=SimpleNamespace(
+                max_total_num_tokens=8,
+                full_max_total_num_tokens=8,
+                swa_max_total_num_tokens=8,
+            ),
+            is_dsa_model=False,
+            is_compressed_kv_model=False,
+            req_to_token_pool=None,
+        )
+
+
+def _build_dsv4_pool(platform, *, page_size, select_layout):
+    """Run the real pool dispatch for a DeepSeek-V4 (compressed-KV) model."""
+    configurator = _configurator(kv_cache_dtype_str="auto")
+    configurator.use_mla_backend = False
+    configurator.spec_algorithm = None
+    configurator.device = "cpu"
+    configurator.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(kv_source_layer_ids=[]),
+        mla_layer_ids=(),
+        compress_ratios=[4],
+        window_size=128,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        index_head_dim=8,
+    )
+    configurator.layer_info = SimpleNamespace(
+        num_effective_layers=1, start_layer=0, end_layer=1
+    )
+    with (
+        _dispatch_env(platform, page_size=page_size),
+        patch.object(kcc, "select_dsv4_kv_layout", select_layout),
+        patch.object(kcc, "unified_fp8_for_dsv4_pool", return_value=False),
+        patch.object(kcc, "max_speculative_num_draft_tokens", return_value=None),
+    ):
+        configurator._build_token_to_kv_pool(
+            sizes=SimpleNamespace(
+                max_running_requests=2,
+                full_max_total_num_tokens=8,
+                swa_max_total_num_tokens=8,
+                c4_max_total_num_tokens=8,
+                c128_max_total_num_tokens=8,
+                c4_state_pool_size=8,
+                c128_state_pool_size=8,
+                c4_state_dtype=None,
+                c128_state_dtype=None,
+            ),
+            is_dsa_model=False,
+            is_compressed_kv_model=True,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(3, 1)),
+        )
 
 
 def _platform(**pool_classes):
@@ -263,6 +428,19 @@ def _recording_pool(base, kind, built, *, stop=False):
                 raise _Built
 
     return RecordingPool
+
+
+def _sub_pool_recorder(base, kind, built):
+    """A platform pool class that records which SWA sub-pool it was built as and
+    stops the composite after its last, sliding-window, sub-pool."""
+
+    class SubPool(base):
+        def __init__(self, **kwargs):
+            built.append((kind, kwargs["allocation_label"]))
+            if kwargs["allocation_label"] == "SWA":
+                raise _Built
+
+    return SubPool
 
 
 if __name__ == "__main__":

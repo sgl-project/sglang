@@ -106,7 +106,11 @@ from sglang.srt.mem_cache.platform_kv_cache_dtype import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
-from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
+from sglang.srt.platforms.interface import (
+    KVPoolKind,
+    reject_out_of_tree_path,
+    require_out_of_tree_impl,
+)
 from sglang.srt.runtime_context import (
     attention_backends,
     get_context,
@@ -177,6 +181,9 @@ _KV_POOL_BASE_FOR_KIND: dict[str, type] = {
     "mha": MHATokenToKVPool,
     "mla": MLATokenToKVPool,
     "dsa": DSATokenToKVPool,
+    "mha_mxfp8": MHATokenToKVPool,
+    "mha_swa": MHATokenToKVPool,
+    "dsv4": DeepSeekV4TokenToKVPool,
 }
 
 
@@ -1853,11 +1860,8 @@ class KVCacheConfigurator:
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
         enable_page_major = self._page_major_enabled()
-        mha_pool_class = self._resolve_kv_pool_class(
-            kind="mha",
-            default=(
-                PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
-            ),
+        mha_pool_class = self._resolve_mha_pool_class(
+            enable_page_major=enable_page_major
         )
         mla_pool_class = self._resolve_kv_pool_class(
             kind="mla", default=MLATokenToKVPool
@@ -1865,18 +1869,17 @@ class KVCacheConfigurator:
         dsa_pool_class = self._resolve_kv_pool_class(
             kind="dsa", default=DSATokenToKVPool
         )
-        if (
-            is_float4_e2m1fn_x2(self.kv_cache_dtype)
-            or self.kv_cache_dtype_str == "mxfp8"
-        ):
+        # Out of tree, mxfp8 is served only through the mha_mxfp8 and dsv4 kinds.
+        mxfp8_without_seam = self.kv_cache_dtype_str == "mxfp8" and (
+            (self.use_mla_backend and not is_compressed_kv_model)
+            or is_unlimited_ocr_v2(self.model_config.hf_config)
+        )
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype) or mxfp8_without_seam:
             reject_out_of_tree_path(
                 current_platform, subsystem="the block-scaled (fp4 / mxfp8) KV pool"
             )
 
         if is_compressed_kv_model:
-            reject_out_of_tree_path(
-                current_platform, subsystem="the DeepSeek-V4 KV pool"
-            )
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -2152,6 +2155,7 @@ class KVCacheConfigurator:
         c128_state_dtype: Optional[torch.dtype],
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
+        pool_cls = self._dsv4_pool_class()
         swa_page_size = get_schedule().page_size
         if not _is_npu:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
@@ -2169,16 +2173,7 @@ class KVCacheConfigurator:
             compression_ratios = self.model_config.compress_ratios
             kv_source_layers = list(self.model_config.hf_config.kv_source_layer_ids)
 
-        # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
-        # follows the same fixed ring ownership as GPU. Do not replace the
-        # configurator's C4-SWA/C128-request budgets with a paged allocator
-        # estimate: arch22 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
-                DSV4NPUTokenToKVPool,
-            )
-
-            pool_cls = DSV4NPUTokenToKVPool
             kv_layout_kwargs = {}
             if self.is_draft_worker:
                 # Draft rows are read by the V4 sparse-attention op, so pin the
@@ -2186,17 +2181,11 @@ class KVCacheConfigurator:
                 # having been emptied to ``[0] * layers`` above.
                 kv_layout_kwargs = {"npu_window_generation": "v4"}
         else:
-            pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
             if self.model_config.mla_layer_ids:
-                from sglang.srt.mem_cache.ernie55_memory_pool import (
-                    Ernie5_5TokenToKVPool,
-                )
-
-                pool_cls = Ernie5_5TokenToKVPool
                 kv_layout_kwargs.update(
                     pool_cls.stage_kwargs(
                         self.model_config.hf_config,
@@ -2257,6 +2246,35 @@ class KVCacheConfigurator:
             req_to_token_pool.register_on_alloc_rows(reset_request_rows)
         return token_to_kv_pool
 
+    def _dsv4_pool_class(self) -> type:
+        if self.model_config.mla_layer_ids:
+            reject_out_of_tree_path(current_platform, subsystem="the Ernie-5.5 KV pool")
+        pool_cls = self._platform_kv_pool_class(kind="dsv4")
+        if pool_cls is not None:
+            return pool_cls
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_kv_pool_cls(kind='dsv4')",
+            subsystem="DeepSeek-V4 KV pool",
+        )
+        if _is_npu:
+            # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
+            # follows the same fixed ring ownership as GPU. Do not replace the
+            # configurator's C4-SWA/C128-request budgets with a paged allocator
+            # estimate: arch22 cache_mode=2 consumes explicit flat state_locs.
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                DSV4NPUTokenToKVPool,
+            )
+
+            return DSV4NPUTokenToKVPool
+        if self.model_config.mla_layer_ids:
+            from sglang.srt.mem_cache.ernie55_memory_pool import (
+                Ernie5_5TokenToKVPool,
+            )
+
+            return Ernie5_5TokenToKVPool
+        return DeepSeekV4TokenToKVPool
+
     def _page_major_enabled(self) -> bool:
         enable_page_major = get_memory().enable_page_major_kv_layout
         if self.is_draft_worker and get_memory().enable_unified_memory:
@@ -2265,22 +2283,10 @@ class KVCacheConfigurator:
             enable_page_major = False
         return enable_page_major
 
-    def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
+    def _platform_kv_pool_class(self, *, kind: KVPoolKind) -> Optional[type]:
         pool_cls = current_platform.get_kv_pool_cls(kind=kind)
         if pool_cls is None:
-            if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is None:
-                return default
-            # No in-tree pool stores a registered dtype; refuse only when a builder
-            # constructs this kind, so kinds a layout never builds are unaffected.
-            return _platform_kv_pool_required(
-                base=default,
-                message=(
-                    f"--kv-cache-dtype {self.kv_cache_dtype_str} needs a platform KV "
-                    f"pool of kind {kind!r} for this model, but "
-                    f"{type(current_platform).__name__}.get_kv_pool_cls(kind={kind!r}) "
-                    "returns None. Choose another --kv-cache-dtype."
-                ),
-            )
+            return None
         base = _KV_POOL_BASE_FOR_KIND[kind]
         if not (isinstance(pool_cls, type) and issubclass(pool_cls, base)):
             raise TypeError(
@@ -2288,6 +2294,38 @@ class KVCacheConfigurator:
                 f"returned {pool_cls!r}; expected a subclass of {base.__name__}"
             )
         return pool_cls
+
+    def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
+        pool_cls = self._platform_kv_pool_class(kind=kind)
+        if pool_cls is not None:
+            return pool_cls
+        if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is None:
+            return default
+        # No in-tree pool stores a registered dtype; refuse only when a builder
+        # constructs this kind, so kinds a layout never builds are unaffected.
+        return _platform_kv_pool_required(
+            base=default, kind=kind, kv_cache_dtype=self.kv_cache_dtype_str
+        )
+
+    def _resolve_mha_pool_class(self, *, enable_page_major: bool) -> type:
+        if self.kv_cache_dtype_str != "mxfp8":
+            return self._resolve_kv_pool_class(
+                kind="mha",
+                default=(
+                    PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
+                ),
+            )
+        pool_cls = self._platform_kv_pool_class(kind="mha_mxfp8")
+        if pool_cls is not None:
+            return pool_cls
+        if not current_platform.is_out_of_tree():
+            return MHATokenToKVPoolMXFP8
+        # Lazy, like a registered dtype: DeepSeek-V4 layouts build no MHA pool.
+        return _platform_kv_pool_required(
+            base=MHATokenToKVPoolMXFP8,
+            kind="mha_mxfp8",
+            kv_cache_dtype=self.kv_cache_dtype_str,
+        )
 
     def _reject_registered_kv_cache_dtype(self, *, pool: str) -> None:
         if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is not None:
@@ -2704,11 +2742,6 @@ class KVCacheConfigurator:
                 "swa_v_head_dim": self.model_config.swa_v_head_dim,
                 "v_head_dim": self.model_config.v_head_dim,
             }
-        swa_pool_class = (
-            MHATokenToKVPoolMXFP8
-            if self.kv_cache_dtype_str == "mxfp8"
-            else mha_pool_class
-        )
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
@@ -2731,7 +2764,8 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
-            token_to_kv_pool_class=swa_pool_class,
+            token_to_kv_pool_class=mha_pool_class,
+            swa_kv_pool_class=self._platform_kv_pool_class(kind="mha_swa"),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             **kwargs,
         )
@@ -3042,23 +3076,16 @@ class KVCacheConfigurator:
             return NPUMHATokenToKVPool
         if self.use_mla_backend:
             return mla_pool_class
-        # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
-        # buffers) for the full-attention layers, same as the SWA branch.
-        if self.kv_cache_dtype_str == "mxfp8":
-            return MHATokenToKVPoolMXFP8
         return mha_pool_class
 
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        if self.kv_cache_dtype_str == "mxfp8":
-            pool_cls = MHATokenToKVPoolMXFP8
-        else:
-            pool_cls = (
-                NoOpMHATokenToKVPool
-                if get_schedule().prefill_only_disable_kv_cache
-                else mha_pool_class
-            )
+        pool_cls = (
+            NoOpMHATokenToKVPool
+            if get_schedule().prefill_only_disable_kv_cache
+            else mha_pool_class
+        )
         pool_kwargs = {}
         if quant_method is not None:
             pool_kwargs["quant_method"] = quant_method
@@ -3969,7 +3996,16 @@ def calculate_mla_kv_cache_dim(
     return kv_cache_dim
 
 
-def _platform_kv_pool_required(*, base: type, message: str) -> type:
+def _platform_kv_pool_required(
+    *, base: type, kind: KVPoolKind, kv_cache_dtype: str
+) -> type:
+    message = (
+        f"--kv-cache-dtype {kv_cache_dtype} needs a platform KV pool of kind "
+        f"{kind!r} for this model, but {type(current_platform).__name__}"
+        f".get_kv_pool_cls(kind={kind!r}) returns None. Choose another "
+        "--kv-cache-dtype."
+    )
+
     # Still a subclass of the in-tree default, as the resolver promises a pool
     # class of that kind; constructing it raises before anything is allocated.
     class PlatformKVPoolRequired(base):
