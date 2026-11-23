@@ -64,6 +64,9 @@ def _clover_local_memory_kernel(
     softmax_history_bias_ptr,
     softmax_history_c_ptr,
     output_ptr,
+    decay_ptr,
+    decay_stride_t,
+    decay_stride_h,
     query_stride_t,
     query_stride_h,
     query_stride_k,
@@ -82,6 +85,7 @@ def _clover_local_memory_kernel(
     output_stride_v,
     scale,
     softmax_reference_block_size,
+    PURE_DECAY: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
@@ -191,8 +195,22 @@ def _clover_local_memory_kernel(
         != 0
     ) & request_active
 
-    history = tl.dot(query, clean_state.to(query.dtype))
-    scores = tl.dot(query, key_transposed)
+    if PURE_DECAY:
+        normalized_q = query_f32 * query_norm[:, None]
+        normalized_k = key_f32 * key_norm[None, :]
+        history = tl.dot(
+            normalized_q * scale, clean_state.to(tl.float32), input_precision="ieee"
+        )
+        decay = tl.load(
+            decay_ptr + token_indices * decay_stride_t + value_head * decay_stride_h,
+            mask=token_mask,
+            other=0.0,
+        )
+        history = history * tl.exp(decay)[:, None]
+        scores = tl.dot(normalized_q, normalized_k, input_precision="ieee")
+    else:
+        history = tl.dot(query, clean_state.to(query.dtype))
+        scores = tl.dot(query, key_transposed)
     logit_scale = tl.load(softmax_logit_scale_ptr + value_head).to(tl.float32)
     history_bias = tl.load(softmax_history_bias_ptr + value_head).to(tl.float32)
     history_c = tl.load(softmax_history_c_ptr + value_head).to(tl.float32)
@@ -206,8 +224,12 @@ def _clover_local_memory_kernel(
     denominator = tl.sum(exp_local, axis=1) + exp_history
     local_weights = exp_local / denominator[:, None]
     history_weight = exp_history / denominator
-    local = tl.dot(local_weights.to(values.dtype), values)
-    output = history * (scale * history_weight)[:, None] + local
+    if PURE_DECAY:
+        local = tl.dot(local_weights, values.to(tl.float32), input_precision="ieee")
+        output = history * history_weight[:, None] + local
+    else:
+        local = tl.dot(local_weights.to(values.dtype), values)
+        output = history * (scale * history_weight)[:, None] + local
     output = tl.where(active[:, None], output, 0.0)
 
     output_offsets = (
@@ -242,7 +264,7 @@ def supports_clover_local_memory_triton(
         and value.shape[-1] == 128
         and value.shape[2] % query.shape[2] == 0
         and value.shape[2] % key.shape[2] == 0
-        and torch.cuda.get_device_capability(query.device)[0] in (9, 10)
+        and torch.cuda.get_device_capability(query.device)[0] in (9, 10, 12)
     )
 
 
@@ -260,6 +282,7 @@ def clover_local_memory_triton(
     softmax_history_bias: torch.Tensor | None = None,
     softmax_history_c: torch.Tensor | None = None,
     softmax_reference_block_size: float = 32.0,
+    pure_decay: bool = False,
 ) -> torch.Tensor:
     """Run the non-mutating fixed-block BD-GDN preview kernel.
 
@@ -301,6 +324,15 @@ def clover_local_memory_triton(
         )
     if clean_ssm_states.device != value.device:
         raise ValueError("BD-GDN clean state and preview tensors must share a device")
+    if pure_decay and (
+        g.shape != (1, num_tokens, num_v_heads)
+        or g.device != value.device
+        or g.dtype != torch.float32
+        or clean_ssm_states.dtype != torch.float32
+    ):
+        raise ValueError(
+            "Pure preview requires FP32 [1,T,H] log-decay and FP32 clean state"
+        )
     logit_scale, history_bias = _check_bd_gdn_softmax_scalars(
         softmax_logit_scale, softmax_history_bias, num_v_heads
     )
@@ -331,7 +363,7 @@ def clover_local_memory_triton(
     block_q = block_t
     num_query_tiles = triton.cdiv(block_size, block_q)
     block_k = triton.next_power_of_2(key_dim)
-    block_v = 128
+    block_v = 16 if pure_decay else 128
     grid = (
         triton.cdiv(value_dim, block_v),
         batch_size * num_query_tiles,
@@ -348,6 +380,9 @@ def clover_local_memory_triton(
         history_bias,
         history_c,
         output,
+        g if pure_decay else query,
+        g.stride(1) if pure_decay else 0,
+        g.stride(2) if pure_decay else 0,
         query.stride(1),
         query.stride(2),
         query.stride(3),
@@ -366,6 +401,7 @@ def clover_local_memory_triton(
         output.stride(3),
         float(scale),
         float(softmax_reference_block_size),
+        PURE_DECAY=pure_decay,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
         NUM_V_HEADS=num_v_heads,

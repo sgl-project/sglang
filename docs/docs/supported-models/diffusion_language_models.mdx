@@ -39,7 +39,7 @@ Requests run one at a time. Use synchronous scheduling and non-streaming request
 ```bash
 SGLANG_FLASHINFER_USE_PAGED=1 python3 -m sglang.launch_server \
   --model-path Diffuspace/Clover-35B-A3B-Preview --trust-remote-code \
-  --dllm-algorithm CloverPureBlock --no-dllm-fdfo \
+  --dllm-algorithm CloverPureBlock --no-dllm-fdfo --disable-overlap-schedule \
   --dtype bfloat16 --tp-size 1 --max-running-requests 1 --context-length 2048
 ```
 
@@ -47,6 +47,20 @@ SGLANG_FLASHINFER_USE_PAGED=1 python3 -m sglang.launch_server \
 curl http://127.0.0.1:30000/generate -H 'Content-Type: application/json' \
   -d '{"text":"Explain block diffusion.","sampling_params":{"temperature":0,"max_new_tokens":65}}'
 ```
+
+### Experimental Clover acceleration
+
+To try bounded denoising on one request, set `sampling_params.custom_params` to
+`{"threshold": 0.4, "max_denoise_steps": 3, "refine_uncertain": true}`.
+The step budget (1 through 32) sets a minimum number of positions to fill by each
+round. Refinement can revisit low-confidence positions in two additional passes.
+These settings can change the generated text and when generation stops.
+
+Set `SGLANG_CLOVER_PURE_FUSED_PREVIEW=1` at launch to enable grouped BF16
+preview kernels. Set `SGLANG_CLOVER_PURE_NATIVE_REPLAY=1` to use the native
+causal path for prefill and replay. Both options are off by default. Fused
+arithmetic can change token selection near the confidence threshold.
+For eager execution of the pure kernels, set `SGLANG_CLOVER_PURE_DISABLE_GRAPH=1`.
 
 ## Example Configuration File
 

@@ -166,8 +166,8 @@ def prepare_sampling_params(params, model_config, prompt_len, context_len):
     """Resolve checkpoint generation defaults before the generic sampler normalizes them."""
     defaults = copy(model_config.hf_generation_config)
     for key, value in (params.get("custom_params") or {}).items():
-        if key == "threshold":
-            validate_threshold(value)
+        if key in ("threshold", "max_denoise_steps", "refine_uncertain"):
+            validate_decode_option(key, value, model_config.hf_config.block_size)
             continue
         if not key.startswith("dllm_") or key not in PENALTY_DEFAULTS:
             raise ValueError(f"Unsupported CloverPureBlock custom parameter: {key}")
@@ -193,3 +193,16 @@ def prepare_sampling_params(params, model_config, prompt_len, context_len):
         raise ValueError(
             "Prompt plus full Clover preview blocks exceeds the context limit"
         )
+
+
+def validate_decode_option(key, value, block_size):
+    if key == "refine_uncertain" and type(value) is not bool:
+        raise ValueError("refine_uncertain must be a boolean")
+    if key == "threshold":
+        validate_threshold(value)
+    if (
+        key == "max_denoise_steps"
+        and value is not None
+        and (type(value) is not int or not 1 <= value <= block_size)
+    ):
+        raise ValueError("max_denoise_steps must be within the Clover block width")

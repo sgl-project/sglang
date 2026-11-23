@@ -159,7 +159,7 @@ class DllmConfig:
             block_size = algorithm_config.get("block_size", block_size)
 
         if arch == "CloverMoeModelLM":
-            from sglang.srt.dllm.clover_sampling import validate_threshold
+            from sglang.srt.dllm.clover_sampling import validate_decode_option
 
             if (
                 not isinstance(mask_id, int)
@@ -168,12 +168,16 @@ class DllmConfig:
                 raise ValueError(
                     "CloverPureBlock requires a valid checkpoint mask_token_id"
                 )
-            if block_size != 32 or algorithm_config.keys() - {"threshold"}:
+            if block_size != 32 or algorithm_config.keys() - {
+                "threshold",
+                "max_denoise_steps",
+                "refine_uncertain",
+            }:
                 raise ValueError(
-                    "CloverPureBlock uses width 32 and accepts only threshold"
+                    "CloverPureBlock uses width 32 and accepts threshold and experimental step/revision options"
                 )
-            if "threshold" in algorithm_config:
-                validate_threshold(algorithm_config["threshold"])
+            for key, value in algorithm_config.items():
+                validate_decode_option(key, value, block_size)
         checkpoint_block_size = getattr(model_config.hf_config, "block_size", None)
         if (
             getattr(model_config.hf_config, "expert_capacity", None) is not None

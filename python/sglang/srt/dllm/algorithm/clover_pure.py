@@ -1,5 +1,7 @@
 """Single-request Clover pure block diffusion on the separate-context scheduler."""
 
+import math
+
 from copy import copy
 
 import torch
@@ -13,6 +15,15 @@ from sglang.srt.dllm.clover_sampling import (
     validate_penalties,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+
+
+def scheduled_transfer(confidence, pending, threshold, target):
+    # Count committed positions towards the target without synchronizing the device.
+    scores = confidence.masked_fill(~pending, torch.inf)
+    slots = scores.argsort(descending=True, stable=True)[:target]
+    transfer = confidence > threshold
+    transfer[slots] = True
+    return transfer & pending
 
 
 class CloverPureBlock(DllmAlgorithm):
@@ -120,24 +131,58 @@ class CloverPureBlock(DllmAlgorithm):
             model_runner.model_config.hf_config.denoising_config["threshold"],
         )
         positions = torch.arange(self.block_size, device=block.device)
-        for step in range(self.block_size):
+        budget = options.get("max_denoise_steps")
+        refine = options.get("refine_uncertain", False)
+        uncertain = torch.zeros_like(block[0], dtype=torch.bool) if refine else None
+
+        def forward_logits():
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits = out.logits_output.full_logits.float()
             logits[:, self.mask_id] = -torch.inf
             penalties.apply(logits, block, self.mask_id)
+            return out, logits
+
+        for step in range(budget or self.block_size):
+            out, logits = forward_logits()
             if step == 0:
                 # No page, position, or recurrent slot changes within this block.
                 forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
             pred, confidence = greedy_with_confidence(logits)
             confidence.masked_fill_(block[0] != self.mask_id, -torch.inf)
-            transfer = confidence > threshold
+            if budget is None:
+                transfer = confidence > threshold
+            else:
+                # A small number of anchors first, then increasing parallel commits.
+                # Explicit final target avoids sensitivity to cos(pi/2) rounding.
+                target = (
+                    self.block_size
+                    if step + 1 == budget
+                    else math.ceil(
+                        self.block_size
+                        * (1 - math.cos(math.pi * (step + 1) / (2 * budget)))
+                    )
+                )
+                transfer = scheduled_transfer(
+                    confidence, block[0] == self.mask_id, threshold, target
+                )
             fallback = (positions == confidence.argmax()) & ~transfer.any()
             update = transfer | fallback
+            if refine:
+                uncertain |= update & (confidence <= threshold)
             block[0].copy_(torch.where(update, pred, block[0]))
             if not (block == self.mask_id).any():
                 break
         else:
             raise RuntimeError("Unresolved Clover masks")
+        if refine:
+            for parity in (0, 1):
+                revisit = (positions % 2 == parity) & uncertain
+                if not revisit.any():
+                    continue
+                block[0].masked_fill_(revisit, self.mask_id)
+                out, logits = forward_logits()
+                pred = logits.argmax(-1)
+                block[0].copy_(torch.where(revisit, pred, block[0]))
         limit = min(
             self.block_size, req.sampling_params.max_new_tokens - len(req.output_ids)
         )

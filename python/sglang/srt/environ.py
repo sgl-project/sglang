@@ -1109,6 +1109,9 @@ class Envs:
     # FlashInfer, FlashMLA, and TRT-LLM
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    SGLANG_CLOVER_PURE_FUSED_PREVIEW = EnvBool(False)
+    SGLANG_CLOVER_PURE_NATIVE_REPLAY = EnvBool(False)
+    SGLANG_CLOVER_PURE_DISABLE_GRAPH = EnvBool(False)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)

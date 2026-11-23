@@ -11,6 +11,19 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestCloverPure(unittest.TestCase):
+    def test_experimental_policy_requires_valid_explicit_options(self):
+        from sglang.srt.dllm.clover_sampling import validate_decode_option
+
+        for key, value in (
+            ("max_denoise_steps", 0),
+            ("max_denoise_steps", 33),
+            ("refine_uncertain", "yes"),
+        ):
+            with self.assertRaises(ValueError):
+                validate_decode_option(key, value, 32)
+        validate_decode_option("max_denoise_steps", None, 32)
+        validate_decode_option("max_denoise_steps", 3, 32)
+
     def test_default_budget_and_checkpoint_stop_fallback(self):
         from types import SimpleNamespace
 

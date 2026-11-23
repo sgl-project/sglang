@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 # Adapted from Diffuspace/Clover-35B-A3B-Preview and the Qwen/Hugging Face implementation.
 """BF16 eager reference arithmetic over the SGLang TP=1 weight and state pools."""
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.clover_pure_memory import bd_gdn_local_memory
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import (
@@ -36,7 +36,7 @@ def rotary(x, positions, config):
     return torch.cat((a * cos - b * sin, b * cos + a * sin, x[..., d:]), -1)
 
 
-def full_attention(layer, x, batch, preview):
+def full_attention(layer, x, batch, preview, padded_prefix=None):
     c = layer.config
     q_weight, k_weight, v_weight = layer.qkv_proj.weight.split(
         (2 * layer.q_size, layer.kv_size, layer.kv_size)
@@ -60,16 +60,28 @@ def full_attention(layer, x, batch, preview):
             k[0].transpose(0, 1).contiguous(),
             v[0].transpose(0, 1).contiguous(),
         )
-    if prefix:
+    if padded_prefix is not None:
+        # Repeat a valid prefix page for padding. The mask excludes those keys from the softmax. Positions use the true prefix.
+        pages, prefix_valid = padded_prefix
         kb, vb = pool.get_kv_buffer(layer.layer_id)
-        indices = (
-            get_req_to_token_pool()
-            .req_to_token[batch.req_pool_indices[0], :prefix]
-            .long()
+        k = torch.cat((kb[pages].transpose(0, 1)[None], k), 2)
+        v = torch.cat((vb[pages].transpose(0, 1)[None], v), 2)
+        mask = torch.cat((prefix_valid, prefix_valid.new_ones(x.shape[1])))[
+            None, None, None
+        ]
+    else:
+        if prefix:
+            kb, vb = pool.get_kv_buffer(layer.layer_id)
+            indices = (
+                get_req_to_token_pool()
+                .req_to_token[batch.req_pool_indices[0], :prefix]
+                .long()
+            )
+            k = torch.cat((kb[indices].transpose(0, 1)[None], k), 2)
+            v = torch.cat((vb[indices].transpose(0, 1)[None], v), 2)
+        mask = torch.ones(
+            (1, 1, x.shape[1], k.shape[2]), device=x.device, dtype=torch.bool
         )
-        k = torch.cat((kb[indices].transpose(0, 1)[None], k), 2)
-        v = torch.cat((vb[indices].transpose(0, 1)[None], v), 2)
-    mask = torch.ones((1, 1, x.shape[1], k.shape[2]), device=x.device, dtype=torch.bool)
     if not preview:
         mask &= torch.arange(k.shape[2], device=x.device) <= batch.positions.view(-1, 1)
     repeats = layer.num_heads // layer.num_kv_heads
@@ -97,14 +109,33 @@ def _causal_scan(q, k, v, g, beta, state):
     return torch.stack(values, 1).to(v.dtype), state
 
 
-def linear_attention(layer, x, batch, preview):
+class CausalReplayGraph:
+    """One fixed-shape recurrence graph reused across the model's GDN layers."""
+
+    def __init__(self):
+        self.graph = None
+
+    def run(self, *inputs):
+        if self.graph is None:
+            self.buffers = tuple(torch.empty_like(x) for x in inputs)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.output = _causal_scan(*self.buffers)
+        for dst, src in zip(self.buffers, inputs):
+            dst.copy_(src)
+        self.graph.replay()
+        return self.output
+
+
+def linear_attention(layer, x, batch, preview, slots=None, replay_graph=None):
     t = x.shape[1]
     width = layer.conv_kernel_size
     qw, zw = layer.in_proj_qkvz.weight.split((layer.conv_dim, layer.value_dim))
     bw, aw = layer.in_proj_ba.weight.chunk(2)
     raw = F.linear(x, qw)
     cache = get_req_to_token_pool().mamba2_layer_cache(layer.layer_id)
-    slots = get_attn_backend().linear_attn_backend.forward_metadata.mamba_cache_indices.long()
+    if slots is None:
+        slots = get_attn_backend().linear_attn_backend.forward_metadata.mamba_cache_indices.long()
     conv = cache.conv[0][slots]
     state = cache.temporal[slots]
     if batch.extend_prefix_lens_cpu[0] == 0:
@@ -162,7 +193,10 @@ def linear_attention(layer, x, batch, preview):
         k = k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
         q = q.repeat_interleave(groups, 2) / layer.head_k_dim**0.5
         k = k.repeat_interleave(groups, 2)
-        y, state = _causal_scan(q, k, v, g, beta, state)
+        if replay_graph is None:
+            y, state = _causal_scan(q, k, v, g, beta, state)
+        else:
+            y, state = replay_graph.run(q, k, v, g, beta, state)
         cache.temporal[slots] = state
     z = F.linear(x, zw).reshape_as(y)
     y = norm(y, layer.norm, layer.config.rms_norm_eps, z)
@@ -233,18 +267,84 @@ def shared_expert(layer, x):
     return shared_out * layer.shared_expert_gate(x).sigmoid()
 
 
+def preview_linear_graph(layer, x, batch, eps, pool):
+    # We only enter with a committed prefix. All variable request data enters
+    # through the two persistent buffers, including the clean-state pool slot.
+    indices = (
+        get_attn_backend().linear_attn_backend.forward_metadata.mamba_cache_indices
+    )
+    captured = getattr(layer, "_pure_linear_graph", None)
+    if captured is None:
+        residual = torch.empty_like(x)
+        slots = torch.empty_like(indices, dtype=torch.long)
+        residual.copy_(x)
+        slots.copy_(indices)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            h = norm(residual, layer.input_layernorm, eps)
+            y = residual + linear_attention(layer.linear_attn, h, batch, True, slots)
+            mlp_input = norm(y, layer.post_attention_layernorm, eps)
+        captured = (graph, residual, slots, y, mlp_input)
+        layer._pure_linear_graph = captured
+    graph, residual, slots, y, mlp_input = captured
+    residual.copy_(x)
+    slots.copy_(indices)
+    graph.replay()
+    return y, mlp_input
+
+
 def forward_eager(model, input_ids, batch):
     preview = batch.forward_mode.is_dllm_extend()
     if batch.batch_size != 1:
         raise ValueError("Clover pure eager forward requires exactly one active row")
+    if (
+        preview
+        and batch.extend_prefix_lens_cpu[0]
+        and envs.SGLANG_CLOVER_PURE_FUSED_PREVIEW.get()
+    ):
+        from sglang.srt.models.clover_pure_fused import preview_forward
+
+        return preview_forward(model, input_ids, batch)
     x = F.embedding(input_ids[None], model.model.embed_tokens.weight)
     eps = model.config.rms_norm_eps
+    replay_graph = None
+    if (
+        not preview
+        and not envs.SGLANG_CLOVER_PURE_DISABLE_GRAPH.get()
+        and input_ids.numel() == model.config.block_size
+    ):
+        if not hasattr(model, "_pure_replay_graph"):
+            model._pure_replay_graph = CausalReplayGraph()
+        replay_graph = model._pure_replay_graph
+    elif (
+        not preview
+        and not envs.SGLANG_CLOVER_PURE_DISABLE_GRAPH.get()
+        and 8 <= input_ids.numel() < model.config.block_size
+    ):
+        # One short-prefill shape plus the permanent full-block replay shape.
+        length = input_ids.numel()
+        cached = getattr(model, "_pure_prefill_graph", None)
+        if cached is None or cached[0] != length:
+            cached = model._pure_prefill_graph = (length, CausalReplayGraph())
+        replay_graph = cached[1]
+    graph_linear = (
+        not envs.SGLANG_CLOVER_PURE_DISABLE_GRAPH.get()
+        and preview
+        and batch.extend_prefix_lens_cpu[0] > 0
+    )
+    if graph_linear and not hasattr(model, "_pure_preview_pool"):
+        model._pure_preview_pool = torch.cuda.graph_pool_handle()
     for layer in model.model.layers:
-        h = norm(x, layer.input_layernorm, eps)
-        if hasattr(layer, "linear_attn"):
-            x = x + linear_attention(layer.linear_attn, h, batch, preview)
+        if graph_linear and hasattr(layer, "linear_attn"):
+            x, h = preview_linear_graph(layer, x, batch, eps, model._pure_preview_pool)
         else:
-            x = x + full_attention(layer, h, batch, preview)
-        h = norm(x, layer.post_attention_layernorm, eps)
+            h = norm(x, layer.input_layernorm, eps)
+            if hasattr(layer, "linear_attn"):
+                x = x + linear_attention(
+                    layer.linear_attn, h, batch, preview, replay_graph=replay_graph
+                )
+            else:
+                x = x + full_attention(layer, h, batch, preview)
+            h = norm(x, layer.post_attention_layernorm, eps)
         x = x + moe(layer.mlp, h, preview)
     return norm(x, model.model.norm, eps)[0]

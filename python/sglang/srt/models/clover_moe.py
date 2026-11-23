@@ -21,6 +21,7 @@ from sglang.kernels.ops.moe.clover_coreset_triton import (
     supports_clover_block_coreset_triton,
 )
 from sglang.srt.configs.clover_moe import CloverMoeConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
@@ -611,7 +612,10 @@ class CloverMoeModelLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        if get_exec().dllm.dllm_algorithm == "CloverPureBlock":
+        if get_exec().dllm.dllm_algorithm == "CloverPureBlock" and (
+            forward_batch.forward_mode.is_dllm_extend()
+            or not envs.SGLANG_CLOVER_PURE_NATIVE_REPLAY.get()
+        ):
             from sglang.srt.models.clover_pure_eager import forward_eager
 
             hidden_states = forward_eager(self, input_ids, forward_batch)
