@@ -91,6 +91,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     set_request_skip_softmax_params,
 )
@@ -2227,16 +2228,18 @@ class DenoisingStage(PipelineStage):
 
     def _cfg_mask_keeps_attention(self, current_model, batch) -> bool:
         # Unequal prompt lengths add a padding mask. USPAttention serves a masked
-        # call with FA varlen or dense SDPA and refuses Skip Softmax, so any other
-        # selected backend (Sparge, Sage, ...) would be replaced or fail.
+        # call with FA varlen (FA only, SGLANG_VARLEN_FA on) or dense SDPA and
+        # refuses Skip Softmax, so any other selected backend would be replaced
+        # or fail.
         if batch.sampling_params.skip_softmax_params is not None:
             return False
+        kept = {AttentionBackendEnum.TORCH_SDPA}
+        if attention_layer._VARLEN_FA_ENABLED:
+            kept.add(AttentionBackendEnum.FA)
         return all(
-            backend in (AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA)
+            module.backend in kept
             for module in current_model.modules()
-            if isinstance(
-                (backend := getattr(module, "backend", None)), AttentionBackendEnum
-            )
+            if isinstance(module, USPAttention)
         )
 
     def _batched_cfg_fits(self, need_bytes: int) -> bool:
@@ -2318,10 +2321,21 @@ class DenoisingStage(PipelineStage):
             )
             if kwargs is None:
                 return None
-            # Decided once per request: the shapes, attention mode and free memory
-            # it depends on do not change between denoising steps.
-            batch_ok = batch.extra.get(_CFG_BATCH_DECISION_KEY)
-            if batch_ok is None:
+            # Reused while the model and shapes stay the same: after the first
+            # batch-2 step its activations stay reserved by the caching allocator,
+            # which mem_get_info reports as used. Progressive resolution changes the
+            # latent shape and so decides again.
+            decision_key = (
+                id(current_model),
+                tuple(latent_model_input.shape),
+                tuple(kwargs["encoder_hidden_states"].shape),
+                kwargs["encoder_hidden_states_mask"] is None,
+                target_dtype,
+            )
+            cached_key, batch_ok = batch.extra.get(
+                _CFG_BATCH_DECISION_KEY, (None, None)
+            )
+            if cached_key != decision_key:
                 # The DiT activations of both rows are not allocated yet at this
                 # point, so the estimate covers both, not only the extra row.
                 row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
@@ -2333,7 +2347,7 @@ class DenoisingStage(PipelineStage):
                     kwargs["encoder_hidden_states_mask"] is None
                     or self._cfg_mask_keeps_attention(current_model, batch)
                 ) and self._batched_cfg_fits(2 * row_bytes)
-                batch.extra[_CFG_BATCH_DECISION_KEY] = batch_ok
+                batch.extra[_CFG_BATCH_DECISION_KEY] = (decision_key, batch_ok)
             if not batch_ok:
                 return None
 

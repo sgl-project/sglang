@@ -18,6 +18,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
@@ -59,16 +61,25 @@ def _tiny_dit(dit_config):
     return model.to(device=_DEVICE, dtype=torch.bfloat16)
 
 
-def _request(cond_len, uncond_len, edit, dtype, quality=None, skip_softmax=None):
+def _request(
+    cond_len,
+    uncond_len,
+    edit,
+    dtype,
+    quality=None,
+    skip_softmax=None,
+    size=HEIGHT,
+    extra=None,
+):
     generator = torch.Generator().manual_seed(1)
 
     def randn(*shape):
         return torch.randn(*shape, generator=generator).to(_DEVICE, dtype)
 
-    noise_tokens = (HEIGHT // 16) * (WIDTH // 16)
+    noise_tokens = (size // 16) * (size // 16)
     batch = SimpleNamespace(
-        height=HEIGHT,
-        width=WIDTH,
+        height=size,
+        width=size,
         latents=randn(1, noise_tokens, CHANNELS),
         prompt_embeds=[randn(1, cond_len, TEXT_DIM)],
         negative_prompt_embeds=[randn(1, uncond_len, TEXT_DIM)],
@@ -82,7 +93,7 @@ def _request(cond_len, uncond_len, edit, dtype, quality=None, skip_softmax=None)
         sampling_params=SimpleNamespace(
             quality=quality, skip_softmax_params=skip_softmax
         ),
-        extra={},
+        extra={} if extra is None else extra,
     )
     latent_input = batch.latents
     if edit:
@@ -122,10 +133,12 @@ def _denoise_step(
     skip_softmax=None,
     steps=1,
     memory_queries=None,
+    size=HEIGHT,
+    extra=None,
 ):
     dtype = next(model.parameters()).dtype
     batch, latent_input = _request(
-        cond_len, uncond_len, edit, dtype, quality, skip_softmax
+        cond_len, uncond_len, edit, dtype, quality, skip_softmax, size, extra
     )
     branch_kwargs = []
     for embeds, prepare in (
@@ -357,6 +370,7 @@ def test_tensor_parallel_runs_cfg_serially(single_process_model_parallel):
 
 @requires_cuda
 def test_exact_quality_runs_cfg_serially(single_process_model_parallel):
+    """Batching changes the reduction order, which the bit-exact tier forbids."""
     model = _tiny_dit(QwenImageDitConfig())
     serial, _ = _denoise_step(
         QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=False
@@ -379,6 +393,7 @@ def test_exact_quality_runs_cfg_serially(single_process_model_parallel):
 def test_skip_softmax_keeps_unequal_prompts_serial(
     single_process_model_parallel, cond_len, uncond_len, expected
 ):
+    """USPAttention refuses Skip Softmax with the padding mask of unequal prompts."""
     model = _tiny_dit(QwenImageDitConfig())
     _, widths = _denoise_step(
         QwenImagePipelineConfig(),
@@ -393,24 +408,26 @@ def test_skip_softmax_keeps_unequal_prompts_serial(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "backend,varlen_fa",
+    [(AttentionBackendEnum.SPARGE_ATTN, True), (AttentionBackendEnum.FA, False)],
+)
 @pytest.mark.parametrize("cond_len,uncond_len,expected", [(7, 3, [1, 1]), (5, 5, [2])])
-def test_sparse_attention_keeps_unequal_prompts_serial(
-    single_process_model_parallel, cond_len, uncond_len, expected
+def test_mask_unsupported_attention_keeps_unequal_prompts_serial(
+    single_process_model_parallel, backend, varlen_fa, cond_len, uncond_len, expected
 ):
+    """A masked batch-2 forward would run dense SDPA instead of the selected kernel."""
     model = _tiny_dit(QwenImageDitConfig())
-    attention = [
-        m
-        for m in model.modules()
-        if isinstance(getattr(m, "backend", None), AttentionBackendEnum)
-    ]
+    attention = [m for m in model.modules() if isinstance(m, USPAttention)]
     assert attention
     # only the enum the decision reads changes; attn_impl stays dense, so the
     # serial forward still runs
     with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(attention_layer, "_VARLEN_FA_ENABLED", varlen_fa)
+        )
         for module in attention:
-            stack.enter_context(
-                patch.object(module, "backend", AttentionBackendEnum.SPARGE_ATTN)
-            )
+            stack.enter_context(patch.object(module, "backend", backend))
         _, widths = _denoise_step(
             QwenImagePipelineConfig(),
             model,
@@ -424,6 +441,7 @@ def test_sparse_attention_keeps_unequal_prompts_serial(
 
 @requires_cuda
 def test_batched_cfg_decides_once_per_request(single_process_model_parallel):
+    """The memory query runs once, not on every denoising step."""
     model = _tiny_dit(QwenImageDitConfig())
     queries = []
     _, widths = _denoise_step(
@@ -438,3 +456,26 @@ def test_batched_cfg_decides_once_per_request(single_process_model_parallel):
     )
     assert widths == [2, 2, 2]
     assert queries == [1]
+
+
+@requires_cuda
+def test_batched_cfg_decides_again_when_resolution_changes(
+    single_process_model_parallel,
+):
+    """Progressive resolution grows the latent inside one request."""
+    model = _tiny_dit(QwenImageDitConfig())
+    extra, queries = {}, []
+    for size in (HEIGHT, HEIGHT, 2 * HEIGHT):
+        _, widths = _denoise_step(
+            QwenImagePipelineConfig(),
+            model,
+            7,
+            3,
+            edit=False,
+            streamed=True,
+            memory_queries=queries,
+            size=size,
+            extra=extra,
+        )
+        assert widths == [2]
+    assert queries == [1, 0, 1]
