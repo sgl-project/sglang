@@ -42,13 +42,13 @@ def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
         dist = (n - qlen + torch.arange(qlen, device=q.device))[:, None] - pos
         index = dist.clamp(0, EXTENT - 1)[:, None, :].expand(qlen, heads, n)
         bias = torch.gather(rel[rows].double(), 2, index) * (dist < EXTENT)[:, None]
-        s = torch.einsum("thd,nhd->thn", q[rows].double(), keys) * scale + bias
+        s = torch.einsum("thd,khd->thk", q[rows].double(), keys) * scale + bias
         hidden = dist < 0
         if window is not None:
             hidden |= dist > window
         s = s.masked_fill(hidden[:, None, :], float("-inf"))
         lse[rows] = torch.logsumexp(s, -1)
-        out[rows] = torch.einsum("thn,nhd->thd", torch.softmax(s, -1), vals)
+        out[rows] = torch.einsum("thk,khd->thd", torch.softmax(s, -1), vals)
     return out, lse
 
 
