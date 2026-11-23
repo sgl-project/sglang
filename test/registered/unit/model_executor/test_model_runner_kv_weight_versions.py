@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
@@ -139,7 +140,11 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
         record = KvWeightVersionRecord.capture(
             slot_indices=torch.tensor([7, 9]), version="v1"
         )
-        output = GenerationBatchResult(kv_weight_version_record=record)
+        # The verify reads the target logits (NaN probe, post-verify graphs).
+        output = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4)),
+            kv_weight_version_record=record,
+        )
         batch = SimpleNamespace(
             spec_info=SimpleNamespace(),
             seq_lens=torch.tensor([2]),
