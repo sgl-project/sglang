@@ -737,8 +737,8 @@ class TestMooncakeTransferShutdown(CustomTestCase):
                         task.cancel()
                     # Let cancelled child tasks settle while the worker is blocked.
                     await asyncio.gather(*(tasks - {send}), return_exceptions=True)
-                    await asyncio.sleep(0)
-                    await asyncio.sleep(0)
+                    done, _ = await asyncio.wait({send}, timeout=0.1)
+                    self.assertFalse(done)
                     self.assertEqual(deregistration, [])
                 finally:
                     release_transfer.set()
