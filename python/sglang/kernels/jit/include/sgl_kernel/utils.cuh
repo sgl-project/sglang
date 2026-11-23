@@ -119,7 +119,7 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#if defined(__MUSACC__)
+#if defined(USE_MUSA)
 #define SGLANG_LDG(arg) __ldg(arg)
 #elif !defined(USE_ROCM)
 #define SGLANG_LDG(arg) __ldg(arg)
