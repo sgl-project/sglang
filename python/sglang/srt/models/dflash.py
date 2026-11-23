@@ -42,7 +42,7 @@ from sglang.srt.layers.logits_processor import (
     row_gather,
     should_apply_lm_head_quant_method,
 )
-from sglang.srt.layers.muse_spark.fused.glue import ar_out, row_split
+from sglang.srt.layers.muse_spark.fused.glue import row_split
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -103,18 +103,6 @@ def _gemm_ag(x, w):
         return None
     c = muse_workspace()
     return gemm_ag(c, x, w) if gemm_ag_supported(c, x, w) else None
-
-
-def _ar_out(layer, x):
-    # CustomAllReduceV2.mc_out storage for a BF16 TP-reduced output (reduced in place), or None
-    if (
-        isinstance(layer.quant_method, UnquantizedLinearMethod)
-        and x.dtype == layer.weight.dtype == torch.bfloat16
-        and layer.reduce_results
-        and not layer.use_dp_attention_reduce
-        and layer.tp_group is get_parallel().tp_group
-    ):
-        return ar_out(x.shape[0], layer.output_size)
 
 
 def _gfx1250_try_gfx95():
@@ -662,9 +650,7 @@ class DFlashAttention(nn.Module):
                 q, k, v, forward_batch, sinks=self.attention_sink_bias, **kwargs
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
-        output, _ = self.o_proj(
-            attn_output, output_tensor=_ar_out(self.o_proj, attn_output)
-        )
+        output, _ = self.o_proj(attn_output)
         return output
 
     def apply_attention_output(
@@ -952,7 +938,7 @@ class DFlashMLP(nn.Module):
         else:
             gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, output_tensor=_ar_out(self.down_proj, x))
+        x, _ = self.down_proj(x)
         return x
 
 
