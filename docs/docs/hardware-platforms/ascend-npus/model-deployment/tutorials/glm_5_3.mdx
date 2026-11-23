@@ -55,7 +55,7 @@ Before following this tutorial, complete the environment setup in the documents 
   and recommended system settings (CPU power scheme, NUMA, swap).
 
 The mixed and PD disaggregation scripts below require a CANN **9.2.0** environment, the corresponding ATB and customized
-operator libraries, a compatible SGLang source checkout, and working inter-node HCCL/Gloo connectivity. Ensure that
+operator libraries, and working inter-node HCCL/Gloo connectivity. Ensure that
 all participating nodes use compatible software versions and can access the model weights. The PD topology additionally requires the configured MemFabric components.
 
 ### Model weights
@@ -65,7 +65,7 @@ For multi-node deployment, download the weights to a shared directory accessible
 identical checkpoint to the same local path on every node.
 
 - [GLM-5.3-BF16](https://www.modelscope.cn/models/ZhipuAI/GLM-5.3-BF16) (BF16, approximately 1.51 TB).
-- [GLM-5.3-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-w8a8) (W8A8 ModelSlim-quantized checkpoint, 764.24 GB, used in the scripts below).
+- [GLM-5.3-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.3-w8a8) (W8A8 ModelSlim-quantized checkpoint, 764.24GB, used in the scripts below).
 
 <Info>
 The deployment examples below use a W8A8 checkpoint with `--quantization modelslim`. The PD disaggregation topology
@@ -153,7 +153,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1000
@@ -185,7 +185,7 @@ For co-located (mixed) serving across **two A3 Series nodes**, both nodes partic
 inference instance. The following script is adapted from the supplied GLM-5.3 W8A8 multi-node configuration, using
 **TP=32**, **DP=16**, DeepEP `auto`, and NEXTN speculative decoding.
 
-Modify the node IP addresses, model/source paths, and network interface, then run the **same script on both nodes**.
+Modify the node IP addresses, model path, and network interface, then run the **same script on both nodes**.
 The two nodes must use the same compatible runtime and be able to communicate with rank 0 via the distributed
 initialization address. In this script, the mixed-serving HTTP port is **6688** (not 8000).
 
@@ -210,7 +210,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib/:${LD_LIBRARY_PATH:-}"
 
 # Keep the allocator configuration disabled as in the supplied script.
@@ -282,7 +282,7 @@ long-prompt processing and autoregressive generation. This configuration uses **
   and NEXTN speculative decoding.
 
 Run the following **same script on all four nodes**. The script selects the role and node rank by matching a configured
-IP address against the local network addresses. Update the model/source paths, the two prefill and two decode IP
+IP address against the local network addresses. Update the model path, the two prefill and two decode IP
 addresses, and the HCCL/Gloo interface before running it. The nodes must reach the prefill master for MemFabric
 bootstrap and should be started before the router.
 
@@ -295,7 +295,7 @@ bootstrap and should be started before the router.
 #   D_IP: two decode node IP addresses (rank 0 first)
 #   NIC: HCCL/Gloo network interface name
 #   MODEL_PATH: local/shared GLM-5.3 W8A8 model directory
-# Ensure MemFabric, ATB, and CANN 9.1.0 custom ops are installed.
+# Ensure MemFabric, ATB, and CANN 9.2.0 custom ops are installed.
 # ============================================================
 P_IP=('<prefill-node-0-ip>' '<prefill-node-1-ip>')
 D_IP=('<decode-node-0-ip>' '<decode-node-1-ip>')
@@ -312,7 +312,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -496,7 +496,7 @@ Disable profiling when measuring uninstrumented service performance.
 For this PD disaggregation configuration, prefill prioritizes long sequences using pipeline/context parallelism and
 DeepEP `normal`, while decode prioritizes low latency using DP/EP, DeepEP `low_latency`, NPU multi-stream,
 and NEXTN. Tune `--mem-fraction-static`, graph capture batch sizes, and concurrency based on observed HBM usage,
-TTFT, TPOT, and request throughput. Check that the weight conversion and MTP settings are compatible.
+TTFT, TPOT, and request throughput. Check that the quantized checkpoint and MTP settings are compatible.
 
 For the full catalog of optimization features and their parameter and compatibility details,
 see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).

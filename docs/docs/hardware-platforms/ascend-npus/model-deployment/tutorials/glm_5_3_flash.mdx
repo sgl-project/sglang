@@ -84,7 +84,8 @@ Reserve enough disk space for both the container image and model weights before 
 </Warning>
 
 Use a SGLang image with the runtime components required by your target platform and deployment mode.
-Replace `IMAGE`, `NAME`, and `MODEL_DIR` below, then start the container. The commands require
+Update `NAME` and `MODEL_DIR` below, then start the container; `IMAGE` defaults to the validated image for your
+platform. The commands require
 [Ascend Docker Runtime](/docs/hardware-platforms/ascend-npus/getting-started/installation#install-ascend-docker-runtime)
 on the host; each selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 For 950PR/DT series PD disaggregation, choose an image that supports DP attention.
@@ -187,7 +188,7 @@ Replace `MODEL_PATH` with the checkpoint directory inside the container.
 
 MODEL_PATH=/path/to/model-weights
 
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export HCCL_BUFFSIZE=1536
