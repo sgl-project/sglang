@@ -11,6 +11,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.sampling.custom_logit_processor import (
     ROW_PREFIX_KEY,
     CustomLogitProcessor,
@@ -20,6 +22,7 @@ from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_common import accept_draft_tree
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     needs_verify_tree,
@@ -216,6 +219,43 @@ class TestOneTokenCap(CustomTestCase):
         self.assertEqual(commit_lens.dtype, torch.int32)
         self.assertEqual(bonus.tolist(), [21, 31, 43])
         self.assertEqual(new_seq_lens.tolist(), [11, 21, 33])
+
+
+class TestCustomLogitProcessorSync(CustomTestCase):
+    """Under overlap the last result is processed after the next launch, so a
+    verify of the next batch would read req.output_ids a round late."""
+
+    def _batch(self, *, has_custom, algorithm, has_grammar=False):
+        return SimpleNamespace(
+            sampling_info=SimpleNamespace(has_custom_logit_processor=has_custom),
+            spec_algorithm=algorithm,
+            has_grammar=has_grammar,
+        )
+
+    def test_spec_batches_with_a_processor_sync(self):
+        for name, has_custom in itertools.product(
+            ("NONE", "EAGLE", "NGRAM", "DFLASH", "DSPARK"), (False, True)
+        ):
+            algorithm = SpeculativeAlgorithm.from_string(name)
+            batch = self._batch(has_custom=has_custom, algorithm=algorithm)
+            with self.subTest(algorithm=name, has_custom=has_custom):
+                self.assertEqual(
+                    ScheduleBatch.custom_logit_processor_needs_sync(batch),
+                    has_custom and not algorithm.is_none(),
+                )
+
+    def test_the_scheduler_processes_the_last_result_first(self):
+        batch = self._batch(
+            has_custom=True, algorithm=SpeculativeAlgorithm.from_string("EAGLE")
+        )
+        batch.grammar_needs_sync = lambda: False
+        batch.custom_logit_processor_needs_sync = lambda: (
+            ScheduleBatch.custom_logit_processor_needs_sync(batch)
+        )
+        with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False):
+            self.assertTrue(
+                Scheduler.should_process_last_batch_early(SimpleNamespace(), batch)
+            )
 
 
 def _verify_input(layout, *, kind, bs):

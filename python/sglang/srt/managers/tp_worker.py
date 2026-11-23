@@ -742,15 +742,18 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
-            # Delay sampling only for normal generation requests.
-            # Keep the existing grammar behavior unchanged.
+            # Delay sampling only for normal generation requests: a grammar or
+            # a custom logit processor reads the last batch's processed result.
             if (
                 self.enable_overlap
                 and not self.enable_spec
                 and (
                     forward_batch.sampling_info.grammars is not None
                     or (
-                        envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                        (
+                            envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                            or forward_batch.sampling_info.has_custom_logit_processor
+                        )
                         and not forward_batch.is_prefill_only
                     )
                 )
