@@ -29,9 +29,8 @@ HW_MAPPING = {
     "mlu": HWBackend.MLU,
 }
 
-# Per-commit test suites. On a PR, NVIDIA and AMD base suites run with `run-ci`;
-# their extra-* suites and every other hardware's suites also need that
-# hardware's `run-ci-<hw>-extra` label (scripts/ci/opt_in_ci_tiers.json).
+# Per-commit test suites. NVIDIA/AMD base suites and NPU suites run with `run-ci`;
+# other selections also need `run-ci-<hw>-extra` (scripts/ci/opt_in_ci_tiers.json).
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
