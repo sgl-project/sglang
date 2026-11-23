@@ -66,7 +66,8 @@ class ExternalCorpusManager:
         if self._pending_load is None:
             return
         recv_req, thread = self._pending_load
-        if not self._all_tp_ranks_agree(not thread.is_alive()):
+        load_finished = not thread.is_alive()
+        if not self._all_tp_ranks_agree(load_finished):
             return
         self._pending_load = None
         thread.join()  # formal happens-before for _load_result visibility
