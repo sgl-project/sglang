@@ -340,6 +340,20 @@ class TestCheckpointComponentSizes(CustomTestCase):
                 {**self.SIZES, "vae": (32, 128)},
             )
 
+    def test_list_valued_pipeline_setting_is_not_a_component(self):
+        # Qwen-Image-2.1-Turbo keeps its sampling grid in model_index.json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_pipeline(root)
+            index = json.loads((root / "model_index.json").read_text())
+            index["sample_sigmas"] = [1.0, 0.978453, 0.414568]
+            (root / "model_index.json").write_text(json.dumps(index))
+
+            self.assertEqual(
+                checkpoint_component_sizes(tmpdir, subfolder=None, revision=None),
+                self.SIZES,
+            )
+
     def test_sizes_every_weighted_component(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_pipeline(Path(tmpdir) / "sub")
