@@ -433,6 +433,11 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
     7. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
 
+    # Unquantized Ascend grouped matmuls consume BF16 activations. A global
+    # wire preference for a quantized target must not change its draft's ABI.
+    if _is_npu and (self.quant_config or {}).get("npu_expert_requires_bf16"):
+        return DispatcherOutputDtype.BF16
+
     # 0. Parse server argument.
     server_args = get_server_args()
     if server_args and get_exec().moe.deepep_dispatcher_output_dtype != "auto":

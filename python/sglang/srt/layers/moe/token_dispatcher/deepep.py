@@ -610,6 +610,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             return {"quant_mode": quant_mode}
 
         if not self.use_mxfp4 and not self.use_mxfp8:
+            if (self.quant_config or {}).get(
+                "npu_expert_requires_bf16"
+            ) and envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
+                raise RuntimeError(
+                    "A BF16-only expert cannot use legacy DeepEP normal dispatch with "
+                    "DEEP_NORMAL_MODE_USE_INT8_QUANT enabled. Use a DeepEP build "
+                    "with per-call quantization or disable legacy INT8 normal dispatch."
+                )
             # A3's legacy pybind Buffer does not expose its dispatch signature.
             # It selects BF16/INT8 dispatch through the DeepEP runtime instead.
             return {}
