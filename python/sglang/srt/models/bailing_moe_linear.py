@@ -61,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
-from sglang.srt.models.utils import WeightsMapper, bind_or_assign
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
@@ -79,12 +79,14 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -107,7 +109,7 @@ _is_sm100_supported = is_cuda() and get_platform().is_sm100
 class DsV3MLA(DeepseekV2AttentionMLA):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        if kwargs["rope_scaling"]:
+        if kwargs["rope_scaling"] and not _is_xpu:
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
 
@@ -616,9 +618,11 @@ class BailingMoEAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = None,
         prefix: str = "mha",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.alt_stream = alt_stream
 
         self.hidden_size = config.hidden_size
         tp_size = get_parallel().attn_tp_size
@@ -690,17 +694,6 @@ class BailingMoEAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q_by_head = q.reshape(-1, self.head_dim)
-        q_by_head = self.query_layernorm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.reshape(-1, self.head_dim)
-        k_by_head = self.key_layernorm(k_by_head)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -711,7 +704,14 @@ class BailingMoEAttention(nn.Module):
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.query_layernorm,
+                k_norm=self.key_layernorm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.dense(attn_output)
@@ -769,6 +769,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     quant_config=quant_config,
                     layer_id=self.layer_id,
                     prefix=prefix + ".attention",
+                    alt_stream=alt_stream,
                 )
         else:
             raise ValueError(f"Unsupported attention type: {config.attention_type}")

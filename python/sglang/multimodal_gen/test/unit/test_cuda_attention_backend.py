@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     DeviceCapability,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -63,6 +64,96 @@ class FakeCudaPlatform(CudaPlatformBase):
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return cls.device_capability
+
+
+class TestFlashInferFA2Selection(CustomTestCase):
+    def test_default_fallback_and_explicit_override(self):
+        """An optional model default must not swallow an explicit backend choice."""
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        fi = AttentionBackendEnum.FLASHINFER_FA2
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        module = ModuleType("flashinfer")
+        module.single_prefill_with_kv_cache = Mock()
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = None
+        server_args._explicit_arg_names = set()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
+        with (
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for capability, installed, dtype, explicit, expected in (
+                ((12, 0), True, torch.bfloat16, None, fi),
+                ((12, 1), True, torch.bfloat16, None, fi),
+                ((12, 0), True, torch.bfloat16, sdpa, sdpa),
+                ((12, 0), False, torch.bfloat16, None, sdpa),
+                ((12, 0), True, torch.float32, None, sdpa),
+                ((8, 0), True, torch.bfloat16, None, fi),
+                ((8, 6), True, torch.float16, None, fi),
+                ((8, 7), True, torch.bfloat16, None, fi),
+                ((8, 0), True, torch.bfloat16, sdpa, sdpa),
+                ((8, 0), False, torch.bfloat16, None, sdpa),
+                ((8, 0), True, torch.float32, None, sdpa),
+                ((8, 9), True, torch.bfloat16, None, fi),
+                ((9, 0), True, torch.bfloat16, None, fi),
+                ((10, 0), True, torch.bfloat16, None, fi),
+                ((13, 0), True, torch.bfloat16, None, fi),
+            ):
+                with (
+                    self.subTest(
+                        capability=capability,
+                        installed=installed,
+                        dtype=dtype,
+                        explicit=explicit,
+                    ),
+                    patch.object(
+                        FakeCudaPlatform,
+                        "device_capability",
+                        DeviceCapability(*capability),
+                    ),
+                    patch.object(
+                        FakeCudaPlatform, "is_sm120_device", capability[0] == 12
+                    ),
+                ):
+                    _cached_get_attn_backend.cache_clear()
+                    with patch.dict(
+                        sys.modules, {"flashinfer": module if installed else None}
+                    ):
+                        backend = get_attn_backend(
+                            128,
+                            dtype,
+                            supported_attention_backends={fi, sdpa},
+                            default_attention_backend=fi,
+                            selected_attention_backend=explicit,
+                            is_cross_attention=True,
+                        )
+                    self.assertEqual(backend.get_enum(), expected)
+            _cached_get_attn_backend.cache_clear()
+            with (
+                patch.dict(sys.modules, {"flashinfer": None}),
+                patch.object(FakeCudaPlatform, "is_sm120_device", True),
+            ):
+                with self.assertRaisesRegex(ValueError, "flashinfer-python"):
+                    get_attn_backend(128, torch.bfloat16, selected_attention_backend=fi)
+            _cached_get_attn_backend.cache_clear()
+            with (
+                patch.dict(sys.modules, {"flashinfer": module}),
+                patch.object(FakeCudaPlatform, "is_sm120_device", False),
+                patch.object(
+                    FakeCudaPlatform, "device_capability", DeviceCapability(8, 9)
+                ),
+            ):
+                backend = get_attn_backend(
+                    128, torch.bfloat16, selected_attention_backend=fi
+                )
+                self.assertEqual(backend.get_enum(), fi)
 
 
 class TestCudaAttentionBackendSelection(unittest.TestCase):

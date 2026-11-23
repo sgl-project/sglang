@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
@@ -30,7 +33,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import (
     SGLDiffusionProfiler,
     maybe_record_function,
@@ -41,18 +43,6 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
-
-
-class Timer(StageProfiler):
-    """
-    A wrapper around StageProfiler to maintain backward compatibility.
-    It forces simple logging behavior (log start/end) regardless of env vars.
-    """
-
-    def __init__(self, name="Stage"):
-        super().__init__(
-            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
-        )
 
 
 class PipelineExecutor(ABC):
@@ -159,6 +149,15 @@ class PipelineExecutor(ABC):
         return payload
 
     @staticmethod
+    def _check_peer_waits(stage: "PipelineStage") -> None:
+        """Fail the request if a Ulysses peer wait expired in a denoising stage,
+        before anything decodes or saves its incomplete output. A group
+        collective: call it where every rank arrives, whichever ranks ran the
+        stage."""
+        if stage.role_affinity == RoleType.DENOISER:
+            IPC_A2A_MULTI.check_timeout()
+
+    @staticmethod
     def _step_stage_profiler() -> None:
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
@@ -170,8 +169,7 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-
-        with self.profile_execution(batch, dump_rank=0):
+        with self.profile_execution(batch, dump_rank=None):
             with current_platform.inference_mode():
                 batch = self.execute(stages, batch, server_args)
 

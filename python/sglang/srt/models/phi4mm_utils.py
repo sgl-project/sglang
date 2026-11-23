@@ -20,15 +20,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
-class BlockBase(nn.Module):
-    """Block abstract module"""
-
-    def __init__(self, input_size, output_size):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-
-
 def get_activation(name="relu"):
     """Select an activation function by name
 
@@ -1596,47 +1587,6 @@ def calc_length(lengths, all_paddings, kernel_size, stride, ceil_mode, repeat_nu
 
 
 ####  multihead attention starts here
-class AttModule(nn.Module):
-    """Attention abstraction module"""
-
-    def __init__(self):
-        super().__init__()
-        self.export_mode = False
-
-    def set_export(self, mode=True):
-        """set the export mode"""
-        self.export_mode = mode
-
-    def forward(
-        self,
-        x: Tensor,
-        memory: Optional[Tensor] = None,
-        pos_emb: Optional[Tensor] = None,
-        att_mask: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
-        """AttModule forward
-
-        Args:
-            x: torch.Tensor
-                input tensor.
-            memory: torch.Tensor, optional
-                memory tensor.
-            pos_emb: torch.Tensor, optional
-                positional encoder embedding.
-            att_mask: torch.Tensor, optional
-                attention mask tensor.
-        """
-        return x, memory, pos_emb, att_mask
-
-
-class AttBlock(BlockBase, AttModule):
-    """Attention Block module to support both Attention and Block module."""
-
-    def memory_dims(self, max_len=False):
-        """memory dimensions"""
-        return (1, self.input_size)
-
-
 def masked_softmax(
     scores,
     mask: Optional[Tensor],
