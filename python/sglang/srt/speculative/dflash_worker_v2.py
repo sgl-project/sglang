@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -508,6 +509,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
+    _aux_inputs: Optional[Tuple[torch.Tensor, ...]] = None
 
     @property
     def has_bound_runtime(self) -> bool:
@@ -1128,6 +1130,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs = min(bs, int(max_running_requests))
         return max(1, bs)
 
+    def _rehearsal_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        device = self.device
+        return SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.full((bs,), 0.95, dtype=torch.float32, device=device),
+            top_ks=torch.zeros(bs, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=True,
+            # Top-k off: the sparse path is cheaper, so the dense full-vocab
+            # renormalization is the peak this rehearsal has to reproduce.
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=self.model_config.vocab_size,
+        )
+
     def _measure_sampling_peak(
         self,
         *,
@@ -1164,20 +1183,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs = self._prewarm_batch_size(block_size)
         device = self.device
 
-        sampling_info = SamplingBatchInfo(
-            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
-            top_ps=torch.full((bs,), 0.95, dtype=torch.float32, device=device),
-            top_ks=torch.zeros(bs, dtype=torch.int32, device=device),
-            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
-            is_all_greedy=False,
-            is_any_greedy=False,
-            need_top_p_sampling=True,
-            # Top-k off: the sparse path is cheaper, so the dense full-vocab
-            # renormalization is the peak this rehearsal has to reproduce.
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
-            vocab_size=vocab_size,
-        )
+        sampling_info = self._rehearsal_sampling_info(bs)
         candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
         target_logits = torch.zeros(
             (bs * block_size, vocab_size), dtype=torch.float32, device=device
@@ -1237,6 +1243,86 @@ class DFlashWorkerV2(BaseSpecWorker):
             result.sampling_headroom_bytes,
         )
         return result
+
+    @torch.no_grad()
+    def prewarm_after_kv_sizing(self) -> None:
+        """Run, for every decode graph batch size, the first-use work of a stock
+        decode round: capture its aux graph, which keeps the final KV pool
+        addresses, and compile and size the greedy and sampled accepts.
+
+        Changes no request state: there is no batch, every commit length is 0
+        (prefix writers skip such rows or send them to the reserved slot 0), and
+        the RNG streams the accepts draw from are restored.
+        """
+        capture_bs = self.model_runner.decode_cuda_graph_capture_bs
+        if not self._hosts_draft or not capture_bs:
+            return
+        block_size = int(self.block_size)
+        device = torch.device(self.device)
+        width = self.draft_model.num_context_features * int(
+            self.draft_model.config.hidden_size
+        )
+        # As in the decode round: a draft with window ids and no ring appends eagerly.
+        windowed = (
+            self.draft_kv_ring is None
+            and self.draft_model_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
+            is not None
+        )
+        draft_input = DFlashDraftInputV2.create_idle_input(device)
+        # A startup selector warm-up leaves its sample; a round clears it first.
+        saved = (self._accept_bonus_buffer_slot, self._selector_sample)
+        self._selector_sample = None
+        sim_rng = self._simulated_acc_len_rng
+        sim_rng_state = None if sim_rng is None else sim_rng.get_state()
+        # Past the largest batch a round can see, a graph batch size never runs.
+        max_bs = min(max(capture_bs), self._prewarm_batch_size(block_size))
+        tic = time.perf_counter()
+        # The CPU RNG is always forked; a CPU device has no separate stream.
+        with torch.random.fork_rng(
+            devices=[] if device.type == "cpu" else [device], device_type=device.type
+        ):
+            # Largest first: the smaller aux graphs reuse its pool memory.
+            for bs in range(max_bs, 0, -1):
+                rows = bs * block_size
+                loc = torch.zeros(rows, dtype=torch.int64, device=device)
+                logits = torch.zeros(
+                    (rows, self.model_config.vocab_size),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                # Greedy, then sampled (where the build has the sampled verify).
+                for sampling_info in (None, self._rehearsal_sampling_info(bs)):
+                    self._accept_block(
+                        candidates=loc.view(bs, block_size),
+                        next_token_logits=logits,
+                        sampling_info=sampling_info,
+                        draft_input=draft_input,
+                        prefix_lens=torch.zeros(bs, dtype=torch.int64, device=device),
+                        bs=bs,
+                    )
+                # The first call captures; the second takes the replay path.
+                for _ in range(2):
+                    self._append_target_hidden_decode(
+                        target_hidden=torch.zeros(
+                            (rows, width), dtype=self.model_runner.dtype, device=device
+                        ),
+                        cache_loc=loc,
+                        positions=loc,
+                        cache_loc_2d=loc.view(bs, block_size),
+                        commit_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+                        swa_cache_loc=loc if windowed else None,
+                    )
+                    self._join_aux()
+            torch.get_device_module(device).synchronize()
+        self._accept_bonus_buffer_slot, self._selector_sample = saved
+        if sim_rng is not None:
+            sim_rng.set_state(sim_rng_state)
+        logger.info(
+            "DFLASH decode pre-warm: bs 1..%d, %d aux graphs, %.2f s",
+            max_bs,
+            len(self._aux_graphs),
+            time.perf_counter() - tic,
+        )
 
     def _stage_draft_sampler(self, *, bs: int, sampling_info) -> None:
         # A batch past the sampler's static buffers has no captured bucket,
@@ -2497,7 +2583,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         # The aux graphs hold no sliding-window locations: such drafts append eagerly.
-        if not self._use_aux_graph or swa_cache_loc is not None:
+        # So does a batch past the target's decode graphs, which runs eagerly too:
+        # prewarm_after_kv_sizing captures every batch size up to there.
+        bs = int(cache_loc_2d.shape[0])
+        capture_bs = self.model_runner.decode_cuda_graph_capture_bs
+        if (
+            not self._use_aux_graph
+            or swa_cache_loc is not None
+            or bs > max(capture_bs, default=0)
+        ):
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=target_hidden,
                 cache_loc=cache_loc,
@@ -2518,7 +2612,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         entry = self._aux_graphs.get(key)
         inputs = (target_hidden, cache_loc, positions, commit_lens)
         if entry is None:
-            static = tuple(torch.empty_like(t) for t in inputs)
+            # One capture stream, memory pool and set of input buffers (sized for
+            # the largest decode graph) serve every key: the graphs replay one at a
+            # time, as each round joins the last replay before writing the inputs.
+            max_bs = max(capture_bs)
+            # The last input, commit_lens, has one row per request.
+            if self._aux_inputs is None or self._aux_inputs[-1].shape[0] < max_bs:
+                self._aux_inputs = tuple(
+                    t.new_empty((t.shape[0] // bs * max_bs, *t.shape[1:]))
+                    for t in inputs
+                )
+                self._aux_pool = torch.cuda.graph_pool_handle()
+                self._aux_capture_stream = torch.cuda.Stream(
+                    device=target_hidden.device
+                )
+            static = tuple(
+                buf[: t.shape[0]] for buf, t in zip(self._aux_inputs, inputs)
+            )
             for dst, src in zip(static, inputs):
                 dst.copy_(src)
             hidden_buf, loc_buf, pos_buf, commit_buf = static
@@ -2533,7 +2643,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     projected=projected,
                 )
 
-            stream = torch.cuda.Stream(device=target_hidden.device)
+            stream = self._aux_capture_stream
             current = torch.cuda.current_stream(target_hidden.device)
             stream.wait_stream(current)
             # Warm-up before capture: rewriting only the committed rows is idempotent.
@@ -2541,7 +2651,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 append()
             current.wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
+            with torch.cuda.graph(graph, pool=self._aux_pool, stream=stream):
                 append()
             current.wait_stream(stream)
             entry = (static, graph)

@@ -891,6 +891,87 @@ class TestGraphPoolBorrow(CustomTestCase):
         )
         self.assertIs(worker.model_runner.sampling_prewarm_result, result)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_aux_graphs_prewarm_on_one_pool_and_input_set(self):
+        """Pre-warm captures an aux graph for every batch size up to the largest
+        decode graph; serving then captures none, and the graphs, replaying from
+        one shared input set, each write only their own committed rows."""
+        block, width, slots = 2, 8, 64
+        kv = torch.full((slots, width), -1.0, device="cuda")
+        worker = object.__new__(DFlashWorkerV2)
+        worker.device = "cuda"
+        worker.block_size = block
+        worker.model_runner = SimpleNamespace(
+            decode_cuda_graph_capture_bs=[1, 2, 4, 8],
+            dtype=torch.float32,
+            max_running_requests=8,
+            max_decode_logits_rows=lambda: 64,
+        )
+        worker._target_worker = SimpleNamespace(
+            model_runner=worker.model_runner,
+            model_config=SimpleNamespace(vocab_size=16),
+        )
+        worker.draft_model = SimpleNamespace(
+            fc_tp_columns=None,
+            num_context_features=2,
+            config=SimpleNamespace(hidden_size=width // 2),
+        )
+        worker.draft_model_runner = SimpleNamespace(
+            runner_ids=SimpleNamespace(space=lambda kind: None)
+        )
+        worker.draft_kv_ring = None
+        worker._use_aux_graph = True
+        worker._aux_graphs = {}
+        worker._aux_overlap = True
+        worker._batched_small_copy = True
+        worker._use_triton_accept_bonus = True
+        worker._accept_bonus_buffer_cap = 0
+        worker._accept_bonus_buffer_slot = 0
+        worker._selector_sample = None
+        worker._simulated_acc_len_rng = None
+        worker._tp_sync = SimpleNamespace(sync=lambda site, values: values)
+
+        def write(*, target_hidden, cache_loc_2d, commit_lens, **kwargs):
+            # Rows past the commit length go to the reserved slot 0.
+            valid = torch.arange(block, device="cuda")[None, :] < commit_lens[:, None]
+            rows = torch.where(valid, cache_loc_2d, 0).reshape(-1)
+            kv.index_copy_(0, rows, target_hidden)
+
+        worker._append_target_hidden_to_draft_kv_by_loc = write
+        # Both rehearsed accepts take the greedy Triton path here.
+        with patch.object(
+            dflash_worker_v2, "is_dflash_sampling_verify_available", lambda: False
+        ):
+            worker.prewarm_after_kv_sizing()
+        self.assertEqual(
+            sorted(key[1][0] for key in worker._aux_graphs), list(range(1, 9))
+        )
+        self.assertTrue(torch.all(kv[1:] == -1))
+
+        graphs = dict(worker._aux_graphs)
+        expected = kv.clone()
+        for bs, first in ((8, 1), (3, 20), (5, 30), (1, 45), (2, 50)):
+            loc = torch.arange(first, first + bs * block, device="cuda")
+            commit = torch.randint(
+                1, block + 1, (bs,), device="cuda", dtype=torch.int32
+            )
+            hidden = torch.randn(bs * block, width, device="cuda")
+            worker._append_target_hidden_decode(
+                target_hidden=hidden,
+                cache_loc=loc,
+                positions=loc,
+                cache_loc_2d=loc.view(bs, block),
+                commit_lens=commit,
+            )
+            worker._join_aux()
+            valid = (
+                torch.arange(block, device="cuda")[None, :] < commit[:, None]
+            ).reshape(-1)
+            expected[loc[valid]] = hidden[valid]
+        torch.cuda.synchronize()
+        self.assertEqual(worker._aux_graphs, graphs)
+        torch.testing.assert_close(kv[1:], expected[1:])
+
 
 if __name__ == "__main__":
     unittest.main()

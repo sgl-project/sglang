@@ -764,6 +764,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             SimpleNamespace(
                 hicache_draft_plan=None,
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
+                prewarm_after_kv_sizing=lambda: trace.append("draft_prewarm_final"),
                 _draft_model_runners=lambda: (worker.model_runner,),
             )
             if use_draft_worker
@@ -887,8 +888,31 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "draft_prewarm",
                 "stream_exit",
                 "resize",
+                "stream_enter",
+                "draft_prewarm_final",
+                "stream_exit",
             ],
         )
+
+    def test_draft_worker_final_prewarm_follows_kv_sizing_and_weights(self):
+        """Captured aux graphs keep the pool addresses and read the weights, so
+        the final pre-warm runs after the KV resize and the weight finalize, on
+        the serving stream."""
+        for enable_overlap in (False, True):
+            with self.subTest(enable_overlap=enable_overlap):
+                trace = self._run_startup(
+                    "overlap", use_draft_worker=True, enable_overlap=enable_overlap
+                )
+                self.assertEqual(
+                    trace[trace.index("resize") :],
+                    [
+                        "resize",
+                        "finalize",
+                        "stream_enter",
+                        "draft_prewarm_final",
+                        "stream_exit",
+                    ],
+                )
 
 
 if __name__ == "__main__":
