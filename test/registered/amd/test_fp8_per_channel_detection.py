@@ -20,6 +20,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=15, suite="base-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 
 def _make_proj(
