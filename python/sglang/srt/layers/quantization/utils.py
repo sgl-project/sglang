@@ -259,11 +259,12 @@ def override_config(config: QuantizationConfig, prefix: str):
         if config.get_name() == "gptq"
         else 32 // config.weight_bits
     )  # packed into int32
-    if config.get_name() == "gptq_marlin":
+    if config.get_name() in ("gptq", "gptq_marlin"):
         is_sym = get_dynamic_override(config, prefix, "sym", config.is_sym)
         if isinstance(is_sym, bool):
             config.is_sym = is_sym
 
+    if config.get_name() == "gptq_marlin":
         if (config.weight_bits, config.is_sym) not in config.TYPE_MAP:
             raise ValueError(
                 "Unsupported quantization config: "
@@ -754,9 +755,9 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
 
 def swizzle_blockscale(scale: torch.Tensor):
     """
-    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    Swizzle NVFP4 (E4M3) or MXFP8 (UE8M0 as uint8) block scales into CUTLASS 128x4 atoms.
     """
-    assert scale.dtype == torch.float8_e4m3fn
+    assert scale.dtype in (torch.float8_e4m3fn, torch.uint8)
     # Pad and blockwise interleave weight_scale
     scale_ndim = scale.ndim
     if scale.ndim == 2:

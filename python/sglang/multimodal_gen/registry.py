@@ -434,7 +434,8 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
 
 
 def has_registered_diffusion_model_path(model_path: str) -> bool:
-    _ensure_registry_initialized()
+    # Built-in model paths are registered by the configs, not the pipelines.
+    load_external_model_package()
     return (
         is_sensenova_u1_model(model_path)
         or _match_registered_hf_path(model_path) is not None
@@ -448,7 +449,7 @@ def _get_config_info(
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
-    _ensure_registry_initialized()
+    load_external_model_package()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     # 0. Explicit model_id override: match by short name
@@ -637,9 +638,8 @@ def get_model_info(
         )
         return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
 
-    # For AUTO or SGLANG backend, try native implementation first
-    # 1. Discover all available pipeline classes and cache them
-    _ensure_registry_initialized()
+    # External packages can map checkpoints without a model_index.json.
+    load_external_model_package()
 
     # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
@@ -684,7 +684,7 @@ def get_model_info(
                 )
             return None
 
-    pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
+    pipeline_cls = get_pipeline_class(pipeline_class_name)
     if not pipeline_cls:
         if backend == Backend.AUTO:
             logger.warning(

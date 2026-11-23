@@ -217,7 +217,6 @@ class K31VerifyHostBinding:
             int(cfg.moe_renormalize),
             int(context_length),
             query_width=int(query_width),
-            request_batches=(1, 2, 4) if int(query_width) == 8 else (1,),
         )
 
     def can_run_graph(self, built, forward_batch):
