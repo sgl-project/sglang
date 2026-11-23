@@ -42,9 +42,9 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     admin_post,
-    find_available_port,
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
@@ -146,7 +146,6 @@ def init_process(
     load_format,
     barrier,
     pause_generation_mode,
-    ports,
 ):
     get_device_module().set_device(rank)
 
@@ -162,7 +161,6 @@ def init_process(
             state_dict_key_to_shape,
             load_format,
             barrier,
-            ports["group"],
         )
     elif rank in [1, 2]:
         init_process_sgl(
@@ -179,7 +177,6 @@ def init_process(
             load_format,
             barrier,
             pause_generation_mode,
-            ports,
         )
 
 
@@ -194,7 +191,6 @@ def init_process_hf(
     state_dict_key_to_shape,
     load_format,
     barrier,
-    group_port,
 ):
     # These two environment variables are very important
     # to avoid unexpected behaviors of CUDA and NCCL.
@@ -240,7 +236,8 @@ def init_process_hf(
     param_queue.put(("hf_base_params", hf_base_params))
 
     # Init weight update group for rank 0 (the training engine in RLHF).
-    init_method = f"tcp://localhost:{group_port}"
+    port = 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+    init_method = f"tcp://localhost:{port}"
     print(f"[hf] {rank=} {world_size=} init custom process group. {init_method=}")
     group = init_custom_process_group(
         backend=get_default_distributed_backend(get_device()),
@@ -321,7 +318,6 @@ def init_process_sgl(
     load_format,
     barrier,
     pause_generation_mode,
-    ports,
 ):
     get_device_module().set_device(rank)
     get_device_module().synchronize()
@@ -335,7 +331,11 @@ def init_process_sgl(
             cuda_graph_max_bs_decode=2,
         )
     else:
-        url = f"http://127.0.0.1:{ports[rank]}"
+        if rank == 1:
+            url = DEFAULT_URL_FOR_TEST
+        else:
+            host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
+            url = ":".join([host, str(int(port) + 10000)])
 
         print(f"[sgl] rank {rank} init server on url: {url}")
         process = popen_launch_server(
@@ -369,11 +369,13 @@ def init_process_sgl(
 
     param_queue.put((f"sgl_dp_{rank}_instruct_params", instruct_params))
 
+    port = 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+
     # Init weight update group with the training engine.
     if backend == "Engine":
         engine.init_weights_update_group(
             master_address="localhost",
-            master_port=str(ports["group"]),
+            master_port=str(port),
             rank_offset=base_gpu_id,
             world_size=world_size,
             group_name="test_parameter_update_group",
@@ -384,7 +386,7 @@ def init_process_sgl(
             f"{url}/init_weights_update_group",
             json={
                 "master_address": "localhost",
-                "master_port": str(ports["group"]),
+                "master_port": str(port),
                 "rank_offset": base_gpu_id,
                 "world_size": world_size,
                 "group_name": "test_parameter_update_group",
@@ -546,15 +548,6 @@ def assert_tied_weights(params_list, message, should_be_tied):
             assert not np.allclose(params[0], params[-1]), message
 
 
-def _pick_free_ports(count):
-    ports = []
-    while len(ports) < count:
-        port = find_available_port(20000 + 2000 * len(ports))
-        if port not in ports:
-            ports.append(port)
-    return ports
-
-
 def test_update_weights_from_distributed(
     tp_size,
     dp_size,
@@ -576,8 +569,6 @@ def test_update_weights_from_distributed(
     param_queue = mp.Queue()
     results = {}
     barrier = mp.Barrier(1 + dp_size)
-    group_port, *server_ports = _pick_free_ports(1 + dp_size)
-    ports = {"group": group_port, **dict(zip((1, 2), server_ports))}
 
     context = mp.spawn(
         init_process,
@@ -594,7 +585,6 @@ def test_update_weights_from_distributed(
             load_format,
             barrier,
             pause_generation_mode,
-            ports,
         ),
         nprocs=1 + dp_size,
         join=False,
