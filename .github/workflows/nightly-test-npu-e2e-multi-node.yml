@@ -397,13 +397,22 @@ jobs:
             done
           done
           echo "Collected ${collected} pod log dir(s)"
+          if [ "${collected}" -eq 0 ]; then
+            echo "No pod-side log dir matched; entries under /root/.cache/tests/logs/log:"
+            ls -1 /root/.cache/tests/logs/log 2>/dev/null | head -n 20 || true
+          fi
 
       - name: Upload metrics artifact
-        if: always() && steps.run_test.outputs.name != ''
+        # Do not depend on steps.run_test.outputs.name: when the runner fails the
+        # container step itself ("Executing the custom container implementation
+        # failed"), the step outputs are empty, so that condition skipped the
+        # upload on exactly the failed runs whose logs we need. A job runs a
+        # single case, so the run-scoped case directory is unambiguous.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: npu-metrics-${{ inputs.test_config_name }}-attempt-${{ github.run_attempt }}
-          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${{ steps.run_test.outputs.name }}
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
           if-no-files-found: ignore
           retention-days: 7
           compression-level: 9

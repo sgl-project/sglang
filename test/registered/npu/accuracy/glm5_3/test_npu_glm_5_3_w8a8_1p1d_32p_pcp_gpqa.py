@@ -306,10 +306,11 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             "prefill_args": [
                 *GLM_5_3_PCP_PD_SEP_PREFILL_ARGS,
                 # Cap the device KV pool so the 32k-token GSP workload overflows
-                # L1 and exercises the L2 host tier; the 1.2x host pool (about
-                # 78k tokens) then cannot hold all three prefixes, so evictions
-                # reach the L3 store. Accuracy is unaffected: gpqa prompts are
-                # short and only the prefill-side cache is capped.
+                # L1 and exercises the L2 host tier. The 1.2x host pool (about
+                # 78k tokens) plus the device pool cover ~144k tokens, while the
+                # hit-rate test's six prefixes need ~192k, so evictions reach the
+                # L3 store. Accuracy is unaffected: gpqa prompts are short and
+                # only the prefill-side cache is capped.
                 "--max-total-tokens",
                 65536,
                 "--hicache-storage-backend-extra-config",
@@ -339,11 +340,10 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
 
     def test_npu_glm_5_3_w8a8_1p1d_32p_pcp_l2_l3_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host and storage hit rates"""
-        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question. Requests are shuffled and round-robin, so
-        # 32 prompts per group give several repeats of the same prefix (reuse),
-        # while the three distinct prefixes overflow the capped device pool and
-        # the host pool (eviction to L2/L3).
+        # 6 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question: ~192k unique tokens against the ~144k
+        # tokens held by L1+L2, so the overflow reaches the L3 store. 32 prompts
+        # per group give several repeats of the same prefix (reuse).
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
@@ -352,7 +352,7 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             input_len=32000,
             output_len=1024,
             max_concurrency=32,
-            gsp_num_groups=3,
+            gsp_num_groups=6,
             gsp_prompts_per_group=32,
             seed=100,
             warmup_requests=16,
