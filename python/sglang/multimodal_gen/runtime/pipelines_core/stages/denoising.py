@@ -2225,7 +2225,9 @@ class DenoisingStage(PipelineStage):
             and self._tp_world_size() <= 1
         )
 
-    def _cfg_mask_keeps_attention(self, current_model, batch, server_args) -> bool:
+    def _cfg_mask_keeps_attention(
+        self, current_model, batch, server_args, device, dtype
+    ) -> bool:
         # Unequal prompt lengths add a padding mask. USPAttention serves a masked
         # call with FA varlen (FA only, SGLANG_VARLEN_FA on) or dense SDPA and
         # refuses Skip Softmax, so any other selected backend would be replaced
@@ -2236,7 +2238,13 @@ class DenoisingStage(PipelineStage):
         ):
             return False
         kept = {AttentionBackendEnum.TORCH_SDPA}
-        if attention_layer._VARLEN_FA_ENABLED:
+        # Same device and dtype conditions as the varlen call in USPAttention;
+        # elsewhere (e.g. Ascend) the masked call falls back to SDPA.
+        if (
+            attention_layer._VARLEN_FA_ENABLED
+            and device.type == "cuda"
+            and dtype in (torch.float16, torch.bfloat16)
+        ):
             kept.add(AttentionBackendEnum.FA)
         return all(
             module.backend in kept
@@ -2333,7 +2341,11 @@ class DenoisingStage(PipelineStage):
             if kwargs[
                 "encoder_hidden_states_mask"
             ] is not None and not self._cfg_mask_keeps_attention(
-                current_model, batch, server_args
+                current_model,
+                batch,
+                server_args,
+                device=latent_model_input.device,
+                dtype=target_dtype,
             ):
                 return None
             # The DiT activations of both rows are not allocated yet at this point,

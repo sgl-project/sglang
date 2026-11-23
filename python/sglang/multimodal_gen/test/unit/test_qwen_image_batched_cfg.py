@@ -495,3 +495,28 @@ def test_attention_autotune_keeps_unequal_prompts_serial(
         autotune=True,
     )
     assert widths == expected
+
+
+@pytest.mark.parametrize(
+    "device,dtype,keeps_fa",
+    [
+        ("cuda", torch.bfloat16, True),
+        ("cpu", torch.bfloat16, False),
+        ("cuda", torch.float32, False),
+    ],
+)
+def test_fa_counts_only_where_the_varlen_kernel_runs(device, dtype, keeps_fa):
+    """Unequal prompts stay serial where the masked call cannot keep FA."""
+    model = torch.nn.Module()
+    model.attn = USPAttention.__new__(USPAttention)
+    torch.nn.Module.__init__(model.attn)
+    model.attn.backend = AttentionBackendEnum.FA
+    batch = SimpleNamespace(sampling_params=SimpleNamespace(skip_softmax_params=None))
+    server_args = SimpleNamespace(enable_attention_backend_autotune=False)
+    with patch.object(attention_layer, "_VARLEN_FA_ENABLED", True):
+        assert (
+            _stage()._cfg_mask_keeps_attention(
+                model, batch, server_args, device=torch.device(device), dtype=dtype
+            )
+            is keeps_fa
+        )
