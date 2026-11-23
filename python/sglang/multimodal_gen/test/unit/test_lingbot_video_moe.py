@@ -2,13 +2,12 @@
 
 import json
 import logging
-import os
 import sys
-import tempfile
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -30,7 +29,7 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
-from sglang.multimodal_gen.registry import _get_config_info, get_model_info
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.distributed import sp_shard_utils as sps
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
@@ -58,8 +57,6 @@ from sglang.multimodal_gen.runtime.pipelines import (
 )
 from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe import (
     LingBotVideoPipeline,
-)
-from sglang.multimodal_gen.runtime.pipelines.lingbot_video_moe_refiner import (
     LingBotVideoRefinerPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -86,12 +83,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     COND_LATENT_KEY,
     VLM_IMAGE_KEY,
-    VLM_PATCH_FACTOR,
-    apply_first_frame_prefix,
     condition_frame,
     pixel_to_vlm_image,
     preprocess_condition_image,
-    smart_resize,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.refiner import (
     compute_refiner_sigmas,
@@ -121,33 +115,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LingBotVideoTextEncodingStage,
 )
 
-_LINGBOT_MODULE_SUBDIRS = (
-    "scheduler",
-    "text_encoder",
-    "processor",
-    "transformer",
-    "vae",
+
+@pytest.mark.parametrize(
+    "pipeline_cls", [LingBotVideoPipeline, LingBotVideoRefinerPipeline]
 )
-
-
-def test_moe_path_resolves_moe_configs():
-    get_model_info.cache_clear()
-    _get_config_info.cache_clear()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        model_dir = os.path.join(tmpdir, "lingbot-video-moe-30b-a3b")
-        os.makedirs(model_dir)
-        with open(
-            os.path.join(model_dir, "model_index.json"), "w", encoding="utf-8"
-        ) as f:
-            json.dump(
-                {"_class_name": "LingBotVideoPipeline", "_diffusers_version": "0.37.1"},
-                f,
-            )
-        for subdir in _LINGBOT_MODULE_SUBDIRS:
-            os.mkdir(os.path.join(model_dir, subdir))
-        info = get_model_info(model_dir, backend="sglang")
-
-    assert info.pipeline_cls.__name__ == "LingBotVideoPipeline"
+def test_moe_path_resolves_moe_configs(tmp_path, pipeline_cls):
+    model_dir = tmp_path / "lingbot-video-moe-30b-a3b"
+    model_dir.mkdir()
+    (model_dir / "model_index.json").write_text(
+        json.dumps(
+            {"_class_name": pipeline_cls.pipeline_name, "_diffusers_version": "0.37.1"}
+        )
+    )
+    for subdir in ("scheduler", "text_encoder", "processor", "transformer", "vae"):
+        (model_dir / subdir).mkdir()
+    info = get_model_info(str(model_dir), backend="sglang")
+    assert info.pipeline_cls is pipeline_cls
     assert info.pipeline_config_cls is LingBotVideoMoEPipelineConfig
     assert info.sampling_param_cls is LingBotVideoMoESamplingParams
 
@@ -802,66 +785,28 @@ def test_condition_frame_requires_one_reference():
         condition_frame([image, image])
 
 
-def test_smart_resize_aligns_to_the_patch_factor():
-    height, width = smart_resize(468, 832, factor=VLM_PATCH_FACTOR)
-    assert (height, width) == (480, 832)
-
-    height, width = smart_resize(30, 30, factor=VLM_PATCH_FACTOR)
-    assert height % VLM_PATCH_FACTOR == 0 and width % VLM_PATCH_FACTOR == 0
-    assert height * width >= 4 * VLM_PATCH_FACTOR**2
-
-
-def test_vlm_image_is_patch_aligned():
-    pixel = preprocess_condition_image(PIL.Image.new("RGB", (100, 60)), 48, 80)
-
-    image = pixel_to_vlm_image(pixel)
-
+@pytest.mark.parametrize(
+    "height,width,expected",
+    [(468, 832, (832, 480)), (30, 30, (64, 64)), (48, 80, (64, 64))],
+)
+def test_vlm_image_is_patch_aligned(height, width, expected):
+    image = pixel_to_vlm_image(torch.ones(1, 3, 1, height, width))
     assert image.mode == "RGB"
-    assert image.width % VLM_PATCH_FACTOR == 0
-    assert image.height % VLM_PATCH_FACTOR == 0
+    assert image.size == expected
 
 
-def test_first_frame_prefix_overwrites_only_the_conditioned_frames():
-    latents = torch.zeros(1, 16, 5, 2, 3)
-    cond = torch.arange(16 * 2 * 3, dtype=torch.float32).reshape(1, 16, 1, 2, 3)
-
-    out = apply_first_frame_prefix(latents, cond)
-
-    torch.testing.assert_close(out[:, :, :1], cond)
-    assert float(out[:, :, 1:].abs().max()) == 0.0
-
-
-def test_first_frame_prefix_follows_the_latent_dtype():
-    latents = torch.zeros(1, 16, 2, 1, 1, dtype=torch.float32)
-    cond = torch.ones(1, 16, 1, 1, 1, dtype=torch.bfloat16)
-
-    out = apply_first_frame_prefix(latents, cond)
-
-    assert out.dtype == torch.float32
-    assert float(out[:, :, 0].min()) == 1.0
-
-
-def test_denoising_reapplies_the_condition_latent_after_each_step():
+@pytest.mark.parametrize("conditioned", [False, True])
+def test_denoising_reapplies_only_the_conditioned_prefix(conditioned):
     stage = object.__new__(LingBotVideoDenoisingStage)
-    cond = torch.full((1, 16, 1, 2, 2), 7.0)
-    batch = SimpleNamespace(extra={COND_LATENT_KEY: cond})
-    latents = torch.zeros(1, 16, 3, 2, 2)
-
+    latents = torch.randn(1, 16, 3, 2, 2, dtype=torch.float32)
+    cond = torch.full_like(latents[:, :, :1], 7.0, dtype=torch.bfloat16)
+    batch = SimpleNamespace(extra={COND_LATENT_KEY: cond} if conditioned else {})
     out = stage.post_forward_for_ti2v_task(batch, None, None, latents, None)
-
-    torch.testing.assert_close(out[:, :, :1], cond)
-    assert float(out[:, :, 1:].abs().max()) == 0.0
-
-
-def test_denoising_leaves_latents_untouched_without_a_condition_latent():
-    stage = object.__new__(LingBotVideoDenoisingStage)
-    latents = torch.randn(1, 16, 3, 2, 2)
-
-    out = stage.post_forward_for_ti2v_task(
-        SimpleNamespace(extra={}), None, None, latents, None
-    )
-
-    torch.testing.assert_close(out, latents)
+    if conditioned:
+        torch.testing.assert_close(out[:, :, :1], cond.float())
+        torch.testing.assert_close(out[:, :, 1:], latents[:, :, 1:])
+    else:
+        assert out is latents
 
 
 def test_config_takes_an_optional_image_and_loads_the_vae_encoder():
@@ -901,9 +846,10 @@ def _adjusted(num_frames, explicit_fields, pipeline_class_name=None, **kwargs):
     return params
 
 
-def test_single_frame_request_swaps_in_the_image_negative_prompt():
+def test_single_frame_keeps_frame_count_and_uses_image_negative_prompt():
     params = _adjusted(1, [])
 
+    assert params.num_frames == 1
     assert params.negative_prompt == DEFAULT_NEGATIVE_PROMPT_IMAGE
     assert "temporal_and_motion_stability" not in params.negative_prompt
 
@@ -912,12 +858,6 @@ def test_explicit_negative_prompt_survives_the_single_frame_default():
     params = _adjusted(1, ["negative_prompt"], negative_prompt="keep me")
 
     assert params.negative_prompt == "keep me"
-
-
-def test_single_frame_survives_multi_gpu_frame_alignment():
-    params = _adjusted(1, [])
-
-    assert params.num_frames == 1
 
 
 def test_refiner_rejects_single_frame_requests():
@@ -1004,22 +944,7 @@ def test_sequence_shard_can_be_turned_off_by_the_request():
     assert not params.enable_sequence_shard
 
 
-def test_refiner_sigmas_start_at_the_threshold_and_descend():
-    sigmas = compute_refiner_sigmas(
-        sigma_max=1.0,
-        sigma_min=0.0,
-        num_inference_steps=8,
-        shift=3.0,
-        t_thresh=0.85,
-        tail_steps=2,
-    )
-
-    assert abs(float(sigmas[0]) - 0.85) < 1e-6
-    assert all(b < a for a, b in zip(sigmas, sigmas[1:]))
-    assert float(sigmas.min()) >= 0.0 and float(sigmas.max()) <= 1.0
-
-
-def test_refiner_sigma_tail_steps_extend_the_schedule():
+def test_refiner_sigma_tail_extends_the_descending_base_schedule():
     kwargs = dict(
         sigma_max=1.0,
         sigma_min=0.0,
@@ -1032,6 +957,10 @@ def test_refiner_sigma_tail_steps_extend_the_schedule():
     tailed = compute_refiner_sigmas(tail_steps=2, **kwargs)
 
     assert len(tailed) == len(plain) + 2
+    np.testing.assert_array_equal(tailed[:-2], plain)
+    assert tailed[0] == pytest.approx(0.85)
+    assert (np.diff(tailed) < 0).all()
+    assert 0 <= tailed[-1] <= tailed[0] <= 1
 
 
 @pytest.mark.parametrize("t_thresh", [0.0, 1.5])
@@ -1064,30 +993,18 @@ def test_pixel_resize_keeps_the_clip_layout():
     assert 0.0 <= float(resized.min()) and float(resized.max()) <= 1.0
 
 
-def test_refiner_weights_resolve_to_the_refiner_subfolder():
+@pytest.mark.parametrize("use_override", [False, True])
+def test_refiner_weights_resolve_component_path(tmp_path, use_override):
     pipeline = object.__new__(LingBotVideoRefinerPipeline)
-    pipeline.model_path = "/models/lingbot"
-    server_args = SimpleNamespace(component_paths={})
-
-    path = pipeline._resolve_component_path(
-        server_args, "transformer_2", "transformer_2"
-    )
-
-    assert path == "/models/lingbot/refiner"
-
-
-def test_transformer_2_path_override_wins_over_the_refiner_subfolder(tmp_path):
+    pipeline.model_path = str(tmp_path)
     override = tmp_path / "custom_refiner"
     override.mkdir()
-    pipeline = object.__new__(LingBotVideoRefinerPipeline)
-    pipeline.model_path = "/models/lingbot"
-    server_args = SimpleNamespace(component_paths={"transformer_2": str(override)})
-
-    path = pipeline._resolve_component_path(
-        server_args, "transformer_2", "transformer_2"
+    args = SimpleNamespace(
+        component_paths={"transformer_2": str(override)} if use_override else {}
     )
-
-    assert path == str(override)
+    assert pipeline._resolve_component_path(
+        args, "transformer_2", "transformer_2"
+    ) == str(override if use_override else tmp_path / "refiner")
 
 
 def test_refiner_reseeds_every_output_of_a_batched_request(monkeypatch):
@@ -1210,12 +1127,12 @@ def test_refiner_round_trip_matches_the_declared_decode_precision(monkeypatch):
         seen["decode"] = vae_dtype
         return torch.zeros(1, 3, 1, 4, 4)
 
-    def encode(pixels, server_args, *, vae_dtype, generators):
+    def encode(vae, pixels, server_args, vae_dtype, generators):
         seen["encode"] = vae_dtype
         return torch.zeros(1, 4, 1, 2, 2)
 
     stage.decode = decode
-    stage._encode = encode
+    monkeypatch.setattr(refiner_stages_module, "encode_pixels", encode)
     server_args, batch = _upscale_inputs("lossless")
     # The decode-only override must win over vae_precision on both halves.
     server_args.pipeline_config.vae_decode_precision = "fp32"
@@ -1251,8 +1168,8 @@ def test_refiner_decode_follows_the_request_quality(monkeypatch, quality, fast_p
 
     monkeypatch.setattr(refiner_stages_module, "resolve_decode_precision", resolve)
     stage.decode = decode
-    stage._encode = lambda pixels, server_args, *, vae_dtype, generators: torch.zeros(
-        1, 4, 1, 2, 2
+    monkeypatch.setattr(
+        refiner_stages_module, "encode_pixels", lambda *args: torch.zeros(1, 4, 1, 2, 2)
     )
     server_args, batch = _upscale_inputs(quality)
 
@@ -1261,25 +1178,27 @@ def test_refiner_decode_follows_the_request_quality(monkeypatch, quality, fast_p
     assert seen == {"quality": quality, "fast_path": fast_path}
 
 
-def test_refiner_condition_frame_keeps_the_base_framing():
+def test_refiner_condition_frame_keeps_the_base_framing(monkeypatch):
     # A 3:1 image covers a 2:1 base and a 3:2 refiner frame with different crops;
     # frame 0 must show what the upscaled base clip shows.
     array = torch.zeros(32, 96, 3, dtype=torch.uint8)
     array[..., 0] = (torch.arange(96) // 8 * 20).to(torch.uint8)
     image = PIL.Image.fromarray(array.numpy(), mode="RGB")
-    stage = object.__new__(LingBotVideoRefinerUpscaleStage)
-    stage._encode = lambda pixels, server_args, *, vae_dtype, generators: pixels
-    batch = SimpleNamespace(condition_image=[image], height=16, width=32)
-
-    frame = stage._encode_condition_frame(
-        batch,
-        None,
-        height=32,
-        width=48,
-        vae_dtype=torch.float32,
-        generators=None,
+    stage = _upscale_stage(monkeypatch, _StubVae())
+    server_args, batch = _upscale_inputs("exact")
+    batch.height, batch.width = 16, 32
+    (
+        server_args.pipeline_config.refiner_height,
+        server_args.pipeline_config.refiner_width,
+    ) = 32, 48
+    batch.condition_image = [image]
+    batch.extra[COND_LATENT_KEY] = torch.ones(1, 3, 1, 16, 32)
+    stage.decode = lambda *a, **kw: torch.zeros(1, 3, 2, 16, 32)
+    monkeypatch.setattr(
+        refiner_stages_module, "encode_pixels", lambda vae, pixels, *args: pixels
     )
-
+    stage.forward(batch, server_args)
+    frame = batch.extra[COND_LATENT_KEY]
     base = preprocess_condition_image(image, height=16, width=32)
     torch.testing.assert_close(frame, resize_video_pixels(base, height=32, width=48))
     # Cropping at the refiner size shifts the edges by one 20/255 band.

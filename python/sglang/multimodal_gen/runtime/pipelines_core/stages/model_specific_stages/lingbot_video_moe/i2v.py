@@ -9,10 +9,6 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
-IMAGE_MIN_TOKEN_NUM = 4
-IMAGE_MAX_TOKEN_NUM = 16384
-MAX_RATIO = 200
-
 # Qwen3-VL vision patch_size 16 times spatial_merge_size 2.
 VLM_PATCH_FACTOR = 32
 
@@ -27,47 +23,6 @@ def condition_frame(image: PIL.Image.Image | list[PIL.Image.Image]) -> PIL.Image
     if not isinstance(image, PIL.Image.Image):
         raise ValueError("LingBot-Video TI2V requires exactly one PIL reference frame")
     return image
-
-
-def _round_by_factor(number: float, factor: int) -> int:
-    return round(number / factor) * factor
-
-
-def _ceil_by_factor(number: float, factor: int) -> int:
-    return math.ceil(number / factor) * factor
-
-
-def _floor_by_factor(number: float, factor: int) -> int:
-    return math.floor(number / factor) * factor
-
-
-def smart_resize(
-    height: int,
-    width: int,
-    factor: int,
-    min_pixels: int | None = None,
-    max_pixels: int | None = None,
-) -> tuple[int, int]:
-    if max_pixels is None:
-        max_pixels = IMAGE_MAX_TOKEN_NUM * factor**2
-    if min_pixels is None:
-        min_pixels = IMAGE_MIN_TOKEN_NUM * factor**2
-    if max_pixels < min_pixels:
-        raise ValueError("max_pixels must be greater than or equal to min_pixels.")
-    if max(height, width) / min(height, width) > MAX_RATIO:
-        raise ValueError(f"absolute aspect ratio must be smaller than {MAX_RATIO}.")
-
-    resized_height = max(factor, _round_by_factor(height, factor))
-    resized_width = max(factor, _round_by_factor(width, factor))
-    if resized_height * resized_width > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        resized_height = _floor_by_factor(height / beta, factor)
-        resized_width = _floor_by_factor(width / beta, factor)
-    elif resized_height * resized_width < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        resized_height = _ceil_by_factor(height * beta, factor)
-        resized_width = _ceil_by_factor(width * beta, factor)
-    return resized_height, resized_width
 
 
 def preprocess_condition_image(
@@ -100,21 +55,17 @@ def pixel_to_vlm_image(
 ) -> PIL.Image.Image:
     """Patch-aligned PIL view of the condition frame for Qwen3-VL."""
 
+    # Only image-conditioned requests need the Qwen media processor.
+    from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize
+
     frame = pixel[0, :, 0].detach().cpu().clamp(0, 1)
     array = frame.permute(1, 2, 0).mul(255).byte().numpy()
     image = PIL.Image.fromarray(array, mode="RGB")
     resized_height, resized_width = smart_resize(
-        image.height, image.width, factor=factor
+        image.height,
+        image.width,
+        factor=factor,
+        min_pixels=4 * factor**2,
+        max_pixels=16384 * factor**2,
     )
     return image.resize((resized_width, resized_height))
-
-
-def apply_first_frame_prefix(
-    latents: torch.Tensor, cond_latent: torch.Tensor
-) -> torch.Tensor:
-    """Returns a new tensor; inference latents cannot be updated in place."""
-
-    cond_frames = cond_latent.shape[2]
-    return torch.cat(
-        [cond_latent.to(latents.dtype), latents[:, :, cond_frames:]], dim=2
-    )

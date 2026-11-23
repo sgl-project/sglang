@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     COND_LATENT_KEY,
     VLM_IMAGE_KEY,
-    apply_first_frame_prefix,
     condition_frame,
     pixel_to_vlm_image,
     preprocess_condition_image,
@@ -78,4 +77,6 @@ def apply_cond_latent(batch: Req, latents: torch.Tensor) -> torch.Tensor:
     cond_latent = batch.extra.get(COND_LATENT_KEY)
     if cond_latent is None:
         return latents
-    return apply_first_frame_prefix(latents, cond_latent)
+    return torch.cat(
+        [cond_latent.to(latents.dtype), latents[:, :, cond_latent.shape[2] :]], dim=2
+    )

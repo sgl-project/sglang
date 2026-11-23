@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+from typing import Any
+
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -10,6 +13,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LingBotVideoDenoisingStage,
     LingBotVideoImageConditioningStage,
     LingBotVideoPromptRewriteStage,
+    LingBotVideoRefinementStage,
+    LingBotVideoRefinerUpscaleStage,
     LingBotVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
@@ -40,6 +45,20 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        self._add_base_stages(server_args)
+        self.add_standard_decoding_stage()
+
+    def _text_encoding_stage(
+        self, *, encode_text_only: bool = False
+    ) -> LingBotVideoTextEncodingStage:
+        return LingBotVideoTextEncodingStage(
+            text_encoders=[self.get_module("text_encoder")],
+            tokenizers=[self.get_module("processor")],
+            transformer=self.get_module("transformer"),
+            encode_text_only=encode_text_only,
+        )
+
+    def _add_base_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         config = server_args.pipeline_config
         # One backend for both stages, so an in-process rewriter loads once.
@@ -54,13 +73,7 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             LingBotVideoImageConditioningStage(vae=self.get_module("vae")),
         )
-        self.add_stage(
-            LingBotVideoTextEncodingStage(
-                text_encoders=[self.get_module("text_encoder")],
-                tokenizers=[self.get_module("processor")],
-                transformer=self.get_module("transformer"),
-            ),
-        )
+        self.add_stage(self._text_encoding_stage())
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=[_flow_shift_kwarg],
@@ -71,12 +84,63 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
                 scheduler=self.get_module("scheduler"),
             ),
         )
-        self._maybe_add_refiner_stages(server_args)
+
+
+class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
+    """Base denoise, then the refiner weights at a higher resolution.
+
+    The refiner DiT doubles the resident weights, so the single-pass pipeline stays
+    the default.
+    """
+
+    pipeline_name = "LingBotVideoRefinerPipeline"
+
+    _required_config_modules = [
+        "text_encoder",
+        "processor",
+        "vae",
+        "transformer",
+        "transformer_2",
+        "scheduler",
+    ]
+
+    def _load_config(self) -> dict[str, Any]:
+        # The refiner DiT is absent from model_index.json but shares the base architecture.
+        config = super()._load_config()
+        config["transformer_2"] = config["transformer"]
+        return config
+
+    def _resolve_component_path(
+        self, server_args: ServerArgs, module_name: str, load_module_name: str
+    ) -> str:
+        # The name drives loader selection, so keep it and redirect only the path.
+        if (
+            module_name == "transformer_2"
+            and server_args.component_paths.get(module_name) is None
+        ):
+            return os.path.join(self.model_path, "refiner")
+        return super()._resolve_component_path(
+            server_args, module_name, load_module_name
+        )
+
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        self._add_base_stages(server_args)
+        self.add_stage(
+            self._text_encoding_stage(encode_text_only=True),
+            "refiner_text_encoding_stage",
+        )
+        self.add_stage(
+            LingBotVideoRefinerUpscaleStage(vae=self.get_module("vae"), pipeline=self),
+            "refiner_upscale_stage",
+        )
+        self.add_stage(
+            LingBotVideoRefinementStage(
+                transformer=self.get_module("transformer_2"),
+                scheduler=self.get_module("scheduler"),
+            ),
+            "refinement_stage",
+        )
         self.add_standard_decoding_stage()
 
-    def _maybe_add_refiner_stages(self, server_args: ServerArgs) -> None:
-        # Overridden by the two-pass subclass; the single-pass pipeline adds nothing.
-        return None
 
-
-EntryClass = [LingBotVideoPipeline]
+EntryClass = [LingBotVideoPipeline, LingBotVideoRefinerPipeline]

@@ -6,30 +6,6 @@ import numpy as np
 import torch
 
 
-def validate_refiner_sigmas(
-    sigmas: np.ndarray, t_thresh: float | None = None
-) -> np.ndarray:
-    arr = np.asarray(list(sigmas), dtype=np.float64)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError("refiner sigma schedule must be a non-empty 1D list")
-    if not np.all(np.isfinite(arr)):
-        raise ValueError("refiner sigma schedule contains non-finite values")
-    if np.any(arr < 0.0) or np.any(arr > 1.0):
-        raise ValueError(
-            f"refiner sigma schedule values must be in [0, 1], got {arr.tolist()}"
-        )
-    if arr.size > 1 and not np.all(np.diff(arr) < 0.0):
-        raise ValueError(
-            f"refiner sigma schedule must be strictly descending, got {arr.tolist()}"
-        )
-    if t_thresh is not None and abs(float(arr[0]) - float(t_thresh)) > 1e-6:
-        raise ValueError(
-            f"refiner sigma schedule must start at t_thresh={float(t_thresh)}, "
-            f"got {float(arr[0])}"
-        )
-    return arr
-
-
 def compute_refiner_sigmas(
     *,
     sigma_max: float,
@@ -51,7 +27,7 @@ def compute_refiner_sigmas(
         raise ValueError(f"refiner_sigma_tail_steps must be >= 0, got {tail}")
 
     t_value = float(t_thresh)
-    base = np.linspace(float(sigma_max), float(sigma_min), steps + 1).copy()[:-1]
+    base = np.linspace(float(sigma_max), float(sigma_min), steps + 1)[:-1]
     shifted = shift * base / (1.0 + (shift - 1.0) * base)
     eps = 1e-6
     sigmas = shifted[shifted <= t_value + eps]
@@ -62,7 +38,10 @@ def compute_refiner_sigmas(
         stop = min(float(sigma_min), start)
         extra = np.linspace(start, stop, tail + 2, dtype=np.float64)[1:-1]
         sigmas = np.concatenate([sigmas, extra])
-    return validate_refiner_sigmas(sigmas, t_value).astype(np.float32)
+    # The threshold insertion guarantees a nonempty 1-D schedule starting at t_thresh.
+    if not ((0 <= sigmas) & (sigmas <= 1)).all() or not (np.diff(sigmas) < 0).all():
+        raise ValueError("refiner sigmas must be in [0, 1] and strictly descending")
+    return sigmas.astype(np.float32)
 
 
 def prepare_refiner_latent(

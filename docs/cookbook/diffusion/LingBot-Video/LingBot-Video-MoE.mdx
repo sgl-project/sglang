@@ -34,8 +34,7 @@ image-to-video the condition frame and the caption are encoded together.
 Choose it when you can supply structured JSON captions or run the released
 prompt rewriter: a raw natural-language prompt is out of distribution and
 degrades the output quietly rather than failing. Image conditioning does not
-support sequence parallelism, and the refiner roughly doubles both the weights
-on disk and the peak memory.
+support sequence parallelism, and the refiner needs a second set of DiT weights.
 
 ## 3. Deployment
 
@@ -47,37 +46,11 @@ sglang serve \
 
 One GPU is enough to bring the model up. `--performance-mode` decides where the DiT lives:
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "33.3%"}} />
-    <col style={{width: "33.3%"}} />
-    <col style={{width: "33.3%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>DiT</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Text encoder, VAE</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`auto` (default)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>offloaded to CPU between uses</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>layer by layer</td>
-    </tr>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`speed`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>resident, needs room for all 30B parameters</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>resident</td>
-    </tr>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`memory`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>streamed layer by layer</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>layer by layer</td>
-    </tr>
-  </tbody>
-</table>
+| Mode | DiT | Text encoder, VAE |
+| --- | --- | --- |
+| `auto` (default) | offloaded to CPU between uses | layer by layer |
+| `speed` | resident, needs room for all 30B parameters | resident |
+| `memory` | streamed layer by layer | layer by layer |
 
 `memory` keeps the least memory in use and is the mode to reach for when a whole DiT does not fit; it streams each block from CPU as the loop reaches it.
 
@@ -240,7 +213,7 @@ sglang serve \
   --pipeline-class-name LingBotVideoRefinerPipeline
 ```
 
-This loads a second set of DiT weights, so the checkpoint on disk and the peak memory both roughly double. Defaults for the second pass are 1088x1920, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The step count is 8: `refiner_num_inference_steps` lays out a grid from which only the sigmas at or below `t_thresh` are kept, 6 at these defaults, and `refiner_sigma_tail_steps` appends 2 more at the low end. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
+The extra DiT increases weight memory; peak GPU memory depends on placement and offloading. Defaults for the second pass are 1088x1920, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The step count is 8: `refiner_num_inference_steps` lays out a grid from which only the sigmas at or below `t_thresh` are kept, 6 at these defaults, and `refiner_sigma_tail_steps` appends 2 more at the low end. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
 
 The second pass resizes the decoded clip to 1088x1920 without cropping, so the refiner pipeline defaults the base pass to 480x832 and rejects a base geometry whose aspect ratio is more than 5% off 1088x1920.
 
@@ -249,57 +222,13 @@ The second pass resizes the decoded clip to 1088x1920 without cropping, so the r
 The following request uses the compact 17-frame, 12-step smoke-test profile against the server from section 3. Use the model defaults of 81 frames and 40 steps for the released generation profile.
 
 ```python Python
-import json
 import time
 from pathlib import Path
 
 import requests
 
 base_url = "http://127.0.0.1:30010"
-prompt = json.dumps(
-    {
-        "comprehensive_description": {
-            "scene_content_description": (
-                "A small silver robot arm on a white table slowly reaches "
-                "toward a red cube. The background is a softly lit laboratory wall."
-            ),
-            "camera_movement_description": (
-                "The camera is static at eye level in a medium shot."
-            ),
-        },
-        "camera_info": {
-            "color": "Neutral",
-            "frame_size": "Medium",
-            "shot_type_angle": "Eye level",
-            "lens_size": "Medium",
-            "composition": "Center",
-            "lighting": "Soft light",
-            "lighting_type": "Artificial light",
-        },
-        "world_knowledge": [],
-        "prominent_elements": [
-            {
-                "name": "robot arm",
-                "description": "A small silver robot arm with a two-finger gripper.",
-                "actions": [
-                    {
-                        "timestamp": "[0.0s - 1.0s]",
-                        "action": "reaches toward the red cube",
-                    }
-                ],
-                "location": "center of the frame",
-                "relative_size": "dominant",
-                "shape_and_color": "articulated silver metal arm",
-                "texture": "brushed metal",
-                "appearance_details": "two-finger gripper and visible joints",
-                "relationship": "reaching toward the red cube on the table",
-                "orientation": "upright, base on the table",
-                "pose": "reaching",
-            }
-        ],
-    },
-    separators=(",", ":"),
-)
+prompt = Path("fox.json").read_text()
 
 response = requests.post(
     f"{base_url}/v1/videos",
@@ -347,85 +276,24 @@ Test environment:
 
 Both stacks ran the same caption, resolution, frame count, schedule, and seed, and both computed the two CFG branches sequentially.
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "20.0%"}} />
-    <col style={{width: "20.0%"}} />
-    <col style={{width: "20.0%"}} />
-    <col style={{width: "20.0%"}} />
-    <col style={{width: "20.0%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Stack</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parallelism</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Denoise</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Per step</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>End to end</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>upstream diffusers</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FSDP 8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>409 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>10.23 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>469 s</td>
-    </tr>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>73 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.83 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>175 s</td>
-    </tr>
-  </tbody>
-</table>
+| Stack | Parallelism | Denoise | Per step | End to end |
+| --- | --- | --- | --- | --- |
+| upstream diffusers | FSDP 8 | 409 s | 10.23 s | 469 s |
+| SGLang | `--ulysses-degree 8` | 73 s | 1.83 s | 175 s |
 
 SGLang denoises 5.6x faster and completes the request 2.7x faster. End to end covers text encoding, denoising, and VAE decode, so it closes less than denoise alone: both stacks decode the same 121 frames.
 
 The two rows shard differently, so for a weights-only comparison against upstream FSDP, SGLang `--tp-size 8` denoises the same workload in 139 s, 3.48 s per step, still 2.9x faster.
 
-Output matches the reference in subject, composition, and motion without being bit-identical: PSNR 20.7 dB and SSIM 0.82 on the luma plane. Switching only the sharding layout within SGLang moves the result by the same margin, so the difference is the bf16 reduction-order floor across 40 steps.
+Output matches the reference in subject, composition, and motion without being bit-identical: PSNR 20.7 dB and SSIM 0.82 on the luma plane. Switching only the sharding layout within SGLang moves the result by the same margin, so this comparison does not isolate the effect of reduction order from other implementation differences.
 
 Other tasks, same hardware, schedule, and quality tier:
 
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-    <col style={{width: "25.0%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Task</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parallelism</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Denoise</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Text-to-image, 1 frame</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>31.8 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.2 s</td>
-    </tr>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Image-to-video, 121 frames</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--tp-size 8`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>134 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4.7 s</td>
-    </tr>
-    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner, both passes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8` + FSDP</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>57 s + 100 s</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>7.5 s</td>
-    </tr>
-  </tbody>
-</table>
+| Task | Parallelism | Denoise | Decode |
+| --- | --- | --- | --- |
+| Text-to-image, 1 frame | `--ulysses-degree 8` | 31.8 s | 0.2 s |
+| Image-to-video, 121 frames | `--tp-size 8` | 134 s | 4.7 s |
+| Refiner, both passes | `--ulysses-degree 8` + FSDP | 57 s + 100 s | 7.5 s |
 
 Tensor parallelism is the slower layout because the MoE experts are replicated on every rank rather than sharded: `--tp-size 8` splits the attention projections, but each rank still runs all 128 experts. Prefer sequence parallelism, and use tensor parallelism for image-to-video, where sequence parallelism is unavailable.
 

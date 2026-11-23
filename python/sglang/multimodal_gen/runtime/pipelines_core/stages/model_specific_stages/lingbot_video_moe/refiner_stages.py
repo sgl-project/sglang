@@ -35,12 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     resize_video_pixels,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_decode_precision,
 )
-
-logger = init_logger(__name__)
 
 
 class LingBotVideoRefinerUpscaleStage(DecodingStage):
@@ -75,19 +72,22 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
                     pixels = self.decode(
                         batch.latents, server_args, vae_dtype=vae_dtype
                     )
-                upscaled = resize_video_pixels(pixels, height=height, width=width)
-                latents = self._encode(
-                    upscaled, server_args, vae_dtype=vae_dtype, generators=generators
-                )
-                if batch.extra.get(COND_LATENT_KEY) is not None:
-                    batch.extra[COND_LATENT_KEY] = self._encode_condition_frame(
-                        batch,
-                        server_args,
-                        height=height,
-                        width=width,
-                        vae_dtype=vae_dtype,
-                        generators=generators,
+
+                def upscale_and_encode(pixels):
+                    pixels = resize_video_pixels(pixels, height, width)
+                    return encode_pixels(
+                        vae, pixels, server_args, vae_dtype, generators
                     )
+
+                latents = upscale_and_encode(pixels)
+                if batch.extra.get(COND_LATENT_KEY) is not None:
+                    # Match the base crop before upscaling the reference with the clip.
+                    frame = preprocess_condition_image(
+                        condition_frame(batch.condition_image),
+                        batch.height,
+                        batch.width,
+                    )
+                    batch.extra[COND_LATENT_KEY] = upscale_and_encode(frame)[:, :, :1]
             finally:
                 self.vae.use_tiling = was_tiling
 
@@ -101,38 +101,6 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         batch.latents = prepare_refiner_latent(latents, noise, config.refiner_t_thresh)
         batch.height, batch.width = height, width
         return batch
-
-    def _encode(
-        self,
-        pixels: torch.Tensor,
-        server_args: ServerArgs,
-        *,
-        vae_dtype: torch.dtype,
-        generators: list[torch.Generator] | None,
-    ) -> torch.Tensor:
-        return encode_pixels(self.vae, pixels, server_args, vae_dtype, generators)
-
-    def _encode_condition_frame(
-        self,
-        batch: Req,
-        server_args: ServerArgs,
-        *,
-        height: int,
-        width: int,
-        vae_dtype: torch.dtype,
-        generators: list[torch.Generator] | None,
-    ) -> torch.Tensor:
-        # Crop at the base geometry, then resize like the clip to keep its framing.
-        base_pixel = preprocess_condition_image(
-            condition_frame(batch.condition_image),
-            height=int(batch.height),
-            width=int(batch.width),
-        )
-        pixel = resize_video_pixels(base_pixel, height=height, width=width)
-        latents = self._encode(
-            pixel, server_args, vae_dtype=vae_dtype, generators=generators
-        )
-        return latents[:, :, :1]
 
 
 class LingBotVideoRefinementStage(LingBotVideoDenoisingStage):
@@ -171,26 +139,14 @@ class LingBotVideoRefinementStage(LingBotVideoDenoisingStage):
         batch.guidance_scale = config.refiner_guidance_scale
         # Set once at request init from the base scale, which the refiner replaces.
         batch.do_classifier_free_guidance = config.refiner_guidance_scale > 1.0
-        _use_text_only_conditioning(batch)
-        _zero_negative_conditioning(batch)
+        if (text_only := batch.extra.get(TEXT_ONLY_EMBEDS_KEY)) is not None:
+            embeds, batch.prompt_attention_mask = text_only
+            batch.prompt_embeds = [embeds]
+        if batch.do_classifier_free_guidance:
+            # The refiner conditions on zeros, not the base negative prompt.
+            batch.negative_prompt_embeds = [torch.zeros_like(batch.prompt_embeds[0])]
+            batch.negative_attention_mask = batch.prompt_attention_mask.clone()
         return super()._prepare_denoising_loop(batch, server_args)
-
-
-def _use_text_only_conditioning(batch: Req) -> None:
-    text_only = batch.extra.get(TEXT_ONLY_EMBEDS_KEY)
-    if text_only is None:
-        return
-    prompt_embeds, prompt_mask = text_only
-    batch.prompt_embeds = [prompt_embeds]
-    batch.prompt_attention_mask = prompt_mask
-
-
-def _zero_negative_conditioning(batch: Req) -> None:
-    # The refiner conditions on zeros rather than the negative prompt.
-    if not batch.do_classifier_free_guidance:
-        return
-    batch.negative_prompt_embeds = [torch.zeros_like(batch.prompt_embeds[0])]
-    batch.negative_attention_mask = batch.prompt_attention_mask.clone()
 
 
 def _refiner_generators(
