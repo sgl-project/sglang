@@ -51,7 +51,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             "--quantization",
             "modelslim",
             "--mem-fraction-static",
-            "0.75",
+            "0.70",
         ]
 
         cls.process = popen_launch_server(

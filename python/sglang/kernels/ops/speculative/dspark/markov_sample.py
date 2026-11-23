@@ -265,6 +265,10 @@ class MarkovSampleStep:
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
+                # Older sgl-kernel-npu releases do not declare `softcap`; drop it
+                # when unused so those builds keep working.
+                if kwargs.get("softcap") is None:
+                    kwargs.pop("softcap", None)
                 return markov_sample_step_triton(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
