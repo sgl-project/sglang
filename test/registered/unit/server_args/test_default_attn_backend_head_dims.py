@@ -5,7 +5,8 @@ flashinfer for MHA models, and SGLang's flashinfer backend prefills with FA2.
 FA2 handles only head dims that are multiples of 64, and a vo dim above 256 only
 in multiples of 256. Other dims read out of bounds or return wrong results, and
 FlashInfer 0.7.5 rejects them in plan() (flashinfer-ai/flashinfer#4312). Models
-with such head dims default to triton instead.
+with such head dims default to triton instead. The same holds for the backend
+`--enable-deterministic-inference` picks on SM100/SM120.
 """
 
 import unittest
@@ -13,7 +14,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
-from sglang.srt.arg_groups.model_override_base import get_default_attn_backend
+from sglang.srt.arg_groups import overrides as overrides_module
+from sglang.srt.arg_groups.model_override_base import (
+    ResolvedView,
+    get_default_attn_backend,
+)
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -85,6 +90,46 @@ class TestDefaultAttnBackendHeadDims(CustomTestCase):
         self.assertEqual(
             self._default(_model_config(128, has_attention_sinks=True)), "triton"
         )
+
+
+class TestDeterministicAttnBackendHeadDims(CustomTestCase):
+    def _deterministic(self, model_config, *, is_sm100=True, is_sm120=False):
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                model_path="org/model",
+            )
+        )
+        with (
+            override_platform(is_xpu=False, is_sm100=is_sm100, is_sm120=is_sm120),
+            patch.object(
+                overrides_module, "model_config_of", return_value=model_config
+            ),
+        ):
+            return overrides_module._deterministic_attention_backend(view)
+
+    def test_blackwell_keeps_flashinfer_for_supported_head_dims(self):
+        for is_sm100, is_sm120 in ((True, False), (False, True)):
+            with self.subTest(is_sm100=is_sm100, is_sm120=is_sm120):
+                self.assertEqual(
+                    self._deterministic(
+                        _model_config(128), is_sm100=is_sm100, is_sm120=is_sm120
+                    ),
+                    {"attention_backend": "flashinfer"},
+                )
+
+    def test_blackwell_uses_triton_for_unsupported_head_dims(self):
+        for is_sm100, is_sm120 in ((True, False), (False, True)):
+            with self.subTest(is_sm100=is_sm100, is_sm120=is_sm120):
+                self.assertEqual(
+                    self._deterministic(
+                        _model_config(96), is_sm100=is_sm100, is_sm120=is_sm120
+                    ),
+                    {"attention_backend": "triton"},
+                )
 
 
 if __name__ == "__main__":

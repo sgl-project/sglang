@@ -301,7 +301,7 @@ def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
     return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
 
 
-def _flashinfer_fa2_serves_head_dims(model_config) -> bool:
+def flashinfer_fa2_serves_head_dims(model_config) -> bool:
     """Whether FlashInfer's FA2 prefill handles every (qk, vo) head-dim pair.
 
     FA2 needs both dims to be multiples of 64, and a vo dim above 256 to be a
@@ -375,7 +375,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
         else:
             # FlashInfer does not support attention sinks.
             if get_platform().has_flashinfer and not model_config.has_attention_sinks:
-                if _flashinfer_fa2_serves_head_dims(model_config):
+                if flashinfer_fa2_serves_head_dims(model_config):
                     return "flashinfer"
                 logger.info(
                     "FlashInfer FA2 prefill does not support head_dim=%s "
