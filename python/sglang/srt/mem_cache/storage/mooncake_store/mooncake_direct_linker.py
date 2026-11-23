@@ -4,7 +4,6 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from queue import Empty, Queue
