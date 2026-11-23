@@ -46,8 +46,8 @@ elif _is_xpu:
     )
 if _is_npu:
     from sgl_kernel_npu.operators.data_move import (
-        transfer_state_all_layer_direct_lf_pf,
-        transfer_state_per_layer_direct_pf_lf,
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_per_layer_direct_pf_lf,
     )
 
 logger = logging.getLogger(__name__)
@@ -492,7 +492,7 @@ class MambaPoolHost(HostKVCache):
                 dtype=torch.int64, device=dst.device, non_blocking=True
             )
             dst_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
-            transfer_state_per_layer_direct_pf_lf(
+            transfer_kv_per_layer_direct_pf_lf(
                 src=src,
                 dst=dst,
                 src_indices=src_indices,
@@ -628,7 +628,7 @@ class MambaPoolHost(HostKVCache):
             dst_indices = dst_indices.to(
                 dtype=torch.int64, device=device_states[0].device, non_blocking=True
             )
-            transfer_state_all_layer_direct_lf_pf(
+            transfer_kv_all_layer_direct_lf_pf(
                 device_states=device_states,
                 host_states=host_states,
                 device_indices=src_indices,
