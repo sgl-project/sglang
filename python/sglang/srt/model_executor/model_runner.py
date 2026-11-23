@@ -1705,7 +1705,13 @@ class ModelRunner:
 
             return UnoDecodeCudaGraphRunner
 
-        if self.spec_algorithm.is_none() and envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get():
+        # Beam requests are refused with speculative decoding and with pipeline
+        # parallelism, whose non-last ranks return no logits for the runner to trim.
+        if (
+            envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
+            and self.spec_algorithm.is_none()
+            and get_parallel().pp_size == 1
+        ):
             from sglang.srt.beam_search.decode_cuda_graph import (
                 BeamDecodeCudaGraphRunner,
             )
