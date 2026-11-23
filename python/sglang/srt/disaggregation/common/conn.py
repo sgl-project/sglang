@@ -2228,7 +2228,11 @@ class CommonKVManager(BaseKVManager):
                         response = session.get(
                             f"http://{bootstrap_addr}/health",
                             timeout=(2, 3),
-                            headers={"Connection": "keep-alive"},
+                            # The Rust server's /health skips its generation probe for this.
+                            headers={
+                                "Connection": "keep-alive",
+                                "X-SGLang-Bootstrap-Heartbeat": "1",
+                            },
                         )
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
@@ -3441,12 +3445,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
 
+            if pp_rank not in tp_group_table:
+                self._registered_count += 1
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
             )
-
-            self._registered_count += 1
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(

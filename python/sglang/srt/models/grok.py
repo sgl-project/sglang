@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.kernels.ops.activation.gelu_and_mul_triton import gelu_and_mul_triton
 from sglang.kernels.ops.layernorm.fused_rmsnorm import (
@@ -901,6 +902,7 @@ def _prepare_presharded_weights(
     revision: Optional[str],
     fall_back_to_pt: bool,
     allow_patterns_overrides: Optional[list[str]] = None,
+    safetensors_index_file: Optional[str] = SAFE_WEIGHTS_INDEX_NAME,
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
@@ -912,6 +914,7 @@ def _prepare_presharded_weights(
             revision,
             fall_back_to_pt,
             allow_patterns_overrides,
+            safetensors_index_file,
         )
 
     if not os.path.isdir(model_name_or_path):
@@ -947,6 +950,7 @@ def _prepare_presharded_weights(
             revision,
             fall_back_to_pt,
             allow_patterns_overrides,
+            safetensors_index_file,
         )
 
     if hf_weights_files[0].endswith("safetensors"):
