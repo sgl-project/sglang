@@ -22,6 +22,10 @@ cd "${sglang_source_path}"
 # CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
 # needs a writable transformers dynamic-module cache.
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+# Log the effective path: whether the dynamic-module cache is pod-local
+# (/tmp/hf_modules) or shared with the other nodes decides whether the
+# concurrent-copy race can also happen across pods.
+echo "HF_MODULES_CACHE=${HF_MODULES_CACHE}"
 
 echo "NPU info:"
 npu-smi info
