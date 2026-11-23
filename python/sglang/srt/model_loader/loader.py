@@ -28,6 +28,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -460,7 +461,7 @@ def _checkpoint_tensor_readers(
             return True
         return moe.loads_checkpoint_expert(expert_id)
 
-    def readers(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
+    def rank_of(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
         match = _EXPERT_ID_RE.search(name)
         layer_id = get_layer_id(name)
         # Some backends read per-expert scalars, e.g. input scales, on every rank.
@@ -474,12 +475,12 @@ def _checkpoint_tensor_readers(
     index, count = _node_local_peers(get_parallel().moe_ep_group.ranks)
     location = get_global_expert_location_metadata()
     m = None if location is None else location.physical_to_logical_map_cpu
-    node_reads = None
+    node_reads: Optional[Callable[[str, int], bool]] = None
     if (m is None or torch.equal(m, torch.arange(m.shape[-1]).expand_as(m))) and all(
         moe._expert_storage_rank == moe.moe_ep_rank for moe in moe_layers.values()
     ):
 
-        def node_reads(name: str, nbytes: int) -> bool:
+        def in_node_share(name: str, nbytes: int) -> bool:
             match = _EXPERT_ID_RE.search(name)
             layer_id = get_layer_id(name)
             if match is None or layer_id not in moe_layers or nbytes <= 8:
@@ -488,7 +489,8 @@ def _checkpoint_tensor_readers(
             block = expert_id // moe._num_local_routed - moe.moe_ep_rank + index
             return expert_id >= moe._num_global_routed or 0 <= block < count
 
-    return CheckpointTensorReaders(readers=readers, node_reads=node_reads)
+        node_reads = in_node_share
+    return CheckpointTensorReaders(rank_of=rank_of, node_reads=node_reads)
 
 
 class DefaultModelLoader(BaseModelLoader):

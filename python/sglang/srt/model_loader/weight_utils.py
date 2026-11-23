@@ -154,13 +154,11 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
 
 class CheckpointTensorReaders(msgspec.Struct, frozen=True):
     # (name, nbytes) -> (index, count) of this rank among the node's readers, or None.
-    readers: Callable[[str, int], Optional[Tuple[int, int]]]
+    rank_of: Callable[[str, int], Optional[Tuple[int, int]]]
     # (name, nbytes) -> whether the node reads the tensor; None if experts are not
     # placed in order, so the node's share cannot be told from the tensor name.
     node_reads: Optional[Callable[[str, int], bool]] = None
 
-    def __call__(self, name: str, nbytes: int) -> Optional[Tuple[int, int]]:
-        return self.readers(name, nbytes)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -1185,7 +1183,7 @@ def _read_tensors(
         info = header[name]
         begin, end = info["data_offsets"]
         begin, end = begin + 8 + size, end + 8 + size
-        if readers(name, end - begin) is None:
+        if readers.rank_of(name, end - begin) is None:
             continue
         dtype = _SAFETENSORS_DTYPES.get(info["dtype"])
         read = (  # Experts stacked in one tensor stay mapped; a rank copies its part.
@@ -1348,7 +1346,12 @@ def _prefetch_all_checkpoints(
         my_files = [(path, node_reads) for path in files]
     else:  # Prefetch only what the node reads, split by file among its readers.
         my_files = [
-            (path, lambda name, n, i=i: (r := readers(name, n)) and i % r[1] == r[0])
+            (
+                path,
+                lambda name, n, i=i: (
+                    (r := readers.rank_of(name, n)) and i % r[1] == r[0]
+                ),
+            )
             for i, path in enumerate(sorted_files)
         ]
     total_for_rank = len(my_files)

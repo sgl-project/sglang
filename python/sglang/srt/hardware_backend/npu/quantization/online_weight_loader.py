@@ -184,7 +184,12 @@ class NPUOnlineMoEWeightLoader:
         else:
             current = getattr(self.layer, f"{prefix}_weight")
             destinations = tuple(
-                self.layer._weight_loader_expert_ids(current, expert_id)
+                self.layer._weight_loader_expert_ids(
+                    expert_id,
+                    require_global_experts=getattr(
+                        current, "_sglang_require_global_experts", False
+                    ),
+                )
             )
             if not destinations:
                 # Nonlocal experts must not allocate or start a reload.

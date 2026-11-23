@@ -1279,7 +1279,12 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+        for local_expert_id in self._weight_loader_expert_ids(
+            expert_id,
+            require_global_experts=getattr(
+                param, "_sglang_require_global_experts", False
+            ),
+        ):
             self._weight_loader_impl(
                 param=param,
                 loaded_weight=loaded_weight,
@@ -1290,24 +1295,26 @@ class FusedMoE(torch.nn.Module):
 
     def loads_checkpoint_expert(self, expert_id: int) -> bool:
         """Whether this rank loads the checkpoint's routed expert ``expert_id``."""
-        return next(self._weight_loader_expert_ids(None, expert_id), None) is not None
+        expert_ids = self._weight_loader_expert_ids(
+            expert_id, require_global_experts=False
+        )
+        return next(expert_ids, None) is not None
 
     def _weight_loader_expert_ids(
-        self, param: Optional[torch.nn.Parameter], expert_id: int
+        self, expert_id: int, *, require_global_experts: bool
     ):
         """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
         if global_expert_location_metadata is None:
-            if not getattr(param, "_sglang_require_global_experts", False):
+            if not require_global_experts:
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
             yield expert_id
             return
 
-        require_global_experts = getattr(param, "_sglang_require_global_experts", False)
         shared_expert_id = (
             expert_id - global_expert_location_metadata.num_logical_experts
             if self._has_fused_shared and expert_id is not None
@@ -1339,7 +1346,7 @@ class FusedMoE(torch.nn.Module):
         for expert_id in physical_expert_ids:
             # Expert IDs are local unless this parameter explicitly requires
             # global expert storage. Preserve EPLB replicas and shared slots.
-            if not getattr(param, "_sglang_require_global_experts", False):
+            if not require_global_experts:
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id < 0 or expert_id >= self.num_local_experts:
                     continue
