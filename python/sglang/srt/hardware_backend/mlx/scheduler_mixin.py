@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import DynamicGradMode
 
@@ -84,8 +84,6 @@ class SchedulerMlxOverlapMixin:
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return True
-        # batch.has_grammar, not sampling_info.grammars: the latter is only
-        # populated at forward launch (see _build_logit_edit_rows).
         return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
@@ -155,6 +153,9 @@ class SchedulerMlxOverlapMixin:
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             self._prepare_mlx_launch(batch)
+            # Build the sampling plugins' step state, as Scheduler.run_batch does.
+            if self.is_generation:
+                batch.sampling_info.set_plugin_state(batch.reqs)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
@@ -210,7 +211,7 @@ class SchedulerMlxOverlapMixin:
             self.increment_scheduler_iterations()
 
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -255,8 +256,7 @@ class SchedulerMlxOverlapMixin:
             ):
                 self.cur_batch_for_debug = pending_next.schedule_batch
                 self.last_batch = pending_next.schedule_batch
-                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                    self.invariant_checker.self_check_during_busy()
+                self.invariant_checker.run(CheckPhase.BUSY, pending_next.schedule_batch)
                 continue
 
             # 4. Chain is broken. Finalise pending_next (if any), then
@@ -277,5 +277,4 @@ class SchedulerMlxOverlapMixin:
                 self.on_idle()
 
             self.last_batch = next_batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+            self.invariant_checker.run(CheckPhase.BUSY, next_batch)

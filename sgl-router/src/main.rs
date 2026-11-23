@@ -25,7 +25,11 @@ use sgl_router::{
         },
     },
     tokenizer::TokenizerRegistry,
-    workers::{introspect::worker_client, manager, WorkerRegistry},
+    workers::{
+        control::{ExternalWorkerSource, WorkerControlService},
+        introspect::worker_client,
+        manager, WorkerRegistry,
+    },
 };
 use std::{
     sync::Arc,
@@ -35,7 +39,6 @@ use tokio::{
     net::TcpListener,
     signal::unix::{signal, Signal, SignalKind},
     sync::{oneshot, watch},
-    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +61,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
+    #[cfg(feature = "fips")]
+    install_fips_crypto_provider()?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
@@ -121,25 +126,36 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
-    let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
-        &config,
-        &worker_registry,
-        &engine_state,
-        &local_inflight_requests,
-    )
-    .await?;
+    let (worker_events, discovery_handle) =
+        spawn_discovery(&config).await.context("spawn discovery")?;
+    let external_source = match &config.discovery {
+        DiscoveryBackend::K8s(_) => ExternalWorkerSource::Kubernetes,
+        DiscoveryBackend::StaticUrls(_) => ExternalWorkerSource::Static,
+    };
+    let (worker_control, control_rx) =
+        WorkerControlService::new(Arc::clone(&worker_registry), external_source);
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
     let mut app_context = build_app_context(
         &config,
         tokenizers,
-        worker_registry,
+        Arc::clone(&worker_registry),
         routing_policies,
-        local_inflight_requests,
+        Arc::clone(&local_inflight_requests),
         &engine_state,
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    app_context.worker_control = Some(Arc::clone(&worker_control));
+    let worker_manager_handle = tokio::spawn(manager::run_with_config_and_control(
+        worker_events,
+        control_rx,
+        worker_control,
+        Some(Arc::new(config.clone())),
+        Some(Arc::clone(&engine_state)),
+        Some(local_inflight_requests),
+        Some(Arc::clone(&app_context.metrics)),
+    ));
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
@@ -199,6 +215,26 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     Ok(())
 }
 
+/// Make aws-lc-rs's FIPS module the process-wide rustls provider before any TLS
+/// client is built (reqwest and kube take the installed default), and refuse to
+/// start unless the module runs in FIPS mode.
+#[cfg(feature = "fips")]
+fn install_fips_crypto_provider() -> Result<()> {
+    rustls::crypto::default_fips_provider()
+        .install_default()
+        .map_err(|_| {
+            anyhow::anyhow!("a rustls crypto provider was installed before the FIPS one")
+        })?;
+    aws_lc_rs::try_fips_mode()
+        .map_err(|e| anyhow::anyhow!("aws-lc-rs is not in FIPS mode: {e}"))?;
+    ensure!(
+        rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips()),
+        "the installed rustls crypto provider is not FIPS-approved"
+    );
+    tracing::info!("FIPS mode: aws-lc-rs FIPS module is the rustls crypto provider");
+    Ok(())
+}
+
 fn install_signal_handlers() -> Result<(Signal, Signal)> {
     let sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
@@ -206,6 +242,9 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 }
 
 fn log_startup(config: &Config) {
+    // Resolve (and log, or warn about) SGLANG_ROUTER_MAX_BODY_BYTES with the
+    // rest of the startup configuration, not when the router is first built.
+    sgl_router::server::routes::chat::max_chat_body_bytes();
     if let Some(advisory) = sgl_router::config::shutdown_drain_advisory(
         config.server.shutdown_drain_secs,
         config.server.termination_grace_secs,
@@ -329,25 +368,6 @@ async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
     }
 }
 
-async fn start_worker_discovery_and_manager(
-    config: &Config,
-    worker_registry: &Arc<WorkerRegistry>,
-    engine_state: &Arc<KvEventIndex>,
-    local_inflight_requests: &Arc<RouterInflightLoadRegistry>,
-) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
-    let (worker_events, discovery_handle) =
-        spawn_discovery(config).await.context("spawn discovery")?;
-    // Keep engine subscriptions and local request counters in sync with worker membership.
-    let worker_manager_handle = tokio::spawn(manager::run_with_config(
-        worker_events,
-        Arc::clone(worker_registry),
-        Some(Arc::new(config.clone())),
-        Some(Arc::clone(engine_state)),
-        Some(Arc::clone(local_inflight_requests)),
-    ));
-    Ok((discovery_handle, worker_manager_handle))
-}
-
 fn build_app_context(
     config: &Config,
     tokenizers: Arc<TokenizerRegistry>,
@@ -403,6 +423,20 @@ fn build_app_context(
             .tree()
             .pending()
             .set_max_followers(cache.pending_prefix_max_followers);
+        if cache.media_affinity_ttl_ms > 0 {
+            let ttl = Duration::from_millis(cache.media_affinity_ttl_ms);
+            let tree = engine_state.tree();
+            tree.media().enable(ttl);
+            tree.media_ranks().enable(ttl);
+            let ids = app_context.tokenizers.media_token_ids().to_vec();
+            if ids.is_empty() {
+                tracing::warn!(
+                    "--cache-media-affinity-ttl-ms is set but the tokenizer declares no image \
+                     placeholder token; media affinity stays inactive"
+                );
+            }
+            tree.set_media_tokens(ids);
+        }
     }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();

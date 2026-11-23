@@ -12,6 +12,7 @@ from transformers import (
     Gemma2Config,
     Gemma3TextConfig,
     LlamaConfig,
+    PretrainedConfig,
     Qwen3_5Config,
 )
 
@@ -20,6 +21,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_embedding_nemotron3,
     is_hybrid_swa_model,
     is_layer_types_hybrid_swa_model,
     is_multimodal_model,
@@ -133,6 +135,28 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestEmbeddingNemotron3Config(CustomTestCase):
+    def test_detects_bidirectional_mean_pooled_ministral3(self):
+        config = PretrainedConfig(
+            architectures=["Ministral3Model"], is_causal=False, pooling="avg"
+        )
+        self.assertTrue(is_embedding_nemotron3(config))
+
+    def test_does_not_misclassify_other_ministral3_checkpoints(self):
+        for fields in (
+            {"architectures": ["Ministral3Model"]},
+            {"architectures": ["Ministral3Model"], "is_causal": False},
+            {"architectures": ["Ministral3Model"], "pooling": "avg"},
+            {
+                "architectures": ["Ministral3ForCausalLM"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_embedding_nemotron3(PretrainedConfig(**fields)))
 
 
 class TestDraftModelConfig(CustomTestCase):
@@ -398,6 +422,30 @@ class TestAudioUnderstandableFlag(CustomTestCase):
                 audio_config={"num_mel_bins": 128}
             ).is_audio_understandable_model
         )
+
+
+class TestDisableMultimodal(CustomTestCase):
+    """--disable-multimodal must make a multimodal-by-default checkpoint
+    text-only; the Rust server refuses to start a multimodal model it has no
+    pipeline for, so serving such a model there depends on this."""
+
+    def _build(self, **server_args):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlavaForConditionalGeneration"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(
+                ServerArgs(model_path=checkpoint, **server_args)
+            )
+
+    def test_disable_turns_off_a_multimodal_checkpoint(self):
+        self.assertTrue(self._build().is_multimodal)
+        self.assertFalse(self._build(disable_multimodal=True).is_multimodal)
 
 
 class TestDefaultContextLength(CustomTestCase):

@@ -37,10 +37,11 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 _DEV = "cuda"
 _NUM_DRAFT = 4
@@ -57,6 +58,7 @@ def _runner_ids(req_to_token, page_size, n_pages):
     v2p = torch.randperm(n_pages, generator=g).to(torch.int64)
     v2p[0] = 0  # page 0 is the reserved sink
     t = RunnerIds.__new__(RunnerIds)
+    t._role_sub_pools = {}
     t.req_to_token = req_to_token
     t.page_size = page_size
     t.device = _DEV

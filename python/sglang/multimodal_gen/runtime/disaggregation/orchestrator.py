@@ -20,6 +20,7 @@ import zmq
 from transformers import AutoProcessor
 from zmq.utils.monitor import recv_monitor_message
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     DispatchPolicy,
     PoolDispatcher,
@@ -42,6 +43,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
     is_transfer_message,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.request import (
+    RequestUnpickler,
+    request_pickle_globals,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import init_metrics
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -120,9 +125,6 @@ class _EncoderTTAEntry:
 class _TransferRequestState:
     sender_role: RoleType = RoleType.ENCODER
     receiver_role: RoleType = RoleType.DENOISER
-    sender_session_id: str = ""
-    sender_pool_ptr: int = 0
-    sender_slot_offset: int = 0
     data_size: int = 0
     manifest: dict = None
     scalar_fields: dict = None
@@ -179,14 +181,15 @@ class DiffusionServer:
         encoder_capacity: int = 4,
         denoiser_capacity_per_worker: int = 2,
         decoder_capacity: int = 4,
-        p2p_mode: bool = True,
         server_args=None,
         glm_distributed_mode_enabled: bool = False,
         prompt_encoder_work_endpoints: list[str] | None = None,
         image_encoder_work_endpoints: list[str] | None = None,
         prompt_encoder_result_endpoint: str | None = None,
         image_encoder_result_endpoint: str | None = None,
+        sampling_params_cls: type = SamplingParams,
     ):
+        self._request_pickle_globals = request_pickle_globals(sampling_params_cls)
         split_encoding = bool(
             prompt_encoder_work_endpoints or image_encoder_work_endpoints
         )
@@ -246,7 +249,6 @@ class DiffusionServer:
         self._denoiser_tta: deque[_RoleTTAEntry] = deque()
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
-        self._transfer_mode = p2p_mode
         self._glm_distributed_state: _GlmDistributedModeState | None = None
 
         if glm_distributed_mode_enabled:
@@ -337,14 +339,6 @@ class DiffusionServer:
         self._assignments: dict[str, dict[RoleType, int]] = {}
 
     @property
-    def tracker(self) -> RequestTracker:
-        return self._tracker
-
-    @property
-    def dispatcher(self) -> PoolDispatcher:
-        return self._dispatcher
-
-    @property
     def is_alive(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 
@@ -419,16 +413,20 @@ class DiffusionServer:
         poller.register(frontend, zmq.POLLIN)
         result_roles = {}
         all_sockets = [frontend]
+        # bind fixed listeners before outbound connections can claim their ports
         for role, pool in self._pools.items():
-            for endpoint in pool.endpoints:
-                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
-                pool.pushes.append(sock)
             result, _ = get_zmq_socket(
                 self._context, zmq.PULL, pool.result_endpoint, bind=True, same_port=True
             )
             poller.register(result, zmq.POLLIN)
             result_roles[result] = role
-            all_sockets.extend([result, *pool.pushes])
+            all_sockets.append(result)
+
+        for pool in self._pools.values():
+            for endpoint in pool.endpoints:
+                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
+                pool.pushes.append(sock)
+            all_sockets.extend(pool.pushes)
 
         self._encoder_pushes = self._pools[self._input_role].pushes
         self._denoiser_pushes = self._pools[RoleType.DENOISER].pushes
@@ -551,7 +549,7 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
+            reqs = RequestUnpickler(payload, self._request_pickle_globals).load()
             if not isinstance(reqs, list):
                 reqs = [reqs]
             if len(reqs) != 1:
@@ -1112,7 +1110,7 @@ class DiffusionServer:
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
             msg = decode_transfer_msg(frames)
-        except (ValueError, Exception) as e:
+        except Exception as e:
             logger.error("DiffusionServer: failed to decode transfer message: %s", e)
             return
 
@@ -1211,9 +1209,6 @@ class DiffusionServer:
         p2p = _TransferRequestState(
             sender_role=role,
             receiver_role=next_role,
-            sender_session_id=msg.get("session_id", ""),
-            sender_pool_ptr=msg.get("pool_ptr", 0),
-            sender_slot_offset=msg.get("slot_offset", 0),
             data_size=msg.get("data_size", 0),
             manifest=msg.get("manifest", {}),
             scalar_fields=msg.get("scalar_fields", {}),
@@ -1439,9 +1434,6 @@ class DiffusionServer:
 
             if p2p is not None and msg.get("staged_for_decoder"):
                 # Denoiser slot freed later in _handle_transfer_pushed
-                p2p.sender_session_id = msg.get("session_id", "")
-                p2p.sender_pool_ptr = msg.get("pool_ptr", 0)
-                p2p.sender_slot_offset = msg.get("slot_offset", 0)
                 p2p.data_size = msg.get("data_size", 0)
                 p2p.manifest = msg.get("manifest", {})
                 p2p.scalar_fields = msg.get("scalar_fields", {})
@@ -1506,7 +1498,6 @@ class DiffusionServer:
             pending_count = len(self._pending)
         stats = {
             "role": "diffusion_server",
-            "transfer_mode": self._transfer_mode,
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,

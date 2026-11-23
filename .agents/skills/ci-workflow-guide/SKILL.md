@@ -14,7 +14,7 @@ The workflow files settle any disagreement with this guide. Counts that change w
 ## Naming Conventions
 
 - **Suite**: `{stage}-test-{runner_config}`, generated from each test's `register_cuda_ci(stage=..., runner_config=...)` (e.g. `base-b-test-1-gpu-small`, `nightly-test-8-gpu-b200`)
-- **runner_config**: a runner-pool key (`1-gpu-small`, `4-gpu-h100`, `2-gpu-gb300`); `scripts/ci/runner_configs.yml` maps it to the physical runner label. Runner configs are independent of tiers: any tier can run any runner config.
+- **runner_config**: a runner-pool key (`1-gpu-small`, `4-gpu-h100`, `2-gpu-gb300`); `scripts/ci/runner_configs.yml` maps it to the physical runner label and install. Runner configs are independent of tiers: any tier can run any runner config. A stage's kind (`diffusion` in `base-b-diffusion`) can replace the install through `kind_installs`; `scripts/ci/runner_configs.py` resolves the pair.
 - **Test group**: directory-level group under `test/registered/` (e.g. `hicache` maps to `test/registered/hicache/test_*.py`)
 
 ---
@@ -40,9 +40,10 @@ The workflow files settle any disagreement with this guide. Counts that change w
 | `.github/workflows/pr-test-extra.yml` | Extra tier, gated by `run-ci` and `run-ci-nv-extra` |
 | `.github/workflows/nightly-test-nvidia.yml`, `weekly-test-nvidia.yml` | Scheduled tiers: one matrix row per runner config |
 | `.github/workflows/_pr-test-stage.yml`, `_pr-test-stage-cpu.yml` | Reusable stage: checkout, health check, install, `run_suite.py` per shard |
+| `.github/workflows/_diffusion-pr-test-stage.yml` | Reusable diffusion lane, called by `pr-test-multimodal-gen.yml`: the same steps for one `base-b-diffusion*` stage and runner_config, one job per case partition |
 | `.github/workflows/_pr-test-check-changes.yml` | Path filters, partitions, retry and continue-on-error flags |
 | `scripts/ci/utils/compute_partitions.py` | Shard count and `max_parallel` per suite |
-| `scripts/ci/runner_configs.yml` | `runner_config` -> runner label |
+| `scripts/ci/runner_configs.yml` | `runner_config` -> runner label; stage kind -> install |
 | `test/run_suite.py` | Suite lists (`PER_COMMIT_SUITES`, `NIGHTLY_SUITES`, `OTHER_SUITES`); collects, filters, partitions, executes tests |
 | `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
 | `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
@@ -164,7 +165,7 @@ Retry classification: a failure matching `NON_RETRIABLE_PATTERNS` (import, synta
 
 Within a suite, `ci_register.py:auto_partition()` assigns files to shards with the LPT heuristic: sort by time descending (filename as tie-breaker), then give each file to the shard with the least total time.
 
-The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. CUDA diffusion lanes also run `test/run_suite.py` (suites `base-b-diffusion*-test-*`), but partition the 1-gpu and 2-gpu lanes by case with `compute_diffusion_partitions.py`; AMD diffusion jobs call `python/sglang/multimodal_gen/test/run_suite.py`.
 
 ---
 
@@ -226,10 +227,10 @@ Base CI covers only the core default paths; tests in the extra, nightly, and wee
 
 ### Opt-in CI tiers
 
-An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`: `nv-extra` selects `pr-test-extra.yml` (with its Xeon CPU coverage), and `amd-extra` selects `pr-test-amd-extra.yml`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for `/tag-run-ci-label <tier>`, `/tag-and-rerun-ci <tier>` and `/run-<tier>-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
+An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. NVIDIA and AMD have a Base selection (`nv`, `amd`, no label) and an Extra tier (`nv-extra` selects `pr-test-extra.yml`, `amd-extra` selects `pr-test-amd-extra.yml`). Every other hardware has only an Extra tier, `<hw>-extra` selecting `pr-test-<hw>.yml` (`xeon`, `npu`, `xpu`, `musa`, `arm64`, `mlx`, `mlu`, `ppu`). Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`; the slash handler reads it for the hardware arguments of `/run-ci`, `/run-extra-ci`, `/run-full-ci`, `/tag-run-ci-label` and `/tag-and-rerun-ci`, so adding a tier needs no handler change. A tier's workflows follow one convention, enforced by `scripts/lint/check_opt_in_ci_tiers.py` (pre-commit):
 
-1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`.** The gate live-fetches labels, so a missing opt-in fails the gate job (red run) and a rerun after labeling passes. Keep this decision out of event-payload expressions, which do not refresh on rerun.
-2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).
-3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-<tier>-ci` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run.
+1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>`, and skip every job that needs the gate when `needs.<gate>.outputs.opted-in == 'false'`.** The gate live-fetches labels; a missing opt-in passes the gate with `opted-in=false`, so the run is green with its tests skipped, and a full rerun after labeling runs them (`/run-extra-ci <hw>` reruns green runs). Keep this decision out of event-payload expressions, which do not refresh on rerun. A draft PR or a missing `run-ci` skips the same way in every workflow that uses the gate, so every job that needs the gate checks `opted-in`, finish jobs included, and a skipped run shows no passing check; only `pr-test-finish`, the required check, runs and fails then. The lint below enforces it.
+2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/run-extra-ci <hw>`).
+3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-extra-ci <hw>` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run.
 
-Tier names `base`, `cpu`, `extra`, `failed` and `full` are reserved: they collide with the base aliases, `/run-cpu-ci`, the hardware-specific Extra syntax, `/rerun-failed-ci` and `/run-full-ci`.
+The tier name `extra` is reserved: a tier name is also a slash-command hardware argument, and the bare `extra` argument is rejected as the retired shared tier.

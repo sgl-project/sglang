@@ -2,15 +2,23 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
 
-def quantize_k_cache(cache_k, dv: int | None = None):
-    return _quantize_k_cache_fast_wrapped(cache_k, dv=dv)
+
+def fp8_ds_mla_row_width(d_nope: int, d_rope: int) -> int:
+    """Bytes per fp8_ds_mla KV row: FP8 NoPE, FP32 scale per 128 NoPE, BF16 RoPE."""
+    return d_nope + 4 * (d_nope // 128) + 2 * d_rope
+
+
+def quantize_k_cache(cache_k, dv: int | None = None, scale_ue8m0: bool = False):
+    return _quantize_k_cache_fast_wrapped(cache_k, dv=dv, scale_ue8m0=scale_ue8m0)
 
 
 def quantize_k_cache_separate(
     k_nope: torch.Tensor,
     k_rope: torch.Tensor,
     tile_size: int = 128,
+    scale_ue8m0: bool = False,
 ):
     """
     Quantize k_nope and k_rope separately without concat, returns two tensors.
@@ -26,6 +34,8 @@ def quantize_k_cache_separate(
                 for no-PE MLA (empty rope); None is treated
                 the same as an empty rope.
         tile_size: quantization tile size (default 128)
+        scale_ue8m0: round each tile scale up to a power of two (1e-4 floor), as
+            the reference fp8_ds_mla cache writer does
 
     Returns:
         Tuple of (nope_part, rope_part) where:
@@ -61,7 +71,10 @@ def quantize_k_cache_separate(
         )
 
     return _quantize_k_cache_fast_separate(
-        k_nope=k_nope_2d, k_rope=k_rope_2d, group_size=tile_size
+        k_nope=k_nope_2d,
+        k_rope=k_rope_2d,
+        group_size=tile_size,
+        scale_ue8m0=scale_ue8m0,
     )
 
 
@@ -69,6 +82,7 @@ def _quantize_k_cache_fast_wrapped(
     input_k_cache: torch.Tensor,
     dv: int | None = None,
     tile_size: int = 128,
+    scale_ue8m0: bool = False,
 ) -> torch.Tensor:
     # TODO the final API may be 2D instead of 4D, thus we convert them here
     num_blocks, block_size, _, dim_nope_and_rope = input_k_cache.shape
@@ -91,12 +105,16 @@ def _quantize_k_cache_fast_wrapped(
     k_nope = input_k_cache[:, :dv]
     k_rope = input_k_cache[:, dv:]
 
-    output = _quantize_k_cache_fast(k_nope=k_nope, k_rope=k_rope)
+    output = _quantize_k_cache_fast(
+        k_nope=k_nope, k_rope=k_rope, scale_ue8m0=scale_ue8m0
+    )
 
     return output.view(num_blocks, block_size, 1, -1)
 
 
-def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
+def _quantize_k_cache_fast(
+    k_nope, k_rope, group_size: int = 128, scale_ue8m0: bool = False
+):
     """
     :param k_nope: (num_tokens, dim_nope 512)
     :param k_rope: (num_tokens, dim_rope 64)
@@ -147,12 +165,15 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        SCALE_UE8M0=scale_ue8m0,
     )
 
     return output
 
 
-def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
+def _quantize_k_cache_fast_separate(
+    k_nope, k_rope, group_size: int = 128, scale_ue8m0: bool = False
+):
     """
     Quantize k_nope and k_rope in a single Triton kernel, directly outputting two separate tensors.
 
@@ -170,9 +191,12 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
 
     assert num_tokens == num_tokens_, f"k_nope and k_rope must have same num_tokens"
 
-    # Ensure contiguous tensors for kernel
-    k_nope = k_nope.contiguous()
-    k_rope = k_rope.contiguous()
+    # gfx950: the kernel addresses rows by stride, so column slices of the kv_a
+    # output (k_rope) need no copy, only a packed inner dim.
+    if not is_gfx95_supported() or k_nope.stride(-1) != 1:
+        k_nope = k_nope.contiguous()
+    if not is_gfx95_supported() or k_rope.stride(-1) != 1:
+        k_rope = k_rope.contiguous()
 
     num_tiles = dim_nope // group_size
 
@@ -228,6 +252,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
         DIM_ROPE=dim_rope,
         FP8_MIN=torch.finfo(torch.float8_e4m3fn).min,
         FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+        SCALE_UE8M0=scale_ue8m0,
     )
 
     # Add middle dimension for compatibility with set_mla_kv_buffer_triton
@@ -252,6 +277,7 @@ def _quantize_k_cache_fast_kernel(
     DIM_ROPE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
@@ -268,6 +294,12 @@ def _quantize_k_cache_fast_kernel(
 
         # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
         y_s = tl.max(tl.abs(y)) / FP8_MAX
+        if SCALE_UE8M0:
+            # exp2(ceil(log2(max(s, 1e-4)))) on the exponent bits, so exact
+            # powers of two stay put
+            y_s_bits = tl.maximum(y_s, 1e-4).to(tl.int32, bitcast=True)
+            y_s_exp = (y_s_bits >> 23) + ((y_s_bits & 0x7FFFFF) != 0).to(tl.int32)
+            y_s = (y_s_exp << 23).to(tl.float32, bitcast=True)
         y_s_inv = 1.0 / y_s
         y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
             output_nope_q_ptr.dtype.element_ty

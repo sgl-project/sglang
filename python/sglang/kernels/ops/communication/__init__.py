@@ -33,12 +33,14 @@ for _mod, _fn in [
     ("all_reduce_residual", "all_reduce_pull_res"),
     ("all_reduce_residual", "all_reduce_pull_norm"),
     ("gemm_ag", "gemm_ag_up_proj"),
+    ("moe_front_ag", "moe_front_all_gather"),
     ("sp_collective", "reduce_scatter_res"),
     ("sp_collective", "reduce_scatter_pull"),
     ("sp_collective", "all_gather"),
     ("sp_collective", "all_gather_direct"),
     ("attn_res_collective", "attn_res_fused_pull_rs"),
     ("attn_res_collective", "attn_res_fused_direct_ag"),
+    ("gemm_ag", "gather_add3"),
 ]:
     register_kernel(
         KernelSpec(
@@ -49,6 +51,14 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="communication.engram_gather_peer",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.communication.engram_gather_peer:engram_gather_peer",
+    )
+)
 
 register_kernel(
     KernelSpec(

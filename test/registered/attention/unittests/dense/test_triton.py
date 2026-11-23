@@ -31,8 +31,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=19, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, suite="base-b-test-1-gpu-large-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

@@ -96,6 +96,43 @@ async fn pd_generate_sends_one_bootstrap_room_to_both_workers() {
     assert_eq!(p["bootstrap_port"], 8997);
 }
 
+/// Under PD only prefill computes the prompt, so a non-streaming `/generate`
+/// asking for logprobs gets prefill's input logprobs before decode's.
+#[tokio::test]
+async fn pd_generate_merges_prefill_input_logprobs() {
+    let answer =
+        |logprobs: Value| json!({"text": "ok", "meta_info": {"input_token_logprobs": logprobs}});
+    let prefill = MockWorker::start_returning_error(
+        StatusCode::OK,
+        answer(json!([[null, 1, null], [-0.5, 2, null]])),
+    )
+    .await;
+    let decode =
+        MockWorker::start_returning_error(StatusCode::OK, answer(json!([[-0.25, 3, null]]))).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill),
+        (&decode, WorkerMode::Decode),
+    ];
+    let app = radix_router(&workers, HashTree::new());
+
+    for (return_logprob, expected) in [
+        (
+            true,
+            json!([[null, 1, null], [-0.5, 2, null], [-0.25, 3, null]]),
+        ),
+        (false, json!([[-0.25, 3, null]])),
+    ] {
+        let body = json!({"input_ids": [1, 2, 3], "return_logprob": return_logprob});
+        let res = send(&app, "POST", &body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let response: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
+        assert_eq!(
+            response["meta_info"]["input_token_logprobs"], expected,
+            "return_logprob={return_logprob}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn generate_routes_text_to_the_worker_caching_its_prefix() {
     let (cached, uncached) = (

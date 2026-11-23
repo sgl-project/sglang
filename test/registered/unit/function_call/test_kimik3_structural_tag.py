@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    MESSAGE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -201,6 +202,48 @@ def test_required_allows_response_prefix_but_requires_tools():
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)
+
+
+def test_required_rejects_message_close_before_tools():
+    grammar = _grammar([_tool()], tool_choice="required")
+    response = "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>"
+
+    assert not _accepts(grammar, response + MESSAGE_CLOSE)
+    assert not _accepts(
+        grammar, response + MESSAGE_CLOSE + _tools_section(_valid_weather_call())
+    )
+    assert _accepts(
+        grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
+    )
+    assert not _accepts(grammar, response + "<|close|>messagemessage<|sep|>")
+    for near_miss in (
+        "<|close|>Message<|sep|>",
+        "<|close|>_message<|sep|>",
+        TOOLS_CLOSE,
+    ):
+        assert not _accepts(grammar, response + near_miss)
+    assert not _accepts(grammar, "<|open|>response<|sep|>Hi" + TOOLS_CLOSE)
+
+
+def test_tool_choice_none_rejects_tools_section():
+    grammar = _grammar([_tool()], tool_choice="none")
+    plain = "<|open|>response<|sep|>Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE
+
+    assert _accepts(grammar, plain)
+    assert not _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "<|open|>tools<|close|>message<|sep|>")
+    assert not _accepts(grammar, "<|sep|><|close|>tools<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "")
+    for blank in ("", " ", "\n\n"):
+        empty = f"<|open|>response<|sep|>{blank}<|close|>response<|sep|>"
+        assert not _accepts(grammar, empty + MESSAGE_CLOSE)
+    for text in ("é", "👋 hi", "<b>bold</b>", "x"):
+        response = f"<|open|>response<|sep|>{text}<|close|>response<|sep|>"
+        assert _accepts(grammar, response)
+    assert not _accepts(grammar, "<|open|>response<|sep|>x<|close|>Message<|sep|>")
+    assert _accepts(
+        grammar, "<|open|>response<|sep|>- **a** é\n<b><|close|>response<|sep|>"
+    )
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():
@@ -932,6 +975,29 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+def test_output_may_start_inside_the_prefilled_response():
+    # Without thinking the prompt ends with the response open marker.
+    call = _tools_section(_valid_weather_call())
+    required = _grammar([_tool()], tool_choice="required")
+    assert _accepts(
+        required, "Hi there!<|close|>response<|sep|>" + call + MESSAGE_CLOSE
+    )
+    assert not _accepts(required, "Hi there!<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(
+        required, "Hi<|close|>response<|sep|>" + MESSAGE_CLOSE + call + MESSAGE_CLOSE
+    )
+
+    none = _grammar([_tool()], tool_choice="none")
+    assert _accepts(none, "Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
+
+
+def test_single_call_auto_admits_the_turn_close():
+    grammar = _grammar([_tool()], parallel_tool_calls=False)
+    assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
 
 
 if __name__ == "__main__":
