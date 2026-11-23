@@ -47,6 +47,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _apply_qk_norm,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_attention_core_bcg,
     _minimax_h3_group_attend,
     _modulate_gate,
     _norm,
@@ -132,6 +133,117 @@ def test_embedding_pool_outputs_match_eager_across_replays():
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
     finally:
         runner.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
+@torch.no_grad()
+def test_attention_replay_uses_current_h3_branch_boundaries():
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_bounds,
+    )
+
+    impl = SDPAImpl(num_heads=2, head_size=32, causal=False, softmax_scale=32**-0.5)
+    attn = SimpleNamespace(
+        _attention_impl=impl, _attention_backend_enum=AttentionBackendEnum.TORCH_SDPA
+    )
+
+    class Attention(torch.nn.Module):
+        def forward(self, qkv, cu):
+            q, k, v = qkv.unbind(0)
+            return (
+                _minimax_h3_attention_core_bcg(
+                    attn,
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu,
+                    cu_seqlens_host=(),
+                    max_seqlen=64,
+                    ulysses_active=False,
+                )
+                + 1
+            )
+
+    device = torch.device("cuda")
+    qkv = torch.randn(3, 64, 2, 32, device=device, dtype=torch.bfloat16)
+    runner = BaseBreakableCudaGraphRunner(Attention(), device)
+    try:
+        for i, used in enumerate((25, 53, 25)):
+            bounds = (0, used, 64)
+            cu = torch.tensor(bounds, device=device, dtype=torch.int32)
+            token = live_packed_bounds.set(bounds)
+            try:
+                if i == 0:
+                    assert runner.capture(qkv=qkv, cu=cu)
+                ref = (
+                    impl.forward_varlen(
+                        *qkv.unbind(0),
+                        cu_seqlens=cu,
+                        cu_seqlens_host=bounds,
+                        max_seqlen=used,
+                    )
+                    + 1
+                )
+                with patch.object(runner, "replay", wraps=runner.replay) as replay:
+                    got = runner(qkv=qkv, cu=cu)
+                    replay.assert_called_once()
+                torch.testing.assert_close(got, ref, rtol=0, atol=0)
+            finally:
+                live_packed_bounds.reset(token)
+    finally:
+        runner.reset()
+
+
+def test_bcg_live_bounds_keep_ring_and_ulysses_lengths_separate(monkeypatch):
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_bounds,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as h3
+
+    q = torch.zeros(64, 2, 32)
+    packed = torch.tensor([0, 9, 64], dtype=torch.int32)
+    attn = SimpleNamespace(
+        _attention_impl=Mock(),
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        head_dim=32,
+        q_norm=Mock(),
+        k_norm=Mock(),
+    )
+    token = live_packed_bounds.set((0, 9, 64))
+    try:
+        args = dict(cu_seqlens=packed, cu_seqlens_host=(), max_seqlen=64)
+        h3._minimax_h3_attention_core_impl(attn, q, q, q, **args, ulysses_active=False)
+        assert attn._attention_impl.forward_varlen.call_args.kwargs["max_seqlen"] == 55
+        ring = Mock(return_value=q)
+        monkeypatch.setattr(h3, "get_ring_ctx", lambda: (2, 0))
+        monkeypatch.setattr(h3, "_ring_attention_varlen", ring)
+        h3._minimax_h3_attention_core_impl(
+            attn, q, q, q, **args, ulysses_active=False, ring_active=True
+        )
+        assert ring.call_args.kwargs["real_seq_len"] == 9
+        pipeline = Mock(return_value=q)
+        monkeypatch.setattr(h3, "_minimax_h3_pipelined_dense_attention", pipeline)
+        monkeypatch.setenv("SGLANG_DIFFUSION_FLASHINFER_ULYSSES", "false")
+        monkeypatch.setenv("SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", "2")
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        assert (
+            h3._minimax_h3_qknorm_rope_pipelined_attention(
+                attn, q, q, q, (q, q), **args
+            )
+            is q
+        )
+        assert pipeline.call_args.kwargs["cu_seqlens_host"] == (0, 9, 64)
+        assert pipeline.call_args.kwargs["max_seqlen"] == 55
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        assert (
+            h3._minimax_h3_qknorm_rope_pipelined_attention(
+                attn, q, q, q, (q, q), **args
+            )
+            is None
+        )
+        pipeline.assert_called_once()
+    finally:
+        live_packed_bounds.reset(token)
 
 
 def test_pruned_adaln_lora_projection_preserves_affine_term():

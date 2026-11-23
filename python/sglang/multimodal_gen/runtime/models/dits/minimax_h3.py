@@ -996,6 +996,17 @@ def _minimax_h3_collective_pipelined_attention(
     return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
 
 
+def _live_attention_bounds(cu_seqlens: torch.Tensor) -> tuple[tuple[int, ...], int]:
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_bounds,
+    )
+
+    # Direct runner callers do not install the stage's host metadata. This
+    # fallback is reached outside stream capture (or inside the eager break).
+    bounds = live_packed_bounds.get() or tuple(cu_seqlens.tolist())
+    return bounds, max(b - a for a, b in itertools.pairwise(bounds))
+
+
 def _minimax_h3_qknorm_rope_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
@@ -1023,6 +1034,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
+    if cu_seqlens_host == ():
+        cu_seqlens_host, max_seqlen = _live_attention_bounds(cu_seqlens)
     _minimax_h3_bind_attention_backend(attention, q.dtype)
     cos_sin_cache, positions = rope_cache
     head_dim = attention.head_dim
@@ -1098,6 +1111,9 @@ def _minimax_h3_attention_core_impl(
     residuals, and MLPs remain captured while the dynamic packed attention
     kernel and sequence-parallel collectives execute eagerly.
     """
+
+    if cu_seqlens_host == ():
+        cu_seqlens_host, max_seqlen = _live_attention_bounds(cu_seqlens)
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
@@ -1185,7 +1201,9 @@ def _minimax_h3_attention_core_impl(
             k,
             v,
             attn_impl=attention._attention_impl,
-            real_seq_len=max_seqlen,
+            real_seq_len=cu_seqlens_host[1]
+            if cu_seqlens_host is not None
+            else max_seqlen,
             ring_ws=ring_ws,
         )
     else:
@@ -3395,14 +3413,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             torch.int32
         )
         raw_cu_seqlens_host = self._psp_optional_field(psp, "cu_seqlens_q_host")
-        cu_seqlens_host = tuple(
-            int(value)
-            for value in (
-                cu_seqlens.tolist()
-                if raw_cu_seqlens_host is None
-                else raw_cu_seqlens_host
+        if self._psp_optional_field(psp, "bcg_live_bounds"):
+            cu_seqlens_host = ()
+        else:
+            cu_seqlens_host = tuple(
+                int(value)
+                for value in (
+                    cu_seqlens.tolist()
+                    if raw_cu_seqlens_host is None
+                    else raw_cu_seqlens_host
+                )
             )
-        )
         # max_seqlen_q is set to cu_seqlens[1] (`used`, the real/non-padding
         # row count) by construction -- already a plain host int here, so
         # ring can reuse it as real_seq_len below with no new device sync.

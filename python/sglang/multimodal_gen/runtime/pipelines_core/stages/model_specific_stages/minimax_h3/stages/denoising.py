@@ -1197,9 +1197,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+                live_packed_bounds,
+                supports_live_packed_bounds,
+            )
+
+            if not supports_live_packed_bounds(call_kwargs):
+                return model(**call_kwargs)
             # timestep bits are eager memo keys, not graph specialization inputs
             call_kwargs.pop("adaln_timestep_bits", None)
-            return self._bcg_run(runner, call_kwargs, model)
+            bounds = tuple(call_kwargs["packed_seq_params"]["cu_seqlens_q_host"])
+            token = live_packed_bounds.set(bounds)
+            try:
+                return self._bcg_run(runner, call_kwargs, model)
+            finally:
+                live_packed_bounds.reset(token)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         # The base checks minus batch.generator: H3 seeds its own noise from

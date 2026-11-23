@@ -616,14 +616,42 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             "packed_seq_params": {
                 "cu_seqlens_q": torch.tensor([0, used, packed_seq], dtype=torch.int32),
                 "max_seqlen_q": used,
+                "cu_seqlens_q_host": (0, used, packed_seq),
+                "txt_len": text_seq,
+                "video_spans": [(text_seq + audio_seq, used)],
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
                     [0, text_seq, text_seq], dtype=torch.int32
                 ),
                 "max_seqlen_q": text_seq,
+                "cu_seqlens_q_host": (0, text_seq, text_seq),
             },
         }
+
+    def test_minimax_h3_keeps_unrecognized_packing_unchanged(self):
+        from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+            supports_live_packed_bounds,
+        )
+
+        for which, bounds in [
+            ("packed_seq_params", (0, 10, 25, 64)),
+            ("packed_seq_params", (0, 53, 64)),
+            ("refiner_packed_seq_params", (0, 5, 19)),
+        ]:
+            kwargs = self._minimax_h3_kwargs(19)
+            kwargs[which].update(
+                cu_seqlens_q=torch.tensor(bounds, dtype=torch.int32),
+                cu_seqlens_q_host=bounds,
+            )
+            self.assertFalse(supports_live_packed_bounds(kwargs))
+            with self._patch_buckets(64):
+                self.assertIs(
+                    self.stage._bcg_pad_prompt_kwargs(
+                        kwargs, current_model=self.minimax_h3_model
+                    ),
+                    kwargs,
+                )
 
     def test_minimax_h3_prompt_lengths_share_bucket_signature(self):
         with self._patch_buckets(64, 128):
