@@ -88,35 +88,6 @@ def forward_fuseep(
         return hidden_states
 
     buf = _get_fuseep_buffer(layer)
-    fuseep_mode = get_exec().moe.fuseep_mode
-    if fuseep_mode == 3:
-        config = layer.moe_runner_config
-        hidden_states, _ = buf.fused_deep_moe(
-            x=hidden_states,
-            topk_idx=topk_output.topk_ids.to(torch.int32),
-            topk_weights=topk_output.topk_weights.to(torch.float32),
-            gmm1_permuted_weight=layer.w13_weight,
-            gmm1_permuted_weight_scale=layer.w13_weight_scale,
-            gmm2_weight=layer.w2_weight,
-            gmm2_weight_scale=layer.w2_weight_scale,
-            num_max_dispatch_tokens_per_rank=(
-                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-            ),
-            backend="mega_moe",
-            activation="situ",
-            beta=config.gemm1_alpha if config.gemm1_alpha is not None else 4.0,
-            linear_beta=(
-                config.gemm1_clamp_limit
-                if config.gemm1_clamp_limit is not None
-                else 25.0
-            ),
-            l1_bias=layer.w13_scale_bias,
-            l2_bias=layer.w2_scale_bias,
-            num_experts=layer.num_experts,
-            max_recv_token_num=60000,
-        )
-        return hidden_states
-
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
         topk_idx=topk_output.topk_ids,
@@ -570,64 +541,3 @@ def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
                 requires_grad=False,
             ),
         )
-
-
-def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
-    """Convert W4A8 expert tensors to the per-expert MegaMoE ABI."""
-    if getattr(layer, "_mega_moe_weights_processed", False):
-        return
-
-    bias_attrs = {}
-    for prefix in ("w13", "w2"):
-        scale_bias_attr = f"{prefix}_scale_bias"
-        raw_bias_attr = f"{prefix}_bias"
-        if hasattr(layer, scale_bias_attr):
-            bias_attrs[prefix] = scale_bias_attr
-        elif hasattr(layer, raw_bias_attr):
-            bias_attrs[prefix] = raw_bias_attr
-        else:
-            raise RuntimeError(
-                "FuseEP mode 3 requires ModelSlim W4A8 scale bias for both "
-                f"expert projections; missing {scale_bias_attr}/{raw_bias_attr}."
-            )
-
-    converted = {}
-    for prefix in ("w13", "w2"):
-        weight = getattr(layer, f"{prefix}_weight")
-        scale = getattr(layer, f"{prefix}_weight_scale")
-        bias = getattr(layer, bias_attrs[prefix])
-
-        converted[f"{prefix}_weight"] = [
-            npu_format_cast(expert.transpose(-2, -1).contiguous()).view(torch.int32)
-            for expert in weight.data.unbind(dim=0)
-        ]
-        converted[f"{prefix}_weight_scale"] = [
-            expert.reshape(-1)
-            .to(torch.float32)
-            .view(torch.int32)
-            .to(torch.int64)
-            .view(torch.uint64)
-            for expert in scale.data.unbind(dim=0)
-        ]
-        converted[f"{prefix}_scale_bias"] = [
-            expert.reshape(expert.shape[0], -1).sum(dim=-1).to(torch.float32)
-            for expert in bias.data.unbind(dim=0)
-        ]
-
-    for prefix in ("w13", "w2"):
-        for attr in (
-            f"{prefix}_weight",
-            f"{prefix}_weight_scale",
-            bias_attrs[prefix],
-        ):
-            if hasattr(layer, attr):
-                delattr(layer, attr)
-        setattr(layer, f"{prefix}_weight", converted[f"{prefix}_weight"])
-        setattr(
-            layer,
-            f"{prefix}_weight_scale",
-            converted[f"{prefix}_weight_scale"],
-        )
-        setattr(layer, f"{prefix}_scale_bias", converted[f"{prefix}_scale_bias"])
-
-    layer._mega_moe_weights_processed = True
