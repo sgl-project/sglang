@@ -2,12 +2,15 @@ import asyncio
 import concurrent
 import concurrent.futures
 import concurrent.futures.process
+import copy
 import dataclasses
 import multiprocessing as mp
 import os
 import re
 import threading
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import (
     Any,
     Dict,
@@ -57,6 +60,10 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.utils import envs, logger
+
+_RUNTIME_MM_REQUEST: ContextVar[Optional[object]] = ContextVar(
+    "sglang_runtime_mm_request", default=None
+)
 
 
 @dataclasses.dataclass
@@ -453,6 +460,111 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         """
         return None, None
 
+    @contextmanager
+    def request_context(self, request_obj):
+        token = _RUNTIME_MM_REQUEST.set(request_obj)
+        try:
+            yield
+        finally:
+            _RUNTIME_MM_REQUEST.reset(token)
+
+    @staticmethod
+    def _deep_merge_dicts(
+        base: Optional[Dict[str, Any]],
+        override: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        merged = copy.deepcopy(base or {})
+
+        def merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+            for key, value in source.items():
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge_into(target[key], value)
+                else:
+                    target[key] = copy.deepcopy(value)
+
+        if override:
+            merge_into(merged, override)
+        return merged
+
+    def _get_runtime_request(self):
+        return _RUNTIME_MM_REQUEST.get()
+
+    def _get_runtime_request_dict(
+        self,
+        field_name: str,
+        *,
+        validate_modalities: bool = False,
+    ) -> Dict[str, Any]:
+        request_obj = self._get_runtime_request()
+        value = (
+            getattr(request_obj, field_name, None) if request_obj is not None else None
+        )
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"{field_name} must be a dict when provided.")
+        if validate_modalities:
+            for modality in ("image", "video", "audio"):
+                if modality in value and not isinstance(value[modality], dict):
+                    raise ValueError(
+                        f"{field_name}['{modality}'] must be a dict when provided."
+                    )
+        return value
+
+    def _get_effective_modality_process_config(self, modality: str) -> Dict[str, Any]:
+        base_config = getattr(self, f"{modality}_config", {}) or {}
+        runtime_config = self._get_runtime_request_dict(
+            "mm_process_config", validate_modalities=True
+        ).get(modality, {})
+        return self._deep_merge_dicts(base_config, runtime_config)
+
+    def _get_runtime_processor_kwargs(self) -> Dict[str, Any]:
+        return self._get_runtime_request_dict("processor_kwargs")
+
+    def _get_runtime_io_kwargs(self) -> Dict[str, Any]:
+        return self._get_runtime_request_dict("io_kwargs", validate_modalities=True)
+
+    def _merge_runtime_processor_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        runtime_kwargs = self._get_runtime_processor_kwargs()
+        if not runtime_kwargs:
+            return kwargs
+
+        reserved = {
+            "text",
+            "padding",
+            "return_tensors",
+            "images",
+            "videos",
+            "audio",
+            "audios",
+        }
+        collisions = reserved.intersection(runtime_kwargs.keys())
+        if collisions:
+            raise ValueError(
+                "processor_kwargs cannot override reserved processor inputs: "
+                + ", ".join(sorted(collisions))
+            )
+
+        return self._deep_merge_dicts(kwargs, runtime_kwargs)
+
+    def _get_effective_io_settings(
+        self,
+        *,
+        discard_alpha_channel: bool = True,
+        audio_sample_rate: Optional[int] = None,
+        video_frame_count_limit: Optional[int] = None,
+    ) -> Tuple[bool, Optional[int], Optional[int]]:
+        io_kwargs = self._get_runtime_io_kwargs()
+        image_io = io_kwargs.get("image", {})
+        audio_io = io_kwargs.get("audio", {})
+        video_io = io_kwargs.get("video", {})
+
+        return (
+            image_io.get("discard_alpha_channel", discard_alpha_channel),
+            audio_io.get("audio_sample_rate", audio_sample_rate),
+            video_io.get("frame_count_limit", video_frame_count_limit),
+        )
+
     @property
     def spatial_merge_size(self):
         return self.hf_config.vision_config.spatial_merge_size
@@ -670,18 +782,20 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         process multimodal data with transformers AutoProcessor
         """
         processor, tokenizer = self._resolve_processor(processor)
+        image_config = self._get_effective_modality_process_config("image")
+        video_config = (
+            self._get_effective_modality_process_config("video")
+            if processor_video_config is None
+            else processor_video_config
+        )
+        audio_config = self._get_effective_modality_process_config("audio")
 
         if images:
             kwargs["images"] = images
-            if self.image_config:
-                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
+            if image_config:
+                kwargs.setdefault("images_kwargs", {}).update(image_config)
         if videos:
             kwargs["videos"] = videos
-            video_config = (
-                self.video_config
-                if processor_video_config is None
-                else processor_video_config
-            )
             if video_config:
                 kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
@@ -701,8 +815,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
-            if self.audio_config:
-                kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
+            if audio_config:
+                kwargs.setdefault("audio_kwargs", {}).update(audio_config)
+
+        kwargs = self._merge_runtime_processor_kwargs(kwargs)
 
         processor_device = None
         if (
@@ -789,6 +905,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
         audio_sample_rate: Optional[int] = None,
+        video_frame_count_limit: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
@@ -825,6 +942,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                         raise ValueError(
                             "Mismatch between image tokens and estimated frame counts."
                         )
+                elif modality == Modality.VIDEO:
+                    frame_count_limit = video_frame_count_limit
 
                 futures.append(
                     self.io_executor.submit(
@@ -881,7 +1000,18 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        video_frame_count_limit: Optional[int] = None,
     ) -> BaseMultiModalProcessorOutput:
+        (
+            discard_alpha_channel,
+            audio_sample_rate,
+            video_frame_count_limit,
+        ) = self._get_effective_io_settings(
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
+            video_frame_count_limit=video_frame_count_limit,
+        )
+
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
@@ -935,6 +1065,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 return_text=return_text,
                 discard_alpha_channel=discard_alpha_channel,
                 audio_sample_rate=audio_sample_rate,
+                video_frame_count_limit=video_frame_count_limit,
                 input_ids=input_ids,
             )
         # For models other than MiniCPMO and MiniCPMV,
@@ -948,6 +1079,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return_text=return_text,
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
+            video_frame_count_limit=video_frame_count_limit,
             input_ids=input_ids,
         )
 
@@ -961,6 +1093,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        video_frame_count_limit: Optional[int] = None,
         input_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
@@ -972,6 +1105,16 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
           2. It returns the loaded images, videos, and audios in their original order.
           3. It returns the input prompt as a string.
         """
+
+        (
+            discard_alpha_channel,
+            audio_sample_rate,
+            video_frame_count_limit,
+        ) = self._get_effective_io_settings(
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
+            video_frame_count_limit=video_frame_count_limit,
+        )
 
         # Convert prompt into str
         if isinstance(prompt, list) and return_text:
@@ -987,6 +1130,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             audio_data,
             audio_sample_rate=audio_sample_rate,
             discard_alpha_channel=discard_alpha_channel,
+            video_frame_count_limit=video_frame_count_limit,
         )
 
         return BaseMultiModalProcessorOutput(
@@ -1007,6 +1151,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        video_frame_count_limit: Optional[int] = None,
         input_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
@@ -1046,6 +1191,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
+            video_frame_count_limit=video_frame_count_limit,
         )
         task_info_iter = iter(task_info)
         futures_iter = iter(futures)

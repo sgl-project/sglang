@@ -22,6 +22,7 @@ import dataclasses
 import errno
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import signal
@@ -1984,6 +1985,9 @@ async def openai_v1_audio_transcriptions(
     timestamp_granularities: Optional[List[str]] = Form(
         default=None, alias="timestamp_granularities[]"
     ),
+    processor_kwargs: Optional[str] = Form(default=None),
+    mm_process_config: Optional[str] = Form(default=None),
+    io_kwargs: Optional[str] = Form(default=None),
 ):
     """OpenAI-compatible audio transcription endpoint."""
     if response_format not in ["json", "text", "verbose_json"]:
@@ -1998,6 +2002,23 @@ async def openai_v1_audio_transcriptions(
 
     audio_data = await file.read()
 
+    def _parse_optional_json(field_name: str, raw_value: Optional[str]):
+        if raw_value is None or not raw_value.strip():
+            return None
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be valid JSON: {e.msg}",
+            ) from e
+        if not isinstance(value, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must decode to a JSON object.",
+            )
+        return value
+
     return (
         await raw_request.app.state.openai_serving_transcription.create_transcription(
             audio_data=audio_data,
@@ -2007,6 +2028,11 @@ async def openai_v1_audio_transcriptions(
             temperature=temperature,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
+            processor_kwargs=_parse_optional_json("processor_kwargs", processor_kwargs),
+            mm_process_config=_parse_optional_json(
+                "mm_process_config", mm_process_config
+            ),
+            io_kwargs=_parse_optional_json("io_kwargs", io_kwargs),
             raw_request=raw_request,
         )
     )
