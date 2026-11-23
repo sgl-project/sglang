@@ -50,9 +50,11 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             side_effect=lambda num_sms: setattr(self.deep_gemm, "num_sms", num_sms)
         )
         self.deep_gemm.destroy_localizer = MagicMock()
-        max_num_sms = patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=130)
-        self.max_num_sms = max_num_sms.start()
-        self.addCleanup(max_num_sms.stop)
+        self._max_num_sms_patcher = patch.object(
+            mega_moe, "_mega_moe_max_num_sms", return_value=130
+        )
+        self.max_num_sms = self._max_num_sms_patcher.start()
+        self.addCleanup(self._max_num_sms_patcher.stop)
 
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
@@ -175,6 +177,36 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         buf = self._get_test_buffer(object())
         self.assertEqual(buf, 132)
         deep_gemm.set_num_sms.assert_not_called()
+
+    def test_configure_num_sms_honors_min_reserved_num_sms(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.set_num_sms(148)
+        self._max_num_sms_patcher.stop()
+        mega_moe._mega_moe_max_num_sms.cache_clear()
+        try:
+            with (
+                patch.object(mega_moe, "_device_sm", 103),
+                patch.object(
+                    torch.cuda,
+                    "get_device_properties",
+                    return_value=SimpleNamespace(multi_processor_count=148),
+                ),
+            ):
+                with mega_moe._configure_mega_moe_deep_gemm_num_sms(
+                    deep_gemm, min_reserved_num_sms=16
+                ):
+                    self.assertEqual(deep_gemm.get_num_sms(), 132)
+                self.assertEqual(deep_gemm.get_num_sms(), 148)
+                # Caller-lowered cap is never raised above current_num_sms.
+                deep_gemm.set_num_sms(120)
+                with mega_moe._configure_mega_moe_deep_gemm_num_sms(
+                    deep_gemm, min_reserved_num_sms=16
+                ):
+                    self.assertEqual(deep_gemm.get_num_sms(), 120)
+                self.assertEqual(deep_gemm.get_num_sms(), 120)
+        finally:
+            mega_moe._mega_moe_max_num_sms.cache_clear()
+            self._max_num_sms_patcher.start()
 
     def test_new_buffer_stops_mlopart_helper_on_sm100_only(self):
         """SM100 must stop the MLOPart helper, which blocks cuda-checkpoint, once per
