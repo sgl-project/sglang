@@ -10,6 +10,7 @@ import logging
 import re
 from array import array
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -86,6 +87,7 @@ from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopK,
     TopKOutputFormat,
     build_precomputed_topk_output,
@@ -99,6 +101,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Mxfp8RoutedInputPreQuant,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
@@ -115,6 +120,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_forward_context,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -163,7 +172,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
-from sglang.srt.utils.log_utils import print_warning_once, rank0_log
+from sglang.srt.utils.log_utils import print_info_once, print_warning_once, rank0_log
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
@@ -1703,6 +1712,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor],
         scatters: bool = False,
+        local_rows: bool = False,
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight (or its TP-sharded form, see
@@ -1714,7 +1724,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         RowParallelLinear).
 
         scatters: a sequence-parallel pass. The two sums are reduce-scattered
-        onto this rank's token rows, where the tail then runs."""
+        onto this rank's token rows, where the tail then runs.
+
+        local_rows: hidden_states holds this rank's rows, which it routes itself.
+        The shared experts gather every row on the side stream."""
         if TYPE_CHECKING:  # NOTE: precondition for this case
             assert (
                 self._front_w is not None
@@ -1725,12 +1738,19 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
-        num_tokens, hidden_size = hidden_states.shape
-        sharded = self._sharded_front_covers(num_tokens)
-        if sharded:
-            gate_up, front_block = self._sharded_front_gemm(hidden_states)
+        hidden_size = hidden_states.shape[1]
+        if local_rows:
+            num_tokens = layernorm_sp.sp_num_tokens()
+            sharded = False
+            shared_output = self._forward_shared_gathered(hidden_states, num_tokens)
+            routed = self._route_local_rows(hidden_states, num_tokens)
         else:
-            gate_up, router_logits, routed_input = self._fused_front(hidden_states)
+            num_tokens = hidden_states.shape[0]
+            sharded = self._sharded_front_covers(num_tokens)
+            if sharded:
+                gate_up, front_block = self._sharded_front_gemm(hidden_states)
+            else:
+                gate_up, router_logits, routed_input = self._fused_front(hidden_states)
         latent_numel = num_tokens * self.moe_hidden_size
         if scatters:
             buf = None
@@ -1751,11 +1771,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
         if buf is None:
             latent = k3_sp_collective.sp_partial_rows(
-                "moe_latent", hidden_states, self.moe_hidden_size
+                "moe_latent", hidden_states, self.moe_hidden_size, num_tokens
             )
-            shared_output = k3_sp_collective.sp_partial_rows(
-                "moe_shared", hidden_states, hidden_size
-            )
+            if not local_rows:
+                shared_output = k3_sp_collective.sp_partial_rows(
+                    "moe_shared", hidden_states, hidden_size
+                )
         else:
             latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
             shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
@@ -1789,9 +1810,11 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
                 )
+            elif local_rows:
+                self._forward_routed_gathered(*routed, latent)
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if not sharded:
+            if not sharded and not local_rows:
                 with torch.cuda.stream(self.alt_stream):
                     self._forward_shared(gate_up, shared_output)
                     # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1871,6 +1894,87 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
+    @cached_property
+    def _sp_routes_local_rows(self) -> bool:
+        local_rows = (
+            self.routed_expert_up_proj is not None
+            and self._eligible_for_fused_front
+            and self._route_quant_fuse_eligible
+            and not self._moe_front_needs_dense_bf16
+            and self.alt_stream is not None
+            and k3_ar_fusion.enabled()
+            and k3_sp_collective.sp_can_gather_routed()
+        )
+        print_info_once(
+            "K3 LayerNorm SP MoE routing on "
+            + ("local rows" if local_rows else "gathered rows")
+        )
+        return local_rows
+
+    def _forward_shared_gathered(
+        self, hidden_states: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        """Queue the shared experts on the side stream before gemm1 takes every SM."""
+        shared_output = k3_sp_collective.sp_partial_rows(
+            "moe_shared", hidden_states, hidden_states.shape[1], num_tokens
+        )
+        self.alt_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.alt_stream):
+            gate_up = _k3_bf16_gemm(
+                k3_sp_collective.sp_all_gather(hidden_states, num_tokens),
+                self._front_w[: self._front_sizes[0]],
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            self._forward_shared(gate_up, shared_output)
+            return k3_sp_collective.sp_reduce_scatter(
+                shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+            )
+
+    def _route_local_rows(self, hidden_states: torch.Tensor, num_tokens: int):
+        from sglang.srt.layers.quantization.mxfp4 import (
+            _prepare_flashinfer_mxfp8_activations,
+        )
+
+        front = _k3_bf16_gemm(
+            hidden_states,
+            self._front_w[self._front_sizes[0] :],
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
+        router_logits, routed_input = torch.split(front, self._front_sizes[1:], dim=-1)
+        route_quant_handoff.clear()
+        with forward_context(replace(get_forward_context(), topk_rows_scattered=True)):
+            topk_output = self.topk(hidden_states, router_logits)
+        _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
+            routed_input, self.experts.quant_method.hidden_size
+        )
+        weights, ids, x_q, x_s = k3_sp_collective.sp_gather_routed(
+            [
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                x_q.view(torch.uint8),
+                x_s.view(torch.uint8),
+            ]
+        )
+        return (
+            weights[:num_tokens],
+            ids[:num_tokens],
+            x_q[:num_tokens].view(torch.float8_e4m3fn),
+            x_s[:num_tokens].view(torch.float8_e4m3fn),
+        )
+
+    def _forward_routed_gathered(self, weights, ids, x_q, x_s, latent):
+        shape_only = latent.new_empty((1, 1)).expand(
+            x_q.shape[0], self.experts.quant_method.hidden_size
+        )
+        with zero_copy_context.set_moe_output(latent):
+            expert_output = self.experts(
+                shape_only,
+                StandardTopKOutput(weights, ids, None),
+                pre_quant_input=Mxfp8RoutedInputPreQuant(x_q, x_s, None),
+            )
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+
     def _forward_sp_rows(
         self,
         hidden_states: torch.Tensor,
@@ -1880,12 +1984,21 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         """This rank's rows of the output on a sequence-parallel pass. An EP
         all-to-all backend dispatches the rows it is given; TP-sharded experts
         take every row, and their sums are reduce-scattered back."""
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
         with get_forward().scoped(sp_active=False):
             if _uses_ep_a2a():
                 return self.forward(
                     hidden_states,
                     prefix_sum=prefix_sum,
                     valid_token_count=valid_token_count,
+                )
+            # The MoE op of the piecewise TC graph drops pre_quant_input.
+            if self._sp_routes_local_rows and not is_in_tc_piecewise_cuda_graph():
+                return self._forward_fused(
+                    hidden_states, prefix_sum=prefix_sum, scatters=True, local_rows=True
                 )
             full = k3_sp_collective.sp_all_gather(
                 hidden_states, layernorm_sp.sp_num_tokens()
