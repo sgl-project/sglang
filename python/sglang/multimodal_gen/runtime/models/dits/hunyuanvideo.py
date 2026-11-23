@@ -4,7 +4,6 @@
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -25,7 +24,6 @@ from sglang.multimodal_gen.configs.models.fsdp import (
     is_single_block,
     is_txt_in,
 )
-from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -66,10 +64,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.common import modulate
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
-    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -216,7 +212,6 @@ class MMDoubleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()
         self.local_num_attention_heads = divide(num_attention_heads, tp_size)
@@ -466,7 +461,6 @@ class MMSingleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()
@@ -775,7 +769,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         """
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
-        enable_teacache = forward_batch is not None and forward_batch.enable_teacache
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         if guidance is None:
@@ -872,9 +865,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         elif self.should_skip_forward_for_cached_states(img=img, vec=vec):
             img = self.retrieve_cached_states(img)
         else:
-            if enable_teacache:
-                original_img = img.clone()
-
             # Process through double stream blocks
             for index, block in enumerate(self.double_blocks):
                 double_block_args = [
@@ -905,8 +895,6 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             # Extract image features
             img = x[:, :img_seq_len, ...]
 
-            if enable_teacache:
-                self.maybe_cache_states(img, original_img)
             if enable_spectrum:
                 self.spectrum_record_features(img)
 
@@ -917,109 +905,11 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         return img
 
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        self.previous_residual = hidden_states - original_hidden_states
-
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None:
-            return False
-        current_timestep = forward_context.current_timestep
-        enable_teacache = forward_batch.enable_teacache
-
-        if not enable_teacache:
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is None or not forward_batch.enable_teacache:
             return False
         raise NotImplementedError("teacache is not supported yet for HunyuanVideo")
-
-        teacache_params = forward_batch.teacache_params
-        assert teacache_params is not None, "teacache_params is not initialized"
-        assert isinstance(teacache_params, TeaCacheParams), (
-            "teacache_params is not a TeaCacheParams"
-        )
-        num_inference_steps = forward_batch.num_inference_steps
-        teache_thresh = teacache_params.teacache_thresh
-
-        coefficients = teacache_params.coefficients
-
-        if current_timestep == 0:
-            self.cnt = 0
-
-        inp = kwargs["img"].clone()
-        vec_ = kwargs["vec"].clone()
-        # convert to DTensor
-        vec_ = torch.distributed.tensor.DTensor.from_local(
-            vec_,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        inp = torch.distributed.tensor.DTensor.from_local(
-            inp,
-            torch.distributed.DeviceMesh(
-                current_platform.device_type,
-                list(range(get_sp_world_size())),
-                mesh_dim_names=("dp",),
-            ),
-            [torch.distributed.tensor.Replicate()],
-        )
-
-        # txt_ = kwargs["txt"].clone()
-
-        # inp = img.clone()
-        # vec_ = vec.clone()
-        # txt_ = txt.clone()
-        (
-            img_mod1_shift,
-            img_mod1_scale,
-            img_mod1_gate,
-            img_mod2_shift,
-            img_mod2_scale,
-            img_mod2_gate,
-        ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
-        normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
-        modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
-        if self.cnt == 0 or self.cnt == num_inference_steps - 1:
-            should_calc = True
-            self.accumulated_rel_l1_distance = 0
-        else:
-            coefficients = [
-                7.33226126e02,
-                -4.01131952e02,
-                6.75869174e01,
-                -3.14987800e00,
-                9.61237896e-02,
-            ]
-            rescale_func = np.poly1d(coefficients)
-            assert self.previous_modulated_input is not None, (
-                "previous_modulated_input is not initialized"
-            )
-            self.accumulated_rel_l1_distance += rescale_func(
-                (
-                    (modulated_inp - self.previous_modulated_input).abs().mean()
-                    / self.previous_modulated_input.abs().mean()
-                )
-                .cpu()
-                .item()
-            )
-            if self.accumulated_rel_l1_distance < teache_thresh:
-                should_calc = False
-            else:
-                should_calc = True
-                self.accumulated_rel_l1_distance = 0
-        self.previous_modulated_input = modulated_inp
-        self.cnt += 1
-
-        return not should_calc
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states + self.previous_residual
 
 
 class SingleTokenRefiner(nn.Module):
