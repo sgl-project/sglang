@@ -783,6 +783,10 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
+        # Wired by Glm5NextModel after PP layers are built: next DSA layer id
+        # and its attn_mqa for DCP dcp_kv_buffer prefix prefetch.
+        self.next_full_attention_layer_id: Optional[int] = None
+        self.next_dsa_attn_mqa = None
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -1068,6 +1072,20 @@ class Glm5NextDecoderLayer(nn.Module):
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+
+        # Optional A/B kick: after attn releases dcp_kv_buffer, before MegaMoE.
+        # Env: SGLANG_DCP_KV_BUFFER_PREFETCH_KICK=after_attn
+        if not self.is_linear_attn and self.next_dsa_attn_mqa is not None:
+            from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+                maybe_kick_next_dsa_dcp_kv_buffer_prefetch,
+            )
+
+            maybe_kick_next_dsa_dcp_kv_buffer_prefetch(
+                forward_batch=forward_batch,
+                next_attn_mqa=self.next_dsa_attn_mqa,
+                when="after_attn",
+            )
+
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         if isinstance(self.mlp, Glm5NextMLP):
@@ -1082,7 +1100,18 @@ class Glm5NextDecoderLayer(nn.Module):
                 output_is_tp_partial=self._sp_mlp_output_is_tp_partial(),
                 total_rows=positions.shape[-1],
             )
-            return self.ffn_boundary.finish(hidden_states, forward_batch), topk_indices
+            hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+            if not self.is_linear_attn and self.next_dsa_attn_mqa is not None:
+                from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+                    maybe_kick_next_dsa_dcp_kv_buffer_prefetch,
+                )
+
+                maybe_kick_next_dsa_dcp_kv_buffer_prefetch(
+                    forward_batch=forward_batch,
+                    next_attn_mqa=self.next_dsa_attn_mqa,
+                    when="after_ffn",
+                )
+            return (hidden_states, topk_indices)
 
         if (
             isinstance(self.mlp, Glm5NextMoE)
@@ -1103,6 +1132,19 @@ class Glm5NextDecoderLayer(nn.Module):
                 gemm_output_zero_allocator,
             )
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
+
+        # Default kick: after MegaMoE + MHC post. Cover ≈ following ~3 KDA layers.
+        # Env: SGLANG_DCP_KV_BUFFER_PREFETCH_KICK=after_ffn (default)
+        if not self.is_linear_attn and self.next_dsa_attn_mqa is not None:
+            from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+                maybe_kick_next_dsa_dcp_kv_buffer_prefetch,
+            )
+
+            maybe_kick_next_dsa_dcp_kv_buffer_prefetch(
+                forward_batch=forward_batch,
+                next_attn_mqa=self.next_dsa_attn_mqa,
+                when="after_ffn",
+            )
 
         return (hidden_states, topk_indices)
 
@@ -1204,6 +1246,27 @@ class Glm5NextModel(nn.Module):
             prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(config, idx),
         )
+        # Next DSA (full-attention) layer map for DCP dcp_kv_buffer prefix prefetch.
+        # Unlike DeepseekV2 (every layer is full attn), GLM hybrid skips KDA ids.
+        full_ids = [
+            i
+            for i in range(self.start_layer, self.end_layer)
+            if not config.is_kda_layer(i)
+        ]
+        self.next_full_attention_layer_id = {
+            full_ids[j]: full_ids[j + 1] for j in range(len(full_ids) - 1)
+        }
+        self.first_dsa_attn_mqa = None
+        if full_ids:
+            first_layer = self.layers[full_ids[0]]
+            self.first_dsa_attn_mqa = getattr(first_layer.self_attn, "attn_mqa", None)
+        for lid, nxt in self.next_full_attention_layer_id.items():
+            layer = self.layers[lid]
+            next_layer = self.layers[nxt]
+            layer.next_full_attention_layer_id = nxt
+            # KDA layers have Glm5NextLinearAttention (no attn_mqa); DSA has MLA.
+            layer.next_dsa_attn_mqa = getattr(next_layer.self_attn, "attn_mqa", None)
+
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -1289,6 +1352,17 @@ class Glm5NextModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
+            )
+        # First DSA has no previous-layer kicker; hide its prefix AG behind
+        # embed + early KDA/dense layers (independent of after_attn/after_ffn A/B).
+        if self.first_dsa_attn_mqa is not None:
+            from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+                maybe_kick_first_dsa_dcp_kv_buffer_prefetch,
+            )
+
+            maybe_kick_first_dsa_dcp_kv_buffer_prefetch(
+                forward_batch=forward_batch,
+                first_attn_mqa=self.first_dsa_attn_mqa,
             )
         device = hidden_states.device
         zero_allocator = BumpAllocator(

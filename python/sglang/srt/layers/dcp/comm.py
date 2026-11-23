@@ -319,8 +319,20 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
+    """Gather prefix KV into ``dcp_kv_buffer`` and append the current extend K.
+
+    When ``SGLANG_ENABLE_DCP_KV_BUFFER_PREFETCH`` has a matching pending
+    next-layer prefix prefetch, the sync prefix AllGather is skipped and only
+    the local extend K is appended.
+    """
+    # Lazy import: kv_buffer_prefetch imports all_gather_kv_cache_for_dcp from here.
+    from sglang.srt.layers.dcp.kv_buffer_prefetch import (
+        try_consume_dcp_kv_buffer_prefix_prefetch,
+    )
+
+    prefix_ready = try_consume_dcp_kv_buffer_prefix_prefetch(attn_mqa.layer_id)
     # On hip, skip the all-gather when there is no cached prefix to avoid crash
-    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+    if not prefix_ready and (not _is_hip or dcp_extend_prefix_lens_sum > 0):
         cache_k_nope, cache_k_rope = token_to_kv_pool.layer_router.read(
             attn_mqa.layer_id
         ).read_mla(
