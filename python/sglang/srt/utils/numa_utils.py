@@ -455,6 +455,83 @@ def _query_numa_node_for_gpu(device_id: int):
             pass  # Ignore shutdown errors
 
 
+_CGROUP_V2_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+_CGROUP_V1_CPU_DIRS = (
+    "/sys/fs/cgroup/cpu",
+    "/sys/fs/cgroup/cpu,cpuacct",
+)
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _cgroup_cpu_quota() -> Optional[float]:
+    cpu_max = _read_text(_CGROUP_V2_CPU_MAX)
+
+    if cpu_max is not None:
+        parts = cpu_max.split()
+
+        if len(parts) != 2 or parts[0] == "max":
+            return None
+
+        try:
+            quota, period = map(int, parts)
+        except ValueError:
+            return None
+
+        if quota > 0 and period > 0:
+            return quota / period
+
+        return None
+
+    for cpu_dir in _CGROUP_V1_CPU_DIRS:
+        quota_value = _read_text(os.path.join(cpu_dir, "cpu.cfs_quota_us"))
+        period_value = _read_text(os.path.join(cpu_dir, "cpu.cfs_period_us"))
+
+        if quota_value is None or period_value is None:
+            continue
+
+        try:
+            quota = int(quota_value)
+            period = int(period_value)
+        except ValueError:
+            return None
+
+        if quota > 0 and period > 0:
+            return quota / period
+
+    return None
+
+
+def _cap_cpu_ids_by_cgroup_quota(*, cpu_ids: str, world_size: int) -> str:
+    quota = _cgroup_cpu_quota()
+    cpus = [cpu for cpu in cpu_ids.split(",") if cpu]
+
+    if quota is None or not cpus:
+        return cpu_ids
+
+    per_rank = max(1, math.floor(quota / max(1, world_size)))
+
+    if per_rank >= len(cpus):
+        return cpu_ids
+
+    capped_cpus = ",".join(cpus[:per_rank])
+
+    logger.warning(
+        f"Cgroup CPU quota is {quota:g} CPUs across {world_size} rank(s), "
+        f"but this rank has {len(cpus)} CPUs selected. Limiting the binding "
+        f"to {per_rank} OpenMP thread(s): {capped_cpus}. "
+        "Set SGLANG_CPU_OMP_THREADS_BIND explicitly to override this limit."
+    )
+
+    return capped_cpus
+
+
 def init_threads_binding(
     *,
     numa_index: int,
@@ -483,7 +560,9 @@ def init_threads_binding(
             f"is out of range for {n_node} numa/CBB nodes. This usually means dp_size * tp_size "
             f"exceeds the number of numa/CBB nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
         )
-        local_omp_cpuid = cpu_ids_by_node[numa_index]
+        local_omp_cpuid = _cap_cpu_ids_by_cgroup_quota(
+            cpu_ids=cpu_ids_by_node[numa_index], world_size=world_size
+        )
     else:
         threads_bind_list = omp_cpuids.split("|")
         # Bound-check numa_index against the bind list rather than asserting

@@ -18,6 +18,7 @@ from sglang.srt.utils.numa_utils import (
     _strip_memory_args,
     configure_subprocess,
     get_numa_node_if_available,
+    init_threads_binding,
     numa_bind_to_node,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -652,6 +653,91 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
+
+
+_TWO_NODES_TEN_CORES = ["0,1,2,3,4,5,6,7,8,9", "10,11,12,13,14,15,16,17,18,19"]
+
+
+class TestThreadsBindingCgroupQuota(unittest.TestCase):
+    """With SGLANG_CPU_OMP_THREADS_BIND unset, a rank must not pin more OpenMP
+    threads than its share of the cgroup CPU quota (docker --cpus, k8s limits.cpu)."""
+
+    def _bind(self, files, *, numa_index=0, world_size=1, env=None):
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, env or {}, clear=False))
+            if not env:
+                os.environ.pop("SGLANG_CPU_OMP_THREADS_BIND", None)
+            stack.enter_context(
+                patch(
+                    "sglang.srt.utils.numa_utils.get_cpu_ids_by_node",
+                    return_value=_TWO_NODES_TEN_CORES,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.utils.numa_utils._read_text",
+                    side_effect=lambda path: files.get(path),
+                )
+            )
+            return init_threads_binding(numa_index=numa_index, world_size=world_size)
+
+    def test_v2_quota_caps_rank(self):
+        self.assertEqual(
+            self._bind({"/sys/fs/cgroup/cpu.max": "400000 100000"}), "0,1,2,3"
+        )
+
+    def test_v2_unlimited_keeps_node(self):
+        self.assertEqual(
+            self._bind({"/sys/fs/cgroup/cpu.max": "max 100000"}),
+            _TWO_NODES_TEN_CORES[0],
+        )
+
+    def test_quota_is_shared_across_ranks(self):
+        self.assertEqual(
+            self._bind(
+                {"/sys/fs/cgroup/cpu.max": "500000 100000"},
+                numa_index=1,
+                world_size=2,
+            ),
+            "10,11",
+        )
+        self.assertEqual(
+            self._bind(
+                {"/sys/fs/cgroup/cpu.max": "50000 100000"},
+                numa_index=1,
+                world_size=2,
+            ),
+            "10",
+        )
+
+    def test_v1_quota_caps_rank(self):
+        self.assertEqual(
+            self._bind(
+                {
+                    "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us": "200000",
+                    "/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us": "100000",
+                }
+            ),
+            "0,1",
+        )
+        self.assertEqual(
+            self._bind(
+                {
+                    "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1",
+                    "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+                }
+            ),
+            _TWO_NODES_TEN_CORES[0],
+        )
+
+    def test_explicit_bind_is_not_capped(self):
+        self.assertEqual(
+            self._bind(
+                {"/sys/fs/cgroup/cpu.max": "200000 100000"},
+                env={"SGLANG_CPU_OMP_THREADS_BIND": "0-7|10-17"},
+            ),
+            "0-7",
+        )
 
 
 if __name__ == "__main__":
