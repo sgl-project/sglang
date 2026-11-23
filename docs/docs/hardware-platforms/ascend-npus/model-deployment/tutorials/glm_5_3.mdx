@@ -98,8 +98,10 @@ The command requires
 on the host; it selects all NPUs of the node with `ASCEND_VISIBLE_DEVICES`.
 
 ```bash Command
+# pull image
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
+# create container
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -e ASCEND_VISIBLE_DEVICES=0-15 \
@@ -109,14 +111,19 @@ docker run -itd --shm-size=16g --name ${NAME} \
 -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
 --entrypoint=bash \
 swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+
+# enter container
+docker exec -it ${NAME} bash
 ```
 
   </Tab>
   <Tab title="A2 Series">
 
 ```bash Command
+# pull image
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
 
+# create container
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
@@ -144,6 +151,9 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
 swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050
+
+# enter container
+docker exec -it ${NAME} bash
 ```
 
   </Tab>

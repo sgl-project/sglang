@@ -94,7 +94,7 @@ For 950PR/DT series PD disaggregation, choose an image that supports DP attentio
 
 ```bash Command
 # ============================================================
-# Before running, update the following variables:
+# Before running, update the following variables or use default values:
 #   IMAGE: SGLang image for A3 Series
 #   NAME: container name
 #   MODEL_DIR: model weights directory on the host
@@ -104,8 +104,10 @@ IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang
 NAME=sglang-glm53-flash-a3
 MODEL_DIR=/path/to/model-weights
 
+# pull image
 docker pull "$IMAGE"
 
+# create container
 docker run -itd --shm-size=16g --name "$NAME" \
     --privileged=true --net=host \
     -e ASCEND_VISIBLE_DEVICES=0-15 \
@@ -117,6 +119,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
     --entrypoint=bash \
     "$IMAGE"
 
+# enter container
 docker exec -it "$NAME" bash
 ```
 
@@ -125,7 +128,7 @@ docker exec -it "$NAME" bash
 
 ```bash Command
 # ============================================================
-# Before running, update the following variables:
+# Before running, update the following variables or use default values:
 #   IMAGE: SGLang image for 950PR/DT series
 #   NAME: container name
 #   MODEL_DIR: model weights directory on the host
@@ -135,8 +138,10 @@ IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang
 NAME=sglang-glm53-flash-950pr-dt-series
 MODEL_DIR=/path/to/model-weights
 
+# pull image
 docker pull "$IMAGE"
 
+# create container
 docker run -itd --shm-size=16g --name "$NAME" \
     --privileged=true --net=host \
     -e ASCEND_VISIBLE_DEVICES=0-7 \
@@ -148,6 +153,7 @@ docker run -itd --shm-size=16g --name "$NAME" \
     --entrypoint=bash \
     "$IMAGE"
 
+# enter container
 docker exec -it "$NAME" bash
 ```
 
