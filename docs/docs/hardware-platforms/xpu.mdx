@@ -345,8 +345,10 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --tp 2 --dcp-size 2
 ```
 
-Both MHA/GQA models (e.g. Qwen, Llama) and MLA models (e.g. DeepSeek-V3) are
-supported.
+MHA/GQA models (e.g. Qwen, Llama) and dense MLA models (e.g. DeepSeek-V2-Lite)
+are supported. For MLA, the model all-gathers Q across the DCP group and owns the
+cross-rank merge, so Triton returns the rank-local partial and its log-sum-exp
+instead of a finished output.
 
 ### Requirements
 
@@ -361,6 +363,8 @@ supported.
 |---|---|
 | Decode graph capture under DCP | Auto-disabled: the per-layer collectives are not capturable in an XPU graph |
 | `--dcp-comm-backend fi_a2a` | CUDA-only (needs FlashInfer MNNVL); use the default `ag_rs` or `a2a` |
+| Sparse-attention (DSA) MLA models, e.g. DeepSeek-V3.2 and GLM-5 | Not supported. Their sparse decode runs on `flash_mla_decode`, which returns no softmax LSE, so there is nothing for the cross-rank merge to weight the partials with. |
+| `--kv-cache-dtype fp8_*` with an MLA model | Not supported: the FP8 MLA write takes the combined-row cache door, which has no DCP-aware path |
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 

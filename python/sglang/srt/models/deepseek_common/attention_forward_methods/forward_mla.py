@@ -99,7 +99,14 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla"}
+    # triton derives its DCP LSE with torch.logsumexp, i.e. natural log.
+    return attention_backend in {"flashmla", "cutedsl_mla", "triton"}
+
+
+# These backends attend each DCP rank's own prefix shard and merge the partials
+# by LSE, so they never read attn_dcp_metadata.dcp_kv_buffer. Filling it anyway
+# would cost a whole-prefix all-gather per layer.
+_DCP_SELF_SHARDED_EXTEND_BACKENDS = frozenset({"triton"})
 
 
 if _is_cuda:
@@ -633,18 +640,22 @@ class DeepseekMLAForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if (
+                    self.current_attention_backend
+                    not in _DCP_SELF_SHARDED_EXTEND_BACKENDS
+                ):
+                    # for extend, gather kv
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -758,14 +769,36 @@ class DeepseekMLAForwardMixin:
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            attn_output = self.attn_mqa(
-                q,
-                k,
-                k_nope,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if is_dcp_mla_decode_phase(forward_batch):
+                # q carries every DCP rank's heads after the gather above, and
+                # attn_mqa's tp_q_head_num is the pre-gather count, which would
+                # mis-shape the output buffer. The widened layer sizes it and
+                # the backend hands back the partial state for the merge below.
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q,
+                    k,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
 
         # correct attn_output with respect to lse from other ranks
         if is_dcp_mla_decode_phase(forward_batch):

@@ -1483,6 +1483,22 @@ class TritonAttnBackend(AttentionBackend):
             return output, lse
         return output
 
+    def _set_mla_kv_buffer_dcp(
+        self,
+        forward_batch: ForwardBatch,
+        layer: RadixAttention,
+        k: torch.Tensor,
+    ) -> None:
+        # MLATokenToKVPool.set_kv_buffer rejects a widened loc; only
+        # set_mla_kv_buffer's kernel resolves the owner rule (pos % dcp_size),
+        # so split the absorbed row back into its nope/rope halves for it.
+        self.token_to_kv_pool.set_mla_kv_buffer(
+            layer,
+            forward_batch.out_cache_loc,
+            k[..., : layer.v_head_dim],
+            k[..., layer.v_head_dim :],
+        )
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1493,6 +1509,9 @@ class TritonAttnBackend(AttentionBackend):
         k_scale=None,
         v_scale=None,
     ) -> None:
+        if self.dcp_size > 1 and self.use_mla:
+            self._set_mla_kv_buffer_dcp(forward_batch, layer, k)
+            return
         # DCP writes to the local physical shard (loc = out_cache_loc //
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
@@ -1875,9 +1894,13 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
-        # Select the replicated K/V heads matching this rank's Q shard.
+        # Select the replicated K/V heads matching this rank's Q shard. A dense
+        # layer declares as many KV heads as Q heads (MLA's MHA-mode companion
+        # up-projects one KV head per Q head), so the model already sharded them
+        # to match this rank's Q and there is no replica to pick from; slicing
+        # would halve the heads and remap every Q head to the wrong one.
         if k.numel() > 0:
-            if layer.tp_k_head_num > 1:
+            if 1 < layer.tp_k_head_num < layer.tp_q_head_num:
                 kv_head_start = (
                     group.rank_in_group * layer.tp_k_head_num // group.world_size
                 )
@@ -2118,6 +2141,63 @@ class TritonAttnBackend(AttentionBackend):
 
         return o
 
+    def _forward_decode_dcp_mla(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        attn_logits: torch.Tensor,
+        k_descale,
+        v_descale,
+        logits_soft_cap: float,
+        enable_lean: Optional[bool],
+    ):
+        """Return this rank's MLA decode partial and its natural-log LSE.
+
+        The MLA model path owns both the Q all-gather and the cross-rank merge
+        (``deepseek_common/attention_forward_methods/forward_mla.py``), unlike
+        MHA where this backend does them, so q already carries every DCP rank's
+        heads and the merge needs the rank-local state rather than an output.
+        """
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        num_tokens, num_heads, _ = q_view.shape
+        # A rank owning no position of a request must weigh 0 in the merge, so
+        # its untouched rows need out=0 / lse=-inf, not uninitialized memory.
+        o = torch.zeros(
+            (num_tokens, num_heads, layer.v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        self.forward_metadata.attn_lse.fill_(-float("inf"))
+        self.decode_attention_fwd(
+            q_view,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o,
+            kv_indptr,
+            kv_indices,
+            attn_logits,
+            self.forward_metadata.attn_lse,
+            self.forward_metadata.num_kv_splits,
+            self.max_kv_splits,
+            layer.scaling,
+            k_descale,
+            v_descale,
+            logit_cap=logits_soft_cap,
+            xai_temperature_len=layer.xai_temperature_len,
+            has_mla=True,
+            enable_lean=enable_lean,
+            lean_Mp=self.forward_metadata.lean_Mp,
+            lean_Lp=self.forward_metadata.lean_Lp,
+            lean_Op=self.forward_metadata.lean_Op,
+            lean_locks=self.forward_metadata.lean_locks,
+        )
+        local_lse = torch.logsumexp(
+            self.forward_metadata.attn_lse[:num_tokens, :num_heads, :], dim=-1
+        )
+        return o.flatten(1), local_lse
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2148,20 +2228,23 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    # `full_loc` carries the pre-translated loc under the unified
-                    # pool, refreshed into a capture-stable buffer before replay —
-                    # translating inside set_kv_buffer would be captured and replay
-                    # a stale v2p. None (-> raw loc) for static pools.
-                    KVWriteLoc(
-                        forward_batch.out_cache_loc,
-                        self.forward_metadata.swa_out_cache_loc,
-                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
-                    ),
-                    k,
-                    v,
-                )
+                if self.dcp_size > 1:
+                    self._set_mla_kv_buffer_dcp(forward_batch, layer, k)
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        # `full_loc` carries the pre-translated loc under the unified
+                        # pool, refreshed into a capture-stable buffer before replay —
+                        # translating inside set_kv_buffer would be captured and replay
+                        # a stale v2p. None (-> raw loc) for static pools.
+                        KVWriteLoc(
+                            forward_batch.out_cache_loc,
+                            self.forward_metadata.swa_out_cache_loc,
+                            full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                        ),
+                        k,
+                        v,
+                    )
             else:
                 self._set_kv_buffer(
                     forward_batch,
@@ -2241,6 +2324,18 @@ class TritonAttnBackend(AttentionBackend):
             if score_mod is not None:
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
+                )
+            if self.use_mla:
+                return self._forward_decode_dcp_mla(
+                    q,
+                    layer,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    k_descale,
+                    v_descale,
+                    logits_soft_cap,
+                    enable_lean,
                 )
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):

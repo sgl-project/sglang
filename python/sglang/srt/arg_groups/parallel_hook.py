@@ -193,6 +193,18 @@ def _validate_dcp_on_xpu(server_args: Any):
                 f"the triton attention backend, but got {role}={backend!r}. "
                 "Pass --attention-backend triton."
             )
+    if (
+        parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE
+        and cfg.kv_cache_dtype != "auto"
+        and use_mla_backend(server_args)
+    ):
+        raise ValueError(
+            "Decode context parallel (--dcp-size > 1) on XPU does not support "
+            "a quantized MLA KV cache: the scaled write takes the combined-row "
+            "cache door, which has no DCP-aware path (only set_mla_kv_buffer's "
+            "kernel resolves the owner rule), but got "
+            f"--kv-cache-dtype={cfg.kv_cache_dtype}."
+        )
     if cfg.attention_backend is None and cfg.decode_attention_backend is None:
         # Pin it before the model overrides run: several of them pick intel_xpu
         # on XPU while the backend is still unset.

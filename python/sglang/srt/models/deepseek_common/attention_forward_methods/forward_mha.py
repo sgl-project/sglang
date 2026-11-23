@@ -24,6 +24,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
@@ -587,8 +588,10 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
-            # Save latent cache
+        if _is_cuda or _is_xpu:
+            # XPU joins this door because it is the only MLA write that resolves
+            # the DCP owner rule; the combined-row set_kv_buffer below rejects a
+            # widened loc. The kernel is Triton, so it runs on both platforms.
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
