@@ -44,7 +44,7 @@ pub struct DetokenizeResponse {
 
 /// The served model's tokenizer. One model is served, so any `model` name uses
 /// it; a model started with `--no-tokenizer` has none.
-pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Arc<Tokenizer>, ApiError> {
+pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Tokenizer, ApiError> {
     let model = &ctx.config.model.id;
     ctx.preprocessor
         .tokenizers()

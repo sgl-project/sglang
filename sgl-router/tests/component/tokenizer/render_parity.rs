@@ -42,7 +42,9 @@ fn array_only_template_content_parity() {
     )
     .unwrap()
     .unwrap();
-    let tokenizer = adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap();
+    let path = "tests/fixtures/tiny_tokenizer.json";
+    let (tokenizer, _) =
+        adapter::load_sglang(path, Default::default(), &adapter::ModelFiles::open(path)).unwrap();
     for case in fixture["cases"].as_array().unwrap() {
         let request =
             serde_json::json!({"messages": [{"role": "user", "content": case["content"]}]});

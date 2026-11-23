@@ -3,6 +3,10 @@
 use crate::ProcessorError as Error;
 use crate::model_files::resolve_tokenizer_file;
 
+mod sglang;
+
+pub use sglang::{PromptAffixes, SglangTokenizer};
+
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
 pub trait TextTokenizer: Send + Sync {

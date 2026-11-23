@@ -21,6 +21,7 @@ skips `dynamo-parsers`.
 src/
   model_files.rs   find files in a model dir or the HF cache
   tokenizer/       encode prompts
+  token_pieces.rs  token id -> tokenizer.json piece, for logprob bytes
   render/          chat request -> prompt
     models/        model-specific SGLang code
     legacy/        conversation.py templates
@@ -51,10 +52,37 @@ DynamoTokenizer::new(without_specials, with_specials)
 trait TextTokenizer { encode(text, add_special_tokens), encode_segments(segments, add_special_tokens) }
 ```
 
-Pass-through. `load_tokenizer` calls `Tokenizer::from_file_with_options`, and
-`encode` / `encode_segments` call the Dynamo tokenizer. Dynamo fixes
-`add_special_tokens` at load time, so `DynamoTokenizer` holds one handle per
-setting and picks one per request.
+Pass-through, used by `sglang-server`. `load_tokenizer` calls
+`Tokenizer::from_file_with_options`, and `encode` / `encode_segments` call the
+Dynamo tokenizer. Dynamo fixes `add_special_tokens` at load time, so
+`DynamoTokenizer` holds one handle per setting and picks one per request.
+
+```rust
+SglangTokenizer::new(dynamo_tokenizer, tokenizer_file)
+    .with_prompt_affixes(PromptAffixes::derive(tokenizer_file, &tokenizer_config, &model_config)?)
+    .with_bos_token(&tokenizer_config)
+    .with_token_pieces(&tokenizer_json)
+tokenizer.encode(text, add_special_tokens) / encode_prompt(text) / encode_segments(segments, add_special_tokens)
+tokenizer.encode_chat(prompt_segments, continuation) / decode(ids, skip_special_tokens) / byte_level_bytes(id)
+```
+
+SGLang-specific, used by sgl-router. The host builds the Dynamo backend (its
+own encoder or cache) loaded without special tokens, and reads the checkpoint's
+configs; `SglangTokenizer` adds what transformers and SGLang's tokenizer
+manager do on top of it:
+
+- `PromptAffixes`: the special tokens `tokenizer(text)` adds. BOS follows
+  `add_bos_token` for the classes `_fix_v5_add_bos_eos_token` restores, and the
+  `tokenizer.json` post-processor otherwise; EmbeddingGemma's EOS ends an
+  `encode_prompt`. `derive` errs where it cannot reproduce them (a normalizer
+  transformers replaces, a BOS that is not one token), and encoding with
+  special tokens then errs too, so the host can leave the prompt to the engine.
+- `encode_chat`: the template without special tokens, then the continuation
+  with them minus one leading BOS (`_append_assistant_prefix_to_prompt_ids`).
+- Tiktoken checkpoints encode in `tokenization_kimi.py`'s chunks.
+- `OpenAiTokenizer` for the `openai` layer: `decode`, and logprob bytes from
+  `token_pieces.rs` (`convert_ids_to_tokens` over `tokenizer.json`, which
+  Dynamo does not expose).
 
 ## render
 

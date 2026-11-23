@@ -3820,6 +3820,7 @@ dependencies = [
  "async-stream",
  "dynamo-protocols",
  "dynamo-renderer",
+ "dynamo-tokenizers",
  "futures",
  "hf-hub",
  "minijinja",

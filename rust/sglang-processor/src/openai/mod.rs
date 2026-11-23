@@ -9,16 +9,15 @@
 mod chat;
 mod completions;
 mod kimi_k3_tag;
-mod pieces;
 mod request;
 mod wire;
 
 use serde::Deserialize;
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 
+pub use crate::token_pieces::TokenPieces;
 pub use chat::{ChatModel, ChatResponder, DeepSeekOutputError, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
-pub use pieces::TokenPieces;
 pub use sglang_api_types::api::v1::GenerateRequest;
 pub use wire::Reply;
 
