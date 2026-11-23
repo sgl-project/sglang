@@ -305,7 +305,7 @@ class VerifyRoute(msgspec.Struct, frozen=True):
 class VerifyStep(msgspec.Struct):
     """One target verify's sampling state, from `SamplingPipeline.plan_verify`:
     the route its fast paths read, the bound watermark, and what the stages read
-    from the draft tree, bound after the target forward launches."""
+    from the draft tree, built after the target forward launches."""
 
     batch: ScheduleBatch
     route: VerifyRoute
