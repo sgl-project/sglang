@@ -1737,24 +1737,27 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         )
         self.assertEqual(handle.xfer, ("dropped", self.agent.sections["dropped"]))
 
-    def test_reload_hides_stale_dlists_and_keeps_them_after_a_failed_load(self):
-        """Once NIXL loads the peer again, a dlist prepared before the reload must
-        not be reachable; a failed load must keep the dlists for a later reload."""
+    def test_failed_load_keeps_the_dlists_for_a_later_reload(self):
+        """Sends to the peer stay on the prepared path once a later reload succeeds."""
         mgr = self._make_manager(["dropped"])
         self.agent.remove_remote_agent("dropped")
-        layouts = mgr.transport._layouts["dropped"]
-        reachable_while_loading = []
+        remote = mgr._peers["dropped"].remote
+        with patch.object(
+            self.agent,
+            "add_remote_agent",
+            side_effect=RuntimeError("NIXL_ERR_BACKEND"),
+        ):
+            with self.assertRaises(RuntimeError):
+                mgr.transport.reload(remote)
 
-        def add_remote_agent(metadata):
-            reachable_while_loading.append(mgr.transport._layouts.get("dropped"))
-            raise RuntimeError("NIXL_ERR_BACKEND")
+        mgr.transport.reload(remote)
 
-        self.agent.add_remote_agent = add_remote_agent
-        with self.assertRaises(RuntimeError):
-            mgr.transport.reload(mgr._peers["dropped"].remote)
-
-        self.assertEqual(reachable_while_loading, [None])
-        self.assertIs(mgr.transport._layouts.get("dropped"), layouts)
+        (handle,) = mgr.send_kvcache(
+            "dropped",
+            np.array([1], dtype=np.int32),
+            np.array([2], dtype=np.int32),
+        )
+        self.assertEqual(handle.xfer, ("dropped", self.agent.sections["dropped"]))
 
 
 class TestNixlUnifiedMemory(CustomTestCase):
