@@ -93,7 +93,7 @@ class UocrGreedyGraph:
         # adjustments, so any transform of the logits invalidates it.
         if (
             sampling_info.logit_bias is not None
-            or sampling_info.grammar_mask is not None
+            or sampling_info.grammars is not None
             or sampling_info.has_custom_logit_processor
             or sampling_info.step_penalties is not None
         ):
