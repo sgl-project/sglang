@@ -1660,6 +1660,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    # Scratch the CUTLASS grouped GEMM writes on every call: valid in this
+    # process only, so a weight snapshot gives each reader its own instead of
+    # sharing it. The stride tables are constants and are shared.
+    _process_local_fields = frozenset(
+        {
+            "workspace",
+            "a_ptr",
+            "b_ptr",
+            "out_ptr",
+            "a_scales_ptr",
+            "b_scales_ptr",
+            "expert_offsets",
+            "problem_sizes1",
+            "problem_sizes2",
+        }
+    )
+
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
