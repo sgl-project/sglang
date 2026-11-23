@@ -14,6 +14,24 @@ use crate::message::config::{ApiKeys, DeploymentInfo};
 /// The route a listener serves forwarded control requests on.
 pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
 
+/// The header a relayed control request presents its target listener's
+/// `peer_token` in: the route serves only requests that carry it, which only
+/// this launch's own listeners know.
+pub(crate) const PEER_TOKEN_HEADER: &str = "x-sglang-peer-token";
+
+/// The token this listener's relay route requires: its own entry's in the
+/// listener table. `None`, and every relayed request refused, for a listener
+/// the table does not list, which no peer relays to.
+pub(crate) fn own_peer_token(deployment_info: &DeploymentInfo) -> Option<&str> {
+    let own = deployment_info.dp_rank.unwrap_or(0);
+    deployment_info
+        .rust_server_endpoints
+        .iter()
+        .find(|endpoint| endpoint.dp_rank == own)?
+        .peer_token
+        .as_deref()
+}
+
 /// Peers only need a connection to come up; the scheduler-side wait (a
 /// flush's own `timeout_s`, a weight check) has no bound on the local path
 /// either, so a response is waited for as long as it takes.
@@ -23,30 +41,47 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct Peer {
     ranks: [RankId; 1],
     url: String,
+    /// The listener's [`PEER_TOKEN_HEADER`] value.
+    token: Option<http::HeaderValue>,
     client: reqwest::Client,
 }
 
 impl Peer {
-    pub(crate) fn new(client: reqwest::Client, dp_rank: RankId, base_url: &str) -> Self {
-        Self {
+    pub(crate) fn new(
+        client: reqwest::Client,
+        dp_rank: RankId,
+        base_url: &str,
+        token: Option<&str>,
+    ) -> Result<Self, String> {
+        let token = token
+            .map(|token| {
+                let mut value = http::HeaderValue::from_str(token).map_err(|_| {
+                    format!("control peer client: dp rank {dp_rank}'s peer token is not a valid header value")
+                })?;
+                value.set_sensitive(true);
+                Ok::<_, String>(value)
+            })
+            .transpose()?;
+        Ok(Self {
             ranks: [dp_rank],
             url: format!("{}{FORWARD_PEER_PATH}", base_url.trim_end_matches('/')),
+            token,
             client,
-        }
+        })
     }
 
     async fn forward(&self, build: &RequestBuilder<'_>) -> Result<Bytes, CoreError> {
         let header = build()
             .encode()
             .map_err(|error| CoreError::Internal(error.to_string()))?;
-        let response = self
+        let mut post = self
             .client
             .post(&self.url)
-            .header(http::header::CONTENT_TYPE, "application/msgpack")
-            .body(header)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .header(http::header::CONTENT_TYPE, "application/msgpack");
+        if let Some(token) = &self.token {
+            post = post.header(PEER_TOKEN_HEADER, token.clone());
+        }
+        let response = post.body(header).send().await.map_err(transport_error)?;
         let status = response.status();
         let body = response.bytes().await.map_err(transport_error)?;
         if status.is_success() {
@@ -120,16 +155,18 @@ pub(crate) fn peer_endpoints(
         .default_headers(headers)
         .build()
         .map_err(|error| format!("control peer client: {error}"))?;
-    Ok(endpoints
+    endpoints
         .into_iter()
         .map(|endpoint| {
-            Arc::new(Peer::new(
+            Peer::new(
                 client.clone(),
                 endpoint.dp_rank,
                 &endpoint.endpoint,
-            )) as Arc<dyn ControlTarget>
+                endpoint.peer_token.as_deref(),
+            )
+            .map(|peer| Arc::new(peer) as Arc<dyn ControlTarget>)
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -181,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_the_encoded_message_and_returns_the_reply_body() {
         let (url, seen) = peer_listener((StatusCode::OK, Bytes::from_static(b"reply-bytes"))).await;
-        let peer = Peer::new(reqwest::Client::new(), 3, &url);
+        let peer = Peer::new(reqwest::Client::new(), 3, &url, None).unwrap();
         let replies = peer.control(&build).await;
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].rank, 3);
@@ -203,7 +240,7 @@ mod tests {
             (StatusCode::INTERNAL_SERVER_ERROR, CoreErrorKind::Internal),
         ] {
             let (url, _) = peer_listener((status, Bytes::from_static(b"why"))).await;
-            let peer = Peer::new(reqwest::Client::new(), 1, &url);
+            let peer = Peer::new(reqwest::Client::new(), 1, &url, None).unwrap();
             let error = peer.control(&build).await.remove(0).outcome.unwrap_err();
             assert_eq!(error.kind(), expected, "{status}");
             if status == StatusCode::BAD_REQUEST {
@@ -215,7 +252,7 @@ mod tests {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let unreachable = format!("http://{}", probe.local_addr().unwrap());
         drop(probe);
-        let peer = Peer::new(reqwest::Client::new(), 1, &unreachable);
+        let peer = Peer::new(reqwest::Client::new(), 1, &unreachable, None).unwrap();
         let error = peer.control(&build).await.remove(0).outcome.unwrap_err();
         assert!(matches!(error, CoreError::Unavailable), "{error}");
     }
@@ -236,14 +273,17 @@ mod tests {
                 RustServerEndpoint {
                     dp_rank: 2,
                     endpoint: url_b,
+                    peer_token: None,
                 },
                 RustServerEndpoint {
                     dp_rank: 1,
                     endpoint: "http://127.0.0.1:1".into(),
+                    peer_token: None,
                 },
                 RustServerEndpoint {
                     dp_rank: 0,
                     endpoint: url_a,
+                    peer_token: None,
                 },
             ],
             ..Default::default()
@@ -319,6 +359,7 @@ mod tests {
             rust_server_endpoints: vec![RustServerEndpoint {
                 dp_rank: 1,
                 endpoint: url,
+                peer_token: None,
             }],
             ..Default::default()
         };
