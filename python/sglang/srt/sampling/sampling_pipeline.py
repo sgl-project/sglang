@@ -368,7 +368,8 @@ class VerifyStep(msgspec.Struct):
         builds when `needs_verify_tree`. Under overlap the previous step's
         result is still queued; `barrier` advances the grammar FSM over its
         tokens and returns them per request, as result processing will append
-        them to req.output_ids."""
+        them to req.output_ids. The probe reads `logits_output`, which also
+        gives the grammar mask its device."""
         detect_nan_logits(logits_output.next_token_logits, "verify")
         if tree is None:
             return

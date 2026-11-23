@@ -3638,7 +3638,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             kv_weight_version_record = target_out.kv_weight_version_record
         logits_output = target_out.logits_output
         # Before the deferred-shard block, which may drop the logits: the NaN
-        # probe reads the vocab shard.
+        # probe reads the vocab shard. The gather launches after the host work.
         verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
