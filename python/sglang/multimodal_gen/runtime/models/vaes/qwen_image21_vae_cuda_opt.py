@@ -46,15 +46,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.jit.utils.compile.parallel import parallel_compile
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     bias_residual_add,
+    bias_residual_add_builder,
     can_use_bias_residual_add,
     can_use_channel_rmsnorm_finish_silu,
     can_use_channel_rmsnorm_silu_nhwc,
     can_use_nearest_upsample_nhwc,
     channel_rmsnorm_finish_silu,
     channel_rmsnorm_silu_nhwc,
+    channel_rmsnorm_silu_nhwc_builders,
     dup_up3d_add,
     nearest_upsample_nhwc,
 )
@@ -465,6 +468,36 @@ def _install_norm_silu(decoder, gate, residual_block_cls, rms_norm_cls) -> int:
     return count
 
 
+def _first_decode_jit_builders(decoder, residual_block_cls) -> list:
+    """Factories of the JIT modules a decode at the default quality builds.
+
+    Each norm width, with and without the fused conv bias, is a module of its
+    own: nine ~5 s builds, one after another, inside the first decode of a
+    process with a cold JIT cache.
+    """
+    sites = []
+    for module in decoder.modules():
+        if (
+            type(module) is residual_block_cls
+            and type(module.norm1) is FusedChannelRMSNormSiLU
+        ):
+            conv1 = module.conv1
+            takes_bias = type(conv1) is FoldedPadConv2d and conv1.bias is not None
+            sites.append((module.norm1.gamma.numel(), False))
+            sites.append((module.norm2.gamma.numel(), takes_bias))
+    if type(decoder.norm_out) is FusedChannelRMSNormSiLU:
+        sites.append((decoder.norm_out.gamma.numel(), False))
+    return [*channel_rmsnorm_silu_nhwc_builders(sites), bias_residual_add_builder(True)]
+
+
+def _build_first_decode_jit_modules(decoder, residual_block_cls) -> None:
+    try:
+        parallel_compile(_first_decode_jit_builders(decoder, residual_block_cls))
+    except Exception as e:
+        # the first use builds the module again and reports the error
+        logger.debug("Qwen-Image 2.1 VAE: JIT prebuild failed: %s", e)
+
+
 def _replace_children(root: nn.Module, child_cls: type, make) -> int:
     targets = [
         (parent, name)
@@ -525,6 +558,7 @@ def maybe_optimize_qwen_image21_vae(vae: nn.Module) -> nn.Module:
     decoder._sgl_channels_last = False
     decoder.forward = MethodType(_decoder_layout_forward, decoder)
     register_vae_fast_path_gate(vae, gate)
+    _build_first_decode_jit_modules(decoder, QwenImage21ResidualBlock)
     logger.info(
         "Qwen-Image 2.1 VAE: %d fused RMSNorm+SiLU sites, %d convs with folded padding, "
         "%d channels_last upsamplers, %d folded upsample+conv pairs "

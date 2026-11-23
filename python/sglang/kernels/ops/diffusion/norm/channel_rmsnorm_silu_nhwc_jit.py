@@ -14,7 +14,8 @@ Even channel counts up to 2048. CUDA only.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import functools
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import torch
 
@@ -54,6 +55,22 @@ def _jit_module(vec: int, lanes: int, units: int, has_bias: bool) -> Module:
         cuda_files=["diffusion/channel_rmsnorm_silu_nhwc.cuh"],
         cuda_wrappers=[("run", f"channel_rmsnorm_silu_nhwc::Kernel<{args}>::run")],
     )
+
+
+def channel_rmsnorm_silu_nhwc_builders(
+    sites: Iterable[tuple[int, bool]],
+) -> list[Callable[[], Module]]:
+    """One module factory per distinct specialization among ``(channels, has_bias)`` sites.
+
+    A decoder reaches several channel widths and each is a build of its own on
+    first use; hand these to ``parallel_compile`` to build them together.
+    """
+    keys = {
+        (*_specialization(channels), has_bias)
+        for channels, has_bias in sites
+        if channels % 2 == 0 and 0 < channels <= _MAX_CHANNELS
+    }
+    return [functools.partial(_jit_module, *key) for key in sorted(keys)]
 
 
 def _channel_last_dims(x: torch.Tensor) -> tuple[int, ...]:
@@ -133,5 +150,6 @@ def channel_rmsnorm_silu_nhwc(
 __all__ = [
     "can_use_channel_rmsnorm_silu_nhwc",
     "channel_rmsnorm_silu_nhwc",
+    "channel_rmsnorm_silu_nhwc_builders",
     "is_channels_last_dense",
 ]

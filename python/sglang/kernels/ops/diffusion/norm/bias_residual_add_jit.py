@@ -11,7 +11,8 @@ pass's read + write of ``y`` disappears. Supports channels_last-dense tensors
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import functools
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -37,6 +38,11 @@ def _jit_module(channels_inner: bool) -> Module:
         cuda_files=["diffusion/bias_residual_add.cuh"],
         cuda_wrappers=[("run", f"bias_residual_add::Kernel<{args}>::run")],
     )
+
+
+def bias_residual_add_builder(channels_inner: bool) -> Callable[[], Module]:
+    """The module factory of one layout, for ``parallel_compile``."""
+    return functools.partial(_jit_module, channels_inner)
 
 
 def _same_layout(y: torch.Tensor, h: torch.Tensor) -> bool:
@@ -110,4 +116,8 @@ def bias_residual_add(
     return out
 
 
-__all__ = ["bias_residual_add", "can_use_bias_residual_add"]
+__all__ = [
+    "bias_residual_add",
+    "bias_residual_add_builder",
+    "can_use_bias_residual_add",
+]
