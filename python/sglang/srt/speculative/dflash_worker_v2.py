@@ -1148,6 +1148,69 @@ class DFlashWorkerV2(BaseSpecWorker):
         torch.cuda.synchronize()
         return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
 
+    def _verify_logits_shared_output(self, rows: int):
+        """The persistent logits buffer when serving's verify sampler reads from
+        it, else None (serving then makes a fresh matrix, so must the rehearsal)."""
+        shared_output = getattr(self.model_runner, "graph_shared_output", None)
+        if shared_output is None or shared_output.max_rows < rows:
+            return None
+        # DP attention can run a verify round eagerly, without the buffer.
+        if get_parallel().attn_dp_enabled:
+            return None
+        # A deferred TP gather leaves a vocab shard in the graph, and the full
+        # logits are gathered into a new matrix before sampling.
+        lp = getattr(self, "_target_logits_processor", None)
+        if (
+            lp is not None
+            and lp.defer_verify_gather
+            and lp.do_tensor_parallel_all_gather
+            and not lp.use_attn_tp_group
+            and not lp.do_tensor_parallel_all_gather_dp_attn
+            and (lp.final_logit_softcapping or lp.defer_plain_gather)
+        ):
+            return None
+        return shared_output
+
+    def _rehearsal_free_bytes(self) -> Tuple[int, int]:
+        """Free device memory, and memory PyTorch holds cached but unused."""
+        free, _ = torch.cuda.mem_get_info(self.device)
+        cached = torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(
+            self.device
+        )
+        return free, cached
+
+    def _sampling_rehearsal_oom(
+        self, bs: int, block_size: int, vocab_size: int, free: Tuple[int, int]
+    ) -> torch.OutOfMemoryError:
+        """The rehearsal's OOM, restated as what it needed and what to change."""
+        gib = 1 << 30
+        matrix_gib = bs * block_size * vocab_size * 4 / gib
+        runner = self.model_runner
+        pool = getattr(runner, "token_to_kv_pool", None)
+        if getattr(pool, "post_capture_active", False):
+            sized = (
+                "Post-capture KV sizing is on, so the KV cache is not allocated "
+                "yet: graph capture itself left too little. Lower "
+                "--mem-fraction-static or --max-running-requests."
+            )
+        else:
+            sized = (
+                "The KV cache was sized from --mem-fraction-static="
+                f"{runner.mem_fraction_static} before this pre-warm and left too "
+                "little for it; non-greedy requests at this batch could fail the "
+                "same way under load. Lower --mem-fraction-static or "
+                "--max-running-requests, or set "
+                "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1 to size the KV cache after "
+                "the pre-warm."
+            )
+        return torch.OutOfMemoryError(
+            "DFLASH sampling pre-warm ran out of GPU memory rehearsing the "
+            f"{bs}x{block_size}x{vocab_size} verify probabilities (full-vocab "
+            f"fp32 temporaries of {matrix_gib:.2f} GiB each; after CUDA graph "
+            f"capture {free[0] / gib:.2f} GiB was free on the device and "
+            f"{free[1] / gib:.2f} GiB more cached by PyTorch). " + sized
+        )
+
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
@@ -1178,10 +1241,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             need_min_p_sampling=False,
             vocab_size=vocab_size,
         )
+        free_before = self._rehearsal_free_bytes()
         candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
-        target_logits = torch.zeros(
-            (bs * block_size, vocab_size), dtype=torch.float32, device=device
-        )
+        rows = bs * block_size
+        shared_output = self._verify_logits_shared_output(rows)
+        if shared_output is not None:
+            # Already resident and already counted: rehearse on the buffer
+            # serving samples from, zeroed so capture leftovers never reach the
+            # sampler.
+            target_logits = shared_output.get_logits_buffer(vocab_size, rows=rows)
+            target_logits.zero_()
+        else:
+            target_logits = torch.zeros(
+                (rows, vocab_size), dtype=torch.float32, device=device
+            )
 
         # Size the process-lifetime chain buffers before anything borrows. The
         # cache is keyed on device index, so pass the resolved device, not "cuda".
@@ -1190,12 +1263,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # One unborrowed pass, so any workspace a kernel caches for the process
         # lifetime lands outside graph storage and off the measured peak.
-        with envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
-            self._measure_sampling_peak(
-                candidates=candidates,
-                target_logits=target_logits,
-                sampling_info=sampling_info,
-            )
+        try:
+            with envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False):
+                self._measure_sampling_peak(
+                    candidates=candidates,
+                    target_logits=target_logits,
+                    sampling_info=sampling_info,
+                )
+        except torch.OutOfMemoryError as e:
+            raise self._sampling_rehearsal_oom(
+                bs, block_size, vocab_size, free_before
+            ) from e
 
         borrowing = graph_pool_borrow_enabled()
         try:
@@ -1204,9 +1282,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_logits=target_logits,
                 sampling_info=sampling_info,
             )
-        except torch.OutOfMemoryError:
+        except torch.OutOfMemoryError as e:
             if not borrowing:
-                raise
+                raise self._sampling_rehearsal_oom(
+                    bs, block_size, vocab_size, free_before
+                ) from e
             reason = (
                 "DFLASH sampling rehearsal exhausted graph-pool memory for the "
                 f"{bs}x{block_size}x{vocab_size} verify probability matrices"
@@ -1217,13 +1297,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 reason,
             )
             disable_graph_pool_borrow(reason)
-            peak_bytes = self._measure_sampling_peak(
-                candidates=candidates,
-                target_logits=target_logits,
-                sampling_info=sampling_info,
-            )
+            try:
+                peak_bytes = self._measure_sampling_peak(
+                    candidates=candidates,
+                    target_logits=target_logits,
+                    sampling_info=sampling_info,
+                )
+            except torch.OutOfMemoryError as retry_error:
+                raise self._sampling_rehearsal_oom(
+                    bs, block_size, vocab_size, free_before
+                ) from retry_error
 
-        sampling_input_bytes = target_logits.numel() * target_logits.element_size()
+        sampling_input_bytes = (
+            0
+            if shared_output is not None
+            else target_logits.numel() * target_logits.element_size()
+        )
         result = SamplingPrewarmResult(
             sampling_input_bytes=sampling_input_bytes,
             sampling_headroom_bytes=peak_bytes + sampling_input_bytes,

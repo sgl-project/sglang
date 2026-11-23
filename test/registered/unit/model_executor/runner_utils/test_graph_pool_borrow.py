@@ -14,6 +14,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -890,6 +891,165 @@ class TestGraphPoolBorrow(CustomTestCase):
             result.sampling_headroom_bytes, result.sampling_input_bytes
         )
         self.assertIs(worker.model_runner.sampling_prewarm_result, result)
+
+    def _dflash_prewarm_worker(self, **runner_fields):
+        worker = object.__new__(DFlashWorkerV2)
+        worker.block_size = 4
+        worker.device = "cuda"
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                max_running_requests=2,
+                max_decode_logits_rows=lambda: 8,
+                sampling_prewarm_result=None,
+                mem_fraction_static=0.93,
+                **runner_fields,
+            ),
+            model_config=SimpleNamespace(vocab_size=32),
+        )
+        worker.model_runner = worker._target_worker.model_runner
+        return worker
+
+    def _rehearse_logits(self, worker):
+        """Run the pre-warm; return the logits each pass got, with their sum
+        at the time, and the result."""
+        seen = []
+
+        def rehearse(*, next_token_logits, **kwargs):
+            seen.append((next_token_logits, float(next_token_logits.abs().sum())))
+            return torch.zeros(2), torch.zeros(2)
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            patch.object(
+                dflash_worker_v2,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dp_enabled=False),
+            ),
+            patch.object(
+                dflash_worker_v2,
+                "compute_dflash_sampling_correct_drafts_and_bonus",
+                rehearse,
+            ),
+        ):
+            result = worker.prewarm_sampling()
+        return seen, result
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_prewarm_rehearses_on_the_shared_logits_buffer(self):
+        """Serving writes verify logits into the graph runners' persistent
+        buffer, so the rehearsal must use it too: a fresh matrix would make
+        startup demand one full-vocab temporary more than serving ever needs."""
+        shared = GraphSharedOutput(device=torch.device("cuda"), max_rows=8)
+        buffer = shared.get_logits_buffer(32, rows=8)
+        buffer.fill_(7.0)
+        worker = self._dflash_prewarm_worker(graph_shared_output=shared)
+
+        seen, result = self._rehearse_logits(worker)
+
+        self.assertEqual(len(seen), 2)
+        for logits, total in seen:
+            self.assertEqual(logits.data_ptr(), buffer.data_ptr())
+            self.assertEqual(tuple(logits.shape), (2 * 4, 32))
+            # Zeroed before the sampler saw it: capture leftovers never leak in.
+            self.assertEqual(total, 0.0)
+        # The logits are already resident: nothing extra for KV sizing to hold back.
+        self.assertEqual(result.sampling_input_bytes, 0)
+        self.assertIs(worker.model_runner.sampling_prewarm_result, result)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_prewarm_keeps_a_fresh_matrix_for_a_deferred_tp_gather(self):
+        """A deferred TP gather samples from a newly gathered matrix, not the
+        buffer, so the rehearsal must allocate one and reserve its bytes."""
+        shared = GraphSharedOutput(device=torch.device("cuda"), max_rows=8)
+        buffer = shared.get_logits_buffer(32, rows=8)
+        worker = self._dflash_prewarm_worker(graph_shared_output=shared)
+        worker._target_logits_processor = SimpleNamespace(
+            defer_verify_gather=True,
+            do_tensor_parallel_all_gather=True,
+            use_attn_tp_group=False,
+            do_tensor_parallel_all_gather_dp_attn=False,
+            final_logit_softcapping=30.0,
+            defer_plain_gather=False,
+        )
+
+        seen, result = self._rehearse_logits(worker)
+
+        self.assertEqual(len(seen), 2)
+        for logits, _ in seen:
+            self.assertNotEqual(logits.data_ptr(), buffer.data_ptr())
+        # 2 rows x 4 draft tokens x 32 vocab x 4 bytes.
+        self.assertEqual(result.sampling_input_bytes, 2 * 4 * 32 * 4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_prewarm_oom_names_the_fix(self):
+        """A rehearsal OOM with nothing left to fall back to must say what it
+        needed and what to change, not surface raw."""
+        cases = [
+            # (borrowing, failing call): the warm-up and the measured pass
+            # without borrowing, and the retry after the borrowing fallback.
+            (False, 1),
+            (False, 2),
+            (True, 3),
+        ]
+        for borrowing, failing_call in cases:
+            with self.subTest(borrowing=borrowing, failing_call=failing_call):
+                self.state.disabled_reason = None
+                worker = self._dflash_prewarm_worker()
+                original = torch.OutOfMemoryError("CUDA out of memory")
+                calls = []
+
+                def rehearse(**kwargs):
+                    calls.append(None)
+                    if len(calls) == failing_call or (borrowing and len(calls) == 2):
+                        raise original
+                    return torch.zeros(2), torch.zeros(2)
+
+                with (
+                    envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(borrowing),
+                    patch.object(
+                        pool, "get_global_graph_memory_pool", return_value=(1, 2)
+                    ),
+                    patch.object(
+                        dflash_worker_v2,
+                        "compute_dflash_sampling_correct_drafts_and_bonus",
+                        rehearse,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        torch.OutOfMemoryError,
+                        r"2x4x32.*GiB was free.*cached by PyTorch.*"
+                        r"--mem-fraction-static=0\.93.*--max-running-requests.*"
+                        r"SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1",
+                    ) as raised:
+                        worker.prewarm_sampling()
+                self.assertIs(raised.exception.__cause__, original)
+                self.assertEqual(len(calls), failing_call)
+                self.assertIsNone(worker.model_runner.sampling_prewarm_result)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_prewarm_oom_under_post_capture_sizing_says_so(self):
+        """With post-capture sizing the KV cache is not allocated yet, so the
+        message must not blame it or suggest the flag that is already on."""
+        worker = self._dflash_prewarm_worker(
+            token_to_kv_pool=SimpleNamespace(post_capture_active=True)
+        )
+
+        def rehearse(**kwargs):
+            raise torch.OutOfMemoryError("CUDA out of memory")
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            patch.object(
+                dflash_worker_v2,
+                "compute_dflash_sampling_correct_drafts_and_bonus",
+                rehearse,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                torch.OutOfMemoryError, r"Post-capture KV sizing is on"
+            ) as raised:
+                worker.prewarm_sampling()
+        self.assertNotIn("SGLANG_ENABLE_POST_CAPTURE_KV_SIZING", str(raised.exception))
 
 
 if __name__ == "__main__":
