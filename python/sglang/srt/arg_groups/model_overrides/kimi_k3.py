@@ -182,20 +182,50 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    overrides = {}
-    if cfg.dcp_size > 1 and cfg.speculative_algorithm == "DSPARK":
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
-        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+    platform = get_platform()
+    overrides = {"decode_state_free_radix_default": True}
+    if cfg.dcp_size > 1:
+        supported = ("DSPARK",) if platform.is_npu else ("DSPARK", "DFLASH")
+        if cfg.speculative_algorithm not in (None, *supported):
             raise ValueError(
-                "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
+                f"Kimi-K3.1 DCP supports {', '.join(supported)} on {cfg.device}."
             )
-        overrides["speculative_attention_mode"] = "decode"
-    if get_platform().is_npu:
-        if cfg.dcp_size > 1:
+        pd_backends = ("mooncake", "mori") if platform.is_gfx95 else ("mooncake",)
+        if (
+            cfg.disaggregation_mode != "null"
+            and not platform.is_npu
+            and cfg.disaggregation_transfer_backend not in pd_backends
+        ):
+            raise ValueError(
+                "Kimi-K3.1 DCP supports PD only over Mooncake (or MoRI on gfx950)."
+            )
+        if cfg.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+        if cfg.speculative_algorithm == "DFLASH":
+            from sglang.srt.speculative.dflash_draft_ring import (
+                dflash_dcp_mla_draft_backend,
+            )
+
+            draft_backend = dflash_dcp_mla_draft_backend()
+            if cfg.speculative_draft_attention_backend not in (None, draft_backend):
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DFLASH needs "
+                    f"--speculative-draft-attention-backend {draft_backend}."
+                )
+            overrides["speculative_draft_attention_backend"] = draft_backend
+        if cfg.speculative_algorithm is not None:
+            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
+            # rank attends over its KV shard and the (o, lse) partials are merged.
+            overrides["speculative_attention_mode"] = "decode"
+        if platform.is_npu:
             if attn_tp_size_of(cfg) % cfg.dcp_size != 0:
                 raise ValueError("Kimi-K3.1 Ascend DCP must divide attention TP size.")
             if cfg.kv_cache_dtype not in ("auto", "bfloat16"):
@@ -205,8 +235,6 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                     "Kimi-K3.1 Ascend DCP requires eager prefill. Set "
                     "--disable-prefill-cuda-graph."
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError("Kimi-K3.1 Ascend DCP supports DSPARK speculation.")
             if (
                 cfg.disaggregation_mode != "null"
                 or cfg.enable_hierarchical_cache
@@ -221,36 +249,7 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             if envs.SGLANG_NPU_USE_MLAPO.get() or get_bool_env_var("SGLANG_USE_FIA_NZ"):
                 raise ValueError("Kimi-K3.1 Ascend DCP requires unfused ND KV writes.")
             overrides["kv_cache_dtype"] = "bfloat16"
-        overrides["decode_state_free_radix_default"] = True
-        return overrides
-    if cfg.dcp_size > 1:
-        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
-            raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
-            )
-        pd_backends = ("mooncake", "mori") if get_platform().is_gfx95 else ("mooncake",)
-        if (
-            cfg.disaggregation_mode != "null"
-            and cfg.disaggregation_transfer_backend not in pd_backends
-        ):
-            raise ValueError(
-                "Kimi-K3.1 DCP supports PD only over Mooncake (or MoRI on gfx950)."
-            )
-        if cfg.speculative_algorithm == "DFLASH":
-            from sglang.srt.speculative.dflash_draft_ring import (
-                dflash_dcp_mla_draft_backend,
-            )
-
-            draft_backend = dflash_dcp_mla_draft_backend()
-            if cfg.speculative_draft_attention_backend not in (None, draft_backend):
-                raise ValueError(
-                    "Kimi-K3.1 DCP + DFLASH needs "
-                    f"--speculative-draft-attention-backend {draft_backend}."
-                )
-            overrides["speculative_draft_attention_backend"] = draft_backend
-            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
-            # rank attends over its KV shard and the (o, lse) partials are merged.
-            overrides["speculative_attention_mode"] = "decode"
+            return overrides
         if (
             cfg.dsa_topk_backend != "sgl-kernel"
             or not envs.SGLANG_OPT_USE_TOPK_V2.get()
@@ -273,10 +272,9 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
-    if cfg.enable_flashmla_prefill_token_packing is None:
+    if not platform.is_npu and cfg.enable_flashmla_prefill_token_packing is None:
         logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True
-    overrides["decode_state_free_radix_default"] = True
     return overrides
 
 

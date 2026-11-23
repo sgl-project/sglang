@@ -264,15 +264,12 @@ class MarkovSampleStep:
         if inputs_on_cuda(**kwargs):
             if _is_npu:
                 # Ascend's operator only handles the unmodified logits path.
-                if (
-                    kwargs.get("softcap") is not None
-                    or kwargs.get("vocab_limit") is not None
-                ):
-                    return cls.torch(**kwargs)
+                softcap = kwargs.pop("softcap", None)
+                vocab_limit = kwargs.pop("vocab_limit", None)
+                if softcap is not None or vocab_limit is not None:
+                    return cls.torch(softcap=softcap, vocab_limit=vocab_limit, **kwargs)
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
-                kwargs.pop("softcap", None)
-                kwargs.pop("vocab_limit", None)
                 return markov_sample_step_triton(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)

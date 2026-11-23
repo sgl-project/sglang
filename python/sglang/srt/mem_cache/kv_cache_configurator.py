@@ -2386,12 +2386,6 @@ class KVCacheConfigurator:
                 get_glm_dsa_cp_layer_shard_info(self)
             )
 
-        # Indexer uses the allocator-global slot space on DCP target workers.
-        dcp_size = get_parallel().attn_dcp_size
-        if self.is_draft_worker:
-            index_size = max_total_num_tokens
-        else:
-            index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
         # Shared layers never access the indexer; pool sizing uses the same gate
         # so the saved indexer memory can be used for additional KV tokens.
@@ -2447,7 +2441,6 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
-            index_size=index_size,
             index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(

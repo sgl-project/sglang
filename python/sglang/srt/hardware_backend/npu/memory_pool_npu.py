@@ -855,10 +855,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.index_page_size = (
             page_size // index_kpool if index_page_size is None else index_page_size
         )
-        self.index_size = size if index_size is None else index_size
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        if index_size is None:
+            # Index-K uses global slots. Draft capacity already spans those slots.
+            index_size = size
+            if index_head_dim is not None and not is_draft_worker:
+                index_size *= self.dcp_size
+        self.index_size = index_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -1570,9 +1575,6 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             indexer_layer_ids = [
                 i for i, skip in enumerate(skip_topk_layers) if not skip
             ]
-        # A target shards MLA KV, but its indexer writes allocator-global IDs.
-        # Draft capacity already spans the global address space.
-        index_size = size if is_draft_worker else size * get_parallel().attn_dcp_size
         super().__init__(
             size=size,
             page_size=page_size,
@@ -1583,8 +1585,6 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
             index_head_dim=index_head_dim,
-            index_size=index_size,
-            index_page_size=page_size // index_kpool,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=kv_cache_dim,
             is_draft_worker=is_draft_worker,

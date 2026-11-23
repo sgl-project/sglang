@@ -44,11 +44,6 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         pool = object()
 
         with (
-            patch.object(
-                kcc,
-                "get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=2),
-            ),
             patch(
                 "sglang.srt.layers.cp.utils.get_parallel",
                 return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
@@ -88,7 +83,6 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
 
         self.assertIs(result, pool)
         self.assertEqual(pool_class.call_args.args, (64,))
-        self.assertEqual(pool_class.call_args.kwargs["index_size"], 128)
         self.assertEqual(pool_class.call_args.kwargs["indexer_layer_ids"], (10, 12))
         self.assertEqual(
             pool_class.call_args.kwargs["indexer_quant_mode"], QUANT_MODE_TOKEN_INT8

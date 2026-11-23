@@ -467,15 +467,12 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_hybrid_dsa_allocates_indexer_in_global_slot_space(self):
-        with (
-            patch.object(NPUMLATokenToKVPool, "__init__", return_value=None) as init,
-            patch(
-                "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=2),
-            ),
+        with patch(
+            "sglang.srt.hardware_backend.npu.memory_pool_npu.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=2, attn_dcp_rank=0),
         ):
             for is_draft_worker, size in [(False, 256), (True, 512)]:
-                NPUDSATokenToKVPool(
+                pool = NPUDSATokenToKVPool(
                     size=size,
                     page_size=128,
                     kv_lora_rank=512,
@@ -488,9 +485,9 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
                     skip_topk_layers=[False, True],
                     is_draft_worker=is_draft_worker,
                 )
-                self.assertEqual(init.call_args.kwargs["size"], size)
-                self.assertEqual(init.call_args.kwargs["index_size"], 512)
-                self.assertEqual(init.call_args.kwargs["indexer_layer_ids"], [0])
+                self.assertEqual(pool.size, size)
+                self.assertEqual(pool.index_size, 512)
+                self.assertEqual(pool.index_k_buffer.shape, (1, 6, 128, 1, 128))
 
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
         pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
