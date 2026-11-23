@@ -73,14 +73,14 @@ def _quantize_npu_indexer_activation(
             torch.empty_like(x, dtype=dst_type),
             torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
-    rotated = x @ hadamard
     if kpool_query and dst_type == torch.int8:
         from sgl_kernel_npu.operators.activation import dynamic_quant
 
-        quantized, scale = dynamic_quant(rotated.reshape(-1, 128), dst_type=dst_type)
+        quantized, scale = dynamic_quant(x.reshape(-1, 128), dst_type=dst_type)
         # PI requires positive descales, including padding rows.
         scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     else:
+        rotated = x @ hadamard
         quantized, scale = torch_npu.npu_dynamic_quant(
             rotated.reshape(-1, 128), dst_type=dst_type
         )
