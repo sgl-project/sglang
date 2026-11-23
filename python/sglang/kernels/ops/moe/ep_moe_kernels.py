@@ -17,6 +17,7 @@ if _is_cuda or _is_musa or _is_sail:
     )
 
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 def _get_launch_config_1d(device, numel):
@@ -556,6 +557,10 @@ def _silu_and_mul_post_quant_kernel_sail(
 
             inv_s = tl.reshape(1.0 / output_s, (N_GROUPS, 1))
             output_q_2d = tl.clamp(gate_up_2d * inv_s, fp8_min, fp8_max)
+            if output_ptr.dtype.element_ty == tl.int8:
+                # float->int8 casts truncate; round to nearest first, as
+                # _per_token_quant_int8 does, to avoid a full biased step.
+                output_q_2d = libdevice.round(output_q_2d)
             output_q = tl.reshape(output_q_2d, (BLOCK_N,)).to(
                 output_ptr.dtype.element_ty
             )
@@ -647,9 +652,13 @@ def _silu_and_mul_post_quant_kernel_sail(
                 output_s = _absmax / fp8_max
                 if SCALE_UE8M0:
                     output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
-                output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
-                    output_ptr.dtype.element_ty
-                )
+                output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max)
+                if output_ptr.dtype.element_ty == tl.int8:
+                    # float->int8 casts truncate; round to nearest first, as
+                    # _per_token_quant_int8 does, to keep the error at half a
+                    # quantization step instead of a full biased step.
+                    output_q = libdevice.round(output_q)
+                output_q = output_q.to(output_ptr.dtype.element_ty)
                 tl.store(
                     output_ptr_offs + token_index * stride_output_1,
                     output_q,
