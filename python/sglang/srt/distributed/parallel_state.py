@@ -3325,7 +3325,7 @@ def _any_rank_in_world(flag: bool) -> bool:
     world = get_world_group()
     if world.world_size == 1:
         return flag
-    value = torch.tensor([int(flag)], dtype=torch.int32)
+    value = torch.tensor([int(flag)], dtype=torch.int32, device="cpu")
     torch.distributed.all_reduce(
         value, op=torch.distributed.ReduceOp.MAX, group=world.cpu_group
     )
