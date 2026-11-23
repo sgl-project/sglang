@@ -5,7 +5,6 @@ import inspect
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,30 +43,20 @@ def weight_rewrite_error(*features: str) -> Optional[str]:
 
 def activate(exec_config: Any) -> None:
     _routes.clear()
-    if not (selection := os.environ.get("FLASHINFER_KERNEL_PACKAGES", "").strip()):
+    if not os.environ.get("FLASHINFER_KERNEL_PACKAGES", "").strip():
         return
     try:
-        from flashinfer.trace_apply import packages, preloaded_entry
+        from flashinfer.trace_apply import installed_packages
     except ImportError:
-        logger.warning("FLASHINFER_KERNEL_PACKAGES needs FlashInfer >= 0.7.5; ignored.")
+        logger.warning(
+            "Kernel packages at SGLang call sites need FlashInfer's "
+            "installed_packages(); skipped."
+        )
         return
 
-    root = Path(os.environ.get(packages.ROOT_ENV) or packages.DEFAULT_PACKAGE_ROOT)
-    sites: dict[str, str] = {}
-    for digest in filter(None, map(str.strip, selection.split(","))):
-        try:
-            package = packages.verify_package(root, digest)
-            tags = (package.definition or {}).get("tags") or ()
-            site = next((t[7:] for t in tags if t.startswith("fi_api:")), "")
-            key = package.operation, str(package.solution.get("name"))
-            if preloaded_entry(*key) is not None:
-                sites[digest] = site
-        except Exception:
-            continue  # FlashInfer warned about it at import
-    # FlashInfer's own checks again, installing nothing: a package it refused at
-    # import stays out, so a Definition only ever runs its own package's kernel.
-    loaded = packages.load_packages(root, list(sites), strict=False, enable=False)
-
+    # Listing binds each package in this process, so the refusal below also
+    # sees the packages of a forked worker.
+    installed = installed_packages()
     offload = exec_config.offload
     features = {
         "--enable-eplb": exec_config.moe.enable_eplb,
@@ -79,12 +68,11 @@ def activate(exec_config: Any) -> None:
     if error := weight_rewrite_error(*(name for name, on in features.items() if on)):
         raise ValueError(error)
 
-    for package in loaded.packages:
-        name = str(loaded.solutions[package.operation].name)
-        site = sites[package.digest]
-        _routes.setdefault(site, []).append(
-            (package.definition, loaded.callables[package.operation, name])
-        )
+    for package, run in installed:
+        tags = (package.definition or {}).get("tags")
+        tags = map(str, tags if isinstance(tags, list) else ())
+        site = next((t[7:] for t in tags if t.startswith("fi_api:")), "")
+        _routes.setdefault(site, []).append((package.definition, run))
         logger.info(
             "FlashInfer kernel package %s: %s.",
             package.digest[:12],

@@ -5,16 +5,13 @@ import sys
 
 import pytest
 
+from sglang import Engine
+from sglang.srt import runtime_context as rc
+from sglang.srt.kernel_plugins import flashinfer_packages
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-small")
-
-packages = pytest.importorskip("flashinfer.trace_apply.packages")
-
-from sglang import Engine  # noqa: E402
-from sglang.srt import runtime_context as rc  # noqa: E402
-from sglang.srt.kernel_plugins import flashinfer_packages  # noqa: E402
-from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 SITE = "sglang.kernels.ops.mamba.triton_ops.ssd_chunk_scan._chunk_scan_fwd"
 # A pass-through Solution with a setup step, fitting one-chunk prefills (K == 1). It
@@ -92,6 +89,11 @@ def seal(root, kernel=KERNEL, chunks=1):
 
 @pytest.fixture
 def package(tmp_path, monkeypatch):
+    # Skipped here, not at import: CI runs this file as a script, where a
+    # module-level skip is an uncaught exception.
+    packages = pytest.importorskip("flashinfer.trace_apply.packages")
+    if not hasattr(packages, "installed_packages"):
+        pytest.skip("needs FlashInfer's installed_packages()")
     root = tmp_path / "packages"
     # A package that fails to import, selected first under the same names: its
     # Definition (K == 3) must not be routed to the next package's kernel.
@@ -99,7 +101,7 @@ def package(tmp_path, monkeypatch):
     monkeypatch.setenv("FLASHINFER_KERNEL_PACKAGE_ROOT", str(root))
     monkeypatch.setenv("FLASHINFER_KERNEL_PACKAGES", ",".join(digests))
     monkeypatch.setenv("KERNEL_PACKAGE_PROBE", str(tmp_path / "probe.json"))
-    return root, digests
+    return packages, root, digests
 
 
 def test_package_serves_chunk_scan_in_scheduler(package, tmp_path):
@@ -129,7 +131,7 @@ def test_package_serves_chunk_scan_in_scheduler(package, tmp_path):
 
 
 def test_setup_package_refuses_memory_saver(package):
-    root, digests = package
+    packages, root, digests = package
     # FlashInfer was imported before the env; load as its import does.
     packages.load_packages(root, digests, strict=False)
     rc.reset_context()
