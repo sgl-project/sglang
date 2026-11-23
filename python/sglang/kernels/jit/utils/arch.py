@@ -176,8 +176,6 @@ def resolve_compile_arch(
 
 def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
     """Default compile flags for `arch`, defaulting to the detected local GPU."""
-    if is_musa_runtime():
-        return ["-DUSE_MUSA", "-std=c++20", "-O3"]
     if is_hip_runtime():
         flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
         # Detect FP8 type based on GPU architecture
@@ -191,15 +189,16 @@ def get_default_target_flags(arch: CompileArch | None = None) -> List[str]:
         except Exception:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
-    else:
-        if arch is None:
-            arch = get_compile_arch()
-        return [
-            arch.jit_flag,
-            "-std=c++20",
-            "-O3",
-            "--expt-relaxed-constexpr",
-        ]
+    if is_musa_runtime():
+        return ["-DUSE_MUSA", "-std=c++20", "-O3"]
+    if arch is None:
+        arch = get_compile_arch()
+    return [
+        arch.jit_flag,
+        "-std=c++20",
+        "-O3",
+        "--expt-relaxed-constexpr",
+    ]
 
 
 @cache_once

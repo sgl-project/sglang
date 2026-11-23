@@ -68,3 +68,17 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
         "-L/opt/musa/lib",
         "-lmusart",
     ]
+
+
+def test_musa_checks_preserve_existing_platform_precedence(monkeypatch):
+    monkeypatch.setattr(toolchain, "is_sail_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: True)
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(toolchain, "rocm_home", lambda: "/opt/rocm")
+
+    assert toolchain.device_compiler_path.__wrapped__() == "/opt/rocm/bin/hipcc"
+    assert toolchain.base_cuda_flags() == [
+        "-fPIC",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "-fno-gpu-rdc",
+    ]
