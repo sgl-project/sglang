@@ -17,6 +17,10 @@ export const config = {
 
   latencyPercentile: "P50",
 
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
+
   supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtx6000"],
 
   // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared catalog.
