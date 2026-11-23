@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.pipelines import minimax_h3_pipeline
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
@@ -264,6 +266,220 @@ def test_hybrid_override_loads_ref_config_and_admits_all_native_tasks(weights):
         )
     with pytest.raises(ValueError):
         pipeline.release_metadata.canonical_task("unknown")
+
+
+def _write_partition(root, subfolder, partition, tasks, **contract):
+    os.makedirs(os.path.join(root, subfolder, "pika"))
+    os.makedirs(os.path.join(root, subfolder, "transformer"))
+    open(os.path.join(root, subfolder, "pika", "adapter.safetensors"), "w").close()
+    model_index = {
+        "_class_name": "PikaH3FlexPipeline",
+        "_diffusers_version": "0.32.2",
+        "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+        "_minimax_h3": {
+            "schema_version": 1,
+            "partition": partition,
+            "tasks": tasks,
+            "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            "dmd_denoising_steps": [1000, 750, 500, 250, 100, 40],
+            "stochastic_sampling": True,
+            "lora_adapter": "pika/adapter.safetensors",
+            **contract,
+        },
+    }
+    with open(os.path.join(root, subfolder, "model_index.json"), "w") as f:
+        json.dump(model_index, f)
+    return model_index
+
+
+def _dual_pipeline(root):
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.server_args = SimpleNamespace(
+        model_variant="fl2va+ref2va",
+        model_subfolder=None,
+        component_weights_paths={},
+        transformer_weights_path=None,
+        component_paths={},
+        lora_path=None,
+        model_path=root,
+        revision=None,
+    )
+    pipeline.model_path = os.path.join(root, "FL2VA")
+    pipeline._required_config_modules = ["text_encoder", "transformer"]
+    pipeline.dual_variant_lora_adapters = []
+    return pipeline
+
+
+def test_dual_variant_loads_the_ref2va_transformer_and_admits_both(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+    pipeline = _dual_pipeline(root)
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(minimax_h3_pipeline, "maybe_download_model") as download,
+    ):
+        pipeline._load_config()
+
+    # both partitions are on disk: nothing is downloaded
+    download.assert_not_called()
+    # the shared components come from FL2VA, the second transformer from Ref2VA
+    assert pipeline.server_args.model_subfolder == "FL2VA"
+    assert pipeline.required_config_modules == [
+        "text_encoder",
+        "transformer",
+        "transformer_2",
+    ]
+    assert model_index["transformer_2"] == model_index["transformer"]
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    # each transformer merges its own adapter; none applies to both
+    assert pipeline.server_args.lora_path is None
+    assert pipeline.dual_variant_lora_adapters == [
+        ("fl2va", "transformer", os.path.join(root, "FL2VA/pika/adapter.safetensors")),
+        (
+            "ref2va",
+            "transformer_2",
+            os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+        ),
+    ]
+    stage = MiniMaxH3PartitionAdmissionStage(pipeline.release_metadata)
+    for task in ("t2va", "fl2va", "ref2va"):
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(task=task, quality="exact"),
+            num_inference_steps=6,
+        )
+        assert (
+            stage.forward(batch, SimpleNamespace(minimax_h3_adaln_online=False))
+            is batch
+        )
+    with pytest.raises(ValueError):
+        pipeline.release_metadata.canonical_task("t2i")
+
+
+def test_dual_variant_downloads_the_ref2va_partition_from_the_hub(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    pipeline = _dual_pipeline(root)
+    # the base loader fetched FL2VA/** of the Hub repository into root
+    pipeline.server_args.model_path = "MiniMaxAI/MiniMax-H3"
+    pipeline.server_args.revision = "main"
+
+    def download(model_id, **kwargs):
+        _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+        return root
+
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(
+            minimax_h3_pipeline, "maybe_download_model", side_effect=download
+        ) as fetch,
+    ):
+        pipeline._load_config()
+
+    fetch.assert_called_once_with(
+        "MiniMaxAI/MiniMax-H3",
+        allow_patterns=["Ref2VA/**"],
+        revision="main",
+        model_subfolder="Ref2VA",
+    )
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    assert pipeline.dual_variant_lora_adapters[1] == (
+        "ref2va",
+        "transformer_2",
+        os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+    )
+    assert pipeline.release_metadata.tasks == ("t2va", "fl2va", "ref2va")
+
+
+def test_dual_variant_needs_one_sampling_contract(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    _write_partition(
+        root,
+        "Ref2VA",
+        "ref2va",
+        ["ref2va"],
+        sigma_shift_scales={"video": 5.0, "audio": 3.0},
+    )
+    pipeline = _dual_pipeline(root)
+    with patch.object(ComposedPipelineBase, "_load_config", return_value=model_index):
+        with pytest.raises(ValueError, match="sampling contract"):
+            pipeline._load_config()
+
+
+@pytest.mark.parametrize("dual", [False, True])
+def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1) if dual else None
+    calls = []
+    stage.finish_unused_declared_component = lambda *, component_name, module: (
+        calls.append(("release", component_name, module))
+    )
+    stage._manage_dit_use_site = lambda module, name, batch: calls.append(
+        ("use", name, module)
+    )
+    stage._declared_component_use = lambda *, component_name: component_name
+
+    stage._component_residency_manager = None
+    assert stage._begin_dit_use(True, None) is (
+        stage.transformer_2 or stage.transformer
+    )
+    assert calls == []
+
+    stage._component_residency_manager = SimpleNamespace(
+        begin_use=lambda use, module: calls.append(("use", use, module))
+    )
+    ref2va = stage._begin_dit_use(True, None)
+    t2va = stage._begin_dit_use(False, None)
+    assert t2va is stage.transformer
+    if not dual:
+        assert ref2va is stage.transformer
+        assert calls == [
+            ("use", "transformer", stage.transformer),
+            ("use", "transformer", stage.transformer),
+        ]
+        return
+    # the DiT kept ready after the previous request leaves before the other is placed
+    assert ref2va is stage.transformer_2
+    assert calls == [
+        ("release", "transformer", stage.transformer),
+        ("use", "transformer_2", stage.transformer_2),
+        ("release", "transformer_2", stage.transformer_2),
+        ("use", "transformer", stage.transformer),
+    ]
+
+
+@pytest.mark.parametrize("performance_mode", ["auto", "speed"])
+@pytest.mark.parametrize("explicit_mode", [None, "component-offload"])
+def test_dual_variant_dit_uses_keep_the_last_dit_ready(performance_mode, explicit_mode):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.vae = None
+    stage.pipeline = None
+    stage._registered_stage_name = "denoising"
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1)
+    server_args = SimpleNamespace(
+        performance_mode=performance_mode,
+        explicit_residency_mode=lambda name: explicit_mode,
+    )
+    uses = stage.component_uses(server_args)
+    assert [use.component_name for use in uses] == ["transformer", "transformer_2"]
+    for use in uses:
+        # a request alone says which DiT it runs: never prefetch the first one
+        assert not use.allow_prefetch and use.memory_intensive
+        # the automatic placement keeps the DiT that ran last on the GPU
+        assert use.keep_ready_after_request == (
+            performance_mode == "auto" and explicit_mode is None
+        )
+
+    stage.transformer_2 = None
+    (single,) = stage.component_uses(server_args)
+    assert single.allow_prefetch and not single.keep_ready_after_request
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
