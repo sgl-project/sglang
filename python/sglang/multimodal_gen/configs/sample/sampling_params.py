@@ -1098,6 +1098,20 @@ class SamplingParams:
         if diffusers_kwargs is not None:
             sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
+        # __post_init__ maps the default output_quality before _adjust knows the
+        # data type, so an image got the video default and its PNG the slow
+        # compressed encode instead of the stored one
+        quality = sampling_params.output_quality
+        if (
+            user_kwargs.get("output_compression") is None
+            and quality is not None
+            and sampling_params.data_type != DataType.VIDEO
+            and sampling_params.output_compression
+            == sampling_params._adjust_output_quality(quality, DataType.VIDEO)
+        ):
+            sampling_params.output_compression = sampling_params._adjust_output_quality(
+                quality, sampling_params.data_type
+            )
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
