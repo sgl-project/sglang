@@ -417,9 +417,7 @@ class MuseSpark1xAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         attn_out = glue.run_attention(self, qkv, positions, forward_batch)
         if attn_out is not None:
-            return self.o_proj(
-                attn_out, output_tensor=glue.ar_out(attn_out.shape[0], self.hidden_size)
-            )[0]
+            return self.o_proj(attn_out)[0]
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
             q, k, v, o_gate = qkv.split(split_sizes + [self.q_size], dim=-1)
