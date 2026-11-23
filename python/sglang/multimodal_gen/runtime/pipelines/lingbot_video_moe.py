@@ -9,16 +9,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
-    LingBotVideoAutoNegativeStage,
     LingBotVideoDenoisingStage,
     LingBotVideoImageConditioningStage,
-    LingBotVideoPromptRewriteStage,
     LingBotVideoRefinementStage,
     LingBotVideoRefinerUpscaleStage,
     LingBotVideoTextEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_backends import (
-    build_rewriter_backend,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -44,10 +39,6 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
-    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self._add_base_stages(server_args)
-        self.add_standard_decoding_stage()
-
     def _text_encoding_stage(
         self, *, encode_text_only: bool = False
     ) -> LingBotVideoTextEncodingStage:
@@ -58,18 +49,8 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
             encode_text_only=encode_text_only,
         )
 
-    def _add_base_stages(self, server_args: ServerArgs) -> None:
+    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
-        config = server_args.pipeline_config
-        # One backend for both stages, so an in-process rewriter loads once.
-        rewriter_backend = build_rewriter_backend(
-            config, trust_remote_code=server_args.trust_remote_code
-        )
-        if rewriter_backend is not None:
-            self.add_stage(LingBotVideoPromptRewriteStage(backend=rewriter_backend))
-            if config.rewriter_auto_negative:
-                self.add_stage(LingBotVideoAutoNegativeStage(backend=rewriter_backend))
-        # Must precede text encoding, which reads the condition frame.
         self.add_stage(
             LingBotVideoImageConditioningStage(vae=self.get_module("vae")),
         )
@@ -78,6 +59,10 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=[_flow_shift_kwarg],
         )
+        self._add_denoising_stages()
+        self.add_standard_decoding_stage()
+
+    def _add_denoising_stages(self) -> None:
         self.add_stage(
             LingBotVideoDenoisingStage(
                 transformer=self.get_module("transformer"),
@@ -123,8 +108,8 @@ class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
             server_args, module_name, load_module_name
         )
 
-    def create_pipeline_stages(self, server_args: ServerArgs) -> None:
-        self._add_base_stages(server_args)
+    def _add_denoising_stages(self) -> None:
+        super()._add_denoising_stages()
         self.add_stage(
             self._text_encoding_stage(encode_text_only=True),
             "refiner_text_encoding_stage",
@@ -140,7 +125,6 @@ class LingBotVideoRefinerPipeline(LingBotVideoPipeline):
             ),
             "refinement_stage",
         )
-        self.add_standard_decoding_stage()
 
 
 EntryClass = [LingBotVideoPipeline, LingBotVideoRefinerPipeline]
