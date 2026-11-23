@@ -8,8 +8,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.residual import attn_bank, attn_bank_hip
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3_amd import kimi_k3_hip
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,11 +59,6 @@ class TestDSparkPrefixCaptureRowShards(CustomTestCase):
     def _capture(self, rank: int) -> torch.Tensor:
         full = torch.arange(TOTAL * HIDDEN, dtype=torch.float32).view(TOTAL, HIDDEN)
         start, valid = attn_bank_hip.row_shard(TOTAL, WORLD, rank)
-        parallel = SimpleNamespace(
-            attn_tp_size=WORLD,
-            attn_tp_rank=rank,
-            attn_tp_group=_EqualSizeGroup(full, rank),
-        )
         bank = SimpleNamespace(block_residual=torch.zeros(TOTAL, 1, HIDDEN))
         model = SimpleNamespace(
             dspark_aux_hidden_stream="prefix",
@@ -70,9 +67,12 @@ class TestDSparkPrefixCaptureRowShards(CustomTestCase):
         with (
             envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.override(True),
             patch.object(attn_bank, "_is_gfx95", True),
-            patch.object(attn_bank, "get_parallel", return_value=parallel),
-            patch.object(attn_bank_hip, "get_parallel", return_value=parallel),
-            patch.object(kimi_k3, "get_parallel", return_value=parallel),
+            patch.object(attn_bank, "attn_bank_hip", attn_bank_hip, create=True),
+            get_parallel().override(
+                attn_tp_size=WORLD,
+                attn_tp_rank=rank,
+                attn_tp_group=_EqualSizeGroup(full, rank),
+            ),
             patch.object(kimi_k3, "_is_gfx95", True),
             patch.object(
                 kimi_k3,
@@ -80,10 +80,12 @@ class TestDSparkPrefixCaptureRowShards(CustomTestCase):
                 kimi_k3_hip.gather_stream_rows_hip,
                 create=True,
             ),
-            patch.object(kimi_k3.residual_batch, "snapshot", lambda h, fb: h),
         ):
             captured = kimi_k3.KimiK3LinearModel._dspark_capture_stream(
-                model, 0, full[start : start + valid], forward_batch=None
+                model,
+                0,
+                full[start : start + valid],
+                forward_batch=SimpleNamespace(residual_stream=ResidualStream()),
             )
         return captured, full
 

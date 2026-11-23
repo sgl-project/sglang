@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -499,6 +500,61 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
 
 
 class TestSpeculatorsDSparkConfig(CustomTestCase):
+    def test_aux_stream_config_honors_launch_json_overrides(self):
+        """The capture stream must match the draft configuration's launch overrides."""
+        from sglang.srt.models import kimi_k3
+
+        owner = SimpleNamespace(model=SimpleNamespace(carries_bank_slices=False))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "dflash_config": {"aux_hidden_stream": "attn_res"},
+                    }
+                )
+            )
+            with get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path=directory,
+                trust_remote_code=False,
+                json_model_override_args=json.dumps(
+                    {"dflash_config": {"aux_hidden_stream": "prefix"}}
+                ),
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(owner, [3])
+        self.assertEqual(owner.model.dspark_aux_hidden_stream, "prefix")
+        self.assertEqual(owner.model.dspark_layers_to_capture, [3])
+
+    def test_aux_stream_config_never_executes_untrusted_remote_code(self):
+        """An untrusted draft config must fail without executing checkpoint code."""
+        from sglang.srt.models import kimi_k3
+
+        owner = SimpleNamespace(model=SimpleNamespace(carries_bank_slices=False))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "untrusted_draft",
+                        "auto_map": {
+                            "AutoConfig": "configuration_untrusted.UntrustedConfig"
+                        },
+                    }
+                )
+            )
+            Path(directory, "configuration_untrusted.py").write_text(
+                'raise AssertionError("Untrusted draft code executed")\n'
+            )
+            with (
+                get_context().override_server_args(
+                    speculative_algorithm="DSPARK",
+                    speculative_draft_model_path=directory,
+                    trust_remote_code=False,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(owner, [3])
+
     def test_speculators_dspark_config_flattens_layer_ids_and_aux_stream(self):
         from sglang.srt.configs.speculators_dspark import (
             try_load_speculators_dspark_config,
@@ -603,16 +659,10 @@ class TestSpeculatorsDSparkConfig(CustomTestCase):
             causal_lm = SimpleNamespace(
                 model=SimpleNamespace(carries_bank_slices=False)
             )
-            spec = SimpleNamespace(
-                speculative_draft_model_path=tmp, speculative_draft_model_revision=None
-            )
-            with (
-                patch.object(kimi_k3, "get_spec", return_value=spec),
-                patch.object(
-                    kimi_k3,
-                    "get_model",
-                    return_value=SimpleNamespace(trust_remote_code=False),
-                ),
+            with get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path=tmp,
+                trust_remote_code=False,
             ):
                 kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(
                     causal_lm, [1, 3]

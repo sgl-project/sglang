@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import json
 import logging
 import re
 from array import array
@@ -3875,6 +3876,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 spec_cfg.speculative_draft_model_path,
                 trust_remote_code=get_model().trust_remote_code,
                 revision=spec_cfg.speculative_draft_model_revision,
+                model_override_args=json.loads(get_model().json_model_override_args),
+                model_config_parser=get_model().model_config_parser,
             )
             self.model.dspark_aux_hidden_stream = get_dflash_aux_hidden_stream(
                 draft_cfg
