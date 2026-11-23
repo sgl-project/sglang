@@ -1,6 +1,7 @@
 """Muse Spark on SM90: the stacked split FP32 router (one GEMM over bf16 hi / lo halves, or the
 small-M GEMV) vs stock's two GEMMs, and the lm_head scale as GEMM alpha vs scaling after."""
 
+import sys
 import types
 
 import pytest
@@ -105,3 +106,7 @@ def test_lm_head_alpha_matches_scale_after(scale, m, buffered):
     # alpha is one fp32 multiply of the fp32 accumulator, like mul_; beta = 0 never reads buf
     assert buf is None or ours.data_ptr() == buf.data_ptr()
     assert torch.equal(ours.view(torch.int32), stock.view(torch.int32))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
