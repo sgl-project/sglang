@@ -98,6 +98,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             r"(?:(?P<self_close>/>)"
             rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
+        # The opening of invoke_regex: where it can first match, and whether
+        # that invoke is self-closing.
+        self.invoke_header_regex = (
+            rf'<{invoke}\s+name="[^"]+"\s*(?:(?P<self_close>/>)|>)'
+        )
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
@@ -287,6 +292,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if e_token in current_text:
                     current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
+
+        # An invoke completes on its end tag, or at once when self-closing.
+        # Until then the search below cannot finish a call, and running it over
+        # the whole buffer on every chunk made one long argument cost O(N^2).
+        if self.invoke_end_token not in current_text:
+            header = re.search(self.invoke_header_regex, current_text)
+            if header is None or not header.group("self_close"):
+                return StreamingParseResult(normal_text="", calls=[])
 
         all_calls: list[ToolCallItem] = []
         # Only recovered for the first call: the DSML guard above never releases a
