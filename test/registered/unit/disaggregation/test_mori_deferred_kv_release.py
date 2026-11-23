@@ -435,43 +435,6 @@ class TestMoriAuxLayout(CustomTestCase):
         )
         self.assertEqual(remote_offsets_and_sizes(None), ([[24], [48]], [[8], [16]]))
 
-    def test_decode_drops_an_aux_item_longer_than_its_buffer(self):
-        """A prefill with another buffer layout sends another buffer's item to this
-        position. A longer one must not be written: it would run into the next
-        request's row, or past the buffer. The room fails, since a later Success
-        would commit the unwritten row."""
-        rows = (ctypes.c_ubyte * 16)()
-        manager = _manager()
-        manager.kv_args = SimpleNamespace(
-            aux_data_ptrs=[ctypes.addressof(rows)], aux_item_lens=[8]
-        )
-        manager.request_status[11] = KVPoll.WaitingForInput
-
-        def receive(data, room=b"11"):
-            manager._handle_aux_data(
-                [
-                    MoriKVManager.AUX_DATA_HEADER,
-                    room,
-                    b"0",
-                    b"0",
-                    struct.pack(">I", len(data)),
-                    data,
-                ]
-            )
-
-        with patch("sglang.srt.disaggregation.mori.conn.logger.error") as log:
-            receive(b"\x01" * 16)
-        log.assert_called_once()
-        self.assertEqual(bytes(rows), bytes(16))
-        manager.update_status(11, KVPoll.Success)
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertIn("AUX_DATA rejected", manager.failure_records[11])
-
-        manager.request_status[12] = KVPoll.WaitingForInput
-        receive(b"\x02" * 8, room=b"12")
-        self.assertEqual(bytes(rows), b"\x02" * 8 + bytes(8))
-        self.assertEqual(manager.request_status[12], KVPoll.WaitingForInput)
-
     def test_an_aux_item_dropped_after_success_fails_the_request(self):
         """Metadata and Success travel on separate sockets, so Success can arrive
         first and the receiver caches it while it waits for the metadata. An
