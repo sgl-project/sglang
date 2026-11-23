@@ -141,6 +141,9 @@ class PrefillServerInfo:
     state_wire: Optional[List[List[Optional[str]]]] = None
     # Each pipeline stage's entries, by stage, when the stages differ.
     state_wires: Optional[List[Optional[List[List[Optional[str]]]]]] = None
+    # Non-checksum metadata buffer item sizes when prefill exchanges them;
+    # None when it does not or predates this field.
+    aux_item_lens: Optional[List[int]] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
@@ -174,6 +177,11 @@ class PrefillServerInfo:
         self.stores_to_linker = bool(self.stores_to_linker)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
+        )
+        self.aux_item_lens = (
+            [int(x) for x in self.aux_item_lens]
+            if self.aux_item_lens is not None
+            else None
         )
 
 
@@ -328,6 +336,8 @@ class CommonKVManager(BaseKVManager):
     # the metric keeps its last-chunk fallback, so dashboards do not move.
     reports_transfer_latency: bool = False
 
+    customized_info_enabled: bool = False
+    exchange_aux_item_lens: bool = False
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
@@ -784,6 +794,42 @@ class CommonKVManager(BaseKVManager):
                 "Disaggregation metadata buffer layout mismatch: "
                 f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
                 f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
+                "Both servers must run a build that reports metadata buffer sizes, "
+                "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES, a decode "
+                "--disaggregation-max-top-logprobs-num at least prefill's, and "
+                "compatible metadata buffers."
+            )
+
+    def _required_aux_item_lens(self) -> List[int]:
+        lens = list(self.kv_args.aux_item_lens)
+        if get_disagg().disaggregation_enable_kv_checksum and lens:
+            return lens[:-1]
+        return lens
+
+    def validate_prefill_aux_buffers(
+        self, src_aux_item_lens: Optional[List[int]]
+    ) -> None:
+        if not self.exchange_aux_item_lens and src_aux_item_lens is None:
+            return
+
+        dst_item_lens = self._required_aux_item_lens()
+        slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
+        if not (
+            src_aux_item_lens is not None
+            and len(src_aux_item_lens) == len(dst_item_lens)
+            and (
+                not self.customized_info_enabled
+                or (
+                    len(src_aux_item_lens) >= slots.stop
+                    and src_aux_item_lens[slots] == dst_item_lens[slots]
+                )
+            )
+            and all(src <= dst for src, dst in zip(src_aux_item_lens, dst_item_lens))
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: "
+                f"prefill has item sizes {src_aux_item_lens}, "
+                f"decode has item sizes {dst_item_lens}. "
                 "Both servers must run a build that reports metadata buffer sizes, "
                 "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES, a decode "
                 "--disaggregation-max-top-logprobs-num at least prefill's, and "
@@ -1826,6 +1872,8 @@ class CommonKVManager(BaseKVManager):
         wire = state_wire(self.kv_args)
         if wire:
             payload["state_wire"] = wire
+        if self.exchange_aux_item_lens:
+            payload["aux_item_lens"] = self._required_aux_item_lens()
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -2771,6 +2819,11 @@ class CommonKVReceiver(BaseKVReceiver):
             info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
         ):
             reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+        if reason is None:
+            try:
+                self.kv_mgr.validate_prefill_aux_buffers(info.aux_item_lens)
+            except ValueError as exc:
+                reason = str(exc)
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -2823,14 +2876,6 @@ class CommonKVReceiver(BaseKVReceiver):
             return self._poll()
 
     def _poll(self) -> KVPoll:
-        if (
-            self.conclude_state == KVPoll.Success
-            and self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed
-        ):
-            # Success is cached before the request commits; the manager failed
-            # the room since (a metadata item it dropped). The metadata gate
-            # polls again for this.
-            self.conclude_state = KVPoll.Failed
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -3276,6 +3321,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.spec_kv_layout: Optional[dict] = None
         self.state_wire_by_stage: Dict[int, Optional[list]] = {}
+        self.aux_item_lens: Optional[List[int]] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3371,6 +3417,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
         spec_kv_layout = data.get("spec_kv_layout")
+        aux_item_lens = data.get("aux_item_lens")
+        if aux_item_lens is not None:
+            aux_item_lens = [int(x) for x in aux_item_lens]
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -3390,10 +3439,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             return web.Response(
                 text="Inconsistent prefill allocation policies", status=400
             )
-        self.dsv41_spec_layout = dsv41_spec_layout
-        if self.spec_kv_layout is None:
-            self.spec_kv_layout = spec_kv_layout
-        self.decode_allocation_policy = policy
+        if self._registered_count and self.aux_item_lens != aux_item_lens:
+            return web.Response(
+                text="Disaggregation metadata buffer layout differs across prefill ranks",
+                status=400,
+            )
         rank_state_wire = data.get("state_wire")
         if (
             pp_rank in self.state_wire_by_stage
@@ -3403,6 +3453,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="PD state entries differ across the ranks of one pipeline stage",
                 status=400,
             )
+        self.dsv41_spec_layout = dsv41_spec_layout
+        if self.spec_kv_layout is None:
+            self.spec_kv_layout = spec_kv_layout
+        self.decode_allocation_policy = policy
+        self.aux_item_lens = aux_item_lens
         self.state_wire_by_stage[pp_rank] = rank_state_wire
 
         if self.attn_tp_size is None:
@@ -3511,6 +3566,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 spec_kv_layout=self.spec_kv_layout,
                 state_wire=self._state_wire(),
                 state_wires=self._state_wires(),
+                aux_item_lens=self.aux_item_lens,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3535,6 +3591,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("state_wire")
             if not info.state_wires:
                 payload.pop("state_wires")
+            if info.aux_item_lens is None:
+                payload.pop("aux_item_lens")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

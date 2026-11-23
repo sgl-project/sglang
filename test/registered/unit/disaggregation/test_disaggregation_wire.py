@@ -1,6 +1,8 @@
+import asyncio
 import concurrent.futures
 import ctypes
 import dataclasses
+import json
 import os
 import threading
 import unittest
@@ -13,7 +15,12 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+    PrefillServerInfo,
+)
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -1193,6 +1200,220 @@ class TestDisaggregationWire(unittest.TestCase):
             ):
                 manager.validate_aux_buffers(ptrs, item_lens)
 
+    def test_decode_refuses_incompatible_prefill_aux_layout_at_init(self):
+        """Decode checks the prefill's registered aux_item_lens during receiver
+        init, before any transfer starts, covering missing buffers and RDMA aux."""
+        server = object.__new__(CommonKVBootstrapServer)
+        server.lock = asyncio.Lock()
+        server.pp_size = server.attn_tp_size = server.attn_cp_size = None
+        server.dp_size = server.page_size = server.kv_cache_dtype = None
+        server.kv_layout = server.dsv41_spec_layout = server.spec_kv_layout = None
+        server.state_wire_by_stage = {}
+        server.aux_item_lens = None
+        server.follow_bootstrap_room = server.enable_dsa_cache_layer_split = None
+        server.enable_kv_cache_sharding = server.stores_to_linker = None
+        server.prefill_http_port = None
+        server.decode_allocation_policy = "early"
+        server.prefill_port_table = {}
+        server._registered_count = 0
+
+        def route_put(aux_item_lens, *, tp_size=2, tp_rank=0):
+            payload = {
+                "attn_tp_size": tp_size,
+                "attn_tp_rank": tp_rank,
+                "attn_cp_size": 1,
+                "attn_cp_rank": 0,
+                "attn_dp_size": 1,
+                "attn_dp_rank": 0,
+                "pp_size": 1,
+                "pp_rank": 0,
+                "system_dp_size": 1,
+                "system_dp_rank": 0,
+                "rank_ip": "127.0.0.1",
+                "rank_port": 1000 + tp_rank,
+                "page_size": 4,
+                "kv_cache_dtype": "bfloat16",
+            }
+            if aux_item_lens is not None:
+                payload["aux_item_lens"] = aux_item_lens
+
+            async def _json():
+                return payload
+
+            return asyncio.run(server._handle_route_put(SimpleNamespace(json=_json)))
+
+        prefill_lens = [8, 64, 128, 64]
+        self.assertEqual(route_put(prefill_lens, tp_rank=0).status, 200)
+        self.assertEqual(route_put([8, 64], tp_rank=1).status, 400)
+        self.assertEqual(route_put(prefill_lens, tp_rank=1).status, 200)
+        resp = asyncio.run(
+            server._handle_route_get(
+                SimpleNamespace(
+                    query={
+                        "prefill_dp_rank": "-1",
+                        "prefill_cp_rank": "-1",
+                        "target_tp_rank": "-1",
+                        "target_pp_rank": "-1",
+                    }
+                )
+            )
+        )
+        self.assertEqual(resp.status, 200)
+        served = json.loads(resp.text)
+        self.assertEqual(served["aux_item_lens"], prefill_lens)
+
+        reg_mgr = object.__new__(CommonKVManager)
+        reg_mgr.dist_init_addr = None
+        reg_mgr.bootstrap_host = "127.0.0.1"
+        reg_mgr.bootstrap_port = 8998
+        reg_mgr.attn_tp_size = reg_mgr.attn_cp_size = reg_mgr.attn_dp_size = 1
+        reg_mgr.attn_tp_rank = reg_mgr.attn_cp_rank = reg_mgr.attn_dp_rank = 0
+        reg_mgr.pp_size = reg_mgr.system_dp_size = 1
+        reg_mgr.pp_rank = reg_mgr.system_dp_rank = 0
+        reg_mgr.local_ip = "127.0.0.1"
+        reg_mgr.rank_port = 1000
+        reg_mgr.kv_cache_dtype_str = "bfloat16"
+        reg_mgr.kv_layout = None
+        reg_mgr.dsv41_spec_layout = None
+        reg_mgr.spec_kv_layout = None
+        reg_mgr.kv_args = SimpleNamespace(
+            page_size=4,
+            aux_item_lens=[8, 64, 128, 64, 64],
+            state_types=None,
+        )
+        for exchange, checksum, expected_aux in (
+            (False, False, None),
+            (True, False, [8, 64, 128, 64, 64]),
+            (True, True, [8, 64, 128, 64]),
+        ):
+            reg_mgr.exchange_aux_item_lens = exchange
+            with (
+                get_context().override_server_args(
+                    disaggregation_enable_kv_checksum=checksum
+                ),
+                patch(
+                    "sglang.srt.disaggregation.common.conn.requests.put",
+                    return_value=SimpleNamespace(status_code=200),
+                ) as put_mock,
+            ):
+                reg_mgr.register_to_bootstrap()
+            sent = put_mock.call_args.kwargs["json"]
+            if expected_aux is None:
+                self.assertNotIn("aux_item_lens", sent)
+            else:
+                self.assertEqual(sent["aux_item_lens"], expected_aux)
+
+        def init_receiver(
+            *,
+            prefill_aux,
+            decode_aux,
+            decode_exchange=True,
+            decode_checksum=False,
+            decode_customized=False,
+        ):
+            mgr = object.__new__(CommonKVManager)
+            mgr.exchange_aux_item_lens = decode_exchange
+            mgr.customized_info_enabled = decode_customized
+            mgr.kv_args = SimpleNamespace(aux_item_lens=decode_aux)
+            mgr.request_status = {}
+            mgr.failure_records = {}
+            mgr.failure_lock = threading.Lock()
+            mgr.deferred_bootstrap = None
+            mgr._deferred_ack_targets = {}
+            mgr._deferred_ack_poisoned_rooms = set()
+            mgr._staging_outstanding = {}
+            mgr.required_prefill_response_num_table = {}
+            mgr.addr_to_rooms_tracker = defaultdict(set)
+            mgr.prefill_response_tracker = defaultdict(set)
+            mgr.enable_staging = False
+            mgr.prefill_info_table = {
+                "prefill:8998": PrefillServerInfo(
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    dp_size=1,
+                    pp_size=1,
+                    page_size=4,
+                    kv_cache_dtype="bfloat16",
+                    follow_bootstrap_room=True,
+                    aux_item_lens=prefill_aux,
+                    target_tp_rank=0,
+                    target_tp_ranks=[0],
+                    target_cp_ranks=[0],
+                    target_pp_ranks=[0],
+                    required_dst_info_num=1,
+                    required_prefill_response_num=1,
+                )
+            }
+            receiver = CommonKVReceiver(mgr, "prefill:8998", 11)
+            with (
+                get_context().override_server_args(
+                    disaggregation_enable_kv_checksum=decode_checksum,
+                    disaggregation_decode_allocation_policy="early",
+                ),
+                patch.object(receiver, "_setup_bootstrap_infos") as setup,
+            ):
+                receiver.init(0)
+            return receiver, mgr, setup
+
+        for name, kwargs, accepted in (
+            (
+                "older prefill missing aux_item_lens",
+                {"prefill_aux": None, "decode_aux": [8, 64, 128, 64]},
+                False,
+            ),
+            (
+                "older prefill fewer buffers",
+                {"prefill_aux": [8, 64, 64], "decode_aux": [8, 64, 128, 64]},
+                False,
+            ),
+            (
+                "prefill longer row",
+                {"prefill_aux": [8, 64, 256, 64], "decode_aux": [8, 64, 128, 64]},
+                False,
+            ),
+            (
+                "prefill extra buffer hidden by decode checksum",
+                {
+                    "prefill_aux": [8, 64, 128, 64, 64],
+                    "decode_aux": [8, 64, 128, 64, 64],
+                    "decode_checksum": True,
+                },
+                False,
+            ),
+            (
+                "matching layout",
+                {"prefill_aux": [8, 64, 128, 64], "decode_aux": [8, 64, 128, 64]},
+                True,
+            ),
+            (
+                "decode longer row with decode checksum",
+                {
+                    "prefill_aux": [8, 64, 128, 64],
+                    "decode_aux": [8, 64, 256, 64, 64],
+                    "decode_checksum": True,
+                },
+                True,
+            ),
+            (
+                "neither exchanges",
+                {
+                    "prefill_aux": None,
+                    "decode_aux": [8, 64, 128, 64],
+                    "decode_exchange": False,
+                },
+                True,
+            ),
+        ):
+            with self.subTest(name=name):
+                receiver, mgr, setup = init_receiver(**kwargs)
+                if accepted:
+                    self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+                    setup.assert_called_once()
+                else:
+                    self.assertEqual(receiver.poll(), KVPoll.Failed)
+                    self.assertIn("layout mismatch", mgr.failure_records[11])
+                    setup.assert_not_called()
+
     def test_mooncake_aux_transfer_uses_destination_row_stride(self):
         source = np.arange(192, dtype=np.uint8).reshape(3, 64)
         manager = object.__new__(MooncakeKVManager)
@@ -1420,27 +1641,6 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce(pollers, object(), requests, metadata)
         self.assertEqual(result, [KVPoll.Transferring, KVPoll.Success])
         all_reduce.assert_not_called()
-
-    def test_a_room_failed_while_its_metadata_arrived_is_not_committed(self):
-        """The receive thread can drop a metadata item, fail the room, and write
-        the room marker between this round's poll and the gate's marker read."""
-        failed = []
-
-        class MarkerWrittenAfterTheFailure:
-            def __getitem__(self, index):
-                failed.append(True)
-                return torch.tensor(42)
-
-        poller = Mock(
-            poll=Mock(side_effect=lambda: KVPoll.Failed if failed else KVPoll.Success)
-        )
-        request = SimpleNamespace(
-            req=SimpleNamespace(bootstrap_host="127.0.0.1"), metadata_buffer_index=0
-        )
-        metadata = SimpleNamespace(bootstrap_room=MarkerWrittenAfterTheFailure())
-        with patch.object(dist, "get_world_size", return_value=1):
-            result = poll_and_all_reduce([poller], object(), [request], metadata)
-        self.assertEqual(result, [KVPoll.Failed])
 
     def test_singleton_still_advances_and_waits_for_staging(self):
         request = SimpleNamespace(
