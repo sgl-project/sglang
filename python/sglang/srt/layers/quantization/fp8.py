@@ -107,6 +107,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
+    get_model,
     get_parallel,
     get_platform,
 )
@@ -505,6 +506,18 @@ class Fp8Config(QuantizationConfig):
             self.ignored_layers = list(
                 dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
             )
+
+
+def _loading_presharded() -> bool:
+    """Whether the weights being processed come from a presharded cache.
+
+    A presharded cache stores the weights in the layout they were dumped with, so
+    those loads keep the plain layout and existing caches stay valid.
+    """
+    try:
+        return get_model().load_format == "presharded"
+    except ValueError:  # runtime config not published (standalone use)
+        return False
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -957,7 +970,9 @@ class Fp8LinearMethod(LinearMethodBase):
         # gfx942 preshuffles with the CK path (SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK);
         # the CK bpreshuffle instances need N % 64 == 0.
         bpreshuffle_gfx942 = (
-            _use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()
+            _use_aiter_gfx942
+            and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()
+            and not _loading_presharded()
         )
         if (
             (_use_aiter_bpreshuffle_gfx95 or bpreshuffle_gfx942)
