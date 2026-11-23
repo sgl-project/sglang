@@ -223,13 +223,6 @@ class TestErnie5_5ToolCallStreaming(CustomTestCase):
                 self.assertEqual((normal, json.loads(args)), ("hi ", {"n": 5}))
 
 
-class _NativeRendererTokenizer:
-    """Stands in for ErnieChatTokenizer, whose Python renderer builds the prompt."""
-
-    def render_chat(self, *args, **kwargs):
-        raise NotImplementedError
-
-
 class TestErnie5_5ContinuedTurnReasoning(CustomTestCase):
     def test_continued_assistant_turn_parses_as_answer(self):
         """continue_final_message resumes after the turn's closed think block, but
@@ -241,22 +234,21 @@ class TestErnie5_5ContinuedTurnReasoning(CustomTestCase):
                 force_reasoning=True,
                 continue_final_message=True,
                 previous_content="The answer is",
-                tokenizer=_NativeRendererTokenizer(),
+                prompt_closed_reasoning=True,
             )
 
         result = detector().detect_and_parse(" 8.")
         self.assertEqual((result.reasoning_text, result.normal_text), ("", " 8."))
         self.assertEqual(detector().parse_streaming_increment(" 8.").normal_text, " 8.")
 
-    def test_jinja_continuation_of_open_reasoning_stays_reasoning(self):
-        """A Jinja template appends the prefix as is, so continuing an unclosed
-        think block still generates reasoning; resetting on every continuation
-        streamed it into content."""
+    def test_continuation_of_open_reasoning_stays_reasoning(self):
+        """A prompt the native renderer did not build (Jinja, a conversation
+        template, raw input_ids) keeps the prefix as is, so continuing an unclosed
+        think block still generates reasoning; resetting it streamed into content."""
         detector = Ernie5_5ReasoningDetector(
             force_reasoning=True,
             continue_final_message=True,
             previous_content="<ernie:think>Let me check",
-            tokenizer=object(),
         )
         result = detector.detect_and_parse(" the sum</ernie:think>8")
         self.assertEqual((result.reasoning_text, result.normal_text), (" the sum", "8"))

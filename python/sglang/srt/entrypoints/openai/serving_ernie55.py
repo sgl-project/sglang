@@ -192,7 +192,10 @@ class Ernie55ChatEncodingAdapter:
             and messages
             and messages[-1].get("role") == "assistant"
         )
-        if not continue_final:
+        if continue_final:
+            # The renderer closes the final turn's think block before its content.
+            request._prompt_closed_reasoning = True
+        else:
             # A trailing assistant turn becomes a user turn, as on the Jinja path.
             messages, _ = self._hooks.split_assistant_prefix(messages, request)
         # The renderer continues the final turn itself, after that turn's think

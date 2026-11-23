@@ -102,6 +102,7 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
             image_data=[],
         )
         tokenizer.adapter = adapter
+        tokenizer.request = request
         return tokenizer
 
     def test_template_kwargs_the_renderer_rejects_are_dropped(self):
@@ -142,6 +143,31 @@ class TestErnie55ChatEncodingAdapter(CustomTestCase):
         self.assertEqual(rendered["messages"][-1]["role"], "user")
         self.assertFalse(rendered["continue_final_message"])
         self.assertTrue(rendered["add_generation_prompt"])
+
+    def test_continued_turn_parses_as_answer_only_when_the_adapter_rendered_it(self):
+        """The ernie55 parser reset every continuation to the answer channel, also
+        for prompts another renderer built with the think block left open (a
+        --chat-template conversation template), streaming reasoning into content."""
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        conversation = [
+            {"role": "user", "content": "3+5=?"},
+            {"role": "assistant", "content": "<ernie:think>Let me check"},
+        ]
+        rendered = self._encode(messages=conversation, continue_final_message=True)
+        unrendered = ChatCompletionRequest(
+            model="ernie", messages=conversation, continue_final_message=True
+        )
+        for request, expected in (
+            (rendered.request, ("", " the sum")),
+            (unrendered, (" the sum", "")),
+        ):
+            with self.subTest(adapter_rendered=request is rendered.request):
+                parser = ReasoningParser(
+                    model_type="ernie55", force_reasoning=True, request=request
+                )
+                result = parser.detector.detect_and_parse(" the sum")
+                self.assertEqual((result.reasoning_text, result.normal_text), expected)
 
     _SCHEMA_FORMAT = {
         "type": "json_schema",

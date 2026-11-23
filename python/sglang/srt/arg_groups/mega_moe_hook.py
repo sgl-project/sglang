@@ -193,15 +193,37 @@ def _ernie_moe_rows_per_rank(cfg, rows: int, *, sharded: bool) -> int:
     return rows
 
 
+def _eagle_draft_extend_graph_rows(cfg) -> int:
+    """Rows of the largest EAGLE draft-extend graph, 0 when none is captured
+    (EAGLEWorkerV2 init_cuda_graphs, get_batch_sizes_to_capture)."""
+    decode = cfg.cuda_graph_config.decode if cfg.cuda_graph_config else None
+    if (
+        decode is None
+        or decode.backend == "disabled"
+        or not decode.bs
+        or envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+    ):
+        return 0
+    largest_bs = max(decode.bs)
+    if cfg.max_running_requests is not None:
+        largest_bs = min(
+            largest_bs,
+            ceil_align(
+                cfg.max_running_requests // cfg.attn_dp_size,
+                cfg.tp_size // cfg.attn_dp_size,
+            ),
+        )
+    return largest_bs * (cfg.speculative_num_draft_tokens or 1)
+
+
 def _ernie_moe_decode_rows_per_rank(cfg, decode_tokens: int) -> int:
     rows = _ernie_moe_rows_per_rank(
         cfg, decode_tokens, sharded=_gathered_buffer_required_of(cfg)
     )
     if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
-        # The EAGLE draft-extend graph leaves its batch unsharded, so the MTP
-        # layer routes every captured row: graph bucket x draft tokens.
+        # The draft-extend graph leaves its batch unsharded; eager draft extend shards.
         draft_extend_rows = _ernie_moe_rows_per_rank(
-            cfg, mega_moe_decode_tokens_per_rank(cfg), sharded=False
+            cfg, _eagle_draft_extend_graph_rows(cfg), sharded=False
         )
         rows = max(rows, draft_extend_rows)
     return rows

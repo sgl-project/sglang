@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from transformers import PreTrainedTokenizerBase
 
-from sglang.srt.configs.ernie55 import renders_chat_natively
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ResponsesRequest,
@@ -505,7 +504,7 @@ class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
-        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        prompt_closed_reasoning: bool = False,
     ):
         super().__init__(
             "<ernie:think>",
@@ -525,10 +524,8 @@ class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
             reasoning_default="enable_thinking",
             force_nonempty_content=force_nonempty_content,
         )
-        if continue_final_message and renders_chat_natively(tokenizer):
-            # The Python renderer closes the assistant turn's think block before
-            # its content, so a continued turn generates answer text; a Jinja
-            # template appends the prefix as is, left to the base detection.
+        if continue_final_message and prompt_closed_reasoning:
+            # Other renderers append the prefix as is, left to the base detection.
             self._in_reasoning = False
 
 
@@ -2485,6 +2482,14 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tokenizer" in sig.parameters:
                 kwargs["tokenizer"] = tokenizer
+
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and request._prompt_closed_reasoning
+            and "prompt_closed_reasoning"
+            in inspect.signature(detector_class).parameters
+        ):
+            kwargs["prompt_closed_reasoning"] = True
 
         if tool_call_parser_active:
             sig = inspect.signature(detector_class)

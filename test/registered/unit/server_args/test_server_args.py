@@ -791,18 +791,25 @@ class TestPrepareServerArgs(CustomTestCase):
 
     def test_megamoe_token_budget_counts_ernie_eagle_draft_extend_graph(self):
         """The EAGLE draft-extend graph does not shard its batch over attention
-        TP, so 64 requests x 4 draft tokens put 256 rows on each rank; a check
-        that divided them by attention TP admitted a 128-row buffer."""
-        self._assert_ernie_megamoe_buffer_floor(
-            256,
-            tp_size=2,
-            max_running_requests=64,
-            declared={
-                "speculative_algorithm": "EAGLE",
-                "speculative_num_draft_tokens": 4,
-                "cuda_graph_config": SimpleNamespace(decode=SimpleNamespace(max_bs=64)),
-            },
-        )
+        TP, so its largest captured bucket (32 under a 33 limit) x 4 draft tokens
+        puts 128 rows on each rank; without that graph the draft extend runs
+        eagerly and sharded, so only 40 requests x 4 / 2 = 80 rows."""
+        from sglang.srt.environ import envs
+
+        decode = SimpleNamespace(backend="full", max_bs=33, bs=[1, 2, 4, 8, 16, 32])
+        for disabled, floor in ((False, 128), (True, 80)):
+            with self.subTest(draft_extend_graph_disabled=disabled):
+                with envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.override(disabled):
+                    self._assert_ernie_megamoe_buffer_floor(
+                        floor,
+                        tp_size=2,
+                        max_running_requests=40,
+                        declared={
+                            "speculative_algorithm": "EAGLE",
+                            "speculative_num_draft_tokens": 4,
+                            "cuda_graph_config": SimpleNamespace(decode=decode),
+                        },
+                    )
 
     def test_megamoe_token_budget_follows_ernie_mlp_gather_sharding(self):
         """With attention DP, disabling the attention gather still leaves the MLP
