@@ -242,6 +242,13 @@ def get_mc_ptr(x: torch.Tensor) -> int:
 
 
 @cache_once
+def communicator():
+    """The TP workspace communicator that nvlink_comm collectives launch on."""
+    state = _get_state()
+    assert state is not None
+    return state.lease.get_communicator()
+
+
 def register_sp_collective_comm() -> bool:
     """Register the TP workspace's communicator with ``sp_collective``, whose
     direct ops barrier on it; False when another communicator owns this TP size."""

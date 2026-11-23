@@ -599,6 +599,17 @@ struct NVLinkComm {
     return run_pull<Primitive::AG, kPullUnroll>(
         comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
   }
+
+  template <uint32_t kPullUnroll>
+  static void reduce_scatter_pull(
+      CommunicatorRef comm,
+      TensorView in,
+      TensorView out,
+      tvm::ffi::Optional<TensorView> residual,
+      int64_t in_mc_ptr,
+      uint32_t num_blocks_hint) {
+    return run_pull<Primitive::RS, kPullUnroll>(comm->get_pull_obj(), in, out, residual, in_mc_ptr, 0, num_blocks_hint);
+  }
 };
 
 }  // namespace sglang

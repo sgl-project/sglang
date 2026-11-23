@@ -14,6 +14,7 @@ from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
     attn_res_collective,
     gemm_ag,
+    nvlink_comm,
     sp_collective,
 )
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
@@ -208,6 +209,78 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("num_unroll", [1, 4])
+@torch.inference_mode()
+def test_nvlink_comm_pull_reduce_scatter_and_all_gather(num_unroll):
+    _require_sm100()
+    comm = _init_comm()
+    rank, world_size = dist.get_rank(), comm.world_size
+    local_tokens = 33
+    generator = torch.Generator(device="cuda").manual_seed(30 + rank)
+    reduce_input, _, reduce_mc = _symmetric_tensor(
+        (world_size * local_tokens, _HIDDEN_SIZE)
+    )
+    reduce_input.copy_(
+        torch.randn(
+            reduce_input.shape,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+    )
+    residual = torch.randn(
+        local_tokens,
+        _HIDDEN_SIZE,
+        generator=torch.Generator(device="cuda").manual_seed(31),
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    expected_reduce = reduce_input.float()
+    _, nccl_group = _init_world()
+    dist.all_reduce(expected_reduce, group=nccl_group)
+    lo = rank * local_tokens
+    expected_reduce = (expected_reduce[lo : lo + local_tokens] + residual.float()).to(
+        torch.bfloat16
+    )
+    dist.barrier(group=nccl_group)
+    reduce_output = torch.empty_like(expected_reduce)
+    nvlink_comm.reduce_scatter_pull(
+        comm.obj,
+        reduce_input,
+        reduce_output,
+        residual,
+        in_mc_ptr=reduce_mc,
+        num_unroll=num_unroll,
+    )
+
+    gather_input = torch.randn(
+        local_tokens,
+        _HIDDEN_SIZE,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    expected_gather = torch.empty(
+        world_size * local_tokens,
+        _HIDDEN_SIZE,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    dist.all_gather_into_tensor(expected_gather, gather_input, group=nccl_group)
+    gather_output, _, gather_mc = _symmetric_tensor(expected_gather.shape)
+    nvlink_comm.all_gather_pull(
+        comm.obj,
+        gather_input,
+        gather_output,
+        out_mc_ptr=gather_mc,
+        num_unroll=num_unroll,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(reduce_output, expected_reduce, rtol=2e-2, atol=3e-2)
+    torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
+
+
 @cache_once
 def _gemm_ag_operands():
     generator = torch.Generator().manual_seed(30)
@@ -384,6 +457,8 @@ def _precompile(num_gpus):
         if world_size in gemm_ag.WORLD_SIZES:
             gemm_ag._jit_module(world_size)
     attn_res._jit_fused_tma_module(4, 1, 200)
+    for num_unroll in (1, 4):
+        nvlink_comm._jit_pull_module(torch.bfloat16, num_unroll)
 
 
 if __name__ == "__main__":

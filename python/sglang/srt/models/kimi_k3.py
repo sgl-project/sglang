@@ -613,6 +613,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        sp_shared_rs_stream: Optional[torch.cuda.Stream] = None,
         kda_dwdp: Optional[KdaDwdp] = None,
     ):
         super().__init__()
@@ -631,6 +632,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        self.sp_shared_rs_stream = sp_shared_rs_stream
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -1753,8 +1755,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if local_rows:
             num_tokens = layernorm_sp.sp_num_tokens()
             sharded = False
-            shared_output = self._forward_shared_gathered(hidden_states, num_tokens)
-            routed = self._route_local_rows(hidden_states, num_tokens)
+            # Two nvlink_comm collectives in flight at once would arrive on the
+            # same barrier semaphores, so the routed gather runs between the side
+            # gather and the side reduce-scatter.
+            shared_output, side_gathered = self._forward_shared_gathered(
+                hidden_states, num_tokens
+            )
+            routed = self._route_local_rows(hidden_states, num_tokens, side_gathered)
+            shared_output = self._reduce_scatter_shared(shared_output)
         else:
             num_tokens = hidden_states.shape[0]
             sharded = self._sharded_front_covers(num_tokens)
@@ -1813,7 +1821,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 with torch.cuda.stream(self.alt_stream):
                     if scatters:
                         shared_output = k3_sp_collective.sp_reduce_scatter(
-                            shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                            shared_output, k3_sp_collective.SP_RS_OVERLAP
                         )
                     else:
                         k3_ar_fusion.all_reduce_low_sm(shared_output)
@@ -1832,13 +1840,15 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
                     if scatters:
                         shared_output = k3_sp_collective.sp_reduce_scatter(
-                            shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                            shared_output, k3_sp_collective.SP_RS_OVERLAP
                         )
                     else:
                         k3_ar_fusion.all_reduce_low_sm(
                             shared_output, num_blocks=4, unroll=8
                         )
-            current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(
+                self.sp_shared_rs_stream if local_rows else self.alt_stream
+            )
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
             if scatters:
@@ -1924,24 +1934,42 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
     def _forward_shared_gathered(
         self, hidden_states: torch.Tensor, num_tokens: int
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.cuda.Event]:
         """Queue the shared experts on the side stream before gemm1 takes every SM."""
         shared_output = k3_sp_collective.sp_partial_rows(
             "moe_shared", hidden_states, hidden_states.shape[1], num_tokens
         )
         self.alt_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.alt_stream):
+            gathered = k3_sp_collective.sp_all_gather(
+                hidden_states, num_tokens, k3_sp_collective.SP_AG_OVERLAP
+            )
+            side_gathered = torch.cuda.Event()
+            side_gathered.record()
             gate_up = _k3_bf16_gemm(
-                k3_sp_collective.sp_all_gather(hidden_states, num_tokens),
+                gathered,
                 self._front_w[: self._front_sizes[0]],
                 out_dtype=torch.float32 if self._front_fp32 else None,
             )
             self._forward_shared(gate_up, shared_output)
+        return shared_output, side_gathered
+
+    def _reduce_scatter_shared(self, shared_output: torch.Tensor) -> torch.Tensor:
+        """Reduce-scatter the shared experts at high priority, between gemm1 waves."""
+        stream = self.sp_shared_rs_stream
+        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(self.alt_stream)
+        with torch.cuda.stream(stream):
             return k3_sp_collective.sp_reduce_scatter(
-                shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                shared_output, k3_sp_collective.SP_RS_OVERLAP
             )
 
-    def _route_local_rows(self, hidden_states: torch.Tensor, num_tokens: int):
+    def _route_local_rows(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        side_gathered: torch.cuda.Event,
+    ):
         from sglang.srt.layers.quantization.mxfp4 import (
             _prepare_flashinfer_mxfp8_activations,
         )
@@ -1958,6 +1986,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
             routed_input, self.experts.quant_method.hidden_size
         )
+        torch.cuda.current_stream().wait_event(side_gathered)
         weights, ids, x_q, x_s = k3_sp_collective.sp_gather_routed(
             [
                 topk_output.topk_weights,
@@ -3376,6 +3405,9 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                sp_shared_rs_stream=(
+                    alt_streams[3] if alt_streams is not None else None
+                ),
                 kda_dwdp=kda_dwdp,
             )
         else:
@@ -3629,8 +3661,14 @@ class KimiK3LinearModel(nn.Module):
         #   [0] MoE dual-stream shared-expert tail
         #   [1] DeepseekV2AttentionMLA base internals (forwarded; unused by K3)
         #   [2] MLA output-gate GEMM, overlaps the attention core
+        #   [3] SP shared-expert reduce-scatter, at high priority
         # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        self.alt_streams = (
+            None
+            if _is_hip
+            else [torch.cuda.Stream() for _ in range(3)]
+            + [torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])]
+        )
 
         # The attention-residual bank of one forward, which every layer's
         # stage boundaries read.

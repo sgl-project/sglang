@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from functools import cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -485,12 +485,18 @@ def attn_res_all_gather(
 # Multicast kernels on k3_ar_fusion's plane when it is up and the shard is whole
 # 16 B vectors; layernorm_sp's NCCL collectives otherwise.
 
-# Measured on GB300 TP8 at 16K rows; re-tune when the kernels change.
-_SP_RS_BLOCKS = 96
-# A low-SM launch for a reduce-scatter that overlaps GEMMs on another stream.
-SP_RS_OVERLAP_BLOCKS = 16
-_SP_AG_BLOCKS = 32
-_SP_BLOCK_SIZE = 1024
+
+class SPTuning(NamedTuple):
+    num_blocks: int
+    num_unroll: int
+
+
+# Measured on 8xB300 TP8 at 1,280-2,048 rows a rank. Re-tune when the kernels change.
+SP_AG = SPTuning(32, 2)
+SP_RS = SPTuning(96, 4)
+# Low-SM launches for collectives that overlap GEMMs on another stream.
+SP_AG_OVERLAP = SPTuning(16, 2)
+SP_RS_OVERLAP = SPTuning(16, 4)
 
 
 @cache
@@ -498,27 +504,12 @@ def _sp_multicast() -> bool:
     ready = (
         k3_ar_fusion.enabled()
         and get_parallel().tp_group.world_size in _SUPPORTED_WORLD_SIZES
-        and k3_ar_fusion.register_sp_collective_comm()
     )
     logger.info(
         "K3 LayerNorm SP collectives: %s",
-        "pull reduce-scatter / direct all-gather on the TP multicast plane"
-        if ready
-        else "NCCL",
+        "nvlink_comm pull on the TP multicast plane" if ready else "NCCL",
     )
     return ready
-
-
-def _sp_tuning(num_blocks: int):
-    from sglang.kernels.ops.communication import sp_collective
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
-    comm = get_parallel().tp_group.ca_comm
-    if isinstance(comm, CustomAllReduceV2):
-        num_blocks = max(1, min(num_blocks, comm.config.num_pull_blocks))
-    return sp_collective.Tuning(num_blocks, _SP_BLOCK_SIZE)
 
 
 def _sp_kernel_takes(x: torch.Tensor, shard_rows: int) -> bool:
@@ -533,7 +524,9 @@ def _sp_kernel_takes(x: torch.Tensor, shard_rows: int) -> bool:
     )
 
 
-def sp_all_gather(local_rows: torch.Tensor, total_rows: int) -> torch.Tensor:
+def sp_all_gather(
+    local_rows: torch.Tensor, total_rows: int, tuning: SPTuning = SP_AG
+) -> torch.Tensor:
     """Gather every rank's token-row shard and trim the padding. The result is
     overwritten by the next gather of that width."""
     world_size = get_parallel().tp_group.world_size
@@ -547,14 +540,15 @@ def sp_all_gather(local_rows: torch.Tensor, total_rows: int) -> torch.Tensor:
     )
     if output is None:
         return layernorm_sp.all_gather_token_rows(local_rows, total_rows=total_rows)
-    from sglang.kernels.ops.communication import sp_collective
+    from sglang.kernels.ops.communication import nvlink_comm
 
-    sp_collective.all_gather_direct(
-        world_size,
+    nvlink_comm.all_gather_pull(
+        k3_ar_fusion.communicator(),
         local_rows,
         output,
-        output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
-        tuning=_sp_tuning(_SP_AG_BLOCKS),
+        out_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
+        num_unroll=tuning.num_unroll,
+        num_blocks_hint=tuning.num_blocks,
     )
     return output[:total_rows]
 
@@ -576,9 +570,7 @@ def sp_partial_rows(
     return like.new_empty((rows, width))
 
 
-def sp_reduce_scatter(
-    partial: torch.Tensor, num_blocks: int = _SP_RS_BLOCKS
-) -> torch.Tensor:
+def sp_reduce_scatter(partial: torch.Tensor, tuning: SPTuning = SP_RS) -> torch.Tensor:
     """Sum a TP-partial ``[rows, width]`` output onto this rank's token-row
     shard, padding the rows to whole shards."""
     world_size = get_parallel().tp_group.world_size
@@ -591,23 +583,64 @@ def sp_reduce_scatter(
     )
     if full is None:
         return layernorm_sp.reduce_scatter_token_rows(partial)
-    from sglang.kernels.ops.communication import sp_collective
+    from sglang.kernels.ops.communication import nvlink_comm
 
     full[rows:].zero_()
-    return sp_collective.reduce_scatter_pull(
-        world_size,
+    output = partial.new_empty((padded // world_size, partial.shape[1]))
+    nvlink_comm.reduce_scatter_pull(
+        k3_ar_fusion.communicator(),
         full,
-        partial.new_empty((padded // world_size, partial.shape[1])),
-        None,
-        input_mc_ptr=k3_ar_fusion.get_mc_ptr(full),
-        tuning=_sp_tuning(num_blocks),
+        output,
+        in_mc_ptr=k3_ar_fusion.get_mc_ptr(full),
+        num_unroll=tuning.num_unroll,
+        num_blocks_hint=tuning.num_blocks,
     )
+    return output
+
+
+_SP_ROUTED = (
+    "sp_routed_weights",
+    "sp_routed_ids",
+    "sp_routed_quant",
+    "sp_routed_scale",
+)
 
 
 def sp_can_gather_routed() -> bool:
-    return get_parallel().tp_group.get_available_pynccl_comm() is not None
+    return (
+        _sp_multicast()
+        or get_parallel().tp_group.get_available_pynccl_comm() is not None
+    )
 
 
 def sp_gather_routed(segments: list[torch.Tensor]) -> list[torch.Tensor]:
-    """Every rank's rows of each routed MoE input, in one grouped all-gather."""
-    return get_parallel().tp_group.all_gatherv(segments)
+    """Every rank's rows of each routed MoE input."""
+    group = get_parallel().tp_group
+    rows = segments[0].shape[0] * group.world_size
+    # Gather the raw bytes of every row as bf16
+    views = [s.contiguous().view(torch.uint8).view(s.shape[0], -1) for s in segments]
+    outputs = (
+        [
+            k3_ar_fusion.try_symm_buffer(name, rows, v.shape[1] // 2, torch.bfloat16)
+            for name, v in zip(_SP_ROUTED, views)
+        ]
+        if _sp_multicast() and all(v.shape[1] % 16 == 0 for v in views)
+        else [None]
+    )
+    if any(out is None for out in outputs):
+        return group.all_gatherv(segments)
+    from sglang.kernels.ops.communication import nvlink_comm
+
+    for view, out in zip(views, outputs):
+        nvlink_comm.all_gather_pull(
+            k3_ar_fusion.communicator(),
+            view.view(torch.bfloat16),
+            out,
+            out_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
+            num_unroll=SP_AG.num_unroll,
+            num_blocks_hint=SP_AG.num_blocks,
+        )
+    return [
+        out.view(torch.uint8).view(s.dtype).view(rows, *s.shape[1:])
+        for out, s in zip(outputs, segments)
+    ]
