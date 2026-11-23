@@ -4,9 +4,11 @@ Verifies that:
 1. Prefill Full Graph and Decode Full Graph both actually replay (no silent fallback to eager)
    across exact-bucket and bucket-padded multi-request workloads with request-slot padding.
 2. Prefill logits and multi-step greedy decoded token sequences match eager execution.
+3. The torch top-k/top-p/min-p sampler captures and replays the same result as eager.
 
 Usage:
     python3 -m unittest test_xpu_graph.TestXPUGraph.test_full_graph_runs
+    python3 -m unittest test_xpu_graph.TestSamplerXPUGraph
 """
 
 import time
@@ -23,6 +25,7 @@ from sglang.benchmark.one_batch import (
     prepare_synthetic_inputs_for_latency_test,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.runtime_context import SpawnRanks, publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -329,6 +332,54 @@ class TestXPUGraph(CustomTestCase):
                 eager_ids,
                 "Decoded token IDs mismatch between full graph and eager on prefix extend",
             )
+
+
+class TestSamplerXPUGraph(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        batch, vocab = 4, 3072
+        self.probs = torch.softmax(torch.randn(batch, vocab, device="xpu"), dim=-1)
+        self.top_ks = torch.full((batch,), 50, device="xpu", dtype=torch.int32)
+        self.top_ps = torch.full((batch,), 0.8, device="xpu")
+        self.min_ps = torch.full((batch,), 0.05, device="xpu")
+        self.seeds = torch.arange(batch, device="xpu", dtype=torch.int64) + 1234
+        self.positions = torch.arange(batch, device="xpu", dtype=torch.int64) + 7
+
+    def assert_replay_matches_eager(self, sample):
+        eager = sample()
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            captured = sample()
+        graph.replay()
+        torch.xpu.synchronize()
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+    def test_seeded_top_k_top_p_sampling(self):
+        self.assert_replay_matches_eager(
+            lambda: top_k_top_p_min_p_sampling_from_probs_torch(
+                self.probs,
+                self.top_ks,
+                self.top_ps,
+                self.min_ps,
+                False,
+                self.seeds,
+                self.positions,
+            )
+        )
+
+    def test_min_p_filtered_probs(self):
+        self.assert_replay_matches_eager(
+            lambda: top_k_top_p_min_p_sampling_from_probs_torch(
+                self.probs,
+                self.top_ks,
+                self.top_ps,
+                self.min_ps,
+                True,
+                None,
+                self.positions,
+                return_filtered_probs=True,
+            )[1]
+        )
 
 
 if __name__ == "__main__":
