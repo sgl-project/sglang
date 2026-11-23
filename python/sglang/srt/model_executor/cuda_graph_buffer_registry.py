@@ -500,6 +500,12 @@ class CudaGraphBufferRegistry:
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
+            if (
+                envs.SGLANG_DSPARK_COMPACT_DIRECT_INPUTS.get()
+                and slot.name in ("input_ids", "positions", "out_cache_loc")
+                and same_tensor_view(dst, src)
+            ):
+                continue
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":
