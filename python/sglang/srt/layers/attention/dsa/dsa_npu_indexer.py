@@ -502,8 +502,9 @@ class DSANPUIndexerMixin:
         # full-attn pool, which is keyed by compact (dense) layer ids;
         # translate the global layer id before unwrapping the wrapper.
         if hasattr(pool, "full_kv_pool"):
-            kv = pool.layer_router.read(layer_id)
-            pool, layer_id = kv.view, kv.view_layer_id
+            pool._wait_for_layer(layer_id)
+            layer_id = pool._transfer_full_attention_id(layer_id)
+            pool = pool.full_kv_pool
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
