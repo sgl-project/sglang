@@ -23,8 +23,12 @@ from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import (
     LTX2VideoResnetBlock3d,
     PerChannelRMSNorm,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+# ROCm also reports torch.cuda.is_available(); the kernels mount on CUDA only.
+cuda_only = pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="needs the CUDA kernels"
+)
 
 # (activation dtype, autocast dtype or None)
 PRECISIONS = [
