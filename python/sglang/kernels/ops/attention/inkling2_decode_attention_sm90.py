@@ -2,8 +2,8 @@
 partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
 sequence (MTP verify). Each split takes an equal share of the sequence's own keys;
-on a global layer's verify, an equal share of their cost, where the keys at least
-the bias extent behind every query run as larger tiles without bias or masks."""
+on a global layer's verify of up to 64 padded rows, an equal share of their cost, where
+the keys at least the bias extent behind every query run as larger unmasked tiles."""
 
 import torch
 import triton
