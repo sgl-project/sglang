@@ -590,6 +590,12 @@ class XPUCompressedTensorsWNA16MoE(CompressedTensorsWNA16TritonMoE):
     whereas compressed-tensors stores symmetric codes with a +8 offset.
     """
 
+    @staticmethod
+    def is_device_supported() -> bool:
+        from sgl_kernel.utils import is_xe2_arch
+
+        return is_xe2_arch()
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_xpu_int4_converted", False):
             return

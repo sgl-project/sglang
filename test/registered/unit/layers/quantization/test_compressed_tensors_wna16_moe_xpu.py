@@ -33,7 +33,10 @@ def _pack_int32_along_k(codes):
     return torch.nn.Parameter(words.to(torch.int32), requires_grad=False)
 
 
-@unittest.skipUnless(torch.xpu.is_available(), "needs an Intel XPU")
+@unittest.skipUnless(
+    torch.xpu.is_available() and XPUCompressedTensorsWNA16MoE.is_device_supported(),
+    "needs an Intel Xe2 GPU",
+)
 class TestXPUNativeWNA16MoE(CustomTestCase):
     def _run(self, group_size, drop_slots=False):
         device = torch.device("xpu")

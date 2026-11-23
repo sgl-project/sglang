@@ -152,16 +152,19 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                 self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
                 self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
 
-    def _xpu_moe_scheme(self, backend, **weight_overrides):
+    def _xpu_moe_scheme(self, backend, xe2=True, num_bits=4, **weight_overrides):
         quant_config = CompressedTensorsConfig.from_config(
             _make_wna16_moe_config(
-                ["re:.*mlp.experts.*"], num_bits=4, **weight_overrides
+                ["re:.*mlp.experts.*"], num_bits=num_bits, **weight_overrides
             )
         )
         with (
             mock.patch.object(compressed_tensors, "_is_xpu", True),
             mock.patch.object(
                 compressed_tensors, "get_moe_runner_backend", return_value=backend
+            ),
+            mock.patch.object(
+                XPUCompressedTensorsWNA16MoE, "is_device_supported", return_value=xe2
             ),
         ):
             return quant_config.get_moe_scheme(
@@ -183,6 +186,15 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         # The native scheme subclasses the Triton one, so isinstance can't tell them apart.
         self.assertIs(type(scheme), CompressedTensorsWNA16TritonMoE)
 
+    def test_xpu_off_xe2_falls_back_to_triton(self):
+        for group_size in (32, 128):
+            with self.subTest(group_size=group_size):
+                scheme = self._xpu_moe_scheme(
+                    MoeRunnerBackend.AUTO, xe2=False, group_size=group_size
+                )
+
+                self.assertIs(type(scheme), CompressedTensorsWNA16TritonMoE)
+
     def test_xpu_native_scheme_refuses_triton_quant_info(self):
         scheme = self._xpu_moe_scheme(MoeRunnerBackend.AUTO)
 
@@ -202,29 +214,19 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             "group64": (4, {"group_size": 64}),
             "group256": (4, {"group_size": 256}),
         }
-        for backend, cases in (
-            (MoeRunnerBackend.AUTO, rejected_by_both),
-            (MoeRunnerBackend.TRITON, {**rejected_by_both, **rejected_by_triton}),
+        for backend, xe2, cases in (
+            (MoeRunnerBackend.AUTO, True, rejected_by_both),
+            (MoeRunnerBackend.AUTO, False, {**rejected_by_both, **rejected_by_triton}),
+            (MoeRunnerBackend.TRITON, True, {**rejected_by_both, **rejected_by_triton}),
         ):
             for name, (num_bits, overrides) in cases.items():
-                with self.subTest(backend=backend, name=name):
-                    quant_config = CompressedTensorsConfig.from_config(
-                        _make_wna16_moe_config(
-                            ["re:.*mlp.experts.*"], num_bits=num_bits, **overrides
-                        )
+                with (
+                    self.subTest(backend=backend, xe2=xe2, name=name),
+                    self.assertRaisesRegex(ValueError, "WNA16 MoE on XPU"),
+                ):
+                    self._xpu_moe_scheme(
+                        backend, xe2=xe2, num_bits=num_bits, **overrides
                     )
-                    with (
-                        mock.patch.object(compressed_tensors, "_is_xpu", True),
-                        mock.patch.object(
-                            compressed_tensors,
-                            "get_moe_runner_backend",
-                            return_value=backend,
-                        ),
-                        self.assertRaisesRegex(ValueError, "WNA16 MoE on XPU"),
-                    ):
-                        quant_config.get_moe_scheme(
-                            torch.nn.Module(), layer_name=EXPERTS_LAYER
-                        )
 
     def test_xpu_native_scheme_stores_signed_nibbles(self):
         """compressed-tensors stores code + 8; the native kernel reads signed INT4."""
