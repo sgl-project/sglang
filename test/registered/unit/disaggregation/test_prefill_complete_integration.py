@@ -603,6 +603,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         move(reqs, scheduler.disagg_prefill_transfer_queue)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
+        scheduler.pp_prefill_early_finish = None
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
         enter_scope(

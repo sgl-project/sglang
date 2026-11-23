@@ -111,6 +111,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    get_stream,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -161,6 +162,15 @@ def clamp_kv_send_end(
     if end_idx is None:
         end_idx = min(req.extend_end, len(req.origin_input_ids))
     return min(end_idx, req.kv.cache_protected_len)
+
+
+def _kv_send_fence(*, current_stream, forward_stream):
+    """A stream ordered after both the indices copies and a forward still
+    writing the KV, without making the scheduling stream wait on that forward."""
+    fence = get_stream("kv_send_fence")
+    fence.wait_stream(current_stream)
+    fence.wait_stream(forward_stream)
+    return fence
 
 
 def _uses_write_through_cache(cache: object) -> bool:
@@ -1429,6 +1439,9 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
+        # PP rank 0 with early finish: the requests whose output already went out.
+        early_finish = self.pp_prefill_early_finish
+        streamed_early = set()
 
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
@@ -1512,6 +1525,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 pass
             elif poll == KVPoll.Success:  # transfer done
+                if early_finish is not None and early_finish.released(req):
+                    streamed_early.add(req.rid)
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1520,8 +1535,13 @@ class SchedulerDisaggregationPrefillMixin:
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
-                req.time_stats.set_prefill_kv_transfer_finish_time()
+                if req.rid not in streamed_early:
+                    req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                # Streamed early, every stage had already reported Success;
+                # a later failure only changes how the stages release the KV.
+                if early_finish is not None and early_finish.released(req):
+                    streamed_early.add(req.rid)
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -1530,7 +1550,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
 
         for req in done_reqs:
-            req.time_stats.set_completion_time()
+            if req.rid not in streamed_early:
+                req.time_stats.set_completion_time()
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1550,7 +1571,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if "speed_gb_s" in metrics:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
-        # Stream requests which have finished transfer
+        # Stream requests which have finished transfer; the streamer skips the
+        # ones streamed early (finished and finished_output).
         self.output_streamer.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
@@ -1563,6 +1585,8 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             self._release_mm_inputs(req)
+        if early_finish is not None and done_reqs:
+            early_finish.forget(req.rid for req in done_reqs)
 
         return done_reqs
 
@@ -1699,7 +1723,8 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             elif computed:
-                self.send_kv_chunk(req)
+                # Under PP this chunk's forward may still run on forward_stream.
+                self.send_kv_chunk(req, forward_in_flight=get_parallel().pp_size > 1)
 
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
@@ -1761,6 +1786,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        forward_in_flight: bool = False,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1781,13 +1807,19 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            forward_in_flight=forward_in_flight,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        forward_in_flight: bool = False,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -2058,7 +2090,13 @@ class SchedulerDisaggregationPrefillMixin:
             indices_event = None
             if host_indices:
                 indices_event = self.device_module.Event()
-                indices_event.record(self.device_module.current_stream())
+                stream = self.device_module.current_stream()
+                if forward_in_flight:
+                    # The sender reads KV once this event completes.
+                    stream = _kv_send_fence(
+                        current_stream=stream, forward_stream=self.forward_stream
+                    )
+                indices_event.record(stream)
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue

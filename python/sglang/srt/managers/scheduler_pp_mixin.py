@@ -10,6 +10,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.pp_early_finish import (
+    PPPrefillEarlyFinish,
+    start_pp_prefill_early_finish,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -92,6 +96,33 @@ def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
     return fwd_batch
 
 
+def _pp_prefill_early_relay_enabled() -> bool:
+    """Resolve SGLANG_OPT_PP_EARLY_RELAY once for the PP PD prefill loop."""
+    if not envs.SGLANG_OPT_PP_EARLY_RELAY.get():
+        return False
+    logger.info(
+        "SGLANG_OPT_PP_EARLY_RELAY engaged: a stage forwards reqs, transferred rids "
+        "and release sets to the next stage as soon as it has them"
+    )
+    return True
+
+
+def _pp_prefill_proxy_recv_after_forward_engages(*, comm_overlap: bool) -> bool:
+    """SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD is on for the PP PD prefill loop;
+    it needs SGLANG_PP_COMM_OVERLAP's communication stream."""
+    if not comm_overlap:
+        logger.info(
+            "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD declined: needs "
+            "SGLANG_PP_COMM_OVERLAP on a CUDA device"
+        )
+        return False
+    logger.info(
+        "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD engaged: a stage posts its next "
+        "proxy receive only after its forward in flight"
+    )
+    return True
+
+
 def _pp_exchange_outputs_before_forward(
     cur_batch: Optional[ScheduleBatch],
     spec_relay: bool,
@@ -144,6 +175,9 @@ class SchedulerPPMixin:
     _pp_reqs_awaiting_verdict: Tuple[
         Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
     ] = ()
+    # PP rank 0's early finish (SGLANG_OPT_PP_PREFILL_EARLY_FINISH), set by the PP PD
+    # prefill loop; every other loop reads None.
+    pp_prefill_early_finish: Optional[PPPrefillEarlyFinish] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -302,8 +336,31 @@ class SchedulerPPMixin:
         Release Requests still use the two-pass PP consensus. Bootstrap uses
         PPConsensusStore instead of the legacy two-round RID sync.
 
+        With SGLANG_OPT_PP_EARLY_RELAY a stage sends the ith reqs and transferred
+        rids right after it has them and relays a release set right after it
+        arrives; the last stage starts its release set and takes the relayed one
+        before its launch. Every stage gets the same messages at the same
+        iteration either way; only when they leave changes.
         """
         self.init_pp_loop_state()
+        self.pp_prefill_early_finish = None
+        if envs.SGLANG_OPT_PP_PREFILL_EARLY_FINISH.get():
+            self.pp_prefill_early_finish = start_pp_prefill_early_finish(
+                kv_manager=self.disagg_prefill_bootstrap_queue.kv_manager,
+                transfer_queue=self.disagg_prefill_transfer_queue,
+                output_streamer=self.output_streamer,
+            )
+        early_relay = _pp_prefill_early_relay_enabled()
+        # PP rank 0 receives no proxy tensors.
+        if (
+            envs.SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD.get()
+            and not self.pp_group.is_first_rank
+        ):
+            self._pp_proxy_recv_after_forward = (
+                _pp_prefill_proxy_recv_after_forward_engages(
+                    comm_overlap=self.pp_comm_stream is not None
+                )
+            )
 
         # PD additional state initialization
         tmbs = [None] * self.pp_loop_size
@@ -311,6 +368,7 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        send_relay_work = []
 
         while True:
             server_is_idle = True
@@ -340,6 +398,21 @@ class SchedulerPPMixin:
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                if early_relay and not self.pp_group.is_last_rank:
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
+                elif early_relay:
+                    # Before the launch, which may wait for this stage's forward:
+                    # the stages before this one then never wait for it.
+                    self._pp_commit_comm_work(send_release_work)
+                    send_release_work, _ = self._pp_pd_send_consensus_release_ids(
+                        tmbs, next_first_rank_mb_id, None, transferred_rids
+                    )
+                    if tmbs[next_mb_id] is not None:
+                        next_release_rids = self._pp_recv_pyobj_from_prev_stage()
 
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
@@ -386,15 +459,25 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                if not early_relay:
+                    send_release_work, release_rids = (
+                        self._pp_pd_send_consensus_release_ids(
+                            tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        )
                     )
-                )
 
-                if tmbs[next_mb_id] is not None:
+                if tmbs[next_mb_id] is not None and not (
+                    early_relay and self.pp_group.is_last_rank
+                ):
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
+                    if early_relay:
+                        # The next stage takes this set in this same iteration.
+                        self._pp_commit_comm_work(send_relay_work)
+                        send_relay_work = self._pp_send_pyobj_to_next_stage(
+                            next_release_rids, async_send=True
+                        )
+                if not early_relay:
+                    self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -407,11 +490,12 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
-                    self._pp_send_capacity_digest()
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
+                    if not early_relay:
+                        self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                        self._pp_send_capacity_digest()
+                        send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                            transferred_rids, async_send=True
+                        )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_verdict_requests()
@@ -708,6 +792,8 @@ class SchedulerPPMixin:
             logger.info(
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
             )
+        # Set by the PP PD prefill loop (SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD).
+        self._pp_proxy_recv_after_forward = False
 
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
@@ -1159,6 +1245,11 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            if self._pp_proxy_recv_after_forward and self.launch_event is not None:
+                # Post the receive after this stage's forward in flight, as
+                # SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD does for an output recv.
+                with self.pp_comm_stream_ctx:
+                    self.device_module.current_stream().wait_event(self.launch_event)
             tensor_dict, self.pp_proxy_recv_event = self._pp_recv_typed_dict(
                 expected_kind="proxy",
                 all_gather_group=(self.attn_tp_group),
