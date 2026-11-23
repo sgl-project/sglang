@@ -504,7 +504,9 @@ class VerifyStep(msgspec.Struct):
         batch = self.batch
         info = batch.sampling_info
         if info.step_penalties is not None:
-            info.step_penalties.commit_accept(accept)
+            info.step_penalties.commit(
+                accept.accept_tokens(), accept_mask=accept.accept_mask()
+            )
         if self.watermark is not None:
             self.watermark.commit(accept)
         if not batch.return_logprob or batch.forward_mode.is_idle():

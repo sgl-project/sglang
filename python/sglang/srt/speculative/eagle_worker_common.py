@@ -170,9 +170,8 @@ def make_post_verify_io(
 
 
 def accept_draft_tree(
-    batch: ScheduleBatch,
-    *,
     verify: VerifyStep,
+    *,
     verify_input: Any,
     logits_output: Any,
     speculative_runtime_hooks: Any,
@@ -183,6 +182,7 @@ def accept_draft_tree(
 ) -> VerifyAccept:
     """The tree accept core of EAGLE and NGRAM: the runtime hooks' post-verify
     under the NV mega runtime, eagle_sample otherwise."""
+    batch = verify.batch
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
     # The provider's sampling view carries no custom logit processors.
     if (
@@ -920,8 +920,7 @@ def run_eagle_verify(
         )
 
     accept = accept_draft_tree(
-        batch,
-        verify=verify,
+        verify,
         verify_input=verify_input,
         logits_output=logits_output,
         speculative_runtime_hooks=speculative_runtime_hooks,

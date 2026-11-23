@@ -68,8 +68,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         ),
                     ):
                         accept = eagle_worker_common.accept_draft_tree(
-                            batch,
-                            verify=verify,
+                            verify,
                             verify_input=verify_input,
                             logits_output=logits_output,
                             speculative_runtime_hooks=hooks,
