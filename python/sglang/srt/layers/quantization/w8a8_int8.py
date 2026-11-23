@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_host_cpu_arm64,
     use_intel_amx_backend,
 )
@@ -40,6 +41,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -56,6 +58,8 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+elif _is_hip:
+    from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
 
 
 logger = logging.getLogger(__name__)
@@ -220,6 +224,20 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
+
+        if _is_hip:
+            # triton_scaled_mm requires M > 0; empty batches (e.g. DP-attention idle) return early.
+            if x_q_2d.shape[0] == 0:
+                return x.new_empty(output_shape)
+            output = triton_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+            return output.view(output_shape)
 
         output = int8_scaled_mm(
             x_q_2d,

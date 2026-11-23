@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda, is_hip
 
 __all__ = [
     "CompressedTensorsW8A8Int8",
@@ -30,8 +30,11 @@ __all__ = [
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+elif _is_hip:
+    from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
 
 
 def _requantize_int8_with_max_scale(
@@ -244,6 +247,23 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             )
 
         x_q, x_scale = per_token_quant_int8(x)
+
+        if _is_hip:
+            output_shape = (*x_q.shape[:-1], layer.weight.shape[1])
+            x_q_2d = x_q.view(-1, x_q.shape[-1])
+            # triton_scaled_mm requires M > 0; empty batches (e.g. DP-attention idle) return early.
+            if x_q_2d.shape[0] == 0:
+                return x.new_empty(output_shape)
+            x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
+            output = triton_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                out_dtype=x.dtype,
+                bias=bias,
+            )
+            return output.view(output_shape)
 
         return int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias

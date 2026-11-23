@@ -2289,6 +2289,7 @@ class ModelConfig:
             "quark_int4fp8_moe",
             "quark_mxfp4",
             "minimax_m3_nvfp4",
+            "w8a8_int8",
         ]
         if is_gfx95_supported():
             rocm_supported_quantization.append("modelopt_fp8")
