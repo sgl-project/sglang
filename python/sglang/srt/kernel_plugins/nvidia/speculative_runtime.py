@@ -25,7 +25,6 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_mode import ForwardMode
-    from sglang.srt.sampling.sampling_pipeline import VerifyStep
 
 
 class StockVerifyBatch(msgspec.Struct, frozen=True):
@@ -64,6 +63,7 @@ def default_post_verify(
 ) -> PostVerifyOutput:
     """Run the existing verifier and preserve its outputs and mutation order."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
     from sglang.srt.speculative import eagle_utils
 
     batch = StockVerifyBatch(
@@ -74,9 +74,20 @@ def default_post_verify(
         req_pool_indices=io.req_pool_indices,
         return_logprob=io.return_logprob,
     )
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute.derive(
+            batch.sampling_info,
+            has_grammar=io.grammar_mask is not None,
+            has_watermark=io.watermark is not None,
+        ),
+        watermark=io.watermark,
+        watermark_full_mask=io.watermark_full_mask,
+        grammar_mask=io.grammar_mask,
+    )
     token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
         io.verify_tree,
-        _verify_step(io, batch),
+        verify,
         io.logits,
         uno_target_max_top_k=io.sparse_target_max_top_k,
         simulated_acc_len=io.simulated_accept_length,
@@ -88,23 +99,6 @@ def default_post_verify(
         token_ids=token_ids,
         accepted_lengths=accepted_lengths,
         accepted_indices=accepted_indices,
-    )
-
-
-def _verify_step(io: PostVerifyIO, batch: StockVerifyBatch) -> VerifyStep:
-    """The verify step eagle_sample adjusts and routes with, from the view."""
-    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
-
-    return VerifyStep(
-        batch=batch,
-        route=VerifyRoute.derive(
-            batch.sampling_info,
-            has_grammar=io.grammar_mask is not None,
-            has_watermark=io.watermark is not None,
-        ),
-        watermark=io.watermark,
-        watermark_full_mask=io.watermark_full_mask,
-        grammar_mask=io.grammar_mask,
     )
 
 

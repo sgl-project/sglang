@@ -432,7 +432,6 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         target_logits=target_logits,
         draft_probs=draft_probs,
         sampling_info=sampling_info,
-        need_truncated_sampling=False,
         draft_input=SimpleNamespace(max_top_k=None, uniform_top_k_value=None),
         gamma=3,
         verify_num_draft_tokens=4,

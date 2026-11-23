@@ -448,8 +448,7 @@ class TestTreeVerifyCustomLogitProcessor(CustomTestCase):
                     next_token_logits_vocab_shard=None,
                 )
                 result = accept_draft_tree(
-                    batch,
-                    verify=_bound_verify(batch, layout),
+                    _bound_verify(batch, layout),
                     verify_input=_verify_input(layout, kind=kind, bs=2),
                     logits_output=logits_output,
                     speculative_runtime_hooks=None,

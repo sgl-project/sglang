@@ -19,7 +19,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import operator
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -30,9 +30,6 @@ from sglang.srt.utils.device import (
     is_cuda,
     is_npu,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 _is_cuda = is_cuda()
 # The verify kernel stages rows with cp.async, which needs sm_80.
@@ -532,9 +529,6 @@ class StepPenalties:
         self.pool.accumulate(
             self.batch_indices, self.penalty_indices, token_ids, accept_mask
         )
-
-    def commit_accept(self, accept: VerifyAccept) -> None:
-        self.commit(accept.accept_tokens(), accept_mask=accept.accept_mask())
 
 
 def _compute_logit_penalties(
