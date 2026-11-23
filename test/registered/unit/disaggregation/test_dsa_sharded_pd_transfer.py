@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 _ROOM = 7
 _INDEX_PAGE_BYTES = 64 * (128 + 4)

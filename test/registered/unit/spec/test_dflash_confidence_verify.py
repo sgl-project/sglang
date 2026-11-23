@@ -14,7 +14,7 @@ from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.srt.speculative.dspark_components import dspark_planner
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 def _greedy_accept(candidates, target_predict, cutoff_verify_lens):

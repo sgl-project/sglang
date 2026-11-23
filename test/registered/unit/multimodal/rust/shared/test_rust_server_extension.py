@@ -22,7 +22,7 @@ from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # The Rust frontend decodes these headers and renders their `meta_info` keys
 # (rust/sglang-server/src/api_server/core/frame.rs); they must match Python.

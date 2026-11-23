@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     is_rust_server_built,
 )
 
-register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=96, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(

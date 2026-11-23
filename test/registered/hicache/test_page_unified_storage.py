@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=360, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=222, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestPageUnifiedStorage(CustomTestCase):

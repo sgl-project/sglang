@@ -10,7 +10,7 @@ from sglang.srt.layers.engram import _check_group_layout, _claim_group_slot
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 GROUP = {"replication": "group_shards", "group_size": 4, "group_store": "/s"}
 

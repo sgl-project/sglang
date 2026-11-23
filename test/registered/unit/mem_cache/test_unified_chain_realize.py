@@ -39,8 +39,8 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
-register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=73, suite="base-a-test-cpu")
+register_cuda_ci(est_time=54, stage="extra-a", runner_config="1-gpu-small")
 
 
 def _allocator(device, chain, lazy):

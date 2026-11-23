@@ -28,7 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.runtime_context import get_parallel
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _make_scheduler(

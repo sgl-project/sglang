@@ -14,7 +14,7 @@ from sglang.test.kits.attention_unittest.attention_methods.gdn_prewarm import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=27, stage="extra-b", runner_config="4-gpu-b200")
 
 _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
 _sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0

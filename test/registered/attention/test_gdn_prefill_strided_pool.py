@@ -45,7 +45,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=60, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=29, stage="extra-b", runner_config="4-gpu-b200")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM

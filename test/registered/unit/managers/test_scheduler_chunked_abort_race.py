@@ -41,7 +41,7 @@ from sglang.test.scheduler_test_utils import (  # noqa: E402
     idle_penalty_status_pool,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _FakeReq(FakeReq):

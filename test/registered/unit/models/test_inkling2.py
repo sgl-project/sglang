@@ -32,8 +32,8 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
-register_cuda_ci(est_time=37, stage="base-c", runner_config="4-gpu-gb300")
+register_cpu_ci(est_time=43, suite="base-a-test-cpu")
+register_cuda_ci(est_time=17, stage="base-c", runner_config="4-gpu-gb300")
 
 # The released checkpoint's config.json.
 _RELEASE_CONFIG = {

@@ -40,7 +40,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 X = (11_000_000_001, 12_000_000_002, 13_000_000_003, 14_000_000_004)
 Y = (21_000_000_001, 22_000_000_002, 23_000_000_003, 24_000_000_004)

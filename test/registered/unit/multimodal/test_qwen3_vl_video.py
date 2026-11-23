@@ -37,7 +37,7 @@ from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import (
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 # Qwen3-VL vision: 16-pixel patches, 2x2 spatial merge.
 _PATCH_SIZE = 16

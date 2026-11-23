@@ -20,7 +20,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.utils import WeightsMapper
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestModelSlimMapping(CustomTestCase):

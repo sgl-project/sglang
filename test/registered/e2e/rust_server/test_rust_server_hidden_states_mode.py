@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=124, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(

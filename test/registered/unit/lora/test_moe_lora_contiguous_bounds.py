@@ -8,7 +8,7 @@ import pytest
 from sglang.kernels.ops.lora.moe.dispatch_contiguous import contiguous_m_pad_ceiling
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestAlignedSegmentMath:

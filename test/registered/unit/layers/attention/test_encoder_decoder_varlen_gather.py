@@ -25,7 +25,7 @@ with patch.dict(
     from sglang.srt.layers.attention import xpu_backend
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestEncoderDecoderForward(unittest.TestCase):

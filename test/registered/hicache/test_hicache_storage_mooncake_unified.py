@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=400, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 
 PAGE_SIZE = 64
 

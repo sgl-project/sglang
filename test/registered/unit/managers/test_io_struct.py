@@ -47,7 +47,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="base-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 

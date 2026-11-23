@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=627, stage="base-b", runner_config="1-gpu-large")
 
 # The env of Foundry's recipes (recipe/sglang/set_env.sh),
 # set for native, SAVE and LOAD alike so the three start from the same pins.

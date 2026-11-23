@@ -8,7 +8,7 @@ from sglang.test.kernels.kv_canary.bench_cases import (
     cases_to_x_vals,
 )
 
-register_cpu_ci(est_time=6, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=2, stage="base-a", runner_config="cpu")
 
 
 def test_fast_matrix_cases_include_e2e_decode_and_chunked_prefill_scenarios() -> None:

@@ -26,7 +26,7 @@ import torch
 from sglang.kernels.ops.gemm import fp8_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 CONFIGS_DIR = os.path.join(
     os.path.dirname(os.path.abspath(fp8_kernel.__file__)), "configs"

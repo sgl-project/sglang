@@ -14,7 +14,7 @@ from sglang.srt.layers.cp import zigzag
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mem_cache_utils import routed
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize("rank", [0, 1])

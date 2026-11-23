@@ -46,7 +46,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 # Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which

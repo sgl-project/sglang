@@ -12,7 +12,7 @@ from sglang.test import field_writes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 _SRT_DIR = Path(schedule_batch.__file__).resolve().parents[1]
 

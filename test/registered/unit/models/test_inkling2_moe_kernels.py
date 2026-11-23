@@ -22,7 +22,7 @@ from sglang.srt.models.inkling_common.inkling2_norm import RMSNorm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
-register_cuda_ci(est_time=200, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=42, stage="base-c", runner_config="4-gpu-gb300")
 
 sm100_or_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available()

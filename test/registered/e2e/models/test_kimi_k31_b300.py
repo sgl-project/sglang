@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1144, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 DFLASH_DRAFT_MODEL = "RadixArk/Kimi-K3.1-Dflash2-Preview"

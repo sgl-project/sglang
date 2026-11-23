@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8LinearMethod,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestNpuLinearShapes(CustomTestCase):

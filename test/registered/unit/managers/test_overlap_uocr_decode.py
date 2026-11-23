@@ -31,7 +31,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 
 ROWS = 8
 

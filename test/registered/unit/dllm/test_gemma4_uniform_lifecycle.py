@@ -22,7 +22,7 @@ from sglang.test.scheduler_test_utils import (
     release_only_retirer,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _Req(FakeReq):

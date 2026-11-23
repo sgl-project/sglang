@@ -17,7 +17,7 @@ from sglang.benchmark.utils import dp_listener_urls
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 BATCH_SIZE = 5
 INPUT_LEN = 4

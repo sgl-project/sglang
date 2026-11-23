@@ -19,7 +19,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def _handle_pd_request(mode, req):

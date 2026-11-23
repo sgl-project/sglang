@@ -20,7 +20,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 from sglang.srt.entrypoints import http_server
 from sglang.srt.managers.io_struct import GenerateReqInput
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 RUST_ERROR_FRAMES_FIXTURE = os.path.join(
     os.path.dirname(__file__),

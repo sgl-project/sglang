@@ -16,7 +16,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import build_fixture, match_p
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures require CUDA")

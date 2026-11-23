@@ -13,7 +13,7 @@ from sglang.test.customized_info_sampler import (
 from sglang.test.mock_model.utils import MOCK_MODEL_PATH
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=27, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=36, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, stage="base-b", runner_config="1-gpu-small-amd")
 
 

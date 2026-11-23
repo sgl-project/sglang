@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=480, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=296, stage="extra-a", runner_config="2-gpu-large")
 
 PAGE_SIZE = 64
 PROMPT_PAGES = 12
