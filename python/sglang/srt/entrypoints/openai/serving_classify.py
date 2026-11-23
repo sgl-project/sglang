@@ -25,6 +25,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_hf_config_attr(hf_config, attr: str, default=None):
+    if hf_config is None:
+        return default
+    if isinstance(hf_config, dict):
+        return hf_config.get(attr, default)
+    return getattr(hf_config, attr, default)
+
+
 class OpenAIServingClassify(OpenAIServingBase):
     """Handler for v1/classify requests"""
 
@@ -35,18 +43,21 @@ class OpenAIServingClassify(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.id2label = self._get_id2label_mapping()
-        self.is_multi_label = (
-            getattr(self.tokenizer_manager.model_config.hf_config, "problem_type", None)
-            == "multi_label_classification"
+        hf_config = getattr(
+            getattr(self.tokenizer_manager, "model_config", None), "hf_config", None
         )
+        self.problem_type = _get_hf_config_attr(hf_config, "problem_type", None)
+        self.is_multi_label = self.problem_type == "multi_label_classification"
+        self.is_regression = self.problem_type == "regression"
+        self.num_labels = _get_hf_config_attr(hf_config, "num_labels", None)
+        self.id2label = self._get_id2label_mapping()
         self.model_name = (
             self.tokenizer_manager.served_model_name
             if self.tokenizer_manager.served_model_name
             else self.tokenizer_manager.model_path
         )
         if not self.id2label:
-            raise ValueError("id2label mapping is missing")
+            self.id2label = {0: "LABEL_0"}
 
     def _request_id_prefix(self) -> str:
         return "classify-"
@@ -100,14 +111,14 @@ class OpenAIServingClassify(OpenAIServingBase):
                 # List of strings
                 for i, item in enumerate(input):
                     if not isinstance(item, str):
-                        return f"All items in input list must be strings"
+                        return "All items in input list must be strings"
                     if not item.strip():
                         return f"Input at index {i} cannot be empty or whitespace only"
             elif isinstance(first_item, int):
                 # List of integers (token IDs)
                 for i, item in enumerate(input):
                     if not isinstance(item, int):
-                        return f"All items in input list must be integers"
+                        return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
         return None
@@ -115,20 +126,27 @@ class OpenAIServingClassify(OpenAIServingBase):
     def _get_id2label_mapping(self) -> Optional[Dict[int, str]]:
         """Get id2label mapping from model config."""
         try:
-            hf_config = self.tokenizer_manager.model_config.hf_config
+            hf_config = getattr(
+                getattr(self.tokenizer_manager, "model_config", None), "hf_config", None
+            )
+            id2label = _get_hf_config_attr(hf_config, "id2label", None)
             # Check for id2label in hf_config
-            if hf_config.id2label:
-                return hf_config.id2label
+            if id2label:
+                try:
+                    return {int(k): str(v) for k, v in id2label.items()}
+                except (ValueError, TypeError):
+                    return {k: str(v) for k, v in id2label.items()}
             # Check for num_labels and create default mapping if needed
-            if hasattr(hf_config, "num_labels") and hf_config.num_labels:
-                num_labels = hf_config.num_labels
+            num_labels = _get_hf_config_attr(hf_config, "num_labels", None)
+            if num_labels:
                 # Create default mapping: {0: "LABEL_0", 1: "LABEL_1", ...}
                 return {i: f"LABEL_{i}" for i in range(num_labels)}
 
+            return {0: "LABEL_0"}
         except Exception as e:
             logger.warning(f"Failed to get id2label mapping: {e}")
 
-        return None
+        return {0: "LABEL_0"}
 
     async def _handle_non_streaming_request(
         self,
@@ -167,15 +185,25 @@ class OpenAIServingClassify(OpenAIServingBase):
             if embedding:
                 try:
                     embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
-                    probs = (
-                        torch.sigmoid(embedding_tensor)
-                        if self.is_multi_label
-                        else F.softmax(embedding_tensor, dim=0)
-                    ).tolist()
+                    if self.is_regression:
+                        probs = embedding_tensor.tolist()
+                    elif (
+                        self.is_multi_label
+                        or embedding_tensor.numel() < 2
+                        or (self.num_labels is not None and self.num_labels < 2)
+                    ):
+                        probs = torch.sigmoid(embedding_tensor).tolist()
+                    else:
+                        probs = F.softmax(embedding_tensor, dim=0).tolist()
 
                     predicted_class = torch.argmax(embedding_tensor).item()
 
-                    label = self.id2label[predicted_class]
+                    label = self.id2label.get(
+                        predicted_class,
+                        self.id2label.get(
+                            str(predicted_class), f"LABEL_{predicted_class}"
+                        ),
+                    )
 
                 except Exception as e:
                     logger.error(f"Error processing embedding for item {i}: {e}")
