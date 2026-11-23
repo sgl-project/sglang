@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    _compact_staged_pages,
+    _concat_free_and_staged,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -45,14 +49,41 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
         self.free_group = None
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
-        return len(self.free_pages) + len(self.release_pages)
+        return len(self.free_pages) + self.num_staged_pages
+
+    def get_all_free_pages(self):
+        return _concat_free_and_staged(self.free_pages, self.staged_pages)
+
+    def merge_and_sort_free(self):
+        if not self.staged_pages:
+            return
+        merged = self.get_all_free_pages()
+        if self.need_sort:
+            self.free_pages, _ = torch.sort(merged)
+        else:
+            self.free_pages = merged
+        self.staged_pages = []
+        self.num_staged_pages = 0
+
+    def _stage_pages(self, *page_ids: torch.Tensor):
+        for ids in page_ids:
+            n = ids.numel()
+            if n == 0:
+                continue
+            self.staged_pages.append(
+                ids if ids.dtype == torch.int64 else ids.to(torch.int64)
+            )
+            self.num_staged_pages += n
+        _compact_staged_pages(self.staged_pages)
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
+        if need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
         if need_size > len(self.free_pages):
@@ -66,17 +97,26 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Copy to detach from mutable caller views (e.g., req_to_token rows) before deferral.
+        owned = free_index.to(dtype=torch.int64, copy=True)
         if self.free_group is None:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
-            else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+            self._stage_pages(owned)
         else:
-            self.free_group.append(self._copy_for_free_group(free_index))
+            self.free_group.append(owned)
+
+    def free_group_end(self):
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self._stage_pages(*pending)
 
     def free_page_ids(self, page_ids: torch.Tensor):
-        # page_size == 1: page ids are token ids.
-        self.free(page_ids)
+        # page_size == 1: page ids are owned token ids.
+        if page_ids.numel() == 0:
+            return
+        if self.free_group is None:
+            self._stage_pages(page_ids)
+        else:
+            self.free_group.append(self._copy_for_free_group(page_ids))
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

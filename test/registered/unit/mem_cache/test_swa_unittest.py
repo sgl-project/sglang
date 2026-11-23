@@ -250,12 +250,9 @@ class TestSWA(unittest.TestCase):
         torch.testing.assert_close(
             allocator.full_to_swa_index_mapping[old_full], new_swa
         )
-        self.assertTrue(
-            torch.isin(old_swa, allocator.swa_attn_allocator.free_pages).item()
-        )
-        self.assertFalse(
-            torch.isin(new_swa, allocator.swa_attn_allocator.free_pages).item()
-        )
+        swa_free = allocator.swa_attn_allocator.get_all_free_pages()
+        self.assertTrue(torch.isin(old_swa, swa_free).item())
+        self.assertFalse(torch.isin(new_swa, swa_free).item())
 
     def _build_two_mapped_slots(self, page_size=1):
         allocator, _ = _build_swa_allocator(
@@ -271,10 +268,10 @@ class TestSWA(unittest.TestCase):
         return allocator, old_full, new_full, old_swa, new_swa
 
     def _swa_slot_is_free(self, allocator, swa_index):
-        # free_pages holds page ids for page_size > 1 and token ids otherwise,
+        # free pages hold page ids for page_size > 1 and token ids otherwise,
         # so compare in page space (a no-op divide when page_size == 1).
         swa_pages = swa_index // allocator.page_size
-        free_pages = allocator.swa_attn_allocator.free_pages
+        free_pages = allocator.swa_attn_allocator.get_all_free_pages()
         return bool(torch.isin(swa_pages, free_pages).all().item())
 
     def _run_remap_during_free_group(self, allocator, old_full, new_full, new_swa):
@@ -834,12 +831,12 @@ class TestSWAPageRepsFree(CustomTestCase):
                 indices = _swa_alloc(allocator, 3 * ps)
                 mapping = allocator.full_to_swa_index_mapping
                 expected = torch.unique(mapping[indices[:num_tokens]] // ps)
-                before = allocator.swa_attn_allocator.free_pages.numel()
+                before = allocator.swa_attn_allocator.get_all_free_pages().numel()
 
                 allocator.free_swa_segment(indices[:num_tokens], start_pos=0)
 
-                free_pages = allocator.swa_attn_allocator.free_pages
-                freed = free_pages[: free_pages.numel() - before]
+                free_pages = allocator.swa_attn_allocator.get_all_free_pages()
+                freed = free_pages[before:]
                 self.assertTrue(torch.equal(torch.sort(freed)[0], expected))
                 # The whole last page goes back, and its mapping with it.
                 touched = -(num_tokens // -ps) * ps

@@ -24,7 +24,11 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    _compact_staged_pages,
+    _concat_free_and_staged,
+)
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
@@ -173,7 +177,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (len(self.free_pages) + self.num_staged_pages) * self.page_size
 
     def get_all_free_pages(self):
-        return torch.cat((self.free_pages, *self.staged_pages))
+        return _concat_free_and_staged(self.free_pages, self.staged_pages)
 
     def set_reuse_guard_event(self, event: torch.cuda.Event | None) -> None:
         """Cover KV writes still in flight when the scheduler releases pages.
@@ -189,7 +193,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._staged_guard_event is not None:
             self._staged_guard_event.synchronize()
             self._staged_guard_event = None
-        self.free_pages, _ = torch.sort(self.get_all_free_pages())
+        merged = self.get_all_free_pages()
+        if self.need_sort:
+            self.free_pages, _ = torch.sort(merged)
+        else:
+            self.free_pages = merged
         self.staged_pages = []
         self.num_staged_pages = 0
 
@@ -391,10 +399,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.unique(free_index.cpu() // ps),
             )
 
-        self.free_page_ids(reps // ps)
+        self.free_page_ids(reps // ps, owned=True)
 
-    def free_page_ids(self, page_ids: torch.Tensor):
-        """Free exactly these pages; no page twice, no dedup."""
+    def free_page_ids(self, page_ids: torch.Tensor, *, owned: bool = False):
+        """Free exactly these pages; no page twice, no dedup.
+
+        ``owned``: caller hands ``page_ids`` over without future mutation, so a
+        free group holds it without cloning.
+        """
         if page_ids.numel() == 0:
             return
 
@@ -403,22 +415,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_ids_group.append(self._copy_for_free_group(page_ids))
+            self.free_page_ids_group.append(
+                page_ids if owned else self._copy_for_free_group(page_ids)
+            )
 
     def _debug_check_no_duplicate_pages(self):
         pages = self.get_all_free_pages()
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
-        if self.need_sort:
-            self.staged_pages.extend(page_ids)
-            self.num_staged_pages += sum(ids.numel() for ids in page_ids)
-            if self._reuse_guard_event is not None:
-                # Events come from successive forwards on the same stream, so
-                # the latest also covers writes guarded by earlier events.
-                self._staged_guard_event = self._reuse_guard_event
-        else:
-            self.free_pages = torch.cat((*page_ids, self.free_pages))
+        for ids in page_ids:
+            n = ids.numel()
+            if n == 0:
+                continue
+            self.staged_pages.append(
+                ids if ids.dtype == torch.int64 else ids.to(torch.int64)
+            )
+            self.num_staged_pages += n
+        _compact_staged_pages(self.staged_pages)
+        if self._reuse_guard_event is not None:
+            # Events come from successive forwards on the same stream, so
+            # the latest also covers writes guarded by earlier events.
+            self._staged_guard_event = self._reuse_guard_event
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -427,8 +445,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         super().free_group_end()
         if self.free_page_ids_group:
-            self._release_page_ids(torch.cat(self.free_page_ids_group))
-            self.free_page_ids_group = []
+            pending, self.free_page_ids_group = self.free_page_ids_group, []
+            self._release_page_ids(*pending)
         if self.debug_mode:
             # the no-double-free contract can only break across a group's calls
             self._debug_check_no_duplicate_pages()
@@ -440,7 +458,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.free_page_ids_group = []
-        # need_sort only: freed pages wait here, unsorted, until an alloc runs short.
+        # Freed pages wait here until an alloc runs short (sorted on merge iff need_sort).
         self.staged_pages: list[torch.Tensor] = []
         self.num_staged_pages = 0
         self._reuse_guard_event = None

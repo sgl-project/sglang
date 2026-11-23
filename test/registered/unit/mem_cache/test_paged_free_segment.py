@@ -50,9 +50,9 @@ class TestFreeSegment(unittest.TestCase):
                     alloc = _make_allocator()
                     row = _make_kv_row(alloc, num_tokens)
                     expected = torch.unique(row[start:end] // PAGE_SIZE)
-                    before = len(alloc.free_pages)
+                    before = len(alloc.get_all_free_pages())
                     alloc.free_segment(row[start:end], start_pos=start)
-                    freed = alloc.free_pages[: len(alloc.free_pages) - before]
+                    freed = alloc.get_all_free_pages()[before:]
                     self.assertTrue(
                         torch.equal(torch.sort(freed)[0], expected),
                         f"{num_tokens=} {start=} {end=}",
@@ -61,9 +61,9 @@ class TestFreeSegment(unittest.TestCase):
     def test_empty_segment_is_noop(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, PAGE_SIZE)
-        before = len(alloc.free_pages)
+        before = len(alloc.get_all_free_pages())
         alloc.free_segment(row[:0], start_pos=0)
-        self.assertEqual(len(alloc.free_pages), before)
+        self.assertEqual(len(alloc.get_all_free_pages()), before)
 
     def test_unaligned_start_is_rejected(self):
         alloc = _make_allocator()
@@ -82,24 +82,25 @@ class TestFreeSegment(unittest.TestCase):
     def test_group_defers_until_group_end(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
-        before = len(alloc.free_pages)
+        before = len(alloc.get_all_free_pages())
         alloc.free_group_begin()
         alloc.free_segment(row, start_pos=0)
-        self.assertEqual(len(alloc.free_pages), before)
+        self.assertEqual(len(alloc.get_all_free_pages()), before)
         alloc.free_group_end()
-        self.assertEqual(len(alloc.free_pages), before + 2)
+        self.assertEqual(len(alloc.get_all_free_pages()), before + 2)
 
     def test_group_owns_deferred_page_representatives(self):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
         expected_pages = torch.unique(row // PAGE_SIZE)
+        before = len(alloc.get_all_free_pages())
 
         alloc.free_group_begin()
         alloc.free_segment(row, start_pos=0)
         row.zero_()
         alloc.free_group_end()
 
-        freed_pages = alloc.free_pages[: expected_pages.numel()]
+        freed_pages = alloc.get_all_free_pages()[before:]
         self.assertTrue(torch.equal(torch.sort(freed_pages)[0], expected_pages))
 
     def test_group_end_debug_assert_catches_cross_call_double_free(self):
@@ -141,7 +142,7 @@ class TestFreeSegment(unittest.TestCase):
         )
         req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
 
-        before = len(alloc.free_pages)
+        before = len(alloc.get_all_free_pages())
         alloc.free_group_begin()
         alloc.free_segment(row[PAGE_SIZE : PAGE_SIZE + 1], start_pos=PAGE_SIZE)
         with (
@@ -162,16 +163,16 @@ class TestFreeSegment(unittest.TestCase):
             )
         alloc.free_group_end()
 
-        self.assertEqual(len(alloc.free_pages), before + 1)
+        self.assertEqual(len(alloc.get_all_free_pages()), before + 1)
 
 
 class TestFreeSegments(unittest.TestCase):
     def _freed_by_segments(self, num_tokens, spans):
         alloc = _make_allocator()
         row = _make_kv_row(alloc, num_tokens)
-        before = len(alloc.free_pages)
+        before = len(alloc.get_all_free_pages())
         alloc.free_segments([(row[a:b], a) for a, b in spans])
-        freed = alloc.free_pages[: len(alloc.free_pages) - before]
+        freed = alloc.get_all_free_pages()[before:]
         reference = torch.unique(torch.cat([row[a:b] for a, b in spans]) // PAGE_SIZE)
         return freed, reference
 
