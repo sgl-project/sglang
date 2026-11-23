@@ -3,6 +3,7 @@ from typing import Dict, Type
 from sglang.benchmark.datasets.agentic_trace import AgenticTraceDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.custom import CustomDataset
+from sglang.benchmark.datasets.dynamic import DynamicDataset
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
 )
@@ -19,6 +20,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "agentic-trace": AgenticTraceDataset,
     "sharegpt": ShareGPTDataset,
     "custom": CustomDataset,
+    "dynamic": DynamicDataset,
     "openai": OpenAIDataset,
     # TODO: "random" vs "random-ids" should be a flag (e.g. --random-source=sharegpt|integers),
     # not two separate dataset names sharing the same class.
