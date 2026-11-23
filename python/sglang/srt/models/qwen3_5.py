@@ -282,13 +282,15 @@ if _is_cpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+    from sgl_kernel_npu.operators.activation import (
         fused_sigmoid_mul as npu_fused_sigmoid_mul,
     )
 
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
-    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -331,10 +333,8 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
-        triton_split_qkv_rmsnorm_mrope,
-    )
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+    from sgl_kernel_npu.operators.norm import (
+        split_qkv_rmsnorm_mrope,
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
@@ -1548,7 +1548,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if positions.ndim == 1:
             positions = positions.expand(3, -1)
         cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
-        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+        q, k, v, gate = split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=self.q_norm.gemma_weight,
             k_weight=self.k_norm.gemma_weight,

@@ -364,6 +364,71 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNotNone(resps[0].generated_output)
 
 
+class TestRolloutGenerateEndpoint(unittest.TestCase):
+    def _generate(self, **request_fields):
+        import asyncio
+        from unittest.mock import patch
+
+        import msgspec
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+            rollout_api,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+            RolloutRequest,
+        )
+
+        async def forward(pipeline_request):
+            return OutputBatch(output=torch.zeros(1, 3, 1, 8, 8))
+
+        def build_sampling_params(request_id, **kwargs):
+            return SamplingParams(request_id=request_id, **kwargs)
+
+        with (
+            patch.object(rollout_api, "get_global_server_args", return_value=None),
+            patch.object(rollout_api, "build_sampling_params", build_sampling_params),
+            patch.object(rollout_api, "prepare_request", lambda **kwargs: None),
+            patch.object(
+                rollout_api,
+                "async_scheduler_client",
+                types.SimpleNamespace(forward=forward),
+            ),
+        ):
+            response = asyncio.run(
+                rollout_api.rollout_generate(
+                    RolloutRequest(
+                        prompt="x",
+                        num_inference_steps=4,
+                        rollout=False,
+                        **request_fields,
+                    )
+                )
+            )
+
+        payload = msgspec.msgpack.decode(response.body)
+        self.assertEqual(len(payload), 1)
+        return payload[0]
+
+    def test_request_without_seed_reports_the_seed_that_was_used(self):
+        """`seed` is optional on the request; a seedless rollout must return the
+        generated sample with the default seed it ran with, not fail after generation."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+
+        self.assertEqual(self._generate()["seed"], SamplingParams.seed)
+
+    def test_request_seed_is_reported_next_to_a_per_sample_seed_list(self):
+        """`extra_sampling_params` may carry a list of seeds, which the response's
+        integer `seed` field cannot hold; the request's own seed is reported."""
+        sample = self._generate(seed=7, extra_sampling_params={"seed": [3, 4]})
+
+        self.assertEqual(sample["seed"], 7)
+
+
 class TestBuildSamplingKwargs(unittest.TestCase):
     def _make_request(self, **overrides):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
