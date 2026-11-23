@@ -12,7 +12,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci, register_mps_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mps_ci(est_time=45, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=45, suite="extra-unit-test-mps")
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 

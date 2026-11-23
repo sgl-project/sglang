@@ -360,9 +360,10 @@ class CompiledMlxGraph:
         )
 
     def prepare(self, arrays, *, tails=None):
-        """Trace a read-only dummy call without submitting inference."""
+        """Evaluate a read-only dummy call before admitting the specialization."""
         try:
             outputs = self._call(arrays, tails=tails)
+            mx.eval(*outputs)
         except (RuntimeError, ValueError, NotImplementedError) as error:
             raise UnsupportedMlxRegion(
                 f"Unsupported MLX preparation: {error}"

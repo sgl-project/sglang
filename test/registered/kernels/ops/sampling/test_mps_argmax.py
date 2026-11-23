@@ -9,7 +9,7 @@ import torch
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mps_ci(est_time=10, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=10, suite="extra-unit-test-mps")
 
 
 @unittest.skipUnless(torch.backends.mps.is_available(), "Requires Torch MPS")

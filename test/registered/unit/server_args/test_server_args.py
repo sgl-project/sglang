@@ -184,6 +184,27 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             POSITIONAL_FIELD_ORDER,
         )
 
+    def test_mps_backend_preserves_existing_positional_slots(self):
+        """Adding the MPS backend must not reinterpret pre-existing positional calls."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (564, "enable_dsa_fp4_indexer"),
+            (565, "kda_dwdp_size"),
+            (566, "weight_cache_transport"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        positional = [getattr(defaults, field.name) for field in fields[:567]]
+        positional[564:567] = [True, 2, "shm"]
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.enable_dsa_fp4_indexer)
+        self.assertEqual(args.kda_dwdp_size, 2)
+        self.assertEqual(args.weight_cache_transport, "shm")
+        self.assertEqual(args.mps_execution_backend, "eager")
+
 
 class TestMuseSparkLaunchDefaults(CustomTestCase):
     """Minimal recipes must resolve before generic memory/backend defaults."""

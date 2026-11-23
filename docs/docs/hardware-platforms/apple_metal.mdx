@@ -128,10 +128,10 @@ SGLANG_USE_MLX=0 python -m sglang.launch_server \
 
 The installed `sgl_kernel` package must include `_metal` and
 `_metal.metallib`; missing artifacts produce an error.
-New graph specializations are traced on read-only dummy inputs before admitting
-a live request, without submitting dummy inference or committing warmup K/V.
-Unsupported export or first tracing falls back to eager before admission;
-execution errors after submission propagate instead of retrying eagerly.
+New graph specializations are traced and synchronously evaluated on read-only
+dummy inputs before admitting a live request, without committing warmup K/V.
+Unsupported export, tracing or warmup evaluation falls back to eager before
+admission; errors during live execution propagate instead of retrying eagerly.
 Warm up your request shapes before measuring throughput. AOT applies to the
 radix shaders, not the entire model.
 

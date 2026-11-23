@@ -11,7 +11,7 @@ import torch
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mps_ci(est_time=30, suite="stage-a-unit-test-mps")
+register_mps_ci(est_time=30, suite="extra-unit-test-mps")
 
 
 @unittest.skipUnless(
@@ -156,8 +156,8 @@ class TestCompiledGraph(CustomTestCase):
         )
         return runner, batch, pools
 
-    def test_prelaunch_export_and_lazy_trace_failures_fall_back_without_kv_writes(self):
-        """A shape must fail admission before a live request can reach a bad trace."""
+    def test_prelaunch_export_trace_and_eval_failures_fall_back_without_kv_writes(self):
+        """A bad specialization must fail admission without changing live KV."""
         import mlx.core as mx
 
         from sglang.srt.runtime_context import get_context
@@ -193,6 +193,18 @@ class TestCompiledGraph(CustomTestCase):
                     mx, "compile", side_effect=RuntimeError("unsupported compiler")
                 ),
             ),
+            (
+                "evaluation",
+                patch.object(mx, "eval", side_effect=RuntimeError("unsupported eval")),
+            ),
+            (
+                "lookahead evaluation",
+                patch.object(
+                    mx,
+                    "eval",
+                    side_effect=[None, RuntimeError("unsupported tail eval")],
+                ),
+            ),
         ):
             with (
                 self.subTest(boundary=boundary),
@@ -203,25 +215,28 @@ class TestCompiledGraph(CustomTestCase):
                 with failure:
                     self.assertFalse(runner.can_run_graph(batch))
                 self.assertIn(1, runner._unsupported_batches)
+                self.assertFalse(runner._graphs)
                 self.assertFalse(runner.can_run_graph(batch))
                 self.assertEqual(runner.execution_count, 0)
                 for actual, expected in zip(pools, before):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    def test_admission_traces_without_submitting_or_evaluating_dummy_inference(self):
+    def test_admission_evaluates_dummy_inference_without_committing_kv(self):
         import mlx.core as mx
 
         from sglang.srt.runtime_context import get_context
 
         with get_context().override_server_args(device="mps"):
             runner, batch, pools = self._runner_fixture()
-            with (
-                patch.object(
-                    mx, "async_eval", side_effect=AssertionError("dummy submission")
-                ),
-                patch.object(
-                    mx, "eval", side_effect=AssertionError("dummy evaluation")
-                ),
+            before = tuple(pool.clone() for pool in pools)
+            with patch.object(
+                mx, "async_eval", side_effect=AssertionError("async dummy submission")
+            ):
+                self.assertTrue(runner.can_run_graph(batch))
+            for actual, expected in zip(pools, before):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            with patch.object(
+                mx, "eval", side_effect=AssertionError("repeated warmup")
             ):
                 self.assertTrue(runner.can_run_graph(batch))
             self.assertEqual(runner.execution_count, 0)
@@ -234,36 +249,48 @@ class TestCompiledGraph(CustomTestCase):
             )
             torch.testing.assert_close(pools[0][1], expected_key)
 
-    def test_new_dynamic_prefill_shape_is_traced_before_admission(self):
-        """A warmed prefill graph does not prove a new length can compile."""
+    def test_new_dynamic_prefill_shape_is_prepared_before_admission(self):
+        """A warmed prefill length cannot hide a new length's trace or eval error."""
         import mlx.core as mx
 
         from sglang.srt.runtime_context import get_context
 
-        with get_context().override_server_args(device="mps"):
-            runner, batch, pools = self._runner_fixture(prefill=True, tokens=3)
-            self.assertTrue(runner.can_run_graph(batch))
-            before = tuple(pool.clone() for pool in pools)
-            batch.input_ids = torch.ones(5, device="mps", dtype=torch.int64)
-            batch.positions = torch.arange(5, device="mps")
-            batch.out_cache_loc = torch.arange(1, 6, device="mps")
-            batch.seq_lens.fill_(5)
-            batch.seq_lens_sum = batch.extend_num_tokens = 5
-            batch.extend_seq_lens.fill_(5)
-            batch.extend_seq_lens_cpu = [5]
+        def fail_trace(*args, **kwargs):
+            def trace(*flat):
+                raise RuntimeError("unsupported new length")
 
-            def fail_trace(*args, **kwargs):
-                def trace(*flat):
-                    raise RuntimeError("unsupported new length")
+            return trace
 
-                return trace
-
-            with patch.object(mx, "compile", side_effect=fail_trace):
-                self.assertFalse(runner.can_run_graph(batch))
-            self.assertIn(5, runner._unsupported_batches)
-            self.assertNotIn(3, runner._unsupported_batches)
-            for actual, expected in zip(pools, before):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for boundary, failure in (
+            ("trace", patch.object(mx, "compile", side_effect=fail_trace)),
+            (
+                "evaluation",
+                patch.object(
+                    mx, "eval", side_effect=RuntimeError("unsupported new length")
+                ),
+            ),
+        ):
+            with (
+                self.subTest(boundary=boundary),
+                get_context().override_server_args(device="mps"),
+            ):
+                runner, batch, pools = self._runner_fixture(prefill=True, tokens=3)
+                self.assertTrue(runner.can_run_graph(batch))
+                before = tuple(pool.clone() for pool in pools)
+                batch.input_ids = torch.ones(5, device="mps", dtype=torch.int64)
+                batch.positions = torch.arange(5, device="mps")
+                batch.out_cache_loc = torch.arange(1, 6, device="mps")
+                batch.seq_lens.fill_(5)
+                batch.seq_lens_sum = batch.extend_num_tokens = 5
+                batch.extend_seq_lens.fill_(5)
+                batch.extend_seq_lens_cpu = [5]
+                with failure:
+                    self.assertFalse(runner.can_run_graph(batch))
+                self.assertIn(5, runner._unsupported_batches)
+                self.assertNotIn(3, runner._unsupported_batches)
+                self.assertFalse(runner._graphs)
+                for actual, expected in zip(pools, before):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_preparation_is_read_only_and_execution_errors_are_not_retried(self):
         """Successful preparation cannot commit KV or hide a later execution error."""

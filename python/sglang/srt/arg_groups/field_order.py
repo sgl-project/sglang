@@ -570,9 +570,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_flashmla_prefill_token_packing",
     "decode_state_free_radix_default",
     "gc_freeze_on_idle_secs",
-    "mps_execution_backend",
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "mps_execution_backend",
 )
 # fmt: on

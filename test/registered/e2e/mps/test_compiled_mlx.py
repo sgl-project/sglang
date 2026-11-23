@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_mps_ci(est_time=420, suite="stage-b-e2e-mps")
+register_mps_ci(est_time=420, suite="extra-e2e-test-mps")
 
 
 @unittest.skipUnless(
