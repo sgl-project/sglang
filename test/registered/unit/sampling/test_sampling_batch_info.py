@@ -22,8 +22,9 @@ from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
+    VerifyRoute,
+    VerifyStep,
     _adjust_before_watermark,
-    adjust_verify_logits,
 )
 from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
@@ -159,9 +160,21 @@ class TestSamplingPipelineOrder(CustomTestCase):
         watermarked = torch.zeros(2, 4)
         row_prefixes = [[], [0]]
 
-        def apply_watermark(logits, *, sampling_info):
+        def apply_watermark(logits, *, sampling_info, **kwargs):
             events.append("watermark")
             return watermarked, sampling_info
+
+        step = VerifyStep(
+            batch=SimpleNamespace(
+                sampling_info=_make_info(has_custom_logit_processor=True),
+                req_pool_indices=None,
+                return_logprob=False,
+            ),
+            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+            watermark=SimpleNamespace(apply=apply_watermark),
+            watermark_full_mask=True,
+            row_prefixes=row_prefixes,
+        )
 
         module = "sglang.srt.sampling.sampling_pipeline"
         with (
@@ -178,14 +191,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 ),
             ),
         ):
-            verify_logits, _ = adjust_verify_logits(
-                logits,
-                sampling_info=_make_info(has_custom_logit_processor=True),
-                grammar_mask=None,
-                draft_tokens=torch.zeros(1, 2, dtype=torch.long),
-                apply_watermark=apply_watermark,
-                row_prefixes=row_prefixes,
-            )
+            verify_logits, _ = step.adjust(logits, torch.zeros(1, 2, dtype=torch.long))
 
         self.assertIs(verify_logits, watermarked)
         self.assertEqual(

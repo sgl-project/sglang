@@ -367,13 +367,29 @@ class VerifyStep(msgspec.Struct):
         positions: Optional[torch.Tensor] = None,
         tree: Optional[EagleVerifyInput] = None,
     ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
-        """`adjust_verify_logits` over a verify's logits; `draft_tokens` is
+        """The stages over a verify's logits, in sampling's order (see
+        `_adjust_before_watermark` for the rows); returns the logits and the
+        sampling info to accept with. The watermark may replace both, and when
+        it keeps the unwatermarked logits for the logprobs, the custom logit
+        processor runs on both, as in sampling. `draft_tokens` is
         [bs, width]. A chain verify passes `positions` [bs, width], read by the
         watermark; a tree verify passes its verify input as `tree` instead: the
         penalty walks its `retrieve_next_token` / `retrieve_next_sibling`, and
-        the watermark reads its flat draft tokens, positions, and custom mask."""
+        the watermark reads its flat draft tokens, positions, and custom mask. A
+        custom logit processor reads `self.row_prefixes`."""
         batch = self.batch
-        apply_watermark = None
+        sampling_info = batch.sampling_info
+        _adjust_before_watermark(
+            logits,
+            sampling_info,
+            draft_tokens=draft_tokens,
+            next_child=None if tree is None else tree.retrieve_next_token,
+            next_sibling=None if tree is None else tree.retrieve_next_sibling,
+            grammar_mask=self.grammar_mask,
+        )
+        # Read before the watermark, which may replace the sampling info.
+        has_custom_logit_processor = sampling_info.has_custom_logit_processor
+        verify_logits = logits
         if self.watermark is not None:
             if tree is None:
                 geometry = dict(
@@ -385,24 +401,25 @@ class VerifyStep(msgspec.Struct):
                     positions=tree.positions,
                     custom_mask=tree.custom_mask,
                 )
-            apply_watermark = partial(
-                self.watermark.apply,
+            verify_logits, sampling_info = self.watermark.apply(
+                logits,
+                sampling_info=sampling_info,
                 req_pool_indices=batch.req_pool_indices,
                 draft_token_num=draft_tokens.shape[1],
                 # compute_spec_logprobs reads the unwatermarked logits after verify.
                 keep_logits=batch.return_logprob,
                 **geometry,
             )
-        return adjust_verify_logits(
-            logits,
-            sampling_info=batch.sampling_info,
-            grammar_mask=self.grammar_mask,
-            draft_tokens=draft_tokens,
-            next_child=None if tree is None else tree.retrieve_next_token,
-            next_sibling=None if tree is None else tree.retrieve_next_sibling,
-            apply_watermark=apply_watermark,
-            row_prefixes=self.row_prefixes,
-        )
+        if has_custom_logit_processor:
+            assert self.row_prefixes is not None, "verify needs the draft row prefixes"
+            _custom_logit_processor_stage(
+                verify_logits,
+                sampling_info,
+                logprob_logits=None if verify_logits is logits else logits,
+                rows_per_request=draft_tokens.shape[1],
+                row_prefixes=self.row_prefixes,
+            )
+        return verify_logits, sampling_info
 
     def cap_tree_accept(
         self, accept_lens: torch.Tensor, accept_index: torch.Tensor
@@ -463,48 +480,3 @@ class VerifyStep(msgspec.Struct):
                 accept.tokens.reshape(-1),
                 chain_stride=accept.tokens.shape[1],
             )
-
-
-def adjust_verify_logits(
-    logits: torch.Tensor,
-    *,
-    sampling_info: SamplingBatchInfo,
-    grammar_mask: Optional[GrammarMask],
-    draft_tokens: torch.Tensor,
-    next_child: Optional[torch.Tensor] = None,
-    next_sibling: Optional[torch.Tensor] = None,
-    apply_watermark: Optional[Callable[..., Tuple[torch.Tensor, Any]]] = None,
-    row_prefixes: Optional[List[List[int]]] = None,
-) -> Tuple[torch.Tensor, SamplingBatchInfo]:
-    """The stages over a verify's logits, in sampling's order (see
-    `_adjust_before_watermark` for the rows). Returns the logits and the
-    sampling info to accept with. `apply_watermark` is the bound
-    `VerifyWatermark.apply` given the logits and the sampling info; it may
-    replace both, and when it keeps the unwatermarked logits for the logprobs,
-    the custom logit processor runs on both, as in sampling. `row_prefixes`
-    (`VerifyStep.row_prefixes`) is required with a custom logit processor."""
-    _adjust_before_watermark(
-        logits,
-        sampling_info,
-        draft_tokens=draft_tokens,
-        next_child=next_child,
-        next_sibling=next_sibling,
-        grammar_mask=grammar_mask,
-    )
-    # Read before the watermark, which may replace the sampling info.
-    has_custom_logit_processor = sampling_info.has_custom_logit_processor
-    verify_logits = logits
-    if apply_watermark is not None:
-        verify_logits, sampling_info = apply_watermark(
-            logits, sampling_info=sampling_info
-        )
-    if has_custom_logit_processor:
-        assert row_prefixes is not None, "verify needs the draft row prefixes"
-        _custom_logit_processor_stage(
-            verify_logits,
-            sampling_info,
-            logprob_logits=None if verify_logits is logits else logits,
-            rows_per_request=draft_tokens.shape[1],
-            row_prefixes=row_prefixes,
-        )
-    return verify_logits, sampling_info
