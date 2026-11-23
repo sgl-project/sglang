@@ -307,6 +307,115 @@ def test_device_varlen_capability_preserves_host_plans(monkeypatch):
     )
 
 
+def test_supports_graph_device_varlen_resolves_backend_override(monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        flash_attn,
+        skip_softmax,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Attention
+
+    monkeypatch.setattr(skip_softmax, "get_request_skip_softmax_params", lambda: None)
+    monkeypatch.setattr(flash_attn, "fa_ver", 4)
+
+    attn = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    attn.to_gate_compress = None
+    attn._attention_impl = None
+
+    resolved = []
+
+    def resolve_override():
+        resolved.append(True)
+        attn._attention_impl = SDPAImpl(
+            num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace(attn=attn)],
+        _resolve_attention_backend_once=resolve_override,
+    )
+    assert not MiniMaxH3DiTModel.supports_graph_device_varlen(model)
+    assert resolved == [True]
+
+    attn._attention_impl = None
+
+    def resolve_fa4():
+        attn._attention_impl = flash_attn.FlashAttentionImpl(
+            2, 128, False, 128**-0.5, packed_trailing_padding=True
+        )
+
+    model._resolve_attention_backend_once = resolve_fa4
+    assert MiniMaxH3DiTModel.supports_graph_device_varlen(model)
+
+
+def test_unbucketed_varlen_attention_keeps_bcg_break(monkeypatch):
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        H3PackedPrompt,
+        live_packed_prompt,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as h3
+
+    x = torch.zeros(16, 64, dtype=torch.bfloat16)
+    q = torch.zeros(16, 2, 32, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 9, 16], dtype=torch.int32)
+    bcg_out = torch.ones_like(q)
+    direct_out = torch.full_like(q, 2.0)
+
+    attn = h3.MiniMaxH3Attention.__new__(h3.MiniMaxH3Attention)
+    attn.num_heads = 2
+    attn.head_dim = 32
+    attn.q_norm = None
+    attn.k_norm = None
+    attn.bcg_breakpoint = True
+    attn._attention_backend_enum = AttentionBackendEnum.FA
+    attn.to_gate_compress = None
+    attn._attention_impl = SimpleNamespace(
+        forward_varlen=Mock(return_value=direct_out)
+    )
+
+    bcg_core = Mock(return_value=bcg_out)
+    monkeypatch.setattr(h3, "_apply_qk_norm", lambda q, k, *a, **kw: (q, k))
+    monkeypatch.setattr(h3, "is_in_breakable_cuda_graph", lambda: True)
+    monkeypatch.setattr(h3, "_minimax_h3_attention_core_bcg", bcg_core)
+
+    token = live_packed_prompt.set(H3PackedPrompt((0, 9, 16), 9, capture_varlen=True))
+    try:
+        unbucketed = attn._attend(
+            x,
+            q,
+            q,
+            q,
+            rope_cache=None,
+            cu_seqlens=cu,
+            cu_seqlens_host=(0, 9, 16),
+            max_seqlen=9,
+            subblock_sparse_query_block_mask=None,
+            ulysses_active=False,
+            ring_active=False,
+        )
+        assert bcg_core.call_count == 1
+        assert attn._attention_impl.forward_varlen.call_count == 0
+        torch.testing.assert_close(unbucketed, bcg_out.reshape(16, 64))
+
+        bucketed = attn._attend(
+            x,
+            q,
+            q,
+            q,
+            rope_cache=None,
+            cu_seqlens=cu,
+            cu_seqlens_host=(),
+            max_seqlen=16,
+            subblock_sparse_query_block_mask=None,
+            ulysses_active=False,
+            ring_active=False,
+        )
+        assert bcg_core.call_count == 1
+        assert attn._attention_impl.forward_varlen.call_count == 1
+        torch.testing.assert_close(bucketed, direct_out.reshape(16, 64))
+    finally:
+        live_packed_prompt.reset(token)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
 @torch.no_grad()
 def test_capture_reads_updated_device_boundaries(monkeypatch):

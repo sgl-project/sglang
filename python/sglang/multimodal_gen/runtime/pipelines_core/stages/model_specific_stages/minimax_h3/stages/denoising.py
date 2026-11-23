@@ -1245,6 +1245,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     text_len,
                     capture_varlen=capture_device_varlen
                     and model.supports_graph_device_varlen(),
+                    source_psp=psp,
                 )
             # timestep bits are eager memo keys, not graph specialization inputs
             call_kwargs.pop("adaln_timestep_bits", None)

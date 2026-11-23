@@ -1795,7 +1795,7 @@ class MiniMaxH3Attention(nn.Module):
             )
 
             branch = live_packed_prompt.get()
-            if branch is not None and branch.capture_varlen:
+            if cu_seqlens_host == () and branch is not None and branch.capture_varlen:
                 # The normal two capture-stream warmups initialize the same backend and workspace.
                 out = self._attention_impl.forward_varlen(
                     q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
@@ -3169,6 +3169,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     def supports_graph_device_varlen(self) -> bool:
         # The embedding and PDD head remain eager breaks. Only independent
         # self-attention can be folded into the intervening graph segment.
+        if hasattr(self, "_resolve_attention_backend_once"):
+            self._resolve_attention_backend_once()
         for block in self.blocks:
             attn = block.attn
             if (

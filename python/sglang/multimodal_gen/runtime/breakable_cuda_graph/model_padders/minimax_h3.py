@@ -25,6 +25,7 @@ class H3PackedPrompt:
     capture_varlen: bool = False
     offsets: tuple[torch.Tensor, torch.Tensor] | None = None
     by_bucket: dict[int, dict] = field(default_factory=dict)
+    source_psp: Any = None
 
 
 live_packed_prompt: ContextVar[H3PackedPrompt | None] = ContextVar(
