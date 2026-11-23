@@ -555,14 +555,17 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
 
 
 class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
+    def __init__(self, length: int, ignored_stop_position: Optional[int] = None):
         super().__init__()
         self.length = length
+        self.ignored_stop_position = ignored_stop_position
 
     def to_json(self):
+        position = self.ignored_stop_position
         return {
             "type": "length",  # to match OpenAI API's return value
             "length": self.length,
+            "ignored_stop": None if position is None else {"position": position},
         }
 
 
@@ -580,6 +583,13 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TokenIdRows:
+    """A batch ``token_ids_logprobs`` entry with its own ids for each scored row."""
+
+    rows: List[List[int]]
 
 
 @dataclasses.dataclass
