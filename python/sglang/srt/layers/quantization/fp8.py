@@ -509,21 +509,6 @@ class Fp8Config(QuantizationConfig):
             )
 
 
-def _holds_on_all_tp_ranks(flag: bool) -> bool:
-    """Whether ``flag`` holds on every TP rank. A TP CPU-group collective: every TP
-    rank must call it for the same layers in the same order."""
-    if not torch.distributed.is_initialized():
-        return flag
-    tp_group = get_parallel().tp_group
-    if tp_group.world_size <= 1:
-        return flag
-    flags = torch.tensor([int(flag)], dtype=torch.int32)
-    torch.distributed.all_reduce(
-        flags, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
-    )
-    return bool(flags.item())
-
-
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -931,13 +916,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             and weight.dtype == torch.float8_e4m3fn
         )
-        gfx942_bf16_cache = (
-            _is_gfx942_supported
-            and not get_fp8_gemm_runner_backend().is_triton()
-            and weight.dtype == torch.float8_e4m3fnuz
-        )
+        gfx942_fnuz = _is_gfx942_supported and weight.dtype == torch.float8_e4m3fnuz
         if (
-            (hopper_bf16_cache or gfx942_bf16_cache)
+            (hopper_bf16_cache or gfx942_fnuz)
             and weight.is_cuda
             and self.weight_block_size == [32, 32]
             and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
@@ -948,19 +929,27 @@ class Fp8LinearMethod(LinearMethodBase):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
             from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
-            # Keep every finite E4M3 value (down to 2^-9, or 2^-10 for FNUZ) a normal
-            # BF16 after scaling, and reject mislabeled non-power-of-two scales.
-            min_exact_scale = 2.0**-116 if gfx942_bf16_cache else 2.0**-117
+            # Keep every finite E4M3 value a normal BF16 after scaling; FNUZ halves the
+            # values and doubles the scales. Reject mislabeled non-power-of-two scales.
+            fnuz_shift = 1 if gfx942_fnuz else 0
             exact_bf16_scales = (
-                (weight_scale >= min_exact_scale)
-                & (weight_scale <= 2.0**119)
+                (weight_scale >= 2.0 ** (-117 + fnuz_shift))
+                & (weight_scale <= 2.0 ** (119 + fnuz_shift))
                 & (torch.frexp(weight_scale)[0] == 0.5)
             ).all()
-            # The cache and its online-update rejection must agree across TP ranks, so
-            # a shard builds it only if every rank's scales pass.
-            if not is_batch_invariant_mode_enabled() and _holds_on_all_tp_ranks(
-                bool(exact_bf16_scales.item())
-            ):
+            if gfx942_fnuz:
+                # Set from the config alone, so all ranks holding such layers reject
+                # together; a reload cannot re-normalize FNUZ weights.
+                layer._derived_weight_cache_error = (
+                    "Online weight updates are not supported for group32 FP8 "
+                    "weights on gfx942: reloads cannot re-normalize FNUZ weights, "
+                    "and captured CUDA graphs retain any BF16 expansions."
+                )
+            # Batch-invariant mode routes gfx942's F.linear through its own mm/addmm.
+            build_bf16_cache = (
+                gfx942_fnuz and not get_fp8_gemm_runner_backend().is_triton()
+            ) or (hopper_bf16_cache and not is_batch_invariant_mode_enabled())
+            if build_bf16_cache and exact_bf16_scales.item():
                 # Group32 FP8 GEMMs on Hopper and gfx942 are K-loop bound; reuse a BF16
                 # expansion, keeping the original FP8 weights for fallbacks.
                 layer.register_buffer(
@@ -968,16 +957,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
                     persistent=False,
                 )
-                layer._derived_weight_cache_error = (
-                    "Online weight updates are not supported for group32 FP8 "
-                    "weights on gfx942: captured CUDA graphs retain their BF16 "
-                    "expansions."
-                    if gfx942_bf16_cache
-                    else "Online weight updates are not supported while Hopper FP8 "
-                    "BF16 weight caches are active: captured CUDA graphs retain "
-                    "these derived weights. Restart with "
-                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
-                )
+                if hopper_bf16_cache:
+                    layer._derived_weight_cache_error = (
+                        "Online weight updates are not supported while Hopper FP8 "
+                        "BF16 weight caches are active: captured CUDA graphs retain "
+                        "these derived weights. Restart with "
+                        "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                    )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
 

@@ -2,13 +2,16 @@
 
 import contextlib
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.srt.layers.quantization import fp8, fp8_utils
+from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.utils import is_gfx942_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.layer_ut_utils import (
@@ -90,47 +93,44 @@ class TestGfx942Block32Bf16Linear(CustomTestCase):
                         torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
     def test_scale_range_follows_fnuz_normalization(self):
-        # FNUZ normalization doubles the scale; the smallest E4M3 value times 2^-117
-        # (checkpoint scale) is the smallest normal BF16.
+        # FNUZ normalization doubles the scale, so checkpoint scales keep the E4M3
+        # exactness range [2^-117, 2^119].
         n, k = 32, 64
         weight = torch.ones((n, k), device="cuda").to(torch.float8_e4m3fn)
-        for exp, cached in ((-117, True), (-118, False)):
+        for exp, cached in ((-117, True), (-118, False), (119, True), (120, False)):
             with self.subTest(exp=exp):
                 scale = torch.full((n // 32, k // 32), 2.0**exp, device="cuda")
                 layer, _ = _build_layer(n, k, weight.clone(), scale)
                 has_cache = getattr(layer, "_block_fp8_bf16_weight", None) is not None
                 self.assertEqual(has_cache, cached)
-                # An all-FP8 layer keeps online updates.
-                rejects = getattr(layer, "_derived_weight_cache_error", None)
-                self.assertEqual(rejects is not None, cached)
+                # The rejection depends only on the config, so a shard whose scales
+                # keep FP8 rejects a reload before writing, like its cached peers.
+                before = layer.weight.detach().view(torch.uint8).clone()
+                updater = _weight_updater(torch.nn.Sequential(layer))
+                ok, error = updater.update_weights_from_disk("/nonexistent", "auto")
+                self.assertFalse(ok)
+                self.assertIn("gfx942", error)
+                self.assertIn("gfx942", updater.load_rejection("plugin_weight_update"))
+                self.assertTrue(torch.equal(layer.weight.view(torch.uint8), before))
 
     def test_cache_rejects_online_updates(self):
         layer, _ = _build_layer(64, 128)
         self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
         self.assertIn("gfx942", layer._derived_weight_cache_error)
 
-    def test_cache_follows_every_tp_rank(self):
-        # A peer whose shard fails the scale check keeps this rank on FP8 too, so the
-        # online-update rejection agrees across ranks.
-        tp_group = SimpleNamespace(world_size=2, cpu_group=object())
-
-        def peer_fails(flags, op=None, group=None):
-            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-            self.assertIs(group, tp_group.cpu_group)
-            flags.zero_()
-
-        with (
-            mock.patch.object(
-                fp8, "get_parallel", lambda: SimpleNamespace(tp_group=tp_group)
-            ),
-            mock.patch.object(
-                torch.distributed, "all_reduce", side_effect=peer_fails
-            ) as all_reduce,
-        ):
-            layer, _ = _build_layer(64, 128)
-        self.assertEqual(all_reduce.call_count, 1)
-        self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
-        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
+    def test_batch_invariant_mode_keeps_cache(self):
+        # A draft model loads after the target has enabled batch-invariant mode.
+        with set_batch_invariant_mode(True):
+            layer, _ = _build_layer(576, 5120)
+            bias = torch.randn(576, device="cuda", dtype=torch.bfloat16)
+            x = torch.randn(135, 5120, device="cuda", dtype=torch.bfloat16)
+            full = layer.quant_method.apply(layer, x, bias)
+            for m in (1, 6, 65):
+                with self.subTest(m=m):
+                    out = layer.quant_method.apply(layer, x[:m], bias)
+                    torch.testing.assert_close(out, full[:m], rtol=0, atol=0)
+        self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
+        self.assertIn("gfx942", layer._derived_weight_cache_error)
 
     def test_explicit_triton_backend_keeps_fp8_path(self):
         with (
@@ -146,14 +146,27 @@ class TestGfx942Block32Bf16Linear(CustomTestCase):
                 layer, torch.randn(6, 128, device="cuda").bfloat16()
             )
         self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
-        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
+        self.assertIn("gfx942", layer._derived_weight_cache_error)
         self.assertTrue(fake_matmul.called)
+
+
+def _weight_updater(model: torch.nn.Module) -> WeightUpdater:
+    return WeightUpdater(
+        tp_rank=0,
+        device="cuda",
+        gpu_id=0,
+        model_config=mock.Mock(),
+        custom_weight_loaders={},
+        get_model=lambda: model,
+        update_model_fields=mock.Mock(),
+        recapture_cuda_graph=mock.Mock(),
+        get_model_runner=mock.Mock(),
+    )
 
 
 @contextlib.contextmanager
 def _fake_fp8_kernels(n: int):
-    """Stand-ins for the FP8 Triton path, whose ROCm group32 ue8m0 activation quant
-    fails on its own; only the dispatch is checked."""
+    """Stand-ins for the FP8 Triton kernels; only the dispatch is checked."""
 
     def fake_group_quant(x, group_size, **kwargs):
         q = torch.zeros_like(x, dtype=torch.float8_e4m3fnuz)
