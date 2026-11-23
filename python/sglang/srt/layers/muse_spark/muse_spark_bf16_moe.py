@@ -702,7 +702,6 @@ class MuseSpark1xBf16Experts(nn.Module):
         from sglang.srt.layers.moe.moe_runner.triton_utils import (
             try_get_optimal_moe_config,
         )
-        from sglang.srt.layers.muse_spark.fused.glue import ar_out
 
         w1, w2, n, e = (
             self.gate_up_proj,
@@ -776,7 +775,6 @@ class MuseSpark1xBf16Experts(nn.Module):
             weight_first=weight_first,
             apply_norm=post_expert_norm is not None,
             slot_expert_ids=local_topk_ids,
-            out=ar_out(*hidden_states.shape),
         ).to(hidden_states.dtype)
 
     def _grouped_ws(self, x) -> torch.Tensor:

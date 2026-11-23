@@ -34,8 +34,7 @@ def _runtime():
         ps.initialize_model_parallel(backend="gloo")
 
 
-def _setup(M, monkeypatch):
-    monkeypatch.setattr(glue, "ar_out", lambda m, n: None)  # no TP group here
+def _setup(M):
     torch.manual_seed(M)
     mod = MuseSpark1xBf16Experts(
         num_experts=E,
@@ -70,8 +69,8 @@ def _ref(x, ids, tw, w13, w2, nw):  # fp64; RMS, then the norm weight
 
 @sm90
 @pytest.mark.parametrize("M", [1, 100, 300, 4096])  # 4096: grouped path
-def test_not_less_accurate_than_stock(M, monkeypatch):
-    mod, norm, x, ids, tw = _setup(M, monkeypatch)
+def test_not_less_accurate_than_stock(M):
+    mod, norm, x, ids, tw = _setup(M)
     w13 = mod.gate_up_proj.data.clone()
     mod._triton_runner_config = mod._build_triton_runner_config()
     mod._triton_interleaved = False  # stock: [gate; up] rows, Triton fused_moe
@@ -91,9 +90,9 @@ def test_not_less_accurate_than_stock(M, monkeypatch):
 
 
 @sm90
-def test_cuda_graph_replay(monkeypatch):
+def test_cuda_graph_replay():
     """Decode batches captured once, replayed on new inputs: as eager."""
-    mod, norm, x, ids, tw = _setup(64, monkeypatch)
+    mod, norm, x, ids, tw = _setup(64)
     mod.prepare_trtllm_weights(norm)
     run = lambda: mod._forward_triton(x, tw, ids, norm)
     run()
