@@ -656,11 +656,11 @@ fn component_available(
     let Some(block) = block else {
         return false;
     };
-    block.tier_masks.iter().any(|(tier, mask)| {
-        mask & component != 0
-            && tier_in_mask(SERVABLE_TIER_MASK, *tier)
-            && tier_in_mask(spec_tier_mask, *tier)
-    })
+    let allowed_tiers = SERVABLE_TIER_MASK & spec_tier_mask;
+    block
+        .tier_masks
+        .iter()
+        .any(|(tier, mask)| mask & component != 0 && tier_in_mask(allowed_tiers, *tier))
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds

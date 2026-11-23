@@ -40,8 +40,6 @@ struct BlockRecord {
     token_count: u32,
     /// Resident component snapshot for each `(worker, tier)`.
     placements: HashMap<(String, i32), u32>,
-    /// One component snapshot per shared DRAM pool, independent of its members.
-    pool_placements: HashMap<String, u32>,
     /// Workers for which the root-to-this-block prefix is complete and this
     /// boundary is servable by the Legacy/FULL-only fast path.
     prefix_complete_workers: HashSet<String>,
@@ -72,6 +70,8 @@ struct State {
     blocks: HashMap<i64, BlockRecord>,
     workers: HashMap<String, WorkerRecord>,
     pools: HashMap<String, PoolRecord>,
+    /// Pool masks by hash; private-only blocks have no reverse entry.
+    pool_placements: HashMap<i64, HashMap<String, u32>>,
     hit_counts: HashMap<i64, u64>,
 }
 
@@ -319,7 +319,7 @@ impl InMemoryKvIndexerBackend {
             let Some(block) = state.blocks.get(hash) else {
                 continue;
             };
-            let mut placements = effective_placements(state, block).peekable();
+            let mut placements = effective_placements(state, block, hash).peekable();
             if placements.peek().is_none() {
                 continue;
             }
@@ -393,11 +393,9 @@ impl InMemoryKvIndexerBackend {
         // one block view. Allocation is O(first-block holders) whatever the request
         // length, which is why there is no scan cap: length costs time, not memory.
         let state = self.read_state()?;
-        let Some(first) = state
-            .blocks
-            .get(&hashes[0])
-            .filter(|block| !block.placements.is_empty() || !block.pool_placements.is_empty())
-        else {
+        let Some(first) = state.blocks.get(&hashes[0]).filter(|block| {
+            !block.placements.is_empty() || state.pool_placements.contains_key(&hashes[0])
+        }) else {
             return Ok(MatchExternalKvPrefixResponse {
                 matches: Vec::new(),
                 best_prefix_blocks: 0,
@@ -426,7 +424,7 @@ impl InMemoryKvIndexerBackend {
         };
         let mut seen = HashSet::new();
         let mut pool_candidates: HashMap<&str, Vec<PoolPrefixCandidate<'_>>> = HashMap::new();
-        let mut candidates: Vec<PrefixCandidate> = effective_placements(&state, first)
+        let mut candidates: Vec<PrefixCandidate> = effective_placements(&state, first, &hashes[0])
             .filter(|(worker, _, _)| {
                 !fast_worker_ids.contains(worker.as_str()) && seen.insert(worker.as_str())
             })
@@ -463,11 +461,26 @@ impl InMemoryKvIndexerBackend {
                 })
             })
             .collect();
-        let candidate_by_id: HashMap<String, usize> = candidates
+        let candidate_by_id: HashMap<String, usize, ahash::RandomState> = candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| (candidate.worker_id.clone(), index))
             .collect();
+        let mut candidates_by_pool: HashMap<&str, Vec<usize>> = HashMap::new();
+        if !state.pools.is_empty() {
+            for (index, candidate) in candidates.iter().enumerate() {
+                if let Some(worker) = state
+                    .workers
+                    .get(&candidate.worker_id)
+                    .filter(|worker| !worker.dram_pool_id.is_empty())
+                {
+                    candidates_by_pool
+                        .entry(&worker.dram_pool_id)
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
         let mut present = vec![false; candidates.len()];
         let mut block_views: Vec<BlockComponents> = (0..candidates.len())
             .map(|_| BlockComponents {
@@ -544,26 +557,41 @@ impl InMemoryKvIndexerBackend {
             for hash in hashes {
                 present.fill(false);
                 for block in &mut block_views {
-                    block.token_count = 0;
                     block.tier_masks.clear();
                 }
                 if let Some(block) = state.blocks.get(hash) {
-                    let mut add_placement = |worker: &String, tier, mask| {
-                        let Some(&index) = candidate_by_id.get(worker) else {
-                            return;
-                        };
-                        present[index] = true;
-                        block_views[index].token_count = block.token_count;
-                        block_views[index].tier_masks.push((tier, mask));
-                    };
                     // Without pool records, no worker can be pool-bound.
                     if state.pools.is_empty() {
                         for ((worker, tier), mask) in &block.placements {
-                            add_placement(worker, *tier, *mask);
+                            let Some(&index) = candidate_by_id.get(worker) else {
+                                continue;
+                            };
+                            present[index] = true;
+                            let view = &mut block_views[index];
+                            view.token_count = block.token_count;
+                            view.tier_masks.push((*tier, *mask));
                         }
                     } else {
-                        for (worker, tier, mask) in effective_placements(&state, block) {
-                            add_placement(worker, tier, mask);
+                        for (worker, tier, mask) in private_placements(&state, block) {
+                            let Some(&index) = candidate_by_id.get(worker) else {
+                                continue;
+                            };
+                            present[index] = true;
+                            let view = &mut block_views[index];
+                            view.token_count = block.token_count;
+                            view.tier_masks.push((tier, mask));
+                        }
+                        for (pool_id, mask) in state.pool_placements.get(hash).into_iter().flatten()
+                        {
+                            if let Some(indices) = candidates_by_pool.get(pool_id.as_str()) {
+                                for &index in indices {
+                                    present[index] = true;
+                                    block_views[index].token_count = block.token_count;
+                                    block_views[index]
+                                        .tier_masks
+                                        .push((TierType::TierDram as i32, *mask));
+                                }
+                            }
                         }
                     }
                 }
@@ -608,13 +636,11 @@ impl InMemoryKvIndexerBackend {
     }
 }
 
-// Placements as workers see them: a member's own DRAM/SSD is replaced by its
-// pool's DRAM. Expanded per query, never stored.
-fn effective_placements<'a>(
+fn private_placements<'a>(
     state: &'a State,
     block: &'a BlockRecord,
 ) -> impl Iterator<Item = (&'a String, i32, u32)> {
-    let private = block
+    block
         .placements
         .iter()
         .filter(|((worker, tier), _)| {
@@ -624,15 +650,29 @@ fn effective_placements<'a>(
                     .get(worker)
                     .is_none_or(|w| w.dram_pool_id.is_empty())
         })
-        .map(|((worker, tier), mask)| (worker, *tier, *mask));
-    let shared = block.pool_placements.iter().flat_map(|(id, mask)| {
-        state.pools.get(id).into_iter().flat_map(move |pool| {
-            pool.members
-                .iter()
-                .map(move |worker| (worker, TierType::TierDram as i32, *mask))
-        })
-    });
-    private.chain(shared)
+        .map(|((worker, tier), mask)| (worker, *tier, *mask))
+}
+
+// Placements as workers see them: a member's own DRAM/SSD is replaced by its
+// pool's DRAM. Expanded per query, never stored.
+fn effective_placements<'a>(
+    state: &'a State,
+    block: &'a BlockRecord,
+    hash: &i64,
+) -> impl Iterator<Item = (&'a String, i32, u32)> {
+    let shared = state
+        .pool_placements
+        .get(hash)
+        .into_iter()
+        .flatten()
+        .flat_map(|(id, mask)| {
+            state.pools.get(id).into_iter().flat_map(move |pool| {
+                pool.members
+                    .iter()
+                    .map(move |worker| (worker, TierType::TierDram as i32, *mask))
+            })
+        });
+    private_placements(state, block).chain(shared)
 }
 
 fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
@@ -643,12 +683,14 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
             apply_report_chain(state, action.parent_block_hash, &action.hashes);
             for (i, hash) in action.hashes.into_iter().enumerate() {
                 let block = state.blocks.entry(hash).or_default();
-                block
-                    .pool_placements
-                    .insert(id.clone(), action.component_masks[i]);
                 if action.block_sizes[i] > 0 {
                     block.token_count = action.block_sizes[i];
                 }
+                state
+                    .pool_placements
+                    .entry(hash)
+                    .or_default()
+                    .insert(id.clone(), action.component_masks[i]);
                 state
                     .pools
                     .get_mut(&id)
@@ -666,15 +708,23 @@ fn apply_pool(state: &mut State, req: ApplyExternalKvBatchRequest) {
             };
             for hash in hashes {
                 state.pools.get_mut(&id).unwrap().holdings.remove(&hash);
-                if let Some(block) = state.blocks.get_mut(&hash) {
-                    block.pool_placements.remove(&id);
-                    if block.placements.is_empty() && block.pool_placements.is_empty() {
+                if let Some(placements) = state.pool_placements.get_mut(&hash) {
+                    placements.remove(&id);
+                    if placements.is_empty() {
+                        state.pool_placements.remove(&hash);
+                    }
+                }
+                if let Some(block) = state.blocks.get(&hash) {
+                    if block.placements.is_empty() && !state.pool_placements.contains_key(&hash) {
                         state.hit_counts.remove(&hash);
                     }
                 }
                 prune_empty_leaf(state, hash);
             }
         }
+    }
+    if state.pool_placements.is_empty() {
+        state.pool_placements.shrink_to_fit();
     }
 }
 
@@ -1005,11 +1055,9 @@ fn revoke_one(state: &mut State, worker_id: &str, hash: &i64, tier: i32) {
         }
     }
 
-    if state
-        .blocks
-        .get(hash)
-        .is_some_and(|block| block.placements.is_empty() && block.pool_placements.is_empty())
-    {
+    if state.blocks.get(hash).is_some_and(|block| {
+        block.placements.is_empty() && !state.pool_placements.contains_key(hash)
+    }) {
         state.hit_counts.remove(hash);
     }
 }
@@ -1020,7 +1068,7 @@ fn prune_empty_leaf(state: &mut State, mut hash: i64) {
             return;
         };
         if !block.placements.is_empty()
-            || !block.pool_placements.is_empty()
+            || state.pool_placements.contains_key(&hash)
             || !block.children.is_empty()
             || !block.prefix_complete_workers.is_empty()
         {
