@@ -49,6 +49,18 @@ register_kernel(
         capabilities=frozenset({_JIT_SOFTMAX_CAPABILITY}),
     )
 )
+_TRITON_SOFTMAX_CAPABILITIES = frozenset(
+    {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+)
+
+register_kernel(
+    KernelSpec(
+        op="sampling.softmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.softmax_triton:temperature_softmax",
+        capabilities=_TRITON_SOFTMAX_CAPABILITIES,
+    )
+)
 register_kernel(
     KernelSpec(
         op="sampling.softmax_sample",
@@ -88,6 +100,19 @@ def _use_jit_softmax() -> bool:
     return _JIT_SOFTMAX_CAPABILITY.is_satisfied_by(PlatformInfo.detect())
 
 
+@functools.cache
+def _use_triton_softmax() -> bool:
+    platform = PlatformInfo.detect()
+    return any(cap.is_satisfied_by(platform) for cap in _TRITON_SOFTMAX_CAPABILITIES)
+
+
+@functools.cache
+def _triton_softmax_module():
+    from sglang.kernels.ops.sampling import softmax_triton
+
+    return softmax_triton
+
+
 def softmax(
     logits: torch.Tensor,
     temperatures: Optional[torch.Tensor] = None,
@@ -109,23 +134,27 @@ def softmax(
             return softmax_jit.softmax(
                 logits, temperatures, rows_per_request=rows_per_request, out=out
             )
-    if temperatures is not None and rows_per_request > 1:
-        temperatures = temperatures.repeat_interleave(rows_per_request, dim=0)
-    if temperatures is not None and logits.is_cuda and torch.version.hip is not None:
-        from sglang.kernels.ops.sampling.softmax_triton import (
-            temperature_softmax,
-        )
-
-        probs = temperature_softmax(logits, temperatures)
-    else:
-        if temperatures is not None:
-            logits = logits / temperatures
-        from sglang.kernels.cake_kernels.sampling import supports_softmax
-
-        if supports_softmax(logits):
-            probs = cake_softmax(logits)
+    if logits.is_cuda and _use_triton_softmax():
+        triton_mod = _triton_softmax_module()
+        if triton_mod.can_softmax(
+            logits, temperatures, rows_per_request=rows_per_request, out=out
+        ):
+            return triton_mod._temperature_softmax_unchecked(
+                logits, temperatures, rows_per_request=rows_per_request, out=out
+            )
+    if temperatures is not None:
+        if rows_per_request > 1:
+            temperatures = temperatures.repeat_interleave(rows_per_request, dim=0)
+        if out is logits:
+            logits.div_(temperatures)
         else:
-            probs = torch.softmax(logits, dim=-1)
+            logits = logits / temperatures
+    from sglang.kernels.cake_kernels.sampling import supports_softmax
+
+    if supports_softmax(logits):
+        probs = cake_softmax(logits)
+    else:
+        probs = torch.softmax(logits, dim=-1)
     return probs if out is None else out.copy_(probs)
 
 
