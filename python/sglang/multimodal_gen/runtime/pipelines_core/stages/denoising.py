@@ -175,6 +175,8 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 logger = init_logger(__name__)
 
+_BATCHED_CFG_MARGIN_BYTES = 1 * 1024**3
+
 # Request-gated DiT fusions and the lowest quality level that may mount each
 # one. A fusion belongs to "lossless" when it keeps the reference math and the
 # precision of every operand and accumulator, changing only where or in which
@@ -1897,6 +1899,11 @@ class DenoisingStage(PipelineStage):
             return 1
         return get_sp_world_size()
 
+    def _tp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_tp_group().world_size
+
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
@@ -2209,8 +2216,31 @@ class DenoisingStage(PipelineStage):
             and not server_args.enable_breakable_cuda_graph
             and not self._cache_dit_enabled
             and self._sp_world_size() <= 1
+            # Each rank checks its own free memory; under TP two ranks could pick
+            # different paths and run mismatched collectives.
+            and self._tp_world_size() <= 1
             and self._dit_streams_when_serving(current_model)
         )
+
+    def _batched_cfg_fits(self, need_bytes: int) -> bool:
+        # Aims to keep a request that just fits with serial CFG from running out of
+        # memory in the batch-2 forward. Same free-memory source and 1 GiB margin as
+        # the component prefetch check (component_residency_strategies.py).
+        free_bytes = int(
+            current_platform.get_available_gpu_memory(
+                device_id=get_local_torch_device().index or 0, empty_cache=False
+            )
+            * 1024**3
+        )
+        if need_bytes + _BATCHED_CFG_MARGIN_BYTES <= free_bytes:
+            return True
+        logger.info_once(
+            "Running the CFG branches serially: batching them needs about %.2f GiB "
+            "(estimate plus margin) and %.2f GiB is free.",
+            (need_bytes + _BATCHED_CFG_MARGIN_BYTES) / 1024**3,
+            free_bytes / 1024**3,
+        )
+        return False
 
     def _dit_streams_when_serving(self, module) -> bool:
         # A DiT offloaded only for the compile warmup is resident afterwards, so
@@ -2270,6 +2300,15 @@ class DenoisingStage(PipelineStage):
                 cond_branch.kwargs, uncond_branch.kwargs
             )
             if kwargs is None:
+                return None
+            # The DiT activations of both rows are not allocated yet at this point,
+            # so the estimate covers both, not only the extra row.
+            row_bytes = server_args.pipeline_config.batch_cfg_row_bytes(
+                latent_model_input.shape[1],
+                kwargs["encoder_hidden_states"].shape[1],
+                target_dtype,
+            )
+            if not self._batched_cfg_fits(2 * row_bytes):
                 return None
 
             def twice(x):

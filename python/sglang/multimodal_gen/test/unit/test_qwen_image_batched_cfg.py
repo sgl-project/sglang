@@ -20,9 +20,11 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _DEVICE = torch.device("cuda")
 requires_cuda = pytest.mark.skipif(
@@ -109,6 +111,7 @@ def _denoise_step(
     streamed,
     stage=None,
     resident_layers=0,
+    free_gib=1024.0,
 ):
     dtype = next(model.parameters()).dtype
     batch, latent_input = _request(cond_len, uncond_len, edit, dtype)
@@ -135,6 +138,9 @@ def _denoise_step(
         pipeline_config=pipeline_config,
     )
     with (
+        patch.object(
+            current_platform, "get_available_gpu_memory", return_value=free_gib
+        ),
         patch.object(model, "forward", counting_forward),
         patch.object(
             model,
@@ -250,3 +256,86 @@ def test_dit_with_every_layer_resident_stays_serial(single_process_model_paralle
         resident_layers=num_layers - 1,
     )
     assert widths == [2]
+
+
+@pytest.mark.parametrize(
+    "pipeline_cls,latent_tokens,measured_mib",
+    [
+        # 1024x1024 default request on H200: the extra peak allocated memory of the
+        # batched path, which one estimated row must cover (text tokens left out).
+        (QwenImagePipelineConfig, 4096, 318),
+        (QwenImageEditPlusPipelineConfig, 8192, 636),
+        (QwenImageEditPlus_2511_PipelineConfig, 8192, 734),
+    ],
+)
+def test_cfg_row_estimate_covers_measured_extra_memory(
+    pipeline_cls, latent_tokens, measured_mib
+):
+    row = pipeline_cls().batch_cfg_row_bytes(latent_tokens, 0, torch.bfloat16)
+    assert row >= measured_mib * 1024**2
+
+
+@requires_cuda
+def test_streamed_dit_without_headroom_runs_cfg_serially(
+    single_process_model_parallel,
+):
+    model = _tiny_dit(QwenImageDitConfig())
+    serial, _ = _denoise_step(
+        QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=False
+    )
+    out, widths = _denoise_step(
+        QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=True, free_gib=0.0
+    )
+    assert widths == [1, 1]
+    torch.testing.assert_close(out, serial, rtol=0, atol=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("edit", [False, True])
+def test_cfg_row_estimate_gets_the_request_shape(single_process_model_parallel, edit):
+    pipeline_cls = QwenImageEditPlusPipelineConfig if edit else QwenImagePipelineConfig
+    model = _tiny_dit(QwenImageDitConfig())
+    _, latent_input = _request(7, 3, edit, torch.bfloat16)
+    calls = []
+
+    def spy(config, *args):
+        calls.append(args)
+        return 0
+
+    with patch.object(pipeline_cls, "batch_cfg_row_bytes", spy, create=True):
+        _denoise_step(pipeline_cls(), model, 7, 3, edit=edit, streamed=True)
+    # every latent token, the edit reference included, and the longer prompt
+    assert calls == [(latent_input.shape[1], 7, torch.bfloat16)]
+
+
+@requires_cuda
+def test_batched_cfg_needs_two_rows_plus_margin(single_process_model_parallel):
+    model = _tiny_dit(QwenImageDitConfig())
+    row = 3 * 1024**2
+    need = 2 * row + 1024**3  # two rows plus the 1 GiB margin
+    with patch.object(
+        QwenImagePipelineConfig, "batch_cfg_row_bytes", return_value=row, create=True
+    ):
+        for free, expected in ((need, [2]), (need - 1, [1, 1])):
+            _, widths = _denoise_step(
+                QwenImagePipelineConfig(),
+                model,
+                7,
+                3,
+                edit=False,
+                streamed=True,
+                free_gib=free / 1024**3,
+            )
+            assert widths == expected, (free, widths)
+
+
+@requires_cuda
+def test_tensor_parallel_runs_cfg_serially(single_process_model_parallel):
+    model = _tiny_dit(QwenImageDitConfig())
+    with patch.object(
+        denoising, "get_tp_group", return_value=SimpleNamespace(world_size=2)
+    ):
+        _, widths = _denoise_step(
+            QwenImagePipelineConfig(), model, 7, 3, edit=False, streamed=True
+        )
+    assert widths == [1, 1]

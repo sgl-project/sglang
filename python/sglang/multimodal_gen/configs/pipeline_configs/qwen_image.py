@@ -541,6 +541,22 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             merged["freqs_complex"] = longer["freqs_complex"]
         return merged
 
+    # Estimated activation memory of one CFG row of the DiT forward, in hidden-size
+    # rows per token. The extra peak of the batch-2 forward at 1024x1024 measured
+    # on H200 (Qwen-Image 318 MiB, Edit-2509 636 MiB, Edit-2511 734 MiB) is 13 to
+    # 15 rows; 16 covers all three.
+    _CFG_ROW_ACTIVATION_ROWS_PER_TOKEN = 16
+
+    def batch_cfg_row_bytes(self, latent_tokens, text_tokens, dtype):
+        """Estimated activation bytes of one CFG row of the DiT forward."""
+        hidden = self.dit_config.arch_config.hidden_size
+        return (
+            self._CFG_ROW_ACTIVATION_ROWS_PER_TOKEN
+            * (latent_tokens + text_tokens)
+            * hidden
+            * dtype.itemsize
+        )
+
     def post_denoising_loop(self, latents, batch):
         # unpack latents for qwen-image
         (
