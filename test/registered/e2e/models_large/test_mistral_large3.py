@@ -8,9 +8,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-# Runs on both H200 and B200: registered once per runner_config below
-# Note: trtllm_mla backend may have hardware-specific behavior
-register_cuda_ci(est_time=3000, stage="weekly", runner_config="8-gpu-h200")
+# Blackwell-only: the class below is skipped on other GPUs.
 register_cuda_ci(est_time=3000, stage="weekly", runner_config="8-gpu-b200")
 
 MISTRAL_LARGE3_FP8_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"

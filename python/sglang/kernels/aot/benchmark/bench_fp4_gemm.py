@@ -13,14 +13,14 @@ from flashinfer.testing import bench_gpu_time
 
 flashinfer_logger.setLevel(logging.ERROR)
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_capability,
     is_sm100_supported,
     is_sm120_supported,
 )
-from sglang.utils import is_in_ci
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max

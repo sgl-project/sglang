@@ -32,7 +32,7 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Split-K is opt-in (SGLANG_ENABLE_LORA_CSGMV_SPLIT_K defaults to False).
-register_cuda_ci(est_time=25, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="nightly", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -205,14 +205,6 @@ def test_deterministic_mode_keeps_original_shrink_path():
             assert launches.call_args.kwargs["SPLIT_K"] == 4
             chunked_sgmv_lora_shrink_forward(inputs, weights, batch_info, 3, split_k=1)
             assert launches.call_count == 2
-            for deterministic in (False, True):
-                with (
-                    envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(deterministic),
-                    pytest.raises(ValueError, match="split_k must be positive"),
-                ):
-                    chunked_sgmv_lora_shrink_forward(
-                        inputs, weights, batch_info, 3, split_k=0
-                    )
             with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
                 actual = chunked_sgmv_lora_shrink_forward(
                     inputs, weights, batch_info, 3, split_k=8

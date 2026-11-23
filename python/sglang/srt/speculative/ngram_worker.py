@@ -4,13 +4,10 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
+from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
-from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -24,18 +21,21 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    accept_draft_tree,
+    bind_eagle_runtime_hooks,
+)
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
-    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
+from sglang.srt.speculative.target_verify import TargetVerify
 from sglang.srt.utils import is_cpu
-from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
 
@@ -43,25 +43,8 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
-
-
-def _attn_backend_supports_qlen_mask(attn_backend) -> bool:
-    backend = attn_backend
-    for _ in range(4):
-        if backend is None:
-            return False
-        full_backend = getattr(backend, "full_attn_backend", None)
-        if full_backend is not None:
-            backend = full_backend
-            continue
-        prefill_backend = getattr(backend, "prefill_backend", None)
-        decode_backend = getattr(backend, "decode_backend", None)
-        if prefill_backend is not None and decode_backend is not None:
-            spec_is_decode = getattr(backend, "spec_attn_is_decode", False)
-            backend = decode_backend if spec_is_decode else prefill_backend
-            continue
-        break
-    return type(backend).__name__ == "FlashAttentionBackend"
+# Tail of each request's context inserted into the trie once its prefill ends.
+NGRAM_EXTEND_PROMPT_WINDOW = 1024
 
 
 def _derive_tree_links(
@@ -93,6 +76,8 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -113,9 +98,8 @@ class NGRAMWorker(BaseSpecWorker):
         self.server_args = server_args
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.use_full_mask = USE_FULL_MASK and not _attn_backend_supports_qlen_mask(
-            getattr(self.model_runner, "attn_backend", None)
-        )
+        # Resolved in init_attention_backends() once model_runner.attn_backend exists.
+        self.use_full_mask: bool = USE_FULL_MASK and not _is_cpu
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
@@ -126,7 +110,6 @@ class NGRAMWorker(BaseSpecWorker):
         # alloc_memory_pool(), after the target pools are allocated.
         self.device = get_device().device
 
-        self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
@@ -169,8 +152,22 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
+        # Drain queued inserts first, or they land after the reset.
+        self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        attn_backend = getattr(self.model_runner, "attn_backend", None)
+        self.use_full_mask = (
+            USE_FULL_MASK
+            and not _is_cpu
+            and not getattr(attn_backend, "supports_qlen_only_verify_mask", False)
+        )
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -219,7 +216,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.positions = torch.empty(
             (max_total_drafts,), dtype=torch.int64, device=self.device
         )
-        self.tree_mask = torch.ones(
+        self.tree_mask = torch.empty(
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
 
@@ -241,14 +238,6 @@ class NGRAMWorker(BaseSpecWorker):
             self.tree_mask_batch.append(
                 self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
             )
-
-    def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
-    ) -> None:
-        # Signature must match BaseSpecWorker.on_verify_complete_cpu; the
-        # result processor calls it with batch_size as a keyword argument.
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
@@ -341,7 +330,7 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if self.use_full_mask and not _is_cpu:
+        if self.use_full_mask:
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -370,7 +359,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if self.use_full_mask and not _is_cpu:
+        if self.use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -409,17 +398,31 @@ class NGRAMWorker(BaseSpecWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             draft_token_num=self.draft_token_num,
+            custom_mask_is_qlen_only=not self.use_full_mask,
         )
 
+    def _insert_extend_prompt_tails(self, batch: ScheduleBatch) -> None:
+        """Seed the trie with each request's context once its prefill finishes."""
+        batch_tokens = []
+        for req in batch.reqs:
+            # A middle chunk would re-insert the same tail on every chunk.
+            if req is batch.chunked_req:
+                continue
+            # Unpadded: multimodal pad values are cache identities, not tokens.
+            tail = list(req.output_ids[-NGRAM_EXTEND_PROMPT_WINDOW:])
+            need = NGRAM_EXTEND_PROMPT_WINDOW - len(tail)
+            if need > 0:
+                tail = list(req.origin_input_ids_unpadded[-need:]) + tail
+            if tail:
+                batch_tokens.append(tail)
+        if batch_tokens:
+            self.ngram_corpus.batch_put(batch_tokens)
+
     def _update_ngram_corpus(self, batch: ScheduleBatch):
+        # Prompt context is inserted at extend by _insert_extend_prompt_tails.
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -457,7 +460,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            grammar_mask = None
+            grammar_tree = None
             if batch.has_grammar:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
@@ -465,36 +468,32 @@ class NGRAMWorker(BaseSpecWorker):
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                grammar_mask = build_grammar_vocab_mask(
-                    reqs=batch.reqs,
-                    tree=GrammarTree.from_host(
-                        retrieve_next_token_cpu,
-                        retrieve_next_sibling_cpu,
-                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
-                    ),
-                    sampling_info=batch.sampling_info,
-                    device=verify_input.retrieve_next_token.device,
-                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
-                    barrier=None,
+                grammar_tree = GrammarTree.from_host(
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-
-            # Sample
-            maybe_detect_nan(
-                logits_output.next_token_logits, "verify: target model logits"
-            )
-            maybe_detect_inf(
-                logits_output.next_token_logits, "verify: target model logits"
-            )
-            (
-                predict,
-                accept_lens,
-                accept_index,
-            ) = eagle_sample(
-                verify_input,
+            verify = TargetVerify.prepare(
                 batch,
-                logits_output,
-                grammar_mask,
-                watermark_state=self.model_runner.watermark_state,
+                logits_output=logits_output,
+                grammar_tree=grammar_tree,
+                # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
+                grammar_barrier=None,
+                watermark_engine=self.model_runner.watermark,
+                watermark_full_mask=not verify_input.custom_mask_is_qlen_only,
+            )
+            accept = accept_draft_tree(
+                batch,
+                verify=verify,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                speculative_runtime_hooks=self._speculative_runtime_hooks,
+            )
+            verify.commit(batch, logits_output=logits_output, accept=accept)
+            predict, accept_lens, accept_index = (
+                accept.tokens,
+                accept.accept_lens,
+                accept.accept_index,
             )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
@@ -504,17 +503,7 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 self.draft_token_num,
             )
-            accept_tokens = predict[accept_index]
-            if (
-                self.model_runner.watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-            ):
-                self.model_runner.watermark_state.append_speculative(
-                    batch.req_pool_indices,
-                    accept_tokens,
-                    accept_lens,
-                )
-            accept_tokens = accept_tokens.flatten()
+            accept_tokens = predict[accept_index].flatten()
             next_token_ids = accept_tokens
 
             # The KV mover expects drafts-only counts. NGRAM's
@@ -526,14 +515,6 @@ class NGRAMWorker(BaseSpecWorker):
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
             )
-            if batch.return_logprob:
-                compute_spec_logprobs(
-                    batch,
-                    logits_output,
-                    predict,
-                    accept_index=accept_index,
-                )
-
             if on_publish is not None:
                 on_publish(new_seq_lens)
 
@@ -553,6 +534,8 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            if batch.forward_mode.is_extend():
+                self._insert_extend_prompt_tails(batch)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

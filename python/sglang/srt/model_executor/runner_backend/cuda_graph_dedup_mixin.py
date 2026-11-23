@@ -21,7 +21,6 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -333,7 +332,7 @@ class DedupedCudaGraphMixin:
         return bool(
             server_args is not None
             and get_exec().features.enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
 
     def build_deduped_cuda_graph(self):

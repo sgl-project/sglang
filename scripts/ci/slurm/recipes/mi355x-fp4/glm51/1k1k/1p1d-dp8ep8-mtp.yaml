@@ -35,7 +35,7 @@ model:
     - --reasoning-parser
     - glm45
     - --tool-call-parser
-    - glm45
+    - glm
     - --disable-shared-experts-fusion
 
 runtime:

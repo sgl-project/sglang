@@ -171,6 +171,74 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "tp,cp,dp,pp,shared", [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4)]
+)
+def test_shared_tp_spans_pcp_without_crossing_dp_or_pp(tp, cp, dp, pp, shared):
+    from contextlib import ExitStack
+
+    created = {}
+
+    def coordinator(*, group_ranks, group_name, **kwargs):
+        created[group_name] = group_ranks
+        group = Mock()
+        group.world_size = len(group_ranks[0])
+        group.rank_in_group = 0
+        return group
+
+    with ExitStack() as stack:
+        for name in (
+            "_WORLD",
+            "_TP",
+            "_ATTN_CP",
+            "_ATTN_TP",
+            "_PP",
+            "_MOE_EP",
+            "_MOE_TP",
+            "_MOE_DP",
+            "_SHARED_EXPERTS_TP",
+            "_DCP",
+        ):
+            stack.enter_context(patch.object(parallel_state, name, None))
+        stack.enter_context(
+            patch("torch.distributed.is_initialized", return_value=True)
+        )
+        stack.enter_context(
+            patch("torch.distributed.get_world_size", return_value=tp * pp)
+        )
+        stack.enter_context(patch("torch.distributed.get_rank", return_value=0))
+        stack.enter_context(patch("torch.distributed.get_backend", return_value="nccl"))
+        stack.enter_context(
+            patch.object(parallel_state, "GroupCoordinator", side_effect=coordinator)
+        )
+        stack.enter_context(
+            patch.object(
+                parallel_state, "get_world_group", return_value=Mock(local_rank=0)
+            )
+        )
+        publish_build_topology(
+            tp_size=tp,
+            pp_size=pp,
+            attn_cp_size=cp,
+            attn_dp_size=dp,
+            shared_experts_tp_size=shared,
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+        )
+        try:
+            parallel_state.initialize_model_parallel()
+            groups = created["shared_experts_tp"]
+            assert groups == [
+                list(range(start, start + shared))
+                for start in range(0, tp * pp, shared)
+            ]
+            for ranks in groups:
+                assert len({r // tp for r in ranks}) == 1
+                assert len({(r % tp) // (tp // dp) for r in ranks}) == 1
+        finally:
+            parallel_state.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("custom_allreduce_enabled", [False, True])
 def test_parallel_group_construction_tp8_attn_cp2(custom_allreduce_enabled):
     """
@@ -436,11 +504,8 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                pipeline_model_parallel_size=1,
-                decode_context_parallel_size=8,
-            )
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
@@ -515,25 +580,40 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+@pytest.mark.parametrize(
+    "gfx95, gfx942, expect_fused",
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+def test_fused_allreduce_rmsnorm_quant_per_group_runs_on_gfx942_and_gfx95(
+    monkeypatch, gfx95, gfx942, expect_fused
+):
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    monkeypatch.setattr(parallel_state, "is_gfx95_supported", lambda: gfx95)
+    monkeypatch.setattr(parallel_state, "is_gfx942_supported", lambda: gfx942)
+    calls = []
+
+    class _FusedCustomAllReduce:
+        disabled = False
+
+        def custom_fused_ar_rms_per_group_quant(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "fused"
+
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.ca_comm = _FusedCustomAllReduce()
+    coordinator.world_size = 2
+    x = torch.zeros(4, 3072, dtype=torch.bfloat16)
+    weight = torch.ones(3072, dtype=torch.bfloat16)
+
+    out = coordinator.fused_allreduce_rmsnorm_quant_per_group(
+        x, torch.zeros_like(x), weight, 1e-6
+    )
+
+    assert out == ("fused" if expect_fused else None)
+    assert len(calls) == int(expect_fused)
+
+
 if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2(False)
-        test_parallel_group_construction_tp8_attn_cp2(True)
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-        test_group_desc_propagated_via_real_new_group("tp")
-        test_group_desc_propagated_via_real_new_group("pp")
-        test_group_desc_none_normalized_to_anonymous()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(pytest.main([__file__]))

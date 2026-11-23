@@ -84,10 +84,12 @@ def bind_dspark_draft_strategy(
     draft_tokens: torch.Tensor,
     step_temperatures: torch.Tensor,
     allocate_step_logits: Callable[[], torch.Tensor],
+    specialize: bool = True,
 ) -> BoundDsparkDraftStrategy:
-    """Resolve the DSpark proposal once and keep per-batch fallback in the facade."""
+    """Resolve the DSpark proposal once and keep per-batch fallback in the facade.
+    ``specialize=False`` keeps the stock proposal, which writes every step-logits row."""
 
-    factory = megakernel_draft_sampler(draft_model)
+    factory = megakernel_draft_sampler(draft_model) if specialize else None
     if factory is None:
         return BoundDsparkDraftStrategy(_STOCK_DRAFT_STRATEGY, None)
 
