@@ -41,14 +41,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     SpeculativeRuntimeHooks,
     Step,
     SupportsDecodeTensorEntry,
-    SupportsDraftAccept,
-    SupportsDraftAux,
-    SupportsDraftEmbed,
-    SupportsDraftSelectorHead,
-    SupportsKdaCommit,
     SupportsPrefillBody,
-    SupportsRank0Broadcast,
-    SupportsSampledAccept,
     SupportsStateSlotReset,
     find_spec,
     registered_architectures,
@@ -939,6 +932,19 @@ def install_megakernel(
     tokens = _tokens_per_request()
     tensor_verify = tokens > 1 and spec.tensor_verify_build is not None
     reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
+    # The draft's own forward serves a draft spec this server or GPU does not meet; all
+    # ranks decline together, skipping the collectives below.
+    if is_draft and (
+        unmet := sorted(set().union(*_gather_tp(reasons + _residency_reasons(spec))))
+    ):
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "NVIDIA megakernel: %s does not serve this setup (%s); the draft "
+                "keeps its own forward",
+                spec.name,
+                "; ".join(unmet),
+            )
+        return
     reasons += _layout_reasons()
     if not tensor_verify:
         reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
@@ -1115,86 +1121,6 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
     """The built draft spec's draft_sampler factory, or None for SGLang's proposal."""
     built = built_megakernel(draft_model)
     return None if built is None else built.draft_sampler
-
-
-def _offered(model: torch.nn.Module, protocol: type) -> Any:
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(model)
-    return built if isinstance(built, protocol) else None
-
-
-def _offered_draft(
-    draft_model: torch.nn.Module, protocol: type, sizes: str, *, what: str
-) -> Any:
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(draft_model)
-    offered = built if isinstance(built, protocol) and getattr(built, sizes) else None
-    megakernel_agree(() if offered is None else getattr(offered, sizes), what=what)
-    return offered
-
-
-def megakernel_draft_aux(draft_model: torch.nn.Module) -> Optional[SupportsDraftAux]:
-    """Draft spec that writes the DFlash context KV, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model, SupportsDraftAux, "draft_aux_rows", what="draft aux rows"
-    )
-
-
-def megakernel_draft_selector_head(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftSelectorHead]:
-    """Draft spec whose forward proposes the block, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftSelectorHead,
-        "draft_head_requests",
-        what="draft head requests",
-    )
-
-
-def megakernel_draft_accept(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftAccept]:
-    """Draft spec running the greedy verify accept, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftAccept,
-        "draft_accept_requests",
-        what="draft accept requests",
-    )
-
-
-def megakernel_draft_embed(
-    draft_model: torch.nn.Module,
-) -> Optional[SupportsDraftEmbed]:
-    """Draft spec that embeds the draft block, else None; call on all TP ranks."""
-    return _offered_draft(
-        draft_model,
-        SupportsDraftEmbed,
-        "draft_embed_requests",
-        what="draft embed requests",
-    )
-
-
-def megakernel_kda_commit(target_model: torch.nn.Module) -> Optional[SupportsKdaCommit]:
-    """Target spec that commits the KDA state after a verify (rank-local), else None."""
-    return _offered(target_model, SupportsKdaCommit)
-
-
-def megakernel_rank0_broadcast(
-    target_model: torch.nn.Module,
-) -> Optional[SupportsRank0Broadcast]:
-    """Target spec broadcasting rank 0's sampled-accept decision on device, else None."""
-    return _offered(target_model, SupportsRank0Broadcast)
-
-
-def megakernel_sampled_accept(
-    target_model: torch.nn.Module,
-) -> Optional[SupportsSampledAccept]:
-    """Target spec that runs the DFLASH sampled accept on vocab shards, else None."""
-    return _offered(target_model, SupportsSampledAccept)
 
 
 def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
@@ -1395,15 +1321,20 @@ def _model_disable_reasons(
         reasons += spec.model_disable_reasons(model, hf_config)
     if "forward" in model.__dict__:
         reasons.append("the model's forward is already replaced on this instance")
+    return reasons + _residency_reasons(spec)
+
+
+def _residency_reasons(spec: MegakernelSpec) -> list[str]:
+    """This rank's GPU cannot keep the spec's persistent grids resident."""
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
     if sms < spec.requires.resident_blocks:
-        reasons.append(
+        return [
             f"{Feature.PARTITIONED_GPU.value}: {sms} SMs, the persistent grids need "
             f"{spec.requires.resident_blocks}"
-        )
-    return reasons
+        ]
+    return []
 
 
 class _Dispatch:
