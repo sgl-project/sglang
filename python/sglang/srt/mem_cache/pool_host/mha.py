@@ -125,8 +125,9 @@ def prepare_mha_write_back_staging(
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
     ):
         return None
-    page_chunk = write_back_staging_page_chunk(page_size)
-    token_capacity = min(page_capacity or page_chunk, page_chunk) * page_size
+    token_capacity = (
+        min(page_capacity, write_back_staging_page_chunk(page_size)) * page_size
+    )
     shapes = tuple(
         (token_capacity, layer_num, head_num, dim)
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
