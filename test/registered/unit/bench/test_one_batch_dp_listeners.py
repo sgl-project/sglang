@@ -350,6 +350,22 @@ class TestDpListenerSplit(CustomTestCase):
         self.assertEqual(result.total_output_tokens, 15)
         self.assertEqual(result.cache_hit_rate, 0.5)
 
+    def test_ragged_batch_counts_all_input_tokens(self):
+        base = self._listener()
+        base.server_info = _server_info([])
+        (result,) = self._run(base, input_len_list="1,2")
+
+        (sent,) = base.generate_bodies(stream=True)
+        num_input_tokens = sum(map(len, sent["input_ids"]))
+        self.assertEqual(num_input_tokens, 7)
+        self.assertAlmostEqual(
+            result.input_throughput * result.last_ttft, num_input_tokens
+        )
+        self.assertAlmostEqual(
+            result.overall_throughput * result.latency,
+            num_input_tokens + result.total_output_tokens,
+        )
+
     def test_failed_sub_batch_fails_the_batch(self):
         # Rank 0 alone would stream for about 30 s.
         rank0 = self._listener(chunk_delay=0.2, keepalives=150)
