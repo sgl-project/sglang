@@ -4970,16 +4970,39 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
             handle_kv_cache_sharding(args)
 
-    def test_hicache_host_offload_is_accepted_but_not_storage(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        args.enable_hierarchical_cache = True
-        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
-            handle_kv_cache_sharding(args, 80 * 1024)
+    def test_hicache_storage_allowlist(self):
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_shard_hook._KV_SHARD_STORAGE_BACKENDS",
+                {"dynamic"},
+            ),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+        ):
+            for backend in (None, "file", "dynamic"):
+                with self.subTest(backend=backend):
+                    args = self._rounding_args(
+                        raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                    )
+                    args.enable_hierarchical_cache = True
+                    args.hicache_storage_backend = backend
+                    handle_kv_cache_sharding(args, 80 * 1024)
 
+        for backend in ("fast_file", "mooncake"):
+            with self.subTest(backend=backend):
+                args = self._args(
+                    enable_hierarchical_cache=True, hicache_storage_backend=backend
+                )
+                with self.assertRaisesRegex(ValueError, backend):
+                    handle_kv_cache_sharding(args)
+
+    def test_hicache_file_storage_rejects_dsa(self):
         args = self._args(
             enable_hierarchical_cache=True, hicache_storage_backend="file"
         )
-        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
+        args._model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        )
+        with self.assertRaisesRegex(ValueError, "for DSA models"):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):

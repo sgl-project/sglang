@@ -46,7 +46,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
+from sglang.srt.mem_cache.storage.file.lru_file_evictor import (
+    LRUFileEvictor,
+    _parse_size_to_bytes,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.test_utils import CustomTestCase
 
@@ -178,6 +181,15 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         self.assertEqual(len(b._evictor._lru), 0)
         self.assertEqual(b._evictor._total_bytes, 0)
 
+    def test_sharded_file_refuses_eviction_before_scanning_files(self):
+        config = replace(_make_config(extra_config={"max_size": 1}), key_tp_rank=0)
+        with (
+            mock.patch.object(LRUFileEvictor, "_scan_existing_files") as scan,
+            self.assertRaisesRegex(ValueError, "eviction"),
+        ):
+            HiCacheFile(config, file_path=self.tmpdir)
+        scan.assert_not_called()
+
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):
     def test_basic_lru_evicts_oldest(self):
@@ -293,6 +305,22 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
         self.assertTrue(b0.config_suffix.endswith("_cp0_4"))
         self.assertTrue(b1.config_suffix.endswith("_cp3_4"))
         self.assertNotEqual(b0.config_suffix, b1.config_suffix)
+
+    def test_sharded_gqa_keys_follow_head_shard_across_cp_ranks(self):
+        suffixes = []
+        for cp_rank, head_rank in ((0, 1), (1, 1), (1, 0)):
+            config = _make_config(
+                tp_rank=cp_rank * 2 + head_rank,
+                tp_size=4,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=2,
+            )
+            backend = HiCacheFile(
+                replace(config, key_tp_rank=head_rank), file_path=self.tmpdir
+            )
+            suffixes.append(backend.config_suffix)
+        self.assertEqual(suffixes[0], suffixes[1])
+        self.assertNotEqual(suffixes[1], suffixes[2])
 
 
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
