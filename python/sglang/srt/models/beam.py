@@ -397,8 +397,8 @@ class BeamMoE(nn.Module):
         # Tiny GEMM up to 16 tokens.
         self.use_fp32_router = (
             self.use_fast_router
-            # Full-model validation covers the BF16 MoE runner.
-            and quant_config is None
+            # Full-model validation covers BF16 and ModelOpt NVFP4 checkpoints.
+            and quant_scheme in ("bf16", "nvfp4")
             and config.hidden_size == 5120
             and config.num_experts == 256
             and torch.cuda.get_device_capability()[0] in (9, 10)

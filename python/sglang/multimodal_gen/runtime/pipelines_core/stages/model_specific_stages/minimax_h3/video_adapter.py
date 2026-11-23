@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     canonical_minimax_h3_task,
 )
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 
 try:
     # imported with the adapter so the first output check does not pay for it
@@ -377,6 +378,7 @@ def _ffprobe_output_media(path: str) -> dict[str, Any]:
                 "json",
                 str(path),
             ],
+            env=local_media_subprocess_env(),
             check=True,
             capture_output=True,
             text=True,
