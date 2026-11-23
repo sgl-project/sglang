@@ -121,7 +121,6 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     cu_seqlens_q: Optional[torch.Tensor] = None  # Query offsets, including leading 0.
     actual_seq_lengths_q: Optional[torch.Tensor] = None
-    indexer_valid_requests: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
     # CPU mirror of actual_seq_lengths_q_pa for host-side padding trims.
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
@@ -662,7 +661,6 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
-            num_padding=getattr(forward_batch, "num_padding", 0),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1059,10 +1057,6 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
-        if self.use_verify_indexer_request_shard:
-            self.graph_metadata["indexer_valid_requests"] = torch.empty(
-                max_bs, dtype=torch.bool, device=self.device
-            )
         if self.dense_mla_dcp_target and self.speculative_num_draft_tokens is not None:
             self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
                 (
@@ -1214,13 +1208,6 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-            if (
-                self.use_verify_indexer_request_shard
-                and forward_mode.is_target_verify()
-            ):
-                metadata.indexer_valid_requests = self.graph_metadata[
-                    "indexer_valid_requests"
-                ][:bs]
         else:
             metadata.actual_seq_lengths_q = torch.tensor(
                 [1 + i for i in range(bs)],
@@ -1275,19 +1262,12 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
-        num_padding: int = 0,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
-        if metadata.indexer_valid_requests is not None:
-            # KV lengths can include the verify width for padded rows. Refresh
-            # this graph input from the live batch boundary at each replay.
-            num_real = bs - num_padding
-            metadata.indexer_valid_requests[:num_real].fill_(True)
-            metadata.indexer_valid_requests[num_real:].fill_(False)
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:

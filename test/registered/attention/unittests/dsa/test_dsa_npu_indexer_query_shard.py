@@ -198,7 +198,6 @@ class TestFp8PcpIndexerQueryShard(CustomTestCase):
             seq_lens=torch.tensor([101, 103, 501, 503], dtype=torch.int32),
             actual_seq_lengths_q=torch.arange(1, 5, dtype=torch.int32),
             block_tables=torch.tensor([[1, 2], [1, 2], [5, 6], [5, 6]]),
-            indexer_valid_requests=None,
         )
         metadata.actual_seq_lengths_kv = metadata.seq_lens
         indexer = dsa_npu_indexer.DSANPUIndexerMixin()

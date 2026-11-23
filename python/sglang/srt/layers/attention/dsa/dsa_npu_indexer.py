@@ -651,9 +651,10 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
-        verify_valid_requests = attn_backend.forward_metadata.indexer_valid_requests
         if (
-            verify_valid_requests is not None
+            forward_batch.forward_mode.is_target_verify()
+            and attn_backend.graph_mode
+            and attn_backend.use_verify_indexer_request_shard
             and block_table is not None
             and actual_seq_lengths_kv.device == k.device
             and not use_quant_indexer
@@ -767,14 +768,15 @@ class DSANPUIndexerMixin:
                 ).squeeze(1)
             else:
                 kv_lens = actual_seq_lengths_kv.to(device=k.device, dtype=torch.int32)
-                valid_requests = None
+                padded_requests = None
                 if shard is not None and shard.request_rows is not None:
-                    valid_requests = verify_valid_requests[shard.request_rows]
-                    # An all-empty shard may leave indexer output unwritten.
-                    # Run padded rows against the reserved page zero, then
-                    # discard their output before the fixed-size all-gather.
-                    kv_lens = torch.where(valid_requests, kv_lens, verify_width)
-                    block_table = block_table.masked_fill(~valid_requests[:, None], 0)
+                    # Graph replay pads request pool indices with reserved slot 0.
+                    padded_requests = (
+                        forward_batch.req_pool_indices[shard.request_rows] == 0
+                    )
+                    # Keep all-empty shards safe and mask their output before gather.
+                    kv_lens = torch.where(padded_requests, verify_width, kv_lens)
+                    block_table = block_table.masked_fill(padded_requests[:, None], 0)
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
                     key=past_key_states,
@@ -787,10 +789,10 @@ class DSANPUIndexerMixin:
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
-                if valid_requests is not None:
+                if padded_requests is not None:
                     topk_indices = (
                         topk_indices.view(-1, verify_width, self.index_topk)
-                        .masked_fill(~valid_requests[:, None, None], -1)
+                        .masked_fill(padded_requests[:, None, None], -1)
                         .view(-1, self.index_topk)
                     )
             if shard is not None:
