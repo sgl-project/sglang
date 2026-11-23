@@ -1183,6 +1183,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         batch: Req,
         packed_branches=None,
         capture_device_varlen: bool = False,
+        capture_bcg: bool = False,
         attn_metadata: AscendFAMetadata | CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
         num_steps: int | None = None,
@@ -1251,6 +1252,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             call_kwargs.pop("adaln_timestep_bits", None)
             token = live_packed_prompt.set(packed_branches[key])
             try:
+                if capture_bcg and not self._bcg_is_warmup():
+                    padded = self._bcg_pad_prompt_kwargs(
+                        call_kwargs, current_model=model
+                    )
+                    runner.capture(**padded)
+                    return runner(**padded)
                 return self._bcg_run(runner, call_kwargs, model)
             finally:
                 live_packed_prompt.reset(token)

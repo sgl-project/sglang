@@ -368,9 +368,7 @@ def test_unbucketed_varlen_attention_keeps_bcg_break(monkeypatch):
     attn.bcg_breakpoint = True
     attn._attention_backend_enum = AttentionBackendEnum.FA
     attn.to_gate_compress = None
-    attn._attention_impl = SimpleNamespace(
-        forward_varlen=Mock(return_value=direct_out)
-    )
+    attn._attention_impl = SimpleNamespace(forward_varlen=Mock(return_value=direct_out))
 
     bcg_core = Mock(return_value=bcg_out)
     monkeypatch.setattr(h3, "_apply_qk_norm", lambda q, k, *a, **kw: (q, k))
