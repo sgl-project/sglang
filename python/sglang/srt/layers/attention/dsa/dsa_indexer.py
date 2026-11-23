@@ -1944,6 +1944,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif not forward_batch.out_cache_loc.is_contiguous():
             forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
 
+        cp_active = self.dsa_enable_prefill_cp and is_cp_active(forward_batch)
         # Keep K in the same no-Hadamard space as the fused Q/K writer.
         if self._aiter_fused_fp8_active(forward_batch):
             key = self._get_k_bf16(x, positions, rotate=False)
@@ -1956,7 +1957,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 act_quant=act_quant,
                 out_cache_loc=out_cache_loc,
             )
-        elif self.use_dsa_indexer_fusion and not is_cp_active(forward_batch):
+        elif self.use_dsa_indexer_fusion and not cp_active:
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -1972,7 +1973,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         else:
             # Match the full Q/K path: restore global K before the cache write.
-            if is_cp_active(forward_batch):
+            if cp_active:
                 key = self._get_k_bf16(x, positions, rotate=False)
                 key = self._maybe_rotate(key)
                 key = get_cp_strategy().materialize_full_indexer_k_cache(
