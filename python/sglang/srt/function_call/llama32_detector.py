@@ -66,10 +66,19 @@ class Llama32Detector(BaseFormatDetector):
         all_actions = []
         action_text_len = len(action_text)
         while idx < action_text_len:
+            while idx < action_text_len and action_text[idx].isspace():
+                idx += 1
+            if idx >= action_text_len:
+                break
             try:
-                obj, end = decoder.raw_decode(action_text[idx:])
+                obj, end = decoder.raw_decode(action_text, idx)
                 all_actions.append(obj)
-                idx += end + len(self.tool_call_separator)
+                if action_text.startswith(self.tool_call_separator, end):
+                    idx = end + len(self.tool_call_separator)
+                elif action_text.startswith(self.bot_token, end):
+                    idx = end + len(self.bot_token)
+                else:
+                    idx = end
                 safe_idx = idx
             except json.JSONDecodeError:
                 # Try Python dict conversion as fallback
@@ -91,7 +100,14 @@ class Llama32Detector(BaseFormatDetector):
                         if json_version != potential_dict:
                             obj, _ = decoder.raw_decode(json_version)
                             all_actions.append(obj)
-                            idx = dict_end + len(self.tool_call_separator)
+                            if action_text.startswith(
+                                self.tool_call_separator, dict_end
+                            ):
+                                idx = dict_end + len(self.tool_call_separator)
+                            elif action_text.startswith(self.bot_token, dict_end):
+                                idx = dict_end + len(self.bot_token)
+                            else:
+                                idx = dict_end
                             safe_idx = idx
                             continue
                 except:
