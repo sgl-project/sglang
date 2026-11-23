@@ -1919,7 +1919,6 @@ class AscendAttnBackend(AttentionBackend):
             and not get_is_capture_mode()
             and parallel.pp_size == 1
             and parallel.attn_tp_size > 1
-            and not parallel.dcp_enabled
             and dsa_use_prefill_cp(forward_batch)
             and forward_batch.forward_mode == ForwardMode.EXTEND
         )
