@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import logging
 import os
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "is_hip",
     "FP8_E4M3_MAX",
-    "FP8_E4M3_MIN",
     "is_cuda",
     "is_cuda_alike",
     "is_hpu",
@@ -145,15 +143,6 @@ if is_hip():
     FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
 else:
     FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-FP8_E4M3_MIN = -FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
-
-
-builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
 @lru_cache(maxsize=1)

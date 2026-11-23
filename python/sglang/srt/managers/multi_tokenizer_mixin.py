@@ -430,7 +430,7 @@ class MultiTokenizerRouter:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._task = asyncio.run_coroutine_threadsafe(
-            self.router_worker_obj(), self._loop
+            print_exception_wrapper(self.router_worker_obj), self._loop
         )
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
@@ -647,10 +647,6 @@ async def print_exception_wrapper(func):
         await func()
     except Exception:
         logger.error(f"MultiTokenizerRouter hit an exception: {traceback.format_exc()}")
-        if hasattr(func, "__self__") and isinstance(
-            func.__self__, MultiTokenizerRouter
-        ):
-            func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
