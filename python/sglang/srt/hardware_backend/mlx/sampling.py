@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Seed given to rows without an explicit ``sampling_seed`` when
 # --enable-deterministic-inference is on.  Mirrors the literal in
-# ``SamplingBatchInfo.from_schedule_batch``.
+# ``SamplingBatchInfo.set_seeds_and_mask_rows``.
 DEFAULT_SAMPLING_SEED = 42
 
 # Largest ``top_k`` that still takes the bounded candidate path in
@@ -45,6 +45,7 @@ DEFAULT_SAMPLING_SEED = 42
 MAX_BOUNDED_TOP_K = 1024
 
 _warned_ignored_penalties = False
+_warned_ignored_seed = False
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class MlxSamplingParams:
         cls, req: Any, deterministic_seeding: bool = False
     ) -> MlxSamplingParams:
         sp = req.sampling_params
-        global _warned_ignored_penalties
+        global _warned_ignored_penalties, _warned_ignored_seed
         if not _warned_ignored_penalties and (
             sp.frequency_penalty != 0.0
             or sp.presence_penalty != 0.0
@@ -73,16 +74,21 @@ class MlxSamplingParams:
                 "MLX sampling ignores frequency/presence/repetition penalties; "
                 "a request specified them. (Warning logged once.)"
             )
-        # Seed contract, identical to every other backend: SamplingBatchInfo
-        # populates sampling_seed only under --enable-deterministic-inference,
-        # and then seeds every row (default DEFAULT_SAMPLING_SEED).  Outside
-        # that flag a per-request seed is ignored, so it is ignored here too.
+        # Under --enable-deterministic-inference every row is seeded (default
+        # DEFAULT_SAMPLING_SEED), as in SamplingBatchInfo. Unlike the other backends,
+        # MLX ignores per-request seeds outside that flag.
         seed = None
         if deterministic_seeding:
             seed = (
                 sp.sampling_seed
                 if sp.sampling_seed is not None
                 else DEFAULT_SAMPLING_SEED
+            )
+        elif sp.sampling_seed is not None and sp.top_k > 1 and not _warned_ignored_seed:
+            _warned_ignored_seed = True
+            logger.warning(
+                "MLX sampling ignores sampling_seed unless "
+                "--enable-deterministic-inference is set. (Warning logged once.)"
             )
         return cls(
             temperature=sp.temperature,

@@ -46,13 +46,14 @@ def print_deprecated_warning(message: str):
 #   * an old valued flag replaced by a renamed valued flag
 #       -> `DeprecatedAliasStoreAction`.
 #
-# The second and fourth have registrations today (`--disable-cuda-graph`,
-# `--enable-dp-attention`; `--monokernel-backend`). The other three are kept
-# because the shapes recur -- this package has retired flags of every one of
-# them -- and the fiddly parts (`nargs=0` on a boolean, where the const goes,
+# The first shape has registrations today, the flags removed in SGLang 1.0
+# (`server_args.REMOVED_FLAGS`), and so does the last
+# (`--mamba-max-states-per-path`). The other shapes are kept because they
+# recur -- this package has retired flags of every one of them -- and the
+# fiddly parts (`nargs=0` on a boolean, where the const goes,
 # warn-and-continue versus `parser.error`) are what a reimplementation gets
-# wrong. Pass `new_flag=` so the warning tells the operator what to switch to;
-# that pointer is the whole point.
+# wrong. Pass `new_flag=` so the warning tells the
+# operator what to switch to; that pointer is the whole point.
 
 
 class DeprecatedAction(argparse.Action):
@@ -71,8 +72,8 @@ class DeprecatedAction(argparse.Action):
         if self.error_message is not None:
             parser.error(self.error_message)
         print_deprecated_warning(
-            f"The command line argument '{option_string}' is deprecated and "
-            "will be removed in future versions."
+            f"'{option_string}' is deprecated and has no effect. It will be "
+            "removed in a future release."
         )
 
 

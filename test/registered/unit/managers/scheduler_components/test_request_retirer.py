@@ -5,12 +5,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -60,7 +67,7 @@ class TestReleaseStepsLiveInRequestRetirer(CustomTestCase):
 
 
 def _req(finished_reason, calls):
-    return SimpleNamespace(
+    return FakeReq(
         finished_reason=finished_reason,
         cache_request_handle=object(),
         session=SimpleNamespace(
@@ -116,10 +123,93 @@ class TestRelease(CustomTestCase):
         self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True, verb="abort")
         self.assertEqual(calls, ["output", "counts", "mm", "session", "beam", True])
 
+    def test_takes_the_request_out_of_its_list(self):
+        # A PD transfer or bootstrap failure ends a request still in its queue.
+        calls = []
+        req, other = _req(FINISH_ABORT(), calls), _req(None, calls)
+        queue = IndexedReqList(ListKind.PD_SENDING)
+        move([req, other], queue)
+
+        self._release(req, calls)
+
+        self.assertEqual(list(queue), [other])
+        self.assertIsNone(req.owner_list)
+
     def test_leaves_a_request_that_was_not_aborted_attached(self):
         calls = []
         self._release(_req(FINISH_LENGTH(length=0), calls), calls)
         self.assertEqual(calls, [False])
+
+
+class TestPenaltyIndexExit(CustomTestCase):
+    def _penalized(self, finished_reason):
+        retirer = release_only_retirer(MagicMock())
+        retirer.send_abort_output = lambda abort_req, req: None
+        req = _req(finished_reason, [])
+        req.penalty_index = None
+        req.sampling_params = SamplingParams(presence_penalty=1.0)
+        req.output_ids = []
+        retirer.penalty_status_pool.alloc([req])
+        return retirer, req
+
+    def test_release_frees_the_index(self):
+        retirer, req = self._penalized(FINISH_LENGTH(length=0))
+        with patch.object(request_retirer, "release_kv_cache"):
+            retirer.release(req, checkpoint=False)
+        self.assertIsNone(req.penalty_index)
+        self.assertEqual(retirer.penalty_status_pool.num_indices, 0)
+
+    def test_abort_retracted_frees_the_index(self):
+        # A retracted request holds no KV but keeps its row.
+        retirer, req = self._penalized(FINISH_ABORT())
+        req.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        with patch.object(request_retirer, "make_abort_req"):
+            retirer.abort_retracted(req, reason=FINISH_ABORT())
+        self.assertIsNone(req.penalty_index)
+        self.assertEqual(retirer.penalty_status_pool.num_indices, 0)
+
+
+class TestTakeOutWithoutRelease(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
+        enter_scope(self, envs.SGLANG_IS_IN_CI.override(False))
+        self.retirer = release_only_retirer()
+
+    def test_abandon_takes_a_listed_request_out_as_its_exit(self):
+        req = FakeReq(rid="r", bootstrap_room=7)
+        queue = IndexedReqList(ListKind.PD_RELEASING)
+        move([req], queue)
+
+        self.retirer.abandon(req, RuntimeError("release failed"))
+
+        self.assertIsNone(req.owner_list)
+        self.assertEqual(req.exit_via, "abandon")
+
+    def test_abandon_after_the_release_took_it_out_does_nothing(self):
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
+
+        self.retirer.abandon(req, RuntimeError("release failed"))
+
+        self.assertEqual(req.exit_via, "release")
+
+    def test_abandon_raises_in_ci(self):
+        req = FakeReq(rid="r", bootstrap_room=7)
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            self.assertRaisesRegex(RuntimeError, "release failed"),
+        ):
+            self.retirer.abandon(req, RuntimeError("release failed"))
+
+    def test_settle_output_takes_a_released_request_out_without_an_exit(self):
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
+        deferred = IndexedReqList(ListKind.DEFERRED)
+        move([req], deferred)
+
+        self.retirer.settle_output(req)
+
+        self.assertIsNone(req.owner_list)
+        self.assertEqual(req.exit_via, "release")
 
 
 if __name__ == "__main__":

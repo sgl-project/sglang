@@ -35,6 +35,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.window_params import (
     KEY_PAGE_BASE,
     KEY_REUSE,
 )
+from sglang.srt.sampling.penalties import uses_penalty
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
@@ -535,6 +536,21 @@ def _doc_params(req) -> Optional[dict]:
     return cp
 
 
+def validate_reuse_request(req: Req) -> Optional[str]:
+    cp = _doc_params(req)
+    if cp is None or not cp.get(KEY_REUSE):
+        return None
+    if uses_penalty(req.sampling_params):
+        return (
+            "Unlimited-OCR document reuse does not support sampling penalties "
+            "(frequency_penalty, presence_penalty, repetition_penalty, "
+            "min_new_tokens): a follow-up window's first output tokens are "
+            "copied from the previous window, not sampled, so no penalty can "
+            "count them. Remove the penalties from multi-window documents."
+        )
+    return None
+
+
 def _stop_ids(req) -> set:
     ids = set(req.eos_token_ids or ())
     tok = req.tokenizer
@@ -835,7 +851,14 @@ class DocReuse:
         if not holder.mark_released() or not holder.kv.holds_kv:
             return
         self._cache.free_kv_row(holder.kv, _kept_ranges(entry))
-        self._cache.req_to_token_pool.free(holder)
+        self._storage().release_row(holder)
+
+    def _storage(self):
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        return kv_storage_of(
+            self._cache.req_to_token_pool, self._cache.token_to_kv_pool_allocator
+        )
 
     def _release_source(self, req) -> None:
         st = req.uocr_doc
@@ -1127,6 +1150,8 @@ class DocReuse:
         committed = req.kv.kv_committed_len
         holder = RetainedWindow()
         holder.kv = req.detach_kv()
+        # The window, no request, holds the row from here on.
+        self._storage().hold_row(holder)
         # release_kv_cache stops once the row is claimed, so the request's tree
         # lock (taken on the match's root anchor at admission) is dropped here.
         cache.unlock(req.lock)
