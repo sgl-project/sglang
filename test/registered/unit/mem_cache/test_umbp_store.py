@@ -358,12 +358,20 @@ class TestUMBPStore(unittest.TestCase):
         real = umbp_module._import_umbp_client()
         imported = (FakeUMBPClient, FakeUMBPConfig, fake_role, *real[3:])
         long_model = "m" * 200
-        spdk = MockStorageConfig(
+        embedded_spdk = MockStorageConfig(
             model_name=long_model,
             extra_config={
                 "dram_capacity_bytes": 1024,
                 "ssd_enabled": True,
                 "ssd_backend": "spdk",
+            },
+        )
+        standalone_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                **embedded_spdk.extra_config,
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+                "standalone_auto_start": True,
             },
         )
         dram = MockStorageConfig(
@@ -373,8 +381,9 @@ class TestUMBPStore(unittest.TestCase):
 
         with patch.object(umbp_module, "_import_umbp_client", return_value=imported):
             with self.assertRaisesRegex(ValueError, "SPDK"):
-                umbp_module.UMBPStore(spdk)
+                umbp_module.UMBPStore(standalone_spdk)
             umbp_module.UMBPStore(dram).close()
+            umbp_module.UMBPStore(embedded_spdk).close()
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore

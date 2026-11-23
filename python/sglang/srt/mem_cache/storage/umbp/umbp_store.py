@@ -967,12 +967,13 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.ssd_backend,
         )
 
-        # Anchor keys are the only key shape this change lengthens. Check the
-        # final backend (after the MLA and DP rewrites above) once, here, before
-        # the KV events thread starts.
+        # Only enforce the local SPDK key limit for standalone auto-start.
+        sp = cfg.standalone_process
         if (
             cfg.ssd.enabled
             and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
+            and sp is not None
+            and sp.auto_start
             and not self._kv_anchor_is_logical
         ):
             keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
