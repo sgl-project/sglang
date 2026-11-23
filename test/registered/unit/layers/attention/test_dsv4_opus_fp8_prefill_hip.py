@@ -18,42 +18,43 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _backend(swa_layout=KVLayout.V4, extra_layout=KVLayout.V4):
+def _backend(enabled=True, swa_layout=KVLayout.V4, extra_layout=KVLayout.V4):
     pool = SimpleNamespace(
         get_swa_key_layout=lambda: swa_layout,
         get_extra_key_layout=lambda layer_id: extra_layout,
     )
-    return SimpleNamespace(token_to_kv_pool=pool)
+    return SimpleNamespace(token_to_kv_pool=pool, _opus_fp8_prefill=enabled)
 
 
-def _fp8_applies(backend, num_heads=32, compress_ratio=2, available=True):
-    with patch.object(radix, "opus_fp8_available", return_value=available):
-        return radix.DeepseekV4HipRadixBackend._opus_fp8_applies(
-            backend, num_heads=num_heads, layer_id=3, compress_ratio=compress_ratio
-        )
+def _fp8_applies(backend, num_heads=32, compress_ratio=2):
+    return radix.DeepseekV4HipRadixBackend._opus_fp8_applies(
+        backend, num_heads=num_heads, layer_id=3, compress_ratio=compress_ratio
+    )
 
 
 class TestOpusFp8Applies(CustomTestCase):
-    def test_off_unless_switched_on(self):
-        with envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.override(False):
-            self.assertFalse(_fp8_applies(_backend()))
-        with envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.override(True):
-            self.assertTrue(_fp8_applies(_backend()))
+    def test_on_only_with_the_switch_and_the_kernel(self):
+        for switch, available in ((False, True), (True, False), (True, True)):
+            with (
+                envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.override(switch),
+                patch.object(radix, "opus_fp8_available", return_value=available),
+            ):
+                self.assertEqual(
+                    radix._opus_fp8_prefill_enabled(), switch and available
+                )
+        self.assertFalse(_fp8_applies(_backend(enabled=False)))
+        self.assertTrue(_fp8_applies(_backend()))
 
     def test_layers_the_kernel_cannot_take_keep_bf16(self):
-        with envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.override(True):
-            # the kernel takes at most 32 heads
-            self.assertFalse(_fp8_applies(_backend(), num_heads=33))
-            # the fp8 gather reads only the V4 cache record
-            self.assertFalse(_fp8_applies(_backend(swa_layout=KVLayout.V41)))
-            self.assertFalse(_fp8_applies(_backend(extra_layout=KVLayout.V41)))
-            # an AITER build without the fp8 kernel
-            self.assertFalse(_fp8_applies(_backend(), available=False))
+        # the kernel takes at most 32 heads
+        self.assertFalse(_fp8_applies(_backend(), num_heads=33))
+        # the fp8 gather reads only the V4 cache record
+        self.assertFalse(_fp8_applies(_backend(swa_layout=KVLayout.V41)))
+        self.assertFalse(_fp8_applies(_backend(extra_layout=KVLayout.V41)))
 
     def test_swa_only_layer_ignores_the_compressed_layout(self):
-        with envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.override(True):
-            backend = _backend(extra_layout=KVLayout.V41)
-            self.assertTrue(_fp8_applies(backend, compress_ratio=0))
+        backend = _backend(extra_layout=KVLayout.V41)
+        self.assertTrue(_fp8_applies(backend, compress_ratio=0))
 
 
 class TestWqBPackedForOpus(CustomTestCase):

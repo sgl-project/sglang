@@ -847,6 +847,10 @@ _GROUPED_ASM_GQA = 16
 _GROUPED_ASM_MIN_REQS = 16
 
 
+def _opus_fp8_prefill_enabled() -> bool:
+    return envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.get() and opus_fp8_available()
+
+
 def _grouped_asm_enabled() -> bool:
     """
     Grouped target-verify decode through the asm kernel, off by default.
@@ -1098,6 +1102,7 @@ class DeepseekV4HipRadixBackend(
         self.opus_compressed_rope_workspaces = {
             ratio: SparsePrefillKVBuffer(self.device, dim=DIM_ROPE) for ratio in (1, 2)
         }
+        self._opus_fp8_prefill = _opus_fp8_prefill_enabled()
         # Reset with the metadata: its inputs belong to one prefill forward.
         self._opus_prefill_state: Optional[_OpusPrefillState] = None
 
@@ -3163,7 +3168,9 @@ class DeepseekV4HipRadixBackend(
             isinstance(self.forward_metadata.core_attn_metadata, DSV4AttnMetadata)
             and not is_unified_kv_triton()
             and self._opus_prefill_applies_to(num_tokens, forward_batch, compress_ratio)
-            and self._opus_fp8_applies(num_heads, layer_id, compress_ratio)
+            and self._opus_fp8_applies(
+                num_heads=num_heads, layer_id=layer_id, compress_ratio=compress_ratio
+            )
         )
 
     def _opus_prefill_applies_to(
@@ -3255,7 +3262,9 @@ class DeepseekV4HipRadixBackend(
             state = self._opus_prefill_state = _OpusPrefillState(cache, swa_csr)
         cache = state.cache
         num_swa_rows = cache.swa_token_ids.shape[0]
-        fp8 = packed or self._opus_fp8_applies(num_heads, layer_id, compress_ratio)
+        fp8 = packed or self._opus_fp8_applies(
+            num_heads=num_heads, layer_id=layer_id, compress_ratio=compress_ratio
+        )
         swa_rows = self.opus_prefill_workspace.get(
             num_swa_rows, dtype=fp8_dtype if fp8 else torch.bfloat16
         )
@@ -3274,50 +3283,42 @@ class DeepseekV4HipRadixBackend(
             rope_out=swa_rope,
         )
         swa_kv = swa_rows.view(num_swa_rows, -1)
+        if compress_ratio == 0:
+            kv, kv_rope, csr = swa_kv, swa_rope, state.swa_csr
+            extend_kv = extend_kv_rope = extend_csr = None
+        else:
+            kv, kv_rope, csr = self._opus_compressed_inputs(
+                state=state,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                core_attn_metadata=core_attn_metadata,
+                fp8=fp8,
+            )
+            extend_kv, extend_kv_rope, extend_csr = swa_kv, swa_rope, state.swa_csr
         if fp8:
             q_nope, q_rope = (q.q_nope, q.q_rope) if packed else quantize_q_opus_fp8(q)
-        if compress_ratio == 0:
-            if fp8:
-                out = opus_sparse_prefill_fp8(
-                    q_nope,
-                    q_rope,
-                    swa_kv,
-                    swa_rope,
-                    state.swa_csr,
-                    attn_sink,
-                    self.softmax_scale,
-                )
-            else:
-                out = opus_sparse_prefill(
-                    q, swa_kv, state.swa_csr, attn_sink, self.softmax_scale
-                )
-        else:
-            compressed_kv, compressed_rope, topk_csr = self._opus_compressed_inputs(
-                state, layer_id, compress_ratio, core_attn_metadata, fp8
+            out = opus_sparse_prefill_fp8(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv=kv,
+                kv_rope=kv_rope,
+                csr=csr,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+                extend_kv=extend_kv,
+                extend_kv_rope=extend_kv_rope,
+                extend_csr=extend_csr,
             )
-            if fp8:
-                out = opus_sparse_prefill_fp8(
-                    q_nope,
-                    q_rope,
-                    compressed_kv,
-                    compressed_rope,
-                    topk_csr,
-                    attn_sink,
-                    self.softmax_scale,
-                    extend_kv=swa_kv,
-                    extend_kv_rope=swa_rope,
-                    extend_csr=state.swa_csr,
-                )
-            else:
-                out = opus_sparse_prefill(
-                    q,
-                    compressed_kv,
-                    topk_csr,
-                    attn_sink,
-                    self.softmax_scale,
-                    extend_kv=swa_kv,
-                    extend_csr=state.swa_csr,
-                )
+        else:
+            out = opus_sparse_prefill(
+                q=q,
+                kv=kv,
+                csr=csr,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+                extend_kv=extend_kv,
+                extend_csr=extend_csr,
+            )
         if inv_rope is not None:
             _apply_inverse_rope(out, inv_rope)
         return out
@@ -3327,17 +3328,12 @@ class DeepseekV4HipRadixBackend(
     ) -> bool:
         """Whether this OPUS layer runs the fp8 kernel: the V4 caches the fp8 gather
         reads, and at most the 32 heads that kernel takes."""
-        if not envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.get() or num_heads > 32:
+        if not self._opus_fp8_prefill or num_heads > 32:
             return False
         pool = self.token_to_kv_pool
         if pool.get_swa_key_layout() is not KVLayout.V4:
             return False
-        if (
-            compress_ratio != 0
-            and pool.get_extra_key_layout(layer_id) is not KVLayout.V4
-        ):
-            return False
-        return opus_fp8_available()
+        return compress_ratio == 0 or pool.get_extra_key_layout(layer_id) is KVLayout.V4
 
     @staticmethod
     def _gather_opus_rows(
@@ -3478,22 +3474,22 @@ class DeepseekV4HipRadixBackend(
                 isinstance(core_attn_metadata, DSV4AttnMetadata) and not save_kv_cache
             )
             assert self.opus_fp8_takes_packed_q(
-                q.q_nope.shape[0],
-                q.q_nope.shape[1],
-                layer_id,
-                forward_batch,
-                compress_ratio,
+                num_tokens=q.q_nope.shape[0],
+                num_heads=q.q_nope.shape[1],
+                layer_id=layer_id,
+                forward_batch=forward_batch,
+                compress_ratio=compress_ratio,
             ), (
                 "a packed OPUS query reached a layer that does not run the fp8 OPUS kernel"
             )
             return self._forward_prefill_opus(
-                q,
-                layer_id,
-                compress_ratio,
-                forward_batch,
-                core_attn_metadata,
-                attn_sink,
-                inv_rope,
+                q=q,
+                layer_id=layer_id,
+                compress_ratio=compress_ratio,
+                forward_batch=forward_batch,
+                core_attn_metadata=core_attn_metadata,
+                attn_sink=attn_sink,
+                inv_rope=inv_rope,
             )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
