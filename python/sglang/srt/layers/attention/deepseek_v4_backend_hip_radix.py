@@ -1021,6 +1021,7 @@ class DeepseekV4HipRadixBackend(
         self._bcg_tail_capacity: Optional[int] = None
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
+        self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -2423,7 +2424,27 @@ class DeepseekV4HipRadixBackend(
         )
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
-        saved = (self.forward_metadata, self.candidate_masks)
+        saved = (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
+        )
+        tail = tail_metadata.late_layer_tail
+        if tail.real_rows_count is not None:
+            forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+            non_padded = forward_batch.global_num_token_non_padded
+            if non_padded is not None:
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+                bound = torch.clamp(
+                    non_padded,
+                    max=tail.real_rows_count,
+                    out=self._bcg_tail_num_token_non_padded,
+                )
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
         self.forward_metadata = tail_metadata
         window = self.token_to_kv_pool.request_window
         if window is not None:
@@ -2431,7 +2452,13 @@ class DeepseekV4HipRadixBackend(
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
-        self.forward_metadata, self.candidate_masks = saved
+        (
+            self.forward_metadata,
+            self.candidate_masks,
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
+        ) = saved
         self.tail_source_kv_layer_id = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
