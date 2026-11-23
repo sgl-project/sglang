@@ -1,7 +1,9 @@
 """Bounded DCP runtime headroom for the packed read and gather prefetch."""
 
+import logging
+
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 def runtime_gather_reserve_bytes(
@@ -68,5 +70,31 @@ def runtime_gather_reserve_bytes(
             else context_tokens * prefill_requests
         )
         serial_scratch = (piece_rows + tokens) * prefix_row_bytes
-    native_headroom = (1 << 30) if get_parallel().moe_ep_size > 1 else 0
+    ep_size = get_parallel().moe_ep_size
+    native_headroom = (1 << 30) if ep_size > 1 else 0
+    if native_headroom and get_exec().moe.fuseep_mode == 3:
+        from deep_ep import Buffer
+
+        geometries = {
+            (layer.hidden_size, layer.num_experts)
+            for layer in model.modules()
+            if getattr(layer, "moe_ep_size", 1) > 1
+            and hasattr(layer, "hidden_size")
+            and hasattr(layer, "num_experts")
+        }
+        if not geometries:
+            raise RuntimeError(
+                "Cannot budget MegaMoE communication without expert geometry"
+            )
+        capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        communication_bytes = max(
+            Buffer.get_low_latency_rdma_size_hint(capacity, hidden, ep_size, experts)
+            for hidden, experts in geometries
+        )
+        logging.getLogger(__name__).info(
+            "MegaMoE memory reserve: communication hint=%d bytes; native workspace allowance=%d bytes",
+            communication_bytes,
+            native_headroom,
+        )
+        native_headroom += communication_bytes
     return row_bytes + prefix_bytes + local_sends + serial_scratch + native_headroom
