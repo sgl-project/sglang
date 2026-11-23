@@ -24,7 +24,8 @@ import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.device import get_device_count, get_device_module, is_xpu
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import (
     ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
@@ -43,6 +44,7 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=126, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=190, stage="extra-a", runner_config="2-gpu-large-amd")
+register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -71,7 +73,7 @@ def init_process(
     event_dst_ready_list,
     remote_instance_loader_backend,
 ):
-    torch.cuda.set_device(rank)
+    get_device_module().set_device(rank)
 
     if rank == 0:
         init_process_seed(
@@ -118,8 +120,8 @@ def init_process_seed(
     os.environ["NCCL_NVLS_ENABLE"] = "0"
 
     # Load model and get parameters
-    torch.cuda.set_device(rank)
-    torch.cuda.synchronize()
+    get_device_module().set_device(rank)
+    get_device_module().synchronize()
 
     url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -135,7 +137,7 @@ def init_process_seed(
             *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     seed_params = []
     # Get the weights of seed instance for correctness check.
@@ -173,8 +175,8 @@ def init_process_dst(
     event_dst_ready_list,
     remote_instance_loader_backend,
 ):
-    torch.cuda.set_device(rank * tp_size)
-    torch.cuda.synchronize()
+    get_device_module().set_device(rank * tp_size)
+    get_device_module().synchronize()
     base_gpu_id = rank * tp_size
 
     event_seed_ready.wait()
@@ -237,7 +239,7 @@ def init_process_dst(
                 *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     event_dst_ready_list[rank - 1].set()
 
@@ -354,18 +356,19 @@ def test_load_weights_from_remote_instance(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    torch.cuda.empty_cache()
+    get_device_module().empty_cache()
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
     def test_load_weights_from_remote_instance(self):
 
-        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        assert get_device_count() >= 2, "At least 2 GPUs are required"
+        backends = ["transfer_engine"] if is_xpu() else ["nccl", "transfer_engine"]
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
             # FIXME: refactor this test to have less random behavior
             mode = random.choice(["Engine", "Server"])
-            remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
+            remote_instance_loader_backend = random.choice(backends)
             test_suits = [
                 (
                     1,
@@ -376,31 +379,15 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
                 ),
             ]
         else:
+            model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine"], "nccl"),
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Server"], "nccl"),
-                (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine", "Server"], "nccl"),
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    ["Engine"],
-                    "transfer_engine",
-                ),
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    ["Server"],
-                    "transfer_engine",
-                ),
-                (
-                    2,
-                    2,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    ["Engine", "Server"],
-                    "transfer_engine",
-                ),
+                (tp, tp, model, modes, backend)
+                for backend in backends
+                for tp, modes in (
+                    (1, ["Engine"]),
+                    (1, ["Server"]),
+                    (2, ["Engine", "Server"]),
+                )
             ]
 
         truncate_size = 10
