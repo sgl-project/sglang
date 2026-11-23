@@ -1695,7 +1695,13 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
     def _mlp_flops(self):
         return 6.0 * self.HIDDEN_SIZE * self.INTERMEDIATE_SIZE
 
-    def _constants(self, *, layers_block_type=None, full_attention_layer_ids=None):
+    def _constants(
+        self,
+        *,
+        layers_block_type=None,
+        full_attention_layer_ids=None,
+        full_attention_layer_ids_on_model_config=None,
+    ):
         scheduler = types.SimpleNamespace()
         scheduler.waiting_queue = []
         scheduler.disaggregation_mode = DisaggregationMode.NULL
@@ -1713,6 +1719,10 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
             get_num_attention_heads=lambda tp: self.NUM_HEADS,
             get_num_kv_heads=lambda tp: self.NUM_KV_HEADS,
         )
+        if full_attention_layer_ids_on_model_config is not None:
+            scheduler.model_config.full_attention_layer_ids = (
+                full_attention_layer_ids_on_model_config
+            )
         reporter = _make_reporter(self, scheduler)
         enter_scope(
             self,
@@ -1895,6 +1905,75 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
             * dtype_bytes
         )
         self.assertLess(reporter._kv_cache_bytes_per_token, stale_kv_cache)
+
+    def test_jamba_style_attention_mamba_only_labels_still_charge_mlp_everywhere(self):
+        # Jamba/Bamba's layers_block_type only ever contains "attention" or
+        # "mamba" -- there is no separate "mlp"/"moe" label, because every
+        # layer (whichever mixer it uses) has its own attached MLP. This is a
+        # subset of NemotronH's own exclusive vocabulary, but unlike
+        # NemotronH, counting literal "mlp"/"moe" labels against it finds
+        # zero -- silently forcing num_mlp_layers to 0 and dropping all FFN
+        # FLOPs/bytes. Only the attention *mixer* count should shrink to the
+        # real "attention" entries; the MLP count must still cover every
+        # layer.
+        layers_block_type = (
+            ["attention"]
+            + ["mamba"] * 2
+            + ["attention"]
+            + ["mamba"] * 3
+            + ["attention"]
+            + ["mamba"] * 2
+        )
+        num_attn_layers = 3.0  # "attention" appears 3 times
+        reporter = self._constants(layers_block_type=layers_block_type)
+        wrong_zeroed_mlp = self._attn_linear_flops() * num_attn_layers
+        expected = (
+            self._attn_linear_flops() * num_attn_layers
+            + self._mlp_flops() * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertNotEqual(reporter._linear_flops_per_token, wrong_zeroed_mlp)
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected)
+        # KV-cache bandwidth only applies to the real attention-mixer layers.
+        self.assertAlmostEqual(
+            reporter._kv_cache_bytes_per_token,
+            2.0 * self.NUM_KV_HEADS * self.HEAD_DIM * num_attn_layers * 2.0,
+        )
+
+    def test_full_attention_layer_ids_read_from_model_config_when_present(self):
+        # sglang computes swa/full_attention_layer_ids in ModelConfig.__init__
+        # (via get_hybrid_layer_ids()) and stores them on model_config itself
+        # -- this is the real path for Gemma2/Gemma3/Llama4-style SWA hybrid
+        # models. No layers_block_type is involved for these, and the field
+        # never lives on hf_text_config for this family. The regression this
+        # guards against: checking only hf_text_config (as the non-hybrid
+        # full_attention_layer_ids fallback above does) makes this branch
+        # permanently dead for every SWA-hybrid model.
+        full_attention_layer_ids = [2, 5, 9, 12]
+        reporter = self._constants(
+            full_attention_layer_ids_on_model_config=full_attention_layer_ids
+        )
+        num_attn_layers = float(len(full_attention_layer_ids))
+        expected_linear = self._attn_linear_flops() * num_attn_layers + (
+            self._mlp_flops() * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+
+    def test_warns_when_hybrid_layer_split_cannot_be_determined(self):
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="WARNING",
+        ) as cm:
+            self._constants()
+        self.assertTrue(
+            any("hybrid attention/MLP layer split" in msg for msg in cm.output)
+        )
+
+    def test_no_warning_when_full_attention_layer_ids_present(self):
+        with self.assertNoLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="WARNING",
+        ):
+            self._constants(full_attention_layer_ids=[0, 2])
 
 
 if __name__ == "__main__":

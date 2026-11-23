@@ -564,44 +564,76 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
-        # Per-layer attention/MLP/Mamba split for hybrid architectures.
-        #
-        # `layers_block_type` is not a standardized vocabulary across hybrid
-        # configs. NemotronH uses it as an *exclusive* per-layer block type --
-        # each layer is attention-only, mlp-only, moe-only, or mamba-only, and
-        # mixer/FFN never coexist in the same layer (see its own
-        # `valid_types = {"mamba", "attention", "mlp", "moe"}`). But
-        # Qwen3-Next/Qwen3.5, GigaChat3.5, and BailingHybrid only use the same
-        # field to label the *mixer* ("attention" vs. "linear_attention") --
-        # every layer in those architectures still builds its own FFN
-        # unconditionally. Falcon-H1 uses a single uniform label for every
-        # layer (full attention + full FFN on every layer). Blindly counting
-        # "mlp"/"moe" strings against those non-NemotronH vocabularies zeroes
-        # out FFN costing (or, for Falcon-H1, zeroes out everything).
-        #
-        # Only take the literal-string exclusive-block interpretation when the
-        # vocabulary actually matches NemotronH's; otherwise fall back to
-        # `full_attention_layer_ids`, which every one of these configs
-        # computes correctly for its own semantics, and assume (correctly,
-        # for all of them) that every layer still has an FFN.
+        # Per-layer attention/MLP/Mamba split for hybrid architectures. Two
+        # distinct conventions exist across real HF configs:
+        #   - Dedicated-layer (NemotronH): each layer is *exclusively* one of
+        #     "attention"/"mamba"/"mlp"/"moe" -- a "mamba" layer has no MLP of
+        #     its own, since the FFN lives in its own separately-indexed
+        #     layer. Only count the dedicated labels.
+        #   - Bundled-layer (FalconH1's uniform "hybrid" label; Jamba/Bamba's
+        #     "attention"/"mamba" with no separate FFN label at all): every
+        #     layer carries its own attention-or-mamba mixer *and* its own
+        #     MLP together. These vocabularies never contain "mlp"/"moe" at
+        #     all, so detect the convention by that and fall back to
+        #     "every layer pays the FFN cost" instead of silently zeroing it.
+        # `layers_block_type`'s vocabulary is not standardized across hybrid
+        # configs. NemotronH and Jamba/Bamba use sglang's/transformers' own
+        # exclusive {"mamba", "attention", "mlp", "moe"} labels (Jamba/Bamba
+        # never emit "mlp"/"moe" since the FFN is bundled into every mixer
+        # layer -- see has_dedicated_ffn_layers below). But Qwen3-Next/
+        # Qwen3.5, GigaChat3.5, and BailingHybrid's own layers_block_type
+        # returns "full_attention"/"linear_attention" instead -- counting
+        # "attention" against that vocabulary silently finds zero real
+        # attention layers while the generic "not mamba/mlp/moe" fallback
+        # would overcount by treating every linear_attention layer as full
+        # attention too. Only trust literal label-counting when the
+        # vocabulary is actually a subset of the exclusive convention;
+        # otherwise fall back to full_attention_layer_ids, which each of
+        # those config classes computes correctly for its own semantics.
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
-        full_attention_layer_ids = getattr(
-            hf_text_config, "full_attention_layer_ids", None
-        )
         _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
         if (
             layers_block_type
             and set(layers_block_type) <= _EXCLUSIVE_HYBRID_BLOCK_TYPES
         ):
             num_attn_layers = float(layers_block_type.count("attention"))
-            num_mlp_layers = float(
-                layers_block_type.count("mlp") + layers_block_type.count("moe")
+            has_dedicated_ffn_layers = any(
+                t in ("mlp", "moe") for t in layers_block_type
             )
-        elif full_attention_layer_ids is not None:
-            num_attn_layers = float(len(full_attention_layer_ids))
-            num_mlp_layers = num_layers
+            num_mlp_layers = (
+                float(layers_block_type.count("mlp") + layers_block_type.count("moe"))
+                if has_dedicated_ffn_layers
+                else num_layers
+            )
         else:
-            num_attn_layers = num_layers
+            # full_attention_layer_ids is usually computed by sglang itself
+            # (ModelConfig.__init__, via get_hybrid_layer_ids()) and stored on
+            # model_config -- NOT on hf_text_config, which only ever has it
+            # when a model's own HF config class defines the field natively
+            # (e.g. KimiLinear/KimiK3). Check both so neither source is
+            # silently ignored.
+            full_attention_layer_ids = getattr(
+                model_config, "full_attention_layer_ids", None
+            )
+            if full_attention_layer_ids is None:
+                full_attention_layer_ids = getattr(
+                    hf_text_config, "full_attention_layer_ids", None
+                )
+            if full_attention_layer_ids is None:
+                logger.warning(
+                    "Could not determine hybrid attention/MLP layer split for "
+                    "model %s (no recognized layers_block_type convention and "
+                    "no full_attention_layer_ids on model_config or "
+                    "hf_text_config); estimated MFU/MBU metrics will assume "
+                    "every layer is a full attention+MLP transformer layer, "
+                    "which may be inaccurate for hybrid architectures.",
+                    getattr(model_config, "model_path", type(model_config).__name__),
+                )
+            num_attn_layers = (
+                float(len(full_attention_layer_ids))
+                if full_attention_layer_ids is not None
+                else num_layers
+            )
             num_mlp_layers = num_layers
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
