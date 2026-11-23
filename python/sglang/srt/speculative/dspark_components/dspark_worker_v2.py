@@ -1202,50 +1202,42 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
-        region_accept = None
-        if (
-            not folded_accept
-            and can_run_cuda_graph
-            and not run_compact
-            and self._sampling_graph_eligible(
-                route=verify.route,
-                proposal_folded=proposal.folded,
-                sampling_info=sampling_info,
-                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
-            )
-        ):
-            # The region's route adjusts nothing: no grammar mask to build and
-            # no stage to run first.
-            if simulate_bonus_sampling_info is not None:
-                epilogue.begin_sim_bonus(
-                    bs, simulate_bonus_sampling_info.temperatures[:bs]
-                )
-            region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=logits_output.next_token_logits
-            )
-        # The accept and its commits ran in a graph: the verify graph's fold or the
-        # sampling-accept region replayed right after it.
-        graph_accept = folded_accept or region_accept is not None
 
-        # Returns the accept with the sampling info it read: the watermark's
-        # replacement, or None after the simulated greedy drop.
-        def accept_core() -> tuple:
+        # Returns the accept, the sampling info it read (the watermark's
+        # replacement, or None after the simulated greedy drop), and whether the
+        # sampling-accept region ran it.
+        def accept_core() -> tuple[VerifyAccept, tuple]:
+            target_logits = logits_output.next_token_logits
             accept_info = sampling_info
-            if region_accept is not None:
-                accept = region_accept
-            else:
-                target_logits = logits_output.next_token_logits
-                # Without sampling info (a simulated greedy accept drops it),
-                # nothing adjusts the logits: the drop requires a route that
-                # adjusts nothing.
-                if accept_info is not None:
-                    # run_compact scatters its rows back to (bs * chain_len), so
-                    # the rows line up with the verify ids on both verify paths.
-                    target_logits, accept_info = verify.adjust(
-                        target_logits,
-                        verify_ids_2d,
-                        positions=verify_window.positions_2d,
+            # Without sampling info (a simulated greedy accept drops it), nothing
+            # adjusts the logits: the drop requires a route that adjusts nothing.
+            if accept_info is not None:
+                # run_compact scatters its rows back to (bs * chain_len), so the
+                # rows line up with the verify ids on both verify paths.
+                target_logits, accept_info = verify.adjust(
+                    target_logits, verify_ids_2d, positions=verify_window.positions_2d
+                )
+            accept = None
+            if (
+                not folded_accept
+                and can_run_cuda_graph
+                and not run_compact
+                and self._sampling_graph_eligible(
+                    route=verify.route,
+                    proposal_folded=proposal.folded,
+                    sampling_info=accept_info,
+                    simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                )
+            ):
+                if simulate_bonus_sampling_info is not None:
+                    epilogue.begin_sim_bonus(
+                        bs, simulate_bonus_sampling_info.temperatures[:bs]
                     )
+                accept = self._sampling_accept_graph.run(
+                    bs=bs, target_logits=target_logits
+                )
+            region_ran = accept is not None
+            if not region_ran:
                 accept = self._verify_executor.accept_and_finalize(
                     folded_accept=folded_accept,
                     bs=bs,
@@ -1260,17 +1252,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                     draft_tokens=draft_tokens,
                     simulate_bonus_sampling_info=simulate_bonus_sampling_info,
                 )
-            verify_accept = VerifyAccept(
-                tokens=accept.out_tokens, accept_lens=accept.commit_lens
+            return (
+                VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
+                (accept, accept_info, region_ran),
             )
-            return verify_accept, (accept, accept_info)
 
-        _, (accept, sampling_info) = verify.run(
+        _, (accept, sampling_info, region_ran) = verify.run(
             logits_output,
             accept_core=accept_core,
             grammar_tree=grammar_tree,
             barrier=grammar_barrier,
         )
+        # The accept and its commits ran in a graph: the verify graph's fold or the
+        # sampling-accept region replayed right after it.
+        graph_accept = folded_accept or region_ran
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,
@@ -1281,9 +1276,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._deferred_draft_kv.note_staged(batch.reqs)
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
-        ) or (
-            region_accept is not None and self._sampling_accept_graph.committed_engram
-        )
+        ) or (region_ran and self._sampling_accept_graph.committed_engram)
         # The static verify graph committed the engram history when it folded the accept.
         if not engram_in_graph:
             self.model_runner.ngram_embedding_manager.update_after_verify(

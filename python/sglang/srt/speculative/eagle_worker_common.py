@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -874,7 +874,7 @@ def run_eagle_verify(
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
     # Returns the post-verify graphs' outputs when they replayed, else None.
-    def accept_core() -> Tuple[VerifyAccept, Optional[tuple]]:
+    def accept_core() -> tuple[VerifyAccept, Optional[tuple]]:
         # SGLang's post-verify graphs when they are on, for a batch they can replay;
         # they skip the c128 cleanup below, so not for a KV pool that needs it.
         post = (

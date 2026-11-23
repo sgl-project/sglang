@@ -3649,7 +3649,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        def accept_core() -> Tuple[VerifyAccept, tuple]:
+        def accept_core() -> tuple[VerifyAccept, tuple]:
             if sampling_info is not None and target_predict is None:
                 # In place: DFlash refuses the watermark, the one stage that
                 # returns new logits.
@@ -3664,7 +3664,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict=target_predict,
                 cutoff_verify_lens=None if layout is None else layout.verify_lens,
             )
-            out_tokens, commit_lens = outputs[3], outputs[1]
+            _, commit_lens, _, out_tokens, _, _ = outputs
             return VerifyAccept(tokens=out_tokens, accept_lens=commit_lens), outputs
 
         _, outputs = verify.run(

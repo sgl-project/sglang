@@ -10,8 +10,9 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch the verify worker calls `VerifyStep.run` with its accept core, which
-  runs the stages (`VerifyStep.adjust`) on the logits it accepts from.
+  launch the verify worker calls `VerifyStep.run` with its accept core; the
+  accept core runs the stages (`VerifyStep.adjust`) on the logits it accepts
+  from.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
 builds at each launch (`set_step_state`). A verify differs only in what each
