@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce import (
@@ -29,6 +31,10 @@ from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -54,6 +60,95 @@ _SWIGLU = 3
 # Precomputed routing skips the routing kernel; the launcher branches on this
 # only for Llama4, so any other value is inert.
 _ROUTING_METHOD_UNUSED = 1
+
+_TRITON_ROUTE_ELEMS = 256 << 20
+_GROUPED_MIN_TOKENS = 4096
+_GROUPED_WS_TOKENS = 17408
+_GROUPED_DG = dict(use_psum_layout=True, expected_m_for_psum_layout=512)
+
+
+@triton.jit
+def _rows_kernel(
+    src_ptr,
+    rows_ptr,
+    out_ptr,
+    stride,
+    n_ptr,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SILU_MUL: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    for r in range(tl.program_id(0), tl.load(n_ptr), tl.num_programs(0)):
+        t = tl.load(rows_ptr + r)
+        if t >= 0:
+            if SILU_MUL:
+                gu = tl.load(
+                    src_ptr
+                    + r.to(tl.int64) * 2 * H
+                    + 2 * offs[:, None]
+                    + tl.arange(0, 2)[None, :],
+                    mask=(offs < H)[:, None],
+                )
+                g, u = tl.split(gu.to(tl.float32))
+                v = (g / (1.0 + tl.exp(-g)) * u).to(out_ptr.dtype.element_ty)
+            else:
+                v = tl.load(src_ptr + t.to(tl.int64) * stride + offs, mask=offs < H)
+            tl.store(out_ptr + r.to(tl.int64) * H + offs, v, mask=offs < H)
+
+
+@triton.jit(do_not_specialize=["n"])
+def _route_kernel(
+    ids,
+    local,
+    ws,
+    rows,
+    eids,
+    ntp,
+    n,
+    lo,
+    E,
+    EB: tl.constexpr,
+    BM: tl.constexpr,
+    CH: tl.constexpr,
+):
+    # One CTA: local expert per route (-1: other rank), expert-sorted BM-padded route order (any order within an expert)
+    cnt = ws + n + tl.arange(0, EB) * 32  # a 128-byte line per expert
+    tl.store(cnt, 0)
+    tl.debug_barrier()
+    for s in range(0, n, CH):
+        o = s + tl.arange(0, CH)
+        l = tl.load(ids + o, mask=o < n, other=-1) - lo
+        l = tl.where((l >= 0) & (l < E) & (o < n), l, -1)
+        tl.store(local + o, l, mask=o < n)
+        tl.store(
+            ws + o,
+            tl.atomic_add(ws + n + l * 32, 1, mask=l >= 0, sem="relaxed"),
+            mask=l >= 0,
+        )
+    tl.debug_barrier()
+    pad = (tl.load(cnt, cache_modifier=".cg") + BM - 1) // BM * BM
+    end, total = tl.cumsum(pad, 0), tl.sum(pad, 0)
+    tl.store(ntp, total)
+    for s in range(0, total, 128 * BM):
+        p = s + tl.arange(0, 128) * BM
+        tl.store(
+            eids + p // BM,
+            tl.sum((end[None, :] <= p[:, None]).to(tl.int32), 1),
+            mask=p < total,
+        )
+    for s in range(0, total, CH):
+        tl.store(rows + s + tl.arange(0, CH), n, mask=s + tl.arange(0, CH) < total)
+    tl.store(cnt, end - pad)
+    tl.debug_barrier()
+    for s in range(0, n, CH):
+        o = s + tl.arange(0, CH)
+        l = tl.load(local + o, mask=o < n, other=-1)
+        tl.store(
+            rows + tl.load(ws + n + l * 32, mask=l >= 0) + tl.load(ws + o, mask=l >= 0),
+            o,
+            mask=l >= 0,
+        )
 
 
 def _trtllm_bf16_moe_supported(device: torch.device) -> bool:
@@ -203,8 +298,20 @@ class MuseSpark1xBf16Experts(nn.Module):
             return
         if not _trtllm_bf16_moe_supported(self.gate_up_proj.device):
             if _triton_bf16_moe_supported(self.gate_up_proj.device):
+                from sglang.srt.layers.muse_spark.fused import glue
+
                 self._triton_runner_config = self._build_triton_runner_config()
                 self.use_triton = True
+                self._triton_interleaved = glue.hopper_kernels_enabled(
+                    self.gate_up_proj.device
+                )
+                if not self._triton_interleaved:
+                    return
+                # gate / up rows interleaved: the up-GEMM epilogue applies the SiLU, stores half width
+                for w in self.gate_up_proj.data:
+                    w.copy_(w.view(2, -1, w.shape[1]).transpose(0, 1).reshape(w.shape))
+                if torch.cuda.get_device_capability(self.gate_up_proj.device) == (9, 0):
+                    self._compile_grouped(post_expert_norm)
             return
         if getattr(self, "use_megamoe", False):
             from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
@@ -539,6 +646,10 @@ class MuseSpark1xBf16Experts(nn.Module):
         topk_ids: torch.Tensor,
         post_expert_norm: Optional[nn.Module],
     ) -> torch.Tensor:
+        if self._triton_interleaved:
+            return self._forward_triton_interleaved(
+                hidden_states, topk_scores, topk_ids, post_expert_norm
+            )
         from sglang.srt.layers.moe.moe_runner.triton_utils import fused_experts
         from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -571,6 +682,248 @@ class MuseSpark1xBf16Experts(nn.Module):
             weight_first=weight_first,
             apply_norm=post_expert_norm is not None,
         ).to(hidden_states.dtype)
+
+    def _forward_triton_interleaved(
+        self, hidden_states, topk_scores, topk_ids, post_expert_norm, grouped=True
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        if (
+            grouped
+            and hidden_states.dtype == torch.bfloat16
+            and num_tokens >= _GROUPED_MIN_TOKENS
+            and torch.cuda.get_device_capability(hidden_states.device) == (9, 0)
+            and (
+                is_in_breakable_cuda_graph()
+                or not torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            out = hidden_states.new_empty((num_tokens, self.down_proj.shape[1]))
+            # captured: the workspace is graph-pool memory
+            ws = (
+                self._grouped_ws(hidden_states)
+                if torch.cuda.is_current_stream_capturing()
+                else None
+            )
+            self._forward_grouped(
+                hidden_states, topk_scores, topk_ids, post_expert_norm, out, ws
+            )
+            return out
+        width = max(2 * self.intermediate_size, self.down_proj.shape[1])
+        chunk = max(1, _TRITON_ROUTE_ELEMS // (topk_ids.shape[1] * width))
+        if num_tokens > chunk:
+            output = hidden_states.new_empty((num_tokens, self.down_proj.shape[1]))
+            for start in range(0, num_tokens, chunk):
+                rows = slice(start, start + chunk)
+                output[rows] = self._forward_triton_interleaved(
+                    hidden_states[rows],
+                    topk_scores[rows],
+                    topk_ids[rows],
+                    post_expert_norm,
+                    grouped=False,
+                )
+            return output
+        from sglang.srt.layers.moe.moe_runner.triton import (
+            TritonMoeQuantInfo,
+            TritonRunnerCore,
+            TritonRunnerInput,
+        )
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            try_get_optimal_moe_config,
+        )
+
+        w1, w2, n, e = (
+            self.gate_up_proj,
+            self.down_proj,
+            topk_ids.numel(),
+            self.num_local_experts,
+        )
+        config, (down_config, _) = try_get_optimal_moe_config(
+            w1.shape,
+            w2.shape,
+            self.top_k,
+            None,
+            topk_ids.shape[0],
+            return_down_config=True,
+        )
+        if topk_ids.shape[0] <= 128:  # faster than the table rows (H200 sweep)
+            config = down_config = dict(
+                config,
+                BLOCK_SIZE_M=16,
+                BLOCK_SIZE_N=64,
+                BLOCK_SIZE_K=128,
+                GROUP_SIZE_M=8,
+                num_warps=4,
+                num_stages=5,
+            )
+        bm, eb = config["BLOCK_SIZE_M"], next_power_of_2(e)
+        cap = n + min(n, e) * (bm - 1)
+        local_topk_ids, rows, expert_ids, ntp, ws = (
+            topk_ids.new_empty(k)
+            for k in (topk_ids.shape, cap, -(-cap // bm), 1, n + 32 * eb)
+        )
+        _route_kernel[(1,)](
+            topk_ids,
+            local_topk_ids,
+            ws,
+            rows,
+            expert_ids,
+            ntp,
+            n,
+            self.local_expert_offset,
+            e,
+            EB=eb,
+            BM=bm,
+            CH=1024,
+        )
+        expert_output = (
+            TritonRunnerCore(self._triton_runner_config)
+            .run(
+                TritonRunnerInput(
+                    hidden_states.contiguous(),
+                    topk_scores.to(torch.float32).contiguous(),
+                    topk_ids,
+                    rows,
+                    expert_ids,
+                    ntp,
+                ),
+                TritonMoeQuantInfo(
+                    w13_weight=w1, w2_weight=w2, fuse_swiglu_interleaved=True
+                ),
+                {"config": config, "down_config": down_config},
+            )
+            .hidden_states
+        )
+
+        weight, eps, weight_first = self._finalize_norm_params(post_expert_norm)
+        return fused_post_expert_norm_weighted_sum(
+            expert_output,
+            topk_scores,
+            norm_weight=weight,
+            eps=eps,
+            weight_first=weight_first,
+            apply_norm=post_expert_norm is not None,
+            slot_expert_ids=local_topk_ids,
+        ).to(hidden_states.dtype)
+
+    def _grouped_ws(self, x) -> torch.Tensor:
+        """Per row an input / activation and a gate-up / output row."""
+        import deep_gemm
+
+        align = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        rows = (
+            max(x.shape[0], _GROUPED_WS_TOKENS) * 3 // 2 // align
+            + self.num_local_experts
+        ) * align
+        h, inter = x.shape[1], self.intermediate_size
+        return x.new_empty(rows * (max(h, inter) + max(2 * inter, h)))
+
+    def _compile_grouped(self, post_expert_norm) -> None:
+        x = self.gate_up_proj.new_zeros(
+            (_GROUPED_MIN_TOKENS, self.gate_up_proj.shape[2])
+        )
+        ids = x.new_full(
+            (x.shape[0], self.top_k), self.local_expert_offset, dtype=torch.int32
+        )
+        self._forward_grouped.run_eager(
+            x, ids.float(), ids, post_expert_norm, torch.empty_like(x), None
+        )
+        torch.cuda.empty_cache()
+
+    @eager_on_graph
+    def _forward_grouped(
+        self, x, topk_scores, topk_ids, post_expert_norm, out, ws
+    ) -> None:
+        """The Triton path's arithmetic reading each local expert's weights once."""
+        import deep_gemm
+
+        if ws is None and is_in_breakable_cuda_graph():
+            out.copy_(
+                self._forward_triton_interleaved(
+                    x, topk_scores, topk_ids, post_expert_norm, grouped=False
+                )
+            )
+            torch.cuda.empty_cache()
+            return
+        n, k = topk_ids.shape
+        e, h, inter = self.num_local_experts, x.shape[1], self.intermediate_size
+        align = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        ws = self._grouped_ws(x) if ws is None else ws
+        w1, w2 = max(h, inter), max(2 * inter, h)
+        cap = ws.numel() // (w1 + w2)
+        budget = cap - e * (align - 1) - (k - 1)
+        parts = (n * k - 1) // budget + 1
+        ids = topk_ids.reshape(-1).long() - self.local_expert_offset
+        here = (ids >= 0) & (ids < e)
+        per_tok = here.view(n, k).sum(1)
+        part = (per_tok.cumsum(0) - per_tok) // budget
+        key = (part * (e + 1)).unsqueeze(1) + torch.where(here, ids, e).view(n, k)
+        order = torch.argsort(key.view(-1).short(), stable=True)
+        key = key.view(-1)[order]
+        first = torch.searchsorted(
+            key, torch.arange(parts * (e + 1) + 1, device=x.device)
+        )
+        padded = (first.diff() + align - 1) // align * align
+        padded.view(parts, e + 1)[:, e] = 0
+        end = padded.view(parts, e + 1).cumsum(1)
+        psum = end[:, :e].int()
+        dst = (
+            torch.arange(n * k, device=x.device)
+            + (end.view(-1) - padded - first[:-1])[key]
+        )
+        local = key % (e + 1) < e
+        token = x.new_full((parts * cap + 1,), -1, dtype=torch.int32)
+        token[torch.where(local, key // (e + 1) * cap + dst, parts * cap)] = (
+            order // k
+        ).int()
+        src = x.new_empty(n * k, dtype=torch.int64)
+        src[order] = torch.where(local, dst, -1)
+        gate_up = ws[cap * w1 : cap * (w1 + 2 * inter)].view(cap, 2 * inter)
+        xs, act = ws[: cap * h].view(cap, h), ws[: cap * inter].view(cap, inter)
+        y = ws[-cap * h :].view(cap, h)
+        weight, eps, weight_first = self._finalize_norm_params(post_expert_norm)
+        bounds = torch.searchsorted(
+            part, torch.arange(parts + 1, device=x.device), out_int32=True
+        )
+        for p in range(parts):
+            rows = token[p * cap : (p + 1) * cap]
+            used = psum[p, e - 1 :]
+            _rows_kernel[(min(cap, 4096),)](
+                x,
+                rows,
+                xs,
+                x.stride(0),
+                used,
+                H=h,
+                BLOCK=next_power_of_2(h),
+                SILU_MUL=False,
+            )
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+                xs, self.gate_up_proj, gate_up, psum[p], **_GROUPED_DG
+            )
+            _rows_kernel[(min(cap, 4096),)](
+                gate_up,
+                rows,
+                act,
+                0,
+                used,
+                H=inter,
+                BLOCK=next_power_of_2(inter),
+                SILU_MUL=True,
+            )
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+                act, self.down_proj, y, psum[p], **_GROUPED_DG
+            )
+            fused_post_expert_norm_weighted_sum(
+                y,
+                topk_scores,
+                weight,
+                eps,
+                weight_first,
+                post_expert_norm is not None,
+                rows=src.view(n, k),
+                out=out,
+                part=(bounds, p),
+            )
 
     @torch.no_grad()
     def _finalize_norm_params(self, post_expert_norm):
