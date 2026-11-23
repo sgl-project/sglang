@@ -118,20 +118,22 @@ def auto_size_hicache(
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
+    if not enabled:
+        yield
+        return
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if fraction is None:
         from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
 
-        # ROCm: book explicit sizes against one snapshot (gfx950: its TTM share); else no-op
         with explicit_size_scope(enabled=enabled, params=params):
             yield
         return
-    requested = get_memory().hicache_ratio
-    device_bytes = _estimate_hicache_bytes(params, draft_plan)
     kvcache_device = getattr(
         params.token_to_kv_pool_allocator.get_kvcache(), "device", None
     )
     allocator = get_allocator_class_from_storage(get_allocator_type())
+    requested = get_memory().hicache_ratio
+    device_bytes = _estimate_hicache_bytes(params, draft_plan)
     plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
         allocator, kvcache_device, auto_size=True
     )

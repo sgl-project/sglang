@@ -77,10 +77,30 @@ def _ordered_rstd(
 
 @triton.jit
 def _mean_square_kernel(
-    X, Out, M: tl.constexpr, HEADS: tl.constexpr, TOKEN_STRIDE: tl.constexpr
+    X,
+    Out,
+    M: tl.constexpr,
+    DIM: tl.constexpr,
+    HEADS: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    HEAD_STRIDE: tl.constexpr,
 ):
     rows = tl.program_id(0).to(tl.int64) * 16 + tl.arange(0, 16)
-    mean = _ordered_mean_square(X, M, 128, 16, HEADS, TOKEN_STRIDE)
+    if DIM == 64:
+        offsets = (rows // HEADS) * TOKEN_STRIDE + (rows % HEADS) * HEAD_STRIDE
+        x = tl.load(
+            X + offsets[:, None] + tl.arange(0, 64)[None, :], rows[:, None] < M, 0
+        ).to(tl.float32)
+        # ATen does not vectorize width 64: each lane adds columns i and i+32.
+        total = _fold_halves(mul_rn_f32(x, x), 16, 32)
+        total = _fold_halves(total, 16, 16)
+        total = _fold_halves(total, 16, 8)
+        total = _fold_halves(total, 16, 4)
+        total = _fold_halves(total, 16, 2)
+        total = _fold_halves(total, 16, 1)
+        mean = mul_rn_f32(tl.reshape(total, (16,)), 1.0 / 64)
+    else:
+        mean = _ordered_mean_square(X, M, DIM, 16, HEADS, TOKEN_STRIDE)
     tl.store(Out + rows, mean, rows < M)
 
 
@@ -89,18 +109,24 @@ def _fake_mean_square(x):
 
 
 def can_use_rmsnorm_mean_square(x: torch.Tensor) -> bool:
-    return (
+    if not (
         is_cuda()
         and x.is_cuda
         and x.dtype == torch.bfloat16
-        and x.ndim == 4
-        and x.shape[-1] == 128
-        and x.stride(-1) == 1
-        and x.stride(-2) == 128
-        and x.stride(1) >= x.shape[2] * 128
-        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
-        and 16 <= x.numel() // 128
+        and x.ndim >= 2
+        and x.shape[-1] in (64, 128, 4096)
+        and 16 <= x.numel() // x.shape[-1]
         and x.numel() < 2**29
+    ):
+        return False
+    if x.shape[-1] == 4096:
+        return x.is_contiguous()
+    return (
+        x.ndim == 4
+        and x.stride(-1) == 1
+        and x.stride(-2) in (x.shape[-1], 128)
+        and x.stride(1) >= x.shape[2] * x.stride(-2)
+        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
     )
 
 
@@ -108,14 +134,28 @@ def can_use_rmsnorm_mean_square(x: torch.Tensor) -> bool:
     op_name="rmsnorm_mean_square_bitexact", mutates_args=[], fake_impl=_fake_mean_square
 )
 def rmsnorm_mean_square_bitexact(x: torch.Tensor) -> torch.Tensor:
-    """Match ``x.float().square().mean(-1, keepdim=True)`` for BF16 head-128 views."""
+    """ATen-ordered BF16 mean-square for head-64/128 views or contiguous width 4096.
+
+    At least 16 rows keeps the reduction at 32 lanes. Head-64 views may select
+    either half of a head-128 allocation; token strides and storage offsets
+    are preserved. Larger workspaces and other layouts require the reference.
+    """
     if not can_use_rmsnorm_mean_square(x):
-        raise ValueError("Unsupported head-128 mean-square inputs")
+        raise ValueError("Unsupported ordered mean-square inputs")
     with torch.cuda.device(x.device):
         out = _fake_mean_square(x)
-        rows = x.numel() // 128
+        dim = x.shape[-1]
+        rows = x.numel() // dim
         _mean_square_kernel[(triton.cdiv(rows, 16),)](
-            x, out, rows, x.shape[2], x.stride(1), num_warps=4, enable_fp_fusion=False
+            x,
+            out,
+            rows,
+            dim,
+            x.shape[2] if dim != 4096 else 1,
+            x.stride(1) if dim != 4096 else 0,
+            x.stride(-2),
+            num_warps=4,
+            enable_fp_fusion=False,
         )
     return out
 

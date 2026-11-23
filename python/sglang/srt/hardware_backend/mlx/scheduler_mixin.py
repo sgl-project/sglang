@@ -84,8 +84,6 @@ class SchedulerMlxOverlapMixin:
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return True
-        # batch.has_grammar, not sampling_info.grammars: the latter is only
-        # populated at forward launch (see _build_logit_edit_rows).
         return not (batch.has_grammar or sampling_info.has_custom_logit_processor)
 
     def _prepare_mlx_launch(self: Scheduler, batch: ScheduleBatch):
@@ -155,6 +153,9 @@ class SchedulerMlxOverlapMixin:
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             self._prepare_mlx_launch(batch)
+            # Build the sampling plugins' step state, as Scheduler.run_batch does.
+            if self.is_generation:
+                batch.sampling_info.set_plugin_state(batch.reqs)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the

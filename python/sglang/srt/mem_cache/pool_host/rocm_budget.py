@@ -77,18 +77,22 @@ def _snapshot_scope(*, allocator, device, barrier: bool):
 
 
 def explicit_size_scope(*, enabled: bool, params) -> ContextManager:
-    if not enabled or not is_hip():
+    if not enabled:
         return contextlib.nullcontext()
-    if rocm_pinnable_share_bytes() is not None:
-        return _snapshot_scope(
-            allocator=None, device=None, barrier=base.ranks_per_host() > 1
-        )
-    if base.ranks_per_host() == 1:
-        return contextlib.nullcontext()
+    if is_hip():
+        if rocm_pinnable_share_bytes() is not None:
+            return _snapshot_scope(
+                allocator=None, device=None, barrier=base.ranks_per_host() > 1
+            )
+        if base.ranks_per_host() == 1:
+            return contextlib.nullcontext()
+        barrier = True
+    else:
+        barrier = torch.distributed.is_initialized()
     return _snapshot_scope(
         allocator=get_allocator_class_from_storage(get_allocator_type()),
         device=params.token_to_kv_pool_allocator.get_kvcache().device,
-        barrier=True,
+        barrier=barrier,
     )
 
 

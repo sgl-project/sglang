@@ -338,28 +338,29 @@ class TestHiCacheAutoSize(CustomTestCase):
             self.assertEqual(base.host_memory_preflight([600]), (600, 400))
         barrier.assert_not_called()
 
-    def test_explicit_size_is_a_no_op_off_rocm(self):
-        """Off ROCm an explicit size keeps per-pool sampling and resolves nothing:
-        no snapshot, no collective, no allocator or KV pool lookup."""
-        params = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=Mock())
-        )
+    def test_explicit_size_off_rocm_uses_the_shared_host_budget(self):
+        """Explicit sizes retain the shared snapshot introduced for non-ROCm ranks."""
         with (
             get_context().override_server_args(
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=4),
             patch.object(rocm_budget, "is_hip", return_value=False),
-            patch.object(rocm_budget, "get_allocator_type") as allocator_type,
-            patch.object(base, "available_host_memory_bytes") as sample,
+            patch.object(
+                base,
+                "available_host_memory_bytes",
+                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 4000,
+            ) as sample,
+            patch.object(torch.distributed, "is_initialized", return_value=False),
             patch.object(torch.distributed, "barrier") as barrier,
-            sizing.auto_size_hicache(params=params, draft_plan=None, enabled=True),
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
         ):
-            self.assertIsNone(base._host_memory_budget.get())
-        sample.assert_not_called()
+            self.assertEqual(_plain_left(), 1000)
+        self.assertIsNone(base._host_memory_budget.get())
+        sample.assert_called_once()
         barrier.assert_not_called()
-        allocator_type.assert_not_called()
-        params.token_to_kv_pool_allocator.get_kvcache.assert_not_called()
 
     def _explicit_size_scope(
         self, *, mode, available, hugetlb, gfx950, mappings, ranks

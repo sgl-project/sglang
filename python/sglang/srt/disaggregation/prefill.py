@@ -679,16 +679,25 @@ class SchedulerDisaggregationPrefillMixin:
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
-        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        kv_mgr = bootstrap_queue.kv_manager
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
         lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         for req in batch.reqs:
-            room = getattr(req, "bootstrap_room", None)
+            if (
+                lazy
+                and req.pending_bootstrap
+                and bootstrap_queue.transfer_backend == TransferBackend.NIXL
+            ):
+                # NIXL reserves at send time if the decode prefix arrives after forward.
+                continue
+            room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
                 if lazy and req.extend_end is not None:
-                    prefetch(room, upto_tokens=req.extend_end)
+                    upto_tokens = max(0, req.extend_end - req.disagg_decode_prefix_len)
+                    prefetch(room, upto_tokens=upto_tokens)
                 else:
                     prefetch(room)
 
@@ -1557,9 +1566,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
-    def handle_inflight_transfer_failure(
-        self: Scheduler, req: Req
-    ) -> Optional[Exception]:
+    def handle_inflight_transfer_failure(self: Scheduler, req: Req) -> None:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
@@ -1584,7 +1591,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
-        return exc
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
