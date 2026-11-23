@@ -147,8 +147,7 @@ class TestHistory(CustomTestCase):
         additive, _ = StepPenalties.build(reqs[:1], pool).logit_penalties()
         expected, _ = _expected_penalties(reqs[:1], [[3]])
         torch.testing.assert_close(additive, expected)
-        indices = torch.tensor([reqs[0].penalty_index])
-        self.assertEqual(pool.gather_lens(indices).tolist(), [1])
+        self.assertEqual(pool.live_tables().lens[reqs[0].penalty_index].item(), 1)
 
     def test_commit_into_freed_index_is_reset_by_next_admission(self):
         pool = _pool()
@@ -188,16 +187,12 @@ class TestHistory(CustomTestCase):
 
         pool.free(a)
         pool.free(b)
-        self.assertEqual(pool.counts.shape[0], 0)
-        # Tables built at launch stay; a first read after the drop sees no history.
+        self.assertEqual(pool.tables.counts.shape[0], 0)
+        # Tables built at launch stay; a first read after the drop applies no penalty.
         self.assertIs(read_at_launch.logit_penalties(), tables)
-        additive, scaling = step.logit_penalties()
-        expected = _expected_penalties([a, b], [[], []])
-        torch.testing.assert_close(
-            _stacked(additive, scaling, 2), torch.stack(expected)
-        )
+        self.assertEqual(step.logit_penalties(), (None, None))
         step.commit(torch.tensor([1, 2]))
-        self.assertEqual(pool.counts.shape[0], 0)
+        self.assertEqual(pool.tables.counts.shape[0], 0)
 
         c = _req(3, frequency_penalty=1.0, output_ids=[3])
         _admit(pool, c)
@@ -215,6 +210,44 @@ class TestHistory(CustomTestCase):
         _admit(pool, a)
         additive, _ = StepPenalties.build([a], pool).logit_penalties()
         torch.testing.assert_close(additive, torch.zeros(1, VOCAB_SIZE))
+
+
+class TestParams(CustomTestCase):
+    def test_reused_index_takes_the_new_request_params(self):
+        pool = _pool()
+        live = _req(1, presence_penalty=1.0)
+        a = _req(2, min_new_tokens=5, stop_token_ids=[3], repetition_penalty=2.0)
+        _admit(pool, live)
+        _admit(pool, a)
+        StepPenalties.build([live, a], pool).logit_penalties()
+        index = a.penalty_index
+
+        pool.free(a)
+        b = _req(3, frequency_penalty=0.5, output_ids=[3, 3])
+        _admit(pool, b)
+        self.assertEqual(b.penalty_index, index)
+
+        step = StepPenalties.build([live, b], pool)
+        torch.testing.assert_close(
+            _stacked(*step.logit_penalties(), 2),
+            torch.stack(_expected_penalties([live, b], [[], [3, 3]])),
+        )
+
+    def test_wider_stop_set_keeps_earlier_rows(self):
+        pool = _pool()
+        a = _req(1, min_new_tokens=4, stop_token_ids=[7])
+        _admit(pool, a)
+        StepPenalties.build([a], pool).logit_penalties()
+        b = _req(2, min_new_tokens=4, stop_token_ids=[1, 2, 3, 4, 5])
+        c = _req(3, presence_penalty=1.0)
+        for req in (b, c):
+            _admit(pool, req)
+
+        step = StepPenalties.build([a, b, c], pool)
+        torch.testing.assert_close(
+            _stacked(*step.logit_penalties(), 3),
+            torch.stack(_expected_penalties([a, b, c], [[], [], []])),
+        )
 
 
 class TestBuild(CustomTestCase):
