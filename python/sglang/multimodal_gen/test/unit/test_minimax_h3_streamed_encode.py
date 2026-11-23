@@ -4,6 +4,7 @@
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +152,67 @@ class TestStreamedEncode(CustomTestCase):
                 encoder.close()
                 self.assertEqual(one_shot.read_bytes(), streamed.read_bytes())
 
+    def test_deferred_audio_gives_the_same_mp4(self):
+        """Audio handed over as a callable starts ffmpeg from the writer thread
+        once it returns; frames written before then wait in the queue."""
+        audio = torch.sin(torch.arange(2 * 2 * SAMPLE_RATE) / 7).reshape(2, -1)
+        video = self._video(64, 96)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for deferred in (False, True):
+                paths[deferred] = Path(tmp, f"deferred_{deferred}.mp4")
+                ready = threading.Event()
+
+                def late_audio():
+                    ready.wait()
+                    return audio
+
+                encoder = CudaVideoEncoder.open(
+                    str(paths[deferred]),
+                    device=video.device,
+                    height=64,
+                    width=96,
+                    fps=FPS,
+                    num_frames=video.shape[1],
+                    audio=late_audio if deferred else audio,
+                    audio_sample_rate=SAMPLE_RATE,
+                    max_queued_frames=64,
+                )
+                encoder.write(video[:, :10])
+                self.assertEqual(encoder._process is None, deferred)
+                ready.set()
+                encoder.write(video[:, 10:])
+                encoder.close()
+            self.assertEqual(paths[False].read_bytes(), paths[True].read_bytes())
+
+    def test_failed_deferred_audio_leaves_no_file(self):
+        video = self._video(64, 96)
+
+        def failing_audio():
+            raise RuntimeError("audio decode failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "clip.mp4")
+            encoder = CudaVideoEncoder.open(
+                str(path),
+                device=video.device,
+                height=64,
+                width=96,
+                fps=FPS,
+                num_frames=video.shape[1],
+                audio=failing_audio,
+                audio_sample_rate=SAMPLE_RATE,
+                max_queued_frames=64,
+            )
+            try:
+                encoder.write(video)
+            except RuntimeError:
+                pass
+            with self.assertRaises(RuntimeError):
+                encoder.close()
+            self.assertIsNone(encoder._process)
+            self.assertFalse(path.exists())
+
     def test_concurrent_encodes_both_finish(self):
         # only one staging buffer is cached, so the other one is closed on release
         video = self._video(64, 96)
@@ -172,6 +234,19 @@ class TestStreamedEncode(CustomTestCase):
             for encoder in encoders:
                 encoder.close()
             self.assertEqual(paths[0].read_bytes(), paths[1].read_bytes())
+
+    def test_staging_buffer_serves_smaller_frames(self):
+        from sglang.multimodal_gen.runtime.entrypoints import utils
+
+        utils._close_cached_cuda_video_buffer()
+        with utils._acquire_cuda_video_buffer((4, 100)) as (array, rows):
+            address = array.ctypes.data
+            self.assertTrue(rows.is_pinned())
+        with utils._acquire_cuda_video_buffer((3, 50)) as (array, rows):
+            self.assertEqual((array.shape, tuple(rows.shape)), ((3, 50), (3, 50)))
+            self.assertEqual(array.ctypes.data, address)
+            self.assertEqual(rows.data_ptr(), address)
+        utils._close_cached_cuda_video_buffer()
 
     def test_a_failed_encode_leaves_no_file(self):
         video = self._video(64, 96)

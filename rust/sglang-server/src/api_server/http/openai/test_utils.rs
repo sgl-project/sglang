@@ -47,7 +47,7 @@ pub(super) fn checkpoint_formatter(
     formatter.unwrap_or_else(|| panic!("{error:?}"))
 }
 
-pub(super) fn core_handle() -> CoreHandle {
+pub(crate) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
         flume::unbounded().0,
@@ -63,6 +63,7 @@ pub(super) fn core_handle() -> CoreHandle {
             metrics: None,
             request_log: None,
             generate_validator: None,
+            abort_hook: None,
         },
     )
 }
@@ -175,13 +176,14 @@ pub(super) fn frontend_closed() -> CoreHandle {
             metrics: None,
             request_log: None,
             generate_validator: None,
+            abort_hook: None,
         },
     )
 }
 
 /// App state whose core intake answers every generation with one finished
 /// `ok` chunk, with the ChatML template so chat can render.
-fn answering_app_state() -> Arc<super::AppState> {
+pub(in crate::api_server::http) fn answering_app_state() -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
     answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
 }
@@ -254,6 +256,7 @@ fn answering_app_state_built(
             metrics: None,
             request_log,
             generate_validator: None,
+            abort_hook: None,
         },
     );
     // The test tokenizers add no specials, so one handle serves both modes.
@@ -271,6 +274,11 @@ fn answering_app_state_built(
         chat_formatter: Some(formatter),
         generate_hook: None,
     })
+}
+
+/// The built-in chatml template, for tests that render a chat prompt.
+pub(crate) fn chatml_formatter() -> super::ChatFormatter {
+    sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()
 }
 
 /// Serve one request through the full router (extractors, auth, routing).
@@ -552,7 +560,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             fields: vec![("rid".into(), "None".into())],
             batch_item_fields: Vec::new(),
             batch_shared_fields: Vec::new(),
-            headers: vec!["x-smg-routing-key".into()],
+            headers: vec!["x-sgl-routing-key".into()],
             exceeded_ms: -1,
             openai_requests: true,
             chat_completion_fields: vec![("model".into(), None)],
@@ -575,7 +583,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             .method("POST")
             .uri(path)
             .header("content-type", "application/json")
-            .header("x-smg-routing-key", "conv-1")
+            .header("x-sgl-routing-key", "conv-1")
             .body(Body::from(body.to_string()))
             .unwrap();
         let response = oneshot(app.clone(), req).await;
@@ -596,7 +604,7 @@ async fn openai_request_lines_carry_whitelisted_headers() {
         );
         for line in &lines {
             assert!(
-                line.contains(", headers={'x-smg-routing-key': 'conv-1'}"),
+                line.contains(", headers={'x-sgl-routing-key': 'conv-1'}"),
                 "{path}: {line}"
             );
         }

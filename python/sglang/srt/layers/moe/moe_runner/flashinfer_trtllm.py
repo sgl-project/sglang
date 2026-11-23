@@ -26,7 +26,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    deployment_attn_dp_size,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_out_wrapper,
@@ -41,9 +44,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_context,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
+    get_resources,
+    get_schedule,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.utils.device import is_flashinfer_available
 from sglang.srt.utils.log_utils import print_info_once
@@ -897,14 +904,13 @@ def trtllm_nvfp4_hidden_alignment(
 ) -> int:
     """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
 
-    The per-token (dynamic activation scale) non-gated variant ships far fewer
-    tile configs than the static one. At Nemotron's hidden size 2688 it runs
-    but produces garbage (GSM8K ~0.02 on FlashInfer 0.7.0.post1), while a
-    512-aligned hidden size is correct. Every other variant runs unpadded.
+    The kernels require a hidden size that is a multiple of 256, and of 512
+    for the per-token (dynamic activation scale) non-gated variant. A
+    misaligned hidden size runs without error but returns wrong outputs.
     """
     if use_per_token_activation and not is_gated:
         return 512
-    return 1
+    return 256
 
 
 def align_fp4_moe_weights_for_flashinfer_trtllm(
@@ -1551,6 +1557,54 @@ def _run_cuda_mxfp4_decode_moe(
     )
 
 
+_MXFP4_MOE_WORKSPACE = "trtllm_gen_mxfp4_moe_workspace"
+
+
+def reserve_trtllm_mxfp4_moe_workspace(
+    *, layer: Module, hidden_size: int, intermediate_size: int, precision: str
+) -> None:
+    from flashinfer.fused_moe import trtllm_fused_moe_workspace_size
+    from flashinfer.tllm_enums import ActivationType
+
+    # Kernel tests load weights without a published server config.
+    if not get_context().is_config_namespace_published("disagg"):
+        return
+    if get_disagg().disaggregation_mode == "decode":
+        return
+    prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    max_num_tokens = next_power_of_2(prefill_tokens * deployment_attn_dp_size())
+    activation_type = (
+        ActivationType.Situ
+        if layer.moe_runner_config.activation == "situ"
+        else ActivationType.Swiglu
+    )
+    num_bytes = trtllm_fused_moe_workspace_size(
+        max_num_tokens=max_num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=layer.num_experts,
+        top_k=layer.top_k,
+        quant_mode="mxfp4_mxfp8" if precision == "default" else "mxfp4_bf16",
+        local_num_experts=layer.num_local_experts,
+        activation_type=activation_type.value,
+        gemm1_weights=layer.w13_weight,
+        gemm1_weights_scale=layer.w13_weight_scale,
+        gemm2_weights=layer.w2_weight,
+        gemm2_weights_scale=layer.w2_weight_scale,
+    )
+    buffers = get_resources().buffers
+    current = buffers.get(_MXFP4_MOE_WORKSPACE)
+    if current is not None and current.numel() >= num_bytes:
+        return
+    buffers[_MXFP4_MOE_WORKSPACE] = torch.empty(
+        num_bytes, dtype=torch.uint8, device=layer.w13_weight.device
+    )
+    print_info_once(
+        f"trtllm-gen MXFP4 MoE workspace reserved: {num_bytes / (1 << 30):.2f} GiB "
+        f"for {max_num_tokens} tokens"
+    )
+
+
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
@@ -1738,6 +1792,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 output=symm_output,
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+                # flashinfer rejects workspace_buffer with do_finalize=False.
+                workspace_buffer=(
+                    None
+                    if defer_finalize
+                    else get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
+                ),
             )
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
@@ -1788,6 +1848,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+            workspace_buffer=get_resources().buffers.get(_MXFP4_MOE_WORKSPACE),
         )
         return StandardCombineInput(hidden_states=symm_output)
 
@@ -1823,6 +1884,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        workspace_buffer=get_resources().buffers.get(_MXFP4_MOE_WORKSPACE),
     )[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 
@@ -2023,18 +2085,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 "or the logits-based bypassed TopK input"
             )
 
-    symm_output = None
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
         hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
     )
     if defer_finalize:
-        if use_routed_topk:
-            # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
-            # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
-            )
+        # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
+        # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
+        symm_output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+        )
     else:
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
@@ -2101,8 +2161,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
-        if symm_output is not None:
-            moe_kwargs["output"] = symm_output
+        moe_kwargs["output"] = symm_output
         result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(
@@ -2159,8 +2218,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
-        if not defer_finalize:
-            moe_kwargs["output"] = symm_output
+        moe_kwargs["output"] = symm_output
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:

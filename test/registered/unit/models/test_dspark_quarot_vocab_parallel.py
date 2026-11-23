@@ -4,7 +4,7 @@ The production draft constructor creates both tables; their real weight loaders,
 embedding forward and base-logit gather are compared with full-table arithmetic.
 Two-rank Gloo covers TP2 and DP2 with effective draft TP1. It does not cover a
 multi-rank attention subgroup inside DP, HCCL, attention, or model acceptance.
-Only the constructor's NPU eligibility query is mocked; tensors stay on CPU.
+Each worker constructs RoPE on CPU and mocks the draft's NPU eligibility.
 """
 
 import tempfile
@@ -86,6 +86,7 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
         envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.override(True),
         glm_dspark_quarot_scope(plan),
         patch("sglang.srt.models.dspark.is_npu", return_value=True),
+        patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
         torch.device("cpu"),
     ):
         model = DSparkDraftModel(config)

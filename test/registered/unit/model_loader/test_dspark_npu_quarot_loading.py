@@ -1,8 +1,7 @@
 """Exercise the opt-in QuaRot draft loader with a real, small BF16 checkpoint.
 
-Only the DSpark activation predicate is patched to NPU. Tensor allocation,
-checkpoint loading, FC and normalization run on CPU; this is not an NPU
-arithmetic, full-model correctness or acceptance-rate test.
+The test selects CPU RoPE and controls the draft's NPU eligibility. Tensor
+allocation, checkpoint loading, FC and normalization all run on CPU.
 """
 
 import json
@@ -108,6 +107,7 @@ class TestDSparkNpuQuaRotLoading(CustomTestCase):
             target_model_path=str(self.root / "target"),
         )
 
+    @patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
     def _load(self, *, enabled=True, npu=True, scope=True, weights=None):
         (self.model_dir / "config.json").write_text(json.dumps(self.config))
         save_file(

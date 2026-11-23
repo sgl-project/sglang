@@ -44,6 +44,7 @@ class _CaptureAttention(nn.Module):
         return q
 
 
+@patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
 def _make_attention(head_dim, *, dtype=torch.float32, neox=True, scaling=1.0):
     # Avoid distributed group initialization while exercising the production
     # forward with real projection, norm and rotary modules.
@@ -76,6 +77,7 @@ def _make_attention(head_dim, *, dtype=torch.float32, neox=True, scaling=1.0):
             **rope_kwargs, scaling_factors=[scaling]
         )
     attn.attn = _CaptureAttention()
+    attn.save_kv_cache = True
     attn.v_scale = None
     attn.attention_sink_bias = None
     attn.use_table_qk_norm_rope = False

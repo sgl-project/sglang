@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -134,6 +135,7 @@ class TestDSparkWeightLoading(CustomTestCase):
         self.model_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config, self.weights = _checkpoint()
 
+    @patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
     def _load(self):
         (self.model_dir / "config.json").write_text(json.dumps(self.config))
         save_file(self.weights, str(self.model_dir / "model.safetensors"))
