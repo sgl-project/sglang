@@ -20,12 +20,15 @@ import unittest
 
 import numpy as np
 import requests
-import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
 from sglang.srt.utils.device import get_device_count, get_device_module, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import (
     ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
@@ -44,7 +47,7 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=126, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=190, stage="extra-a", runner_config="2-gpu-large-amd")
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 
 def verify_params_close(params1, params2, error_msg):
@@ -73,6 +76,8 @@ def init_process(
     event_dst_ready_list,
     remote_instance_loader_backend,
 ):
+    if is_xpu():
+        os.environ["MC_USE_TENT"] = "1"
     get_device_module().set_device(rank)
 
     if rank == 0:
