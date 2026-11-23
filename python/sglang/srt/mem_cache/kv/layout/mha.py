@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     _set_kv_buffer_impl,
     _set_mha_kv_buffer_prefix_valid,
+    _try_set_kv_buffer_fp8,
     masked_set_kv_buffer_kernel,
     unwrap_write_loc,
     write_loc_is_physical,
@@ -515,6 +516,26 @@ class MHAView(MHAKVView):
 
             store_sf_token_major(k_scale, self.k_scale_buffer[idx], loc)
             store_sf_token_major(v_scale, self.v_scale_buffer[idx], loc)
+        if (
+            not self.is_mxfp8
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype == torch.float8_e4m3fn
+            and self.v_row_dim == self.row_dim
+        ):
+            idx = layer_id - self.start_layer
+            if _try_set_kv_buffer_fp8(
+                k=cache_k,
+                v=cache_v,
+                k_cache=self._typed(self.k_buffer[idx]),
+                v_cache=self._typed(self.v_buffer[idx]),
+                indices=loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                row_dim=self.row_dim,
+                size_limit=self.size + self.page_size,
+            ):
+                return
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
