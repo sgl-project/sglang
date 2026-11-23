@@ -1256,21 +1256,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-            if verify.first_row_only is not None:
-                # The graph accepts never run with a custom logit processor: it
-                # adjusts the logits.
-                (
-                    accept.correct_len,
-                    accept.commit_lens,
-                    accept.bonus,
-                    accept.new_seq_lens,
-                ) = verify.cap_chain_accept(
+            # The graph accepts never run with a custom logit processor: it
+            # adjusts the logits.
+            accept.commit_lens, accept.bonus, accept.new_seq_lens = (
+                verify.cap_chain_accept(
                     out_tokens=accept.out_tokens,
-                    correct_len=accept.correct_len,
                     commit_lens=accept.commit_lens,
                     bonus=accept.bonus,
                     prefix_lens=prefix_lens,
+                    new_seq_lens=accept.new_seq_lens,
                 )
+            )
         verify.commit(
             VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
             logits_output=logits_output,

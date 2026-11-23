@@ -3681,14 +3681,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
-        if verify.first_row_only is not None:
-            accept_len, commit_lens, bonus, new_seq_lens = verify.cap_chain_accept(
-                out_tokens=out_tokens,
-                correct_len=accept_len,
-                commit_lens=commit_lens,
-                bonus=bonus,
-                prefix_lens=prefix_lens,
-            )
+        commit_lens, bonus, new_seq_lens = verify.cap_chain_accept(
+            out_tokens=out_tokens,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            prefix_lens=prefix_lens,
+            new_seq_lens=new_seq_lens,
+        )
         verify.commit(
             VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
             logits_output=logits_output,

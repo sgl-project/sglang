@@ -42,7 +42,8 @@ class CustomLogitProcessor(ABC):
     # Whether the processor is right on every speculative verify row: it reads a
     # row's tokens as req.output_ids followed by params[ROW_PREFIX_KEY], or reads
     # no history at all. Otherwise verify runs it on each request's first row
-    # only and commits one token per round for that request.
+    # only and commits one token per round for that request. Each row gets its
+    # own copy of the request's params.
     supports_row_prefix: bool = False
 
     @abstractmethod

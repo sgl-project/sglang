@@ -177,8 +177,8 @@ class TestRowPrefixes(CustomTestCase):
             self.assertEqual(verify.row_prefixes, _chain()["row_prefixes"] * 2)
             self.assertEqual(
                 None
-                if verify.first_row_only is None
-                else verify.first_row_only.tolist(),
+                if verify.first_row_only_reqs is None
+                else verify.first_row_only_reqs.tolist(),
                 first_row_only,
             )
 
@@ -191,7 +191,7 @@ class TestOneTokenCap(CustomTestCase):
             watermark=None,
             watermark_full_mask=True,
         )
-        verify.first_row_only = torch.tensor(first_row_only)
+        verify.first_row_only_reqs = torch.tensor(first_row_only)
         return verify
 
     def test_tree_accept_keeps_the_first_token(self):
@@ -205,20 +205,30 @@ class TestOneTokenCap(CustomTestCase):
         """Request 0 accepted draft 1 (commits it), request 1 accepted none
         (commits its first-row bonus), request 2 is not capped."""
         out_tokens = torch.tensor([[21, 22, 23], [31, 0, 0], [41, 42, 43]])
-        correct_len, commit_lens, bonus, new_seq_lens = self._verify(
-            [0, 1]
-        ).cap_chain_accept(
+        commit_lens, bonus, new_seq_lens = self._verify([0, 1]).cap_chain_accept(
             out_tokens=out_tokens,
-            correct_len=torch.tensor([2, 0, 2]),
             commit_lens=torch.tensor([3, 1, 3], dtype=torch.int32),
             bonus=torch.tensor([23, 31, 43]),
             prefix_lens=torch.tensor([10, 20, 30]),
+            new_seq_lens=None,
         )
-        self.assertEqual(correct_len.tolist(), [0, 0, 2])
         self.assertEqual(commit_lens.tolist(), [1, 1, 3])
         self.assertEqual(commit_lens.dtype, torch.int32)
         self.assertEqual(bonus.tolist(), [21, 31, 43])
         self.assertEqual(new_seq_lens.tolist(), [11, 21, 33])
+
+    def test_nothing_capped_returns_the_inputs(self):
+        verify = self._verify([])
+        verify.first_row_only_reqs = None
+        commit_lens, bonus = torch.tensor([3]), torch.tensor([7])
+        out = verify.cap_chain_accept(
+            out_tokens=torch.tensor([[5, 6, 7]]),
+            commit_lens=commit_lens,
+            bonus=bonus,
+            prefix_lens=torch.tensor([10]),
+            new_seq_lens=None,
+        )
+        self.assertEqual(out, (commit_lens, bonus, None))
 
 
 class TestCustomLogitProcessorSync(CustomTestCase):

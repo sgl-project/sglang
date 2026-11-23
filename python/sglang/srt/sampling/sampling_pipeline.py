@@ -316,7 +316,7 @@ class VerifyStep(msgspec.Struct):
     row_prefixes: Optional[List[List[int]]] = None
     # The requests whose custom logit processor ran on their first row only
     # (it does not support row prefixes): each commits one token.
-    first_row_only: Optional[torch.Tensor] = None
+    first_row_only_reqs: Optional[torch.Tensor] = None
 
     def bind_tree(
         self,
@@ -349,7 +349,7 @@ class VerifyStep(msgspec.Struct):
         info = batch.sampling_info
         if info is not None and info.has_custom_logit_processor:
             self.row_prefixes = verify_row_prefixes(*tree.resolve())
-            self.first_row_only = first_row_only_requests(info)
+            self.first_row_only_reqs = first_row_only_requests(info)
 
     def adjust(
         self,
@@ -399,32 +399,33 @@ class VerifyStep(msgspec.Struct):
     def cap_tree_accept(
         self, accept_lens: torch.Tensor, accept_index: torch.Tensor
     ) -> None:
-        """Cut each `first_row_only` request's tree accept to its first token, in
+        """Cut each `first_row_only_reqs` request's tree accept to its first token, in
         place: the accepted first draft, or else the bonus from the first row.
         That is the first row's distribution, so the sampling stays exact."""
-        if self.first_row_only is None:
+        if self.first_row_only_reqs is None:
             return
-        accept_lens.index_fill_(0, self.first_row_only, 1)
-        accept_index[:, 1:].index_fill_(0, self.first_row_only, -1)
+        accept_lens.index_fill_(0, self.first_row_only_reqs, 1)
+        accept_index[:, 1:].index_fill_(0, self.first_row_only_reqs, -1)
 
     def cap_chain_accept(
         self,
         *,
         out_tokens: torch.Tensor,
-        correct_len: torch.Tensor,
         commit_lens: torch.Tensor,
         bonus: torch.Tensor,
         prefix_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Cut each `first_row_only` request's chain accept to its first token,
-        `out_tokens[:, 0]`, as `cap_tree_accept` does; call it only when
-        `first_row_only` is set. Returns the capped `correct_len`, `commit_lens`,
-        `bonus`, and the new sequence lengths."""
+        new_seq_lens: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Cut each `first_row_only_reqs` request's chain accept to its first
+        token, `out_tokens[:, 0]`, as `cap_tree_accept` does. Returns the
+        `commit_lens`, `bonus`, and `new_seq_lens` to commit. The accept core's
+        correct lengths stay uncapped: the acceptance estimators read them."""
+        if self.first_row_only_reqs is None:
+            return commit_lens, bonus, new_seq_lens
         capped = torch.zeros_like(commit_lens, dtype=torch.bool)
-        capped.index_fill_(0, self.first_row_only, True)
+        capped.index_fill_(0, self.first_row_only_reqs, True)
         commit_lens = torch.where(capped, 1, commit_lens)
         return (
-            torch.where(capped, 0, correct_len),
             commit_lens,
             torch.where(capped, out_tokens[:, 0].to(bonus.dtype), bonus),
             prefix_lens + commit_lens.to(prefix_lens.dtype),
