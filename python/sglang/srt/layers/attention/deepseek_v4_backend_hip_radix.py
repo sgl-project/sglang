@@ -110,6 +110,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -3511,10 +3514,6 @@ class DeepseekV4HipRadixBackend(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
         elif forward_batch.forward_mode.is_extend():
-            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-                is_in_breakable_cuda_graph,
-            )
-
             # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
             assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"
             assert (
@@ -3527,8 +3526,16 @@ class DeepseekV4HipRadixBackend(
                 if is_in_breakable_cuda_graph()
                 else self._indexer_row_shard(layer, num_rows=x.shape[0])
             )
+            tail = self.forward_metadata.late_layer_tail
             if row_shard is not None and not indexer_row_shard_pays(
-                self, layer.compress_ratio, forward_batch, row_shard.world
+                ratio=layer.compress_ratio,
+                extend_lens=(
+                    tail.extend_seq_lens_cpu
+                    if tail is not None
+                    else forward_batch.extend_seq_lens_cpu
+                ),
+                seq_lens=forward_batch.seq_lens_cpu,
+                world=row_shard.world,
             ):
                 row_shard = None
             low_ratio_index_topk_hip_extend(

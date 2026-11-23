@@ -71,6 +71,10 @@ if TYPE_CHECKING:
 
 # fp32 logits scored per candidate-block chunk stay under this many bytes
 _CANDIDATE_SCORE_BUDGET_BYTES = 1 << 30
+# Mean compressed positions per row where the row shard pays; measured on MI355X, 16,384-row
+# calls (TP4: 0.57-0.77x at 4,096, 1.01-1.23x at 12,288; TP2: 0.65x at 12,288, 1.24x at 28,672).
+INDEXER_ROW_SHARD_MIN_CONTEXT = 12288
+INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4 = 24576
 
 logger = logging.getLogger(__name__)
 
@@ -840,15 +844,6 @@ def low_ratio_index_topk_hip_extend(
         backend.candidate_masks = publish
 
 
-# Measured on MI355X with 16,384-row calls, by the compressed positions their rows see on
-# average: at TP4 0.57-0.77x at 4,096 and 1.01-1.23x at 12,288; at TP2 0.65x at 12,288 and
-# 1.24x at 28,672. The all-gather and the per-call schedule cost about 0.6 ms whatever the
-# context, and a larger group saves a larger share of the scoring, so TP4's floor also
-# holds above TP4.
-INDEXER_ROW_SHARD_MIN_CONTEXT = 12288
-INDEXER_ROW_SHARD_MIN_CONTEXT_BELOW_TP4 = 24576
-
-
 def _compressed_positions_seen(n: int, ratio: int) -> int:
     """sum(q // ratio for q in 1..n): what rows at positions 0..n-1 see in all."""
     a, b = divmod(n, ratio)
@@ -856,19 +851,12 @@ def _compressed_positions_seen(n: int, ratio: int) -> int:
 
 
 def indexer_row_shard_pays(
-    backend, ratio: int, forward_batch: ForwardBatch, world: int
+    *, ratio: int, extend_lens: Sequence[int], seq_lens: Sequence[int], world: int
 ) -> bool:
-    """Whether the call's rows see enough compressed context on average for the row
-    shard over world ranks to pay; a row at position p sees (p + 1) // ratio positions,
-    and a request's rows are the last of its sequence. Every input is a replicated CPU
-    list, so all ranks agree."""
-    tail = backend.forward_metadata.late_layer_tail
-    lens = (
-        tail.extend_seq_lens_cpu
-        if tail is not None
-        else _as_int_list(forward_batch.extend_seq_lens_cpu)
-    )
-    seq_lens = _as_int_list(forward_batch.seq_lens_cpu)
+    """Whether the rows (the last extend_lens of each sequence) see enough compressed context
+    on average for a row shard over world ranks; the lengths are replicated CPU lists."""
+    lens = _as_int_list(extend_lens)
+    seq_lens = _as_int_list(seq_lens)
     rows = sum(lens)
     context = sum(
         _compressed_positions_seen(s, ratio) - _compressed_positions_seen(s - n, ratio)
