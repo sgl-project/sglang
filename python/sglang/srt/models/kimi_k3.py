@@ -4382,8 +4382,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
         # shard work across ranks image-wise via the DP runner.
         self.use_data_parallel = True
 
-        self.vision_tower = KimiK3VisionTower(config.vision_config)
-        self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        self._skip_vision = bool(config.language_only or config.language_model_only)
+        if not self._skip_vision:
+            self.vision_tower = KimiK3VisionTower(config.vision_config)
+            self.mm_projector = KimiK3MultiModalProjector(config.vision_config)
+        else:
+            self.vision_tower = None
+            self.mm_projector = None
 
         self.language_model = None
         if not config.encoder_only:
@@ -4418,7 +4423,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
-        if self.config.language_only:
+        if self._skip_vision:
             return
         if self.vision_tower.precompile_fused_rope():
             logger.info("Precompiled dynamic-token fused K3 vision RoPE kernel")
@@ -4757,7 +4762,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         vision_params = (
             None
-            if self.config.language_only
+            if self._skip_vision
             else dict(self.named_parameters(remove_duplicate=False))
         )
 

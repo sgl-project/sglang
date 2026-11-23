@@ -95,6 +95,8 @@ class KimiK3Config(PretrainedConfig):
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         image_placeholder: str = "<|kimi_image_placeholder|>",
+        language_only: bool = False,
+        language_model_only: bool = False,
         **kwargs,
     ):
         if text_config is None:
@@ -117,6 +119,8 @@ class KimiK3Config(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
+        self.language_only = language_only
+        self.language_model_only = language_model_only
 
         if getattr(self.text_config, "quantization_config", None) is not None:
             self.quantization_config = self.text_config.quantization_config
