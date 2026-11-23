@@ -91,7 +91,7 @@ cp target/release/libsglang_bench.so \
   `lmdeploy-chat` (`/v1/chat/completions`), streaming and not.
 - **Protocols**: `--protocol http` (default) and `--protocol grpc`, the Rust
   server's `sglang.api.v1` service (below).
-- **Datasets**: `random`, `random-ids`, `sharegpt`.
+- **Datasets**: `random`, `random-ids`, `sharegpt`, and `token-ids` (below).
 - Poisson request pacing (`--request-rate`), a concurrency cap, warmup, cache
   flush, profiler start/stop, the readiness probe, `--extra-request-body`,
   custom headers, and API-key auth.
@@ -114,6 +114,23 @@ loads no tokenizer at all and needs no model files; the retokenized totals
 then report 0, since there is no text to re-encode. That combination takes
 the tokenizer and detokenizer out of the measurement on both ends, which is
 the datapath `sglang-server` is built around.
+
+### Pre-tokenized prompts
+
+`--dataset-name token-ids --dataset-path <file.jsonl>` replays prompts that
+were tokenized ahead of time, one JSON object per line:
+
+```json
+{"input_ids": [151644, 872, 198], "output_len": 256}
+```
+
+Lines are read in file order up to `--num-prompts`, and each line's ids are
+sent as they are, so the server's tokenizer and chat template play no part in
+what is measured. `--sharegpt-output-len` overrides every line's
+`output_len`, as it does for the Python `custom` dataset. The ids must come
+from the served model's tokenizer; the client does not check them. The ids
+travel as `input_ids` on `/generate` and as a token-array `prompt` on
+`/v1/completions`; a chat backend cannot carry them and is refused.
 
 ### gRPC
 
