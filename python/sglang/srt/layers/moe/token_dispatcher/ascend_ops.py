@@ -21,7 +21,9 @@ from sglang.srt.hardware_backend.npu.moe.routing import (
     npu_moe_finalize_routing,
     npu_moe_init_routing,
 )
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
+    ascend_allgather_row_sizes_for_batch,
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
     is_dp_attention_enabled,
@@ -548,7 +550,16 @@ class AscendOpsDispatcher(BaseDispatcher):
         return [int(rows.item()) for rows in gathered_rows]
 
     def _resolve_allgather_row_sizes(self, local_rows: int, group, device) -> list[int]:
-        row_sizes = get_forward().ascend_allgather_row_sizes
+        forward = get_forward()
+        row_sizes = forward.ascend_allgather_row_sizes
+        if row_sizes is None:
+            batch = forward.forward_batch
+            if batch is not None:
+                row_sizes = ascend_allgather_row_sizes_for_batch(
+                    batch,
+                    use_cp=is_cp_active(batch),
+                    use_tp_attn_a2a_scatter=forward.moe_input_attn_tp_sliced,
+                )
         # Use the same branch on every rank. A local mismatch is an invariant
         # violation, so it cannot switch this rank to a different collective.
         if row_sizes is None or len(row_sizes) != dist.get_world_size(group):

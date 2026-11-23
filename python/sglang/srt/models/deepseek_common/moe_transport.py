@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    ascend_allgather_row_sizes_for_batch,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -47,66 +48,6 @@ def shared_expert_runs_locally(moe):
         and moe.shared_experts is not None
         and moe._shared_expert_tp1
     )
-
-
-def ascend_allgather_row_sizes_for_batch(
-    forward_batch,
-    *,
-    use_cp: bool,
-    use_tp_attn_a2a_scatter: bool,
-) -> list[int] | None:
-    """Per-TP-rank row counts for the ascend_ops prefill allgather path.
-
-    ``None`` means the layout cannot be derived from the batch alone, so the
-    dispatcher must exchange row counts on the fly.
-    """
-    parallel = get_parallel()
-    if use_cp:
-        if parallel.attn_cp_size == parallel.tp_size:
-            metadata = forward_batch.attn_cp_metadata
-            return getattr(metadata, "per_rank_actual_token", None)
-        return None
-
-    if parallel.attn_cp_size != 1 or parallel.attn_dp_size == 1:
-        return None
-    dp_rows = forward_batch.global_num_tokens_padded_cpu
-    if dp_rows is None or len(dp_rows) != parallel.attn_dp_size:
-        return None
-    attn_tp_size = parallel.attn_tp_size
-    if attn_tp_size == 1:
-        return dp_rows
-    if not use_tp_attn_a2a_scatter:
-        return None
-
-    # Match tensor_split() at the point where the transport shards rows.
-    row_sizes = []
-    for rows in dp_rows:
-        base, extra = divmod(rows, attn_tp_size)
-        row_sizes.extend(base + (rank < extra) for rank in range(attn_tp_size))
-    return row_sizes
-
-
-def ascend_allgather_row_layout(forward_batch):
-    """Publish the batch's row layout for the ascend_ops prefill allgather path.
-
-    Lets the dispatcher skip its per-MoE-layer row-count exchange. Only layouts
-    derivable from the batch are published; otherwise the dispatcher keeps its
-    on-the-fly exchange.
-    """
-    if not (
-        get_is_extend_in_batch()
-        and get_moe_a2a_backend().is_ascend_ops()
-        and get_moe_ascend_ops_config().prefill == "allgather"
-    ):
-        return nullcontext()
-    row_sizes = ascend_allgather_row_sizes_for_batch(
-        forward_batch,
-        use_cp=is_cp_active(forward_batch),
-        use_tp_attn_a2a_scatter=False,
-    )
-    if row_sizes is None:
-        return nullcontext()
-    return get_forward().scoped(ascend_allgather_row_sizes=row_sizes)
 
 
 @contextmanager
