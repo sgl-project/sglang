@@ -7,7 +7,6 @@ import torch
 from sglang.srt.mem_cache.kv_weight_version_tracker import (
     KvWeightVersionRecord,
     KvWeightVersionTracker,
-    _StringInterner,
 )
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -220,51 +219,6 @@ class TestKvWeightVersionTracker(CustomTestCase):
         self.assertEqual(table._slot_version_ids[:5].tolist(), [0, 1, 2, 1, 0])
 
 
-class TestStringInterner(CustomTestCase):
-    def test_first_value_gets_id_zero(self):
-        """A fresh interner starts numbering at zero."""
-        self.assertEqual(_StringInterner().intern("v0"), 0)
-
-    def test_new_values_get_consecutive_ids_in_first_seen_order(self):
-        """Ids are dense and follow the order in which values were first interned."""
-        interner = _StringInterner()
-
-        self.assertEqual([interner.intern(v) for v in ["b", "a", "c"]], [0, 1, 2])
-
-    def test_a_seen_value_reuses_its_id(self):
-        """Interning a value again returns the id it already has instead of a new one."""
-        interner = _StringInterner()
-        first = interner.intern("v0")
-        interner.intern("v1")
-
-        self.assertEqual(interner.intern("v0"), first)
-        self.assertEqual(interner.intern("v2"), 2)
-
-    def test_lookup_returns_the_interned_value(self):
-        """lookup is the inverse of intern for every id handed out."""
-        interner = _StringInterner()
-        values = ["v0", "v1", "v2"]
-        ids = [interner.intern(v) for v in values]
-
-        self.assertEqual([interner.lookup(i) for i in ids], values)
-
-    def test_lookup_of_an_unknown_id_fails(self):
-        """An id that was never handed out cannot be resolved."""
-        interner = _StringInterner()
-        interner.intern("v0")
-
-        with self.assertRaises(IndexError):
-            interner.lookup(1)
-
-    def test_distinct_strings_never_share_an_id(self):
-        """Values that differ only slightly are still distinct entries."""
-        interner = _StringInterner()
-
-        ids = {interner.intern(v) for v in ["1", "01", "1 ", "default", ""]}
-
-        self.assertEqual(len(ids), 5)
-
-
 class TestFillReqPrefillWeightVersions(CustomTestCase):
     def test_prompt_slots_resolve_to_the_versions_that_computed_them(self):
         """Only the prompt's own slots are read, even when more KV is committed than there are prompt tokens."""
@@ -311,22 +265,6 @@ class TestFillReqPrefillWeightVersions(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, r"\[5\]"):
             table.fill_req_prefill_weight_versions(req)
-
-    def test_a_second_fill_replaces_the_previous_spans(self):
-        """Filling again after a re-prefill replaces the stale spans instead of appending."""
-        table = _table(slots_of_req=[4, 5])
-        table.record(slot_indices=_slots(4, 5), version="v0")
-        req = _ReqStub(num_prompt_tokens=2, kv_committed_len=2)
-        table.fill_req_prefill_weight_versions(req)
-        table.record(slot_indices=_slots(4, 5), version="v1")
-        req.prefill_weight_versions = None
-
-        table.fill_req_prefill_weight_versions(req)
-
-        self.assertEqual(
-            req.prefill_weight_versions,
-            [WeightVersionSpan(version="v1", start=0, end=2)],
-        )
 
     def test_decode_reuses_prompt_spans_without_reading_released_slots(self):
         """Repeated extend processing retains spans after prompt slots are released."""

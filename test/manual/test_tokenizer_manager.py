@@ -41,7 +41,7 @@ class TestInputFormatDetection(unittest.TestCase):
         with (
             patch("zmq.asyncio.Context"),
             patch("sglang.srt.utils.network.get_zmq_socket"),
-            patch("sglang.srt.utils.hf_transformers.get_tokenizer") as mock_tokenizer,
+            patch("sglang.srt.hf_transformers.get_tokenizer") as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             publish(self.server_args, role="tokenizer")
@@ -138,7 +138,7 @@ class TestTokenizerInputPreparation(unittest.TestCase):
         with (
             patch("zmq.asyncio.Context"),
             patch("sglang.srt.utils.network.get_zmq_socket"),
-            patch("sglang.srt.utils.hf_transformers.get_tokenizer") as mock_tokenizer,
+            patch("sglang.srt.hf_transformers.get_tokenizer") as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             publish(self.server_args, role="tokenizer")
@@ -197,7 +197,7 @@ class TestTokenizerResultExtraction(unittest.TestCase):
         with (
             patch("zmq.asyncio.Context"),
             patch("sglang.srt.utils.network.get_zmq_socket"),
-            patch("sglang.srt.utils.hf_transformers.get_tokenizer") as mock_tokenizer,
+            patch("sglang.srt.hf_transformers.get_tokenizer") as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             publish(self.server_args, role="tokenizer")
@@ -320,7 +320,7 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
         with (
             patch("zmq.asyncio.Context"),
             patch("sglang.srt.utils.network.get_zmq_socket"),
-            patch("sglang.srt.utils.hf_transformers.get_tokenizer") as mock_tokenizer,
+            patch("sglang.srt.hf_transformers.get_tokenizer") as mock_tokenizer,
         ):
             mock_tokenizer.return_value = Mock(vocab_size=32000)
             publish(self.server_args, role="tokenizer")

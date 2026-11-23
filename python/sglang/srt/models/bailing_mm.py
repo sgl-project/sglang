@@ -24,6 +24,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -35,7 +36,6 @@ from sglang.srt.models.bailing_moe import BailingMoeV2ForCausalLM
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

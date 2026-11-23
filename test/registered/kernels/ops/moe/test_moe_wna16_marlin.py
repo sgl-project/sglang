@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -30,15 +30,6 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
-
-
-def _has_aot_moe_wna16_marlin_gemm() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
-        torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
-    )
-
-
-AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -151,59 +142,6 @@ def _run_single_gemm(
     )
 
 
-def _run_single_gemm_aot(
-    a,
-    c,
-    qweight,
-    scales,
-    zeros,
-    g_idx,
-    sort_indices,
-    workspace,
-    sorted_token_ids,
-    expert_ids,
-    num_tokens_post_padded,
-    topk_weights,
-    quant_type,
-    block_size_m,
-    topk,
-    size_m,
-    size_n,
-    size_k,
-    mul_topk_weights,
-    is_k_full,
-    use_atomic_add,
-):
-    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-        a,
-        c,
-        qweight,
-        None,  # b_bias
-        scales,
-        None,  # global_scale
-        zeros,
-        g_idx,
-        sort_indices,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=topk,
-        mul_topk_weights=mul_topk_weights,
-        is_ep=False,
-        b_q_type_id=quant_type.id,
-        size_m=size_m,
-        size_n=size_n,
-        size_k=size_k,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
-
-
 def generate_test_cases():
     m_list = [1, 123]
     n_list = [128, 1024]
@@ -255,9 +193,6 @@ TEST_CASES = generate_test_cases()
 def test_moe_wna16_marlin_gemm(
     m, n, k, e, topk, dtype, group_size, act_order, quant_type
 ):
-    if not AOT_AVAILABLE:
-        pytest.skip("sgl_kernel moe_wna16_marlin_gemm AOT op not available")
-
     torch.manual_seed(0)
 
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -328,33 +263,11 @@ def test_moe_wna16_marlin_gemm(
 
     torch.cuda.synchronize()
 
-    # --- Check bitwise equality with AOT kernel ---
-    c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
-    c_aot = _run_single_gemm_aot(
-        a,
-        c_aot,
-        qweight1,
-        scales1,
-        zeros1,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        scalar_type,
-        block_size_m,
-        topk,
-        m,
-        2 * n,
-        k,
-        False,
-        True,
-        use_atomic_add,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
+    # Row i * topk + j of the output is token i through its j-th routed expert.
+    per_expert = torch.matmul(a.float(), w_ref1.float().transpose(1, 2))
+    tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    expected = per_expert[topk_ids.flatten(), tokens].to(dtype)
+    torch.testing.assert_close(c_jit, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -819,7 +732,6 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
         moe_tp_rank=tp_rank,
         use_padded_loading=False,
         use_presharded_weights=False,
-        use_triton_kernels=False,
         moe_runner_config=SimpleNamespace(is_gated=True),
         quant_method=method,
         quant_config=None,
@@ -1446,6 +1358,171 @@ def test_muse_marlin_inactive_routes(
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[-1]) == 0
     torch.testing.assert_close(weights, input_weights, rtol=0, atol=0, equal_nan=True)
+
+
+def _mxfp8_moe_weights(e: int, n: int, k: int):
+    """Canonical E4M3/E8M0 weights and an independent float32 dequantization."""
+    weight = torch.randn(e, n, k, device="cuda") / 16
+    blocks = weight.view(e, n, k // 32, 32)
+    blocks = (
+        blocks
+        * torch.exp2(torch.randint(-6, 7, blocks.shape[:-1], device="cuda"))[..., None]
+    )
+    exponent = torch.ceil(torch.log2(blocks.abs().amax(-1) / 448))
+    scale = torch.exp2(exponent)
+    quantized = (blocks / scale[..., None]).to(torch.float8_e4m3fn)
+    reference = (quantized.float() * scale[..., None]).reshape(e, n, k)
+    return quantized.reshape(e, n, k), (exponent + 127).to(torch.uint8), reference
+
+
+@pytest.mark.parametrize("m", [1, 33, 73, 137, 222])
+# keep_router_weight None leaves the argument at its default.
+@pytest.mark.parametrize(
+    "no_combine, keep_router_weight",
+    [(False, None), (True, None), (True, True), (True, False)],
+)
+def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
+    """Catches missing E8M0 dispatch, FP8 exponent bias and weighted-route regressions."""
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        prepare_moe_mxfp8_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    e, topk, k, n = 8, 2, 256, 128
+    w13, s13, ref13 = _mxfp8_moe_weights(e, 2 * n, k)
+    w2, s2, ref2 = _mxfp8_moe_weights(e, k, n)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
+    prepare_moe_mxfp8_layer_for_marlin(layer)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
+    weights, ids = torch.topk(logits.float().softmax(-1), topk)
+    output = fused_marlin_moe(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=logits,
+        topk_weights=weights,
+        topk_ids=ids.to(torch.int32),
+        num_bits=8,
+        no_combine=no_combine,
+        **(
+            {}
+            if keep_router_weight is None
+            else {"no_combine_keep_router_weight": keep_router_weight}
+        ),
+    )
+    gate_up = torch.einsum("mk,mrnk->mrn", x.float(), ref13[ids])
+    gate, up = gate_up.bfloat16().float().chunk(2, dim=-1)
+    act = (torch.nn.functional.silu(gate) * up).bfloat16().float()
+    routes = torch.einsum("mrn,mrkn->mrk", act, ref2[ids])
+    weighted_routes = routes * weights[..., None]
+    if not no_combine:
+        expected = weighted_routes.sum(1)
+    else:
+        expected = routes if keep_router_weight is False else weighted_routes
+    assert output.shape == expected.shape
+    relative_error = (output.float() - expected).norm() / expected.norm()
+    assert relative_error < 0.01
+    route_error = (output.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
+    assert route_error.max() < 0.02
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [1, 123])
+def test_moe_wna16_marlin_gemm_mxfp8_scale_dtypes(m, dtype):
+    """FP8 group-32 weights dispatch on the scale dtype: E8M0 scales (MXFP8, BF16
+    activations only) and activation-dtype scales with the FP8 exponent bias
+    folded in (Inkling2's repack) must both match the dequantized reference,
+    and each other bitwise."""
+    from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+        fp8_fused_exponent_bias_into_scales,
+        prepare_moe_mxfp8_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    e, topk, k, n = 8, 2, 256, 128
+    w13, s13, ref13 = _mxfp8_moe_weights(e, 2 * n, k)
+    w2, s2, _ = _mxfp8_moe_weights(e, k, n)
+    float_scales = torch.exp2(s13.float() - 127).to(dtype)
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
+    prepare_moe_mxfp8_layer_for_marlin(layer)
+    folded_scales = torch.stack(
+        [
+            fp8_fused_exponent_bias_into_scales(
+                marlin_permute_scales(
+                    s=float_scales[i].T.contiguous(),
+                    size_k=k,
+                    size_n=2 * n,
+                    group_size=32,
+                )
+            )
+            for i in range(e)
+        ]
+    )
+    assert layer.w13_weight_scale.dtype == torch.float8_e8m0fnu
+    assert folded_scales.dtype == dtype
+    scale_sets = [folded_scales]
+    if dtype == torch.bfloat16:
+        scale_sets.insert(0, layer.w13_weight_scale)
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids = torch.topk(score.float().softmax(-1), topk)
+    block_size_m = 8 if m == 1 else 16
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, e
+    )
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    workspace = torch.zeros(sms * 4, dtype=torch.int, device="cuda")
+
+    outputs = []
+    for scales in scale_sets:
+        c = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
+        outputs.append(
+            _run_single_gemm(
+                moe_wna16_marlin_gemm,
+                a,
+                c,
+                layer.w13_weight,
+                scales,
+                None,
+                None,
+                None,
+                workspace,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                topk_weights,
+                scalar_types.float8_e4m3fn,
+                block_size_m,
+                topk,
+                m,
+                2 * n,
+                k,
+                False,
+                True,
+                False,
+            )
+        )
+
+    per_expert = torch.matmul(a.float(), ref13.transpose(1, 2))
+    tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    expected = per_expert[topk_ids.flatten(), tokens].to(dtype)
+    for output in outputs:
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+    if len(outputs) == 2:
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
 
 
 if __name__ == "__main__":

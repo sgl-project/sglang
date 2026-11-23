@@ -7,7 +7,10 @@ from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
 )
-from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    RMSNorm,
+    rms_norm_gated,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
@@ -15,9 +18,11 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_cuda
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=13, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -27,6 +32,7 @@ class TestGdnPrefillLayout(unittest.TestCase):
     NUM_V_HEADS = 4
     HEAD_DIM = 128
 
+    @unittest.skipIf(not is_cuda(), "conv_block_table is CUDA-only")
     def test_compact_prefill_conv_matches_rectangular_output_and_cache(self):
         torch.manual_seed(0)
         for seq_lens in ([65, 1, 0, 1, 1, 1, 1, 1], [8065] + [1] * 127):
@@ -199,6 +205,16 @@ class TestGdnPrefillLayout(unittest.TestCase):
                         is_rms_norm=True,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                    norm = RMSNorm(
+                        self.HEAD_DIM,
+                        dtype=dtype,
+                        device="cuda",
+                        norm_before_gate=norm_before_gate,
+                    )
+                    norm.weight.data.copy_(weight)
+                    native = norm.forward_native(x, z)
+                    torch.testing.assert_close(native, actual, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

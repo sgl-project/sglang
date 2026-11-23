@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -23,11 +23,18 @@ import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsWNA16,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -62,9 +69,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    fuse_qkv_a_proj_tensors,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, log_info_on_rank0
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -154,7 +163,9 @@ def _load_fused_indexer_wk(
 ) -> bool:
     """Load an indexer wk / weights_proj shard into the fused bf16 wk_weights_proj
     param: wk fills the top head_dim rows (dequantized from block-fp8 if needed),
-    weights_proj the bottom n_heads rows.
+    weights_proj the bottom n_heads rows. A block-fp8 weight and its scale wait
+    in ``pending`` by module name and name suffix until both arrive, as clones:
+    the caller may reuse its buffer meanwhile.
 
     Returns False when there is no fused param (non-CUDA, or CUDA with
     SGLANG_DISABLE_DSA_INDEXER_FUSION set, where wk and weights_proj are
@@ -165,45 +176,39 @@ def _load_fused_indexer_wk(
     if fused_param is None or fused_param.dtype != torch.bfloat16:
         return False
 
-    if ".indexer.weights_proj." in name:
-        is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-            w = _clone_if_runai_streamed_tensor(loaded_weight)
-            fused_param.data[-w.shape[0] :].copy_(w)
-            return True
-
-        entry = pending.setdefault(fused_name + ".weights_proj", {})
-        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-            loaded_weight
-        )
-        if "weight" in entry and "scale" in entry:
-            pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
-            )
-            fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
-        return True
-
-    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    # A bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[: w.shape[0]].copy_(w)
-        return True
-
-    entry = pending.setdefault(fused_name, {})
-    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-        loaded_weight
-    )
-    if "weight" in entry and "scale" in entry:
-        pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
-        )
-        fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
+        rows = _clone_if_runai_streamed_tensor(loaded_weight)
+    else:
+        rows = _pair_block_fp8_half(name, loaded_weight, pending, quant_config)
+        if rows is None:
+            return True
+    if ".indexer.weights_proj." in name:
+        fused_param.data[-rows.shape[0] :].copy_(rows)
+    else:
+        fused_param.data[: rows.shape[0]].copy_(rows)
     return True
+
+
+def _pair_block_fp8_half(
+    name: str,
+    loaded_weight: torch.Tensor,
+    pending: Dict[str, Dict[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[torch.Tensor]:
+    """Hold one half of a block-fp8 weight and scale pair until the other
+    arrives, then return the dequantized bf16 weight."""
+    module_name, suffix = name.rsplit(".", 1)
+    entry = pending.setdefault(module_name, {})
+    entry[suffix] = loaded_weight.clone()
+    if len(entry) < 2:
+        return None
+    del pending[module_name]
+    weight = entry.pop("weight")
+    (scale,) = entry.values()
+    block_size = _get_indexer_weight_block_size(quant_config)
+    return block_quant_dequant(weight, scale, block_size, torch.bfloat16)
 
 
 def _load_fused_expert_tensor(
@@ -242,6 +247,20 @@ def _load_fused_expert_tensor(
                 )
         return True
     return False
+
+
+@dataclass
+class _PendingWeightHalves:
+    """Halves of fused params held until the other half arrives. The model keeps
+    them across load_weights calls: a chunked online update can split a pair."""
+
+    # q_a_proj / kv_a_proj_with_mqa tensors by name, fused into fused_qkv_a_proj_with_mqa
+    qkv_a_proj: Dict[str, torch.Tensor] = field(default_factory=dict)
+    # fp8 indexer wk / weights_proj weights and block scales, fused into
+    # wk_weights_proj: {checkpoint module name: {name suffix: tensor}}
+    indexer_wk_weights_proj: Dict[str, Dict[str, torch.Tensor]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -305,9 +324,9 @@ class DeepseekV2WeightLoaderMixin:
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
-        pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
+        pending_halves = self._get_pending_weight_halves()
+        pending_qkv_a_proj = pending_halves.qkv_a_proj
+        pending_indexer_wk = pending_halves.indexer_wk_weights_proj
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -488,9 +507,8 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
-                                loaded_weight
-                            )
+                            # The caller may reuse its buffer while the half waits.
+                            pending_qkv_a_proj[name] = loaded_weight.clone()
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -504,28 +522,18 @@ class DeepseekV2WeightLoaderMixin:
 
                             # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                             if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
+                                q_a_proj_name in pending_qkv_a_proj
+                                and kv_a_proj_name in pending_qkv_a_proj
                             ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                                q_a_proj_weight = pending_qkv_a_proj[q_a_proj_name]
+                                kv_a_proj_weight = pending_qkv_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
-                                    []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
-                                else:
-                                    cat_dim = 0
-                                    if self.quant_config is not None and (
-                                        self.quant_config.get_name() == "awq"
-                                        or self.quant_config.get_name() == "awq_marlin"
-                                        or self.quant_config.get_name() == "moe_wna16"
-                                    ):
-                                        cat_dim = 1
-
-                                    fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                    )
+                                fused_weight = fuse_qkv_a_proj_tensors(
+                                    name,
+                                    q_a=q_a_proj_weight,
+                                    kv_a=kv_a_proj_weight,
+                                    quant_config=self.quant_config,
+                                )
 
                                 param_name = (
                                     name.replace(
@@ -544,8 +552,8 @@ class DeepseekV2WeightLoaderMixin:
                                     logger.warning(
                                         f"{param_name} not found in params_dict."
                                     )
-                                    cached_a_proj.pop(q_a_proj_name, None)
-                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    pending_qkv_a_proj.pop(q_a_proj_name, None)
+                                    pending_qkv_a_proj.pop(kv_a_proj_name, None)
                                     continue
                                 param = params_dict[param_name]
 
@@ -559,8 +567,8 @@ class DeepseekV2WeightLoaderMixin:
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
+                                pending_qkv_a_proj.pop(q_a_proj_name)
+                                pending_qkv_a_proj.pop(kv_a_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
@@ -605,6 +613,28 @@ class DeepseekV2WeightLoaderMixin:
                 future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+
+    def _get_pending_weight_halves(self) -> _PendingWeightHalves:
+        # The mixin has no __init__ of its own, so the first load creates it.
+        if not hasattr(self, "_pending_weight_halves"):
+            self._pending_weight_halves = _PendingWeightHalves()
+        return self._pending_weight_halves
+
+    def discard_pending_weight_halves(self) -> List[str]:
+        """Drop the halves still waiting for their pair and return their names.
+        A weight update calls it before it loads, and when its session ends."""
+        halves = self._get_pending_weight_halves()
+        self._pending_weight_halves = _PendingWeightHalves()
+        return sorted(
+            [
+                *halves.qkv_a_proj,
+                *(
+                    f"{module_name}.{suffix}"
+                    for module_name, entry in halves.indexer_wk_weights_proj.items()
+                    for suffix in entry
+                ),
+            ]
+        )
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
@@ -692,6 +722,21 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif isinstance(
+                self_attn.kv_b_proj.quant_method, CompressedTensorsLinearMethod
+            ) and isinstance(self_attn.kv_b_proj.scheme, CompressedTensorsWNA16):
+                # Still in the checkpoint layout: the kernel repack runs after
+                # load_weights.
+                w = self_attn.kv_b_proj.scheme.dequantize_weight(self_attn.kv_b_proj)
+                # Once repacked it cannot be read back, so an online update's
+                # post_load_weights could not rebuild w_kc/w_vc. Refuse updates
+                # before they write any weight.
+                self_attn.kv_b_proj._derived_weight_cache_error = (
+                    "Online weight updates are not supported for compressed-"
+                    "tensors WNA16 MLA checkpoints: the absorbed w_kc/w_vc "
+                    "weights are built from kv_b_proj before its kernel repack "
+                    "and cannot be rebuilt afterwards."
+                )
             else:
                 w = self_attn.kv_b_proj.weight
 
@@ -750,7 +795,7 @@ class DeepseekV2WeightLoaderMixin:
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and (_is_musa or current_arch().is_sm(9))
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale

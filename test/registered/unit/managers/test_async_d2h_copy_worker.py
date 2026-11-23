@@ -18,7 +18,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker, HostCopyDone
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     async_d2h,
     is_confidential_compute,
     is_pin_memory_available,

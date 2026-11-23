@@ -16,6 +16,7 @@
 import json
 import logging
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
@@ -61,6 +62,11 @@ class BaseGrammarObject:
         self.grammar_stats = None
         self.current_token = None
 
+    def __repr__(self):
+        # Req.__repr__ prints the grammar, and rank consensus checks compare
+        # those reprs across ranks; the default repr carries a per-process address.
+        return f"{type(self).__name__}()"
+
     def maybe_init_reasoning(self, reasoning: bool):
         pass
 
@@ -72,6 +78,11 @@ class BaseGrammarObject:
 
     def rollback(self, k: int):
         raise NotImplementedError()
+
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        """Accept all of ``tokens`` if the grammar allows them; otherwise leave the
+        state untouched and return False. Backends that cannot probe return False."""
+        return False
 
     def is_terminated(self):
         return False
@@ -108,6 +119,12 @@ class BaseGrammarObject:
     def copy(self) -> "BaseGrammarObject":
         return self
 
+    def memory_size_bytes(self) -> Optional[int]:
+        """Approximate host memory held by the compiled artifact behind this
+        grammar, or None when the backend cannot report it (the cache then
+        charges ``BaseGrammarBackend.NOMINAL_GRAMMAR_BYTES``)."""
+        return None
+
     @property
     def finished(self):
         return self._finished
@@ -115,34 +132,6 @@ class BaseGrammarObject:
     @finished.setter
     def finished(self, finished):
         self._finished = finished
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        """
-        Try to jump forward in the grammar.
-
-        Returns:
-            A jump forward helper which may be used in `jump_forward_str_state`.
-            None if the jump forward is not possible.
-        """
-        raise NotImplementedError()
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        """
-        Jump forward for the grammar.
-
-        Returns:
-            A tuple of the jump forward string and the next state of the grammar
-            (which can be used in `jump_and_retokenize` if needed).
-        """
-        raise NotImplementedError()
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ) -> None:
-        """
-        Jump forward occurs, and update the grammar state if needed.
-        """
-        raise NotImplementedError()
 
 
 class GrammarMask(NamedTuple):
@@ -197,13 +186,43 @@ class InvalidGrammarObject(BaseGrammarObject):
     def __repr__(self):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
+    def memory_size_bytes(self) -> int:
+        # The scheduler caches failed compilations too, so a stream of distinct
+        # invalid grammars must still count against the budget.
+        return len(self.error_message.encode("utf-8", "replace"))
+
 
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
-    def __init__(self):
+    # Compiled grammars are kept in an LRU cache bounded by host memory. Each
+    # compiled grammar holds per-vocabulary token tables, so an unbounded cache
+    # leaks host memory whenever clients send a different json_schema / regex /
+    # EBNF per request. The byte budget is the only bound: it is known before
+    # startup, whereas what an entry count costs depends on the schemas clients
+    # happen to send, and a count would bind before the budget for small
+    # grammars without covering xgrammar's own compiler cache. The budget is a
+    # fixed constant rather than a server flag: how the cache is bounded is an
+    # implementation detail, and 1 GiB holds on the order of a thousand typical
+    # compiled schemas. Backends and tests can still pass ``cache_limit_bytes``
+    # to the constructor. Entries are charged what the backend reports, and
+    # xgrammar's ``memory_size_bytes`` undercounts the RSS a compiled grammar
+    # adds, so the real footprint can exceed the budget by a few times.
+    # In-flight requests keep their own ``copy()`` of a grammar, so evicting an
+    # entry is safe.
+    DEFAULT_CACHE_LIMIT_BYTES = 1 << 30
+    # Charged per entry when the backend has no size API (outlines, llguidance).
+    NOMINAL_GRAMMAR_BYTES = 1 << 20
+
+    def __init__(self, cache_limit_bytes: Optional[int] = None):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        if cache_limit_bytes is None:
+            cache_limit_bytes = self.DEFAULT_CACHE_LIMIT_BYTES
+        # <= 0 disables the bound.
+        self.cache_limit_bytes = int(cache_limit_bytes)
+        self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
+        self._cache_entry_bytes: Dict[Tuple[str, str], int] = {}
+        self.cache_size_bytes = 0
 
     def initialize_vocab_mask_buffer(
         self,
@@ -306,17 +325,57 @@ class BaseGrammarBackend:
     ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
+            self.cache.move_to_end(key)  # mark as most recently used
             copied_value = value.copy()
             copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
         value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
+    @staticmethod
+    def key_bytes(key: Tuple[str, str]) -> int:
+        """Bytes the cache holds for the key itself (the schema / regex /
+        EBNF text); for an InvalidGrammarObject this is most of the entry."""
+        return sum(len(str(part).encode("utf-8", "replace")) for part in key)
+
+    def _charge_bytes(self, key: Tuple[str, str], value: BaseGrammarObject) -> int:
+        size = value.memory_size_bytes()
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            size = self.NOMINAL_GRAMMAR_BYTES
+        return size + self.key_bytes(key)
+
+    def _over_budget(self) -> bool:
+        return 0 < self.cache_limit_bytes < self.cache_size_bytes
+
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        if key in self._cache_entry_bytes:
+            self.cache_size_bytes -= self._cache_entry_bytes[key]
         self.cache[key] = value
+        self.cache.move_to_end(key)
+        size = self._charge_bytes(key, value)
+        self._cache_entry_bytes[key] = size
+        self.cache_size_bytes += size
+        # The entry just inserted always stays, so an immediately repeated
+        # grammar still hits even when it alone exceeds the budget.
+        while len(self.cache) > 1 and self._over_budget():
+            evicted_key, _ = self.cache.popitem(last=False)
+            self.cache_size_bytes -= self._cache_entry_bytes.pop(evicted_key, 0)
+            logger.debug(
+                "Grammar cache over budget (%d bytes); evicted %s grammar",
+                self.cache_limit_bytes,
+                evicted_key[0],
+            )
+
+    def discard_cache(self, key: Tuple[str, str]) -> None:
+        """Drop one entry (if present) and release its share of the budget."""
+        if key in self.cache:
+            del self.cache[key]
+            self.cache_size_bytes -= self._cache_entry_bytes.pop(key, 0)
 
     def reset(self):
         self.cache.clear()
+        self._cache_entry_bytes.clear()
+        self.cache_size_bytes = 0
 
 
 def register_vocab_mask_buffer(
@@ -349,19 +408,6 @@ def register_vocab_mask_buffer(
 
     buffers[name] = vocab_mask
     return vocab_mask
-
-
-def get_vocab_mask_buffer(name: str, rows: int) -> Optional[torch.Tensor]:
-    """Return the active rows of a registered mask buffer, if available."""
-    vocab_mask = get_resources().buffers.get(name)
-    if vocab_mask is None:
-        return None
-    if rows > vocab_mask.shape[0]:
-        raise ValueError(
-            f"Grammar batch needs {rows} mask rows, exceeding initialized "
-            f"capacity {vocab_mask.shape[0]} for {name!r}"
-        )
-    return vocab_mask[:rows]
 
 
 def register_grammar_backend(name, init_func):

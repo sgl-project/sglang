@@ -41,7 +41,6 @@ from typing import (
 import numpy as np
 import torch
 import torch.types
-from PIL import Image
 from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import LlamaConfig, PretrainedConfig
@@ -50,6 +49,7 @@ from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
@@ -70,9 +70,7 @@ from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.modality import MultimodalInputFormat
-from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
-
-RawImageType = Union[Image.Image, torch.Tensor]
+from sglang.srt.utils import flatten_nested_list, get_device
 
 
 # sin/cos positional embedding helpers are adapted from:

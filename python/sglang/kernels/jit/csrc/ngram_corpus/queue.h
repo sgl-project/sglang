@@ -24,18 +24,6 @@ class Queue {
     return true;
   }
 
-  bool enqueue(const T& rhs) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (closed_) {
-        return false;
-      }
-      queue_.emplace(rhs);
-    }
-    cv_.notify_one();
-    return true;
-  }
-
   bool dequeue(T& rhs) {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return queue_.size() || closed_; });
@@ -45,16 +33,6 @@ class Queue {
     rhs = std::move(queue_.front());
     queue_.pop();
     return true;
-  }
-
-  size_t size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return queue_.size();
-  }
-
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return queue_.empty();
   }
 
   void close() {
