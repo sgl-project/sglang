@@ -198,7 +198,6 @@ class TestCFGGating(unittest.TestCase):
             patch.multiple(
                 denoising,
                 prepare_rollout_if_enabled=Mock(),
-                set_rollout_early_stop_if_enabled=Mock(),
                 load_transformer_if_needed=Mock(return_value=False),
                 rollout_step_kwargs=Mock(return_value={}),
                 resolve_precision=Mock(return_value=torch.float32),
