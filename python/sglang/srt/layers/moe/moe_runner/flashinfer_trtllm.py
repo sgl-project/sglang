@@ -2015,7 +2015,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 hidden_pad == 0 and pre_quant.x_fp4.shape[0] == hidden_states.shape[0]
             )
             if pre_quant.ready is not None:
-                torch.cuda.current_stream().wait_event(pre_quant.ready)
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_event(pre_quant.ready)
+                for tensor in (
+                    pre_quant.x_fp4,
+                    pre_quant.x_sf,
+                    pre_quant.per_token_scale,
+                ):
+                    tensor.record_stream(current_stream)
         else:
             pre_quant = quantize_nvfp4_per_token_input(hidden_states)
         hs_fp4, hs_scale_linear = pre_quant.x_fp4, pre_quant.x_sf

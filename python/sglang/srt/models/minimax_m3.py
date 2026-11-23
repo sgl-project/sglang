@@ -75,7 +75,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4Config
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     accepts_mxfp8_deepgemm_input,
@@ -103,6 +103,9 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -513,12 +516,15 @@ class MiniMaxM3MoE(nn.Module):
             self.top_k = config.num_experts_per_tok
 
         # Under graph capture, quantize the routed input on the main stream while
-        # the router runs on the alt stream.
+        # the router runs on the alt stream. Gate on the layer's actual scheme so
+        # skipped layers (quant_config.ignored_layers) never receive an NVFP4
+        # pre-quant tuple.
+        experts_scheme = getattr(self.experts, "scheme", None)
         self.router_quant_overlap = (
-            isinstance(quant_config, MiniMaxM3Nvfp4Config)
+            isinstance(experts_scheme, MiniMaxM3Nvfp4MoE)
+            and experts_scheme.use_flashinfer_trtllm
             and get_platform().is_blackwell
             and get_moe_a2a_backend().is_none()
-            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
 
         # The finalize kernels never rescale: the routed scaling factor is already
@@ -640,7 +646,7 @@ class MiniMaxM3MoE(nn.Module):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 pre_quant = None
-                if self.router_quant_overlap:
+                if self.router_quant_overlap and not is_in_tc_piecewise_cuda_graph():
                     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                         quantize_nvfp4_per_token_input,
                     )
