@@ -1,14 +1,19 @@
-"""One-shot NIXL/UCX writes of staged encoder embeddings into host memory."""
+"""NIXL/UCX writes of staged encoder embeddings into receiver-owned host memory."""
 
 import asyncio
+import logging
 import math
 import threading
 import time
+import weakref
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from uuid import uuid4
 
 import msgspec
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class _Destination(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -29,77 +34,176 @@ def _agent():
 
 
 _writer = threading.local()
+_MAX_CACHED_PEERS = 16
+
+
+class _NixlWriter:
+    """One executor thread's UCX agent and its most recently used peers."""
+
+    def __init__(self):
+        self.agent = _agent()
+        self._peers: OrderedDict[bytes, str] = OrderedDict()
+
+    def peer_for(self, metadata: bytes) -> str:
+        # All slices of P's registered pool advertise the same metadata.
+        if metadata in self._peers:
+            self._peers.move_to_end(metadata)
+            return self._peers[metadata]
+
+        # Only NIXL can decode the agent name. Older receivers send fresh
+        # partial metadata per transfer. Loading it may merge registrations or
+        # reject overlapping ranges on an already known peer.
+        try:
+            peer = self.agent.add_remote_agent(metadata)
+        except Exception:
+            if not self._peers:
+                raise
+            self.agent = _agent()
+            self._peers.clear()
+            peer = self.agent.add_remote_agent(metadata)
+
+        for old_metadata, name in self._peers.items():
+            if name == peer:
+                self.agent.remove_remote_agent(peer)
+                del self._peers[old_metadata]
+                peer = self.agent.add_remote_agent(metadata)
+                break
+        if len(self._peers) >= _MAX_CACHED_PEERS:
+            _, oldest_peer = self._peers.popitem(last=False)
+            self.agent.remove_remote_agent(oldest_peer)
+        self._peers[metadata] = peer
+        return peer
 
 
 @contextmanager
 def _writer_agent():
-    # The executor bounds the number of agents. One thread issues a single
-    # write at a time, so it can safely remove P's per-target metadata before
-    # the next write to P. Other threads have independent native agents.
-    agent = getattr(_writer, "agent", None)
-    if agent is None:
-        agent = _writer.agent = _agent()
+    # A thread has one synchronous write in flight. Its previous transfer has
+    # drained before a cache eviction can disconnect a peer.
+    writer = getattr(_writer, "state", None)
+    if writer is None:
+        writer = _writer.state = _NixlWriter()
     try:
-        yield agent
+        yield writer
     except BaseException:
         # A failed native teardown can leave cached registrations on an agent.
         # Start clean on this thread's next transfer.
-        del _writer.agent
+        del _writer.state
         raise
 
 
+class _RegisteredMemory:
+    """Keep the backing tensor alive until the UCX registration is retired."""
+
+    def __init__(self, agent, tensor):
+        self.agent = agent
+        self.tensor = tensor
+        self.registration = agent.register_memory(tensor, backends=["UCX"])
+        try:
+            self.metadata = agent.get_partial_agent_metadata(
+                self.registration, inc_conn_info=True, backends=["UCX"]
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self.agent.deregister_memory(self.registration)
+
+
 class NixlTarget:
-    """A receiver-owned registration. Tensor views remain valid after close()."""
+    """A transfer destination. Tensor views can outlive its write fence."""
 
     def __init__(self, receiver, size):
         self._receiver = receiver
-        self.tensor = torch.empty(size, dtype=torch.uint8, device="cpu")
-        self._registration = receiver._agent.register_memory(
-            self.tensor, backends=["UCX"]
-        )
         self._notification = uuid4().bytes
         self._completed = False
         self._abandoned = False
+        self._one_shot = None
+        pool = receiver._pool
+        slot = pool.try_alloc(size) if pool is not None else None
+        if slot is None:
+            # Preserve admission for a large embedding or a fragmented pool.
+            self.tensor = torch.empty(size, dtype=torch.uint8, device="cpu")
+            self._one_shot = _RegisteredMemory(receiver._agent, self.tensor)
+            metadata = self._one_shot.metadata
+        else:
+            view, _, slot_id = slot
+            try:
+                # from_numpy makes the ndarray the owner of a distinct Torch
+                # storage. Every slice, dtype view or detach holds that storage,
+                # even after the original tensor and request disappear.
+                owner = view.numpy()
+                self.tensor = torch.from_numpy(owner)
+                pool.release_on_gc(owner, slot_id).atexit = False
+            except BaseException:
+                pool.release(slot_id)
+                raise
+            metadata = receiver._pool_registration.metadata
         try:
-            metadata = receiver._agent.get_partial_agent_metadata(
-                self._registration, inc_conn_info=True, backends=["UCX"]
-            )
             self.descriptor = msgspec.msgpack.encode(
                 _Destination(self.tensor.data_ptr(), size, self._notification, metadata)
             )
         except BaseException:
-            receiver._agent.deregister_memory(self._registration)
+            self.close()
             raise
 
     def close(self):
         """Close before publication, after Deliver success, or after a Release fence."""
-        if self._registration is not None:
-            self._receiver._agent.deregister_memory(self._registration)
-            self._registration = None
+        if self.tensor is not None:
+            if self._one_shot is not None:
+                self._one_shot.close()
+                self._one_shot = None
             self._receiver._targets.pop(self._notification, None)
+            # A pooled range stays occupied if a consumer retains any alias.
+            self.tensor = None
 
     def abandon(self):
         """Retain an unfenced destination under the receiver's admission limit."""
-        if self._registration is not None:
+        if self.tensor is not None:
             self._abandoned = True
             self._receiver._reap()
 
     def reaped(self):
         """Poll completion notifications while a Release fence is unavailable."""
-        if self._registration is not None:
+        if self.tensor is not None:
             self._receiver._reap()
-        return self._registration is None
+        return self.tensor is None
 
 
 class NixlReceiver:
-    """One scheduler-thread owner of active targets, including ambiguous writes."""
+    """Register the host embedding pool once and track outstanding remote writes."""
 
-    def __init__(self, capacity=32):
+    def __init__(self, capacity=32, *, pool_bytes=None):
+        from sglang.srt.disaggregation.encoder.receiver import EmbeddingPool
+        from sglang.srt.environ import envs
+
         if capacity <= 0:
             raise ValueError("NIXL receiver capacity must be positive")
+        if pool_bytes is None:
+            pool_bytes = envs.SGLANG_ENCODER_NIXL_POOL_SIZE_MB.get() * 1024**2
+        if type(pool_bytes) is not int or pool_bytes < 0:
+            raise ValueError("NIXL receiver pool size must be a nonnegative byte count")
         self._agent = _agent()
         self._capacity = capacity
         self._targets = {}
+        self._pool = None
+        if pool_bytes:
+            try:
+                pool = EmbeddingPool(device_type="cpu", gpu_id=0, size_bytes=pool_bytes)
+                pool.buffer.zero_()
+                registration = _RegisteredMemory(self._agent, pool.buffer)
+            except Exception as exc:
+                logger.warning(
+                    "Cannot pre-register the %d-byte NIXL receive pool (%s); "
+                    "using per-transfer registration",
+                    pool_bytes,
+                    exc,
+                )
+            else:
+                self._pool = pool
+                self._pool_registration = registration
+                # A live transfer must retain its mapping through interpreter shutdown.
+                weakref.finalize(self, registration.close).atexit = False
 
     def _reap(self):
         # A WRITE's remote completion notification can arrive before the Deliver
@@ -125,11 +229,11 @@ class NixlReceiver:
 
 
 def _write(source, destination, stop, deadline):
-    with _writer_agent() as agent, ExitStack() as stack:
+    with _writer_agent() as writer, ExitStack() as stack:
+        peer = writer.peer_for(destination.agent_metadata)
+        agent = writer.agent
         registration = agent.register_memory(source, backends=["UCX"])
         stack.callback(agent.deregister_memory, registration)
-        peer = agent.add_remote_agent(destination.agent_metadata)
-        stack.callback(agent.remove_remote_agent, peer)
         local = agent.get_xfer_descs(source)
         remote = agent.get_xfer_descs(
             [(destination.address, destination.size, 0)], "DRAM"

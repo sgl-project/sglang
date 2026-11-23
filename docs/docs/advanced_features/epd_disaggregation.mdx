@@ -29,7 +29,17 @@ On the Rust language workers, use `--language-only` with
 uses the encoder identified by the descriptor, so you can omit `--encoder-urls`.
 Use the same `--encoder-transfer-backend nixl` or
 `--encoder-transfer-backend zmq_to_scheduler` on E and P/PD. NIXL requires
-the UCX plugin on both ends.
+the UCX plugin on both ends. Send handoffs to a private language-worker listener
+from a trusted router. The selected encoder receives NIXL access to the registered
+receive region.
+
+With NIXL, rank 0 of P/PD registers a host-memory pool at startup. Set
+`SGLANG_ENCODER_NIXL_POOL_SIZE_MB` to size it (default 256 MiB). Each transfer
+uses a slice, which stays reserved until the write is fenced and the last tensor
+view is released. Each sender thread on E caches the peer registration across
+writes to the same pool. P/PD registers individual buffers when the pool is
+disabled, when startup registration fails, or when the embedding does not fit
+an available slice. Set the size to `0` to disable pooling.
 
 | Model family | Image | Video | Separate audio input |
 |---|---|---|---|

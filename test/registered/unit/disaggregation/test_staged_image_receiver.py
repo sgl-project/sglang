@@ -541,7 +541,8 @@ class TestStagedImageReceiver(unittest.TestCase):
                         write_embedding,
                     )
 
-                    rx.nixl_receiver, writer = NixlReceiver(capacity=1), write_embedding
+                    rx.nixl_receiver = NixlReceiver(capacity=1, pool_bytes=4096)
+                    writer = write_embedding
                 elif backend == "nixl-mock":
                     targets = {}
 

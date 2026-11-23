@@ -1892,7 +1892,7 @@ def _sort_responses_and_compute_total_bytes(response_json_list, total_num_parts)
 
 
 class EmbeddingPool:
-    """Persistent GPU buffer pool for received multimodal embeddings.
+    """Persistent host or device buffer pool for received multimodal embeddings.
 
     Allocator: first-fit on a free-segment list with 256-byte alignment.
     `alloc()` blocks on a Condition when the pool is full and resumes once
@@ -1922,9 +1922,10 @@ class EmbeddingPool:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         logger.info(
-            f"EmbeddingPool allocated: gpu={gpu_id}, "
-            f"size={size_bytes // (1024 * 1024)}MB, base=0x{self.base:x}, "
-            f"rdma_registered={engine is not None}"
+            "Allocated %d MiB embedding pool on %s (base=0x%x)",
+            size_bytes // (1024 * 1024),
+            self.buffer.device,
+            self.base,
         )
 
     def try_alloc(self, nbytes: int) -> Optional[Tuple[torch.Tensor, int, int]]:

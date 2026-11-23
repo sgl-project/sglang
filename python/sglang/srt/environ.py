@@ -2061,6 +2061,8 @@ class Envs:
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
     # Includes staged image encodes, unclaimed leases and deliveries in flight.
     SGLANG_ENCODER_MAX_STAGED_REQUESTS = EnvInt(64)
+    # Pre-registered NIXL host region on P/PD (MiB). Zero selects per-write registration.
+    SGLANG_ENCODER_NIXL_POOL_SIZE_MB = EnvInt(256)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
