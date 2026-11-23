@@ -26,6 +26,7 @@ class TestSailMxfp4W4a16(CustomTestCase):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
+        stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.override(False))
         stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(False))
         stack.enter_context(envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.override(False))
 
@@ -284,6 +285,41 @@ class TestSailMxfp4W4a16(CustomTestCase):
             with patch.object(sail_mxfp4, "get_device_sm", return_value=80):
                 with self.assertRaisesRegex(ValueError, "SM89"):
                     sail_mxfp4.validate_w4a16_modes(False, True)
+
+    def test_megamoe_w4a16_uses_its_own_precision_not_regular_runner_guards(self):
+        """Bypass regular runner guards but reject conflicting activation modes."""
+        for backend in ("megamoe", MoeA2ABackend.MEGAMOE):
+            with (
+                self.subTest(backend=backend),
+                envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(True),
+            ):
+                sail_mxfp4.validate_w4a16_modes(
+                    True,
+                    False,
+                    runner_backend="auto",
+                    a2a_backend=backend,
+                    check_hardware=False,
+                )
+                self.assertEqual(sail_mxfp4.mega_moe_precision(), "bf16xmxfp4")
+                with (
+                    envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.override(True),
+                    self.assertRaisesRegex(ValueError, "mutually exclusive"),
+                ):
+                    sail_mxfp4.validate_w4a16_modes(
+                        True,
+                        False,
+                        runner_backend="auto",
+                        a2a_backend=backend,
+                        check_hardware=False,
+                    )
+        with patch.object(
+            sail_mxfp4,
+            "get_moe_a2a_backend",
+            side_effect=AssertionError(
+                "Do not read the runtime backend without opt-in"
+            ),
+        ):
+            sail_mxfp4.validate_w4a16_modes(False, False, check_hardware=False)
 
     def test_mma_creates_direct_weights_without_bias(self):
         """64-alignment must not misuse Marlin's 128/256 padding or create an

@@ -25,6 +25,17 @@ def _default_hip() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _default_sail() -> bool:
+    """Probe SAIL only when resolving defaults to keep imports lazy."""
+    try:
+        from sglang.srt.utils.device import is_sail
+
+        return is_sail()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -1557,6 +1568,8 @@ class Envs:
     # Consume MXFP4 weights and MMA scales directly; mutually exclusive with the
     # Marlin/VALU mode above.
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
+    # Select FP8 activations for SAIL MegaMoE; mutually exclusive with W4A16.
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8 = EnvBool(False)
     # Use gather-read for GEMM1 in TP MoE; the physical scatter path stays the default.
     SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
     # Let the channel-wise masked DeepGEMM path use the JIT kernel that fuses
@@ -1729,7 +1742,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
-    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(
+        lambda: 0 if _default_sail() else 2
+    )
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
 

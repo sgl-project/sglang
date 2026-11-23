@@ -422,10 +422,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
-        (
-            self.use_deepgemm_mxfp4_w4a16_valu,
-            self.use_deepgemm_mxfp4_w4a16_mma,
-        ) = self._sail_w4a16_modes()
+        if _is_sail and self.use_mega_moe:
+            from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                mega_moe_precision,
+            )
+
+            self._mega_moe_mma_type = mega_moe_precision()
+            self.use_deepgemm_mxfp4_w4a16_valu = False
+            self.use_deepgemm_mxfp4_w4a16_mma = False
+        else:
+            (
+                self.use_deepgemm_mxfp4_w4a16_valu,
+                self.use_deepgemm_mxfp4_w4a16_mma,
+            ) = self._sail_w4a16_modes()
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -506,6 +515,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
+        if _is_sail and self.use_mega_moe:
+            layer._mega_moe_mma_type = self._mega_moe_mma_type
         if self.use_deepgemm_mxfp4_w4a16_mma and with_bias:
             raise ValueError("SAIL MXFP4 W4A16 MMA does not support expert bias.")
         mxfp4_block = 32
@@ -710,6 +721,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Resolve MORI dtype overrides and build the EPv2 op before KV cache
             # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
             layer.dispatcher.set_quant_config({})
+
+        if _is_sail and self.use_mega_moe:
+            from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                process_mega_moe_weights,
+            )
+
+            process_mega_moe_weights(
+                layer, mma_type=self._mega_moe_mma_type, with_bias=self.with_bias
+            )
+            return
 
         if self.use_deepgemm_mxfp4_w4a16_mma:
             from sglang.kernels.ops.quantization.sail_mxfp4 import (

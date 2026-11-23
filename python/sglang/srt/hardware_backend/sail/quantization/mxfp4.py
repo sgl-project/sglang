@@ -34,6 +34,50 @@ def preprocess_sail_mxfp4_scales(scales: torch.Tensor) -> torch.Tensor:
     return preprocess_mxfp4_scales(scales)
 
 
+def mega_moe_precision() -> str:
+    """Select SAIL MegaMoE precision using the framework's internal labels."""
+    w4a8 = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.get()
+    w4a16 = (
+        envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+        or envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+    )
+    if w4a8 and w4a16:
+        raise ValueError("SAIL MegaMoE W4A8 and W4A16 are mutually exclusive.")
+    return "fp8xmxfp4" if w4a8 else "bf16xmxfp4" if w4a16 else "mxf4xmxf4"
+
+
+def process_mega_moe_weights(layer, *, mma_type: str, with_bias: bool) -> None:
+    """Build SAIL MegaMoE weights before regular scale preprocessing."""
+    if getattr(layer, "_mega_moe_weights_built", False):
+        return
+    if with_bias:
+        raise ValueError("SAIL MegaMoE does not support expert bias")
+    import deep_gemm
+
+    transform = getattr(
+        deep_gemm,
+        {
+            "mxf4xmxf4": "transform_weights_for_mega_moe",
+            "fp8xmxfp4": "transform_weights_for_w4a8_mega_moe",
+            "bf16xmxfp4": "transform_weights_for_w4a16_mega_moe",
+        }[mma_type],
+    )
+    l1_pair, l2_pair = transform(
+        (layer.w13_weight.data, torch.stack(list(layer.w13_weight_scale))),
+        (layer.w2_weight.data, torch.stack(list(layer.w2_weight_scale))),
+    )
+    layer.mega_l1_weights = l1_pair
+    layer.mega_l2_weights = l2_pair
+    layer.w13_weight.data = l1_pair[0]
+    layer.w13_weight_scale.data = l1_pair[1]
+    layer.w2_weight.data = l2_pair[0]
+    layer.w2_weight_scale.data = l2_pair[1]
+    layer._mega_moe_mma_type = mma_type
+    layer._mega_moe_weights_built = True
+    layer._mxfp4_backend = "deep_gemm"
+    torch.cuda.empty_cache()
+
+
 def _uses_deepgemm(backend) -> bool:
     """Accept either the resolved enum or the raw server argument."""
     if isinstance(backend, str):
@@ -64,10 +108,17 @@ def validate_w4a16_modes(
     the hook could report the combination, so that half of the check stays with
     ``Mxfp4MoEMethod``.
     """
-    if valu_enabled and mma_enabled:
-        raise ValueError("SAIL MXFP4 W4A16 VALU and MMA modes are mutually exclusive.")
+    # Resolve explicit backends during parsing; do not read flags without W4A16.
     if not (valu_enabled or mma_enabled):
         return
+    backend = get_moe_a2a_backend() if a2a_backend is None else a2a_backend
+    if backend == "megamoe" or (
+        backend is not None and not isinstance(backend, str) and backend.is_megamoe()
+    ):
+        mega_moe_precision()
+        return
+    if valu_enabled and mma_enabled:
+        raise ValueError("SAIL MXFP4 W4A16 VALU and MMA modes are mutually exclusive.")
     if check_hardware and mma_enabled and get_device_sm() < 89:
         raise ValueError("SAIL MXFP4 W4A16 MMA requires SM89+.")
     if not _uses_deepgemm(

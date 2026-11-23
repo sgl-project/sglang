@@ -36,7 +36,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import is_hip, is_sail, is_sm100_supported
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -57,6 +58,12 @@ def _use_amd_flydsl_mega_moe() -> bool:
 
 
 def _mega_moe_mma_type(experts) -> str:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            _mega_moe_mma_type as sail_mma_type,
+        )
+
+        return sail_mma_type(experts)
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
     # Per layer: a draft may differ from the target (draft_model_build_scope).
@@ -69,6 +76,12 @@ def _mega_moe_mma_type(experts) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            _mega_moe_max_num_sms as sail_max_num_sms,
+        )
+
+        return sail_max_num_sms()
     if _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -83,6 +96,14 @@ def _mega_moe_max_num_sms() -> Optional[int]:
 
 @contextmanager
 def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            _configure_mega_moe_deep_gemm_num_sms as sail_num_sms,
+        )
+
+        with sail_num_sms(deep_gemm):
+            yield
+        return
     max_num_sms = _mega_moe_max_num_sms()
     if max_num_sms is None:
         yield
@@ -137,6 +158,22 @@ def _get_mega_moe_symm_buffer(
     mma_type: str,
     activation: str = "swiglu",
 ) -> SymmBuffer:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            _get_mega_moe_symm_buffer as sail_symm_buffer,
+        )
+
+        return sail_symm_buffer(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            num_shared_experts,
+            mma_type=mma_type,
+            activation=activation,
+        )
     import deep_gemm
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
@@ -199,6 +236,12 @@ def _destroy_mega_moe_localizer() -> None:
 
 
 def is_mega_moe_experts_ready(experts) -> bool:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            is_mega_moe_experts_ready as sail_experts_ready,
+        )
+
+        return sail_experts_ready(experts)
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
@@ -229,6 +272,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     if max_tokens_per_rank <= cap:
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.mega_moe import _log_mega_moe_hit
+
+            _log_mega_moe_hit(moe)
         return True
     assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
         f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
@@ -543,6 +590,28 @@ def run_mega_routed_experts(
     buf: Optional[SymmBuffer] = None,
     eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+            run_mega_routed_experts as run_sail_experts,
+        )
+
+        return run_sail_experts(
+            experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            num_tokens=num_tokens,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
+            activation=activation,
+            num_shared_experts=num_shared_experts,
+            routing_in_buffer=routing_in_buffer,
+            buf=buf,
+            eplb_load_row=eplb_load_row,
+        )
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
 
