@@ -1718,7 +1718,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_BEAM_TRIE_DECODE_GRAPH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Replay decode batches of trie-constrained beam search as CUDA graphs. Takes effect when the model's compact trie output head is on; batches that mix beam and regular requests, or that fit no captured graph, still run eagerly.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Replay decode batches of trie-constrained beam search as CUDA graphs. Takes effect when the model's compact trie output head is on. A beam batch that fits no captured graph still runs eagerly; a batch that mixes beam and regular requests decodes as it does without this flag.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
