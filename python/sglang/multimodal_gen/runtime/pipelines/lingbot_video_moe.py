@@ -43,7 +43,9 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(InputValidationStage())
         config = server_args.pipeline_config
         # One backend for both stages, so an in-process rewriter loads once.
-        rewriter_backend = build_rewriter_backend(config)
+        rewriter_backend = build_rewriter_backend(
+            config, trust_remote_code=server_args.trust_remote_code
+        )
         if rewriter_backend is not None:
             self.add_stage(LingBotVideoPromptRewriteStage(backend=rewriter_backend))
             if config.rewriter_auto_negative:

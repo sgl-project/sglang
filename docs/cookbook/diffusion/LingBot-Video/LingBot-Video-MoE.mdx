@@ -202,7 +202,7 @@ Request constraints:
 
 ### 5.2 Image-to-video
 
-Pass a condition image; the first frame is pinned to it for the whole denoising loop. Describe in the caption the motion that should follow the condition frame.
+Pass one condition image. Its encoded latent is kept fixed throughout denoising, so the decoded first frame should resemble the input, not reproduce its pixels exactly. Describe the motion that should follow in the caption.
 
 ```bash Command
 sglang generate \

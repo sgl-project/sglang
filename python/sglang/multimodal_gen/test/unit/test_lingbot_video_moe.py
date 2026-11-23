@@ -3,13 +3,16 @@
 import json
 import logging
 import os
+import sys
 import tempfile
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import PIL.Image
 import pytest
 import torch
+import transformers
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.kernels.ops.diffusion.sites.gated_residual_site import (
@@ -71,6 +74,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     LingBotVideoDenoisingStage,
     LingBotVideoRefinementStage,
     LingBotVideoRefinerUpscaleStage,
+    image_conditioning,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
     refiner_stages as refiner_stages_module,
@@ -84,6 +88,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     VLM_IMAGE_KEY,
     VLM_PATCH_FACTOR,
     apply_first_frame_prefix,
+    condition_frame,
     pixel_to_vlm_image,
     preprocess_condition_image,
     smart_resize,
@@ -766,6 +771,37 @@ def test_condition_image_preserves_pixel_values_when_already_sized():
     torch.testing.assert_close(pixel, expected)
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_base_and_refiner_encode_sample_each_posterior_once(monkeypatch, batch_size):
+    monkeypatch.setattr(
+        image_conditioning, "get_local_torch_device", lambda: torch.device("cpu")
+    )
+    vae = torch.nn.Identity()
+    vae.encode = lambda x: SimpleNamespace(
+        sample=lambda gen: x + randn_tensor(x.shape, generator=gen)
+    )
+    config = SimpleNamespace(get_decode_scale_and_shift=lambda **_: (2.0, 0.25))
+    args = SimpleNamespace(pipeline_config=config, disable_autocast=True)
+    pixels = torch.full((batch_size, 3, 1, 2, 2), 0.75)
+
+    def generators():
+        seeds = [torch.Generator().manual_seed(i) for i in range(batch_size)]
+        return seeds[0] if batch_size == 1 else seeds
+
+    actual = image_conditioning.encode_pixels(
+        vae, pixels, args, torch.float32, generators()
+    )
+    expected = (0.5 + randn_tensor(pixels.shape, generator=generators()) - 0.25) * 2.0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_condition_frame_requires_one_reference():
+    image = PIL.Image.new("RGB", (32, 32))
+    assert condition_frame(image) is condition_frame([image]) is image
+    with pytest.raises(ValueError, match="exactly one"):
+        condition_frame([image, image])
+
+
 def test_smart_resize_aligns_to_the_patch_factor():
     height, width = smart_resize(468, 832, factor=VLM_PATCH_FACTOR)
     assert (height, width) == (480, 832)
@@ -1130,12 +1166,10 @@ def test_refiner_upscale_runs_on_every_rank_under_cfg_parallel(monkeypatch):
         lambda: SimpleNamespace(enable_cfg_parallel=True),
     )
 
+    vae = SimpleNamespace(use_parallel_decode=False)
+    assert DecodingStage(vae).parallelism_type == StageParallelismType.MAIN_RANK_ONLY
     assert (
-        object.__new__(DecodingStage).parallelism_type
-        == StageParallelismType.MAIN_RANK_ONLY
-    )
-    assert (
-        object.__new__(LingBotVideoRefinerUpscaleStage).parallelism_type
+        LingBotVideoRefinerUpscaleStage(vae).parallelism_type
         == StageParallelismType.REPLICATED
     )
 
@@ -1342,20 +1376,33 @@ def test_rewriting_leaves_a_structured_caption_alone():
     assert stage.backend.calls == []
 
 
-def test_rewriter_backend_is_off_until_a_url_or_local_model_is_set():
+def test_rewriter_backend_is_off_until_a_url_or_local_model_is_set(monkeypatch):
     config = LingBotVideoMoEPipelineConfig()
-    assert build_rewriter_backend(config) is None
+    assert build_rewriter_backend(config, trust_remote_code=False) is None
 
     config.rewriter_url = "http://host:30000"
-    assert isinstance(build_rewriter_backend(config), HTTPRewriterBackend)
+    assert isinstance(
+        build_rewriter_backend(config, trust_remote_code=False), HTTPRewriterBackend
+    )
 
     local = LingBotVideoMoEPipelineConfig()
     local.rewriter_model_path = "/models/base"
     with pytest.raises(ValueError, match="rewriter_adapter_path"):
-        build_rewriter_backend(local)
+        build_rewriter_backend(local, trust_remote_code=False)
 
     local.rewriter_adapter_path = "/models/adapter"
-    assert isinstance(build_rewriter_backend(local), TransformersRewriterBackend)
+    processor, model = Mock(), Mock()
+    monkeypatch.setattr(transformers.AutoProcessor, "from_pretrained", processor)
+    monkeypatch.setattr(
+        transformers.AutoModelForImageTextToText, "from_pretrained", model
+    )
+    monkeypatch.setitem(sys.modules, "peft", SimpleNamespace(PeftModel=Mock()))
+    for trust in (False, True):
+        backend = build_rewriter_backend(local, trust_remote_code=trust)
+        assert isinstance(backend, TransformersRewriterBackend)
+        backend._load()
+        assert processor.call_args.kwargs["trust_remote_code"] is trust
+        assert model.call_args.kwargs["trust_remote_code"] is trust
 
 
 def _added_stages(**config_overrides) -> list:
@@ -1372,7 +1419,9 @@ def _added_stages(**config_overrides) -> list:
     pipeline.add_standard_timestep_preparation_stage = lambda *a, **k: None
     pipeline.add_standard_decoding_stage = lambda *a, **k: None
 
-    pipeline.create_pipeline_stages(SimpleNamespace(pipeline_config=config))
+    pipeline.create_pipeline_stages(
+        SimpleNamespace(pipeline_config=config, trust_remote_code=False)
+    )
     return added
 
 

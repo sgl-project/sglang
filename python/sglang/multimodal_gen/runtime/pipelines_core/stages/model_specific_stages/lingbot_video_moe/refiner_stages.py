@@ -3,7 +3,6 @@
 import copy
 
 import torch
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
@@ -23,10 +22,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
     COND_LATENT_KEY,
     TEXT_ONLY_EMBEDS_KEY,
+    condition_frame,
     preprocess_condition_image,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.image_conditioning import (
     apply_cond_latent,
+    encode_pixels,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.refiner import (
     compute_refiner_sigmas,
@@ -36,10 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
-    autocast_context,
-    autocast_enabled,
     resolve_decode_precision,
-    temporary_module_dtype,
 )
 
 logger = init_logger(__name__)
@@ -112,27 +110,7 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         vae_dtype: torch.dtype,
         generators: list[torch.Generator] | None,
     ) -> torch.Tensor:
-        normalized = (pixels.to(get_local_torch_device()).float() - 0.5) / 0.5
-        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
-        with autocast_context(vae_dtype, server_args.disable_autocast):
-            if not vae_autocast_enabled:
-                normalized = normalized.to(vae_dtype)
-            with temporary_module_dtype(
-                self.vae, vae_dtype, enabled=not vae_autocast_enabled
-            ) as vae:
-                latent_dist = vae.encode(normalized)
-
-        if isinstance(latent_dist, AutoencoderKLOutput):
-            latent_dist = latent_dist.latent_dist
-        latents = latent_dist.sample(generators).float()
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                device=latents.device, dtype=latents.dtype, vae=self.vae
-            )
-        )
-        if shift_factor is not None:
-            latents = latents - shift_factor.to(latents.device)
-        return latents * scaling_factor.to(latents.device)
+        return encode_pixels(self.vae, pixels, server_args, vae_dtype, generators)
 
     def _encode_condition_frame(
         self,
@@ -144,12 +122,11 @@ class LingBotVideoRefinerUpscaleStage(DecodingStage):
         vae_dtype: torch.dtype,
         generators: list[torch.Generator] | None,
     ) -> torch.Tensor:
-        image = batch.condition_image
-        if isinstance(image, list):
-            image = image[0]
         # Crop at the base geometry, then resize like the clip to keep its framing.
         base_pixel = preprocess_condition_image(
-            image, height=int(batch.height), width=int(batch.width)
+            condition_frame(batch.condition_image),
+            height=int(batch.height),
+            width=int(batch.width),
         )
         pixel = resize_video_pixels(base_pixel, height=height, width=width)
         latents = self._encode(

@@ -63,11 +63,13 @@ class TransformersRewriterBackend:
         adapter_path: str,
         device_map: str,
         max_new_tokens: int,
+        trust_remote_code: bool,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
         self.device_map = device_map
         self.max_new_tokens = max_new_tokens
+        self.trust_remote_code = trust_remote_code
         self.processor = None
         self.model = None
 
@@ -82,13 +84,13 @@ class TransformersRewriterBackend:
             self.adapter_path,
         )
         self.processor = AutoProcessor.from_pretrained(
-            self.model_path, trust_remote_code=True
+            self.model_path, trust_remote_code=self.trust_remote_code
         )
         base = AutoModelForImageTextToText.from_pretrained(
             self.model_path,
             torch_dtype=torch.bfloat16,
             device_map=self.device_map,
-            trust_remote_code=True,
+            trust_remote_code=self.trust_remote_code,
         )
         self.model = PeftModel.from_pretrained(base, self.adapter_path).eval()
 
@@ -123,7 +125,7 @@ class TransformersRewriterBackend:
         ].strip()
 
 
-def build_rewriter_backend(config):
+def build_rewriter_backend(config, *, trust_remote_code: bool):
     if config.rewriter_url is not None:
         return HTTPRewriterBackend(
             url=config.rewriter_url,
@@ -144,6 +146,7 @@ def build_rewriter_backend(config):
         adapter_path=config.rewriter_adapter_path,
         device_map=config.rewriter_device_map,
         max_new_tokens=config.rewriter_max_new_tokens,
+        trust_remote_code=trust_remote_code,
     )
 
 

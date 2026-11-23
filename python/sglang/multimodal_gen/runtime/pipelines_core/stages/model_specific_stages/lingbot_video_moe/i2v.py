@@ -21,6 +21,14 @@ VLM_IMAGE_KEY = "lingbot_vlm_image"
 TEXT_ONLY_EMBEDS_KEY = "lingbot_text_only_embeds"
 
 
+def condition_frame(image: PIL.Image.Image | list[PIL.Image.Image]) -> PIL.Image.Image:
+    if isinstance(image, list) and len(image) == 1:
+        image = image[0]
+    if not isinstance(image, PIL.Image.Image):
+        raise ValueError("LingBot-Video TI2V requires exactly one PIL reference frame")
+    return image
+
+
 def _round_by_factor(number: float, factor: int) -> int:
     return round(number / factor) * factor
 

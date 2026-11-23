@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import PIL.Image
 import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
@@ -13,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     COND_LATENT_KEY,
     VLM_IMAGE_KEY,
     apply_first_frame_prefix,
+    condition_frame,
     pixel_to_vlm_image,
     preprocess_condition_image,
 )
@@ -36,66 +36,42 @@ class LingBotVideoImageConditioningStage(ImageVAEEncodingStage):
         if batch.condition_image is None:
             return batch
 
-        image = batch.condition_image
-        if isinstance(image, list):
-            image = image[0]
-        if not isinstance(image, PIL.Image.Image):
-            raise ValueError(
-                f"LingBot-Video I2V expects an unprocessed PIL condition image, got {type(image)}."
-            )
-
         pixel = preprocess_condition_image(
-            image, height=int(batch.height), width=int(batch.width)
-        ).to(get_local_torch_device())
+            condition_frame(batch.condition_image),
+            height=int(batch.height),
+            width=int(batch.width),
+        )
         generator = batch.generator
         if isinstance(generator, list):
             generator = generator[0] if generator else None
         batch.extra[VLM_IMAGE_KEY] = pixel_to_vlm_image(pixel)
-        batch.extra[COND_LATENT_KEY] = self._encode_cond_latent(
-            pixel, server_args, generator=generator
-        )
-        return batch
-
-    def _encode_cond_latent(
-        self,
-        pixel: torch.Tensor,
-        server_args: ServerArgs,
-        generator: torch.Generator | None,
-    ) -> torch.Tensor:
         vae_dtype = resolve_precision(
             server_args, self.component_name, precision_attr="vae_precision"
         )
-        vae_autocast_enabled = autocast_enabled(vae_dtype, server_args.disable_autocast)
-        normalized = (pixel.float() - 0.5) / 0.5
-
         with self.use_declared_component(
             component_name=self.component_name, module=self.vae
         ) as vae:
-            assert vae is not None
             self.vae = vae
-            with autocast_context(vae_dtype, server_args.disable_autocast):
-                if not vae_autocast_enabled:
-                    normalized = normalized.to(vae_dtype)
-                with temporary_module_dtype(
-                    self.vae, vae_dtype, enabled=not vae_autocast_enabled
-                ) as vae:
-                    latent_dist = vae.encode(normalized)
-                if isinstance(latent_dist, AutoencoderKLOutput):
-                    latent_dist = latent_dist.latent_dist
-
-        # The reference samples the posterior rather than taking its mode,
-        # which also advances the generator before the noise draw.
-        cond_latent = self.retrieve_latents(
-            latent_dist, generator, sample_mode="sample"
-        ).float()
-        scaling_factor, shift_factor = (
-            server_args.pipeline_config.get_decode_scale_and_shift(
-                device=cond_latent.device, dtype=cond_latent.dtype, vae=self.vae
+            batch.extra[COND_LATENT_KEY] = encode_pixels(
+                vae, pixel, server_args, vae_dtype, generator
             )
-        )
-        return self.scale_and_shift_encode_latents(
-            cond_latent, scaling_factor, shift_factor
-        )
+        return batch
+
+
+def encode_pixels(vae, pixels, server_args, vae_dtype, generator):
+    normalized = (pixels.to(get_local_torch_device()).float() - 0.5) / 0.5
+    cast = not autocast_enabled(vae_dtype, server_args.disable_autocast)
+    with autocast_context(vae_dtype, server_args.disable_autocast):
+        with temporary_module_dtype(vae, vae_dtype, enabled=cast) as encoder:
+            posterior = encoder.encode(normalized.to(vae_dtype) if cast else normalized)
+    if isinstance(posterior, AutoencoderKLOutput):
+        posterior = posterior.latent_dist
+    # Sample before drawing denoising noise, matching the reference RNG order.
+    latents = posterior.sample(generator).float()
+    scale, shift = server_args.pipeline_config.get_decode_scale_and_shift(
+        device=latents.device, dtype=latents.dtype, vae=vae
+    )
+    return ImageVAEEncodingStage.scale_and_shift_encode_latents(latents, scale, shift)
 
 
 def apply_cond_latent(batch: Req, latents: torch.Tensor) -> torch.Tensor:

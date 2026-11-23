@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.i2v import (
+    condition_frame,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.rewriter_prompts import (
     IMAGE_STEP1_EXPAND,
     IMAGE_STEP2_MAP,
@@ -19,7 +22,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     VIDEO_STEP2_MAP,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 _CJK = re.compile(r"[　-〿㐀-䶿一-鿿＀-￯]")
 _FENCED_JSON = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
@@ -72,14 +74,7 @@ def needs_rewrite(prompt: str) -> bool:
 
 
 def condition_image(batch: Req) -> PIL.Image.Image:
-    """The condition frame as a PIL image, loading it if the stage runs first."""
-
-    image = batch.condition_image
-    if isinstance(image, list):
-        image = image[0]
-    if not isinstance(image, PIL.Image.Image):
-        image = load_image(batch.image_path)
-    return image.convert("RGB")
+    return condition_frame(batch.condition_image).convert("RGB")
 
 
 class LingBotVideoPromptRewriteStage(PipelineStage):
