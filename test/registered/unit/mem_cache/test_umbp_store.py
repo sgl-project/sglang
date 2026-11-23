@@ -375,6 +375,37 @@ class TestUMBPStore(unittest.TestCase):
                 umbp_module.UMBPStore(spdk)
             umbp_module.UMBPStore(dram).close()
 
+            # A 186-byte prefix passes the anchor check (186 + 69 = 255 bytes), but
+            # a hybrid key is 186 + 1 + 64 + 17 = 268 bytes, so SPDK rejects it at
+            # registration. The same prefix on DRAM registers without error.
+            from sglang.srt.mem_cache.hicache_storage import PoolName
+
+            near = "m" * 186
+            spdk_near = umbp_module.UMBPStore(
+                MockStorageConfig(
+                    model_name=near,
+                    extra_config={
+                        "dram_capacity_bytes": 1024,
+                        "ssd_enabled": True,
+                        "ssd_backend": "spdk",
+                    },
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "hybrid pool"):
+                spdk_near.register_mem_host_pool_v2(
+                    MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4
+                )
+            dram_near = umbp_module.UMBPStore(
+                MockStorageConfig(
+                    model_name=near,
+                    extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
+                )
+            )
+            dram_near.register_mem_host_pool_v2(
+                MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4
+            )
+            dram_near.close()
+
     def test_spdk_guard_placeholder_matches_page_hash_width(self):
         from sglang.srt.mem_cache.utils import get_hash_str
 
