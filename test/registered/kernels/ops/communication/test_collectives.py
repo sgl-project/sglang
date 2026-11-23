@@ -26,7 +26,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 
@@ -345,13 +345,120 @@ def test_attention_residual_direct_all_gather():
     assert handle is not None
 
 
+# One row; fewer rows than some ranks' share of an even split; an even split; a
+# ragged split with several rows a block, so the chunk slots are reused.
+_STREAM_NUM_TOKENS = (1, 5, 64, 1027)
+# (chunk_rows, occupancy, consumer_regs), bank rows: one chunk that ends with the
+# prefix row, the prefix row in a chunk of its own, bank rows in both chunks, and
+# the two-blocks-an-SM config of one bank row.
+_STREAM_CONFIGS = (
+    ((4, 1, 200), 3),
+    ((4, 1, 200), 4),
+    ((4, 1, 200), 6),
+    ((2, 2, 0), 1),
+)
+
+
+@cache_once
+def _stream_operands():
+    """What every rank holds a copy of, and this rank's two symmetric buffers."""
+    max_tokens, max_bank_rows = max(_STREAM_NUM_TOKENS), 6
+    generator = torch.Generator().manual_seed(60)
+    bank = torch.randn(max_tokens, max_bank_rows, _HIDDEN_SIZE, generator=generator)
+    residual = torch.randn(max_tokens, _HIDDEN_SIZE, generator=generator)
+    replicated = tuple(
+        t.to(_device(), torch.bfloat16)
+        for t in (
+            bank,
+            residual,
+            torch.linspace(-0.01, 0.01, _HIDDEN_SIZE),
+            torch.linspace(1.25, 0.75, _HIDDEN_SIZE),
+        )
+    )
+    x, x_handle, x_mc = _symmetric_tensor((max_tokens, _HIDDEN_SIZE))
+    stream, stream_handle, stream_mc = _symmetric_tensor((max_tokens, _HIDDEN_SIZE))
+    _stream_words(stream).copy_(_STREAM_EMPTY)
+    return replicated, (x, x_mc, stream, stream_mc), (x_handle, stream_handle)
+
+
+# The stream marker: 0x80000000 in the first 32-bit word of every 16 bytes.
+_STREAM_EMPTY = torch.tensor([-(2**31), 0, 0, 0], dtype=torch.int32)
+
+
+def _stream_words(stream):
+    return stream.reshape(-1).view(torch.int32).view(-1, 4)
+
+
+@pytest.mark.parametrize("with_residual", (False, True))
+@pytest.mark.parametrize("config,num_bank_rows", _STREAM_CONFIGS)
+@pytest.mark.parametrize("num_tokens", _STREAM_NUM_TOKENS)
+@torch.inference_mode()
+def test_attention_residual_stream_all_reduce(
+    num_tokens, config, num_bank_rows, with_residual
+):
+    """The aggregation beside the streamed pull all-reduce, against the in-place
+    pull all-reduce followed by the aggregation."""
+    _require_sm100()
+    comm = _init_comm()
+    (bank, residual, cw, ow), (x, x_mc, stream, stream_mc), _ = _stream_operands()
+    bank, x, stream = bank[:num_tokens], x[:num_tokens], stream[:num_tokens]
+    residual = residual[:num_tokens] if with_residual else None
+    local = attn_res._jit_fused_tma_module(*config)
+    streamed = attn_res._jit_fused_stream_module(*config)
+    partial = torch.randn(
+        num_tokens,
+        _HIDDEN_SIZE,
+        generator=torch.Generator().manual_seed(61 + dist.get_rank()),
+    ).to(_device(), torch.bfloat16)
+    if not with_residual:
+        # (+0.0, -0.0) pairs sum to the marker's own bits: a delivered row must
+        # not read as one that has not arrived.
+        partial[0].view(-1, 2).copy_(torch.tensor([0.0, -0.0]))
+        partial[-1].view(-1, 2).copy_(torch.tensor([0.0, -0.0]))
+
+    x.copy_(partial)
+    nvlink_comm.all_reduce_pull(
+        comm.obj, x, x, residual, in_mc_ptr=x_mc, out_mc_ptr=x_mc
+    )
+    expected_prefix = x.clone()
+    expected = torch.empty_like(x)
+    local.run(expected_prefix, bank, cw, ow, expected, num_bank_rows, 1e-6, False)
+
+    for _ in range(3):  # every round finds the stream as the round before left it
+        x.copy_(partial)
+        output = torch.full_like(x, float("nan"))
+        blocks = nvlink_comm.all_reduce_pull_stream(
+            comm.obj, x, stream, residual, in_mc_ptr=x_mc, out_mc_ptr=stream_mc
+        )
+        streamed.run(
+            stream,
+            x,
+            bank,
+            cw,
+            ow,
+            output,
+            num_bank_rows,
+            1e-6,
+            False,
+            comm.world_size,
+            blocks,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(x, expected_prefix)  # as values: a -0.0 may come as +0.0
+        assert (_stream_words(stream) == _STREAM_EMPTY.to(stream.device)).all()
+
+
 def _precompile(num_gpus):
     for world_size in num_gpus:
         nvlink_comm._jit_push_module(torch.bfloat16, world_size)
         sp_collective._jit_module(world_size)
         if world_size in gemm_ag.WORLD_SIZES:
             gemm_ag._jit_module(world_size)
-    attn_res._jit_fused_tma_module(4, 1, 200)
+    nvlink_comm._jit_pull_module(torch.bfloat16, 4)
+    for config in {config for config, _ in _STREAM_CONFIGS}:
+        attn_res._jit_fused_tma_module(*config)
+        attn_res._jit_fused_stream_module(*config)
 
 
 if __name__ == "__main__":

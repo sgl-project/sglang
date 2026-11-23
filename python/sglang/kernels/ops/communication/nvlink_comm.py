@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 
 _PRIMITIVES: Final = ["all_gather", "all_reduce"]
+# The pull plane also has the all-reduce that streams its output to a dependent.
+_PULL_PRIMITIVES: Final = [*_PRIMITIVES, "all_reduce_stream"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -40,7 +42,7 @@ def _jit_pull_module(dtype: torch.dtype, num_unroll: int) -> Module:
         f"unroll{num_unroll}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
-            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in _PRIMITIVES
+            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in _PULL_PRIMITIVES
         ],
     )
 
@@ -119,6 +121,34 @@ def all_reduce_pull(
     """``output = allreduce(input) [+ residual]`` over symmetric ``input`` / ``output``
     (may be the same tensor), reduce-scattered in the switch and multicast back."""
     _jit_pull_module(input.dtype, num_unroll).all_reduce(
+        comm,
+        input,
+        output,
+        residual,
+        in_mc_ptr or get_multicast_ptr(input),
+        out_mc_ptr or get_multicast_ptr(output),
+        num_blocks_hint,
+    )
+
+
+def all_reduce_pull_stream(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    *,
+    in_mc_ptr: int = 0,
+    out_mc_ptr: int = 0,
+    num_unroll=4,
+    num_blocks_hint: int = 0,
+) -> int:
+    """:func:`all_reduce_pull` into a second symmetric buffer, for a kernel that
+    consumes ``output`` beside it. ``output`` holds the stream marker (0x80000000
+    in the first word of every 16 bytes); the next kernel on the stream is released
+    before the first load and has to take each row through the marker, putting it
+    back. Returns the number of blocks launched.
+    """
+    return _jit_pull_module(input.dtype, num_unroll).all_reduce_stream(
         comm,
         input,
         output,

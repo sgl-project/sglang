@@ -10,7 +10,7 @@ import logging
 import re
 from array import array
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -501,6 +501,16 @@ def _k3_all_reduce_add(hidden_states, residual, forward_batch):
     if k3_ar_fusion.find_mc_ptr(hidden_states) is None:
         return None
     return k3_ar_fusion.all_reduce(hidden_states, residual)
+
+
+def _k3_all_reduce_add_read(
+    bank, score_proj, score_norm, hidden_states, residual, forward_batch, norm
+):
+    """`_k3_all_reduce_add` with the bank's FFN read of the result running beside
+    the all-reduce; None for the batches that pair does not take."""
+    return bank.require().forward_all_reduce(
+        hidden_states, residual, score_proj, score_norm, norm
+    )
 
 
 def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
@@ -3311,7 +3321,7 @@ class KimiK3DecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 writes_block=self.is_block_write_layer,
-                ffn_input_fusions=self._ffn_input_fusions(),
+                ffn_input_fusions=self._ffn_input_fusions(attn_bank),
                 fuses_slice_collectives=self._sp_moe
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
@@ -3326,13 +3336,20 @@ class KimiK3DecoderLayer(nn.Module):
             (ffn, self.post_attention_layernorm),
         )
 
-    def _ffn_input_fusions(self):
+    def _ffn_input_fusions(self, attn_bank):
         """K3's kernels that complete the attention output's sum with the
         pending residual add ahead of the bank's FFN read: the fused
-        all-reduce on every row, or the tuned reduce-scatter onto this rank's
-        attention-TP shard (SP-MoE)."""
+        all-reduce on every row (first with the read beside it, where that is
+        supported), or the tuned reduce-scatter onto this rank's attention-TP
+        shard (SP-MoE)."""
         if self.all_reduce_fusion:
-            return (ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add),)
+            add = ReadoutFusion(SumGroup.ATTN_TP, _k3_all_reduce_add)
+            if not k3_ar_fusion.attn_res_stream_supported():
+                return (add,)
+            read = partial(
+                _k3_all_reduce_add_read, attn_bank, self.mlp_res_proj, self.mlp_res_norm
+            )
+            return (ReadoutFusion(SumGroup.ATTN_TP, read, reads=True), add)
         if self._sp_moe and k3_sp_collective.enabled():
             return (
                 ReadoutFusion(SumGroup.ATTN_TP, _k3_reduce_scatter_add, scatters=True),

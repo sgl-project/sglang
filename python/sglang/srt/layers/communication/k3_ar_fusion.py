@@ -18,7 +18,15 @@ as the attn-res prefix sum) or ``None``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, overload
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    overload,
+)
 
 import torch
 
@@ -58,6 +66,8 @@ _LOW_SM_PULL_UNROLL = 8
 # [latent | shared] pair flattened to rows x (moe_hidden_size + hidden_size).
 ATTN_O_PROJ = "attn_o_proj"
 MOE_LATENT_SHARED = "moe_latent_shared"
+# What :func:`all_reduce_attn_res` streams o_proj's reduced rows through.
+ATTN_O_PROJ_STREAM = "attn_o_proj_stream"
 
 
 class _State(NamedTuple):
@@ -167,7 +177,11 @@ def _max_buffer_rows() -> int:
 
 
 def _create_buffer(
-    name: str, width: int, dtype: torch.dtype, group_name: str
+    name: str,
+    width: int,
+    dtype: torch.dtype,
+    group_name: str,
+    init: Optional[Callable[[torch.Tensor], None]] = None,
 ) -> _Buffer:
     """One symmetric buffer, rendezvoused once. ``empty_strided_p2p`` skips the
     caching allocator, so this is right for a persistent buffer only."""
@@ -185,6 +199,8 @@ def _create_buffer(
             torch.device("cuda", torch.cuda.current_device()),
             group_name,
         ).view(max_rows, width)
+        if init is not None:
+            init(region)
     handle = _SymmetricMemory.rendezvous(region)
     assert handle is not None and handle.multicast_ptr != 0
     buf = _Buffer(
@@ -212,8 +228,11 @@ def symm_buffer(
     width: int,
     dtype: torch.dtype,
     group_name: Optional[str] = None,
+    *,
+    init: Optional[Callable[[torch.Tensor], None]] = None,
 ):
-    """``[rows, width]`` view of a named persistent symmetric buffer.
+    """``[rows, width]`` view of a named persistent symmetric buffer; ``init``
+    fills it once at its creation (uninitialized otherwise).
 
     The pull reduces in place on the input's multicast alias, so every rank must
     resolve the same ``(buffer, offset)``; a per-forward symm-pool allocation does
@@ -229,7 +248,8 @@ def symm_buffer(
 
         group_name = get_parallel().tp_group.cpu_group.group_name
     buf: _Buffer = ctx.get_buffer(
-        f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype, group_name)
+        f"k3_symm:{name}",
+        lambda: _create_buffer(name, width, dtype, group_name, init),
     )
     assert 0 < rows <= buf.max_rows and width == buf.width and dtype == buf.region.dtype
     return buf.region[:rows]
@@ -379,6 +399,115 @@ def _k3_pull_all_reduce(
         out_mc_ptr=x_mc,
         num_unroll=num_unroll,
         num_blocks_hint=num_blocks_hint,
+    )
+
+
+@cache_once
+def _attn_res_stream_min_rows() -> Optional[int]:
+    """Rows from which :func:`all_reduce_attn_res` takes a batch, or None where
+    it takes none. It saves the aggregation's time less a few microseconds a
+    launch, which a prefill of fewer rows does not show."""
+    from sglang.srt.utils.device import get_device_sm
+
+    return 8192 if get_device_sm() in (100, 103) else None
+
+
+def _mark_stream_empty(region: torch.Tensor) -> None:
+    """Fill ``region`` with the stream marker (``StreamMarker`` in
+    sgl_kernel/distributed/communicator.cuh): 0x80000000 in the first 32-bit
+    word of every 16 bytes."""
+    words = region.view(-1).view(torch.int32).view(-1, 4)
+    words.zero_()
+    words[:, 0] = -(2**31)
+
+
+def attn_res_stream_supported() -> bool:
+    """Whether :func:`all_reduce_attn_res` takes any batch on this device."""
+    return enabled() and _attn_res_stream_min_rows() is not None
+
+
+def all_reduce_attn_res(
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    ow: torch.Tensor,
+    nvb: int,
+    eps: float,
+) -> Optional[torch.Tensor]:
+    """:func:`all_reduce` of ``x`` with ``attn_res_fused_tma(x, bank, cw, ow, out,
+    nvb, eps)`` of the result running beside it instead of after it; returns
+    ``out``. The reduce delivers its rows through a second symmetric buffer and
+    the aggregation takes each one as soon as it is whole.
+
+    None, with nothing touched, for a batch the pair does not take: outside its
+    row window, or an ``x`` that is not a :func:`symm_buffer` slice."""
+    from sglang.kernels.ops.attention import attn_res
+
+    min_rows, state, rows = _attn_res_stream_min_rows(), _get_state(), x.shape[0]
+    if state is None or min_rows is None or not min_rows <= rows <= _max_buffer_rows():
+        return None
+    x_mc = find_mc_ptr(x)
+    if x_mc is None:
+        return None
+    # The buffer starts as stream markers, and the aggregation puts the marker
+    # back over every row it takes.
+    stream = symm_buffer(
+        ATTN_O_PROJ_STREAM, rows, x.shape[1], x.dtype, init=_mark_stream_empty
+    )
+    out = torch.empty_like(x)
+    _k3_stream_all_reduce_attn_res(
+        state.world_size,
+        x,
+        x_mc,
+        stream,
+        get_mc_ptr(stream),
+        residual,
+        bank,
+        cw,
+        ow,
+        out,
+        nvb,
+        eps,
+        *attn_res._tuning(nvb, rows),
+    )
+    return out
+
+
+@register_custom_op(
+    op_name="k3_stream_all_reduce_attn_res", mutates_args=["x", "stream", "out"]
+)
+def _k3_stream_all_reduce_attn_res(
+    world_size: int,
+    x: torch.Tensor,
+    x_mc: int,
+    stream: torch.Tensor,
+    stream_mc: int,
+    residual: Optional[torch.Tensor],
+    bank: torch.Tensor,
+    cw: torch.Tensor,
+    ow: torch.Tensor,
+    out: torch.Tensor,
+    nvb: int,
+    eps: float,
+    chunk_rows: int,
+    occupancy: int,
+    consumer_regs: int,
+) -> None:
+    from sglang.kernels.ops.attention import attn_res
+
+    # Whole rows, not _rows(): the aggregation takes rows in the order this
+    # split delivers them.
+    blocks = nvlink_comm.all_reduce_pull_stream(
+        kimi_k3_comm.get_comm(world_size),
+        x,
+        stream,
+        residual,
+        in_mc_ptr=x_mc,
+        out_mc_ptr=stream_mc,
+    )
+    attn_res._jit_fused_stream_module(chunk_rows, occupancy, consumer_regs).run(
+        stream, x, bank, cw, ow, out, nvb, eps, False, world_size, blocks
     )
 
 
