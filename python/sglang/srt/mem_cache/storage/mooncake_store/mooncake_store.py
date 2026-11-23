@@ -626,7 +626,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ):
                     client_hostname = shared_engine.get_session_id()
                     transfer_engine = shared_engine.get_engine()
-                    shared_engine.enable_shared_memory_registration()
+                    shared_engine.enable_memory_registration_reuse()
                     logger.info(
                         f"Reuse initialized mooncake transfer engine: {shared_engine}"
                     )

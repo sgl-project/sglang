@@ -143,16 +143,16 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def enable_shared_memory_registration(self) -> None:
-        if not hasattr(self.engine, "enable_shared_memory_registration"):
+    def enable_memory_registration_reuse(self) -> None:
+        if not hasattr(self.engine, "enable_memory_registration_reuse"):
             raise RuntimeError(
                 "Sharing a Mooncake engine with the store requires "
-                "enable_shared_memory_registration. Upgrade Mooncake."
+                "enable_memory_registration_reuse. Upgrade Mooncake."
             )
-        ret = self.engine.enable_shared_memory_registration()
+        ret = self.engine.enable_memory_registration_reuse()
         if ret != 0:
             raise RuntimeError(
-                "Failed to enable Mooncake shared memory registration "
+                "Failed to enable Mooncake memory registration reuse "
                 f"(ret={ret}); enable it before registering buffers on "
                 "a classic transfer engine."
             )
