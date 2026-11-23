@@ -159,6 +159,14 @@ class TestSteadyStateMetrics(unittest.TestCase):
         self.assertEqual(metrics.input_throughput, 2.0)
         self.assertEqual(metrics.output_throughput, 2.0)
 
+    def test_rust_client_is_rejected_before_starting_the_benchmark(self):
+        with patch.object(steady_state_serving.serving, "run_benchmark") as run:
+            with self.assertRaisesRegex(ValueError, "--rust-client"):
+                steady_state_serving.run_steady_state_benchmark(
+                    Namespace(rust_client=True), concurrency_ratio=0.8
+                )
+            run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
