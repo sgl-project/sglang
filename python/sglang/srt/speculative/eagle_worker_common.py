@@ -97,8 +97,9 @@ def bind_eagle_runtime_hooks(
         # Only callers whose post-verify consumer understands the shard marker
         # and validated outer target models opt in. Exact class-name matching
         # deliberately excludes MTP draft models and unvalidated subclasses.
-        # The stock policy declines every temperature row.
         processors[0].enable_sharded_verify(
+            # A provider's local keys; the stock policy declines every
+            # temperature row.
             temperature_keys=hooks.post_verify.local_keys
             is not STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify.local_keys
         )

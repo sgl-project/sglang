@@ -94,8 +94,8 @@ def default_post_verify(
 def _verify_step(io: PostVerifyIO, batch: StockVerifyBatch) -> VerifyStep:
     """The verify step eagle_sample adjusts and routes with, from the view. The
     route takes `VerifyRoute.derive`'s terms, with the view's grammar mask and
-    watermark standing in for `has_grammar` and the sampling info's watermark
-    rows, which the view does not carry; keep the two in step."""
+    watermark standing in for `has_grammar` and `info.watermark`, which the
+    view does not carry; keep the two in step."""
     from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 
