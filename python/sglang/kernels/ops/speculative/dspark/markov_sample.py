@@ -265,6 +265,10 @@ class MarkovSampleStep:
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
+                # Older NPU kernels implement the uncapped, full-vocab path.
+                for option in ("softcap", "vocab_limit"):
+                    if kwargs.get(option) is None:
+                        kwargs.pop(option, None)
                 return markov_sample_step_triton(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
