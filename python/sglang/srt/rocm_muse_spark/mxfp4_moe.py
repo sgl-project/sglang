@@ -54,21 +54,44 @@ def _is_gfx1250() -> bool:
 
 # gfx1250 has no gfx950 a4w4 / compact A4 kernels; aiter's A8W4 TDM fused MoE runs all MXFP4 expert batches.
 GFX1250_A8W4 = envs.SGLANG_ROCM_MUSE_GFX1250_A8W4.get() and _is_gfx1250()
-if GFX1250_A8W4:
-    # aiter keys its grouped-MoE CSV on topk=-1 under an EP mask and on the real topk without one; the local-id
-    # calls below run without the mask, so this file repeats the TP8/EP8 tuned rows up to 256 tokens under topk=8.
-    # It also holds the EP row for 16384 tokens (8193..16384-token prefill chunks), faster than aiter's default tile.
-    # Up to 512 tokens both CSVs keep num_buffer_stage2 = 3: with 2 stage-2 LDS buffers the stage-2 output's
-    # LDS + TDM store occasionally wrote stale LDS bytes (single non-finite elements, then NaN rows after the
-    # per-expert norm) under verify load, the gfx1250 TDM-store pattern of ROCm/aiter#7202 / #7203.
-    _LOCAL_IDS_CSV = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "configs",
-        "gfx1250_tp8_ep8_a8w4_local_ids_fmoe.csv",
-    )
-    os.environ["AITER_CONFIG_GROUPED_FMOE"] = os.pathsep.join(
-        p for p in (os.environ.get("AITER_CONFIG_GROUPED_FMOE"), _LOCAL_IDS_CSV) if p
-    )
+# aiter keys its grouped-MoE CSV on topk=-1 under an EP mask and on the real topk without one; the local-id
+# calls below run without the mask, so this file repeats the TP8/EP8 tuned rows up to 256 tokens under topk=8.
+# It also holds the EP row for 16384 tokens (8193..16384-token prefill chunks), faster than aiter's default tile.
+# Up to 512 tokens both CSVs keep num_buffer_stage2 = 3: with 2 stage-2 LDS buffers the stage-2 output's
+# LDS + TDM store occasionally wrote stale LDS bytes (single non-finite elements, then NaN rows after the
+# per-expert norm) under verify load, the gfx1250 TDM-store pattern of ROCm/aiter#7202 / #7203.
+_LOCAL_IDS_CSV = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "configs",
+    "gfx1250_tp8_ep8_a8w4_local_ids_fmoe.csv",
+)
+
+
+def _add_gfx1250_a8w4_fmoe_rows() -> None:
+    """Add this model's grouped-MoE rows to the tables aiter searches, beside the ones it already searches.
+
+    AITER_CONFIG_GROUPED_FMOE, once set, replaces aiter's own tuned table and its per-model tables for the whole
+    process. So this runs when a Muse Spark model prepares its gfx1250 experts, not at import (every server on
+    gfx1250 imports this module, and the other models would lose their tuned tiles), and an unset variable is
+    first resolved to the tables aiter would have read."""
+    paths = [
+        p
+        for p in os.environ.get("AITER_CONFIG_GROUPED_FMOE", "").split(os.pathsep)
+        if p
+    ]
+    if _LOCAL_IDS_CSV in paths:
+        return
+    if not paths:
+        from aiter.jit.core import AITER_CONFIGS
+
+        paths = [
+            p
+            for p in str(AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE).split(os.pathsep)
+            if p
+        ]
+    os.environ["AITER_CONFIG_GROUPED_FMOE"] = os.pathsep.join(paths + [_LOCAL_IDS_CSV])
+
+
 # Stage-1 launch (tile_n, async copy, waves per EU), MI355X prefill widths.
 _S1_TILE_N = 128
 _S1_ASYNC = True
@@ -262,6 +285,8 @@ def prepare_gfx1250_a8w4_weights(experts) -> None:
     """gfx1250: shuffle the MXFP4 experts into aiter's gfx1250 layout (GU-interleaved w13, n32k4 scales) and drop
     the stored copy; every expert batch then runs ``run_gfx1250_a8w4``."""
     from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+    _add_gfx1250_a8w4_fmoe_rows()
 
     e = experts.num_local_experts
     w13 = moe_shuffle_weight(
