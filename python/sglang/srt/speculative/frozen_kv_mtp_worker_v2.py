@@ -741,12 +741,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
         self.adaptive_controller = None
 
-        # Some dummy tensors (parity with EAGLEWorkerV2 init).
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
-
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property

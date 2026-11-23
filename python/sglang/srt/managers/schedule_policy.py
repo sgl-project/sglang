@@ -94,9 +94,7 @@ if TYPE_CHECKING:
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
+CLIP_MAX_NEW_TOKENS = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 @lru_cache(maxsize=1)
@@ -570,7 +568,7 @@ class SchedulePolicy:
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
-            if getattr(tree_cache, "disable", True):
+            if tree_cache.disable:
                 if policy_enum == CacheAwarePolicy.UNIBOOST:
                     # UniBoost still works without a prefix cache: every
                     # prompt token counts as uncached work.
@@ -1200,7 +1198,7 @@ class PrefillAdder:
         self.waiting_queue_len = waiting_queue_len
 
     def _admitted_extend_lens(self) -> List[int]:
-        return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
+        return [req.extend_len for req in self.can_run_list]
 
     def _tile_admission_metric_key(self) -> str:
         return f"{PREFILL_TILE_BUDGET_MODE}_q_tiles_per_head"
@@ -2109,7 +2107,7 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if req.sampling_params.ignore_eos and self.tree_cache.disable:
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         max_new = self._swa_new_tokens(req)
