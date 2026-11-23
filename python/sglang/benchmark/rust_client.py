@@ -101,6 +101,7 @@ _UNSUPPORTED_OPTIONS = {
     "apply_chat_template": False,
     "plot_throughput": False,
     "cache_report": False,
+    "goodput": None,
     "pd_separated": False,
     "return_routed_experts": False,
     "token_ids_logprob": None,

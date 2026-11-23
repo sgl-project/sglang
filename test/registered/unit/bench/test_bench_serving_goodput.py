@@ -4,6 +4,7 @@ import argparse
 import unittest
 
 from sglang.benchmark.goodput import calculate_goodput
+from sglang.benchmark.rust_client import UnsupportedByRustClient, check_supported
 from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -31,6 +32,14 @@ OUTPUTS = [
 
 
 class TestBenchServingGoodput(CustomTestCase):
+    def test_rust_client_rejects_explicit_goodput(self):
+        args = argparse.Namespace(backend="sglang", dataset_name="random", goodput=None)
+        check_supported(args)
+
+        args.goodput = [("ttft", 500.0)]
+        with self.assertRaisesRegex(UnsupportedByRustClient, "goodput"):
+            check_supported(args)
+
     def test_request_is_good_only_if_it_meets_every_listed_slo(self):
         all_three = {"ttft": 3 / 5, "tpot": 3 / 5, "e2el": 3 / 5}
         # (--goodput entries, good requests, attainment of each listed SLO alone)
