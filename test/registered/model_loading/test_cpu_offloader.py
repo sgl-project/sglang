@@ -14,6 +14,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelL
 from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
+from sglang.srt.model_loader.tensor_aliases import find_tensor_aliases
 from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -177,7 +178,7 @@ class TestCpuOffloader(CustomTestCase):
         norm.weight.data.copy_(loaded_weights)
         norm.gemma_weight.zero_()
 
-        PreshardedModelLoader._rebind_parameter_aliases(norm)
+        PreshardedModelLoader._rebind_parameter_aliases(norm, ())
 
         self.assertEqual(norm.weight.device.type, "cpu")
         self.assertEqual(norm.gemma_weight.device.type, self.device.type)
@@ -246,21 +247,37 @@ class TestCpuOffloader(CustomTestCase):
             self.assertEqual(convolution.bias.device.type, "cpu")
 
     def test_loaders_rebuild_replaced_convolution_view(self) -> None:
-        for rebind in (
-            PreshardedModelLoader._rebind_parameter_aliases,
-            WeightCacheModelLoader._rebuild_stale_views,
+        # GDN layers name the convolution conv1d, KDA layers qkv_conv1d; the
+        # rebuild must not depend on either name.
+        for projection_name, cache_name in (
+            ("conv1d", "conv_weights"),
+            ("qkv_conv1d", "conv_weights"),
+            ("temporal_projection", "cached_kernel"),
         ):
-            with self.subTest(loader=rebind.__qualname__), torch.no_grad():
-                model = CachedConvolution("conv1d", self.device)
-                model.conv1d.weight = nn.Parameter(torch.ones_like(model.conv1d.weight))
-                model.projection.weight.fill_(1)
+            for rebind in (
+                PreshardedModelLoader._rebind_parameter_aliases,
+                WeightCacheModelLoader._rebuild_stale_views,
+            ):
+                with (
+                    self.subTest(
+                        projection=projection_name, loader=rebind.__qualname__
+                    ),
+                    torch.no_grad(),
+                ):
+                    model = CachedConvolution(projection_name, self.device, cache_name)
+                    aliases = find_tensor_aliases(model)
+                    convolution = getattr(model, projection_name)
+                    convolution.weight = nn.Parameter(
+                        torch.ones_like(convolution.weight)
+                    )
+                    model.projection.weight.fill_(1)
 
-                rebind(model)
-                output = model(torch.ones((1, 3, 3), device=self.device))
+                    rebind(model, aliases)
+                    output = model(torch.ones((1, 3, 3), device=self.device))
 
-                torch.testing.assert_close(
-                    output, torch.full((1, 2), 9.0, device=self.device)
-                )
+                    torch.testing.assert_close(
+                        output, torch.full((1, 2), 9.0, device=self.device)
+                    )
 
 
 if __name__ == "__main__":

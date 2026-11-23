@@ -23,6 +23,10 @@ from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
 )
+from sglang.srt.model_loader.tensor_aliases import (
+    find_tensor_aliases,
+    rebase_tensor_aliases,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -216,13 +220,6 @@ class WeightCacheModelLoader(BaseModelLoader):
         # IPC handles. Running it again would double-process (e.g.,
         # re-quantize already-quantized weights), corrupting tensor data.
 
-        # Rebuild stale tensor views. Some modules store tensor views as
-        # plain attributes (not parameters/buffers) during __init__. When
-        # the model is initialized on meta device and then weights are
-        # replaced via IPC mapping, these views still point to the old
-        # meta storage. We must recreate them from the now-valid tensors.
-        self._rebuild_stale_views(model)
-
         # With torch_ipc the model points into the daemon's GPU memory via CUDA
         # IPC. If the daemon dies, those pointers dangle, so watch it and fail
         # loud. vmm_fd mappings keep the memory alive, so a dead daemon is
@@ -308,34 +305,24 @@ class WeightCacheModelLoader(BaseModelLoader):
         return quant_method, quant_config
 
     @staticmethod
-    def _rebuild_stale_views(model):
-        """Rebuild tensor views that went stale after IPC weight replacement.
+    def _rebuild_stale_views(model, aliases) -> list:
+        """Rebuild the tensor aliases recorded before mapping on the mapped
+        tensors, and return those that cannot be rebuilt.
 
-        RadixLinearAttention.conv_weights is a view of conv1d.weight created
-        during __init__. After IPC mapping replaces conv1d.weight with a new
-        tensor, the old view still points to meta-device storage. Recreate
-        it from the now-valid parameter.
+        Some modules keep a view of a parameter, or the parameter itself, as
+        a plain attribute or under a second name (RadixLinearAttention keeps
+        conv_weights, a view of its layer's convolution weight, made in
+        __init__). Mapping replaces the parameter, so these still point to
+        the meta-device storage the model was built with. A buffer that
+        several modules registered can also arrive under one name only, and
+        is registered under the others again here.
         """
-        try:
-            from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-        except ImportError:
-            return
-
-        count = 0
-        for _, module in model.named_modules():
-            conv1d = getattr(module, "conv1d", None)
-            attn = getattr(module, "attn", None)
-            if conv1d is not None and isinstance(attn, RadixLinearAttention):
-                if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.refresh_conv_weights(conv1d.weight)
-                    if hasattr(conv1d, "bias") and conv1d.bias is not None:
-                        attn.bias = conv1d.bias
-                    count += 1
-
-        if count > 0:
+        rebuilt, problems = rebase_tensor_aliases(model, aliases)
+        if rebuilt:
             logger.info(
-                f"[WeightCacheModelLoader] Rebuilt {count} stale conv_weights views"
+                f"[WeightCacheModelLoader] Rebuilt {rebuilt} stale tensor alias(es)"
             )
+        return problems
 
     @staticmethod
     def _set_module_tensor(model, name, tensor, is_param=True):
@@ -398,6 +385,10 @@ class WeightCacheModelLoader(BaseModelLoader):
                     self.load_config,
                     quant_config,
                 )
+        # Tensors that alias a parameter or buffer (views kept as plain
+        # attributes, second registrations) keep the meta storage when the
+        # mapping below replaces it; record them to rebuild them afterwards.
+        aliases = find_tensor_aliases(model)
 
         # Build lookup dicts of existing parameter/buffer names in the
         # meta-device model. Post-quantization parameters (e.g. weight_scale
@@ -466,6 +457,8 @@ class WeightCacheModelLoader(BaseModelLoader):
                 + "\n".join(mismatched)
             )
 
+        alias_problems = self._rebuild_stale_views(model, aliases)
+
         # After mapping every daemon entry, any tensor still on the meta device
         # is one the daemon did NOT provide. Filling it with torch.empty() would
         # hand the model uninitialized GPU memory — silently producing wrong
@@ -499,6 +492,14 @@ class WeightCacheModelLoader(BaseModelLoader):
                 f"{'...' if len(still_on_meta_params) > 10 else ''}\n"
                 f"  buffers: {still_on_meta_buffers[:10]}"
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
+            )
+        # The same rule for tensors kept outside the registries: one still on
+        # the meta device would fail, or read garbage, when the model runs.
+        if alias_problems:
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] {len(alias_problems)} tensor alias(es) could "
+                f"not be rebuilt on the mapped weights and still refer to the "
+                f"meta device:\n  " + "\n  ".join(alias_problems)
             )
 
         map_elapsed = time.perf_counter() - map_tic
