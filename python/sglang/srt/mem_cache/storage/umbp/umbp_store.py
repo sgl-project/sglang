@@ -254,6 +254,7 @@ class UMBPStore(HiCacheStorage):
 
     # MoRI's SPDK proxy clamps keys to kMaxKeyLen - 1 = 255 bytes.
     _SPDK_MAX_KEY_BYTES = 255
+    _spdk_key_check = False
 
     def __init__(
         self,
@@ -966,25 +967,18 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.ssd_backend,
         )
 
-        # Only enforce the local SPDK key limit for standalone auto-start.
+        # Only enforce the SPDK key limit for standalone auto-start. Embedded and
+        # external standalone servers never receive this SSD config.
         sp = cfg.standalone_process
-        if (
-            cfg.ssd.enabled
+        self._spdk_key_check = (
+            bool(cfg.ssd.enabled)
             and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
             and sp is not None
-            and sp.auto_start
-            and not self._kv_anchor_is_logical
-        ):
+            and bool(sp.auto_start)
+        )
+        if self._spdk_key_check and not self._kv_anchor_is_logical:
             keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
-            longest = max(len(key.encode("utf-8")) for key in keys)
-            if longest > self._SPDK_MAX_KEY_BYTES:
-                prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
-                raise ValueError(
-                    f"UMBP SPDK store: longest anchor key is {longest} UTF-8 bytes, "
-                    f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
-                    f"The namespace prefix is {prefix_bytes} bytes; "
-                    "shorten the served model name or extra_backend_tag."
-                )
+            self._check_spdk_key_budget(keys, "anchor")
 
         # Build the client only after the key check, so a failed check does not
         # leave a standalone server started by UMBPClient running.
@@ -1200,12 +1194,35 @@ class UMBPStore(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
+        if getattr(self, "_spdk_key_check", False):
+            self._check_hybrid_pool_budget(host_pool, host_pool_name)
         self.registered_pools[host_pool_name] = host_pool
         self._register_host_buffer_for_zero_copy(host_pool)
+
+    def _check_hybrid_pool_budget(self, host_pool, pool_name):
+        keys, _ = self._get_hybrid_page_component_keys(
+            [_PAGE_HASH_PLACEHOLDER], PoolTransfer(name=pool_name), host_pool=host_pool
+        )
+        if not keys:
+            return
+        self._check_spdk_key_budget(keys, f"hybrid pool {pool_name}")
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
     # ------------------------------------------------------------------
+    def _check_spdk_key_budget(self, keys, kind: str) -> None:
+        if not keys:
+            return
+        longest = max(len(key.encode("utf-8")) for key in keys)
+        if longest > self._SPDK_MAX_KEY_BYTES:
+            prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
+            raise ValueError(
+                f"UMBP SPDK store: longest {kind} key is {longest} UTF-8 bytes, "
+                f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
+                f"The namespace prefix is {prefix_bytes} bytes; "
+                "shorten the served model name or extra_backend_tag."
+            )
+
     def _anchor_key_suffixes(self) -> tuple[str, ...]:
         if self._kv_anchor_is_page_envelope:
             # Object format does not determine whether TP ranks share its bytes.
@@ -1393,11 +1410,17 @@ class UMBPStore(HiCacheStorage):
     # Multi-pool v2 interface
     # ------------------------------------------------------------------
     def _get_hybrid_page_component_keys(
-        self, page_keys, transfer: PoolTransfer, *, rank_suffix: Optional[str] = None
+        self,
+        page_keys,
+        transfer: PoolTransfer,
+        *,
+        rank_suffix: Optional[str] = None,
+        host_pool=None,
     ):
-        """Expand logical page keys for one registered hybrid side pool."""
+        """Expand logical page keys for one hybrid side pool."""
         pool_name = transfer.name
-        host_pool = self.registered_pools.get(pool_name)
+        if host_pool is None:
+            host_pool = self.registered_pools.get(pool_name)
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 

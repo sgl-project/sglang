@@ -399,6 +399,30 @@ class TestUMBPStore(unittest.TestCase):
             umbp_module.UMBPStore(dram).close()
             umbp_module.UMBPStore(embedded_spdk).close()
 
+            boundary_model = "m" * 186  # Anchor keys are exactly 255 bytes.
+            boundary_spdk = MockStorageConfig(
+                model_name=boundary_model, extra_config=standalone_spdk.extra_config
+            )
+            store = umbp_module.UMBPStore(boundary_spdk)
+            self.assertIsInstance(store, umbp_module.UMBPStore)
+            store.close()
+
+            pool_name = umbp_module.PoolName.DEEPSEEK_V4_C4
+            store = umbp_module.UMBPStore(boundary_spdk)
+            with self.assertRaisesRegex(ValueError, "hybrid pool"):
+                store.register_mem_host_pool_v2(MockHybridSidePool(), pool_name)
+            self.assertNotIn(pool_name, store.registered_pools)
+            store.close()
+
+            boundary_dram = MockStorageConfig(
+                model_name=boundary_model, extra_config=dram.extra_config
+            )
+            store = umbp_module.UMBPStore(boundary_dram)
+            pool = MockHybridSidePool()
+            store.register_mem_host_pool_v2(pool, pool_name)
+            self.assertIs(store.registered_pools[pool_name], pool)
+            store.close()
+
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
