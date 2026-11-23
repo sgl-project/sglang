@@ -57,7 +57,11 @@ def _worker(enabled=True, mode="static"):
 
 def _eligible(worker, info, *, folded=True, grammar=False, sim_bonus=None):
     return worker._sampling_graph_eligible(
-        route=VerifyRoute.derive(info, has_grammar=grammar),
+        route=VerifyRoute.derive(
+            info,
+            has_grammar=grammar,
+            has_watermark=info is not None and info.watermark is not None,
+        ),
         proposal_folded=folded,
         sampling_info=info,
         simulate_bonus_sampling_info=sim_bonus,

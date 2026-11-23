@@ -253,7 +253,9 @@ class UnoWorkerV2(BaseSpecWorker):
             raise NotImplementedError("UNO does not support min-p sampling.")
 
         if VerifyRoute.derive(
-            sampling_info, has_grammar=batch.has_grammar
+            sampling_info,
+            has_grammar=batch.has_grammar,
+            has_watermark=sampling_info.watermark is not None,
         ).adjusts_logits:
             raise NotImplementedError(
                 "UNO does not support logit adjustments (grammar, penalties, "

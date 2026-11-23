@@ -92,25 +92,15 @@ def default_post_verify(
 
 
 def _verify_step(io: PostVerifyIO, batch: StockVerifyBatch) -> VerifyStep:
-    """The verify step eagle_sample adjusts and routes with, from the view. The
-    route takes `VerifyRoute.derive`'s terms, with the view's grammar mask and
-    watermark standing in for `has_grammar` and `info.watermark`, which the
-    view does not carry; keep the two in step."""
-    from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+    """The verify step eagle_sample adjusts and routes with, from the view."""
     from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 
-    sampling = batch.sampling_info
     return VerifyStep(
         batch=batch,
-        route=VerifyRoute(
-            adjusts_logits=(
-                io.grammar_mask is not None
-                or io.watermark is not None
-                or sampling.step_penalties is not None
-                or sampling.logit_bias is not None
-                or sampling.has_custom_logit_processor
-            ),
-            need_truncated_sampling=need_truncated_sampling(sampling),
+        route=VerifyRoute.derive(
+            batch.sampling_info,
+            has_grammar=io.grammar_mask is not None,
+            has_watermark=io.watermark is not None,
         ),
         watermark=io.watermark,
         watermark_full_mask=io.watermark_full_mask,

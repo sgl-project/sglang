@@ -358,7 +358,9 @@ class TestPostVerifyGraphs(CustomTestCase):
                 topk=topk, draft_probs=None, draft_token_num=7, max_tree_depth=7
             )
             route = VerifyRoute.derive(
-                batch.sampling_info, has_grammar=batch.has_grammar
+                batch.sampling_info,
+                has_grammar=batch.has_grammar,
+                has_watermark=batch.sampling_info.watermark is not None,
             )
             return graphs._key(
                 batch, route, verify_input, logits_output, can_run_cuda_graph
@@ -491,7 +493,11 @@ class TestPostVerifyGraphs(CustomTestCase):
             next_token_logits=torch.zeros((7, 8)),
             next_token_logits_vocab_shard=None,
         )
-        route = VerifyRoute.derive(verify_batch.sampling_info, has_grammar=False)
+        route = VerifyRoute.derive(
+            verify_batch.sampling_info,
+            has_grammar=False,
+            has_watermark=verify_batch.sampling_info.watermark is not None,
+        )
         keys = {
             graphs._key(verify_batch, route, verify_input, logits, True, max_top_k)
             for max_top_k in (20, None)
@@ -614,7 +620,9 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     got = graphs.run(
                         batch=batch,
                         route=VerifyRoute.derive(
-                            batch.sampling_info, has_grammar=batch.has_grammar
+                            batch.sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=batch.sampling_info.watermark is not None,
                         ),
                         verify_input=verify_input,
                         logits_output=SimpleNamespace(

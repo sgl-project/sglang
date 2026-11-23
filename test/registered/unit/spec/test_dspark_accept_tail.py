@@ -95,7 +95,7 @@ class TestAcceptTailParity(CustomTestCase):
                 greedy_draft=True,
             ),
             sampling_info=None,
-            route=VerifyRoute.derive(None, has_grammar=False),
+            route=VerifyRoute.derive(None, has_grammar=False, has_watermark=False),
             draft_input=None,
             layout=None
             if verify_lens is None

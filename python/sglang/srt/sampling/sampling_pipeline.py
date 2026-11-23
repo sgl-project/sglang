@@ -156,7 +156,11 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             )
         return VerifyStep(
             batch=batch,
-            route=VerifyRoute.derive(info, has_grammar=batch.has_grammar),
+            route=VerifyRoute.derive(
+                info,
+                has_grammar=batch.has_grammar,
+                has_watermark=info is not None and info.watermark is not None,
+            ),
             watermark=watermark,
             watermark_full_mask=watermark_full_mask,
         )
@@ -263,20 +267,25 @@ class VerifyRoute(msgspec.Struct, frozen=True):
 
     @classmethod
     def derive(
-        cls, info: Optional[SamplingBatchInfo], *, has_grammar: bool
+        cls,
+        info: Optional[SamplingBatchInfo],
+        *,
+        has_grammar: bool,
+        has_watermark: bool,
     ) -> VerifyRoute:
-        """`has_grammar` comes from the batch: verify builds its grammar mask over
-        the draft tree, not from the sampling info."""
+        """`has_grammar` and `has_watermark` come from the caller: verify builds
+        its grammar mask over the draft tree, and the provider's sampling view
+        carries neither stage's state."""
         # Without sampling info, only a grammar edits the logits.
         if info is None:
             return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
         return cls(
             adjusts_logits=(
                 has_grammar
+                or has_watermark
                 or info.step_penalties is not None
                 or info.logit_bias is not None
                 or info.has_custom_logit_processor
-                or info.watermark is not None
             ),
             need_truncated_sampling=need_truncated_sampling(info),
         )
