@@ -73,10 +73,10 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.last_layer_ffn import (
-    FFN_GRAPH_ROWS,
     FFN_GRAPH_VARIANT,
     MIN_EXTEND_TOKENS,
     graph_rows_for_batch,
+    select_graph_row_buckets,
     select_graph_token_buckets,
     stage_graph_indices,
 )
@@ -784,23 +784,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 max_req_slots=self._capture_req_slots,
             )
 
-        # Retain the ordinary graph. Pruned variants are captured only for
-        # measured token buckets; every other shape keeps the ordinary key.
+        # Retain ordinary graphs and add pruned variants to eligible existing
+        # input-token buckets. Unsupported requests keep the ordinary key.
         model = self.model_runner.model
         model_type = getattr(getattr(model, "config", None), "model_type", None)
-        measured_buckets = (
+        eligible_buckets = (
             select_graph_token_buckets(model_type, self.capture_num_tokens)
-            if getattr(model, "last_layer_ffn_graph_buckets", ())
+            if getattr(model, "_ffn_pruning_supported", False)
             and model_type in MIN_EXTEND_TOKENS
             else ()
         )
-        self._ffn_graph_token_buckets = frozenset(measured_buckets)
+        self._ffn_graph_token_buckets = frozenset(eligible_buckets)
+        self._ffn_graph_rows = select_graph_row_buckets(
+            self.model_runner.max_running_requests
+        )
         self._ffn_graph_enabled = (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and not get_exec().overlap.enable_two_batch_overlap
             and getattr(model, "_ffn_pruning_supported", False)
             and getattr(model, "enable_last_layer_ffn_pruning", False)
             and bool(self._ffn_graph_token_buckets)
+            and bool(self._ffn_graph_rows)
             and not getattr(model, "capture_aux_hidden_states", False)
             and not getattr(self.layer_model, "layers_to_capture", ())
             and self.model_runner.is_generation
@@ -808,7 +812,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._ffn_graph_indices = (
             torch.zeros(
-                max(FFN_GRAPH_ROWS), dtype=torch.int64, device=self.model_runner.device
+                max(self._ffn_graph_rows),
+                dtype=torch.int64,
+                device=self.model_runner.device,
             )
             if self._ffn_graph_enabled
             else None
@@ -816,8 +822,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._ffn_graph_enabled and get_parallel().tp_rank == 0:
             logger.info(
                 "Last-layer FFN pruning graphs: buckets=%s rows=%s",
-                measured_buckets,
-                FFN_GRAPH_ROWS,
+                eligible_buckets,
+                self._ffn_graph_rows,
             )
 
         # --- capture --------------------------------------------------
@@ -1241,16 +1247,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
-        model = self.model_runner.model
         if (
             self._ffn_graph_enabled
-            and model.enable_last_layer_ffn_pruning
+            and (model := self.model_runner.model).enable_last_layer_ffn_pruning
             and num_tokens in self._ffn_graph_token_buckets
             and (
                 rows := graph_rows_for_batch(
                     forward_batch, model.last_layer_ffn_min_extend_tokens
                 )
             )
+            and rows in self._ffn_graph_rows
         ):
             return ShapeKey(size=num_tokens, variant_label=f"{FFN_GRAPH_VARIANT}{rows}")
         if self._capture_chunked_prefix:
@@ -1970,7 +1976,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             self.capture_one_shape(num_tokens)
             if self._ffn_graph_enabled and num_tokens in self._ffn_graph_token_buckets:
-                for rows in FFN_GRAPH_ROWS:
+                for rows in self._ffn_graph_rows:
                     if rows <= num_tokens:
                         self.capture_one_shape(num_tokens, ffn_rows=rows)
             if self._capture_chunked_prefix:

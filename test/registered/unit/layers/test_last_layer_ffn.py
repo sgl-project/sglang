@@ -1,13 +1,19 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.last_layer_ffn import eligible_batch, select_attention_rows
+from sglang.srt.layers.last_layer_ffn import (
+    configure_last_layer_ffn,
+    eligible_batch,
+    select_attention_rows,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,6 +44,65 @@ def batch():
 
 
 class LastLayerFFNTests(CustomTestCase):
+    def configure_model(self, **changes):
+        model = SimpleNamespace(
+            pp_group=SimpleNamespace(world_size=changes.get("pp_size", 1))
+        )
+        parallel = SimpleNamespace(
+            tp_size=changes.get("tp_size", 1),
+            attn_dp_size=changes.get("attn_dp_size", 1),
+            attn_cp_size=changes.get("attn_cp_size", 1),
+        )
+        execution = SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(
+                        backend=changes.get("backend", Backend.BREAKABLE)
+                    )
+                )
+            )
+        )
+        with (
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch("sglang.srt.runtime_context.get_exec", return_value=execution),
+            patch("sglang.srt.utils.is_cuda", return_value=changes.get("cuda", True)),
+        ):
+            configure_last_layer_ffn(
+                model,
+                supported_architecture=changes.get("supported_architecture", True),
+                quant_config=changes.get("quant_config"),
+                model_type=changes.get("model_type", "qwen3"),
+            )
+        return model
+
+    def test_supported_architectures_enable_pruning_by_default(self):
+        for model_type, minimum in [("qwen2", 512), ("qwen3", 512), ("llama", 2048)]:
+            for backend in (Backend.DISABLED, Backend.BREAKABLE):
+                with self.subTest(model_type=model_type, backend=backend):
+                    model = self.configure_model(model_type=model_type, backend=backend)
+                    self.assertTrue(model._ffn_pruning_supported)
+                    self.assertTrue(model.enable_last_layer_ffn_pruning)
+                    self.assertEqual(model.last_layer_ffn_min_extend_tokens, minimum)
+
+    def test_unsupported_runtime_disables_pruning(self):
+        for changes in [
+            {"supported_architecture": False},
+            {"model_type": "unsupported"},
+            {"quant_config": object()},
+            {"cuda": False},
+            {"tp_size": 2},
+            {"pp_size": 2},
+            {"attn_dp_size": 2},
+            {"attn_cp_size": 2},
+            {"backend": Backend.FULL},
+            {"backend": Backend.TC_PIECEWISE},
+        ]:
+            with self.subTest(changes=changes):
+                model = self.configure_model(**changes)
+                self.assertFalse(model._ffn_pruning_supported)
+                self.assertFalse(model.enable_last_layer_ffn_pruning)
+                self.assertIsNone(model.last_layer_ffn_min_extend_tokens)
+
     def test_eligibility(self):
         self.assertTrue(eligible_batch(batch()))
         cases = {

@@ -2,7 +2,8 @@
 
 The optimization is automatic for the measured dense architectures. There is
 no environment variable. Quantized, parallel, LoRA, TBO, and full-hidden-state
-requests keep the ordinary path, as do input shapes without a measured gain.
+requests keep the ordinary path. Architecture-specific token minima avoid
+short prefills where row selection can outweigh the saved computation.
 """
 
 import torch
@@ -23,24 +24,10 @@ MIN_EXTEND_TOKENS = {
     "qwen3": 512,
     "llama": 2048,
 }
-# Pruned graphs exist only at buckets replayed with a positive interval.
-# The default capture ladder is otherwise left on the ordinary graph.
-# Qwen2 adds 16384 because 4096x4 was measured; Qwen3 and Llama were not.
-FFN_GRAPH_TOKEN_BUCKETS = {
-    "qwen2": (512, 2048, 4096, 8192, 16384),
-    "qwen3": (512, 2048, 4096, 8192),
-    "llama": (2048, 8192),
-}
-# Measured batches are 1 and 4. A 16-row variant would cover unmeasured
-# batches, so batches above 4 stay on the ordinary path.
-FFN_GRAPH_ROWS = (1, 4)
+# Bound graph output shapes independently of the server's input-token buckets.
+# Eager execution selects the actual number of request rows without this cap.
+FFN_GRAPH_ROWS = (1, 4, 8, 16)
 FFN_GRAPH_VARIANT = "last_layer_ffn_"
-
-if set(MIN_EXTEND_TOKENS) != set(FFN_GRAPH_TOKEN_BUCKETS):
-    raise RuntimeError("last-layer FFN architecture tables diverged")
-for _model_type, _buckets in FFN_GRAPH_TOKEN_BUCKETS.items():
-    if any(bucket < MIN_EXTEND_TOKENS[_model_type] for bucket in _buckets):
-        raise RuntimeError(f"{_model_type} graph bucket is below its measured minimum")
 
 
 def eligible_batch(batch):
@@ -115,22 +102,30 @@ def select_attention_rows(hidden_states, batch, indices):
 
 
 def shape_allows_pruning(batch, min_extend_tokens):
-    """Enable only shapes with a measured gain for this architecture."""
-    if min_extend_tokens is None or batch.batch_size > FFN_GRAPH_ROWS[-1]:
+    """Apply the architecture token minimum, without limiting eager batch size."""
+    if min_extend_tokens is None:
         return False
     lens = batch.extend_seq_lens_cpu
     return bool(lens) and sum(lens) >= min_extend_tokens
 
 
 def select_graph_token_buckets(model_type, capture_num_tokens):
-    """Measured buckets that this server already captures."""
+    """Reuse server capture buckets at or above the architecture token minimum."""
     minimum = MIN_EXTEND_TOKENS[model_type]
-    captured = set(capture_num_tokens)
-    return tuple(
-        bucket
-        for bucket in FFN_GRAPH_TOKEN_BUCKETS[model_type]
-        if bucket >= minimum and bucket in captured
-    )
+    return tuple(sorted({bucket for bucket in capture_num_tokens if bucket >= minimum}))
+
+
+def select_graph_row_buckets(max_running_requests):
+    """Capture every reachable row bucket, including the rounded-up last bucket."""
+    if max_running_requests is None:
+        return FFN_GRAPH_ROWS
+    previous = 0
+    result = []
+    for rows in FFN_GRAPH_ROWS:
+        if previous < max_running_requests:
+            result.append(rows)
+        previous = rows
+    return tuple(result)
 
 
 def graph_rows_for_batch(batch, min_extend_tokens):
@@ -180,10 +175,8 @@ def configure_last_layer_ffn(
     model.enable_last_layer_ffn_pruning = model._ffn_pruning_supported
     if model._ffn_pruning_supported:
         model.last_layer_ffn_min_extend_tokens = MIN_EXTEND_TOKENS[model_type]
-        model.last_layer_ffn_graph_buckets = FFN_GRAPH_TOKEN_BUCKETS[model_type]
     else:
         model.last_layer_ffn_min_extend_tokens = None
-        model.last_layer_ffn_graph_buckets = ()
 
 
 def prepare_last_layer_ffn(model, batch, *, get_embedding=False, input_embeds=None):

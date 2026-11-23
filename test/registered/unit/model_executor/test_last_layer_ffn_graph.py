@@ -6,7 +6,9 @@ import torch
 from sglang.srt.layers.last_layer_ffn import (
     FFN_GRAPH_ROWS,
     graph_rows_for_batch,
+    select_graph_row_buckets,
     select_graph_token_buckets,
+    shape_allows_pruning,
     stage_graph_indices,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -42,35 +44,69 @@ def batch(lens):
 
 
 class GraphTests(CustomTestCase):
+    def test_capture_rows_cover_all_reachable_batches(self):
+        for maximum in range(0, 65):
+            expected = {
+                next(rows for rows in FFN_GRAPH_ROWS if bs <= rows)
+                for bs in range(1, min(maximum, 16) + 1)
+            }
+            self.assertEqual(set(select_graph_row_buckets(maximum)), expected)
+        self.assertEqual(select_graph_row_buckets(None), FFN_GRAPH_ROWS)
+        self.assertEqual(select_graph_row_buckets(3), (1, 4))
+        self.assertEqual(select_graph_row_buckets(5), (1, 4, 8))
+        self.assertEqual(select_graph_row_buckets(9), (1, 4, 8, 16))
+
     def test_graph_row_buckets_follow_each_model(self):
         qwen = 512
         self.assertEqual(graph_rows_for_batch(batch([512]), qwen), 1)
         self.assertEqual(graph_rows_for_batch(batch([256, 256]), qwen), 4)
         self.assertEqual(graph_rows_for_batch(batch([128] * 4), qwen), 4)
         self.assertEqual(graph_rows_for_batch(batch([128]), qwen), 0)
-        self.assertEqual(graph_rows_for_batch(batch([512] * 5), qwen), 0)
+        self.assertEqual(graph_rows_for_batch(batch([512] * 5), qwen), 8)
         llama = 2048
         self.assertEqual(graph_rows_for_batch(batch([512]), llama), 0)
         self.assertEqual(graph_rows_for_batch(batch([512] * 4), llama), 4)
         self.assertEqual(graph_rows_for_batch(batch([2048]), llama), 1)
         self.assertEqual(graph_rows_for_batch(batch([128] * 4), llama), 0)
 
-    def test_capture_plan_skips_unmeasured_buckets(self):
-        capture = [128, 256, 512, 640, 1024, 2048, 4096, 8192, 16384]
+    def test_qwen3_6144_capture_and_three_request_rows(self):
         self.assertEqual(
-            select_graph_token_buckets("qwen2", capture),
-            (512, 2048, 4096, 8192, 16384),
+            select_graph_token_buckets("qwen3", [4096, 6144, 8192]), (4096, 6144, 8192)
         )
         self.assertEqual(
-            select_graph_token_buckets("qwen3", capture),
-            (512, 2048, 4096, 8192),
+            select_graph_token_buckets("qwen3", [4096, 8192]), (4096, 8192)
         )
-        self.assertEqual(select_graph_token_buckets("llama", capture), (2048, 8192))
-        self.assertEqual(
-            len(select_graph_token_buckets("qwen3", capture)) * len(FFN_GRAPH_ROWS),
-            8,
-        )
-        self.assertNotIn(16, FFN_GRAPH_ROWS)
+        self.assertEqual(graph_rows_for_batch(batch([2048] * 3), 512), 4)
+        self.assertEqual(graph_rows_for_batch(batch([6144]), 512), 1)
+        indices = torch.full((4,), -1, dtype=torch.int64)
+        stage_graph_indices(indices, torch.tensor([2048] * 3, dtype=torch.int32), 4)
+        self.assertEqual(indices.tolist(), [2047, 4095, 6143, 0])
+
+    def test_capture_plan_uses_existing_buckets_above_minimum(self):
+        capture = [128, 512, 640, 1024, 2048, 2560, 4608, 6144, 8192, 16384, 512]
+        for model_type, minimum in [("qwen2", 512), ("qwen3", 512), ("llama", 2048)]:
+            self.assertEqual(
+                select_graph_token_buckets(model_type, capture),
+                tuple(sorted({n for n in capture if n >= minimum})),
+            )
+        self.assertEqual(FFN_GRAPH_ROWS, (1, 4, 8, 16))
+
+    def test_graph_cap_does_not_limit_eager(self):
+        for size, rows in [(5, 8), (8, 8), (9, 16), (16, 16), (17, 0), (32, 0)]:
+            b = batch([512] * size)
+            self.assertTrue(shape_allows_pruning(b, 512))
+            self.assertEqual(graph_rows_for_batch(b, 512), rows)
+        self.assertFalse(shape_allows_pruning(batch([8] * 32), 512))
+        self.assertFalse(shape_allows_pruning(batch([512] * 32), None))
+
+    def test_large_variable_batch_indices_reset_padding(self):
+        lengths = [100 + i for i in range(9)]
+        buf = torch.full((16,), 999, dtype=torch.int64)
+        stage_graph_indices(buf, torch.tensor(lengths, dtype=torch.int32), 16)
+        expected = torch.tensor(lengths).cumsum(0).sub(1).tolist() + [0] * 7
+        self.assertEqual(buf.tolist(), expected)
+        stage_graph_indices(buf, torch.tensor([512] * 5, dtype=torch.int32), 8)
+        self.assertEqual(buf[:8].tolist(), [511, 1023, 1535, 2047, 2559, 0, 0, 0])
 
     def test_cached_prefix_uses_suffix_rows_and_keeps_metadata(self):
         b = batch([300, 212])
@@ -106,6 +142,7 @@ class GraphTests(CustomTestCase):
     def test_graph_key_switches_back_to_original_for_fallbacks(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._ffn_graph_enabled = True
+        runner._ffn_graph_rows = FFN_GRAPH_ROWS
         runner._capture_chunked_prefix = False
         runner._ffn_graph_token_buckets = frozenset({512, 2048, 4096, 8192})
         runner.model_runner = SimpleNamespace(
@@ -114,6 +151,9 @@ class GraphTests(CustomTestCase):
                 last_layer_ffn_min_extend_tokens=512,
             )
         )
+        runner._ffn_graph_rows = (1,)
+        self.assertIsNone(runner._shape_key(2048, batch([1024, 1024])).variant_label)
+        runner._ffn_graph_rows = FFN_GRAPH_ROWS
         b = batch([1024, 1024])
         self.assertEqual(runner._shape_key(2048, b).variant_label, "last_layer_ffn_4")
         self.assertIsNone(runner._shape_key(1024, b).variant_label)
