@@ -694,6 +694,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             (total_vocab_size + self.make_ngram_vocab_size_divisible_by - 1)
             // self.make_ngram_vocab_size_divisible_by
         ) * self.make_ngram_vocab_size_divisible_by
+        checkpoint_shards = int(getattr(config, "split_ngram_parts", 512))
+        self.checkpoint_shard_size = (
+            padded_vocab_size + checkpoint_shards - 1
+        ) // checkpoint_shards
         self.use_attn_tp_ngram = _use_attn_tp_ngram()
         self.gather_dp_tokens = (
             is_dp_attention_enabled()
@@ -779,10 +783,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ngram_ids, forward_batch, physical_tokens
         )
         embeddings = self.ngram_embedding(lookup_ids)
-        embeddings = embeddings * self.ngram_embedding.weight_scale
+        embeddings = embeddings * self._get_embedding_scale(lookup_ids)
         return self._finish_embedding_lookup(
             embeddings, semantic_tokens, forward_batch, physical_tokens
         )
+
+    def _get_embedding_scale(self, lookup_ids: torch.Tensor) -> torch.Tensor:
+        scale = self.ngram_embedding.weight_scale
+        if scale.numel() != 1:
+            scale = scale[lookup_ids // self.checkpoint_shard_size].unsqueeze(-1)
+        return scale
 
     def _prepare_embedding_lookup(
         self,
@@ -974,8 +984,8 @@ def _gather_ple_embedding_from_pinned_kernel(
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
-    The table stays in its checkpoint storage dtype (fp8 with a per-tensor
-    weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
+    The table stores bf16 or fp8 rows; gathers emit unscaled bf16 values.
+    Qwen4ExpNGramEmbedding applies checkpoint or load-time scales.
 
     The source weight may be on the meta device; only its metadata is used.
     """
@@ -1503,6 +1513,7 @@ class Qwen4ExpPLELayer(nn.Module):
         lookup_ids.record_stream(stream)
         with torch.get_device_module().stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
+            output_view.mul_(self.ple_embedding._get_embedding_scale(lookup_ids))
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
     def _consume_prefetched_embeddings(
@@ -1513,7 +1524,6 @@ class Qwen4ExpPLELayer(nn.Module):
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
         torch.get_device_module().current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
-        embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
             embeddings,
             semantic_tokens,
@@ -2669,7 +2679,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
 
         def copy_ple_rows_to_tp_embedding(
-            emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
+            emb,
+            loaded_weight: torch.Tensor,
+            row_start: int,
+            row_end: int,
+            scale: Optional[torch.Tensor] = None,
         ) -> None:
             tp_start = emb.shard_indices.org_vocab_start_index
             tp_end = emb.shard_indices.org_vocab_end_index
@@ -2679,10 +2693,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 local_start = ov_start - tp_start
                 src_start = ov_start - row_start
                 n_rows = ov_end - ov_start
+                rows = loaded_weight[src_start : src_start + n_rows]
+                if scale is not None:
+                    rows = rows.float() / scale.to(device=rows.device)
                 emb.weight.data[local_start : local_start + n_rows].copy_(
-                    loaded_weight[src_start : src_start + n_rows].to(
-                        device=emb.weight.device, dtype=emb.weight.dtype
-                    )
+                    rows.to(device=emb.weight.device, dtype=emb.weight.dtype)
                 )
 
         # Print warning once per load_weights() call
@@ -2733,16 +2748,37 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 # entry or it pins the old bf16 storage until load end.
                 params_dict.pop(f"{mod_prefix}.ngram_embedding.weight", None)
                 torch.cuda.empty_cache()
+            scale = None
             if (
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
+                # Each streamed checkpoint shard has its own range; retaining
+                # its scale avoids staging the entire BF16 table or requantizing.
+                if emb.weight_scale.numel() == 1 and ple_num_sync_shards > 1:
+                    emb.weight_scale = emb.weight_scale.expand(
+                        ple_num_sync_shards
+                    ).clone()
+                    buffers[f"{mod_prefix}.ngram_embedding.weight_scale"] = (
+                        emb.weight_scale
+                    )
+                amax = (
+                    loaded_weight.abs().amax().float()
+                    if loaded_weight.numel()
+                    else loaded_weight.new_zeros((), dtype=torch.float32)
+                )
+                scale = (
+                    (amax / torch.finfo(torch.float8_e4m3fn).max)
+                    .clamp_min(torch.finfo(emb.weight_scale.dtype).tiny)
+                    .to(dtype=emb.weight_scale.dtype)
+                )
+                emb.weight_scale[shard_idx].copy_(scale)
                 if not ple_warned_downcast:
                     ple_warned_downcast = True
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "
-                        "downcasting is lossy",
+                        "quantizing with a scale per checkpoint shard",
                         loaded_weight.dtype,
                     )
             shard_size = (
@@ -2751,7 +2787,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_start = shard_idx * shard_size
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
-            copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
+            copy_ple_rows_to_tp_embedding(
+                emb, loaded_weight, shard_start, shard_end, scale=scale
+            )
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
 
