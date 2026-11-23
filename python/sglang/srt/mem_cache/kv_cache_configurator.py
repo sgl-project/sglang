@@ -684,6 +684,8 @@ class KVCacheConfigurator:
     def loc_space_scale(self) -> int:
         if not self.is_draft_worker:
             return 1
+        if get_spec().speculative_dflash_draft_kv_ring and not self.use_mla_backend:
+            return 1
         return draft_loc_space_scale(
             hf_config=self.model_config.hf_config,
             use_mla_backend=self.use_mla_backend,

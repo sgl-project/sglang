@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -497,6 +498,28 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
 
 
 class TestDSparkGqaDraftKVRingRocm(CustomTestCase):
+    def test_gqa_ring_pool_page_size_is_not_widened_by_target_dcp(self):
+        """A private GQA ring must use the page width charged by its target."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.is_draft_worker = True
+        configurator.use_mla_backend = False
+        configurator.model_config = SimpleNamespace(hf_config=self._gqa_config())
+        for ring_enabled, expected_scale in ((False, 8), (True, 1)):
+            with (
+                self.subTest(ring_enabled=ring_enabled),
+                get_context().override_server_args(
+                    tp_size=8,
+                    dcp_size=8,
+                    page_size=16,
+                    speculative_dflash_draft_kv_ring=ring_enabled,
+                ),
+                get_parallel().override(attn_dcp_size=8),
+            ):
+                self.assertEqual(configurator.loc_space_scale, expected_scale)
+                self.assertEqual(configurator.pool_page_size, 16 * expected_scale)
+
     def _gqa_config(self):
         return SimpleNamespace(
             layer_types=["sliding_attention"] * 5,
