@@ -80,12 +80,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         boh = i_n * NT
 
     # calculate offset
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
-    v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
-    w += ((bos * H + i_h) * K).to(tl.int64)
+    # Widen before the products: casting afterwards only widens a wrapped int32.
+    bos, boh = bos.to(tl.int64), boh.to(tl.int64)
+    h += (boh * H + i_h) * V * K
+    v += (bos * H + i_h) * V
+    k += (bos * Hg + i_h // (H // Hg)) * K
+    w += (bos * H + i_h) * K
     if SAVE_NEW_VALUE:
-        v_new += ((bos * H + i_h) * V).to(tl.int64)
+        v_new += (bos * H + i_h) * V
     stride_v = H * V
     stride_h = H * V * K
     stride_k = Hg * K
@@ -134,9 +136,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
 
     if TRACK_STATE:
         i_track = tl.load(track_chunk_idx + i_n).to(tl.int32)
-        p_track_base = track_state + (i_n * stride_track_state + i_h * V * K).to(
-            tl.int64
-        )
+        p_track_base = track_state + i_n.to(tl.int64) * stride_track_state + i_h * V * K
     else:
         i_track = -1
         p_track_base = track_state

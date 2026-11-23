@@ -14,6 +14,8 @@ from torch import nn
 from sglang.kernels.ops.diffusion import (
     LINGBOT_VIDEO_GATED_RESIDUAL,
     LINGBOT_VIDEO_RMSNORM,
+    can_use_rmsnorm_scale_shift_per_token,
+    rmsnorm_scale_shift_per_token,
     try_gated_residual,
     try_lingbot_video_rmsnorm,
 )
@@ -83,6 +85,10 @@ LINGBOT_VIDEO_FP32_MODULES = (
 
 logger = logging.getLogger(__name__)
 
+# Latched when the fused RMSNorm+modulate kernel fails; a failed Triton build
+# would otherwise be retried at two sites per block on every step.
+_norm_modulate_fusion_failed = False
+
 
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
@@ -133,6 +139,39 @@ def _lingbot_gated_residual(
         return fused
     # The reference FP32 multiply form, which "exact" requests always take.
     return residual + (gate * update).to(residual.dtype)
+
+
+def _lingbot_norm_modulate(
+    block: LingBotVideoBlock,
+    norm: LingBotVideoRMSNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """``(norm(x) * scale + shift).to(out_dtype)`` at a block modulate site.
+
+    Uses the request-gated fused RMSNorm+scale+shift kernel when the block's
+    quality-gated site is enabled; otherwise the reference chain. ``scale`` is
+    the raw ``scale_msa/mlp``; the kernel applies ``x * (1 + scale)``.
+    """
+    global _norm_modulate_fusion_failed
+    if (
+        not _norm_modulate_fusion_failed
+        and LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(block)
+        and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift)
+    ):
+        try:
+            out = rmsnorm_scale_shift_per_token(
+                x, norm.weight, scale, shift, norm.variance_epsilon
+            )
+            return out if out.dtype == out_dtype else out.to(out_dtype)
+        except Exception as exc:
+            _norm_modulate_fusion_failed = True
+            logger.warning(
+                "Disabling LingBot Video fused RMSNorm+modulate fast path: %s", exc
+            )
+    return (norm(x) * (1.0 + scale) + shift).to(out_dtype)
 
 
 def _joint_position_ids(
@@ -355,13 +394,23 @@ class LingBotVideoBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
     ) -> torch.Tensor:
-        mod = temb6.unsqueeze(1) + self.scale_shift_table.unsqueeze(0)
+        if temb6.ndim != 2 or temb6.shape[0] != x.shape[0]:
+            raise ValueError(
+                "LingBotVideoBlock expects per-sample temb6 with shape "
+                f"(B, 6D); got {tuple(temb6.shape)} for hidden states {tuple(x.shape)}."
+            )
+        mod = (temb6 + self.scale_shift_table).unsqueeze(1)  # (B, 1, 6D)
+        if LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(self):
+            # The fused per-token kernels need (B, S, D) modulation views.
+            mod = mod.expand(-1, x.shape[1], -1).contiguous()
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(
             6, dim=-1
         )
         gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
 
-        attn_in = (self.norm1(x) * (1.0 + scale_msa) + shift_msa).to(x.dtype)
+        attn_in = _lingbot_norm_modulate(
+            self, self.norm1, x, scale_msa, shift_msa, x.dtype
+        )
         attn_out = self.attn(
             attn_in,
             freqs_cis,
@@ -370,7 +419,9 @@ class LingBotVideoBlock(nn.Module):
         )
         x = _lingbot_gated_residual(self, x, self.norm_post_attn(attn_out), gate_msa)
 
-        ffn_in = (self.norm2(x) * (1.0 + scale_mlp) + shift_mlp).to(x.dtype)
+        ffn_in = _lingbot_norm_modulate(
+            self, self.norm2, x, scale_mlp, shift_mlp, x.dtype
+        )
         ffn_out = self.ffn(ffn_in)
         ffn_normed = self.norm_post_ffn(ffn_out)
         x = _lingbot_gated_residual(self, x, ffn_normed, gate_mlp)
@@ -565,7 +616,6 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         text = self.text_embedder(encoder_hidden_states)
         joint = torch.cat([x, text], dim=1)  # [video; text]
-        joint_seq_len = joint.shape[1]
 
         attention_mask = None
         # B==1 text is trimmed to true length upstream, so no mask; B>1 may pad, build a key mask.
@@ -584,6 +634,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         # combined with a key mask.
         shard = None
         if self._shard_sequence():
+            joint_seq_len = joint.shape[1]
             shard = build_shard_plan(joint_seq_len)
             joint = shard_like(joint, shard)
             positions = shard_like(
@@ -605,7 +656,8 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         timestep_proj = self.time_proj(timestep.float())
         t_emb = self.time_embedder(timestep_proj)  # (B, D)
-        temb6 = self.time_modulation(t_emb)  # (B, 6D), broadcast over the sequence
+        # Modulation depends only on the timestep, so project once per sample.
+        temb6 = self.time_modulation(t_emb)  # (B, 6D)
 
         for block in self.blocks:
             joint = block(
@@ -619,8 +671,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         if shard is not None:
             joint = gather_seq(joint, shard.orig_len)
 
-        final_mod = self.norm_out_modulation(t_emb)  # (B, 2D)
-        shift, scale = final_mod.unsqueeze(1).chunk(2, dim=-1)
+        shift, scale = self.norm_out_modulation(t_emb).unsqueeze(1).chunk(2, dim=-1)
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift
         projected = self.proj_out(final_hidden.to(self.proj_out.weight.dtype))
         x = projected[:, :n_video]

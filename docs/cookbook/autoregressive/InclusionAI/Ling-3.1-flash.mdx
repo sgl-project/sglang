@@ -79,7 +79,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 
 - **Attention:** BailingKDA shards its projections on attention TP; DP-attention size must divide TP. Prefill CP is disabled because BailingKDA does not implement the required sequence gather and recurrent-state handling.
 - **MoE:** Auto, DeepGEMM, and Triton use the FP8 MoE runner paths. EP must divide TP.
-- **PD disaggregation:** the Playground exposes separate prefill and decode roles with Mooncake transfer. The runtime has hybrid recurrent-state transfer support, but this model's PD deployment has not been verified. Provision separate workers and route requests through a PD-aware gateway; select the role-specific command for each worker.
+- **PD disaggregation:** the Playground exposes separate prefill and decode roles with Mooncake transfer. The runtime has hybrid recurrent-state transfer support, but this model's PD deployment has not been verified. Provision separate workers and route requests through `sgl-router`; select the role-specific command for each worker.
 - **HiCache:** enabling Mooncake on the H200 base preserves NEXTN and adds direct page-first I/O, hybrid-KDA prefix settings, and TCP storage endpoints.
 
 ### Performance

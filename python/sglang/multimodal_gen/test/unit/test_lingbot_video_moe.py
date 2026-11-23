@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import logging
 import os
 import tempfile
 from contextlib import nullcontext
@@ -11,6 +12,9 @@ import pytest
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.kernels.ops.diffusion.sites.gated_residual_site import (
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
@@ -38,6 +42,7 @@ from sglang.multimodal_gen.runtime.models.dits import (
 from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
     LingBotVideoBlock,
+    LingBotVideoRMSNorm,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
 )
@@ -366,6 +371,74 @@ def test_joint_shard_reassembles_the_global_sequence(monkeypatch, sp_size):
     gathered = torch.cat(chunks, dim=1)[:, :joint_seq_len]
     torch.testing.assert_close(gathered, hidden)
     torch.testing.assert_close(torch.cat(pos_chunks)[:joint_seq_len], positions)
+
+
+class _LinearAttn(torch.nn.Linear):
+    to_q = property(lambda self: self)
+
+    def forward(self, x, *args, **kwargs):
+        return super().forward(x)
+
+
+def test_block_per_sample_modulation_matches_per_token():
+    batch, seq_len, hidden = 2, 5, 16
+    torch.manual_seed(0)
+    block = object.__new__(LingBotVideoBlock)
+    torch.nn.Module.__init__(block)
+    block.scale_shift_table = torch.nn.Parameter(torch.randn(1, 6 * hidden))
+    for name in ("norm1", "norm_post_attn", "norm2", "norm_post_ffn"):
+        setattr(block, name, LingBotVideoRMSNorm(hidden))
+    block.attn = _LinearAttn(hidden, hidden)
+    block.ffn = torch.nn.Linear(hidden, hidden)
+    x = torch.randn(batch, seq_len, hidden)
+    temb6 = torch.randn(batch, 6 * hidden)
+
+    out = block(x, temb6, None)
+    # The enabled gated site expands modulation to per-token (B, S, 6D) views;
+    # on CPU the fused kernels decline, so this is the per-token reference.
+    setattr(block, LINGBOT_VIDEO_GATED_RESIDUAL.enabled_attr, True)
+    expected = block(x, temb6, None)
+
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, expected)
+
+
+def test_failed_norm_modulate_kernel_is_reported_and_not_retried(monkeypatch, caplog):
+    """A failing fused RMSNorm+modulate kernel is reported once and the site
+    then stays on the reference chain instead of relaunching the kernel on
+    every call."""
+    module = dits_lingbot_video_moe
+    launches = []
+
+    def failing_kernel(*args):
+        launches.append(args)
+        raise RuntimeError("kernel build failed")
+
+    # restores the process-wide latch after the test
+    monkeypatch.setattr(module, "_norm_modulate_fusion_failed", False, raising=False)
+    monkeypatch.setattr(
+        module, "can_use_rmsnorm_scale_shift_per_token", lambda *args: True
+    )
+    monkeypatch.setattr(module, "rmsnorm_scale_shift_per_token", failing_kernel)
+    site = torch.nn.Module()
+    module.LINGBOT_VIDEO_GATED_RESIDUAL.mark(site)
+    assert module.LINGBOT_VIDEO_GATED_RESIDUAL.mount(site)
+    torch.manual_seed(0)
+    norm = module.LingBotVideoRMSNorm(8)
+    x, scale, shift = torch.randn(3, 2, 4, 8)
+    reference = norm(x) * (1.0 + scale) + shift
+
+    with caplog.at_level(logging.WARNING, logger=module.logger.name):
+        for _ in range(2):
+            out = module._lingbot_norm_modulate(
+                site, norm, x, scale, shift, torch.float32
+            )
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+    assert len(launches) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "kernel build failed" in warnings[0]
 
 
 class _FakeBatchEncoding(dict):

@@ -2,7 +2,7 @@
 
 This test benchmarks text models on AMD MI30x/MI35x with 2 GPUs.
 
-Registry: nightly-amd-perf-text-2-gpu suite
+Registry: nightly-perf-text-test-2-gpu-amd suite
 
 Example usage:
     python -m pytest test_text_models_perf_amd.py -v
@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - Text models benchmark (~60 min)
-register_amd_ci(est_time=3600, suite="nightly-amd-perf-text-2-gpu", nightly=True)
+register_amd_ci(est_time=3600, suite="nightly-perf-text-test-2-gpu-amd", nightly=True)
 
 RESULT_DIR = "performance_results_text_models_amd"
 
