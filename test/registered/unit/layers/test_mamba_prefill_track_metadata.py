@@ -352,9 +352,6 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
             with self.subTest(verify=verify):
                 batch = ScheduleBatch(
                     reqs=[],
-                    sampling_info=SimpleNamespace(
-                        penalizer_orchestrator=SimpleNamespace(is_required=False)
-                    ),
                     spec_algorithm=SimpleNamespace(is_none=lambda: False),
                     mamba_track_mask=torch.tensor([True]),
                     mamba_track_seqlens=torch.tensor([65]),
