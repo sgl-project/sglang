@@ -520,6 +520,8 @@ def forward_dsa_prepare_npu(
             and not input_on_attn_tp_slices
             and not get_attn_tp_context().input_scattered
             and m.num_heads.bit_count() == 1
+            and not forward_batch.reuse_dsa_topk_indices
+            and getattr(forward_batch.spec_info, "dsa_seed_topk_capture", None) is None
             and getattr(backend, "can_shard_pcp_dsa_queries", lambda _: False)(
                 forward_batch
             )
@@ -547,6 +549,14 @@ def forward_dsa_prepare_npu(
             )
     else:
         topk_indices = prev_topk_indices
+        # A PP stage can start on a layer that shares Top-K, before its indexer
+        # has prepared the stage-local PCP metadata.
+        if not getattr(
+            forward_batch, "dsa_cp_metadata_prepared", False
+        ) and dsa_use_prefill_cp(forward_batch):
+            prepare_cp_metadata = getattr(backend, "prepare_dsa_cp_metadata", None)
+            if prepare_cp_metadata is not None:
+                prepare_cp_metadata(forward_batch)
 
     if backend.uses_dcp_partial_attention(forward_batch):
         q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)

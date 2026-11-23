@@ -1822,8 +1822,12 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        *,
+        rank_local_keys: Tuple[str, ...] = (),
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
+
+        Entries in rank_local_keys are sent directly without TP slicing.
         NOTE: `dst` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1856,13 +1860,18 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
+        tensor_keys = (k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor))
+        for key, tensor in zip(tensor_keys, tensor_list, strict=True):
             if tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                all_gather_group is not None
+                and key not in rank_local_keys
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1875,8 +1884,12 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        *,
+        rank_local_keys: Tuple[str, ...] = (),
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
+
+        Entries in rank_local_keys are received without a TP all-gather.
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1908,6 +1921,7 @@ class GroupCoordinator:
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
                     all_gather_group is not None
+                    and key not in rank_local_keys
                     and tensor.numel() % all_gather_size == 0
                 )
 

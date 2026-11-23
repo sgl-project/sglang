@@ -3237,7 +3237,17 @@ class DeepseekV2Model(nn.Module):
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
-            initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+            initial_topk_indices = pp_proxy_tensors.tensors.get(
+                PPProxyTensors.DSA_PCP_LOCAL_TOPK_KEY
+            )
+            if initial_topk_indices is not None:
+                backend = get_attn_backend()
+                backend = getattr(backend, "full_attn_backend", backend)
+                backend.restore_pp_pcp_dsa_query_shard(
+                    forward_batch, positions.shape[0], initial_topk_indices
+                )
+            else:
+                initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
         index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
         if not self.pp_group.is_first_rank:
             assert not (
@@ -3355,7 +3365,13 @@ class DeepseekV2Model(nn.Module):
                     topk_indices = proxy_tensors["hidden_states"].new_empty(
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
-                proxy_tensors.tensors["topk_indices"] = topk_indices
+                key = (
+                    PPProxyTensors.DSA_PCP_LOCAL_TOPK_KEY
+                    if getattr(forward_batch, "npu_dsa_pcp_query_shard", None)
+                    is not None
+                    else "topk_indices"
+                )
+                proxy_tensors.tensors[key] = topk_indices
             return proxy_tensors
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)

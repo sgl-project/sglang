@@ -1102,6 +1102,7 @@ class SchedulerPPMixin:
                         else self.attn_tp_group
                     ),
                     async_send=async_send,
+                    rank_local_keys=(PPProxyTensors.DSA_PCP_LOCAL_TOPK_KEY,),
                 )
             )
         return p2p_work
@@ -1137,7 +1138,8 @@ class SchedulerPPMixin:
         while True:
             with self.pp_comm_stream_ctx:
                 tensor_dict = self.pp_group.recv_tensor_dict(
-                    all_gather_group=all_gather_group
+                    all_gather_group=all_gather_group,
+                    rank_local_keys=(PPProxyTensors.DSA_PCP_LOCAL_TOPK_KEY,),
                 )
                 recv_event = self._pp_record_comm_event()
             received_kind = tensor_dict.get("__msg_type__", "default")

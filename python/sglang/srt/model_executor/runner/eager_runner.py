@@ -359,12 +359,13 @@ class EagerRunner(BaseRunner):
             )
         else:
             input_embeds = kwargs.get("input_embeds")
-            # Prepare multimodal embeddings and model IDs in global token order.
-            input_ids, input_embeds = prepare_language_model_inputs(
-                model, input_ids, forward_batch, input_embeds
-            )
-            if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(input_ids)
+            # Later PP stages receive PCP-local hidden states via the proxy.
+            if model.pp_group.is_first_rank:
+                input_ids, input_embeds = prepare_language_model_inputs(
+                    model, input_ids, forward_batch, input_embeds
+                )
+                if input_embeds is None:
+                    input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -401,7 +402,7 @@ class EagerRunner(BaseRunner):
         if getattr(model, "capture_aux_hidden_states", False):
             hidden_states, aux_hidden_states = hidden_states
 
-        stream = torch.cuda.current_stream()
+        stream = torch.get_device_module(self.model_runner.device).current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
         if aux_hidden_states is not None:

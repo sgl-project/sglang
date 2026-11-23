@@ -34,6 +34,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    build_dsa_pcp_query_shard,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     dsa_token_shard_redistribute_heads,
@@ -1919,11 +1920,43 @@ class AscendAttnBackend(AttentionBackend):
             and not self.enable_sparsity_driven_kv_offload
             and not self.graph_mode
             and not get_is_capture_mode()
-            and parallel.pp_size == 1
             and parallel.attn_tp_size > 1
             and dsa_use_prefill_cp(forward_batch)
             and forward_batch.forward_mode == ForwardMode.EXTEND
         )
+
+    def restore_pp_pcp_dsa_query_shard(
+        self,
+        forward_batch: ForwardBatch,
+        num_query_rows: int,
+        topk_indices: torch.Tensor,
+    ) -> None:
+        """Rebuild the sender's row slice using this stage's own KV metadata."""
+        if not self.can_shard_pcp_dsa_queries(forward_batch):
+            raise RuntimeError(
+                "Received rank-local DSA PCP Top-K for an ineligible PP stage"
+            )
+        self.prepare_dsa_cp_metadata(forward_batch)
+        metadata = self.forward_metadata
+        parallel = get_parallel()
+        shard = None
+        if (
+            getattr(forward_batch, "dsa_cp_metadata_prepared", False)
+            and metadata.block_tables is not None
+        ):
+            shard = build_dsa_pcp_query_shard(
+                num_query_rows,
+                metadata.actual_seq_lengths_q,
+                metadata.actual_seq_lengths_kv,
+                metadata.block_tables,
+                parallel.attn_tp_size,
+                parallel.attn_tp_rank,
+            )
+        if shard is None or shard.plan.rows != topk_indices.shape[0]:
+            raise RuntimeError(
+                "Received rank-local DSA PCP Top-K with mismatched PP query rows"
+            )
+        forward_batch.npu_dsa_pcp_query_shard = shard
 
     def do_cp_balance_attn(
         self,

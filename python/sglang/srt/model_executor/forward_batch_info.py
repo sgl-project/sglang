@@ -2403,6 +2403,8 @@ def build_inner_fb_view(
 
 
 class PPProxyTensors:
+    DSA_PCP_LOCAL_TOPK_KEY = "dsa_pcp_local_topk_indices"
+
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
 
