@@ -524,7 +524,7 @@ Loads one or more LoRA adapters and applies them to the model. Both static merge
 
 Each adapter must have a complete LoRA A/B pair for at least one layer on its selected target. Other layers may be unmatched. If any adapter has no match, the request is rejected and the previous adapters remain active. This also applies when reusing a cached nickname on a different target.
 
-When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass.
+When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass. Dynamic LoRA does not retain a separate copy of the base weights. You can still switch to `merge` later: the layer keeps the original weights only while merged so that unmerging restores them exactly.
 
 **Endpoint:** `POST /v1/set_lora`
 
@@ -537,9 +537,7 @@ When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mo
   - `"transformer_2"`: Apply only to transformer_2 (low noise for Wan2.2)
   - `"critic"`: Apply only to the critic model
 - `strength` (float or list of floats, optional): LoRA strength for static merge or dynamic execution, default 1.0. If a list, must match the length of `lora_nickname`. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
-- `merge_mode` (string, optional): `"auto"`, `"merge"` (force static merge), `"dynamic"` (apply LoRA at forward time), or `"disabled"` (apply LoRA at forward time without retaining base-weight snapshots or allowing merges). If omitted, uses the server's `--lora-merge-mode`, which defaults to `"auto"`.
-
-Switching a merged adapter to `"disabled"` restores the base weights before releasing the snapshot. Active adapters continue to run at forward time with their configured strengths. Offload buffers needed for inference stay allocated. Select another mode with `set_lora` to restore snapshot retention.
+- `merge_mode` (string, optional): `"auto"`, `"merge"` (force static merge), or `"dynamic"` (apply LoRA at forward time). If omitted, inherits `--lora-merge-mode`
 
 **Single LoRA Example:**
 
@@ -591,7 +589,7 @@ When using multiple LoRAs:
 
 **Merge LoRA Weights**
 
-Manually merges the currently set LoRA weights into the base model. For targets using `merge_mode="disabled"`, this endpoint reactivates dynamic LoRA at the requested strength without merging or creating snapshots. Use `set_lora` with another mode to re-enable merging.
+Manually merges the currently set LoRA weights into the base model.
 
 <Note>
 With FSDP-sharded weights, manual merge may require a full-gather and can OOM. Use `set_lora` with `merge_mode="auto"` or `"dynamic"` for the lower-peak path.

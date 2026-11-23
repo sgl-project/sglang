@@ -500,8 +500,8 @@ class AutoRoundConfig(QuantizationConfig):
 
             quant_args = CPUGPTQConfig(
                 **self.get_gptq_config_kwargs(weight_bits, group_size),
+                is_sym=sym,
             )
-            quant_args.sym = sym
 
             if isinstance(layer, FusedMoE):
                 layer.scheme = quant_args.get_moe_scheme(layer)
