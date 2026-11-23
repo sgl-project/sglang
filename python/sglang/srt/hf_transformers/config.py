@@ -14,6 +14,7 @@
 """Config loading utilities."""
 
 import copy
+import typing
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -31,11 +32,12 @@ from sglang.srt.configs.model_config_parser_registry import (
     register_model_config_parser,
 )
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url, lru_cache_frozenset
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import _ensure_gguf_version
 
 from .common import (
     _CONFIG_REGISTRY,
+    HF_STRICT_CONFIG_ERRORS,
     AutoConfig,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -212,6 +214,130 @@ def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _float_declared_fields(config_class) -> frozenset:
+    """Names of fields *config_class* declares as (possibly optional) float.
+
+    Reads raw ``__annotations__`` merged over the MRO: ``typing.get_type_hints``
+    fails on config classes whose annotations reference lazily imported modules
+    (e.g. ``torch``), and ``dataclasses.fields(...).type`` is a string here, not
+    the type object. Only scalar float (and ``float | None``) matches; a
+    container such as ``list[float]`` never receives an int value to promote.
+    """
+    fields = set()
+    for klass in reversed(config_class.__mro__):
+        for name, ann in getattr(klass, "__annotations__", {}).items():
+            if ann is float or (
+                typing.get_origin(ann) is not None and float in typing.get_args(ann)
+            ):
+                fields.add(name)
+    return frozenset(fields)
+
+
+def _hf_config_class(model_type):
+    """Config class for *model_type*, or None if transformers lacks it.
+
+    transformers v5's CONFIG_MAPPING is a lazy mapping: ``.get()`` never
+    resolves (and ``in`` is unreliable), so membership goes through
+    CONFIG_MAPPING_NAMES and the class is fetched with ``[]``.
+    """
+    from transformers.models.auto.configuration_auto import (
+        CONFIG_MAPPING,
+        CONFIG_MAPPING_NAMES,
+    )
+
+    if model_type is None or model_type not in CONFIG_MAPPING_NAMES:
+        return None
+    try:
+        return CONFIG_MAPPING[model_type]
+    except (KeyError, AttributeError, ImportError, TypeError, ValueError):
+        return None
+
+
+def _nested_config_classes(config_class) -> dict:
+    """Sub-config dict field name -> config class, as the parent declares it.
+
+    transformers builds sub-configs from dicts that usually carry no
+    ``model_type`` (``text_config`` / ``vision_config`` ...), and it resolves
+    the class from ``sub_configs`` on the parent class rather than from
+    ``CONFIG_MAPPING``, so the same lookup is needed to coerce them.
+    """
+    sub_configs = getattr(config_class, "sub_configs", None)
+    return sub_configs if isinstance(sub_configs, dict) else {}
+
+
+def _coerce_ints_to_floats(config_dict: dict, config_class=None) -> bool:
+    """Promote int values to float where the config class declares float.
+
+    Published checkpoints sometimes carry integral floats as JSON ints
+    (e.g. a DeepSeek-V3-family config with "routed_scaling_factor": 1).
+    transformers v5 config classes are strict dataclasses and raise
+    StrictDataclassFieldValidationError for that, while older transformers
+    silently accepted it. Only int -> float is promoted (float -> int would
+    truncate); sub-config dicts are handled recursively. Returns True if any
+    value was coerced.
+    """
+    changed = False
+    if config_class is None:
+        config_class = _hf_config_class(config_dict.get("model_type"))
+    float_fields = (
+        _float_declared_fields(config_class)
+        if config_class is not None
+        else frozenset()
+    )
+    nested_classes = (
+        _nested_config_classes(config_class) if config_class is not None else {}
+    )
+    for name, value in config_dict.items():
+        if (
+            name in float_fields
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        ):
+            config_dict[name] = float(value)
+            changed = True
+        elif isinstance(value, dict):
+            nested_class = nested_classes.get(name) or _hf_config_class(
+                value.get("model_type")
+            )
+            if nested_class is not None:
+                changed = _coerce_ints_to_floats(value, nested_class) or changed
+    return changed
+
+
+def _load_hf_auto_config(model, trust_remote_code, revision, **kwargs):
+    """``AutoConfig.from_pretrained`` with a retry for strict-dataclass configs.
+
+    transformers v5 config classes are strict dataclasses (huggingface_hub):
+    a config.json that stores an integral float as a JSON int raises
+    StrictDataclassFieldValidationError ("expected float, got int"), which is
+    not a ValueError and escapes the usual load error handling. Retry by
+    building the config from an in-memory copy of config.json with those
+    fields promoted to float.
+    """
+    try:
+        return AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except HF_STRICT_CONFIG_ERRORS:
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model, revision=revision, **kwargs
+        )
+        config_class = _hf_config_class(config_dict.get("model_type"))
+        if config_class is None or not _coerce_ints_to_floats(
+            config_dict, config_class
+        ):
+            raise
+        logger.info(
+            "Coerced integral int values to float in the %s config; "
+            "strict-dataclass configs reject int where float is declared",
+            config_dict.get("model_type"),
+        )
+        config = config_class.from_dict(config_dict)
+        if isinstance(model, str):
+            config._name_or_path = model
+        return config
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -225,7 +351,7 @@ class HfModelConfigParser(ModelConfigParserBase):
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
-            config = AutoConfig.from_pretrained(
+            config = _load_hf_auto_config(
                 model,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
