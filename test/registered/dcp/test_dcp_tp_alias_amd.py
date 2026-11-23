@@ -1,6 +1,6 @@
 """ROCm TP8/DCP8: the collectives DCP issues, eager and replayed from a CUDA graph.
 
-On ROCm, full-width DCP reuses the TP coordinator unless TP carries QuickAllReduce.
+On ROCm, full-width DCP reuses the TP coordinator unless TP carries an enabled QuickAllReduce.
 Each torchrun worker builds TP8/DCP8 through ``initialize_model_parallel``, checks
 which coordinator DCP got, and compares the DCP collectives (all-gather,
 all-gather-into-tensor, reduce-scatter along a dim, all-to-all, FP32 and BF16
@@ -109,6 +109,8 @@ def _worker(mode: str) -> None:
     qr_runs = tp.qr_comm is not None and not tp.qr_comm.disabled
     if mode == "qr-int8":
         assert qr_runs, "gfx950 TP must build an enabled QuickAllReduce here"
+    if mode == "qr-disabled":
+        assert tp.qr_comm is not None and tp.qr_comm.disabled
     if qr_runs:
         assert dcp is not tp, "DCP must not share a TP coordinator whose QR runs"
         assert dcp.qr_comm is None
