@@ -90,6 +90,27 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["custom_fused_moe_kwarg"] == "enabled"
 
 
+def test_aiter_runner_attaches_effective_gate_layout_to_fp4_weight(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured["gate_up_interleave"] = getattr(
+            kwargs["w1"], "gate_up_interleave", None
+        )
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(fused_moe_kwargs={"gate_mode": "interleave"}),
+        running_state={},
+    )
+
+    assert captured["gate_up_interleave"] is True
+
+
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
     monkeypatch,
 ):

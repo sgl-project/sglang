@@ -213,6 +213,11 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
+        gate_mode = extra.get("gate_mode")
+        if gate_mode is not None and quant_info.quant_type == AiterQuantType.PER_1X32:
+            quant_info.w13_weight.gate_up_interleave = (
+                str(getattr(gate_mode, "value", gate_mode)).lower() == "interleave"
+            )
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
