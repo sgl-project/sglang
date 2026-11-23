@@ -25,7 +25,7 @@ from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.facts import facts_of
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,8 +41,10 @@ def next_layer():
 
 class TestIndependentStageConstruction(CustomTestCase):
     def test_compute_owned_cp_gather_preserves_output_sum(self):
-        # Quantized MoE transport replaces only the BF16 input gather. Losing
-        # the output sum or declaring the input gather twice corrupts results.
+        from sglang.srt.layers.cp.moe_fp8_transport import cp_moe_row_transport
+
+        # The boundary selects the variant; the transport declares the full
+        # compute rows while keeping residual and returned output on source rows.
         parallel = fixture.parallel_of(
             attn_dp=1,
             attn_tp=1,
@@ -52,26 +54,51 @@ class TestIndependentStageConstruction(CustomTestCase):
         )
         with fixture.planning(parallel, dsa_cp=True):
             baseline = declare_ffn(sparse=True, exit_rows=factories.ExitRows.ATTENTION)
-            deferred = replace(baseline, gathers_attn_cp_input=True)
+            deferred = replace(baseline, row_transport=cp_moe_row_transport())
             for variant in (BatchVariant.ORDINARY, BatchVariant.CONTEXT_PARALLEL):
                 normal = factories._resolve_stage(baseline, variant, None)
                 actual = factories._resolve_stage(deferred, variant, None)
-                self.assertEqual(actual.contract.output, normal.contract.output)
-                self.assertEqual(actual.during, normal.during)
+                rows = deferred.row_transport.rows[variant]
+                self.assertEqual(
+                    actual.contract.output.group, normal.contract.output.group
+                )
+                self.assertEqual(actual.during, rows.source)
                 self.assertEqual(actual.returned, normal.returned)
+                self.assertEqual(actual.contract.input.layout, rows.source)
+                self.assertFalse(actual.contract.input.gathered_by_compute)
+                self.assertEqual(rows.compute, normal.contract.input.layout)
                 if variant is BatchVariant.CONTEXT_PARALLEL:
                     self.assertIn(
                         factories.TokenAxis.ATTN_CP,
-                        actual.contract.input.gathered_by_compute,
+                        rows.source.sharded,
                     )
+                    self.assertNotIn(factories.TokenAxis.ATTN_CP, rows.compute.sharded)
                     self.assertIsNotNone(actual.contract.output.group)
                 else:
-                    self.assertEqual(actual.contract, normal.contract)
-            # A declaration retains the capability when recorded as facts.
-            self.assertTrue(facts_of(deferred).gathers_attn_cp_input)
-            parallel.enable_cp_tp_group_sharing = False
-            with self.assertRaisesRegex(NotImplementedError, "full-TP sparse FFN"):
-                factories._resolve_stage(deferred, BatchVariant.CONTEXT_PARALLEL, None)
+                    self.assertEqual(rows.source, rows.compute)
+            # Neighbour facts retain contracts, not live model bindings.
+            self.assertEqual(
+                facts_of(deferred).row_transport.rows, deferred.row_transport.rows
+            )
+            self.assertIsNone(facts_of(deferred).row_transport.bind)
+
+    def test_cp_fp8_bindings_do_not_share_layer_ids(self):
+        from sglang.srt.layers.cp.moe_fp8_transport import CpMoeFp8Binding
+
+        first = SimpleNamespace(
+            layer_id=0, _compute_cp_moe_fp8_transport_enabled=lambda: (True, "ok")
+        )
+        second = SimpleNamespace(
+            layer_id=0,
+            _compute_cp_moe_fp8_transport_enabled=lambda: (False, "fallback"),
+        )
+        a, b = CpMoeFp8Binding(first), CpMoeFp8Binding(second)
+        self.assertIs(a.layer, first)
+        self.assertIs(b.layer, second)
+        self.assertTrue(a.eligibility[0])
+        self.assertFalse(b.eligibility[0])
+        first._compute_cp_moe_fp8_transport_enabled = lambda: (False, "changed")
+        self.assertTrue(a.eligibility[0])
 
     def test_active_variant_without_a_bound_path_never_falls_back(self):
         from sglang.srt.layers.layer_boundary import construction

@@ -20,7 +20,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

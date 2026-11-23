@@ -11,8 +11,12 @@ import transformers
 from safetensors.torch import save_file
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
     ComfyInt8EmbeddingMethod,
 )
@@ -32,6 +36,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.factory import _ROPE_DICT
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -113,6 +120,56 @@ def test_encoder_load_copies_host_checkpoint_into_final_parameters(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_offloaded_encoder_builds_resident_rope_cache(
+    tmp_path, single_process_model_parallel
+):
+    """CPU and CUDA round some cos/sin entries apart; offload must not change them."""
+    hf_config = transformers.Qwen3Config(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=40960,
+        rope_theta=1000000.0,
+    )
+    reference = transformers.Qwen3Model(hf_config)
+    save_file(
+        {name: p.detach().clone() for name, p in reference.named_parameters()},
+        tmp_path / "model.safetensors",
+    )
+
+    def rope_caches(starts_on_cpu):
+        config = Qwen3TextConfig()
+        config.update_model_arch(hf_config.to_dict())
+        config.arch_config.architectures = ["Qwen3ForCausalLM"]
+        with mock.patch.dict(_ROPE_DICT, clear=True):
+            loaded = TextEncoderLoader().load_model(
+                str(tmp_path),
+                config,
+                SimpleNamespace(pipeline_config=None),
+                dtype="bf16",
+                component_starts_on_cpu=starts_on_cpu,
+            )
+        caches = [
+            m.cos_sin_cache for m in loaded.modules() if isinstance(m, RotaryEmbedding)
+        ]
+        assert caches
+        for cache in caches:
+            assert cache.device.type == ("cpu" if starts_on_cpu else "cuda")
+            assert cache.dtype == torch.bfloat16
+        return [cache.cpu() for cache in caches]
+
+    resident = rope_caches(starts_on_cpu=False)
+    offloaded = rope_caches(starts_on_cpu=True)
+    assert len(offloaded) == len(resident)
+    for a, b in zip(offloaded, resident):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("backend", ["int8", "nvfp4"])
 @pytest.mark.parametrize("tensorwise", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
@@ -192,6 +249,21 @@ def test_comfy_embedding_checkpoint_lookup(tmp_path, backend, tensorwise, tp_siz
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert embedding.weight.dtype == torch.int8
         assert torch.count_nonzero(embedding.weight[count:]) == 0
+
+
+def test_embedding_rejects_a_quant_method_without_an_embedding_op():
+    """A quant config that hands an embedding layer a linear-only method must be
+    rejected when the layer is built, not at the first token lookup."""
+    config = SimpleNamespace(
+        get_quant_method=lambda layer, prefix: UnquantizedLinearMethod()
+    )
+    with pytest.raises(NotImplementedError, match="must implement the 'embedding'"):
+        VocabParallelEmbedding(
+            8,
+            4,
+            quant_config=config,
+            tp_group=SimpleNamespace(world_size=1, rank_in_group=0),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -680,23 +752,36 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIs(model_config.quant_config, self.serialized)
 
     def test_explicit_online_quantization_configures_native_encoder(self):
-        model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
-
-        _configure_encoder_quantization(
-            model_config,
-            TextEncoder,
-            {},
-            "/model/text_encoder",
-            "/model/text_encoder",
-            "text_encoder",
-            explicit_quantization="convrot_int8",
-            ignored_layers=["lm_head"],
-        )
-
-        self.assertIsInstance(model_config.quant_config, ConvRotInt8Config)
-        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
-        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
+        for method, config_cls in (
+            ("convrot_int8", ConvRotInt8Config),
+            ("fp8", Fp8Config),
+            ("mxfp8", MXFP8Config),
+        ):
+            with self.subTest(method=method):
+                model_config = SimpleNamespace(quant_config=None)
+                _configure_encoder_quantization(
+                    model_config,
+                    TextEncoder,
+                    {},
+                    "/model/text_encoder",
+                    "/model/text_encoder",
+                    "text_encoder",
+                    explicit_quantization=method,
+                    ignored_layers=["lm_head"],
+                )
+                self.assertIsInstance(model_config.quant_config, config_cls)
+                self.assertFalse(
+                    getattr(
+                        model_config.quant_config, "is_checkpoint_fp8_serialized", False
+                    )
+                    or getattr(
+                        model_config.quant_config,
+                        "is_checkpoint_int8_serialized",
+                        False,
+                    )
+                )
+                self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)

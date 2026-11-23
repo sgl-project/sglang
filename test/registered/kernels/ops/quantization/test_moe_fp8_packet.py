@@ -39,23 +39,32 @@ def _bytes(tensor):
 @pytest.mark.parametrize("rows", [1, 3, 129, 1024])
 @pytest.mark.parametrize("hidden,topk", [(128, 1), (512, 9), (4096, 9)])
 @pytest.mark.parametrize("column_major", [False, True])
-def test_packet_exact_wire_and_roundtrip(rows, hidden, topk, column_major):
+@pytest.mark.parametrize("column_major_scales", [False, True])
+def test_packet_exact_wire_and_roundtrip(
+    rows, hidden, topk, column_major, column_major_scales
+):
     inputs = _inputs(rows, hidden, topk, column_major)
     packet = pack_moe_fp8(*inputs)
     assert torch.equal(packet, pack_reference(*inputs))
-    restored = unpack_moe_fp8(packet, hidden, topk)
+    restored = unpack_moe_fp8(
+        packet, hidden, topk, column_major_scales=column_major_scales
+    )
     reference_restored = unpack_reference(packet, hidden, topk)
     for actual, reference, expected in zip(restored, reference_restored, inputs):
         assert torch.equal(_bytes(actual), _bytes(expected))
         assert torch.equal(_bytes(actual), _bytes(reference))
-    assert restored[1].stride(0) == 1
-    assert restored[1].stride(1) % 4 == 0
+    if column_major_scales:
+        assert restored[1].stride(0) == 1
+        assert restored[1].stride(1) % 4 == 0
+    else:
+        assert restored[1].is_contiguous()
 
 
-def test_packet_empty():
+@pytest.mark.parametrize("column_major_scales", [False, True])
+def test_packet_empty(column_major_scales):
     inputs = _inputs(0, 512, 9, True)
     packet = pack_moe_fp8(*inputs)
-    restored = unpack_moe_fp8(packet, 512, 9)
+    restored = unpack_moe_fp8(packet, 512, 9, column_major_scales=column_major_scales)
     assert packet.shape == (0, 608)
     for actual, expected in zip(restored, inputs):
         assert actual.shape == expected.shape
@@ -71,14 +80,19 @@ def test_rank_major_gather_preserves_token_and_router_order():
         assert torch.equal(_bytes(tensor), _bytes(expected))
 
 
-def test_packet_graph_replay_reads_updated_inputs():
+@pytest.mark.parametrize("column_major_scales", [False, True])
+def test_packet_graph_replay_reads_updated_inputs(column_major_scales):
     inputs = _inputs(129, 512, 9, True)
-    unpack_moe_fp8(pack_moe_fp8(*inputs), 512, 9)
+    unpack_moe_fp8(
+        pack_moe_fp8(*inputs), 512, 9, column_major_scales=column_major_scales
+    )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         packet = pack_moe_fp8(*inputs)
-        restored = unpack_moe_fp8(packet, 512, 9)
+        restored = unpack_moe_fp8(
+            packet, 512, 9, column_major_scales=column_major_scales
+        )
     for old, new in zip(inputs, _inputs(129, 512, 9, True)):
         old.copy_(new)
     graph.replay()

@@ -21,8 +21,8 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         "_npu_hicache_mamba_io_mode",
         return_value="async",
     )
-    @patch.object(mamba_pool_host, "transfer_state_per_layer_direct_pf_lf", None)
-    @patch.object(mamba_pool_host, "transfer_state_all_layer_direct_lf_pf", None)
+    @patch.object(mamba_pool_host, "transfer_kv_per_layer_direct_pf_lf", None)
+    @patch.object(mamba_pool_host, "transfer_kv_all_layer_direct_lf_pf", None)
     def test_async_requires_native_operator(self, _mock_mode):
         pool = MambaPoolHost.__new__(MambaPoolHost)
 
@@ -42,7 +42,7 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         with (
             patch.object(
                 mamba_pool_host,
-                "transfer_state_per_layer_direct_pf_lf",
+                "transfer_kv_per_layer_direct_pf_lf",
                 transfer_op,
             ),
             patch.object(
@@ -80,7 +80,7 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
         with (
             patch.object(
                 mamba_pool_host,
-                "transfer_state_all_layer_direct_lf_pf",
+                "transfer_kv_all_layer_direct_lf_pf",
                 transfer_op,
             ),
             patch.object(
@@ -130,14 +130,6 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
 
         torch.testing.assert_close(
             device_layers[2, device_indices], host[host_indices, 2, 0]
-        )
-
-    def test_copy_helpers_keep_static_signatures(self):
-        self.assertIsInstance(
-            MambaPoolHost.__dict__["_copy_tensor_pf_lf"], staticmethod
-        )
-        self.assertIsInstance(
-            MambaPoolHost.__dict__["_copy_tensor_all_layers_lf_pf"], staticmethod
         )
 
     @patch.object(mamba_pool_host, "transfer_mamba_state", None)

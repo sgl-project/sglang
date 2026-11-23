@@ -10,6 +10,7 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.abort_timeout_kit import AbortAllMixin
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
@@ -20,7 +21,7 @@ from sglang.test.kits.spec_server_kits import (
 )
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base, EagleLlama2Base
 
-register_cuda_ci(est_time=833, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=833, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestEagle3Topk16(
@@ -56,6 +57,7 @@ class TestEagleLlama2Suite(
     SpecAccuracyKit,
     SpecLogprobKit,
     SpecPenaltyKit,
+    PenalizedEOSMixin,
     SpecFeatureKit,
     AbortAllMixin,
 ):

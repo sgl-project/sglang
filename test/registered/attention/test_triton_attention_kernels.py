@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd")
 
 
 def extend_attention_fwd_torch(
@@ -682,6 +682,84 @@ class TestTritonAttention(CustomTestCase):
             self.assertTrue(cos_sim.item() > 1 - (1e-5))
             self.assertTrue(torch.allclose(o[start:end], o_torch, atol=1e-2))
 
+    def test_extend_attention_int32_kv_indices_above_2g(self):
+        """Regression for int32 KV offset overflow in the extend kernels.
+
+        With int32 kv_indices, slot * stride wraps once slot >= 2**31 / stride.
+        Slots sit just below 2**32 / stride so a wrapped offset lands on the
+        zero rows in front of the buffer and shows up as a mismatch, not a
+        fault. Needs ~8.6 GB.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, P, E, H_Q, D = 2, 64, 16, 8, 128
+        pad, num_slots = 256, 2**32 // D
+        big = torch.zeros(pad + num_slots, 1, D, dtype=dtype, device=device)
+        kv_buffer = big[pad:]
+
+        q = torch.randn(B * E, H_Q, D, dtype=dtype, device=device)
+        kv = torch.randn(B, P + E, 1, D, dtype=dtype, device=device)
+        k_ext = kv[:, P:].reshape(B * E, 1, D)
+        slots = torch.arange(B * (P + E), dtype=torch.int32, device=device)
+        high_slots = slots + (num_slots - pad)
+        kv_buffer[high_slots.long()] = kv.flatten(0, 1)
+        ref_buffer = kv.flatten(0, 1)
+
+        qo_indptr = torch.arange(0, (B + 1) * E, E, dtype=torch.int32, device=device)
+        prefix_indptr = torch.arange(
+            0, (B + 1) * P, P, dtype=torch.int32, device=device
+        )
+        unified_indptr = torch.arange(
+            0, (B + 1) * (P + E), P + E, dtype=torch.int32, device=device
+        )
+        prefix_lens = torch.full((B,), P, dtype=torch.int32, device=device)
+
+        def run(buf, idx, unified):
+            o = torch.empty_like(q)
+            if unified:
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    buf,
+                    buf,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    unified_indptr,
+                    idx,
+                    prefix_lens,
+                    max_len_extend=E,
+                )
+            else:
+                prefix_idx = idx.view(B, P + E)[:, :P].flatten()
+                extend_attention_fwd(
+                    q,
+                    k_ext,
+                    k_ext,
+                    o,
+                    buf,
+                    buf,
+                    qo_indptr,
+                    prefix_indptr,
+                    prefix_idx,
+                    None,
+                    True,
+                    None,
+                    E,
+                    1.0,
+                    1.0,
+                )
+            return o
+
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                torch.testing.assert_close(
+                    run(kv_buffer, high_slots, unified),
+                    run(ref_buffer, slots, unified),
+                    atol=1e-2,
+                    rtol=1e-2,
+                )
+
     def test_context_attention(self):
         head_dim = [128, 96, 80, 13]
 
@@ -763,6 +841,14 @@ class TestTritonAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D in configs:
             self._test_decode_attention_once(B, H_Q, H_KV, D)
+
+    def test_decode_attention_gqa_group_above_tile(self):
+        """Every query head reads its own KV head when a GQA group is wider than
+        the grouped kernel's 16-head tile, also when it is not a multiple of 16."""
+        # groups of 24 (GLM-4-32B at TP 1) and 20, then 8, 16 and 32
+        for H_Q, H_KV in ((48, 2), (40, 2), (16, 2), (32, 2), (64, 2)):
+            with self.subTest(H_Q=H_Q, H_KV=H_KV):
+                self._test_decode_attention_once(2, H_Q, H_KV, 128)
 
     def _test_grouped_decode_attention_once(self, B, S, H_Q, H_KV, D, D_V):
         dtype = torch.bfloat16
@@ -867,6 +953,91 @@ class TestTritonAttention(CustomTestCase):
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
 
+    def test_grouped_decode_attention_split_programs_bitwise(self):
+        """Above _MAX_SPLIT_PROGRAMS splits (deterministic mode sizes the split budget
+        by the context length) stage 1 can run fewer blocks that loop over the
+        splits. With and without stage 2 stopping at each request's own count
+        (deterministic mode's stop_at_request_splits), the output must be bitwise
+        the same as with one block per split."""
+        from sglang.kernels.ops.attention import decode_attention as da
+
+        device = get_device()
+        dtype = torch.bfloat16
+        H_Q, H_KV, D, tile, max_kv_splits = 64, 8, 64, 256, 128
+        seq_lens = [1, 255, 1500, 2049, 8000, 20000]
+        B = len(seq_lens)
+        torch.manual_seed(0)
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        total = int(lens.sum())
+        q = torch.randn(B, H_Q, D, dtype=dtype, device=device)
+        k_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        v_buffer = torch.randn(total, H_KV, D, dtype=dtype, device=device)
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(lens, dim=0)
+        kv_indices = torch.randperm(total, device=device)
+        num_kv_splits = ((lens + tile - 1) // tile).to(torch.int32)
+        sinks = torch.randn(H_Q, dtype=torch.float32, device=device)
+
+        def run(max_split_programs, stop_at_request_splits):
+            old = da._MAX_SPLIT_PROGRAMS, da._device_core_count
+            # One core: the block count is _MAX_SPLIT_PROGRAMS, whatever the device.
+            da._MAX_SPLIT_PROGRAMS = max_split_programs
+            da._device_core_count = lambda device_index: 1
+            try:
+                o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
+                attn_logits = torch.empty(
+                    (B, H_Q, max_kv_splits, D), dtype=torch.float32, device=device
+                )
+                attn_lse = torch.empty(
+                    (B, H_Q, max_kv_splits), dtype=torch.float32, device=device
+                )
+                decode_attention_fwd_grouped(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    o,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    attn_lse,
+                    num_kv_splits,
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    sinks=sinks,
+                    stop_at_request_splits=stop_at_request_splits,
+                )
+                return o
+            finally:
+                da._MAX_SPLIT_PROGRAMS, da._device_core_count = old
+
+        for stop in (False, True):
+            one_block_per_split = run(max_kv_splits, stop)
+            for programs in (1, 8, 32):
+                self.assertTrue(
+                    torch.equal(run(programs, stop), one_block_per_split),
+                    f"{programs} blocks per request and head tile differ "
+                    f"(stop_at_request_splits={stop})",
+                )
+
+    def test_grouped_decode_split_programs_cover_the_device(self):
+        """Stage 1 loops over splits only while the blocks still cover the device: a
+        budget sized by the core count (normal-mode MLA) keeps one block per split at
+        small batch, and a large batch still gets _MAX_SPLIT_PROGRAMS blocks."""
+        from sglang.kernels.ops.attention.decode_attention import _split_programs
+
+        # (batch, head_tiles, max_kv_splits, core_count, expected)
+        for batch, tiles, budget, cores, expected in [
+            (1, 1, 256, 256, 0),  # MLA, 16 heads per rank, batch 1: one per split
+            (2, 1, 256, 256, 128),
+            (8, 1, 256, 256, 32),
+            (64, 4, 512, 256, 32),  # deterministic budget at a large batch
+            (1, 4, 512, 256, 64),
+            (1, 1, 32, 256, 0),
+        ]:
+            with self.subTest(batch=batch, tiles=tiles, budget=budget, cores=cores):
+                self.assertEqual(_split_programs(batch, tiles, budget, cores), expected)
+
     def test_decode_attention_uneven_batch_graph_replay(self):
         """One captured decode graph replayed over uniform, padded and ragged batches.
 
@@ -900,12 +1071,7 @@ class TestTritonAttention(CustomTestCase):
             backend.cuda_graph_uneven_batch = torch.zeros(
                 1, dtype=torch.int32, device=device
             )
-            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
-                None,
-                None,
-                None,
-                lens,
-            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (None, lens)
 
             seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
             kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)

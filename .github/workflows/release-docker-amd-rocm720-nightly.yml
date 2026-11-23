@@ -27,7 +27,7 @@ on:
         type: boolean
         default: true
   schedule:
-    - cron: '0 11 * * *'  # an hour after ROCm 10, ahead of the 12:00 UTC MILES builds
+    - cron: '0 10 * * *'  # an hour after ROCm 10, ahead of the 11:00 UTC MILES builds
 
 # Scheduled runs always push; a manual dispatch can turn the push off.
 env:

@@ -8,10 +8,8 @@ This module provides generic sampling parameters that work with any diffusers pi
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 
 
 @dataclass

@@ -11,10 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Round-trip correctness of ``UnifiedKVPool._build_mamba_views`` -- the
-envelope-strided conv/temporal (SSM) state views that back ``UnifiedMambaPool``.
+"""Round-trip correctness of ``MambaSubPoolSpec.views`` -- the
+envelope-strided conv/temporal (SSM) state views that back ``StateView``.
 Guards against garbled greedy decode from a stride/offset/alignment bug in the
-state views. CPU-only.
+state views. Runs on CPU; the whole-entry clear case also runs on a GPU when
+one is present.
 
 Within one slot's envelope the bytes are
 ``[conv[0] L0 | conv[0] L1 | ... | conv[1] L0 | ... | temporal L0 | ...]``,
@@ -30,9 +31,10 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 def _make_pool(
@@ -46,13 +48,10 @@ def _make_pool(
     device="cpu",
     grow_direction="down",
 ):
-    """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
+    """Minimal 2-band arena sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MHASubPoolSpec,
-        UnifiedKVPool,
-    )
+    from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 
     mamba_spec = MambaSubPoolSpec(
         name="mamba",
@@ -79,7 +78,7 @@ def _make_pool(
     # multiple of 8 so bf16/fp32 ``.view()`` stays legal.
     total_bytes = want_slots * entry_mamba + 8 * entry_max
     total_bytes = ((total_bytes + 7) // 8) * 8
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
@@ -102,7 +101,7 @@ class TestUnifiedMambaViews(unittest.TestCase):
         """Write a distinct random tensor to every view, then read all of them
         back: writing all first makes any envelope overlap corrupt an earlier
         write."""
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
         torch.manual_seed(0)
         refs = []
         for v in conv_views:
@@ -174,11 +173,11 @@ class TestUnifiedMambaViews(unittest.TestCase):
         """Zero buffer; write a sentinel to ONE view; every OTHER view must read
         all-zero. Pinpoints conv[i]/conv[j]/temporal aliasing if present."""
         pool, spec = _make_pool(**self.FALCON_KW)
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
         views = list(conv_views) + [temporal_view]
         names = [f"conv[{i}]" for i in range(len(conv_views))] + ["temporal"]
         for target in range(len(views)):
-            pool._raw.zero_()
+            pool.raw.zero_()
             views[target].fill_(7.0)
             for other in range(len(views)):
                 if other == target:
@@ -193,20 +192,71 @@ class TestUnifiedMambaViews(unittest.TestCase):
                     f"(envelope regions overlap)",
                 )
 
-    def test_alignment_guard_fires_on_misaligned_spec(self):
-        """A per-slot entry that is not a multiple of the temporal itemsize would
-        mis-offset the view and must trip the alignment assert; either guard can
-        fire first, so match on the shared "misaligned" wording."""
-        with self.assertRaises(AssertionError) as cm:
-            _make_pool(
-                mamba_layer_num=1,  # entry = 2 B conv + 4 B temporal = 6 B, not %4
-                conv_state_shapes=[(1, 1)],
-                conv_dtype=torch.bfloat16,
-                temporal_state_shape=(1,),
-                temporal_dtype=torch.float32,
-                want_slots=4,
-            )
-        self.assertIn("misalign", str(cm.exception).lower())
+    def test_typed_parts_align_without_overlapping_adjacent_slots(self):
+        pool, spec = _make_pool(
+            mamba_layer_num=1,
+            conv_state_shapes=[(1, 1)],
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(1,),
+            temporal_dtype=torch.float32,
+            want_slots=4,
+        )
+        conv, temporal = spec.views(pool)
+        self.assertEqual(spec.entry_bytes(), 128)
+        conv[0][0, 1].fill_(3)
+        temporal[0, 1].fill_(5)
+        conv[0][0, 2].fill_(7)
+        temporal[0, 2].fill_(11)
+        self.assertEqual(float(conv[0][0, 1].item()), 3)
+        self.assertEqual(float(temporal[0, 1].item()), 5)
+        self.assertEqual(float(conv[0][0, 2].item()), 7)
+        self.assertEqual(float(temporal[0, 2].item()), 11)
+        self.assertEqual(temporal.data_ptr() % 4, 0)
+
+    def test_whole_entry_clear_zeroes_exactly_the_cleared_entries(self):
+        """The whole-entry clear fills words, not bytes, when the entry rows
+        allow it: it must zero exactly the listed entries (duplicates included)
+        and pick the widest word that the row size, row stride and base offset
+        all divide, falling back to bytes otherwise."""
+        from sglang.srt.mem_cache.kv.layout.state import StateView, _as_widest_words
+
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device, layout="arena"):
+                pool, spec = _make_pool(**self.FALCON_KW, device=device)
+                view = StateView(arena=pool, spec=spec, mamba_layer_ids=[0, 1, 2, 3, 4])
+                self.assertEqual(view._entry_words.dtype, torch.int64)
+                pool.raw.fill_(0xAB)
+                expected = pool.raw.clone()
+                entry = spec.entry_bytes()
+                for slot in (2, 5):
+                    expected[slot * entry : (slot + 1) * entry] = 0
+                view.clear_slots(torch.tensor([2, 5, 2], device=device))
+                self.assertTrue(torch.equal(pool.raw, expected))
+
+            # (row bytes, row stride, base offset) -> widest legal word.
+            layouts = {
+                (24, 24, 0): torch.int64,
+                (24, 32, 0): torch.int64,
+                (24, 24, 4): torch.int32,
+                (24, 28, 0): torch.int32,
+                (12, 16, 0): torch.int32,
+                (24, 24, 1): torch.uint8,
+                (6, 6, 0): torch.uint8,
+            }
+            for (row, stride, offset), dtype in layouts.items():
+                with self.subTest(device=device, row=row, stride=stride, offset=offset):
+                    raw = torch.full(
+                        (offset + 4 * stride,), 0xAB, dtype=torch.uint8, device=device
+                    )
+                    rows = raw.as_strided((4, row), (stride, 1), offset)
+                    words = _as_widest_words(rows)
+                    self.assertEqual(words.dtype, dtype)
+                    expected = raw.clone()
+                    for r in (1, 3):
+                        expected[offset + r * stride : offset + r * stride + row] = 0
+                    words.index_fill_(0, torch.tensor([1, 3, 1], device=device), 0)
+                    self.assertTrue(torch.equal(raw, expected))
 
 
 def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:

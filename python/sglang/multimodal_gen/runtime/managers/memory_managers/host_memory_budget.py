@@ -15,9 +15,11 @@ the cap is read directly from whichever cgroup version is mounted.
 
 import os
 import weakref
+from collections.abc import Iterable
 
 import psutil
 import torch
+from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -106,19 +108,26 @@ def _cgroup_dirs(mount: str) -> list[str]:
     return dirs
 
 
-# memory.stat keys for the page cache a cgroup is charged for: v2, then v1.
-_CGROUP_FILE_CACHE_KEYS = ("file", "cache")
+# memory.stat keys for the reclaimable page cache: v1's subtree totals, then v2's
+# (hierarchical already). Both are the file LRUs, which leave out shmem.
+_CGROUP_FILE_CACHE_KEYS = (
+    ("total_active_file", "total_inactive_file"),
+    ("active_file", "inactive_file"),
+)
 
 
 def _cgroup_file_cache_bytes(directory: str) -> int:
+    stat = {}
     try:
         with open(os.path.join(directory, "memory.stat")) as handle:
             for line in handle:
                 key, _, value = line.partition(" ")
-                if key in _CGROUP_FILE_CACHE_KEYS:
-                    return int(value)
+                stat[key] = int(value)
     except (OSError, ValueError):
-        pass
+        return 0
+    for keys in _CGROUP_FILE_CACHE_KEYS:
+        if all(key in stat for key in keys):
+            return sum(stat[key] for key in keys)
     return 0
 
 
@@ -133,9 +142,8 @@ def cgroup_memory_limit_bytes(
     commit memory the process cannot have.
 
     A cgroup is charged for the page cache it touches, so its usage grows by
-    the whole checkpoint the process maps. ``exclude_file_cache`` reports the
-    anonymous share alone, for callers that may spend cache the kernel would
-    reclaim under the cap anyway.
+    the whole checkpoint the process maps. ``exclude_file_cache`` leaves out
+    the cache on the file LRUs, which the kernel reclaims under the cap.
     """
     for mount, limit_name, usage_name in _CGROUP_MOUNTS:
         tightest = None
@@ -155,9 +163,19 @@ def cgroup_memory_limit_bytes(
 
 
 def physical_host_memory_available_bytes() -> int:
-    """What the machine itself can still give: kernel available under any cgroup cap."""
+    """What the machine itself can still give: kernel available under any cgroup cap.
+
+    Page cache charged to the cgroup counts as available, as MemAvailable counts
+    it outside one: the kernel reclaims it under the cap. That includes a
+    mapping's own cached pages, which are the room it needs to stay cached, and
+    a layer pinned out of the mapping stops needing them.
+
+    Both file LRUs count, not only the inactive one the kubelet subtracts:
+    which list a page sits on follows its access history and the LRU
+    implementation, so the active list holds cold cache too.
+    """
     available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
+    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
     if capped is None:
         return available
     limit, usage = capped
@@ -186,22 +204,6 @@ def host_memory_available_bytes() -> int:
             pass
         return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
     return physical_host_memory_available_bytes()
-
-
-def shared_pool_available_bytes() -> int:
-    """Bytes a shared host/device pool can still give this process.
-
-    The device's own free figure is the kernel's MemFree, which leaves out the
-    page cache -- memory the kernel hands back on demand and a placement may
-    therefore spend. A cgroup cap is honoured on its anonymous share only, for
-    the same reason: the cache charged to the cgroup is reclaimed under the cap.
-    """
-    available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
-    if capped is None:
-        return available
-    limit, anonymous = capped
-    return min(available, max(0, limit - anonymous))
 
 
 def host_copies_are_redundant() -> bool:
@@ -241,8 +243,18 @@ def host_copies_would_not_fit(weight_bytes: int) -> bool:
     return weight_bytes >= host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
 
 
+def host_pin_reserve_bytes(available_bytes: int) -> int:
+    return max(
+        int(available_bytes * HOST_RESERVE_FRACTION),
+        MIN_HOST_RESERVE_BYTES,
+    )
+
+
 class HostPinBudget:
     """Hands out pinned-host-memory allowances until the headroom runs out.
+
+    This enforces a capacity selected elsewhere; it does not choose component
+    placement independently from the VRAM planner.
 
     Pinning is not all-or-nothing per process: a component whose weights stream
     once per request gains far less from pinning than one re-streamed on every
@@ -257,7 +269,13 @@ class HostPinBudget:
     it only fires when the bytes genuinely do not fit.
     """
 
-    def __init__(self, available_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        available_bytes: int | None = None,
+        *,
+        reserve_bytes: int | None = None,
+        node_local_ranks: int = 1,
+    ) -> None:
         if available_bytes is None:
             if host_copies_are_redundant():
                 # Nothing to pin for: on one pool the copy duplicates
@@ -266,15 +284,53 @@ class HostPinBudget:
                 available_bytes = 0
             else:
                 available_bytes = host_memory_available_bytes()
-        self.available_bytes = available_bytes
-        self.reserve_bytes = max(
-            int(available_bytes * HOST_RESERVE_FRACTION), MIN_HOST_RESERVE_BYTES
+        # Every GPU worker process on this node constructs its own budget from
+        # the same host-wide reading, with no cross-rank coordination; without
+        # the divisor N ranks book N times the real headroom.
+        self.available_bytes = available_bytes // max(1, node_local_ranks)
+        self.reserve_bytes = (
+            host_pin_reserve_bytes(self.available_bytes)
+            if reserve_bytes is None
+            else reserve_bytes
         )
+        # This worker's non-overlapping share of the node-wide planner budget.
+        # Auto placement may later assign a different execution quota, but the
+        # next joint solve must still see the original node capacity.
+        self.planning_capacity_bytes = max(0, self.available_bytes - self.reserve_bytes)
         self.committed_bytes = 0
+
+    @classmethod
+    def for_local_worker(cls, local_worker_count: int) -> "HostPinBudget":
+        """Give one worker a non-overlapping share of the node allowance."""
+        worker_count = max(1, local_worker_count)
+        node_available = host_memory_available_bytes()
+        node_spendable = max(0, node_available - host_pin_reserve_bytes(node_available))
+        return cls(
+            available_bytes=node_spendable // worker_count,
+            reserve_bytes=0,
+        )
 
     @property
     def spendable_bytes(self) -> int:
         return max(0, self.available_bytes - self.reserve_bytes - self.committed_bytes)
+
+    def set_spendable_capacity(self, capacity_bytes: int) -> tuple[int, int]:
+        """Replace this worker's quota and return its previous budget state.
+
+        The startup default is an equal, non-overlapping node share. Once all
+        ranks have reported their real layer-store sizes, the joint placement
+        planner can safely replace that provisional share with an asymmetric
+        quota whose node-wide sum stays within the same allowance.
+        """
+        if capacity_bytes < 0:
+            raise ValueError("host pin capacity must be non-negative")
+        previous = (self.available_bytes, self.reserve_bytes)
+        self.available_bytes = capacity_bytes
+        self.reserve_bytes = 0
+        return previous
+
+    def restore_capacity(self, state: tuple[int, int]) -> None:
+        self.available_bytes, self.reserve_bytes = state
 
     def request(self, *, component_name: str, weight_bytes: int) -> bool:
         """Whether `component_name` may pin `weight_bytes`, and book it if so.
@@ -304,6 +360,12 @@ class HostPinBudget:
 
     def release(self, weight_bytes: int) -> None:
         """Return an allowance when its pinned storage is no longer owned."""
+        if weight_bytes <= 0:
+            return
+        if weight_bytes > self.committed_bytes:
+            raise ValueError(
+                "cannot release more pinned-host memory than was committed"
+            )
         self.committed_bytes -= weight_bytes
 
     def track_storage(self, storage: torch.UntypedStorage) -> None:
@@ -321,22 +383,30 @@ def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
     return max(0, weight_bytes) * max(1, uses_per_request)
 
 
-def module_weight_bytes(module) -> int:
-    """Bytes of parameters and buffers a module would hand to the host."""
-    seen: set[int] = set()
+def tensor_storage_bytes(tensors: Iterable[torch.Tensor]) -> int:
+    """Physical bytes backing tensors, deduplicated across aliases and views."""
+    seen: set[tuple[torch.device, int]] = set()
     total = 0
-    for tensor in list(module.parameters()) + list(module.buffers()):
+    for tensor in tensors:
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
         try:
             storage = tensor.untyped_storage()
             pointer = storage.data_ptr()
             storage_bytes = storage.nbytes()
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             continue
-        if pointer == 0 or pointer in seen:
+        storage_key = (tensor.device, pointer)
+        if pointer == 0 or storage_key in seen:
             continue
-        seen.add(pointer)
+        seen.add(storage_key)
         total += storage_bytes
     return total
+
+
+def module_weight_bytes(module) -> int:
+    """Physical bytes of parameters and buffers a module would hand to the host."""
+    return tensor_storage_bytes((*module.parameters(), *module.buffers()))
 
 
 def describe_host_memory() -> str:
@@ -346,7 +416,9 @@ def describe_host_memory() -> str:
     if capped is None:
         return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
+    _, unreclaimable = cgroup_memory_limit_bytes(exclude_file_cache=True)
     return (
         f"{available / GIB_BYTES:.1f} GiB available "
-        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
+        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB "
+        f"of which {(usage - unreclaimable) / GIB_BYTES:.1f} GiB reclaimable cache)"
     )

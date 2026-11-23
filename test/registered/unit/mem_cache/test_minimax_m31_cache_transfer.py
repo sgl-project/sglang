@@ -32,16 +32,18 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.base import (
-    host_memory_budget_bytes,
     host_memory_budget_scope,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
     MiniMaxM3Nvfp4IndexKPoolHost,
     MiniMaxM3Nvfp4MainKVPoolHost,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -136,6 +138,8 @@ def test_page_rows_pack_components_at_aligned_offsets():
 class CopyingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _generic_entry_pairs = MooncakeKVManager._generic_entry_pairs
+    _transfer_copies = MooncakeKVManager._transfer_copies
     is_mla_backend = False
     is_hybrid_mla_backend = False
     enable_custom_mem_pool = False
@@ -143,10 +147,26 @@ class CopyingKVManager:
     max_transfer_batch_indices = 0
     kv_args = SimpleNamespace(prefill_start_layer=0)
 
-    def _transfer_data(self, session, blocks):
+    def __init__(self, src_ptrs, dst_ptrs):
+        attach_mooncake_transport(
+            self,
+            engine_writes(self._copy),
+            kv=src_ptrs,
+            peer_kv=dst_ptrs,
+            sessions=("cpu-test",),
+        )
+
+    @staticmethod
+    def _copy(session, blocks):
         for src, dst, size in blocks:
             ctypes.memmove(dst, src, size)
         return 0
+
+
+def static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
 
 
 @pytest.mark.parametrize("length,prefix", [(257, 0), (257, 128), (256, 256)])
@@ -163,42 +183,43 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     destination_pages = minimax_index_transfer_pages(
         destination_slots, page_size=128, prefix_len=prefix
     )
+    src_storage, dst_storage = static_storage(src), static_storage(dst)
     src_args, dst_args = KVArgs(), KVArgs()
-    setup_state_kv_args(src_args, src)
-    setup_state_kv_args(dst_args, dst)
+    setup_state_kv_args(src_args, src_storage)
+    setup_state_kv_args(dst_args, dst_storage)
     assert src_args.state_types == [StateType.MINIMAX_INDEX_K]
 
     def state(args):
         return args.state_data_ptrs[0], args.state_data_lens[0], args.state_item_lens[0]
 
-    def kv_layer_ids(pool):
+    def kv_layer_ids(pool, storage):
         return build_kv_layer_ids(
             token_to_kv_pool=pool,
             draft_token_to_kv_pool=None,
             num_draft_entries=0,
             num_hidden_layers=2,
+            storage=storage,
         )
 
     # Main rows pair by layer id like production; the index state is flat.
     channels = [
         (
-            get_kv_transfer_buf_infos(src),
-            get_kv_transfer_buf_infos(dst),
+            get_kv_transfer_buf_infos(src_storage),
+            get_kv_transfer_buf_infos(dst_storage),
             False,
-            kv_layer_ids(src),
-            kv_layer_ids(dst),
+            kv_layer_ids(src, src_storage),
+            kv_layer_ids(dst, dst_storage),
         ),
         (state(src_args), state(dst_args), True, None, None),
     ]
     assert channels[0][3] == [0, 1]
     for (sp, sl, si), (dp, dl, di), flat, src_ids, dst_ids in channels:
         assert si == di and sl == dl
+        manager = CopyingKVManager(sp, dp)
         assert (
             MooncakeKVManager._send_kvcache_generic(
-                CopyingKVManager(),
+                manager,
                 mooncake_session_id="cpu-test",
-                src_data_ptrs=sp,
-                dst_data_ptrs=dp,
                 item_lens=si,
                 prefill_data_indices=source_pages,
                 dst_data_indices=destination_pages,
@@ -206,6 +227,8 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
                 force_flat=flat,
                 src_layer_ids=src_ids,
                 dst_layer_ids=dst_ids,
+                src_keys=manager._local_keys.kv,
+                dst_keys=manager._peers["cpu-test"].keys.kv,
             )
             == 0
         )
@@ -232,8 +255,9 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
     sender.should_send_kv_chunk.return_value = True
     sender.get_max_transfer_tokens.return_value = None
     scheduler = SimpleNamespace(
+        tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: True),
         token_to_kv_pool_allocator=SimpleNamespace(
-            page_size=128, translate_kv_indices_for_transfer=lambda x: x
+            page_size=128, translate_kv_indices_for_transfer=lambda x: x, storage=None
         ),
         req_to_token_pool=SimpleNamespace(
             req_to_token=token_mapping([2, 4, 1, 3], length).unsqueeze(0)
@@ -242,13 +266,15 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
         disagg_metadata_buffers=Mock(),
         disagg_prefill_bootstrap_queue=SimpleNamespace(
             kv_manager=SimpleNamespace(
-                kv_args=SimpleNamespace(state_types=[StateType.MINIMAX_INDEX_K])
+                kv_args=SimpleNamespace(
+                    state_types=[StateType.MINIMAX_INDEX_K], state_sub_pools=[None]
+                )
             )
         ),
-        disagg_prefill_pending_chunk_rids=set(),
     )
     req = SimpleNamespace(
-        kv=SimpleNamespace(req_pool_idx=0),
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=length),
+        skip_radix_cache_insert=False,
         origin_input_ids=list(range(length)),
         rid="prefix-hit",
         start_send_idx=prefix,
@@ -477,8 +503,8 @@ def test_unsupported_stack_fails_before_allocating_host_memory(case):
         patch.object(assembler, "get_memory", return_value=memory),
         patch(_MAIN_HOST) as allocate,
         patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            return_value=1 if case == "budget" else 10**9,
+            "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+            return_value=(2, 1) if case == "budget" else (0, 10**9),
         ),
     ):
         with pytest.raises((ValueError, NotImplementedError)):
@@ -489,8 +515,10 @@ def test_unsupported_stack_fails_before_allocating_host_memory(case):
 def dspark_params(target, draft):
     return CacheInitParams(
         False,
-        None,
-        SimpleNamespace(get_kvcache=lambda: target),
+        # A request table without recurrent-state slots.
+        SimpleNamespace(holds_state_slots=False),
+        # A static allocator: no unified KV storage.
+        SimpleNamespace(get_kvcache=lambda: target, storage=None),
         128,
         sidecar_draft_device_pools=(draft,),
     )
@@ -583,7 +611,7 @@ def test_dspark_hicache_shares_capacity_and_total_budget(
                 sum(entry.host_pool.kv_buffer.nbytes for entry in group.entries)
                 == budget
             )
-            assert host_memory_budget_bytes() == 0
+            assert host_memory_preflight().available_bytes == 0
             draft_entry = group.get_entry(PoolName.DRAFT)
             layers = [draft_entry.layer_mapper(i) for i in range(6)]
             assert layers == [0, 1, 2, 3, 4, None]
@@ -686,7 +714,10 @@ def test_dspark_default_hicache_auto_size_fits_all_pools(cpu_host_allocation):
             )
             assert {entry.host_pool.size for entry in group.entries} == {384}
             assert actual_bytes <= 0.8 * rank_budget
-            assert host_memory_budget_bytes() == int(0.8 * rank_budget) - actual_bytes
+            assert (
+                host_memory_preflight().available_bytes
+                == int(0.8 * rank_budget) - actual_bytes
+            )
         finally:
             for entry in group.entries:
                 entry.host_pool.destroy()

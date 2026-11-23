@@ -64,7 +64,8 @@ def _unpack(
     H: tl.constexpr,
     K: tl.constexpr,
     WIDTH: tl.constexpr,
-    SM,
+    SS0,
+    SS1,
     R: tl.constexpr,
     C: tl.constexpr,
     GS: tl.constexpr,
@@ -91,7 +92,7 @@ def _unpack(
         bits |= tl.load(P + soff + 2, smask, 0).to(tl.uint32) << 16
         bits |= tl.load(P + soff + 3, smask, 0).to(tl.uint32) << 24
         tl.store(
-            S + rows[:, None] + gs[None, :] * SM,
+            S + rows[:, None] * SS0 + gs[None, :] * SS1,
             bits.to(tl.float32, bitcast=True),
             smask,
         )
@@ -161,8 +162,12 @@ def pack_moe_fp8(q, scale, weights, ids):
     return payload
 
 
-def unpack_moe_fp8(payload, hidden, topk):
-    """Restore exact values and TMA-aligned column-major FP32 scales."""
+def unpack_moe_fp8(payload, hidden, topk, *, column_major_scales=True):
+    """Restore exact values, emitting the scale layout required by its consumer.
+
+    Column-major scales retain TMA row alignment. Compact routed DeepGEMM
+    consumes row-major scales directly, without an extra contiguous copy.
+    """
     if (
         payload.ndim != 2
         or not payload.is_cuda
@@ -177,11 +182,16 @@ def unpack_moe_fp8(payload, hidden, topk):
     if width != triton.cdiv(hidden + hidden // 128 * 4 + topk * 8, 16) * 16:
         raise ValueError("Payload width does not match hidden/topk")
     q = torch.empty((m, hidden), device=payload.device, dtype=torch.float8_e4m3fn)
-    scale = torch.empty(
-        (hidden // 128, triton.cdiv(m, 4) * 4),
-        device=payload.device,
-        dtype=torch.float32,
-    ).t()[:m]
+    if column_major_scales:
+        scale = torch.empty(
+            (hidden // 128, triton.cdiv(m, 4) * 4),
+            device=payload.device,
+            dtype=torch.float32,
+        ).t()[:m]
+    else:
+        scale = torch.empty(
+            (m, hidden // 128), device=payload.device, dtype=torch.float32
+        )
     weights = torch.empty((m, topk), device=payload.device, dtype=torch.float32)
     ids = torch.empty_like(weights, dtype=torch.int32)
     if m:
@@ -195,7 +205,7 @@ def unpack_moe_fp8(payload, hidden, topk):
             hidden,
             topk,
             width,
-            scale.stride(1),
+            *scale.stride(),
             4,
             1024,
             triton.next_power_of_2(hidden // 128),

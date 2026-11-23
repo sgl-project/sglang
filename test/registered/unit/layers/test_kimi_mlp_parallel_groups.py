@@ -54,6 +54,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
         is_megamoe=lambda: False,
         is_flashinfer_megamoe=lambda: False,
         is_deepep=lambda: ep_a2a,
+        is_ascend_ops=lambda: False,
         is_mooncake=lambda: False,
         is_ascend_fuseep=lambda: False,
         is_mori=lambda: False,
@@ -167,6 +168,11 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                     parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
+                                        "is_allocation_symmetric",
+                                        return_value=True,
+                                    ),
+                                    patch.object(
+                                        linear,
                                         "use_symmetric_memory",
                                         return_value=nullcontext(),
                                     ) as allocation,
@@ -183,6 +189,11 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                         allocation.call_args.args[0],
                                         attn if auto_attn else tp,
                                     )
+                                    if not auto_attn:
+                                        self.assertEqual(
+                                            allocation.call_args.kwargs["disabled"],
+                                            layer.tp_group is None,
+                                        )
                                 else:
                                     allocation.assert_not_called()
 

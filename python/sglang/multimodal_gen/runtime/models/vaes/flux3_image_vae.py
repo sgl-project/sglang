@@ -6,10 +6,12 @@ Ported from the BFL FLUX.3 reference (``f3.models.image_vae.autoencoder``) so
 (discovered through ``EntryClass``); ``encode`` maps ``(B,3,H,W)`` in ``[-1,1]``
 to packed latents ``(B, 4*z_channels, H/16, W/16)``, ``decode`` inverts it.
 
-Every ``GroupNorm -> swish`` chain runs SGLang's fused GroupNorm+SiLU kernel
+Every ``GroupNorm -> swish`` chain can run SGLang's fused GroupNorm+SiLU kernel
 (:func:`apply_group_norm_silu`): bit-close, not bit-exact, to the eager chain,
-since the kernel reduces in fp32. The added ``nn.SiLU`` modules carry no
-parameters, so the checkpoint still loads 1:1.
+since the kernel reduces in fp32. It therefore runs only while the VAE's
+:class:`VaeFastPathGate` is enabled, which the stage does for every quality
+tier but ``exact``. The added ``nn.SiLU`` modules carry no parameters, so the
+checkpoint still loads 1:1.
 """
 
 import math
@@ -52,6 +54,14 @@ class AutoEncoderParams:
     num_res_blocks: int = 2
     z_channels: int = 32
     strided_attention: bool = True
+
+
+def _group_norm_swish(
+    x: Tensor, norm: nn.Module, act: nn.SiLU, gate: VaeFastPathGate | None
+) -> Tensor:
+    if gate is not None and gate.enabled:
+        return apply_group_norm_silu(x, norm, act)
+    return act(norm(x))
 
 
 class AttnBlock(nn.Module):
@@ -139,9 +149,10 @@ class ResnetBlock(nn.Module):
             )
         # apply_group_norm_silu's fused path needs an nn.SiLU (== swish).
         self.act = nn.SiLU()
+        self.fast_path_gate: VaeFastPathGate | None = None
 
     def _norm_act(self, x: Tensor, norm: nn.Module) -> Tensor:
-        return apply_group_norm_silu(x, norm, self.act)
+        return _group_norm_swish(x, norm, self.act, self.fast_path_gate)
 
     def forward(self, x):
         h = x
@@ -236,9 +247,10 @@ class Encoder(nn.Module):
             block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1
         )
         self.act = nn.SiLU()
+        self.fast_path_gate: VaeFastPathGate | None = None
 
     def _norm_act(self, x: Tensor, norm: nn.Module) -> Tensor:
-        return apply_group_norm_silu(x, norm, self.act)
+        return _group_norm_swish(x, norm, self.act, self.fast_path_gate)
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.conv_in(x)
@@ -313,9 +325,10 @@ class Decoder(nn.Module):
         )
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
         self.act = nn.SiLU()
+        self.fast_path_gate: VaeFastPathGate | None = None
 
     def _norm_act(self, x: Tensor, norm: nn.Module) -> Tensor:
-        return apply_group_norm_silu(x, norm, self.act)
+        return _group_norm_swish(x, norm, self.act, self.fast_path_gate)
 
     def forward(self, z: Tensor) -> Tensor:
         z = self.post_quant_conv(z)
@@ -377,7 +390,7 @@ class AutoEncoder(nn.Module):
         )
         gate = VaeFastPathGate()
         for module in self.modules():
-            if isinstance(module, AttnBlock):
+            if isinstance(module, (AttnBlock, ResnetBlock, Encoder, Decoder)):
                 module.fast_path_gate = gate
         register_vae_fast_path_gate(self, gate)
 
@@ -428,9 +441,12 @@ class Flux3ImageVAE(AutoEncoder):
     ``AutoEncoder.__init__``, keeping the module tree (and ``state_dict`` keys)
     identical so ``ae.safetensors`` loads without renaming.
 
-    When a decode-parallel group exists (world_size > 1, e.g. ``--vae-sp N``) the
-    decoder is height-sharded (see :func:`enable_spatial_parallel_decoder`); on a
-    single GPU this is a no-op. The encoder is never sharded.
+    With ``use_parallel_decode`` (``--vae-sp true``) and a decode-parallel group
+    (world_size > 1) the decoder is height-sharded (see
+    :func:`enable_spatial_parallel_decoder`). It is off by default: every
+    GroupNorm and the mid attention gather the full height, and on two ranks the
+    sharded decode is slower than the serial one up to 2560x2560. The encoder is
+    never sharded.
     """
 
     _aliases = ["AutoEncoder", "Flux3ImageVAE"]
@@ -459,7 +475,11 @@ class Flux3ImageVAE(AutoEncoder):
         self.config = config
         self.hf_config = hf_config or {}
         # Runs before weight load; SpatialParallelConv2d keeps the param names.
-        self._spatial_parallel = has_decode_parallel_world()
+        self._spatial_parallel = (
+            config is not None
+            and config.use_parallel_decode
+            and has_decode_parallel_world()
+        )
         self._sp_upsamples = (
             enable_spatial_parallel_decoder(self.decoder)
             if self._spatial_parallel
@@ -475,7 +495,7 @@ class Flux3ImageVAE(AutoEncoder):
 # --------------------------------------------------------------------------- #
 # Spatial-parallel (height-sharded) decode.
 #
-# When a decode-parallel group exists (world_size > 1, e.g. `--vae-sp N`) the
+# With `--vae-sp true` and a decode-parallel group (world_size > 1) the
 # decoder is sharded over image height: each rank owns a height slice and its
 # convs exchange halo rows (SpatialParallelConv2d), while the two *global* spatial
 # ops -- GroupNorm (needs full-height statistics) and the mid self-attention
@@ -487,11 +507,11 @@ class Flux3ImageVAE(AutoEncoder):
 
 
 def _sp_norm_act(self, x: Tensor, norm: nn.Module) -> Tensor:
-    """Spatial-parallel ``_norm_act``: gather the full height, run the fused
+    """Spatial-parallel ``_norm_act``: gather the full height, run
     GroupNorm+SiLU on the full tensor (correct global stats), then restore the
     exact original per-rank shards."""
     x, heights = gather_variable_height(x)
-    x = apply_group_norm_silu(x.contiguous(), norm, self.act)
+    x = _group_norm_swish(x.contiguous(), norm, self.act, self.fast_path_gate)
     return chunk_height_by_sizes(x, heights)
 
 

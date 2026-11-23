@@ -36,7 +36,26 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
     Hunyuan3DShapeSaveStage,
 )
+from sglang.multimodal_gen.runtime.utils import mesh3d_utils
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_simplify
+
+
+def _reference_qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Reference for the original full 16-entry accumulation."""
+    p0 = v[f[:, 0]]
+    n = np.cross(v[f[:, 1]] - p0, v[f[:, 2]] - p0)
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
+    plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
+    face_q = (plane[:, :, None] * plane[:, None, :]).reshape(len(f), 16)
+    idx = f.T.ravel()
+    q = np.stack(
+        [
+            np.bincount(idx, weights=np.tile(face_q[:, c], 3), minlength=len(v))
+            for c in range(16)
+        ],
+        axis=1,
+    )
+    return q.reshape(-1, 4, 4)
 
 
 def _unet_config() -> dict:
@@ -276,6 +295,24 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
         self.assertLessEqual(len(mesh.faces), 2000)
         boundary = lambda m: (np.bincount(m.edges_unique_inverse) == 1).sum()
         self.assertEqual(boundary(mesh), boundary(half))
+
+    def test_vertex_quadrics_match_reference_exactly(self):
+        closed = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+        open_boundary = trimesh.Trimesh(
+            vertices=closed.vertices.copy(),
+            faces=closed.faces[closed.triangles_center[:, 2] > 0],
+            process=False,
+        )
+        for mesh_kind, mesh in (("closed", closed), ("open", open_boundary)):
+            with self.subTest(mesh=mesh_kind):
+                reference = _reference_qem_vertex_quadrics(mesh.vertices, mesh.faces)
+                actual = mesh3d_utils._qem_vertex_quadrics(mesh.vertices, mesh.faces)
+
+                self.assertEqual(actual.shape, (len(mesh.vertices), 4, 4))
+                self.assertEqual(actual.dtype, np.float64)
+                np.testing.assert_array_equal(
+                    actual.view(np.uint64), reference.view(np.uint64)
+                )
 
 
 if __name__ == "__main__":
