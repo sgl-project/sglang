@@ -18,9 +18,8 @@ U, E, K = 2.0**-24, 256, 8192
 
 def _inputs(m, e, k, integer, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    if (
-        integer
-    ):  # w = h + q * 2^-10, |h| in 1..4: hi = h, lo = q * 2^-10, all partial sums exact
+    if integer:
+        # w = h + q * 2^-10, |h| in 1..4: hi = h, lo = q * 2^-10, all partial sums exact
         x = torch.randint(-4, 5, (m, k), generator=gen, device="cuda")
         h = torch.randint(1, 5, (e, k), generator=gen, device="cuda")
         h = torch.where(torch.rand(e, k, generator=gen, device="cuda") < 0.5, -h, h)

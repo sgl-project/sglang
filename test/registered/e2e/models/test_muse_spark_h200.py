@@ -71,7 +71,7 @@ class TestMuseSparkH200(DefaultServerBase):
             "--swa-full-tokens-ratio 0.09 --disable-cuda-graph-padding --enable-prefill-delayer "
             "--prefill-delayer-queue-min-ratio 0.2 --prefill-delayer-max-delay-ms 100 "
             "--prefill-delayer-max-delay-passes 6 --prefill-max-requests 32 "
-            "--warmups concurrent_prefill --reasoning-parser muse"
+            "--reasoning-parser muse"
         ).split() + [
             "--speculative-draft-model-path",
             try_cached_muse_spark_model(DRAFT_MODEL_PATH, draft=True),
