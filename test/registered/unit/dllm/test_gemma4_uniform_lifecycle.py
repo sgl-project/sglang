@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    idle_penalty_status_pool,
+    release_only_retirer,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -40,6 +44,7 @@ class _Req(FakeReq):
             kv_committed_len=context_len + block_size,
         )
         self.finished_reason = None
+        self.ignored_stop_token_len = None
         self.finish_on_update = False
         self.retracted_stain = False
         self.sampling_params = SimpleNamespace(max_new_tokens=1024)
@@ -404,6 +409,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.beam_coordinator = Mock()
         scheduler.hisparse_coordinator = None
         scheduler.uocr_runtime = None
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,
