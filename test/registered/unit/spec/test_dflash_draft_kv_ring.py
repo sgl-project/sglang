@@ -498,7 +498,7 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 self.assertTrue(torch.equal(dst_pool[read], keys))
 
 
-class TestSpeculatorsDSparkConfig(unittest.TestCase):
+class TestSpeculatorsDSparkConfig(CustomTestCase):
     def test_speculators_dspark_config_flattens_layer_ids_and_aux_stream(self):
         from sglang.srt.configs.speculators_dspark import (
             try_load_speculators_dspark_config,
@@ -564,8 +564,15 @@ class TestSpeculatorsDSparkConfig(unittest.TestCase):
         self.assertEqual(cfg.dflash_config["target_layer_ids"], [1, 3])
 
     def test_speculators_dspark_config_without_layer_model_type_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "transformer_layer_config.model_type"):
-            self._load({"hidden_size": 64})
+        for layer_config in (
+            {"hidden_size": 64},
+            {"model_type": "", "hidden_size": 64},
+        ):
+            with self.subTest(layer_config=layer_config):
+                with self.assertRaisesRegex(
+                    ValueError, "transformer_layer_config.model_type"
+                ):
+                    self._load(layer_config)
 
     def test_unknown_aux_hidden_stream_is_rejected(self):
         from sglang.srt.speculative.dflash_utils import get_dflash_aux_hidden_stream
