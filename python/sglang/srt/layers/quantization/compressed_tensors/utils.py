@@ -38,7 +38,7 @@ def should_ignore_layer(
     proj_name = layer_name.split(".")[-1]
 
     # Some checkpoints store a real qkv_proj / gate_up_proj, so an entry that
-    # names the fused layer itself wins; a regex on it must agree with shards.
+    # names the fused layer itself wins.
     if check_equal_or_regex_match(
         layer_name=layer_name, targets=[t for t in ignore if not t.startswith("re:")]
     ):
@@ -53,12 +53,16 @@ def should_ignore_layer(
     # each shard of the fused layer has the same scheme.
     shard_proj_names = fused_mapping.get(proj_name)
     if shard_proj_names is None:
+        # The model declares no fusion, so its checkpoint may store the fused
+        # tensor (MiMoV2 Pro's qkv_proj): a regex on the fused name decides.
+        if fused_name_ignored:
+            return True
         shard_proj_names = _FALLBACK_FUSED_SHARDS.get(proj_name)
 
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
     if shard_proj_names is None:
-        return fused_name_ignored
+        return False
 
     # Convert fused_name --> [shard_names]
     shard_names = [
@@ -71,8 +75,9 @@ def should_ignore_layer(
         for shard_name in shard_names
     }
 
-    # Reject a list that covers only some shards even if an entry also matches
-    # the fused name: `re:.*v_proj$` matches qkv_proj too, but q/k may be packed.
+    # Reject a list that covers only some shards. With a declared fusion this
+    # holds even if a regex also matches the fused name: `re:.*v_proj$` matches
+    # qkv_proj too, but the checkpoint's q/k shards are packed.
     if len(shards_ignored) > 1:
         raise ValueError(
             f"Found different quantization schemes for "

@@ -472,6 +472,14 @@ class TestFusedIgnoreWithoutModelMapping(CustomTestCase):
                 fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
             )
 
+    def test_fused_regex_decides_when_the_model_declares_no_fusion(self):
+        """MiMoV2 Pro stores one fused qkv_proj, so `re:.*v_proj$` ignores it whole."""
+        self.assertTrue(
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj", ignore=["re:.*v_proj$"]
+            )
+        )
+
     def test_literal_fused_name_wins_over_a_partial_regex(self):
         """A real fused tensor named literally stays ignored even if a regex hits one shard."""
         self.assertTrue(
