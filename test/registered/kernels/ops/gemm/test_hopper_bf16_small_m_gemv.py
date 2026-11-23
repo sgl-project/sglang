@@ -1,6 +1,8 @@
 """SM90 small-M BF16 GEMV (TileLang) on every M its tables admit: fp64 reference, cuBLAS,
 rows past M, determinism and CUDA graph replay."""
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -112,3 +114,7 @@ def test_cuda_graph_replay(n, k, m, mode):
         graph.replay()
         eager = g.gemv(xs.clone(), arg, torch.empty_like(y), tab)
         assert torch.equal(_bits(y), _bits(eager))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
