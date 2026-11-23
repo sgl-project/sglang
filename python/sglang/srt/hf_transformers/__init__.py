@@ -39,6 +39,7 @@ from .common import (
     get_hf_text_config,
     get_rope_config,
     get_tokenizer_from_processor,
+    is_mrope_config,
     resolve_hf_gguf_reference,
 )
 from .config import get_config
@@ -66,5 +67,6 @@ __all__ = [
     "get_rope_config",
     "get_tokenizer",
     "get_tokenizer_from_processor",
+    "is_mrope_config",
     "normalize_rope_scaling_compat",
 ]

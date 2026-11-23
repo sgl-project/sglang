@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.hf_transformers import get_processor
+from sglang.srt.hf_transformers import get_processor, is_mrope_config
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -79,7 +79,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = is_mrope_config(self.config)
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False

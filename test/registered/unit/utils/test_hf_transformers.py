@@ -31,6 +31,7 @@ from sglang.srt.hf_transformers.common import (
     get_context_length,
     get_hf_text_config,
     get_rope_config,
+    is_mrope_config,
     resolve_hf_gguf_reference,
 )
 from sglang.srt.hf_transformers.config import (
@@ -421,6 +422,47 @@ class TestGetRopeConfig(CustomTestCase):
         theta, params = get_rope_config(cfg)
         self.assertEqual(theta, 10000.0)
         self.assertIsNone(params)
+
+    def test_empty_v5_rope_parameters_falls_back_to_v4(self):
+        cfg = SimpleNamespace(
+            rope_parameters={},
+            rope_scaling={"mrope_section": [1, 1, 1]},
+        )
+        theta, params = get_rope_config(cfg)
+        self.assertEqual(theta, 10000)
+        self.assertEqual(params, {"mrope_section": [1, 1, 1]})
+
+
+class TestIsMropeConfig(CustomTestCase):
+    def test_v4_rope_scaling(self):
+        cfg = SimpleNamespace(
+            rope_parameters=None,
+            rope_scaling={"mrope_section": [1, 1, 1]},
+        )
+        self.assertTrue(is_mrope_config(cfg))
+
+    def test_v5_rope_parameters(self):
+        cfg = PretrainedConfig()
+        cfg.rope_parameters = {"mrope_section": [1, 2, 1]}
+        self.assertTrue(is_mrope_config(cfg))
+
+    def test_v5_takes_precedence_over_v4(self):
+        cfg = SimpleNamespace(
+            rope_parameters={"rope_theta": 10000},
+            rope_scaling={"mrope_section": [1, 1, 1]},
+        )
+        self.assertFalse(is_mrope_config(cfg))
+
+    def test_empty_v5_rope_parameters_falls_back_to_v4(self):
+        cfg = SimpleNamespace(
+            rope_parameters={},
+            rope_scaling={"mrope_section": [1, 1, 1]},
+        )
+        self.assertTrue(is_mrope_config(cfg))
+
+    def test_no_rope_config(self):
+        cfg = SimpleNamespace(rope_parameters=None, rope_scaling=None)
+        self.assertFalse(is_mrope_config(cfg))
 
 
 # ---------------------------------------------------------------------------
