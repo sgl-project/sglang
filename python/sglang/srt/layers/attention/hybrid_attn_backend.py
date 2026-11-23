@@ -13,10 +13,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -62,6 +59,13 @@ class HybridAttnBackend(AttentionBackend):
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.
         return self.target_verify_backend().supports_ragged_verify_graph
+
+    @property
+    def supports_decode_cuda_graph(self) -> bool:
+        return (
+            self.decode_backend.supports_decode_cuda_graph
+            and self.target_verify_backend().supports_decode_cuda_graph
+        )
 
     def target_verify_backend(self) -> AttentionBackend:
         """The backend that runs target verify: the decode backend when

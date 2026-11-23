@@ -214,9 +214,7 @@ def _pd_prefill_skips_mamba_spec_state() -> bool:
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
-    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-        is_unified_kv_fp8,
-    )
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_fp8
 
     return is_unified_kv_fp8() and not (is_draft_worker and spec_algorithm.is_dspark())
 
@@ -288,9 +286,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
         SpecAuxHiddenStateConfig,
     )
-    from sglang.srt.model_executor.pool_configurator import (
-        MemoryPoolConfig,
-    )
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
 def runner_state(table, allocator, *, table_owns_state: bool) -> Optional[StateStorage]:
@@ -1695,9 +1691,7 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
         pre_alloc_size: int,
     ) -> ReqToTokenPool:
-        from sglang.srt.disaggregation.decode import (
-            HybridMambaDecodeReqToTokenPool,
-        )
+        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 
         req_to_token_pool = HybridMambaDecodeReqToTokenPool(
             size=max_num_reqs,
@@ -2157,9 +2151,7 @@ class KVCacheConfigurator:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
         if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import (
-                COMPRESS_RATIO_NEXTN_LAYER,
-            )
+            from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
@@ -2304,9 +2296,7 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int],
         swa_max_total_num_tokens: Optional[int],
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMHATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         kwargs = {}
         if self.is_hybrid_swa_compress:
@@ -2376,9 +2366,7 @@ class KVCacheConfigurator:
         max_running_requests: int,
         is_dsa_model: bool,
     ) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMLATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
@@ -2480,9 +2468,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-            NPUMHATokenToKVPool,
-        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         token_to_kv_pool = NPUMHATokenToKVPool(
             max_total_num_tokens,
@@ -2498,6 +2484,9 @@ class KVCacheConfigurator:
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             modelslim_cache_layout=self.modelslim_cache_layout,
+            # Encoder-decoder FIA must expose per-layer views to the compiler;
+            # indexing the all-layer cache inside capture retains the full pool.
+            use_fia=True if self.model_config.is_encoder_decoder else None,
         )
         return token_to_kv_pool
 
@@ -2738,9 +2727,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.configs.model_config import (
-            uses_minimax_m3_packed_nvfp4_kv,
-        )
+        from sglang.srt.configs.model_config import uses_minimax_m3_packed_nvfp4_kv
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         _hf_config = self.model_config.hf_config
@@ -2896,9 +2883,7 @@ class KVCacheConfigurator:
             extra_args["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
-        from sglang.srt.layers.attention.qsa.config import (
-            parse_qsa_profile,
-        )
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
             resolve_qsa_indexer_dtype,
@@ -3198,9 +3183,7 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import (
-                            parse_hisparse_config,
-                        )
+                        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                         hisparse_cfg = parse_hisparse_config()
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
@@ -3588,9 +3571,11 @@ class KVCacheConfigurator:
                 self._kv_layer_decls(),
                 page_size=self.page_size,
                 fused_draft=placement,
-                speculative_num_draft_tokens=None
-                if _pd_prefill_skips_mamba_spec_state()
-                else max_speculative_num_draft_tokens(),
+                speculative_num_draft_tokens=(
+                    None
+                    if _pd_prefill_skips_mamba_spec_state()
+                    else max_speculative_num_draft_tokens()
+                ),
             )
         from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 
@@ -3604,13 +3589,15 @@ class KVCacheConfigurator:
             context_len=self.model_config.context_len,
             extra_context_len=extra_context,
             pre_alloc_rows=pre_alloc,
-            max_running_requests=None
-            if requested is None
-            else max(1, requested // self.attn_dp_size),
+            max_running_requests=(
+                None if requested is None else max(1, requested // self.attn_dp_size)
+            ),
             max_total_tokens=schedule.max_total_tokens,
-            state_slots=None
-            if schedule.max_mamba_cache_size is None
-            else schedule.max_mamba_cache_size // self.attn_dp_size,
+            state_slots=(
+                None
+                if schedule.max_mamba_cache_size is None
+                else schedule.max_mamba_cache_size // self.attn_dp_size
+            ),
             state_share=ratio / (1 + ratio),
             state_strategy=StateSlotStrategy(
                 radix_cache=not get_memory().disable_radix_cache,

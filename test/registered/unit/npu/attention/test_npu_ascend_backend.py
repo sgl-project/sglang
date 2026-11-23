@@ -13,6 +13,7 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
@@ -702,6 +703,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.use_quant_flash_attn = False
+        backend.use_encoder_decoder_paged = False
         backend.device = torch.device("cpu")
         backend.use_mla = True
         backend.use_dsa = False
@@ -1069,6 +1071,78 @@ class TestMlaPrefixFia(unittest.TestCase):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestEncoderDecoderPagedMetadata(CustomTestCase):
+    def test_views_select_exact_slots_after_reorder_and_page_crossing(self):
+        """A page may start before text; masking must expose only text slots."""
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.page_size = 128
+        backend.max_context_len = 2048
+        backend.forward_metadata = ForwardMetadata()
+        backend.use_encoder_decoder_paged = True
+        backend.graph_metadata = {}
+        backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int64)
+        for row in range(3):
+            pages = torch.randperm(16, generator=torch.Generator().manual_seed(row))
+            backend.req_to_token[row] = (
+                (pages + row * 16 + 1)[:, None] * 128 + torch.arange(128)
+            ).flatten()
+        pointers = None
+        for step, (encoders, decoders, order) in enumerate(
+            (
+                ([1500, 129, 0], [5, 128, 0], [0, 1, 2]),
+                ([129, 1500, 0], [130, 40, 0], [1, 0, 2]),
+                ([128, 1499, 0], [128, 6, 0], [0, 1, 2]),
+            )
+        ):
+            batch = SimpleNamespace(
+                batch_size=3,
+                encoder_lens=torch.tensor(encoders[:2] + [1500]),
+                encoder_lens_cpu=encoders,
+                seq_lens=torch.tensor(decoders),
+                seq_lens_cpu=torch.tensor(decoders),
+                req_pool_indices=torch.tensor(order),
+                num_padding=1,
+            )
+            # Two variants in the same bucket must retain the first graph's
+            # tensor addresses; a replay then updates those same buffers.
+            backend.init_forward_metadata_out_graph(batch, in_capture=step < 2)
+            metadata = backend.forward_metadata.encoder_decoder
+            current = tuple(
+                t.data_ptr()
+                for t in (
+                    metadata.self_block_tables,
+                    metadata.cross_block_tables,
+                    metadata.self_mask,
+                )
+            )
+            if pointers is not None:
+                self.assertEqual(current, pointers)
+            pointers = current
+            for index, (encoder, decoder, row) in enumerate(
+                zip(encoders, decoders, order)
+            ):
+                self_slots = (
+                    metadata.self_block_tables[index, :, None] * 128 + torch.arange(128)
+                ).flatten()
+                self_slots = self_slots[: metadata.self_lengths[index]]
+                selected = self_slots[
+                    ~metadata.self_mask[index, 0, 0, : len(self_slots)]
+                ]
+                torch.testing.assert_close(
+                    selected.long(),
+                    backend.req_to_token[row, encoder : encoder + decoder],
+                )
+                cross_slots = (
+                    metadata.cross_block_tables[index, :, None] * 128
+                    + torch.arange(128)
+                ).flatten()
+                torch.testing.assert_close(
+                    cross_slots[: metadata.cross_lengths[index]].long(),
+                    backend.req_to_token[row, :encoder],
+                )
 
 
 if __name__ == "__main__":

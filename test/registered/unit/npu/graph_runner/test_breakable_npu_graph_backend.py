@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,18 +41,11 @@ def _make_runner():
     )
 
 
-def _flags(*, enable_torch_compile=False):
-    return SimpleNamespace(
-        capture=SimpleNamespace(enable_torch_compile=enable_torch_compile)
-    )
-
-
 class TestBreakableNPUGraphBackend(CustomTestCase):
     def test_construction_reuses_parent_backend(self):
         runner = _make_runner()
         with (
             get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
-            mock.patch.object(mod, "get_flags", return_value=_flags()),
         ):
             backend = mod.BreakableNPUGraphBackend(runner)
 
@@ -60,16 +53,15 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
         self.assertIsInstance(backend, BreakableCudaGraphBackend)
         self.assertIs(backend._cuda_graph_runner, runner)
 
-    def test_torch_compile_is_rejected(self):
+    def test_decode_compile_does_not_disable_breakable_prefill(self):
         runner = _make_runner()
         with (
             get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
-            mock.patch.object(
-                mod, "get_flags", return_value=_flags(enable_torch_compile=True)
-            ),
+            mock.patch.object(get_flags().capture, "enable_torch_compile", True),
         ):
-            with self.assertRaisesRegex(AssertionError, "torch.compile"):
-                mod.BreakableNPUGraphBackend(runner)
+            backend = mod.BreakableNPUGraphBackend(runner)
+            self.assertIsInstance(backend, BreakableCudaGraphBackend)
+            self.assertTrue(get_flags().capture.enable_torch_compile)
 
     # Guards the default ascend_ops config: alltoallv sizes its buffers from
     # live expert counts read on the host, which capture cannot do.  Reject it
@@ -78,7 +70,6 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
         runner = _make_runner()
         with (
             get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
-            mock.patch.object(mod, "get_flags", return_value=_flags()),
             mock.patch.object(
                 mod,
                 "get_moe_a2a_backend",
@@ -97,7 +88,6 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
         runner = _make_runner()
         with (
             get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
-            mock.patch.object(mod, "get_flags", return_value=_flags()),
             mock.patch.object(
                 mod,
                 "get_moe_a2a_backend",
@@ -125,7 +115,6 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
 
         with (
             get_parallel().override(tp_group=tp_group),
-            mock.patch.object(mod, "get_flags", return_value=_flags()),
             mock.patch.object(
                 BreakableCudaGraphBackend, "capture_one", fake_capture_one
             ),
@@ -217,9 +206,7 @@ class TestNpuSegmentCapture(CustomTestCase):
             # Replay: segment replay and eager breaks strictly alternate.
             order.clear()
             for i, seg in enumerate(made):
-                seg.replay.side_effect = (
-                    lambda i=i: order.append(f"seg{i + 1}")  # noqa: B023
-                )
+                seg.replay.side_effect = lambda i=i: order.append(f"seg{i + 1}")  # noqa: B023
             graph.replay()
             self.assertEqual(order, ["seg1", "break1", "seg2", "break2", "seg3"])
 

@@ -45,9 +45,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_tensor_graph_variants,
     megakernel_verify_variants,
 )
-from sglang.srt.layers.attention.base_attn_backend import (
-    SharedReadEnds,
-)
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     DSV41_EARLY_VERIFY_VARIANTS,
@@ -231,6 +229,11 @@ def build_replay_fb_view(
         max_seq_len_host=forward_batch.max_seq_len_host,
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
+        encoder_lens_cpu=(
+            forward_batch.encoder_lens_cpu + [0] * (bs - raw_bs)
+            if is_encoder_decoder and forward_batch.encoder_lens_cpu is not None
+            else None
+        ),
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
         iteration_ids=forward_batch.iteration_ids,
@@ -1317,9 +1320,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 phase="decode",
                 model=self.model_runner.model,
                 # Read only when active: a test may drive capture() on a stand-in.
-                kind=self._foundry_graph_kind()
-                if get_foundry_adapter().enabled
-                else None,
+                kind=(
+                    self._foundry_graph_kind()
+                    if get_foundry_adapter().enabled
+                    else None
+                ),
                 flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
                     self.model_runner
                 ),

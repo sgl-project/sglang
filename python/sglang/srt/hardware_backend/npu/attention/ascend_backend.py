@@ -54,16 +54,9 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import (
-    get_flags,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import (
-    get_bool_env_var,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -100,7 +93,17 @@ def _reshape_kv_for_fia_nz(
 
 
 @dataclass
+class EncoderDecoderMetadata:
+    self_block_tables: torch.Tensor
+    cross_block_tables: torch.Tensor
+    self_mask: torch.Tensor
+    self_lengths: List[int]
+    cross_lengths: List[int]
+
+
+@dataclass
 class ForwardMetadata:
+    encoder_decoder: Optional[EncoderDecoderMetadata] = None
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -355,6 +358,34 @@ class AscendAttnBackend(AttentionBackend):
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.use_encoder_decoder_paged = (
+            model_runner.model_config.is_encoder_decoder
+            and not self.use_mla
+            and self.model_dtype in (torch.float16, torch.bfloat16)
+            and self.kv_cache_dtype == self.model_dtype
+            and self.page_size == 128
+            and not get_parallel().dcp_enabled
+            and not model_runner.is_hybrid_swa
+            and model_runner.spec_algorithm.is_none()
+            and not getattr(model_runner.model_config, "use_alibi", False)
+        )
+        if model_runner.model_config.is_encoder_decoder:
+            from sglang.srt.layers.radix_attention import RadixAttention
+
+            attention_layers = [
+                layer
+                for layer in model_runner.model.modules()
+                if isinstance(layer, RadixAttention)
+            ]
+            self.use_encoder_decoder_paged = (
+                self.use_encoder_decoder_paged
+                and bool(attention_layers)
+                and all(
+                    self._supports_encoder_decoder_layer(layer)
+                    for layer in attention_layers
+                )
+            )
+            self.supports_decode_cuda_graph = self.use_encoder_decoder_paged
         modelslim_cache_layout = (
             model_runner.kv_cache_configurator.modelslim_cache_layout
         )
@@ -486,9 +517,7 @@ class AscendAttnBackend(AttentionBackend):
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
         if self.use_paged_mtp:
-            from sgl_kernel_npu.operators.attention import (
-                paged_mtp_attention_decode,
-            )
+            from sgl_kernel_npu.operators.attention import paged_mtp_attention_decode
 
             self.paged_mtp_attention_decode = paged_mtp_attention_decode
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -527,8 +556,14 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (
-                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            if (
+                self.use_encoder_decoder_paged
+                or self.use_fia
+                and not (
+                    self.use_quant_flash_attn
+                    or self.use_flash_mla
+                    or self.use_paged_mtp
+                )
             ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
@@ -564,6 +599,15 @@ class AscendAttnBackend(AttentionBackend):
             self.is_hybrid_swa
             and layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
+        )
+
+    @staticmethod
+    def _supports_encoder_decoder_layer(layer: RadixAttention) -> bool:
+        return (
+            layer.logit_cap == 0
+            and layer.sliding_window_size == -1
+            and layer.qk_head_dim == layer.v_head_dim
+            and layer.qk_head_dim in (64, 128)
         )
 
     @staticmethod
@@ -634,6 +678,13 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
+        if self.use_encoder_decoder_paged:
+            if in_capture and bs not in self.graph_metadata:
+                self.graph_metadata[bs] = self._create_forward_metadata()
+            self.forward_metadata = self.graph_metadata[bs]
+            self._prepare_encoder_decoder_metadata(forward_batch)
+            self.graph_mode = True
+            return
         if in_capture:
             self._init_cuda_graph_metadata(
                 bs,
@@ -664,6 +715,10 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = self._create_forward_metadata()
+        if self.use_encoder_decoder_paged and forward_batch.forward_mode.is_decode():
+            self._prepare_encoder_decoder_metadata(forward_batch)
+            self.graph_mode = False
+            return
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -981,6 +1036,72 @@ class AscendAttnBackend(AttentionBackend):
         """Create the metadata object for one forward pass."""
         return ForwardMetadata()
 
+    def _prepare_encoder_decoder_metadata(self, forward_batch: ForwardBatch):
+        batch_size = forward_batch.batch_size
+        page_count = (self.max_context_len + self.page_size - 1) // self.page_size
+        metadata = self.forward_metadata.encoder_decoder
+        if metadata is None:
+            tables = torch.zeros(
+                (batch_size, page_count), dtype=torch.int32, device=self.device
+            )
+            metadata = EncoderDecoderMetadata(
+                self_block_tables=tables,
+                cross_block_tables=torch.zeros_like(tables),
+                self_mask=torch.ones(
+                    (batch_size, 1, 1, page_count * self.page_size),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+                self_lengths=[],
+                cross_lengths=[],
+            )
+            self.forward_metadata.encoder_decoder = metadata
+        encoder_lengths = forward_batch.encoder_lens
+        num_padding = getattr(forward_batch, "num_padding", 0)
+        if num_padding:
+            # The shared encoder buffer preserves old tail rows (FILL_ONCE).
+            # Match the zero-length host padding without mutating that buffer.
+            encoder_lengths = encoder_lengths.clone()
+            encoder_lengths[-num_padding:] = 0
+        encoder_lengths_cpu = forward_batch.encoder_lens_cpu
+        if encoder_lengths_cpu is None:
+            encoder_lengths_cpu = encoder_lengths.cpu().tolist()
+        decoder_lengths_cpu = forward_batch.seq_lens_cpu
+        if decoder_lengths_cpu is None:
+            decoder_lengths_cpu = forward_batch.seq_lens.cpu()
+        metadata.cross_lengths = list(encoder_lengths_cpu)
+        metadata.self_lengths = [
+            encoder % self.page_size + decoder if decoder else 0
+            for encoder, decoder in zip(
+                encoder_lengths_cpu, decoder_lengths_cpu.tolist()
+            )
+        ]
+        page_positions = torch.arange(page_count, device=self.device) * self.page_size
+        rows = forward_batch.req_pool_indices[:, None]
+        self_positions = (
+            encoder_lengths[:, None] // self.page_size * self.page_size
+            + page_positions[None, :]
+        )
+        ends = encoder_lengths + forward_batch.seq_lens
+        self_positions = torch.where(self_positions < ends[:, None], self_positions, 0)
+        metadata.self_block_tables.copy_(
+            self.req_to_token[rows, self_positions] // self.page_size
+        )
+        cross_positions = torch.where(
+            page_positions[None, :] < encoder_lengths[:, None],
+            page_positions[None, :],
+            0,
+        )
+        metadata.cross_block_tables.copy_(
+            self.req_to_token[rows, cross_positions] // self.page_size
+        )
+        mask_positions = torch.arange(page_count * self.page_size, device=self.device)
+        offsets = encoder_lengths % self.page_size
+        metadata.self_mask[:, 0, 0, :].copy_(
+            (mask_positions[None, :] < offsets[:, None])
+            | (mask_positions[None, :] >= (offsets + forward_batch.seq_lens)[:, None])
+        )
+
     def _prepare_quant_flash_attn_metadata(
         self,
         metadata: ForwardMetadata,
@@ -1146,7 +1267,6 @@ class AscendAttnBackend(AttentionBackend):
 
         Default no-op. Overridden by DeepseekV4AscendAttnBackend.
         """
-        pass
 
     def _init_cuda_graph_metadata(
         self,
@@ -2109,7 +2229,6 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
-
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -4308,6 +4427,7 @@ class AscendAttnBackend(AttentionBackend):
             self.graph_mode
             and not self.enable_torch_compile
             and not self.dense_mla_dcp_target
+            and forward_batch.encoder_lens is None
         ):
             return self.forward_decode_graph(
                 q,
@@ -4347,6 +4467,39 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if (
+                self.forward_metadata.encoder_decoder is not None
+                and self._supports_encoder_decoder_layer(layer)
+                and not self.use_alibi
+                and sinks is None
+            ):
+                metadata = self.forward_metadata.encoder_decoder
+                cross = layer.is_cross_attention
+                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                    q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                    ),
+                    num_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="BSND",
+                    block_size=self.page_size,
+                    block_table=(
+                        metadata.cross_block_tables
+                        if cross
+                        else metadata.self_block_tables
+                    ),
+                    actual_seq_lengths_kv=(
+                        metadata.cross_lengths if cross else metadata.self_lengths
+                    ),
+                    atten_mask=None if cross else metadata.self_mask,
+                    scale=layer.scaling,
+                )
+                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if self.use_quant_flash_attn:
                 num_token_padding = q.shape[0]
@@ -4473,7 +4626,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 return attn_out
 
-            if self.use_fia:
+            if self.use_fia and forward_batch.encoder_lens is None:
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
@@ -4516,7 +4669,7 @@ class AscendAttnBackend(AttentionBackend):
                         ],
                         dim=0,
                     )
-            elif self.use_fa:
+            elif self.use_fa and forward_batch.encoder_lens is None:
                 from flash_attn_npu_v3 import flash_attn_with_kvcache
 
                 q = q.view(
