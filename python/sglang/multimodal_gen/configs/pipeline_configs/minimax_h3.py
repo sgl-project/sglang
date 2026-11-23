@@ -96,9 +96,20 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
+            # --model-variant fl2va+ref2va loads a second DiT of the same size
+            dit_weight_gb=61.73,
             auto_enable_cfg_parallel=False,
             supports_cfg_parallel=False,
         )
+
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            MINIMAX_H3_DUAL_VARIANT,
+        )
+
+        variant = str(server_args.model_variant or "").strip().lower()
+        # the Ref2VA DiT of a fl2va+ref2va server
+        return ("transformer_2",) if variant == MINIMAX_H3_DUAL_VARIANT else ()
 
     @staticmethod
     def _server_arg_value(value):
@@ -385,6 +396,10 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
             "4xH200 deployment; FastH3 has no audited high-quality deployment. "
             'Use quality="exact", or the default "lossless".'
         )
+
+    def extra_dit_components(self, server_args) -> tuple[str, ...]:
+        # one partition; validate_server_args rejects --model-variant
+        return ()
 
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
