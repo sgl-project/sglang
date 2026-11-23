@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, List
 
@@ -190,8 +191,6 @@ async def concurrent_prefill(
 ):
     """Warm up multi-sequence prefill, mixed steps and input logprobs, so their
     first JIT compiles happen before serving."""
-    import asyncio
-
     vocab = min(2**16, tokenizer_manager.model_config.vocab_size)
 
     async def one(size, **kwargs):
