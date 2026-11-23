@@ -245,6 +245,69 @@ def test_one_token_inplace_verify_matches_ring_fold(lower_bound):
         torch.testing.assert_close(state[:, track[row]], temporal[:, track[row]])
 
 
+@pytest.mark.parametrize(
+    "lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES]
+)
+def test_packed_decode_matches_inplace_single_step(lower_bound):
+    """The packed-decode kernel must match target_verify(inplace_single_step=True)."""
+    bs, HV, H, K, V = 5, 8, 4, 128, 128
+    torch.manual_seed(1)
+    slots = torch.tensor([1, 2, 3, 4, 5], device=DEV, dtype=torch.int32)
+    qsl = torch.arange(bs + 1, device=DEV, dtype=torch.int32)
+    state = torch.randn(7, HV, V, K, device=DEV)
+    q = torch.randn(1, bs, H, K, device=DEV)
+    k = torch.randn(1, bs, H, K, device=DEV)
+    v = torch.randn(1, bs, HV, V, device=DEV)
+    a = torch.randn(1, bs, HV, K, device=DEV)
+    b = torch.randn(1, bs, HV, device=DEV)
+    A_log = torch.randn(HV, device=DEV)
+    dt_bias = torch.randn(HV, K, device=DEV)
+    kernel = TritonKDAKernel()
+    if lower_bound is not None and not getattr(
+        kernel, "supports_packed_decode_safe_gate", False
+    ):
+        pytest.skip("packed decode has no safe-gate path")
+
+    ref_state = state.clone()
+    ref = kernel.target_verify(
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        ssm_states=ref_state,
+        cache_indices=slots,
+        query_start_loc=qsl,
+        intermediate_states_buffer=None,
+        intermediate_state_indices=slots,
+        cache_steps=1,
+        retrieve_parent_token=None,
+        lower_bound=lower_bound,
+        inplace_single_step=True,
+    )
+    packed_state = state.clone()
+    mixed_qkv = torch.cat(
+        [q.reshape(bs, -1), k.reshape(bs, -1), v.reshape(bs, -1)], dim=-1
+    )
+    out = kernel.packed_decode(
+        mixed_qkv,
+        a,
+        b,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=K**-0.5,
+        ssm_states=packed_state,
+        cache_indices=slots,
+        num_v_heads=HV,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+    )
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(packed_state, ref_state, rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     import sys
 

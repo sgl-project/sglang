@@ -1487,6 +1487,30 @@ class KDAAttnBackend(MambaAttnBackendBase):
             padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
             mixed_qkv = padded_flat[dense_token_indices]
 
+        # One token per request, state updated in place: the plain-decode kernel,
+        # with no ring kwargs so it skips the ring write.
+        if (
+            step0_inplace
+            and self.kernel_dispatcher.supports_packed_decode
+            and (
+                layer.lower_bound is None
+                or self.kernel_dispatcher.supports_packed_decode_safe_gate
+            )
+        ):
+            return self.kernel_dispatcher.packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                scale=layer.head_k_dim**-0.5,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices[:batch_size],
+                num_v_heads=layer.num_v_heads,
+                head_v_dim=layer.head_v_dim,
+                lower_bound=layer.lower_bound,
+            )
+
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)

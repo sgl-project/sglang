@@ -225,6 +225,35 @@ def track_mamba_states_if_needed(
     )
 
 
+def track_ssm_states_all_layers(
+    ssm_states_pool: torch.Tensor,
+    cache_indices: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_indices: torch.Tensor,
+    batch_size: int,
+    check_freed_slots: bool = False,
+):
+    """`track_mamba_states_all_layers` for the SSM pool only.
+
+    Zero conv numel per row gives the kernel no conv chunks, so only SSM work
+    items run. `ssm_states_pool` also stands in for the unused conv pointer.
+    """
+    _launch_track_mamba_states(
+        ssm_states_pool,
+        ssm_states_pool,
+        cache_indices,
+        mamba_track_mask,
+        mamba_track_indices,
+        batch_size,
+        ssm_states_pool.shape[0],
+        (0, 0),
+        (ssm_states_pool.stride(0), ssm_states_pool.stride(1)),
+        0,
+        ssm_states_pool[0, 0].numel(),
+        check_freed_slots,
+    )
+
+
 @triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
