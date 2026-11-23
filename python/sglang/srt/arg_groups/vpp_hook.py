@@ -82,10 +82,8 @@ def validate_vpp_options(server_args: Any) -> None:
             raise ValueError(
                 "VPP PD does not support KV offload or runtime role switch yet"
             )
-    if cfg.scheduler_recv_interval > 1 or cfg.num_continuous_decode_steps != 1:
-        raise ValueError(
-            "VPP requires one input poll and one decode step per iteration"
-        )
+    if cfg.scheduler_recv_interval > 1:
+        raise ValueError("VPP requires one input poll per iteration")
     if os.getenv("SGLANG_PP_LAYER_PARTITION") is not None:
         raise ValueError(
             "VPP uses --pp-vpp-layer-partition; unset SGLANG_PP_LAYER_PARTITION"
