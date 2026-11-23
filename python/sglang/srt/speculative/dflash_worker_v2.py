@@ -1430,6 +1430,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
+                on_workspace_reset=self._invalidate_aux_graphs,
             )
             if get_parallel().tp_rank == 0:
                 logger.info(
@@ -2386,6 +2387,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             "DFLASH fused prefix-direct KV append failed; falling back to the per-layer prefix-direct path: %s",
                             e,
                         )
+                        self._invalidate_aux_graphs()
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
@@ -2454,6 +2456,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
                         e,
                     )
+                    self._invalidate_aux_graphs()
                     self._use_fused_kv_materialize = False
                     self._fused_kv_helper = None
 
@@ -2554,6 +2557,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_pending:
             torch.cuda.current_stream(self.device).wait_event(self._aux_done)
             self._aux_pending = False
+
+    def _invalidate_aux_graphs(self) -> None:
+        """Drop cached aux CUDA graphs before fused KV workspaces are freed."""
+        if not self._aux_graphs:
+            return
+        self._join_aux()
+        if self._aux_stream is not None:
+            self._aux_stream.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.current_stream(self.device).synchronize()
+        self._aux_graphs.clear()
 
     def _append_target_hidden_sequential(
         self,

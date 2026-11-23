@@ -1226,7 +1226,13 @@ def build_speculative_verify_target_probs(
                     adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
-            if scaled_logits is not None and scaled_logits.dtype == topk_probs.dtype:
+            if (
+                scaled_logits is not None
+                and scaled_logits.dtype == topk_probs.dtype
+                and scaled_logits.device == topk_probs.device
+                and scaled_logits.shape == next_token_logits.shape
+                and scaled_logits.is_contiguous()
+            ):
                 target_probs = scaled_logits.zero_()
             else:
                 del scaled_logits

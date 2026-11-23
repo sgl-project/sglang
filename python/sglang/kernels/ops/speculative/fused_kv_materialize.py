@@ -262,12 +262,14 @@ class FusedKVMaterializeHelper:
         head_dim: int,
         device: torch.device,
         max_position_hint: Optional[int] = None,
+        on_workspace_reset: Optional[Callable[[], None]] = None,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.rotary_emb = rotary_emb
         self.n_layers = len(layers)
         self.device = device
+        self._on_workspace_reset = on_workspace_reset
         self.kv_size = self.num_kv_heads * self.head_dim
         self.layer_out_dim = 2 * self.kv_size
 
@@ -377,32 +379,44 @@ class FusedKVMaterializeHelper:
         ):
             return
 
-        # Release previous workspace tensors before allocating larger ones to avoid
-        # 2x transient memory spikes, and avoid doubling past the standard 8192
-        # chunked-prefill ceiling (e.g. 8015 -> 8192 doubling to 16030).
+        # Invalidate any cached CUDA graphs referencing the previous workspace
+        # buffers before freeing them, then release before allocating larger
+        # buffers to avoid 2x transient memory spikes.
+        had_workspace = (
+            self._workspace_capacity > 0
+            or self._proj_workspace is not None
+            or self._k_workspace is not None
+            or self._v_workspace is not None
+        )
+        on_workspace_reset = getattr(self, "_on_workspace_reset", None)
+        if had_workspace and on_workspace_reset is not None:
+            on_workspace_reset()
+
         self._proj_workspace = None
         self._k_workspace = None
         self._v_workspace = None
         self._workspace_capacity = 0
+        self._workspace_dtype = None
 
-        if total_ctx <= 256:
-            new_capacity = 256
-        elif total_ctx <= 8192:
-            new_capacity = 8192
-        else:
-            new_capacity = ((total_ctx + 255) // 256) * 256
+        # Round up to the next 256-row multiple instead of doubling or jumping
+        # straight to 8192 so small prefills stay lightweight while 8015 -> 8192
+        # still avoids doubling to 16030.
+        new_capacity = ((max(1, total_ctx) + 255) // 256) * 256
 
-        self._proj_workspace = torch.empty(
+        proj_workspace = torch.empty(
             (new_capacity, self.n_layers * self.layer_out_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._k_workspace = torch.empty(
+        k_workspace = torch.empty(
             (self.n_layers, new_capacity, self.num_kv_heads, self.head_dim),
             dtype=dtype,
             device=self.device,
         )
-        self._v_workspace = torch.empty_like(self._k_workspace)
+        v_workspace = torch.empty_like(k_workspace)
+        self._proj_workspace = proj_workspace
+        self._k_workspace = k_workspace
+        self._v_workspace = v_workspace
         self._workspace_capacity = new_capacity
         self._workspace_dtype = dtype
 

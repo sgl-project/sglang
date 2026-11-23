@@ -2,21 +2,26 @@
 1. FlashInferAttnBackend sizes ``cuda_graph_kv_indices`` per request (not per
    draft token) for linear DFlash verification and lazily allocates
    ``cuda_graph_custom_mask`` only when a wrapper enables ``use_custom_mask``.
-2. FusedKVMaterializeHelper releases previous workspace tensors before growing
-   and avoids doubling past the 8192 chunked-prefill ceiling.
+2. FusedKVMaterializeHelper invalidates cached aux CUDA graphs before releasing
+   previous workspace tensors, rounds capacity up to 256-row multiples instead
+   of doubling or jumping straight to 8192, and leaves no partial state on OOM.
 3. build_speculative_verify_target_probs reuses ``scaled_logits`` storage in
-   the sparse top-k + top-p branch without mutating ``next_token_logits``.
+   the sparse top-k + top-p branch without mutating ``next_token_logits`` and
+   handles non-contiguous inputs safely.
 """
 
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from sglang.kernels.ops.speculative.fused_kv_materialize import FusedKVMaterializeHelper
 from sglang.srt.layers.attention import flashinfer_backend as fi_mod
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,6 +43,22 @@ def _make_minimal_flashinfer_backend(spec_algorithm, *, max_context_len=262144):
     backend.kv_indptr = [torch.zeros(16, dtype=torch.int32)]
     backend.kv_last_page_len = torch.zeros(16, dtype=torch.int32)
     return backend
+
+
+def _make_minimal_fused_kv_helper(on_workspace_reset=None):
+    helper = FusedKVMaterializeHelper.__new__(FusedKVMaterializeHelper)
+    helper.n_layers = 2
+    helper.layer_out_dim = 16
+    helper.num_kv_heads = 2
+    helper.head_dim = 4
+    helper.device = torch.device("cpu")
+    helper._on_workspace_reset = on_workspace_reset
+    helper._workspace_capacity = 0
+    helper._workspace_dtype = None
+    helper._proj_workspace = None
+    helper._k_workspace = None
+    helper._v_workspace = None
+    return helper
 
 
 def test_flashinfer_cuda_graph_kv_indices_and_lazy_custom_mask():
@@ -91,29 +112,36 @@ def test_flashinfer_cuda_graph_kv_indices_and_lazy_custom_mask():
         )
 
 
-def test_fused_kv_materialize_workspace_releases_before_grow_and_avoids_doubling():
-    helper = FusedKVMaterializeHelper.__new__(FusedKVMaterializeHelper)
-    helper.n_layers = 2
-    helper.layer_out_dim = 16
-    helper.num_kv_heads = 2
-    helper.head_dim = 4
-    helper.device = torch.device("cpu")
-    helper._workspace_capacity = 0
-    helper._workspace_dtype = None
-    helper._proj_workspace = None
-    helper._k_workspace = None
-    helper._v_workspace = None
+def test_fused_kv_materialize_workspace_rounds_256_invalidates_before_release_and_avoids_doubling():
+    events = []
 
+    def _on_reset():
+        events.append(
+            (
+                "reset",
+                helper._workspace_capacity,
+                helper._proj_workspace is not None,
+                helper._k_workspace is not None,
+                helper._v_workspace is not None,
+            )
+        )
+
+    helper = _make_minimal_fused_kv_helper(on_workspace_reset=_on_reset)
+
+    # First allocation does not invoke on_workspace_reset.
     helper._ensure_workspace(64, torch.float16)
     assert helper._workspace_capacity == 256
+    assert events == []
 
+    # Growing to 512 rounds to 512 (not 8192) and invalidates before freeing.
     orig_empty = torch.empty
-    seen_released = []
 
     def _spy_empty(*args, **kwargs):
-        if len(seen_released) == 0:
-            seen_released.append(
+        if len(events) == 1:
+            events.append(
                 (
+                    "alloc",
+                    helper._workspace_capacity,
                     helper._proj_workspace is None,
                     helper._k_workspace is None,
                     helper._v_workspace is None,
@@ -125,20 +153,93 @@ def test_fused_kv_materialize_workspace_releases_before_grow_and_avoids_doubling
         "sglang.kernels.ops.speculative.fused_kv_materialize.torch.empty",
         side_effect=_spy_empty,
     ):
-        helper._ensure_workspace(8015, torch.float16)
+        helper._ensure_workspace(512, torch.float16)
 
-    assert seen_released == [(True, True, True)]
+    assert events == [
+        ("reset", 256, True, True, True),
+        ("alloc", 0, True, True, True),
+    ]
+    assert helper._workspace_capacity == 512
+
+    # Growing to 8015 rounds to 8192; subsequent 8192 reuses without doubling to 16030.
+    helper._ensure_workspace(8015, torch.float16)
     assert helper._workspace_capacity == 8192
+    assert len(events) == 3
 
-    # Growing from 8015 to 8192 stays at 8192 instead of doubling to 16030.
     old_proj = helper._proj_workspace
     helper._ensure_workspace(8192, torch.float16)
     assert helper._workspace_capacity == 8192
     assert helper._proj_workspace is old_proj
+    assert len(events) == 3
 
     # Above 8192 rounds up to the next 256-token multiple rather than doubling.
     helper._ensure_workspace(8193, torch.float16)
     assert helper._workspace_capacity == 8448
+    assert len(events) == 4
+
+
+def test_fused_kv_materialize_workspace_oom_leaves_clean_state():
+    resets = []
+    helper = _make_minimal_fused_kv_helper(on_workspace_reset=lambda: resets.append(1))
+    helper._ensure_workspace(64, torch.float16)
+    assert helper._workspace_capacity == 256
+
+    orig_empty = torch.empty
+    call_count = 0
+
+    def _oom_on_second_empty(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("simulated OOM")
+        return orig_empty(*args, **kwargs)
+
+    with (
+        mock.patch(
+            "sglang.kernels.ops.speculative.fused_kv_materialize.torch.empty",
+            side_effect=_oom_on_second_empty,
+        ),
+        pytest.raises(RuntimeError, match="simulated OOM"),
+    ):
+        helper._ensure_workspace(512, torch.float16)
+
+    assert resets == [1]
+    assert helper._workspace_capacity == 0
+    assert helper._workspace_dtype is None
+    assert helper._proj_workspace is None
+    assert helper._k_workspace is None
+    assert helper._v_workspace is None
+
+
+def test_dflash_worker_invalidate_aux_graphs_syncs_and_clears():
+    worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
+    worker.device = torch.device("cpu")
+    worker._aux_graphs = {((16, 64), (1, 16)): ("static", "graph")}
+    worker._aux_pending = True
+    worker._aux_done = object()
+
+    order = []
+
+    class _FakeStream:
+        def synchronize(self):
+            order.append("aux_sync")
+
+    worker._aux_stream = _FakeStream()
+
+    def _fake_join():
+        order.append("join")
+        worker._aux_pending = False
+
+    worker._join_aux = _fake_join
+
+    with mock.patch("torch.cuda.is_available", return_value=False):
+        worker._invalidate_aux_graphs()
+        assert order == ["join", "aux_sync"]
+        assert worker._aux_graphs == {}
+
+        # No-op once already empty.
+        worker._invalidate_aux_graphs()
+        assert order == ["join", "aux_sync"]
 
 
 def test_build_speculative_verify_target_probs_reuses_scaled_logits_without_mutating_input():
@@ -172,8 +273,26 @@ def test_build_speculative_verify_target_probs_reuses_scaled_logits_without_muta
             use_sparse_topk=True,
         )
 
+        # Non-contiguous logits must not fail on `.view(...)` when falling back.
+        noncontig_logits = logits.t().contiguous().t()
+        assert not noncontig_logits.is_contiguous()
+        probs_noncontig = build_speculative_verify_target_probs(
+            next_token_logits=noncontig_logits,
+            sampling_info=sampling_info,
+            bs=bs,
+            draft_token_num=draft_token_num,
+            max_top_k=8,
+            uniform_top_k_value=8,
+            use_sparse_topk=True,
+        )
+
     assert probs.shape == (bs, draft_token_num, vocab_size)
     torch.testing.assert_close(logits, logits_ref)
     torch.testing.assert_close(
         probs.sum(dim=-1), torch.ones((bs, draft_token_num), dtype=torch.float32)
     )
+    torch.testing.assert_close(probs_noncontig, probs)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
