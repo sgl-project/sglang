@@ -2408,8 +2408,6 @@ class Envs:
 
     # Chunk cap for requests returning input logprobs (0: none).
     SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS = EnvInt(0)
-    # Opt-in: finer prefill CUDA-graph buckets below 2048 tokens.
-    SGLANG_ENABLE_FINE_PREFILL_GRAPH_BUCKETS = EnvBool(False)
 
     # ===================================================================
     # Muse Spark

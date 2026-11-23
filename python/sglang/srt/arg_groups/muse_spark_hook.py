@@ -30,7 +30,6 @@ MUSE_SPARK_ENV_DEFAULTS = (
 # Hopper (SM90) serving path, applied with SGLANG_MUSE_SPARK_HOPPER_KERNELS on;
 # see docs/docs/advanced_features/muse_spark_hopper.mdx.
 MUSE_SPARK_SM90_ENV_DEFAULTS = (
-    (envs.SGLANG_ENABLE_FINE_PREFILL_GRAPH_BUCKETS, True),
     (envs.SGLANG_HOPPER_SMALL_M_GEMV, True),
     (envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY, True),
     (envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH, True),
