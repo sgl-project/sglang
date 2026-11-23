@@ -291,23 +291,20 @@ class TestGatherFallback(CustomTestCase):
         parts = _split(full)
         parallel = SimpleNamespace(tp_group=_FakeGroup(parts))
 
-        def call(out, logits, keep):
+        def call(shard, logits, keep):
             return full_logits_unless_kept(
-                logits_output=out, logits=logits, keep_target_shards=keep
+                logits=logits, shard=shard, keep_target_shards=keep
             )
 
         with patch.object(dspark_verify, "get_parallel", return_value=parallel):
-            kept = SimpleNamespace(next_token_logits_vocab_shard=_target_shard(0))
-            self.assertIs(call(kept, parts[0], True), parts[0])
-            self.assertIsNotNone(kept.next_token_logits_vocab_shard)
-            gathered = SimpleNamespace(next_token_logits_vocab_shard=_target_shard(0))
-            got = call(gathered, parts[0], False)
+            shard = _target_shard(0)
+            self.assertEqual(call(shard, parts[0], True), (parts[0], shard))
+            got, got_shard = call(shard, parts[0], False)
             self.assertTrue(torch.equal(got, full.float()))
-            self.assertIsNone(gathered.next_token_logits_vocab_shard)
-            stock = SimpleNamespace(next_token_logits_vocab_shard=None)
+            self.assertIsNone(got_shard)
             logits = full.float()
             for keep in (False, True):
-                self.assertIs(call(stock, logits, keep), logits)
+                self.assertEqual(call(None, logits, keep), (logits, None))
         self.assertEqual(parallel.tp_group.gathers, 1)
 
     def test_run_non_compact_gathers_before_the_adjustments(self):
