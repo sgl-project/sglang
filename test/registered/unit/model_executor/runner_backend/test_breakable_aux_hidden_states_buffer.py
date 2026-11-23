@@ -40,6 +40,7 @@ def _make_backend(runner):
     backend._capture_stream = None
     backend._debug_eager = False
     backend._hicache_graph_events = None
+    backend._segment_capture = None
     backend._shared_output_buffer = None
     backend._precarve = SimpleNamespace(
         measure=contextlib.nullcontext, mint=mock.Mock()
@@ -65,6 +66,7 @@ def _make_runner(*, width=NUM_CAPTURES * HIDDEN, dflash=True):
     runner.pp_size = 1
     runner.enable_cp_bcg_capture = False
     runner.aux_hidden_states_buffer = None
+    runner._is_breakable_backend = True
     runner.backend = _make_backend(runner)
     return runner
 

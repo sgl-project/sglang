@@ -19,10 +19,12 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -51,7 +53,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_replay_scope,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -99,15 +101,24 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
+        self._segment_capture: Optional[Callable[..., Any]] = None
         if (
             self._memory_saver_adapter is not None
             and self._memory_saver_adapter.enabled
         ):
-            raise NotImplementedError(
-                "Breakable CUDA graph is not compatible with memory saver mode"
+            if is_xpu() or is_npu():
+                # The memory saver's pauseable capture wraps torch.cuda.graph only.
+                raise NotImplementedError(
+                    "Breakable CUDA graph is not compatible with memory saver "
+                    "mode on XPU or NPU"
+                )
+            self._segment_capture = partial(
+                self._memory_saver_adapter.cuda_graph,
+                tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
+                # replays read capture-time state from the pool, so a pause must back it up
+                enable_cpu_backup=True,
             )
 
     @contextmanager
@@ -166,6 +177,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
+                segment_capture=self._segment_capture,
             ),
         ):
             self._precarve.mint()
