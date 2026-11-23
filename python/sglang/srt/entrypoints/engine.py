@@ -166,6 +166,10 @@ from sglang.srt.utils.network import (
     get_free_port,
     is_port_available,
 )
+from sglang.srt.utils.process import (
+    gpu_proc_affinity_env,
+    plan_gpu_proc_affinity,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
@@ -938,17 +942,24 @@ class Engine(EngineScoreMixin, EngineBase):
                 _calculate_rank_ranges(get_parallel().node_rank)
             )
 
+            gpu_ids = {
+                (pp_rank, tp_rank): compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=get_device().base_gpu_id,
+                    gpu_id_step=get_device().gpu_id_step,
+                )
+                for pp_rank in pp_rank_range
+                for tp_rank in tp_rank_range
+            }
+            cpu_plan = plan_gpu_proc_affinity(server_args, gpu_ids.values())
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
-                    gpu_id = compute_local_gpu_id(
-                        pp_rank,
-                        tp_rank,
-                        pp_size_per_node,
-                        tp_size_per_node,
-                        base_gpu_id=get_device().base_gpu_id,
-                        gpu_id_step=get_device().gpu_id_step,
-                    )
+                    gpu_id = gpu_ids[pp_rank, tp_rank]
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
                         if prelaunch_dp_schedulers:
@@ -970,6 +981,7 @@ class Engine(EngineScoreMixin, EngineBase):
                             memory_saver_adapter.configure_subprocess(),
                             foundry_adapter.configure_subprocess(server_args),
                             numa_utils.configure_subprocess(server_args, gpu_id),
+                            gpu_proc_affinity_env(cpu_plan, gpu_ids[pp_rank, tp_rank]),
                         ):
                             proc.start()
 

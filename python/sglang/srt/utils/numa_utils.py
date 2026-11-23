@@ -84,6 +84,16 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     yield
 
 
+def numa_bound_cpus(server_args: ServerArgs, gpu_id: int, cpus: set) -> set:
+    """The CPUs a scheduler started from ``cpus`` keeps once NUMA binding places it for
+    ``gpu_id``: its node's share of them, or all of them when the node holds none
+    (``_numactl_cpu_mem_args`` then skips the bind)."""
+    numa_node = get_numa_node_if_available(server_args, gpu_id)
+    if numa_node is None:
+        return cpus
+    return (_node_cpus(numa_node) & cpus) or cpus
+
+
 def _create_numactl_executable(numactl_args: str):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     script = f'''#!/bin/sh

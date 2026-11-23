@@ -23,6 +23,7 @@ import shutil
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 import psutil
@@ -201,41 +202,82 @@ def _thread_siblings(cpu: int) -> str:
         return str(cpu)
 
 
-def set_gpu_proc_affinity(gpu_id: int, server_args=None):
+def _cores(cpus) -> list[list[int]]:
+    """``cpus`` grouped by physical core, a core's threads in one list."""
+    cores = {}
+    for cpu in sorted(cpus):
+        cores.setdefault(_thread_siblings(cpu), []).append(cpu)
+    return sorted(cores.values())
+
+
+def _share(cores: list[list[int]], rank: int, num_ranks: int) -> list[int]:
+    """Rank ``rank``'s slice of ``cores`` split ``num_ranks`` ways, every thread of its cores."""
+    # physical cores per TP (N.B. more Cores than GPUs on node)
+    num_cores_bind = max(len(cores) // num_ranks, 1)
+    # able to handle multiple DP per node
+    start = (rank * num_cores_bind) % len(cores)
+    return sorted(c for core in cores[start : start + num_cores_bind] for c in core)
+
+
+def plan_gpu_proc_affinity(server_args, gpu_ids) -> dict[int, list[int]]:
+    """The CPUs each local scheduler binds to under ``SGLANG_SET_CPU_AFFINITY``, by GPU.
+
+    A scheduler starts from the launcher's CPUs, narrowed to its GPU's NUMA node when
+    NUMA binding places it there. The schedulers that start from the same CPUs split
+    them by physical core. Run in the launcher, before any scheduler narrows the
+    visible devices."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_SET_CPU_AFFINITY.get():
+        return {}
+    from sglang.srt.utils import numa_utils
+    from sglang.srt.utils.device import maybe_reindex_device_id
+
+    launcher_cpus = set(os.sched_getaffinity(0))
+    groups = {}
+    for gpu_id in gpu_ids:
+        # the device id configure_subprocess looks the NUMA node up with
+        with maybe_reindex_device_id(gpu_id) as device_id:
+            cpus = numa_utils.numa_bound_cpus(server_args, device_id, launcher_cpus)
+        groups.setdefault(frozenset(cpus), []).append(gpu_id)
+    plan = {}
+    for cpus, members in groups.items():
+        cores = _cores(cpus)
+        for rank, gpu_id in enumerate(members):
+            plan[gpu_id] = _share(cores, rank, len(members))
+    return plan
+
+
+@contextmanager
+def gpu_proc_affinity_env(plan: dict[int, list[int]], gpu_id: int):
+    """Hand a scheduler spawned inside this block the CPUs ``plan`` gives ``gpu_id``."""
+    from sglang.srt.environ import envs
+
+    cpus = plan.get(gpu_id)
+    if cpus is None:
+        yield
+        return
+    with envs.SGLANG_GPU_PROC_CPUS.override(",".join(map(str, cpus))):
+        yield
+
+
+def set_gpu_proc_affinity(gpu_id: int):
+    from sglang.srt.environ import envs
+
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    allowed = sorted(p.cpu_affinity())
-    if server_args is not None:
-        from sglang.srt.utils import numa_utils
-
-        # NUMA binding places each rank on its GPU's node; ranks on different nodes then
-        # start from different CPUs, so that mask is already the rank's share.
-        if numa_utils.get_numa_node_if_available(server_args, gpu_id) is not None:
-            logger.info(
-                f"Process {pid} gpu_id {gpu_id} keeps its NUMA node CPUs: {allowed}"
-            )
-            return
-
-    parallel = get_parallel()
-    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
-    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
-
-    # Split the physical cores this process may use (a container's CPU slice may hold
-    # only part of the host), each with all of its allowed threads.
-    cores = {}
-    for cpu in allowed:
-        cores.setdefault(_thread_siblings(cpu), []).append(cpu)
-    cores = sorted(cores.values())
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = max(len(cores) // tp_size_per_node, 1)
-
-    # able to handle multiple DP per node
-    start = (gpu_id * num_cores_bind) % len(cores)
-    bind_cpu_ids = sorted(
-        c for core in cores[start : start + num_cores_bind] for c in core
-    )
+    planned = envs.SGLANG_GPU_PROC_CPUS.get()
+    if planned:
+        bind_cpu_ids = [int(c) for c in planned.split(",")]
+    else:
+        # A launcher without a plan (e.g. Ray): split the CPUs this process may use (a
+        # container's CPU slice may hold only part of the host) among the node's ranks.
+        parallel = get_parallel()
+        nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+        tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+        bind_cpu_ids = _share(_cores(p.cpu_affinity()), gpu_id, tp_size_per_node)
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
