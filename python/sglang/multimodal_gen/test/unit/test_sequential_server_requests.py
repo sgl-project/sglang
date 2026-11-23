@@ -143,7 +143,6 @@ def harness(monkeypatch):
             scenarios={"first": scenario},
             step_fractions=[0, 1],
             tolerances=ToleranceConfig(0, 0, 0, 0, 0),
-            improvement_threshold=0,
         ),
     )
     runner = test_server_common.DiffusionServerBase()

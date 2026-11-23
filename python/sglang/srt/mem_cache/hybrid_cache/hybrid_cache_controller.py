@@ -135,6 +135,7 @@ class PPPrefetchTicket:
     prefix_keys: Optional[List[str]]
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
+    storage_read_metadata: Optional[dict[str, Any]] = None
 
 
 class PPPrefetchDecision(Enum):
@@ -206,7 +207,10 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ):
+        self.storage_read_metadata = storage_read_metadata
         self.handle = handle
         self.request_id = handle.rid
         self._lock = threading.Lock()
@@ -308,6 +312,14 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
     if span_id:
         extra_info["span_id"] = span_id
     return extra_info
+
+
+def _storage_read_extra(operation: PrefetchOperation) -> Optional[dict]:
+    fields = _storage_trace_extra(operation)
+    metadata = getattr(operation, "storage_read_metadata", None)
+    if metadata is not None:
+        fields.update(metadata)
+    return fields or None
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -514,6 +526,17 @@ class HybridCacheController(BaseHiCacheController):
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
                 self.pp_prefetch_command_group = None
             raise
+
+        if (
+            self.storage_backend.consumes_kv_hints()
+            and self.page_get_func == self._generic_page_get
+        ):
+            logger.warning(
+                "Storage backend %r consumes kv_hints, but its KV reads use the "
+                "legacy batch_get(), which receives no extra_info. Lookups still "
+                "carry hints; set extra_config interface_v1=1 so reads do too.",
+                storage_backend,
+            )
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
@@ -918,6 +941,10 @@ class HybridCacheController(BaseHiCacheController):
             num_pages = len(transfer.keys or [])
             if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 num_pages = min(num_pages or 1, sidecar_hit_pages)
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # One buffer page per complete block of the hit.
+                block = max(1, int(transfer.block_pages))
+                num_pages = min(num_pages, sidecar_hit_pages // block)
             requests.append((transfer.name, num_pages * entry.host_pool.page_size))
             independent_transfers.append(transfer)
         return requests, independent_transfers
@@ -945,12 +972,21 @@ class HybridCacheController(BaseHiCacheController):
         return super().prefetch_rate_limited()
 
     def alloc_prefetch_host_buffers(
-        self, operation: StorageOperation, need_size: int
+        self,
+        operation: StorageOperation,
+        need_size: int,
+        *,
+        start_owner: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
-            return super().alloc_prefetch_host_buffers(operation, need_size)
+            host_indices = super().alloc_prefetch_host_buffers(
+                operation, need_size, start_owner=start_owner
+            )
+            if host_indices is not None:
+                self._sync_prefetch_trailing_keys(operation, need_size)
+            return host_indices
 
         requests, independent_transfers = self._shared_prefetch_requests(
             operation, need_size
@@ -959,6 +995,16 @@ class HybridCacheController(BaseHiCacheController):
         allocated = self._alloc_shared_host_requests_with_reclaim(requests)
         if allocated is None:
             return None
+        self._sync_prefetch_trailing_keys(operation, need_size)
+        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
+            transfer.host_indices = indices
+        return allocated[0]
+
+    def _sync_prefetch_trailing_keys(
+        self, operation: StorageOperation, need_size: int
+    ) -> None:
+        # Scheduler thread, rank-agreed hit: a rank whose KV read falls short
+        # skips the sidecar read, yet its discard must heal the same keys.
         self._sync_trailing_keys(
             operation.pool_transfers or [],
             operation.sidecar_hash_values or operation.hash_value,
@@ -968,9 +1014,6 @@ class HybridCacheController(BaseHiCacheController):
                 else need_size // self.page_size
             ),
         )
-        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
-            transfer.host_indices = indices
-        return allocated[0]
 
     def allocate_storage_hit(
         self,
@@ -980,12 +1023,19 @@ class HybridCacheController(BaseHiCacheController):
         allow_partial: bool,
         min_tokens: int,
         evict_host: Callable[[int], int],
+        start_owner: Optional[int] = None,
     ) -> tuple[Optional[torch.Tensor], int]:
-        host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+        # Logical-page KV sharding: the owner class of the first page's slot.
+        shard_kwargs = {} if start_owner is None else {"start_owner": start_owner}
+        host_indices = self.alloc_prefetch_host_buffers(
+            operation, hit_tokens, **shard_kwargs
+        )
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
             evict_host(hit_tokens)
-            host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
+            host_indices = self.alloc_prefetch_host_buffers(
+                operation, hit_tokens, **shard_kwargs
+            )
         if host_indices is not None or not allow_partial:
             return host_indices, hit_tokens
 
@@ -1004,7 +1054,9 @@ class HybridCacheController(BaseHiCacheController):
             available = self.mem_pool_host.available_size()
             alloc_len = min(hit_tokens, available - available % self.page_size)
         if alloc_len >= min_tokens:
-            host_indices = self.alloc_prefetch_host_buffers(operation, alloc_len)
+            host_indices = self.alloc_prefetch_host_buffers(
+                operation, alloc_len, **shard_kwargs
+            )
         return host_indices, alloc_len
 
     def free_prefetch_host_buffers(
@@ -1270,6 +1322,8 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1278,6 +1332,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            storage_read_metadata=storage_read_metadata,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1305,6 +1360,8 @@ class HybridCacheController(BaseHiCacheController):
         matched_prefix_tokens: Optional[List[int]],
         pool_transfers: Optional[list[PoolTransfer]],
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ) -> PrefetchSubmission:
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
@@ -1315,6 +1372,7 @@ class HybridCacheController(BaseHiCacheController):
                     prefix_keys,
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
+                    storage_read_metadata=storage_read_metadata,
                 )
             )
 
@@ -1337,6 +1395,7 @@ class HybridCacheController(BaseHiCacheController):
                 PPPrefetchPoolSpec.from_transfer(transfer)
                 for transfer in pool_transfers or []
             ),
+            storage_read_metadata=storage_read_metadata,
         )
         operation = PrefetchOperation(
             handle,
@@ -1344,6 +1403,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
+            storage_read_metadata=ticket.storage_read_metadata,
         )
 
         # Every rank queries and allocates in ticket order on the worker.
@@ -1519,6 +1579,12 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             prefix_keys=ticket.prefix_keys,
+                            # PP0 decided from its own backend; honor ours too.
+                            storage_read_metadata=(
+                                ticket.storage_read_metadata
+                                if self.storage_backend.consumes_kv_hints()
+                                else None
+                            ),
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
                                 PoolTransfer(
@@ -1638,7 +1704,7 @@ class HybridCacheController(BaseHiCacheController):
         # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info=_storage_trace_extra(operation, include_request_id=True) or None,
+            extra_info=_storage_read_extra(operation),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1831,10 +1897,9 @@ class HybridCacheController(BaseHiCacheController):
         kv_derived_transfers: List[PoolTransfer],
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
-        trace_extra = _storage_trace_extra(operation, include_request_id=True)
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=extra_info.prefix_keys,
-            extra_info=trace_extra or None,
+            extra_info=_storage_read_extra(operation),
         )
         return super()._page_transfer_kv_batch(
             operation,
@@ -1888,8 +1953,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation.prefix_keys,
                     sidecar_hashes,
                     transfers_nonkv,
-                    extra_info=_storage_trace_extra(operation, include_request_id=True)
-                    or None,
+                    extra_info=_storage_read_extra(operation),
                 ):
                     results.update(
                         self.storage_backend.batch_get_v2(
@@ -2120,10 +2184,18 @@ class HybridCacheController(BaseHiCacheController):
         is a sliding window of the last N hit pages.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing_n = len(transfer.keys) if transfer.keys else 1
+                transfer.keys = all_hashes[
+                    max(0, kv_hit_pages - trailing_n) : kv_hit_pages
+                ]
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # One key per complete block: the page that ends each block.
+                block = max(1, int(transfer.block_pages))
+                blocks = min(len(transfer.keys or ()), kv_hit_pages // block)
+                transfer.keys = [all_hashes[(i + 1) * block - 1] for i in range(blocks)]
+            else:
                 continue
-            trailing_n = len(transfer.keys) if transfer.keys else 1
-            transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
             if transfer.host_indices is None or transfer.indices_from_pool is not None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)

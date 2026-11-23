@@ -215,12 +215,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         repeats, remainder = divmod(length, len(values))
         return list(values) * repeats + list(values[:remainder])
 
-    @staticmethod
-    def is_empty_list(l):
-        if l is None:
-            return True
-        return len([item for item in flatten_nested_list(l) if item is not None]) == 0
-
     def set_pad_value(self):
         if self.identity is not None:
             if self.pad_value is None:
@@ -265,9 +259,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def validate(self):
         ...
         # TODO
-
-    def is_precomputed_embedding(self):
-        return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
     @staticmethod
     def from_dict(obj: dict):
@@ -336,14 +327,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 for value in self.model_specific_data.values()
             )
         )
-
-    def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
-        """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
-        if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            consumer_count = self._resolve_transport_consumer_count(
-                self.feature, consumer_count
-            )
-            self.feature.acknowledge_consumption(consumer_count)
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
@@ -572,14 +555,17 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
 
 
 class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
+    def __init__(self, length: int, ignored_stop_position: Optional[int] = None):
         super().__init__()
         self.length = length
+        self.ignored_stop_position = ignored_stop_position
 
     def to_json(self):
+        position = self.ignored_stop_position
         return {
             "type": "length",  # to match OpenAI API's return value
             "length": self.length,
+            "ignored_stop": None if position is None else {"position": position},
         }
 
 
@@ -597,6 +583,13 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TokenIdRows:
+    """A batch ``token_ids_logprobs`` entry with its own ids for each scored row."""
+
+    rows: List[List[int]]
 
 
 @dataclasses.dataclass

@@ -35,11 +35,11 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=60, suite="extra-test-1-gpu-xpu")
 
 DEVICE = get_device()
 
@@ -198,7 +198,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue._drop_all()
+        # A failed test may leave requests staged; retire them.
+        for req in list(self.coordinator.ack_staging_queue):
+            leaving_retirer().release(req, checkpoint=False)
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False

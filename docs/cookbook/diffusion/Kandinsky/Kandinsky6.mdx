@@ -157,8 +157,8 @@ blocks. They are alternatives to FSDP in this picker, not additive presets.
 ### Deployment limits
 
 Use monolithic serving. Encoder/denoiser/decoder disaggregation is not supported.
-Breakable CUDA graphs are also not enabled for Kandinsky6: the server disables
-`--enable-breakable-cuda-graph`. Its variable-length text path needs additional
+Breakable CUDA graphs are not validated for Kandinsky6 and stay off by default;
+passing `--enable-breakable-cuda-graph` keeps them on with a warning. Its variable-length text path needs additional
 handling to preserve the unpadded computation; same-shape graph experiments do
 not establish support for arbitrary requests. Keep eager execution for the
 recipes on this page.

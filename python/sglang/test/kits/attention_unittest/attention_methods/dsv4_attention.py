@@ -282,6 +282,7 @@ class TinyDSV4ModelConfig:
             kv_lora_rank=DSV4_KV_LORA_RANK,
             v_head_dim=DSV4_V_HEAD_DIM,
             index_topk=DSV4_INDEX_TOPK,
+            index_n_heads=64,
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
             # Ratio 1/2 layers are their own kv_source (one-layer fixtures).
@@ -427,6 +428,7 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.runner_ids = RunnerIds(
             req_to_token=self.req_to_token_pool.req_to_token,

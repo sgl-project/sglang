@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
 )
 from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
@@ -105,7 +106,7 @@ class TestMmRoutingLabels(CustomTestCase):
 
     def test_text_skip_uses_the_scan_threshold(self):
         # A value equal to the pad shift is multimodal, so its block is scanned.
-        shift = events._MM_PAD_SHIFT_VALUE
+        shift = MM_PAD_SHIFT_VALUE
         self.registry.register((shift,), LABEL_U)
         self.assertEqual(
             events.mm_routing_spans([1, 2, shift, shift], 4, 1), [[(2, 2, LABEL_U)]]

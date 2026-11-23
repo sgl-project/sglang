@@ -24,6 +24,7 @@ from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     NVFP4_BIAS_GELU,
     QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
     SANA_VIDEO_LINEAR_ATTENTION,
     WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     can_use_linear_gelu,
@@ -72,6 +73,7 @@ _ADAPTER_SAFE_FUSIONS = {
     HELIOS_GATED_RESIDUAL: "residual update, no linear",
     MINIMAX_H3_NORM_MODULATE: "norm and modulation, no linear",
     SANA_VIDEO_LINEAR_ATTENTION: "runs on the projections' outputs",
+    SANA_VIDEO2_SOFTMAX_ATTENTION: "runs on the projections' outputs",
 }
 
 
