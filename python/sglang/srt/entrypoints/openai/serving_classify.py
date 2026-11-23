@@ -161,14 +161,12 @@ class OpenAIServingClassify(OpenAIServingBase):
         created_time = int(time.time())
         classify_objects = []
         prompt_tokens = 0
-        total_latency = 0.0
 
         for i, item in enumerate(ret):
             meta_info = item.get("meta_info", {})
             num_tokens = meta_info.get("prompt_tokens", 0)
 
             prompt_tokens += num_tokens
-            total_latency += meta_info.get("e2e_latency", 0.0)
 
             if "embedding" not in item:
                 raise RuntimeError("Missing classification scores in model output")

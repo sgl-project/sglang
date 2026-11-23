@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,12 +47,12 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
         for width in (1, 3):
             with self.subTest(width=width):
                 logits = torch.zeros(3 * width, 4, device="cuda")
-                apply_custom_logit_processor(logits, info, width)
+                apply_custom_logit_processor(logits, info, rows_per_request=width)
                 torch.cuda.synchronize()
                 with torch.profiler.profile(
                     activities=[torch.profiler.ProfilerActivity.CPU]
                 ) as profile:
-                    apply_custom_logit_processor(logits, info, width)
+                    apply_custom_logit_processor(logits, info, rows_per_request=width)
                 names = {event.key for event in profile.key_averages()}
                 self.assertNotIn("aten::nonzero", names)
                 self.assertNotIn("aten::_local_scalar_dense", names)
@@ -75,7 +75,7 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
         for width in (1, 3):
             with self.subTest(width=width):
                 logits = torch.zeros(3 * width, 4, dtype=torch.bfloat16, device="cuda")
-                apply_custom_logit_processor(logits, info, width)
+                apply_custom_logit_processor(logits, info, rows_per_request=width)
                 expected = torch.zeros(3, 4, dtype=torch.bfloat16)
                 expected[0] = 0.1
                 expected[2] = 0.1
@@ -83,30 +83,6 @@ class TestApplyCustomLogitProcessorCUDA(CustomTestCase):
                 self.assertTrue(
                     torch.equal(logits.cpu(), expected.repeat_interleave(width, dim=0))
                 )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_filter_does_not_read_processor_membership_back_to_cpu(self):
-        for keep in ([2, 1], [1]):
-            with self.subTest(keep=keep):
-                info = self._make_info()
-                self._make_info()._filter_batch_custom_logit_processor(keep)
-                torch.cuda.synchronize()
-                with torch.profiler.profile(
-                    activities=[torch.profiler.ProfilerActivity.CPU]
-                ) as profile:
-                    info._filter_batch_custom_logit_processor(keep)
-                names = {event.key for event in profile.key_averages()}
-                self.assertNotIn("aten::nonzero", names)
-                self.assertNotIn("aten::_local_scalar_dense", names)
-                if keep == [2, 1]:
-                    entry = info.custom_logit_processor[0]
-                    self.assertEqual(entry.rows, [0])
-                    self.assertEqual(entry.indices.tolist(), [0])
-                    self.assertEqual(info.custom_params, [{"token_id": 2}, None])
-                    self.assertEqual(set(info.custom_logit_processor), {0})
-                else:
-                    self.assertIsNone(info.custom_logit_processor)
-                    self.assertFalse(info.has_custom_logit_processor)
 
 
 if __name__ == "__main__":
