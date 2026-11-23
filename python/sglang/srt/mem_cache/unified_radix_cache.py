@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 )
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.evict_policy import get_cache_priority
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -240,6 +241,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        self.schedule_low_priority_values_first = (
+            params.schedule_low_priority_values_first
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -1678,7 +1682,9 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             inserted_len=req.kv.cache_inserted_len,
-            priority=req.priority or 0,
+            priority=get_cache_priority(
+                req.priority, self.schedule_low_priority_values_first
+            ),
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1870,7 +1876,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.checkpoint(req, up_to=branch_end)
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            priority=req.priority or 0,
+            priority=get_cache_priority(
+                req.priority, self.schedule_low_priority_values_first
+            ),
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)

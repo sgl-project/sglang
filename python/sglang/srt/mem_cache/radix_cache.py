@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
+from sglang.srt.mem_cache.evict_policy import get_cache_priority
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -287,6 +288,9 @@ class RadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle
         self.eviction_policy = params.eviction_policy.lower()
+        self.schedule_low_priority_values_first = (
+            params.schedule_low_priority_values_first
+        )
 
         # A disabled tree holds nothing, so it reports no KV events and never
         # evicts; its eviction policy config is not built or validated.
@@ -477,7 +481,9 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        priority = req.priority or 0
+        priority = get_cache_priority(
+            req.priority, self.schedule_low_priority_values_first
+        )
         result = self.insert(
             InsertParams(
                 key=radix_key,

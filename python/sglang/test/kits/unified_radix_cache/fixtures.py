@@ -121,6 +121,7 @@ def build_fixture(
     ] = None,
     tree_core_backend: Optional[str] = None,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
+    schedule_low_priority_values_first: bool = False,
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
@@ -274,6 +275,7 @@ def build_fixture(
         kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
+        schedule_low_priority_values_first=schedule_low_priority_values_first,
         is_eagle=cfg.is_eagle,
         component_registry_override=component_registry_override,
     )

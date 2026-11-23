@@ -469,6 +469,7 @@ def build_kv_cache(
         pp_cache_group=parallel.pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
+        schedule_low_priority_values_first=get_schedule().schedule_low_priority_values_first,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,

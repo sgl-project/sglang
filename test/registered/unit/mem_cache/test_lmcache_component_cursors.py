@@ -59,6 +59,7 @@ def cache_class():
 
 def _cache_and_request(cache_class, *, swa_enabled, swa_cursor=0):
     cache = cache_class.__new__(cache_class)
+    cache.schedule_low_priority_values_first = False
     cache.is_swa_enabled = swa_enabled
     cache._index_slots(SLOTS)
     cache.components = {FIRST_WINDOW: SimpleNamespace(window_sub_pool=FIRST)}
@@ -111,8 +112,13 @@ def test_external_swa_load_preserves_independent_cursors(cache_class, swa_cursor
 
 
 @pytest.mark.parametrize("swa_enabled", [False, True])
-def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled):
+@pytest.mark.parametrize("low_values_first", [False, True])
+def test_mamba_publication_snapshots_component_cursors(
+    cache_class, swa_enabled, low_values_first
+):
     cache, req, flow = _cache_and_request(cache_class, swa_enabled=swa_enabled)
+    cache.schedule_low_priority_values_first = low_values_first
+    req.priority = 7
     flow.mamba_value = torch.tensor([1], dtype=torch.int64)
     cache.req_to_token_pool = mock.Mock()
     cache.req_to_token_pool.req_to_token = torch.arange(12).reshape(1, 12)
@@ -132,6 +138,8 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
         cache._publish_external_loaded_prefix(req, token_ids_len=12)
 
     insert_params = cache.insert.call_args.args[0]
+    assert insert_params.priority == (-8 if low_values_first else 7)
+    assert req.priority == 7
     expected = {SECOND_WINDOW: 6}
     if swa_enabled:
         expected[FIRST_WINDOW] = 4

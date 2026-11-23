@@ -110,6 +110,83 @@ register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="base-b-test-1-gpu-small-amd")
 
 
+class TestUnifiedRequestPriorityDirection(
+    UnifiedRadixCacheCoreFixtures, CustomTestCase
+):
+    cfg = CacheConfig(eviction_policy="priority")
+
+    def _cache(self, low_values_first):
+        return build_fixture(
+            self.cfg,
+            tree_core_backend="python",
+            schedule_low_priority_values_first=low_values_first,
+        )
+
+    def _finish_priority_request(self, cache, allocator, pool, tokens, priority):
+        req, _ = self._make_inflight_req(cache, allocator, pool, tokens, allocated=True)
+        req.priority = priority
+        finish_req(cache, req, req.owned_kv_len())
+        self.assertEqual(req.priority, priority)
+
+    def test_request_priority_direction_controls_eviction(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, allocator, pool = self._cache(low_values_first)
+                urgent, background = (0, 100) if low_values_first else (100, 0)
+                self._finish_priority_request(cache, allocator, pool, [1, 2], urgent)
+                self._finish_priority_request(
+                    cache, allocator, pool, [3, 4], background
+                )
+                cache.evict(EvictParams(num_tokens=2))
+                self.assertEqual(match_prefix(cache, [1, 2]).device_prefix_len, 2)
+                self.assertEqual(match_prefix(cache, [3, 4]).device_prefix_len, 0)
+
+    def test_shared_prefix_keeps_most_urgent_request_priority(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, allocator, pool = self._cache(low_values_first)
+                urgent, background = (0, 100) if low_values_first else (100, 0)
+                for tokens, priority in [
+                    ([1, 2, 3], urgent),
+                    ([1, 2, 4], background),
+                    ([5, 6, 7], 50),
+                ]:
+                    self._finish_priority_request(
+                        cache, allocator, pool, tokens, priority
+                    )
+                cache.evict(EvictParams(num_tokens=4))
+                self.assertEqual(match_prefix(cache, [1, 2, 3]).device_prefix_len, 3)
+
+    def test_equal_priorities_keep_lru_order(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, allocator, pool = self._cache(low_values_first)
+                self._finish_priority_request(cache, allocator, pool, [1, 2], 7)
+                self._finish_priority_request(cache, allocator, pool, [3, 4], 7)
+                cache.evict(EvictParams(num_tokens=2))
+                self.assertEqual(match_prefix(cache, [1, 2]).device_prefix_len, 0)
+                self.assertEqual(match_prefix(cache, [3, 4]).device_prefix_len, 2)
+
+    def test_unpublished_request_uses_same_cache_priority(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, allocator, pool = self._cache(low_values_first)
+                req, _ = self._make_inflight_req(
+                    cache, allocator, pool, [1, 2], allocated=True
+                )
+                req.priority = 7
+                component = cache._components_tuple[0]
+                with mock.patch.object(
+                    component,
+                    "prepare_for_caching_req",
+                    wraps=component.prepare_for_caching_req,
+                ) as prepare:
+                    cache.advance_unpublished_req(req)
+                params = prepare.call_args.kwargs["insert_params"]
+                self.assertEqual(params.priority, -8 if low_values_first else 7)
+                self.assertEqual(req.priority, 7)
+
+
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
     def test_component_registry_override_is_instance_local(self):
         params = CacheInitParams(

@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
+    get_cache_priority,
 )
 
 
@@ -26,6 +27,40 @@ def _make_node(**kwargs):
     node.creation_time = kwargs.get("creation_time", 0.0)
     node.priority = kwargs.get("priority", 0)
     return node
+
+
+class TestCachePriorityDirection(unittest.TestCase):
+    def test_eviction_order_follows_both_request_conventions(self):
+        strategy = PriorityStrategy()
+        for low_values_first in (False, True):
+            urgent, background = (0, 100) if low_values_first else (100, 0)
+            high = _make_node(priority=get_cache_priority(urgent, low_values_first))
+            low = _make_node(priority=get_cache_priority(background, low_values_first))
+            self.assertLess(strategy.get_priority(low), strategy.get_priority(high))
+
+    def test_equal_priorities_keep_lru_tiebreak(self):
+        strategy = PriorityStrategy()
+        for low_values_first in (False, True):
+            rank = get_cache_priority(7, low_values_first)
+            old = _make_node(priority=rank, last_access_time=1.0)
+            new = _make_node(priority=rank, last_access_time=2.0)
+            self.assertLess(strategy.get_priority(old), strategy.get_priority(new))
+
+    def test_none_has_same_rank_as_zero(self):
+        for low_values_first in (False, True):
+            self.assertEqual(
+                get_cache_priority(None, low_values_first),
+                get_cache_priority(0, low_values_first),
+            )
+
+    def test_signed_int64_extremes_remain_distinct_and_in_range(self):
+        lo, hi = -(2**63), 2**63 - 1
+        values = [lo, lo + 1, -1, 0, 1, hi - 1, hi]
+        for low_values_first in (False, True):
+            ranks = [get_cache_priority(value, low_values_first) for value in values]
+            self.assertTrue(all(lo <= rank <= hi for rank in ranks))
+            self.assertEqual(len(set(ranks)), len(values))
+            self.assertEqual(ranks, sorted(ranks, reverse=low_values_first))
 
 
 class TestLRUStrategy(unittest.TestCase):

@@ -312,6 +312,70 @@ class TestRadixCache(CustomTestCase):
         """Set up test fixtures."""
         TreeNode.counter = 0
 
+    def _priority_cache(self, low_values_first):
+        allocator = TokenToKVPoolAllocator(
+            size=64, dtype=torch.float16, device="cpu", kvcache=None, need_sort=False
+        )
+        pool = SimpleNamespace(req_to_token=torch.zeros((1, 64), dtype=torch.int64))
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            eviction_policy="priority",
+        )
+        params.schedule_low_priority_values_first = low_values_first
+        return RadixCache(params), pool, allocator
+
+    def _insert_priority_request(self, cache, pool, allocator, tokens, priority):
+        values = allocator.alloc(len(tokens))
+        pool.req_to_token[0, : len(tokens)] = values
+        req = SimpleNamespace(
+            priority=priority,
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                cache_protected_len=0,
+                cache_inserted_len=0,
+                record_insert=lambda length: None,
+            ),
+            extra_key=None,
+            cache_salt=None,
+        )
+        cache._insert_cache(req, array("q", tokens))
+        self.assertEqual(req.priority, priority)
+
+    def test_request_priority_direction_controls_eviction(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, pool, allocator = self._priority_cache(low_values_first)
+                urgent, background = (0, 100) if low_values_first else (100, 0)
+                self._insert_priority_request(cache, pool, allocator, [1, 2], urgent)
+                self._insert_priority_request(
+                    cache, pool, allocator, [3, 4], background
+                )
+                cache.evict(EvictParams(num_tokens=2))
+                for tokens, expected in [([1, 2], 2), ([3, 4], 0)]:
+                    match = cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                    )
+                    self.assertEqual(match.device_prefix_len, expected)
+
+    def test_shared_prefix_keeps_most_urgent_request_priority(self):
+        for low_values_first in (False, True):
+            with self.subTest(low_values_first=low_values_first):
+                cache, pool, allocator = self._priority_cache(low_values_first)
+                urgent, background = (0, 100) if low_values_first else (100, 0)
+                self._insert_priority_request(cache, pool, allocator, [1, 2, 3], urgent)
+                self._insert_priority_request(
+                    cache, pool, allocator, [1, 2, 4], background
+                )
+                self._insert_priority_request(cache, pool, allocator, [5, 6, 7], 50)
+                cache.evict(EvictParams(num_tokens=4))
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3])))
+                )
+                self.assertEqual(match.device_prefix_len, 3)
+
     def test_init_variations(self):
         """Test cache initialization with different parameters."""
         test_cases = [
@@ -505,7 +569,7 @@ class TestRadixCache(CustomTestCase):
             cache.req_to_token_pool.req_to_token[0], tree_indices
         )
 
-    def _checkpoint_split_request(self, priority):
+    def _checkpoint_split_request(self, priority, low_values_first=False):
         """Checkpoint a finished request; returns (cache, prompt_ids, output_ids)."""
 
         class ReqToTokenPool:
@@ -522,7 +586,15 @@ class TestRadixCache(CustomTestCase):
             kvcache=None,
             need_sort=False,
         )
-        cache = RadixCache.create_simulated(mock_allocator=allocator)
+        cache = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                schedule_low_priority_values_first=low_values_first,
+            )
+        )
         prompt_ids = array("q", [1, 2, 3])
         output_ids = array("q", [4, 5])
         kv_indices = allocator.alloc(len(prompt_ids) + len(output_ids))
@@ -573,6 +645,19 @@ class TestRadixCache(CustomTestCase):
         prompt_node, output_node = self._split_nodes(cache)
         self.assertEqual(prompt_node.priority, int64_max)
         self.assertEqual(output_node.priority, int64_max)
+
+    def test_low_values_first_preserves_prompt_retention_boost(self):
+        cache, _, _ = self._checkpoint_split_request(priority=10, low_values_first=True)
+        prompt_node, output_node = self._split_nodes(cache)
+        self.assertGreater(prompt_node.priority, output_node.priority)
+
+    def test_low_values_first_prompt_boost_saturates_at_int64_min_request(self):
+        cache, _, _ = self._checkpoint_split_request(
+            priority=-(2**63), low_values_first=True
+        )
+        prompt_node, output_node = self._split_nodes(cache)
+        self.assertEqual(prompt_node.priority, 2**63 - 1)
+        self.assertEqual(output_node.priority, 2**63 - 1)
 
     def test_kv_cache_events(self):
         """Test KV cache events functionality."""

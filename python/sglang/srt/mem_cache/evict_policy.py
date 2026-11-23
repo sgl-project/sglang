@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
+
+
+def get_cache_priority(priority: Optional[int], low_values_first: bool) -> int:
+    """Convert request priority to a cache rank: larger means retain longer.
+
+    Complement rather than negate so signed int64 priorities remain in range,
+    including INT64_MIN. Normalize once when a request enters the tree; the
+    tree's max propagation and prompt-priority boost then work in either direction.
+    """
+    priority = priority or 0
+    return ~priority if low_values_first else priority
 
 
 class EvictionStrategy(ABC):
