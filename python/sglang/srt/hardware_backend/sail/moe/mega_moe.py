@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -248,6 +249,107 @@ def run_mega_routed_experts(
             **mega_kwargs,
         )
     return y[:num_tokens]
+
+
+def mega_moe_buffer_kimi(moe):
+    return _get_mega_moe_symm_buffer(
+        get_parallel().moe_ep_group.device_group,
+        num_experts=moe.experts.num_experts,
+        num_max_tokens_per_rank=envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get(),
+        num_topk=moe._mega_top_k,
+        hidden=moe.moe_hidden_size,
+        intermediate_hidden=moe._mega_intermediate_size,
+        mma_type=_mega_moe_mma_type(moe.experts),
+        activation="situ",
+    )
+
+
+def forward_mega_experts_kimi(
+    moe,
+    routed_input: torch.Tensor,
+    topk_output,
+    *,
+    valid_token_count: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run three SAIL precisions, masking padded NaNs before and after dispatch."""
+    import deep_gemm
+
+    num_tokens = routed_input.shape[0]
+    num_max_tokens_per_rank = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    )
+    assert num_tokens <= num_max_tokens_per_rank, (
+        f"mega MoE: num_tokens={num_tokens} exceeds "
+        f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+        f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
+        f"the env var to cover the per-rank rows"
+    )
+    mma_type = _mega_moe_mma_type(moe.experts)
+    buf = moe._mega_moe_buffer()
+    if num_tokens > 0:
+        topk_ids_in = topk_output.topk_ids.to(torch.int64)
+        topk_weights_in = topk_output.topk_weights.to(torch.float32)
+    else:
+        topk_ids_in = routed_input.new_empty((0, moe._mega_top_k), dtype=torch.int64)
+        topk_weights_in = routed_input.new_empty(
+            (0, moe._mega_top_k), dtype=torch.float32
+        )
+    valid_rows = None
+    if valid_token_count is not None:
+        valid_rows = (
+            torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+        )
+        routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+        topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+        topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+    deep_gemm.mega_moe_pre_dispatch(
+        routed_input.contiguous(),
+        topk_ids_in.contiguous(),
+        topk_weights_in.contiguous(),
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        num_tokens=num_tokens,
+        group_size=32,
+        mma_type=_ppu_mega_moe_mma_type(mma_type),
+    )
+    y = torch.empty(
+        (num_tokens, moe.moe_hidden_size),
+        dtype=torch.bfloat16,
+        device=routed_input.device,
+    )
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        mega_moe_kernel = getattr(
+            deep_gemm,
+            {
+                "mxf4xmxf4": "fp4_fp4_mega_moe",
+                "fp8xmxfp4": "fp8_fp4_mega_moe",
+                "bf16xmxfp4": "bf16_fp4_mega_moe",
+            }[mma_type],
+        )
+        situ_kwargs = {
+            "situ_beta": moe.experts.moe_runner_config.gemm1_alpha,
+            "situ_linear_beta": moe.experts.moe_runner_config.gemm1_clamp_limit,
+        }
+        if mma_type == "mxf4xmxf4":
+            situ_kwargs["recipe"] = (1, 1, 32)
+        mega_moe_kernel(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            activation="situ",
+            fast_math=True,
+            **situ_kwargs,
+        )
+    y = y[:num_tokens]
+    if valid_rows is not None:
+        y.masked_fill_(~valid_rows[:, None], 0)
+    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+        if moe.routed_scaling_factor is not None and moe.routed_scaling_factor != 1.0:
+            y.mul_(moe.routed_scaling_factor)
+    return y
 
 
 def _require_ppu_mega_moe_deep_gemm_apis() -> None:

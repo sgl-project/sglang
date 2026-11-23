@@ -1609,6 +1609,254 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         experts._mega_moe_weights_built = False
                         self.assertFalse(mega_moe.is_mega_moe_experts_ready(experts))
 
+    def test_kimi_k3_situ_selects_ppu_mma_api_without_changing_cuda_path(self):
+        from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            moe_runner_config=SimpleNamespace(
+                gemm1_alpha=3.0,
+                gemm1_clamp_limit=17.0,
+            ),
+            should_fuse_routed_scaling_factor_in_topk=True,
+        )
+        owner = SimpleNamespace(
+            experts=experts,
+            _mega_top_k=2,
+            moe_hidden_size=4,
+            _mega_intermediate_size=8,
+        )
+        owner._mega_moe_buffer = lambda: KimiK3MoE._mega_moe_buffer(owner)
+        topk_output = SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.6, 0.4]]),
+        )
+
+        for ppu, mma_type, num_tokens in (
+            (True, "mxf4xmxf4", 1),
+            (True, "fp8xmxfp4", 1),
+            (True, "bf16xmxfp4", 1),
+            (True, "mxf4xmxf4", 0),
+            (True, "fp8xmxfp4", 0),
+            (True, "bf16xmxfp4", 0),
+            (False, "mxf4xmxf4", 1),
+            (False, "fp8xfp4", 1),
+            (False, "fp8xfp4", 0),
+        ):
+            with self.subTest(ppu=ppu, mma_type=mma_type, num_tokens=num_tokens):
+                runtime = sail_mega_moe if ppu else mega_moe
+                parallel_owner = (
+                    sail_mega_moe if ppu else sys.modules["sglang.srt.models.kimi_k3"]
+                )
+                deep_gemm = ModuleType("deep_gemm")
+                deep_gemm.mega_moe_pre_dispatch = MagicMock()
+                deep_gemm.fp4_fp4_mega_moe = MagicMock()
+                deep_gemm.fp8_fp4_mega_moe = MagicMock()
+                deep_gemm.bf16_fp4_mega_moe = MagicMock()
+                with (
+                    patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                    patch("sglang.srt.models.kimi_k3._is_sail", ppu),
+                    nullcontext() if ppu else self._reject_sail_imports(),
+                    patch.object(
+                        runtime, "_mega_moe_mma_type", return_value=mma_type
+                    ) as select_type,
+                    patch.object(
+                        runtime, "_get_mega_moe_symm_buffer", return_value=buffer
+                    ) as get_buffer,
+                    patch.object(
+                        runtime,
+                        "_configure_mega_moe_deep_gemm_num_sms",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(
+                        parallel_owner,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            moe_ep_group=SimpleNamespace(device_group=object())
+                        ),
+                    ),
+                    patch(
+                        "sglang.kernels.ops.moe.dsv4.mega_moe_pre_dispatch"
+                    ) as triton_dispatch,
+                ):
+                    result = KimiK3MoE._forward_mega_experts(
+                        owner,
+                        torch.zeros((num_tokens, 4), dtype=torch.bfloat16),
+                        topk_output,
+                    )
+
+                self.assertEqual(result.shape, (num_tokens, 4))
+                self.assertEqual(select_type.call_args_list, [call(experts)] * 2)
+                self.assertEqual(get_buffer.call_args.kwargs["mma_type"], mma_type)
+                if ppu:
+                    self.assertEqual(get_buffer.call_args.kwargs["activation"], "situ")
+                else:
+                    self.assertNotIn("activation", get_buffer.call_args.kwargs)
+                if ppu:
+                    dispatch_args = deep_gemm.mega_moe_pre_dispatch.call_args.args
+                    self.assertEqual(dispatch_args[1].dtype, torch.int64)
+                    for tensor in dispatch_args[:3]:
+                        self.assertTrue(tensor.is_contiguous())
+                    for actual, expected in zip(
+                        dispatch_args[3:],
+                        (buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights),
+                        strict=True,
+                    ):
+                        self.assertIs(actual, expected)
+                    self.assertEqual(
+                        deep_gemm.mega_moe_pre_dispatch.call_args.kwargs,
+                        {
+                            "num_tokens": num_tokens,
+                            "group_size": 32,
+                            "mma_type": {
+                                "mxf4xmxf4": "fp4xfp4",
+                                "fp8xmxfp4": "fp8xfp4",
+                                "bf16xmxfp4": "bf16xfp4",
+                            }[mma_type],
+                        },
+                    )
+                    triton_dispatch.assert_not_called()
+                    kernel = {
+                        "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
+                        "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
+                        "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+                    }[mma_type]
+                    kernel.assert_called_once()
+                    self.assertEqual(kernel.call_args.args[0].shape, (num_tokens, 4))
+                    if mma_type != "mxf4xmxf4":
+                        self.assertNotIn("recipe", kernel.call_args.kwargs)
+                    self.assertEqual(kernel.call_args.kwargs["situ_beta"], 3.0)
+                    self.assertEqual(
+                        kernel.call_args.kwargs["situ_linear_beta"],
+                        17.0,
+                    )
+                else:
+                    if mma_type == "mxf4xmxf4":
+                        deep_gemm.mega_moe_pre_dispatch.assert_called_once()
+                        self.assertEqual(
+                            deep_gemm.mega_moe_pre_dispatch.call_args.args[1].dtype,
+                            torch.int32,
+                        )
+                        triton_dispatch.assert_not_called()
+                    else:
+                        triton_dispatch.assert_called_once()
+                        self.assertEqual(
+                            triton_dispatch.call_args.args[1].dtype, torch.int32
+                        )
+                        self.assertEqual(
+                            triton_dispatch.call_args.kwargs["quant_group_size"], 32
+                        )
+                    deep_gemm.fp8_fp4_mega_moe.assert_called_once()
+                    deep_gemm.fp4_fp4_mega_moe.assert_not_called()
+
+    def test_kimi_ppu_precision_masks_padded_rows_and_scales_routes_once(self):
+        from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+        routed_input = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0], [float("nan")] * 4],
+            dtype=torch.bfloat16,
+        )
+        valid_token_count = torch.tensor(1)
+        buffer = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        staged = {}
+
+        def pre_dispatch(
+            x,
+            ids,
+            weights,
+            buf_x,
+            buf_x_sf,
+            buf_topk_idx,
+            buf_topk_weights,
+            num_tokens,
+            group_size=32,
+            mma_type="mxf4xmxf4",
+        ):
+            self.assertIs(buf_x, buffer.x)
+            self.assertIs(buf_x_sf, buffer.x_sf)
+            self.assertIs(buf_topk_idx, buffer.topk_idx)
+            self.assertIs(buf_topk_weights, buffer.topk_weights)
+            self.assertEqual(num_tokens, 3)
+            self.assertEqual(group_size, 32)
+            self.assertEqual(mma_type, expected_mma_type)
+            self.assertEqual(ids.dtype, torch.int64)
+            self.assertTrue(torch.isfinite(x).all())
+            valid = int(valid_token_count)
+            self.assertTrue(torch.all(ids[valid:] == -1))
+            self.assertTrue(torch.all(weights[valid:] == 0))
+            staged.update(x=x, weights=weights)
+
+        def kernel(y, l1, l2, buf, **kwargs):
+            y.copy_(staged["x"] * staged["weights"].sum(-1, keepdim=True))
+            y[int(valid_token_count) :].fill_(float("nan"))
+
+        for mma_type in ("mxf4xmxf4", "fp8xmxfp4", "bf16xmxfp4"):
+            expected_mma_type = {
+                "mxf4xmxf4": "fp4xfp4",
+                "fp8xmxfp4": "fp8xfp4",
+                "bf16xmxfp4": "bf16xfp4",
+            }[mma_type]
+            for scale_in_topk in (False, True):
+                with self.subTest(mma_type=mma_type, scale_in_topk=scale_in_topk):
+                    experts = SimpleNamespace(
+                        mega_l1_weights=object(),
+                        mega_l2_weights=object(),
+                        moe_runner_config=SimpleNamespace(
+                            gemm1_alpha=4.0, gemm1_clamp_limit=25.0
+                        ),
+                        should_fuse_routed_scaling_factor_in_topk=scale_in_topk,
+                    )
+                    owner = SimpleNamespace(
+                        experts=experts,
+                        _mega_top_k=2,
+                        moe_hidden_size=4,
+                        _mega_moe_buffer=lambda: buffer,
+                        routed_scaling_factor=2.0,
+                    )
+                    topk = SimpleNamespace(
+                        topk_ids=torch.tensor([[0, 1]] * 3, dtype=torch.int32),
+                        topk_weights=torch.tensor([[0.25, 0.75]] * 3)
+                        * (2.0 if scale_in_topk else 1.0),
+                    )
+                    deep_gemm = ModuleType("deep_gemm")
+                    deep_gemm.mega_moe_pre_dispatch = pre_dispatch
+                    deep_gemm.fp4_fp4_mega_moe = kernel
+                    deep_gemm.fp8_fp4_mega_moe = kernel
+                    deep_gemm.bf16_fp4_mega_moe = kernel
+                    with (
+                        patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                        patch("sglang.srt.models.kimi_k3._is_sail", True),
+                        patch.object(
+                            sail_mega_moe, "_mega_moe_mma_type", return_value=mma_type
+                        ),
+                        patch.object(
+                            sail_mega_moe,
+                            "_configure_mega_moe_deep_gemm_num_sms",
+                            return_value=nullcontext(),
+                        ),
+                    ):
+                        for valid in (1, 0, 2):
+                            valid_token_count.fill_(valid)
+                            actual = KimiK3MoE._forward_mega_experts(
+                                owner,
+                                routed_input,
+                                topk,
+                                valid_token_count=valid_token_count,
+                            )
+                            expected = torch.zeros_like(routed_input)
+                            expected[:valid] = routed_input[:valid] * 2
+                            torch.testing.assert_close(actual, expected)
+
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
         expected = torch.tensor(

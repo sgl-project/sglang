@@ -446,7 +446,7 @@ class TestPLAKDADispatch(CustomTestCase):
 
     def test_prepares_fused_decode_handoff_for_k3_tp_layouts(self):
         with (
-            patch.object(kimi_k3, "is_sail", return_value=True),
+            patch.object(kimi_k3, "_is_sail", True),
             patch.object(kimi_k3, "_is_hip", False),
             patch.object(kimi_k3, "_is_npu", False),
             envs.SGLANG_SAIL_PLA.override(True),
@@ -468,7 +468,7 @@ class TestPLAKDADispatch(CustomTestCase):
 
     def test_community_preparation_keeps_its_head_limit(self):
         with (
-            patch.object(kimi_k3, "is_sail", return_value=False),
+            patch.object(kimi_k3, "_is_sail", False),
             patch.object(kimi_k3, "_is_hip", False),
             patch.object(kimi_k3, "_is_npu", False),
             patch.object(kimi_k3, "rank0_log"),

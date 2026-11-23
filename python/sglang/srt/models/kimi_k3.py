@@ -1004,6 +1004,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         )
 
     def _mega_moe_buffer(self):
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+                mega_moe_buffer_kimi,
+            )
+
+            return mega_moe_buffer_kimi(self)
         from sglang.srt.layers.moe.mega_moe import (
             _get_mega_moe_symm_buffer,
             _mega_moe_mma_type,
@@ -1033,6 +1039,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
         applies the norm)."""
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.mega_moe import (
+                forward_mega_experts_kimi,
+            )
+
+            return forward_mega_experts_kimi(
+                self, routed_input, topk_output, valid_token_count=valid_token_count
+            )
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -2563,7 +2577,7 @@ class KimiK3DeltaAttention(nn.Module):
         seg = heads * 128
         # SAIL serves the same path through PLA, which covers a wider head set.
         sail_kda = None
-        if is_sail():
+        if _is_sail:
             from sglang.srt.hardware_backend.sail.kernels import kda as sail_kda
 
         supported_heads = (
@@ -4318,8 +4332,10 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
-                if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
-                    # Under prefill CP the shared EP workspace must count
+                if layer.mlp._use_mega_moe and (
+                    _is_sail or get_parallel().attn_cp_size > 1
+                ):
+                    # Under SAIL or prefill CP the shared EP workspace must count
                     # against the KV budget, not first appear during warmup or
                     # graph capture. Other MegaMoE recipes are sized with the
                     # workspace taken from the non-static slack, as on main.
