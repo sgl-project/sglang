@@ -12,22 +12,6 @@ DEVI const u8* wc6_w(const void* wc, int e, int nrg, int kc, int rg) {
 DEVI const u8* wc6_s(const void* wc, int e, int nrg, int kc, int rg) {
   return wc6_w(wc, e, nrg, kc, rg & ~15) + 32768 + (rg & 15) * 192;
 }
-#ifndef MOE_PLAN
-#define MOE_PLAN 0
-#endif
-#if MOE_PLAN
-#define PLAN_ARGS(...) , __VA_ARGS__
-#else
-#define PLAN_ARGS(...)
-#endif
-DEVI const u8* ew_base(const void* base, const void* rbase, u32 rin, u32 rj, int e, int nrg) {
-  const size_t st = (size_t)(nrg >> 4) * (16 * 35840);
-  return (rin >> e) & 1u ? AS(const u8, rbase) + ((rj >> 4 * __popc(rin & ((1u << e) - 1u))) & 15u) * st
-                         : AS(const u8, base) + (size_t)e * st;
-}
-DEVI u32 pcn(const u32* pc, int e) {
-  return (pc[e >> 1] >> (16 * (e & 1))) & 0xffffu;
-}
 // Tile order of a lane's expert: count `key` descending, ties by lane (key < 2^(nb + 1)).
 DEVI int key_rank(int key, int nb) {
   u32 gtm = 0u, eqm = ~0u;
@@ -396,13 +380,6 @@ struct Params {
   u16* osp[8];
   int R;
   int* ptj;
-  const int* preps;
-  const u32* r13;
-  const u32* r2;
-  const float* rgs13;
-  const float* rgs2;
-  int nrep;
-  int me;
   u8* sw13;
   u8* sw2;
   const int* gsrc;
@@ -491,7 +468,7 @@ __device__ __noinline__ void wp32_fst(
     int srg,
     int rgs,
     int xp,
-    int cmax PLAN_ARGS(const u32* r13, u32 rin, u32 rj)) {
+    int cmax) {
   const int lane = threadIdx.x & 31;
   const u32 bml = bm[lane];
   const int c = __popc(bml);
@@ -513,15 +490,8 @@ __device__ __noinline__ void wp32_fst(
   const int n = __popc(bme);
   const int r = (lane < M && ((bme >> lane) & 1u)) ? __popc(bme & ((1u << lane) - 1u)) : -1;
   const u64 polw = policy_evict_first(), polx = policy_evict_last();
-#if MOE_PLAN
-  const u8* eb0 = ew_base(w13, r13, rin, rj, e0, 512);
-  const int ei = 0;
-#else
-  const void* eb0 = w13;
-  const int ei = e0;
-#endif
-  const u8* wsrc = wc6_w(eb0, ei, 512, 0, rb0 * rgs);
-  const u8* ssrc = wc6_s(eb0, ei, 512, 0, rb0 * rgs);
+  const u8* wsrc = wc6_w(w13, e0, 512, 0, rb0 * rgs);
+  const u8* ssrc = wc6_s(w13, e0, 512, 0, rb0 * rgs);
 #pragma unroll 1
   for (int st = 0; st < ns; ++st) {
     const u32 full = b0 + st * 8;
@@ -574,7 +544,7 @@ DEVI void moe_body(const Params& P) {
   static_assert(NS <= 4);
   // bars: stage full; epi / sfree: signal posted / taken; aq_full / aq_slot: epilogue queue; one-shot rdy, rtd, plr,
   // eis: x gathered, routing / pair list done, producer start; sinfo: (phase, counter); gsm: scales x 256.
-  // scal: 0 tiles, 2 items, 3 pairs, 4 / 5 first k-split tile / pair, 6 gather units, 7 / 11 replica slots / indices,
+  // scal: 0 tiles, 2 items, 3 pairs, 4 / 5 first k-split tile / pair, 6 gather units,
   // 8-10 and 12-13 claim broadcasts, 14 counter bank, 15 guests' phase-2 tiles.
   // bm[BMI(e, w)] bit t: token 32 w + t -> slot e; tiles: (slot, first pair, tokens, first unit)
   u64* bars = AS(u64, smem);
@@ -607,16 +577,6 @@ DEVI void moe_body(const Params& P) {
   const int M = P.M;
   constexpr bool FT_GSDV = IT2K, MOE_FSTV = IT2K;
   constexpr int PAR_OFF = 65536, PAR_WORD = PAR_OFF + 16384;
-#if MOE_PLAN
-  // EP replica plan: same deterministic greedy in every CTA
-  constexpr bool PTL = MAXT * 16 + (PAIRS ? MAXP * 2 : 0) >= 1088;
-  constexpr int PFS = SPX || HB ? 0 : 2;  // w13 stages warmed into L2 during the plan
-  u32* pcnt = AS(u32, PTL ? AS(u8, tiles) : stages);
-  signed char* ploc = AS(signed char, pcnt + 128);
-  float* prgs = AS(float, ploc + 256);
-  int prv0 = -1, prv1 = -1, pcg0 = 0, pcg1 = 0, pjm0 = 0, pjm1 = 0;
-  float pgv = 0.f;
-#endif
   int fi0 = 0, gc0 = 0;
   pdl_wait();
   if (tid == 256) fi0 = atomicAdd(P.ctr + PAR_WORD + 32, 1);
@@ -625,20 +585,6 @@ DEVI void moe_body(const Params& P) {
   int* CB = P.ctr;
   int4 hv0 = {}, hv1 = {};
   if (warp * 32 + lane < M) LD_IDS(P.ids, warp * 32 + lane, hv0, hv1)
-#if MOE_PLAN
-  if (tid >= 256 && tid < 272 && (tid & 7) < P.nrep) pgv = __ldg((tid < 264 ? P.rgs13 : P.rgs2) + (tid & 7));
-  if (warp == 0) {
-    const int nrep = P.nrep;
-    if (lane < 8 * nrep) prv0 = __ldg(P.preps + lane);
-    if (lane + 32 < 8 * nrep) prv1 = __ldg(P.preps + lane + 32);
-    for (pjm0 = lane; nrep > 0 && pjm0 >= nrep; pjm0 -= nrep)
-      ++pcg0;
-    for (pcg1 = pcg0, pjm1 = pjm0 + 32; nrep > 0 && pjm1 >= nrep; pjm1 -= nrep)
-      ++pcg1;
-    if (lane >= 8 * nrep) pcg0 = 0;
-    if (lane + 32 >= 8 * nrep) pcg1 = 0;
-  }
-#endif
   constexpr int NIT = BMT ? (MW * 32 + 383) / 384 : 1;
   int4 hvx[NIT][2];
   if constexpr (BMT) {
@@ -648,8 +594,7 @@ DEVI void moe_body(const Params& P) {
       if (t < M) LD_IDS(P.ids, t, hvx[k][0], hvx[k][1])
     }
   }
-  const float hgs =
-      tid < 64 ? (tid < 32 ? P.gs13[tid] : P.gs2[tid - 32]) : 0.f;  // scaled at use: the plan need not wait for it
+  const float hgs = tid < 64 ? (tid < 32 ? P.gs13[tid] : P.gs2[tid - 32]) : 0.f;  // scaled at use
   for (int i = tid; i < 32 * MW; i += blockDim.x)
     bm[i] = 0u;
   if (tid == 352) {
@@ -669,135 +614,7 @@ DEVI void moe_body(const Params& P) {
     mbar_init_fence();
     fence_async();
   }
-#if MOE_PLAN
-  if (tid < 256) {
-    ploc[tid] = -1;
-    if (tid < 128) pcnt[tid] = 0;
-  }
-  if (tid == 0) {
-    scal[7] = 0;
-    scal[11] = 0;
-  }
-#endif
   __syncthreads();
-#if MOE_PLAN
-  for (int t = tid; t < M; t += blockDim.x) {
-    int4 v0 = hv0, v1 = hv1;
-    if (t != tid) LD_IDS(P.ids, t, v0, v1)
-    const int ev8[8] = EV8(v0, v1);
-    for (int j = 0; j < 8; ++j)
-      atomicAdd(pcnt + ((ev8[j] & 255) >> 1), 1u << (16 * (ev8[j] & 1)));
-  }
-  __syncthreads();
-  const bool pc0 = prv0 >= 0 && pcn(pcnt, prv0 & 255), pc1 = prv1 >= 0 && pcn(pcnt, prv1 & 255);
-  if (PFS > 0 && warp == 10) {
-    // DRAM idles during the plan: warm L2 with this CTA's second-wave item (tile order guessed)
-    const int c = pcn(pcnt, P.me * 32 + lane);
-    int rank = key_rank(c, 9);
-    if constexpr (NT >= 8 && MW <= 8) rank = mix_rank(rank, c);
-    off[rank] = (c + T - 1) / T;
-    __syncwarp();
-    const int v = off[lane], it = blockIdx.x + gridDim.x, t = it / NRB1, rb = it - t * NRB1;
-    int sv = v;
-    for (int d = 1; d < 32; d <<= 1) {
-      const int u = shfl_up(sv, d);
-      if (lane >= d) sv += u;
-    }
-    const u32 hit = ballot(v > 0 && t < sv && t >= sv - v);
-    if (hit) {
-      const int e = __ffs(ballot(rank == __ffs(hit) - 1)) - 1;
-      if (lane < PFS * KW) {
-        prefetch_l2(wc6_w(P.w13, e, 512, lane, rb * RGS), RGS * 2048);
-        prefetch_l2(wc6_s(P.w13, e, 512, lane, rb * RGS), RGS * SRG);
-      }
-    }
-  }
-  if (warp < 8) {
-    const u32 n = pcn(pcnt, tid);
-    const int c = __reduce_add_sync(~0u, pwt(n, T)), d = __popc(ballot(n != 0));
-    if (lane == 0) {
-      wpre[warp] = c;
-      wpre[8 + warp] = d;
-    }
-    bar_sync(14, 256);
-  }
-  if (warp == 0 && !__any_sync(~0u, pc0 || pc1)) {
-    if (pcn(pcnt, P.me * 32 + lane)) ploc[P.me * 32 + lane] = lane;
-  } else if (warp == 0) {
-    const int me = P.me, pown = me * 32 + lane;
-    int ld = 0, nd = 0;
-    if (lane < 8) {
-      ld = wpre[lane];
-      nd = wpre[8 + lane];
-    }
-    if (lane >= 8) ld = -1;
-    int ce[2], ch[2], cg[2], cw[2], cwt[2];
-    bool cv[2];
-    for (int k = 0; k < 2; ++k) {
-      const int e = k ? prv1 : prv0;
-      ce[k] = e & 255;
-      ch[k] = ce[k] >> 5;
-      cg[k] = k ? pcg1 : pcg0;
-      cw[k] = ch[k];
-      cwt[k] = pwt(pcn(pcnt, ce[k]), T);
-      cv[k] = (k ? pc1 : pc0) && cg[k] != ch[k];
-    }
-    for (;;) {
-      const int mx = __reduce_max_sync(~0u, ld * 8 + 7 - (lane & 7)), lmax = mx >> 3, r = 7 - (mx & 7),
-                ldn = ld * 64 + nd;
-      unsigned best = ~0u;
-      for (int k = 0; k < 2; ++k) {
-        const int g = cw[k] == ch[k] ? cg[k] : ch[k], gl = shfl(ldn, g), lg = gl >> 6, ng = gl & 63;
-        if (cv[k] && cw[k] == r && lg + cwt[k] < lmax && ng < 32)
-          best = min(best, ((unsigned)lg << 16) | ((unsigned)ce[k] << 8) | (unsigned)g);
-      }
-      best = __reduce_min_sync(~0u, best);
-      if (best == ~0u) break;
-      const int e = (best >> 8) & 255, g = best & 255;
-      for (int k = 0; k < 2; ++k)
-        if (cv[k] && ce[k] == e) cw[k] = g;
-      const int wm = pwt(pcn(pcnt, e), T);
-      ld += (lane == g ? wm : 0) - (lane == r ? wm : 0);
-      nd += (lane == g) - (lane == r);
-    }
-    u32 gone = 0;
-#pragma unroll
-    for (int k = 0; k < 2; ++k)
-      if (cv[k] && ch[k] == me && cw[k] != me) gone |= 1u << (ce[k] & 31);
-    gone = __reduce_or_sync(~0u, gone);
-    const bool stays = pcn(pcnt, pown) && !((gone >> lane) & 1u);
-    const u32 freem = ballot(!stays);
-    if (stays) ploc[pown] = lane;
-    int base = 0;
-    u32 rin = 0, rj = 0;
-    for (int k = 0; k < 2; ++k) {
-      const bool in = cv[k] && cw[k] == me && ch[k] != me;
-      const u32 m = ballot(in);
-      if (in) {
-        const int c = base + __popc(m & ((1u << lane) - 1u));
-        u32 f = freem;
-        for (int i = c; i > 0; --i)
-          f &= f - 1;
-        const int sk = __ffs(f) - 1;
-        ploc[ce[k]] = sk;
-        if (sk >= 0) {
-          rin |= 1u << sk;
-          rj |= (u32)(k ? pjm1 : pjm0) << 4 * c;
-        }
-      }
-      base += __popc(m);
-    }
-    rin = __reduce_or_sync(~0u, rin);
-    rj = __reduce_or_sync(~0u, rj);
-    if (lane == 0) {
-      scal[7] = rin;
-      scal[11] = rj;
-    }
-  }
-  if (tid >= 256 && tid < 272) prgs[tid - 256] = pgv;
-  if (!PTL) fence_async();
-  __syncthreads();
-#endif
   constexpr bool DGS = SPX && CE1;
   const bool dg = DGS && P.gsrc;
   u32 gsl = ~0u;
@@ -830,12 +647,8 @@ DEVI void moe_body(const Params& P) {
       const int4 v0 = k == 0 ? hv0 : hvx[k][0], v1 = k == 0 ? hv1 : hvx[k][1];
       const int ev[8] = EV8(v0, v1);
       for (int j = 0; j < 8; ++j) {
-#if MOE_PLAN
-        const int e = ploc[ev[j] & 255];
-#else
         int e = ev[j];
         if (dg && (unsigned)(e - 32) < 2u) e = (gsl >> 8 * (e - 32)) & 0xff;
-#endif
         const bool loc = (unsigned)e < 32u;
         lid[t * 8 + j] = loc ? (signed char)e : (signed char)-1;
         em |= loc ? 1u << e : 0u;
@@ -845,18 +658,11 @@ DEVI void moe_body(const Params& P) {
   }
   if (tid < 64) {
     float g = hgs * (FT_GSDV ? 1.f : 256.f);
-#if MOE_PLAN
-    const u32 rin = scal[7];
-    if ((rin >> (tid & 31)) & 1u)
-      g = prgs[(tid & 32) / 4 + ((scal[11] >> 4 * __popc(rin & ((1u << (tid & 31)) - 1u))) & 15)] *
-          (FT_GSDV ? 1.f : 256.f);
-#else
     const int gj = dg ? gix(gsl, tid & 31) : -1;
     if (gj >= 0) {
       const int x = __ldg(P.gsrc + gj);
       g = AS(const float, __ldg(P.peer + 4 * (x >> 5) + 2 + (tid >> 5)))[x & 31] * 256.f;
     }
-#endif
     gsm[tid] = FT_GSDV ? g * 256.f : g;
   }
   if (tid == 0) scal[14] = par_r;
@@ -894,7 +700,7 @@ DEVI void moe_body(const Params& P) {
           SRG,
           RGS,
           XP,
-          HASWG ? 8 * (WGMIN - 1) : 32 PLAN_ARGS(P.r13, scal[7], scal[11]));
+          HASWG ? 8 * (WGMIN - 1) : 32);
     }
   }
   if (warp == 0) {
@@ -962,17 +768,6 @@ DEVI void moe_body(const Params& P) {
   } else
     __syncthreads();
   if (tid == 0) mbar_arrive(rtd);
-#if MOE_PLAN
-  if (PFS > 0 && GNEW && warp == 7) {
-    // DRAM idles until the x gather: warm the second-wave item (exact tile table)
-    const int it = blockIdx.x + gridDim.x, t = it / NRB1, rb = it - t * NRB1;
-    if (t < scal[0] && lane < PFS * KW) {
-      const u8* eb = ew_base(P.w13, P.r13, scal[7], scal[11], tiles[t].x, 512);
-      prefetch_l2(wc6_w(eb, 0, 512, lane, rb * RGS), RGS * 2048);
-      prefetch_l2(wc6_s(eb, 0, 512, lane, rb * RGS), RGS * SRG);
-    }
-  }
-#endif
   constexpr bool MOE_XDIRV = NT == 4, MOE_XRELV = NT == 4, MOE_RT_WRELV = NT == 4 && MW > 1;
   if (warp < 8) {
 #pragma unroll 1
@@ -1386,15 +1181,8 @@ DEVI void moe_body(const Params& P) {
         const int pkw = lane >> 1;
         const bool pscl = lane & 1;
         const void* wcb = phase == 1 ? P.w13 : P.w2;
-#if MOE_PLAN
-        const u8* eb = ew_base(wcb, phase == 1 ? P.r13 : P.r2, scal[7], scal[11], e, nrg_tot);
-        const int ei = 0;
-#else
-        const void* eb = wcb;
-        const int ei = e;
-#endif
         const u8* csrc =
-            pscl ? wc6_s(eb, ei, nrg_tot, kc_item + pkw, rb * RGS) : wc6_w(eb, ei, nrg_tot, kc_item + pkw, rb * RGS);
+            pscl ? wc6_s(wcb, e, nrg_tot, kc_item + pkw, rb * RGS) : wc6_w(wcb, e, nrg_tot, kc_item + pkw, rb * RGS);
         const size_t cstep = (size_t)KW * (nrg_tot >> 4) * 35840;
         u32 cdst = pscl ? WB + pkw * RGS * SRG : pkw * RGS * 2048;
         u32 cbytes = pscl ? RGS * SRG : RGS * 2048;
@@ -1422,10 +1210,6 @@ DEVI void moe_body(const Params& P) {
         } else if constexpr (LEANC)
           lrdy = phase == 1 && gathered && !xdir ? ~0u : 0u;
         const int nrx = phase == 1 ? 32 : 16;
-#if MOE_PLAN
-        const u8* wsrc = eb;
-        const int ew = 0;
-#else
         const int gj = dg ? gix(gsl, e) : -1, ew = gj >= 0 ? gj : e;
         const u8* wsrc = gj >= 0 ? (phase == 1 ? P.sw13 : P.sw2) : AS(const u8, wcb);
         if (gj >= 0) {
@@ -1435,7 +1219,6 @@ DEVI void moe_body(const Params& P) {
           __syncwarp();
           fence_async_global();
         }
-#endif
         auto wblock = [&](int kc) { return wsrc + ((size_t)(ew * 16 + kc) * nrx + rb) * (WB + SB); };
         int st_first = 0;
         if (MOE_FSTV && item == fi0 && phase == 1) {
@@ -1982,4 +1765,3 @@ DEVI void moe_body(const Params& P) {
   }
 #define INST(...) MOE_INST(moe, false, __VA_ARGS__)
 #define INSTSP(...) MOE_INST(moesp, true, __VA_ARGS__)
-#define INSTP(...) MOE_INST(moep, false, __VA_ARGS__)

@@ -49,7 +49,6 @@ _SP_CONFIGS = tuple(c for c in _CONFIGS if c[0] <= 512) + (
     (2048, (8, 14, 1, 2, 64), 232448),
 )
 _THREADS = 384
-PLAN_MAX = 256  # non-SP batches up to here: replica plan kernels (moep_*)
 _CTR_WORDS = 65536 + 16384 + 64
 
 _P, _I, _U64 = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint64
@@ -64,8 +63,7 @@ class _Params(ctypes.Structure):
         (_P, "xs yh scr"),
         (_P * 8, "xsp osp"),
         (_I, "R"),
-        (_P, "ptj preps r13 r2 rgs13 rgs2"),
-        (_I, "nrep me"),
+        (_P, "ptj"),
         (_P, "sw13 sw2 gsrc peer"),
     )
 
@@ -121,8 +119,6 @@ def _compile(name, src):
 class _Module:
     def __init__(self):
         sp_cfgs = [(c, m) for _, c, m in _SP_CONFIGS if c[1] >= 8]
-        p_cfgs = [(c, m) for b, c, m in _CONFIGS if b <= PLAN_MAX]
-        spp_cfgs = [(c, m) for b, c, m in _SP_CONFIGS if c[1] >= 8 and b < DG_MIN]
         inst = lambda cs: "".join(
             "INST{}({}, {}, {}, {}, {})\n".format(p, *c)
             for p, l in cs
@@ -144,26 +140,6 @@ class _Module:
                     self.module, "moesp_" + "_".join(map(str, c)), m
                 )
                 for c, m in sp_cfgs
-            }
-        )
-        self.plan_module = _compile(
-            "moe_w4a16_plan.cu",
-            "#define MOE_PLAN 1\n" + src + inst((("P", p_cfgs), ("SP", spp_cfgs))),
-        )
-        self.funcs.update(
-            {
-                c + ("plan",): cu.function(
-                    self.plan_module, "moep_" + "_".join(map(str, c)), m
-                )
-                for c, m in p_cfgs
-            }
-        )
-        self.funcs.update(
-            {
-                ("sp",) + c + ("plan",): cu.function(
-                    self.plan_module, "moesp_" + "_".join(map(str, c)), m
-                )
-                for c, m in spp_cfgs
             }
         )
         src = cu.read_source("moe_w4a16_big.cuh").replace(
@@ -327,7 +303,6 @@ def _launch(
     gs2,
     norm_weight,
     sp=None,
-    plan=None,
     dg=None,
 ):
     M = local_ids.shape[0]
@@ -378,21 +353,7 @@ def _launch(
         params.sw13, params.sw2, params.gsrc, params.peer = (
             t.data_ptr() for t in (*dg.stage[:2], dg.gsrc, dg.peer)
         )
-    if plan is not None:
-        rp, me, r13, r2, rg13, rg2 = plan
-        params.preps, params.r13, params.r2 = (
-            rp.data_ptr(),
-            r13.data_ptr(),
-            r2.data_ptr(),
-        )
-        params.rgs13, params.rgs2, params.nrep, params.me = (
-            rg13.data_ptr(),
-            rg2.data_ptr(),
-            rp.shape[-1],
-            me,
-        )
-        cfg = cfg + ("plan",)
-    pdl = cfg[0] != "sp" and (cfg[-1] == "plan" or cfg[4] <= 4)
+    pdl = cfg[0] != "sp" and cfg[4] <= 4
     cu.launch(
         _module(dev.index).funcs[cfg],
         ws["sms"],
@@ -452,10 +413,9 @@ def nvfp4_w4a16_moe_with_post_norm(
     w2: torch.Tensor,
     w2_global_scale: torch.Tensor,
     norm_weight: torch.Tensor,
-    plan=None,
     out=None,
 ) -> torch.Tensor:
-    """``local_ids`` -1: remote (global ids with ``plan``)."""
+    """``local_ids`` -1: remote."""
     x = hidden_states.contiguous()
     ids = local_ids.to(torch.int32).contiguous()
     tw = topk_weights.to(torch.float32).contiguous()
@@ -486,7 +446,6 @@ def nvfp4_w4a16_moe_with_post_norm(
             w2,
             w2_global_scale,
             norm_weight,
-            plan=plan,
         )
     return out
 
@@ -512,7 +471,6 @@ def nvfp4_w4a16_moe_sp(
     shard_ptrs,
     recv_ptrs,
     dg: Optional[DynamicGuests] = None,
-    plan=None,
 ) -> None:
     """Route j of token t (row t % R of rank t // R's ``shard``) -> row j * R + t % R of that rank's recv."""
     ids = local_ids.to(torch.int32).contiguous()
@@ -535,7 +493,6 @@ def nvfp4_w4a16_moe_sp(
             w2_global_scale,
             norm_weight,
             (shard_ptrs, recv_ptrs, R),
-            plan=plan,
             dg=dg,
         )
         return

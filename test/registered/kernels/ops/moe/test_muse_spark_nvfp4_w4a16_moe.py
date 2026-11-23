@@ -1,4 +1,4 @@
-"""Fused NVFP4 W4A16 MoE vs fp64 torch and Marlin; moved work; CUDA graph replay."""
+"""Fused NVFP4 W4A16 MoE vs fp64 torch and Marlin; dynamic guests; CUDA graph replay."""
 
 import functools
 from types import SimpleNamespace
@@ -35,12 +35,6 @@ def _gs():  # BF16-exact global scales of 256 experts: gate-up, down
 def _ranks():  # 8 ranks: global expert 32 r + i is rank r's local expert i
     w = [[_experts.__wrapped__(n, r)[2] for r in range(1, 8)] for n in (2 * H, H)]
     return (*(torch.cat([_experts(n)[2], *t]) for n, t in zip((2 * H, H), w)), *_gs())
-
-
-@functools.cache
-def _held():  # replicas: rank g holds expert j of rank g + j + 1
-    g, j = torch.arange(8, device=G)[:, None], torch.arange(6, device=G)
-    return (32 * ((g + j + 1) % 8) + j).int()
 
 
 @functools.cache
@@ -151,72 +145,52 @@ def test_not_less_accurate_than_marlin(M):
     assert err(ours) <= err(stock) <= 2**-7 * ref.norm().item()
 
 
-def _all_ranks(x, ids, tw, nw, sp, moved):
-    """8 ranks on one GPU. moved 0: none, 1: replicas (SP from DG_MIN: guests),
-    2: replica plan holding nothing, 3: replicas with zeroed weights."""
+def _all_ranks(x, ids, tw, nw, guests_on):
+    """8 SP ranks on one GPU; with ``guests_on`` busy ranks' experts run as dynamic guests."""
     (w13, w2, g13, g2), M = _ranks(), x.shape[0]
-    held = _held() * int(moved != 2) - int(moved == 2)  # -1: not held
     xs, ptrs, guests = x.view(8, -1, H), lambda t: [p.data_ptr() for p in t], 0
-    res = torch.zeros(M, H, dtype=D, device=G)
-    if sp:  # recv: [rank, route j, row]
-        res = x.new_full((8, 8, M // 8, H), float("nan"))
+    res = x.new_full((8, 8, M // 8, H), float("nan"))  # recv: [rank, route j, row]
     for r in range(8):
-        own, plan, dg = slice(32 * r, 32 * r + 32), None, None
+        own, dg = slice(32 * r, 32 * r + 32), None
         local = torch.where(ids // 32 == r, ids % 32, -1)
-        if moved and (not sp or M < m.DG_MIN):  # replica plan: global ids
-            rep = [t[held[r].long()] * (moved != 3) for t in (w13, w2, g13, g2)]
-            local, plan = ids, (held, r, *rep)
-        elif moved:  # dynamic guests: local ids 32 + j
+        if guests_on:  # local ids 32 + j
             dg, dur = _guests(), torch.arange(1, 9, dtype=torch.int32, device=G)
             local = m.sp_dynamic_guest_ids(ids, r, dg.gsrc, dur)
             guests += int((local >= 32).sum())
         a = (local, tw, w13[own], g13[own], w2[own], g2[own], nw)
-        if sp:
-            kw = dict(shard_ptrs=ptrs(xs), recv_ptrs=ptrs(res), dg=dg, plan=plan)
-            m.nvfp4_w4a16_moe_sp(*a, shard=xs[r], **kw)
-        else:
-            res += m.nvfp4_w4a16_moe_with_post_norm(x, *a, plan=plan)
+        kw = dict(shard_ptrs=ptrs(xs), recv_ptrs=ptrs(res), dg=dg)
+        m.nvfp4_w4a16_moe_sp(*a, shard=xs[r], **kw)
     return res, guests
 
 
-@sm90  # decode: plan to PLAN_MAX; SP: plan, guests from DG_MIN, big kernel from BIG_MIN
-@pytest.mark.parametrize(
-    "M,sp,skew",
-    [(8, 0, 1), (256, 0, 0), (256, 0, 1), (256, 1, 1), (768, 1, 1), (776, 1, 1)]
-    + [(2048, 1, 1), (2056, 1, 0), (8200, 1, 1)],
-)
-def test_moved_work_same_math(M, sp, skew):
+@sm90  # guests from DG_MIN, big kernel from BIG_MIN
+@pytest.mark.parametrize("M,skew", [(776, 1), (2048, 1), (2056, 0), (8200, 1)])
+def test_guests_same_math(M, skew):
     x, ids, tw, nw = _inputs(M, 256, skew, M)
-    if not sp:  # one weighted route per token: the ranks' outputs add exactly
-        tw = torch.zeros_like(tw).scatter_(1, torch.randint(0, 8, (M, 1), device=G), tw)
-    run = lambda moved: _all_ranks(x, ids, tw, nw.float(), sp, moved)
-    (base, _), (moved, guests), (again, _) = run(0), run(1), run(1)
+    run = lambda on: _all_ranks(x, ids, tw, nw.float(), on)
+    (base, _), (moved, guests), (again, _) = run(False), run(True), run(True)
     assert torch.equal(moved, again)  # deterministic
     if skew:  # positive control: work did move
-        assert guests if sp and M >= m.DG_MIN else not torch.equal(base, run(3)[0])
-    if sp:  # each route's row, NaN-initialized, written once, same bits wherever it ran
-        assert torch.equal(base, moved)
-        return
-    assert torch.equal(base, run(2)[0])
-    # a rank's last tiles split K (fp32 y, no BF16 y); moves change which those are
-    tol = 2**-7 * base.abs() + 2**-12 * base.abs().mean()
-    assert ((moved - base).abs() <= tol).all()
+        assert guests
+    # each route's row, NaN-initialized, written once, same bits wherever it ran
+    assert torch.equal(base, moved)
 
 
 @sm90
 @pytest.mark.parametrize("M", [1, 256])
 def test_cuda_graph_replay(M):
-    """Decode with the replica plan, captured once, replayed on new inputs: as eager."""
-    (w13, w2, g13, g2), held = _ranks(), _held()
-    plan = (held, 0, *(t[held[0].long()] for t in (w13, w2, g13, g2)))
+    """Decode on rank 0 of 8, captured once, replayed on new inputs: as eager."""
+    (w13, w2, g13, g2), local = _ranks(), lambda i: torch.where(i < E, i, -1)
     x, ids, tw, nw = _inputs(M, 256, 0, 0)
+    ids = local(ids)
     a = (x, ids, tw, w13[:E], g13[:E], w2[:E], g2[:E], nw.float())
-    run = lambda out=None: m.nvfp4_w4a16_moe_with_post_norm(*a, plan=plan, out=out)
+    run = lambda out=None: m.nvfp4_w4a16_moe_with_post_norm(*a, out=out)
     out, graph = run(), torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(out)
     for seed, skew in ((1, 0), (2, 1), (3, 0)):
-        for t, v in zip((x, ids, tw), _inputs(M, 256, skew, seed)):
-            t.copy_(v)
+        v = _inputs(M, 256, skew, seed)
+        for t, u in zip((x, ids, tw), (v[0], local(v[1]), v[2])):
+            t.copy_(u)
         graph.replay()
         assert torch.equal(out, run())
