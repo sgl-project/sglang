@@ -909,11 +909,13 @@ FROM scratch AS mega_source_0
 WORKDIR /src
 
 FROM scratch AS mega_source_1
-ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
+# DeepSeek-V4.1 Rubin L tree: sgl-nvidia-mega branch dsv41-rubin-sm107 (sm107 kernel
+# directory, PD decode role, TP8 without expert parallelism) at a fixed commit.
+ARG SGL_NVIDIA_MEGA_REPO="https://github.com/trevor-m/sgl-nvidia-mega.git"
 # Keep the legacy commit argument as a fallback for existing build scripts.
 ARG SGL_NVIDIA_MEGA_COMMIT
-# Explicit REF takes precedence; otherwise use the legacy commit or main.
-ARG SGL_NVIDIA_MEGA_REF=${SGL_NVIDIA_MEGA_COMMIT:-main}
+# Explicit REF takes precedence; otherwise use the legacy commit or the L tree's pin.
+ARG SGL_NVIDIA_MEGA_REF=${SGL_NVIDIA_MEGA_COMMIT:-ac89d1d5165fe0814ec9105c1ebce311508a32e8}
 ADD --keep-git-dir=true ${SGL_NVIDIA_MEGA_REPO}#${SGL_NVIDIA_MEGA_REF} /src/
 
 FROM mega_source_${ENABLE_SGL_NVIDIA_MEGA} AS mega_source

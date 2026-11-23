@@ -1,11 +1,13 @@
 name: Release Docker Images Nightly (CUDA 13.4 Rubin)
 #
-# Builds and publishes nightly CUDA 13.4 / Rubin (sm_107) images from
-# docker/Dockerfile.cu134 for x86_64 and aarch64, merged into multi-arch tags:
-#   - lmsysorg/sglang:nightly-cu134-{date}-{sha}
-#   - lmsysorg/sglang:nightly-cu134
+# DeepSeek-V4.1 Rubin L tree branch (dsv41f-rubin-l): builds and publishes CUDA 13.4 /
+# Rubin (sm_107) images from docker/Dockerfile.cu134 (sgl-nvidia-mega pinned) for x86_64
+# and aarch64, merged into multi-arch tags:
+#   - lmsysorg/sglang:dsv41f-rubin-l-{sha}
+#   - lmsysorg/sglang:dsv41f-rubin-l
 # Each architecture is also pushed to a rolling single-arch tag
-# (nightly-cu134-amd64 / nightly-cu134-arm64) that the merge step reads by digest.
+# (dsv41f-rubin-l-amd64 / dsv41f-rubin-l-arm64) that the merge step reads by digest.
+# This branch never publishes the nightly-cu134 tags.
 #
 
 on:
@@ -45,14 +47,13 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          date_tag="$(date +%Y%m%d)"
           commit="$(git rev-parse HEAD)"
           commit_hash="${commit:0:7}"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
           image_repo="${{ inputs.image_repo || 'lmsysorg/sglang' }}"
           echo "image_repo=${image_repo}"                                  >> "$GITHUB_OUTPUT"
-          echo "tag=nightly-cu134-${date_tag}-${commit_hash}"              >> "$GITHUB_OUTPUT"
-          echo "tag_rolling=nightly-cu134"                                 >> "$GITHUB_OUTPUT"
+          echo "tag=dsv41f-rubin-l-${commit_hash}"                         >> "$GITHUB_OUTPUT"
+          echo "tag_rolling=dsv41f-rubin-l"                                >> "$GITHUB_OUTPUT"
 
   build:
     needs: meta
@@ -92,14 +93,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Resolve Mega main
+      - name: Pin Mega (DeepSeek-V4.1 Rubin L tree)
         id: mega
+        env:
+          MEGA_REPO: https://github.com/trevor-m/sgl-nvidia-mega.git
+          MEGA_COMMIT: ac89d1d5165fe0814ec9105c1ebce311508a32e8
         run: |
           set -euo pipefail
-          MEGA_COMMIT="$(git ls-remote --exit-code https://github.com/sgl-project/sgl-nvidia-mega.git refs/heads/main | cut -f1)"
           [[ "$MEGA_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          echo "repo=$MEGA_REPO" >> "$GITHUB_OUTPUT"
           echo "commit=$MEGA_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "Mega main: $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Mega: $MEGA_REPO @ $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build image
         run: |
@@ -113,6 +117,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg BUILD_JOBS="$(nproc)" \
             --build-arg MANYLINUX_IMAGE="${{ matrix.manylinux_image }}" \
+            --build-arg SGL_NVIDIA_MEGA_REPO=${{ steps.mega.outputs.repo }} \
             --build-arg SGL_NVIDIA_MEGA_REF=${{ steps.mega.outputs.commit }} \
             --build-arg SGLANG_BUILD_COMMIT=${{ steps.meta.outputs.commit }} \
             --build-arg SGLANG_BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
