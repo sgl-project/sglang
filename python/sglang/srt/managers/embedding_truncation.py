@@ -147,6 +147,28 @@ def _truncate_multimodal_tail(
     )
 
 
+def embedding_effective_token_limit(
+    *,
+    truncate: Literal["END", "START", "NONE"],
+    max_tokens: Optional[int],
+    input_token_limit: int,
+) -> int:
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens < -1
+    ):
+        raise ValueError("max_tokens must be an integer greater than or equal to -1.")
+    if truncate != "NONE" and max_tokens is not None and max_tokens > input_token_limit:
+        raise ValueError(
+            f"max_tokens={max_tokens} exceeds the server's embedding input budget "
+            f"of {input_token_limit} tokens."
+        )
+    if max_tokens is None or (max_tokens == -1 and truncate != "NONE"):
+        return input_token_limit
+    return min(max_tokens, input_token_limit)
+
+
 def truncate_embedding_input(
     input_ids,
     *,
@@ -170,25 +192,15 @@ def truncate_embedding_input(
     """
     if truncate not in ("END", "START", "NONE"):
         raise ValueError("embedding_truncate must be END, START, or NONE.")
-    if max_tokens is not None and (
-        isinstance(max_tokens, bool)
-        or not isinstance(max_tokens, int)
-        or max_tokens < -1
-    ):
-        raise ValueError("max_tokens must be an integer greater than or equal to -1.")
+    limit = embedding_effective_token_limit(
+        truncate=truncate,
+        max_tokens=max_tokens,
+        input_token_limit=input_token_limit,
+    )
     if input_ids is None:
         raise ValueError(
             "Embedding input token IDs are unavailable after preprocessing."
         )
-    if truncate != "NONE" and max_tokens is not None and max_tokens > input_token_limit:
-        raise ValueError(
-            f"max_tokens={max_tokens} exceeds the server's embedding input budget "
-            f"of {input_token_limit} tokens."
-        )
-    if max_tokens is None or (max_tokens == -1 and truncate != "NONE"):
-        limit = input_token_limit
-    else:
-        limit = min(max_tokens, input_token_limit)
     length = len(input_ids)
     if mm_inputs is not None and mm_inputs.mm_items and mm_inputs.input_ids is None:
         raise ValueError(

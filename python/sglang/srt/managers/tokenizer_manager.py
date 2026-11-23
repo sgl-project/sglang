@@ -93,6 +93,7 @@ from sglang.srt.managers.embed_types import (
     validate_positional_embed_overrides,
 )
 from sglang.srt.managers.embedding_truncation import (
+    embedding_effective_token_limit,
     embedding_input_token_limit,
     truncate_embedding_input,
 )
@@ -1354,15 +1355,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                (
-                    input_ids,
-                    token_type_ids,
-                    special_tokens_mask,
-                ) = await self._tokenize_texts(
-                    input_text,
-                    is_cross_encoder_request,
-                    **self._embedding_tokenizer_kwargs(obj),
-                )
+                if isinstance(obj, EmbeddingReqInput):
+                    (
+                        input_ids,
+                        token_type_ids,
+                        special_tokens_mask,
+                    ) = await self._tokenize_embedding_texts(
+                        input_text, obj, is_cross_encoder_request
+                    )
+                else:
+                    (
+                        input_ids,
+                        token_type_ids,
+                        special_tokens_mask,
+                    ) = await self._tokenize_texts(input_text, is_cross_encoder_request)
 
         if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(
@@ -1547,6 +1553,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             kwargs["return_special_tokens_mask"] = True
         return kwargs
 
+    async def _tokenize_embedding_texts(self, texts, obj, is_cross_encoder=False):
+        """Defer the special-token mask until a request exceeds its token budget."""
+        mask_kwargs = self._embedding_tokenizer_kwargs(obj)
+        kwargs = dict(mask_kwargs)
+        kwargs.pop("return_special_tokens_mask", None)
+        input_ids, token_type_ids, _ = await self._tokenize_texts(
+            texts, is_cross_encoder, **kwargs
+        )
+        if "return_special_tokens_mask" not in mask_kwargs:
+            return input_ids, token_type_ids, None
+
+        limit = embedding_effective_token_limit(
+            truncate=obj.embedding_truncate,
+            max_tokens=obj.embedding_max_tokens,
+            input_token_limit=self._embedding_input_token_limit(),
+        )
+        input_ids_list = [input_ids] if isinstance(texts, str) else input_ids
+        if all(len(ids) <= limit for ids in input_ids_list):
+            return input_ids, token_type_ids, None
+        return await self._tokenize_texts(texts, is_cross_encoder, **mask_kwargs)
+
+    def _embedding_input_token_limit(self) -> int:
+        schedule = get_schedule()
+        return embedding_input_token_limit(
+            context_len=self.context_len,
+            num_reserved_tokens=self.num_reserved_tokens,
+            max_req_input_len=self.max_req_input_len,
+            max_prefill_tokens=(
+                schedule.max_prefill_tokens
+                if schedule.chunked_prefill_size <= 0
+                else None
+            ),
+        )
+
     def _truncate_embedding_input(
         self,
         obj,
@@ -1558,17 +1598,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not isinstance(obj, EmbeddingReqInput) or obj.embedding_truncate is None:
             return input_ids, token_type_ids, mm_inputs
 
-        schedule = get_schedule()
-        limit = embedding_input_token_limit(
-            context_len=self.context_len,
-            num_reserved_tokens=self.num_reserved_tokens,
-            max_req_input_len=self.max_req_input_len,
-            max_prefill_tokens=(
-                schedule.max_prefill_tokens
-                if schedule.chunked_prefill_size <= 0
-                else None
-            ),
-        )
+        limit = self._embedding_input_token_limit()
         input_ids, token_type_ids, mm_inputs = truncate_embedding_input(
             input_ids,
             truncate=obj.embedding_truncate,
@@ -2112,13 +2142,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
-        (
-            input_ids_list,
-            token_type_ids_list,
-            special_tokens_masks,
-        ) = await self._tokenize_texts(
-            texts, is_cross_encoder_request, **self._embedding_tokenizer_kwargs(obj)
-        )
+        if isinstance(obj, EmbeddingReqInput):
+            (
+                input_ids_list,
+                token_type_ids_list,
+                special_tokens_masks,
+            ) = await self._tokenize_embedding_texts(
+                texts, obj, is_cross_encoder_request
+            )
+        else:
+            (
+                input_ids_list,
+                token_type_ids_list,
+                special_tokens_masks,
+            ) = await self._tokenize_texts(texts, is_cross_encoder_request)
 
         # Process all requests
         tokenized_objs = []
