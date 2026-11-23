@@ -1253,7 +1253,8 @@ class Envs:
     # per-rank capacity, ceil(max tokens / TP size).
     SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS = EnvInt(4096)
     # Dtype of the data the kernel's ranks exchange. fp8 (default) is lossy: it adds
-    # quantization error beyond the stock bf16 all-reduce. bf16 is the accurate mode.
+    # quantization error beyond the stock bf16 all-reduce. bf16 keeps that data in
+    # bf16; the output can still differ from the stock path's (its own sum order).
     SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE = EnvStr("fp8")
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
