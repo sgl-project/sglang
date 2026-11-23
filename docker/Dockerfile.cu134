@@ -581,7 +581,7 @@ FROM torch_deps AS halops_wheel
 # for the opt-in --fp8-gemm-backend=halops. Only prebuilt wheels are published,
 # so fetch the one matching this image's Python and platform. A missing or
 # mismatched wheel leaves /wheels empty and the install step skips it.
-ARG HALOPS_VERSION=0.1.0
+ARG HALOPS_VERSION=0.2.0
 ARG HALOPS_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 
 WORKDIR /build

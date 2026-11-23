@@ -37,7 +37,7 @@ def load_halops_gemm():
         raise RuntimeError(
             "HALOps GEMM backend requested, but the `halops` package is not installed. "
             "The official Docker image ships it; outside Docker install it with: "
-            "pip install halops==0.1.0 "
+            "pip install halops==0.2.0 "
             "-f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/"
             "or build from source"
         ) from exc
