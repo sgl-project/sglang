@@ -98,6 +98,7 @@ class EagleVerifyInput(SpecInput):
         plan: IterationIds,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         window: Optional[WindowRead] = None,
+        token_mapping: Optional[torch.Tensor] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the `RunnerIds` packs the read ids straight into
@@ -128,6 +129,7 @@ class EagleVerifyInput(SpecInput):
             out=kv_indices,
             kind=kind,
             kv_start_idx=None if window is None else window.start,
+            token_mapping=token_mapping,
             # The runner_ids tiles the gather over token blocks, sized from
             # the length sum (an upper bound on the longest live row) while
             # it is still a host int.
@@ -436,6 +438,7 @@ class EagleDraftExtendInput(SpecInput):
         plan: IterationIds,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         window: Optional[WindowRead] = None,
+        token_mapping: Optional[torch.Tensor] = None,
     ):
         """Draft-extend CSR args. ``paged_kernel_lens`` already includes the
         draft-extend window; a ``window`` read starts each row at its window's
@@ -473,6 +476,7 @@ class EagleDraftExtendInput(SpecInput):
             out=kv_indices,
             kv_start_idx=None if window is None else window.start,
             kind=kind,
+            token_mapping=token_mapping,
             num_token_blocks=None,
             kv_lens_sum=host_kv_lens_sum,
         )

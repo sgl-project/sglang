@@ -68,6 +68,7 @@ class NgramVerifyInput(SpecInput):
         plan: IterationIds,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         window: Optional[WindowRead] = None,
+        token_mapping: Optional[torch.Tensor] = None,
     ):
         """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
         is widened here; the `RunnerIds` packs the read ids straight into
@@ -95,6 +96,7 @@ class NgramVerifyInput(SpecInput):
             out=kv_indices,
             kind=kind,
             kv_start_idx=None if window is None else window.start,
+            token_mapping=token_mapping,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
