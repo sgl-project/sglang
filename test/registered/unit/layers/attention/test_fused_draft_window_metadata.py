@@ -41,7 +41,8 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_cuda
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods import (
     dense_attention as _kit,
 )
@@ -61,6 +62,7 @@ _kit._parallel_override.__exit__(None, None, None)
 _VERIFY = 4
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestFusedDraftWindowMetadata(CustomTestCase):
@@ -643,6 +645,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.assertEqual(rows.shape[0], _VERIFY)
         self.assertTrue(torch.equal(rows, expected[live].expand_as(rows)))
 
+    @unittest.skipUnless(is_cuda(), "trtllm_mha runs on CUDA only")
     def test_trtllm_encoder_only_verify_reads_the_window_table(self):
         """An all-sliding non-causal DFLASH draft on a window band verifies
         through the ENCODER_ONLY rows, which take one page table for every
@@ -679,6 +682,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 metadata, IdSpaceKind.SLIDING_WINDOW, length, window
             )
 
+    @unittest.skipUnless(is_cuda(), "trtllm_mha runs on CUDA only")
     def test_trtllm_encoder_only_verify_with_a_full_layer_reads_the_full_table(self):
         """The ENCODER_ONLY rows take one table for all their layers, so a
         draft with any such layer on the full band keeps the full table."""
