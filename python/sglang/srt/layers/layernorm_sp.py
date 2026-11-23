@@ -41,7 +41,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
 
@@ -349,6 +349,10 @@ def sp_fused_matmul_eligible(linear) -> bool:
         return _HAS_NPU_MC2_FUSED and linear.weight.ndim == 2
     if getattr(linear, "_sp_use_cutlass", False):
         return True
+    if is_hip():
+        # Workaround: the Torch fused ops run GEMMs on two streams at once, which
+        # deadlocks hipBLASLt; drop once it supports that.
+        return False
     return _HAS_TORCH_SYMM_MEM_FUSED
 
 

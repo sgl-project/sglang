@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip, print_info_once
 from sglang.srt.utils.common import cdiv, get_bool_env_var
 
@@ -357,10 +357,12 @@ class KimiK3MoEHipMixin:
         shared: torch.Tensor,
         num_tokens: int,
         prefix_sum: torch.Tensor,
+        keep_shard: bool = False,
     ) -> torch.Tensor:
         """The latent norm, up-projection and shared + residual add on this
         rank's rows of the complete latent and shared sums, then the all-gather
-        of the stream, or the stream left on this rank's rows."""
+        of the stream, or the stream left on this rank's rows (keep_shard: its
+        padded rows)."""
         from sglang.srt.models.kimi_k3 import _add3
 
         rows, hidden_size = shared.shape
@@ -378,6 +380,8 @@ class KimiK3MoEHipMixin:
             )
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
         stream_rows = _add3(out, shared, prefix)
+        if keep_shard:
+            return stream_rows
         if self._row_stream:
             # the next read takes this rank's rows (attn_bank._bank_rows)
             return stream_rows[: row_shard(num_tokens, self.tp_size, tp_rank)[1]]
@@ -469,7 +473,29 @@ class KimiK3MoEHipMixin:
         )
         return True
 
-    def _forward_row_front(self, prefix_sum: torch.Tensor) -> torch.Tensor:
+    def forward_sp_rows_hip(
+        self,
+        *,
+        rows: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        num_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """A sequence-parallel pass: the row-sharded front and tail on the padded
+        rows this rank holds, the stream left on them. None: take the gathered path."""
+        if (
+            prefix_sum is None
+            or prefix_sum.shape[0] != rows.shape[0]
+            or not self._row_sharded_tail_eligible(
+                num_tokens=num_tokens, has_prefix=True
+            )
+            or not self.shard_front(normed=rows, num_tokens=num_tokens)
+        ):
+            return None
+        return self._forward_row_front(prefix_sum, keep_shard=True)
+
+    def _forward_row_front(
+        self, prefix_sum: torch.Tensor, keep_shard: bool = False
+    ) -> torch.Tensor:
         """The routed experts on what shard_front gathered and the latent
         reduce-scatter (on the side stream in eager batches), then the row-sharded
         tail. The shared experts run TP-sharded on every gathered row first, their
@@ -509,7 +535,9 @@ class KimiK3MoEHipMixin:
         )
         if side_stream is not None:
             torch.cuda.current_stream().wait_stream(side_stream)
-        return self._row_tail(latent, shared, num_tokens, prefix_sum)
+        return self._row_tail(
+            latent, shared, num_tokens, prefix_sum, keep_shard=keep_shard
+        )
 
     def _column_tail_and_next_read(
         self,
@@ -822,3 +850,60 @@ def link_column_tails_hip(model) -> None:
             comm=comm,
             max_tokens=max_tokens,
         )
+
+
+def sp_o_proj_full_weight_hip(attn) -> Optional[torch.Tensor]:
+    """Post-load under --enable-layernorm-sp: o_proj's [hidden, tp * heads_width]
+    weight, column shards in rank order, or None to keep the reduce-scatter.
+    A collective: every rank loads the same layers in order."""
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.kimi_k3 import KimiK3MLAAttention
+
+    weight = attn.o_proj.weight
+    if not (
+        get_flags().sp.enabled
+        and isinstance(attn.o_proj.quant_method, UnquantizedLinearMethod)
+        and weight.dtype == torch.bfloat16
+        # MLA hands back its gated heads through the output-gate wrapper
+        and (not isinstance(attn, KimiK3MLAAttention) or attn.use_output_gate)
+    ):
+        return None
+    group = get_parallel().tp_group
+    local, full = _sp_o_proj_scratch(
+        group.world_size, weight.shape[1], weight.shape[0], weight.dtype, weight.device
+    )
+    local.copy_(weight.t())
+    torch.distributed.all_gather_into_tensor(full, local, group=group.device_group)
+    return full.t().contiguous()
+
+
+@cache
+def _sp_o_proj_scratch(
+    world_size: int, width: int, hidden: int, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Never freed: cached blocks left at load move later allocations, and the
+    # hipBLASLt-fallback GEMM of the first forward then faults (gfx950, ROCm 10).
+    return (
+        torch.empty(width, hidden, dtype=dtype, device=device),
+        torch.empty(world_size * width, hidden, dtype=dtype, device=device),
+    )
+
+
+def sp_o_proj_rows_hip(
+    *, heads: torch.Tensor, full_weight: torch.Tensor, shard_rows: int
+) -> torch.Tensor:
+    """o_proj's complete output on this rank's padded rows: an all-to-all hands
+    the rank every head of its rows, far less traffic than a reduce-scatter."""
+    from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+    group = get_parallel().tp_group
+    world = group.world_size
+    padded = shard_rows * world
+    if heads.shape[0] < padded:
+        heads = torch.nn.functional.pad(heads, (0, 0, 0, padded - heads.shape[0]))
+    heads = heads.contiguous()
+    received = torch.empty_like(heads)
+    group.all_to_all_single(received, heads)
+    # [rank, row, width] -> [row, rank * width]
+    rows = received.view(world, shard_rows, -1).transpose(0, 1).reshape(shard_rows, -1)
+    return _k3_bf16_gemm(x=rows, weight=full_weight)
