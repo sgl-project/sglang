@@ -28,6 +28,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.native_compact import pack_verify_inputs
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
 )
@@ -485,7 +486,34 @@ class TargetVerifyExecutor:
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
-        if full_block:
+        runner = self.model_runner.decode_cuda_graph_runner
+        outputs = (
+            runner.compact_input_buffers(layout.graph_num_tokens)
+            if envs.SGLANG_DSPARK_COMPACT_DIRECT_INPUTS.get() and runner is not None
+            else None
+        )
+        if outputs is not None:
+            ids, positions, locations, window_index = outputs
+            pack_verify_inputs(
+                indptr=layout.qo_indptr_device,
+                reqs=batch.req_pool_indices,
+                prefixes=batch.seq_lens,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                anchors=draft_block_ids,
+                drafts=draft_tokens,
+                width=stride,
+                ids=ids,
+                positions=positions,
+                locations=locations,
+                window_index=window_index,
+            )
+            ragged_window = RaggedVerifyWindow(
+                positions=positions,
+                verify_cache_loc=locations,
+                verify_ids=ids,
+                window_index=window_index,
+            )
+        elif full_block:
             # Nothing to pack: the verify rows are the verify window.
             verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
             ragged_window = RaggedVerifyWindow(
