@@ -513,12 +513,17 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             parallel_state.destroy_model_parallel()
 
 
-def _init_tp8_dcp(is_hip, dcp_size=8):
+def _init_tp8_dcp(is_hip, dcp_size=8, tp_has_quick_allreduce=False):
     created = {}
 
     def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
         group = Mock()
         group.device_group = Mock()
+        group.qr_comm = (
+            Mock()
+            if tp_has_quick_allreduce and kwargs.get("group_name") == "tp"
+            else None
+        )
         created[kwargs.get("group_name", "unknown")] = group
         return group
 
@@ -574,6 +579,39 @@ def test_non_hip_full_width_dcp_keeps_separate_group():
     assert "dcp" in created
     assert dcp is not tp
     assert dcp_destroys == 1
+
+
+def test_hip_full_width_dcp_keeps_separate_group_when_tp_has_quick_allreduce():
+    """DCP must not inherit TP's QuickAllReduce: a quantized QR regime would round
+    the bf16 all-reduce of DCP's MHA merge, so DCP keeps its own QR-free group."""
+    created, tp, dcp, dcp_destroys, _ = _init_tp8_dcp(
+        is_hip=True, tp_has_quick_allreduce=True
+    )
+    assert dcp is not tp
+    assert created["dcp"] is dcp
+    assert dcp.qr_comm is None
+    assert dcp_destroys == 1
+
+
+def test_destroy_model_parallel_destroys_each_aliased_group_once():
+    """Groups that alias TP (DCP, attention CP/TP, MoE) must not destroy the shared
+    coordinator again, whichever of them aliases it."""
+    tp, pp = Mock(), Mock()
+    with (
+        patch.object(parallel_state, "_SHARED_EXPERTS_TP", tp),
+        patch.object(parallel_state, "_TP", tp),
+        patch.object(parallel_state, "_PP", pp),
+        patch.object(parallel_state, "_DCP", tp),
+        patch.object(parallel_state, "_MOE_EP", tp),
+        patch.object(parallel_state, "_MOE_TP", tp),
+        patch.object(parallel_state, "_MOE_DP", tp),
+        patch.object(parallel_state, "_ATTN_CP", tp),
+        patch.object(parallel_state, "_ATTN_TP", tp),
+    ):
+        parallel_state.destroy_model_parallel()
+        assert parallel_state._TP is None and parallel_state._ATTN_TP is None
+    assert tp.destroy.call_count == 1
+    assert pp.destroy.call_count == 1
 
 
 def _read_group_descs(group_name):

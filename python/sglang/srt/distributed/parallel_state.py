@@ -2734,7 +2734,13 @@ def initialize_model_parallel(
                 dcp_group_ranks.append(
                     tp_group[start : start + decode_context_parallel_size]
                 )
-        if is_hip() and decode_context_parallel_size == tensor_model_parallel_size:
+        if (
+            is_hip()
+            and decode_context_parallel_size == tensor_model_parallel_size
+            # DCP must not inherit TP's QuickAllReduce: the MHA merge all-reduces
+            # bf16 outputs, which a quantized QR regime would round.
+            and _TP.qr_comm is None
+        ):
             # Full-width DCP preserves TP rank order.
             _DCP = _TP
         else:
@@ -3295,56 +3301,31 @@ def destroy_model_parallel():
         dwdp_mgr.cleanup()
         set_global_dwdp_manager(None)
 
-    global _SHARED_EXPERTS_TP
-    global _ATTN_TP
-    global _TP
-    if (
-        _SHARED_EXPERTS_TP is not None
-        and _SHARED_EXPERTS_TP is not _ATTN_TP
-        and _SHARED_EXPERTS_TP is not _TP
-    ):
-        _SHARED_EXPERTS_TP.destroy()
-    _SHARED_EXPERTS_TP = None
+    global _SHARED_EXPERTS_TP, _TP, _PP, _DCP, _MOE_EP, _MOE_TP, _MOE_DP
+    global _ATTN_CP, _ATTN_TP
+    _destroy_groups_once(
+        _SHARED_EXPERTS_TP,
+        _TP,
+        _PP,
+        _DCP,
+        _MOE_EP,
+        _MOE_TP,
+        _MOE_DP,
+        _ATTN_CP,
+        _ATTN_TP,
+    )
+    _SHARED_EXPERTS_TP = _TP = _PP = _DCP = None
+    _MOE_EP = _MOE_TP = _MOE_DP = _ATTN_CP = _ATTN_TP = None
 
-    tp_group_destroyed = _TP
-    if _TP:
-        _TP.destroy()
-    _TP = None
 
-    global _PP
-    if _PP:
-        _PP.destroy()
-    _PP = None
-
-    global _DCP
-    if _DCP and _DCP is not tp_group_destroyed:
-        _DCP.destroy()
-    _DCP = None
-
-    global _MOE_EP
-    if _MOE_EP:
-        _MOE_EP.destroy()
-    _MOE_EP = None
-
-    global _MOE_TP
-    if _MOE_TP:
-        _MOE_TP.destroy()
-    _MOE_TP = None
-
-    global _ATTN_CP
-    global _MOE_DP
-    # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
-    # Only destroy if not aliasing another group.
-    if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
-        _MOE_DP.destroy()
-    _MOE_DP = None
-    if _ATTN_CP:
-        _ATTN_CP.destroy()
-    _ATTN_CP = None
-
-    if _ATTN_TP:
-        _ATTN_TP.destroy()
-    _ATTN_TP = None
+def _destroy_groups_once(*groups: Optional[GroupCoordinator]) -> None:
+    # Several groups (_DCP, _ATTN_CP, _ATTN_TP, _MOE_*) may alias _TP or each other.
+    destroyed: set[int] = set()
+    for group in groups:
+        if group is None or id(group) in destroyed:
+            continue
+        destroyed.add(id(group))
+        group.destroy()
 
 
 def destroy_distributed_environment():
