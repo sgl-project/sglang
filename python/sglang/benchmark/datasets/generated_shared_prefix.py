@@ -138,18 +138,21 @@ def get_gen_prefix_cache_path(
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
     input_ids: bool = False,
+    ordered: Optional[bool] = None,
 ):
-    """Create cache directory under ~/.cache/sglang/benchmark.
+    """Build a cache path under ~/.cache/sglang/benchmark.
 
-    The uniform-mode filename is preserved exactly as before so existing
-    on-disk caches remain valid. Non-default sampling modes get an extra
-    suffix encoding the parameters that affect the cached payload.
+    Ordered and shuffled variants do not reuse legacy caches whose ordering
+    is unknown. Leaving ordered unset preserves the legacy path used by the
+    HiCache benchmark.
     """
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     suffix = ""
     if group_distribution != "uniform":
         suffix = f"_{group_distribution}_{zipf_alpha}"
+    if ordered is not None:
+        suffix += "_ordered" if ordered else "_shuffled"
     # input_ids payloads are raw token-id lists, not decoded text; keep them
     # under a distinct key so a text-mode cache is never loaded as ids.
     if input_ids:
@@ -207,6 +210,7 @@ def sample_generated_shared_prefix_requests(
         group_distribution=group_distribution,
         zipf_alpha=zipf_alpha,
         input_ids=input_ids,
+        ordered=ordered,
     )
     # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
     # cache key; send_routing_key embeds a per-run uuid + timestamp that is
