@@ -468,6 +468,19 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "sgl-kernel"
+    qsa_decode_attention_backend: A[
+        str,
+        Arg(
+            help="QSA (Qwen sparse attention, Qwen4-Exp) decode attention backend. "
+            "'auto' (default) gathers the selected K/V into a scratch and runs "
+            "FlashInfer's dense trtllm-gen paged decode over it. "
+            "'flashinfer_sparse' runs FlashInfer's prims-ts "
+            "QToken-KvBlock-Sparse-Attention in place over the paged BF16 KV "
+            "pool (one kernel, no gather; SM100/SM103/SM107, decode only) and "
+            "keeps the default path where it does not apply.",
+            choices=["auto", "flashinfer_sparse"],
+        ),
+    ] = "auto"
     disable_flashinfer_autotune: A[
         bool,
         "Disable FlashInfer autotuning.",
