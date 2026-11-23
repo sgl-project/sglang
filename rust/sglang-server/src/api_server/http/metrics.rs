@@ -16,6 +16,7 @@ use axum::routing::get;
 
 use super::app::AppState;
 use super::auth::DeclaredRoute;
+use crate::api_server::core::FrontendMetrics;
 use crate::utils::prometheus;
 
 /// Python's `CONTENT_TYPE_PLAIN_0_0_4`, the type it answers a scrape that
@@ -40,15 +41,18 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // Writing this frontend's file and reading every process's is blocking
     // file I/O. The write is best effort: what is on disk is still served.
     let collected = tokio::task::spawn_blocking(move || {
-        if let Some(frontend) = frontend {
+        if let Some(frontend) = &frontend {
             frontend.flush_or_warn();
         }
         let files = prometheus::read_dir_files(&dir)?;
-        let families = prometheus::merge(
+        let mut families = prometheus::merge(
             files
                 .iter()
                 .map(|(name, data)| (name.as_str(), data.as_slice())),
         );
+        // Only the serving listener can supply its current render configuration.
+        families.retain(|family| family.name != FrontendMetrics::RENDER_INFO);
+        families.extend(frontend.as_deref().and_then(FrontendMetrics::render_info));
         Ok::<_, std::io::Error>(prometheus::render(&families))
     })
     .await;
@@ -66,7 +70,6 @@ async fn metrics(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_server::core::FrontendMetrics;
     use crate::message::config::{DisaggregationMode, MetricsConfig, ServerArgs};
     use axum::body::Body;
     use axum::http::Request;
@@ -126,6 +129,77 @@ mod tests {
             content_type,
             String::from_utf8(body.to_vec()).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn render_info_tracks_only_the_scraped_listener() {
+        let dir = std::env::temp_dir().join(format!("render-info-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let name = FrontendMetrics::RENDER_INFO;
+        let old = prometheus::Entry {
+            key: prometheus::mmap_key(
+                name,
+                name,
+                &[("render_fingerprint".into(), "old".into())],
+                "Old.",
+            ),
+            value: 1.0,
+            timestamp: 0.0,
+        };
+        let data = prometheus::encode_entries([&old]);
+        prometheus::write_file(&dir, "gauge_max_1.db", &data).unwrap();
+
+        let listener = |model: &str, digest: Option<&str>| {
+            let mut config = MetricsConfig::for_dir(&dir);
+            config.labels.insert("model_name".into(), model.into());
+            config.labels.insert("site".into(), "a\"b".into());
+            config
+                .labels
+                .insert("render_fingerprint".into(), "custom".into());
+            let mut frontend = FrontendMetrics::new(&config, DisaggregationMode::Null).unwrap();
+            frontend.render_fingerprint = digest.map(str::to_owned);
+            app(config, Some(Arc::new(frontend)))
+        };
+        let first = listener("model-a", Some("abc"));
+        let second = listener("model-b", Some("def"));
+        for (app, model, digest) in [
+            (first.clone(), "model-a", "abc"),
+            (second, "model-b", "def"),
+            (first, "model-a", "abc"),
+        ] {
+            let (status, _, body) = get(app, "/metrics").await;
+            assert_eq!(status, StatusCode::OK);
+            let lines: Vec<_> = body.lines().filter(|line| line.contains(name)).collect();
+            let sample = format!(
+                r#"{name}{{model_name="{model}",render_fingerprint="{digest}",site="a\"b"}} 1.0"#
+            );
+            assert_eq!(
+                lines,
+                [
+                    format!("# HELP {name} Worker render configuration."),
+                    format!("# TYPE {name} gauge"),
+                    sample,
+                ]
+            );
+        }
+        let (status, _, body) = get(listener("model-c", None), "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains(name), "{body}");
+
+        // Other multiprocess readers never inherit a listener's digest.
+        let files = prometheus::read_dir_files(&dir).unwrap();
+        let stored = prometheus::merge(
+            files
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice())),
+        );
+        let family = stored.iter().find(|family| family.name == name).unwrap();
+        assert_eq!(family.samples.len(), 1);
+        assert_eq!(
+            family.samples[0].labels,
+            [("render_fingerprint".to_owned(), "old".to_owned())]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A scrape merges every process's file in the directory, writing the

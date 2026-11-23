@@ -48,7 +48,7 @@ const SUPPORTED_STYLES: &[&str] = &[
 ];
 
 /// A legacy conversation template, mirroring Python's `Conversation` fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(super) struct LegacySpec {
     /// Python `Conversation.name` — drives the CHATGLM round-offset quirk.
     pub(super) name: String,

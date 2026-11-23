@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod content_format;
+mod fingerprint;
 mod legacy;
 mod loader;
 mod media;
@@ -20,6 +21,7 @@ mod selection;
 mod template;
 mod thinking;
 
+pub use self::fingerprint::{RenderFingerprintConfig, render_fingerprint};
 use self::legacy::LegacyFormatter;
 use self::loader::DeveloperErrors;
 pub use self::loader::load_chat_formatter;
@@ -52,7 +54,8 @@ pub struct EncodedPrompt {
 }
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
 pub enum OneOrMany<T> {
     One(T),
     Many(Vec<T>),

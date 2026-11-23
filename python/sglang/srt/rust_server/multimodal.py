@@ -55,6 +55,13 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
+    def render_config_json(self) -> str:
+        """The effective worker and drain settings for the render fingerprint.
+        Feature transport only changes how the same tensor reaches the scheduler."""
+        fields = msgspec.structs.asdict(self)
+        del fields["feature_shm"]
+        return msgspec.json.encode(fields).decode()
+
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     """The Python half of one Rust MM family (an arm of

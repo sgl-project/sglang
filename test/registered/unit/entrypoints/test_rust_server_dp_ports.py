@@ -1,8 +1,10 @@
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import pytest
 
 from sglang.api.v1 import api_types
@@ -24,6 +26,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
+from sglang.srt.rust_server.multimodal import RustMmSpec
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -84,6 +87,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({}, "reject_fingerprint_mismatch", False),
+        ({"on_fingerprint_mismatch": "reject"}, "reject_fingerprint_mismatch", True),
+        ({}, "mm_render_config", None),
         ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
         (
             {"hicache_storage_backend_extra_config": "{}"},
@@ -127,6 +133,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
     ],
     ids=[
         "native-grpc",
+        "fingerprint-default",
+        "fingerprint-reject",
+        "text-only-render-config",
         "hicache_storage_backend",
         "hicache_storage_backend_extra_config",
         "hicache_storage_prefetch_policy",
@@ -183,6 +192,56 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
     # Rust reads absent keys as defaults, so every contract field must be sent
     # under its contract name.
     assert set(api_types.DeploymentInfo.__struct_fields__) <= set(deployment_info)
+
+
+@pytest.mark.parametrize("resample", [None, "aten_u8"], ids=["golden", "aten_u8"])
+def test_typed_config_fingerprints_the_resolved_mm_pipeline(resample):
+    # The processor's render_fingerprint test consumes this worker payload
+    # and pins its SHA-256 for other rendering hosts.
+    fixture = (
+        Path(__file__).resolve().parents[4]
+        / "rust/sglang-processor/tests/fixtures/render_fingerprint_mm_v1.json"
+    )
+    vector = json.loads(fixture.read_text(encoding="utf-8"))
+    settings = vector["mm_render_config"]
+    if resample is not None:
+        settings["resample"] = resample
+    scheduler = _scheduler_for_typed_config()
+    scheduler.model_config.is_multimodal = True
+    scheduler.model_config.context_len = vector["context_length"]
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(
+            default_chat_template_kwargs=vector["default_chat_template_kwargs"],
+            incremental_streaming_output=vector["incremental_streaming_output"],
+            reasoning_parser=vector["reasoning_parser"],
+        ),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        for feature_shm in (False, True):
+            spec = msgspec.convert(dict(settings, feature_shm=feature_shm), RustMmSpec)
+            rust_config._build_server_args(scheduler, extension=extension, mm_spec=spec)
+            args = extension.ServerArgs.call_args.kwargs
+            payload = json.loads(args["mm_render_config"])
+            # Keep 1.0 distinguishable from 1 while allowing JSON key reordering.
+            assert json.dumps(payload, sort_keys=True) == json.dumps(
+                settings, sort_keys=True
+            )
+            assert (
+                json.loads(args["default_chat_template_kwargs"])
+                == vector["default_chat_template_kwargs"]
+            )
+            assert (
+                args["incremental_streaming_output"]
+                is vector["incremental_streaming_output"]
+            )
+            assert args["reasoning_parser"] == vector["reasoning_parser"]
+            assert (
+                extension.ModelConfig.call_args.kwargs["context_len"]
+                == vector["context_length"]
+            )
 
 
 @pytest.mark.parametrize(

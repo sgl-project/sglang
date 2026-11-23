@@ -4192,6 +4192,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-types",
  "tower",
  "tracing",
  "tracing-appender",
@@ -4801,6 +4802,17 @@ dependencies = [
  "syn 2.0.119",
  "tempfile",
  "tonic-build",
+]
+
+[[package]]
+name = "tonic-types"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab1b02061f83d519bba3caa167f88f261ef05720ab8ebc954ade70de3348e8"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
 ]
 
 [[package]]

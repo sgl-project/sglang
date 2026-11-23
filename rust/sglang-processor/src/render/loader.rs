@@ -11,7 +11,8 @@ use dynamo_renderer::{
 use serde_json::{Value, json};
 
 use super::legacy::{
-    LegacyFormatter, builtin_template, infer_legacy_template_from_model_path, parse_legacy_template,
+    LegacyFormatter, LegacySpec, builtin_template, infer_legacy_template_from_model_path,
+    parse_legacy_template,
 };
 use super::thinking::ThinkingTemplates;
 use super::{
@@ -25,26 +26,38 @@ pub fn load_chat_formatter(
     model_type: Option<&str>,
     chat_template_arg: Option<&str>,
 ) -> Result<ChatFormatter, TemplateError> {
+    if let Some(spec) = resolve_builtin_template(model_path, model_type, chat_template_arg) {
+        return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
+    }
+    load_template_file_or_config(config_file, model_type, chat_template_arg)
+}
+
+pub(super) fn resolve_builtin_template(
+    model_path: Option<&str>,
+    model_type: Option<&str>,
+    chat_template_arg: Option<&str>,
+) -> Option<LegacySpec> {
     // Python resolves registry names before looking at the filesystem — and
     // before touching the tokenizer config, so a built-in name works even when
     // `tokenizer_config.json` is absent.
-    if let Some(argument) = chat_template_arg
-        && let Some(spec) = builtin_template(argument)
-    {
-        return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
+    if let Some(argument) = chat_template_arg {
+        return builtin_template(argument);
     }
 
     // Python `load_chat_template` (no `--chat-template`): infer a legacy
     // template from the model path before falling back to the HF template, so
     // a legacy model whose config has no `chat_template` still gets one.
-    if chat_template_arg.is_none()
-        && let Some(model_path) = model_path
-        && let Some(spec) = infer_legacy_template_from_model_path(model_path, model_type)
-    {
-        tracing::info!(%model_path, "inferred legacy chat template from model path");
-        return Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter { spec })));
-    }
+    let model_path = model_path?;
+    let spec = infer_legacy_template_from_model_path(model_path, model_type)?;
+    tracing::info!(%model_path, "inferred legacy chat template from model path");
+    Some(spec)
+}
 
+pub(super) fn load_template_file_or_config(
+    config_file: Option<&str>,
+    model_type: Option<&str>,
+    chat_template_arg: Option<&str>,
+) -> Result<ChatFormatter, TemplateError> {
     // Every remaining source builds the HF renderer around the tokenizer
     // config (the template itself, or the argument injected into it).
     let Some(config_file) = config_file else {

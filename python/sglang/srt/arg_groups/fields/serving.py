@@ -88,6 +88,14 @@ class Serving(msgspec.Struct):
         "Timeout in seconds waiting for each native gRPC response chunk, "
         "including the first. Must be positive. Defaults to 300.",
     ] = 300
+    on_fingerprint_mismatch: A[
+        str,
+        Arg(
+            help="How the Rust api.v1 Generate RPC handles a mismatched "
+            "x-render-fingerprint. Requests without the header are accepted.",
+            choices=["ignore", "reject"],
+        ),
+    ] = "ignore"
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[

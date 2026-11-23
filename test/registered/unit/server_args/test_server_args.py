@@ -4437,6 +4437,35 @@ class TestGrpcServerArgs(CustomTestCase):
             handle_grpc_args(sa)
         self.assertEqual(resolution_result(sa, "grpc_port"), 45000)
 
+    def test_reject_fingerprint_mismatch_requires_rust_and_grpc_port(self):
+        for rust_server, grpc_port in ((False, 50051), (True, None)):
+            with (
+                self.subTest(rust_server=rust_server, grpc_port=grpc_port),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+                envs.SGLANG_GRPC_PORT.override(None),
+            ):
+                sa = self._args(on_fingerprint_mismatch="reject", grpc_port=grpc_port)
+                with self.assertRaisesRegex(ValueError, "--on-fingerprint-mismatch"):
+                    handle_grpc_args(sa)
+
+    def test_reject_fingerprint_mismatch_accepts_rust_grpc(self):
+        parser = self._sidecar_parser()
+        sa = ServerArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--on-fingerprint-mismatch",
+                    "reject",
+                    "--grpc-port",
+                    "50051",
+                ]
+            )
+        )
+        with envs.SGLANG_RUST_SERVER.override(True):
+            handle_grpc_args(sa)
+        self.assertEqual(resolution_result(sa, "on_fingerprint_mismatch"), "reject")
+
     @staticmethod
     def _sidecar_parser():
         parser = server_args_module.argparse.ArgumentParser()

@@ -12,12 +12,14 @@ mod step3p5;
 mod template_context;
 
 pub use self::deepseek_v4::DeepSeekTokenizer;
-pub(super) use self::deepseek_v4::render as render_deepseek_v4;
 pub(crate) use self::deepseek_v4::thinking as deepseek_v4_thinking;
 #[cfg(feature = "openai")]
 pub(crate) use self::deepseek_v4::{
     continued_message as deepseek_v4_continued_message, parse_start as deepseek_v4_parse_start,
     special_tokens as deepseek_v4_special_tokens, task as deepseek_v4_task,
+};
+pub(super) use self::deepseek_v4::{
+    fingerprint_defaults as deepseek_v4_fingerprint_defaults, render as render_deepseek_v4,
 };
 pub(super) use self::glm53::{is_glm53, render as render_glm53};
 pub(super) use self::kimi_k3::render as render_kimi_k3;

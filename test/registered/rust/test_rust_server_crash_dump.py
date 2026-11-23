@@ -53,6 +53,8 @@ def _server_args(ext, port: int):
         http2=None,
         grpc_port=None,
         grpc_response_timeout_secs=300,
+        reject_fingerprint_mismatch=False,
+        mm_render_config=None,
         api_key=None,
         admin_api_key=None,
         log_level="warning",
