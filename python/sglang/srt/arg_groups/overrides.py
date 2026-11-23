@@ -1091,10 +1091,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
-    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
-
-    MiMo defaults to CuTeDSL on Blackwell; other supported models use auto.
-    """
+    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution."""
     model_config = model_config_of(view)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
