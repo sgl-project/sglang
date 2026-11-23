@@ -22,8 +22,9 @@ per-request state, so each commits the sampled tokens or the verify's
 `VerifyAccept`. A `SamplingObserver` sees the decode logits between the penalty
 and the grammar mask.
 
-The sanitize, which heals NaN and inf only under SGLANG_SANITIZE_NAN_LOGITS,
-ends the stages on every path; a verify's route turns
+Each entry probes the model's logits for NaN before the stages
+(`detect_nan_logits`). The sanitize, which heals NaN and inf only under
+SGLANG_SANITIZE_NAN_LOGITS, ends the stages on every path; a verify's route turns
 off the fast paths that skip the stages in that mode.
 """
 
@@ -79,6 +80,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
         logits; they replace the stages after the watermark.
         """
         sampling_info = forward_batch.sampling_info
+        detect_nan_logits(logits_output.next_token_logits, "decode")
         if observer is not None and not observer.is_active(sampling_info):
             observer = None
         observer_state = _adjust_before_watermark(
@@ -106,9 +108,6 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             next_token_ids = graph_token_ids
 
         if next_token_ids is None:
-            maybe_detect_nan(
-                logits_output.next_token_logits, "sampler: next_token_logits"
-            )
             _adjust_after_watermark(
                 logits_output.next_token_logits,
                 sampler_info,
@@ -269,6 +268,14 @@ def _sanitize_stage(
     sanitize_nan_logits(logits, "sampling: logits after the stages")
     if logprob_logits is not None:
         sanitize_nan_logits(logprob_logits, "sampling: logprob logits after the stages")
+
+
+def detect_nan_logits(logits: Optional[torch.Tensor], entry: str) -> None:
+    """The NaN probe each sampling entry runs on the model's logits, a vocab shard
+    included, before any stage edits them: a grammar mask would hide a NaN on a
+    masked token from the probe in the sanitize. Off unless
+    SGLANG_ENABLE_NAN_LOGITS_CHECK or SGLANG_ENABLE_ASYNC_ASSERT is set."""
+    maybe_detect_nan(logits, f"{entry}: model logits")
 
 
 def edits_verify_logits(

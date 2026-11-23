@@ -67,7 +67,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, detect_nan_logits
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -3634,6 +3634,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             indexer_topk_output = target_out.indexer_topk_output
             kv_weight_version_record = target_out.kv_weight_version_record
         logits_output = target_out.logits_output
+        detect_nan_logits(logits_output.next_token_logits, "verify")
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
         target_lp = self._target_logits_processor

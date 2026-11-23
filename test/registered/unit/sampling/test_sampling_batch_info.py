@@ -27,6 +27,7 @@ from sglang.srt.sampling.sampling_pipeline import (
     _adjust_after_watermark,
     _adjust_before_watermark,
     adjust_verify_logits,
+    detect_nan_logits,
 )
 from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
@@ -303,6 +304,14 @@ class TestNanLogits(CustomTestCase):
         verify = self._verify(self._logits())
         self.assertTrue(verify[0, 0].isnan())
         self.assertEqual(verify[0, 1:3].tolist(), [float("inf"), float("-inf")])
+
+    def test_assert_mode_detects_nan(self):
+        with envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(True):
+            with self.assertRaises(RuntimeError):
+                detect_nan_logits(self._logits(), "verify")
+            with self.assertRaises(RuntimeError):
+                self._verify(self._logits())
+            detect_nan_logits(torch.zeros(1, VOCAB_SIZE), "verify")
 
     def test_sanitize_mode_routes_every_verify_through_the_stages(self):
         info = _make_info()
