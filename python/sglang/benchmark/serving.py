@@ -1630,6 +1630,7 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    benchmark_duration = time.perf_counter() - benchmark_start_time
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1675,7 +1676,6 @@ async def benchmark(
         accept_length = None
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,

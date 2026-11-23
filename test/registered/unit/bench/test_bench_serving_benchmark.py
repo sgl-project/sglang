@@ -9,8 +9,10 @@ import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.benchmark import serving
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import benchmark, get_request, set_global_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -164,6 +166,32 @@ class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
                 self.server.flushes.clear()
                 self._run([row], backend="sglang-oai-chat")
                 self.assertEqual(len(self.server.flushes), flushes)
+
+
+class TestBenchServingDuration(_BenchmarkRunTestCase):
+    def test_server_info_time_is_excluded_from_request_throughput(self):
+        row = DatasetRow(prompt="p", prompt_len=1, output_len=1)
+        real_get = serving.requests.get
+        postprocessing_time = 0.0
+
+        def clock():
+            return float(bool(self.server.arrivals)) + postprocessing_time
+
+        def get_server_info(url, **kwargs):
+            nonlocal postprocessing_time
+            if url.endswith("/server_info"):
+                postprocessing_time += 5.0
+            return real_get(url, **kwargs)
+
+        with (
+            patch.object(serving, "time", SimpleNamespace(perf_counter=clock)),
+            patch.object(serving.requests, "get", side_effect=get_server_info),
+        ):
+            result = self._run([row], backend="sglang-oai-chat")
+
+        self.assertGreater(postprocessing_time, 0.0)
+        self.assertEqual(result["duration"], 1.0)
+        self.assertEqual(result["request_throughput"], 1.0)
 
 
 if __name__ == "__main__":
