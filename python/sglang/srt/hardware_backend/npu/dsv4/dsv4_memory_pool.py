@@ -27,9 +27,11 @@ from sgl_kernel_npu.operators.mem_cache import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+    NPUDSV4KVLayout,
+    get_a3_c2_state_bank_count,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -598,12 +600,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         ring_size = self.get_ring_size(2)
         num_req_slots = self.num_req_slots
         if not is_npu_arch35():
-            # CompressorV2 checks block_num >= batch_size even for seqused=0
-            # padding rows. Slot 0 is reserved; align the real request capacity
-            # without increasing the request allocator or changing bank IDs.
-            num_req_slots = max(
-                num_req_slots, get_eager_max_batch_size(num_req_slots - 1)
-            )
+            num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
         return CompressStatePool(
             size=num_req_slots * ring_size,
             ring_size=ring_size,

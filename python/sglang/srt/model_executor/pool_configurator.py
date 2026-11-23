@@ -1807,9 +1807,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        row_alignment = 2
+        if self._npu_low_ratio_bf16:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+                get_a3_c2_state_bank_count,
+            )
+
+            num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
+            # A3 requests a 3-D view with state_cache_page_size=ring_size.
+            row_alignment = ring_size
         state_rows = num_req_slots * ring_size + ring_size + 1
-        state_rows = ceil_div(state_rows, 2) * 2
+        state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
         return state_rows * state_last_dim * torch.float32.itemsize * num_layers
 
