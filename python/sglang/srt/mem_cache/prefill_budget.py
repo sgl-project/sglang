@@ -1210,6 +1210,12 @@ class ChainPrefillBudget(PrefillBudget):
             purpose=DemandPurpose.RUNNING,
             cached_tokens=held,
         )
+        # With mixed chunked prefill, `__init__` already counts the row this
+        # request decodes in this pass (`num_mixed_decode_tokens`), and the
+        # growth counts it again: one row per mixed decode in each window.
+        # Accepted, as the token sub-pool counts it twice alike: `total_offset`
+        # takes both the mixed decode tokens and each running request's
+        # estimated decode.
         for name, tokens in growth.items():
             self.window_offsets[name] += tokens
 

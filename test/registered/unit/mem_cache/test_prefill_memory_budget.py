@@ -946,6 +946,63 @@ class TestRunningDecodeReservation(CustomTestCase):
                 if not should_admit:
                     self.assertEqual(result, AddReqResult.NO_TOKEN)
 
+    def test_next_pass_reserves_running_window_growth(self):
+        # The last pass admitted A, which now decodes. The tree owns A's prompt
+        # (`protect_prefix`), so A holds no window row of its own yet, but its
+        # decode regrows a window: those rows stay committed beside B, the same
+        # request, which then fits in 76 tokens but not in 72. Dropping that
+        # commitment, or crediting A's tree-owned prompt as window rows A
+        # holds, admits B at 72 into rows A's decode takes.
+        page, prompt = 4, 12
+
+        def request(rid):
+            req = Req(
+                rid, None, array("q", [1] * prompt), SamplingParams(max_new_tokens=32)
+            )
+            req.refresh_fill_ids()
+            return req
+
+        def adder(allocator, cache, running):
+            return PrefillAdder(
+                page_size=page,
+                tree_cache=cache,
+                token_to_kv_pool_allocator=allocator,
+                running_batch=SimpleNamespace(reqs=running),
+                new_token_ratio=1.0,
+                rem_input_tokens=1024,
+                rem_chunk_tokens=16,
+            )
+
+        for pool_tokens, should_admit in ((72, False), (76, True)):
+            with self.subTest(pool_tokens=pool_tokens):
+                allocator = _shared_allocator(page_size=page, pool_tokens=pool_tokens)
+                cache = SimpleNamespace(
+                    **vars(_cache()),
+                    supports_mamba=lambda: False,
+                    lock=lambda node: None,
+                    unlock=lambda lock: None,
+                    finish_storage_prefetch_admission=lambda *args, **kwargs: None,
+                )
+                running = request("A")
+                result = adder(allocator, cache, []).add_one_req(
+                    running, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(result, AddReqResult.CONTINUE)
+                # A's prefill ran: the tree took its prompt and A sampled a token.
+                self.assertIsNotNone(allocator.alloc(prompt))
+                running.kv.req_pool_idx = 0
+                running.kv.protect_prefix(prompt)
+                running.kv.kv_allocated_len = running.kv.kv_committed_len = prompt
+                running.output_ids.append(7)
+
+                next_pass = adder(allocator, cache, [running])
+                result = next_pass.add_one_req(
+                    request("B"), has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(bool(next_pass.can_run_list), should_admit)
+                if not should_admit:
+                    self.assertEqual(result, AddReqResult.NO_TOKEN)
+
 
 class TestFixedPrefillMemoryBudget(unittest.TestCase):
     def _allocator(self, cls=SWATokenToKVPoolAllocator):
