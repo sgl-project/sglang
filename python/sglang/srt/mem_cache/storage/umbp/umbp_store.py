@@ -967,14 +967,15 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.ssd_backend,
         )
 
-        # Only enforce the SPDK key limit for standalone auto-start. Embedded and
-        # external standalone servers never receive this SSD config.
+        # Only enforce the SPDK key limit for standalone auto-start. Embedded mode
+        # receives the SSD config but serves DRAM only. An external standalone server
+        # reads its own env, so this config never reaches it.
         sp = cfg.standalone_process
         self._spdk_key_check = (
-            bool(cfg.ssd.enabled)
+            cfg.ssd.enabled
             and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
             and sp is not None
-            and bool(sp.auto_start)
+            and sp.auto_start
         )
         if self._spdk_key_check and not self._kv_anchor_is_logical:
             keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
@@ -1194,7 +1195,7 @@ class UMBPStore(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
-        if getattr(self, "_spdk_key_check", False):
+        if self._spdk_key_check:
             self._check_hybrid_pool_budget(host_pool, host_pool_name)
         self.registered_pools[host_pool_name] = host_pool
         self._register_host_buffer_for_zero_copy(host_pool)
