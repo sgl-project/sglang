@@ -158,6 +158,88 @@ mod tests {
         assert_eq!(json["error"]["type"], "invalid_request_error");
     }
 
+    /// `/v1/messages` decodes on its own, so Gemma 4's markers must survive
+    /// for its reasoning parser to split the thinking block from the text.
+    #[tokio::test]
+    async fn gemma4_messages_keep_reasoning_markers() {
+        use crate::api_server::http::openai::test_utils::{
+            answering_app_state_with_request, chatml_formatter, chunk,
+        };
+        use crate::message::config::{ModelConfig, ServerArgs};
+        use crate::message::request::RequestKind;
+
+        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
+        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
+        let tokenizer = sglang_processor::dynamo_tokenizers::Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        ))
+        .unwrap();
+        for (model_type, expected) in [
+            (
+                "gemma4",
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "Check the calculation."},
+                    {"type": "text", "text": "The answer is 4."},
+                ]),
+            ),
+            (
+                "llama",
+                serde_json::json!([{"type": "text", "text": STRIPPED}]),
+            ),
+        ] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "m".into(),
+                reasoning_parser: Some("gemma4".into()),
+                model_config: ModelConfig {
+                    model_type: Some(model_type.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let state = answering_app_state_with_request(
+                args,
+                chatml_formatter(),
+                Some(tokenizer.clone()),
+                |request| {
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation");
+                    };
+                    // Replay the same output at the decoder boundary with the submitted flag.
+                    let text = if generate.sampling_params.skip_special_tokens {
+                        STRIPPED
+                    } else {
+                        MARKED
+                    };
+                    chunk(request.rid.as_str(), text, true)
+                },
+            );
+            let (status, body) = post(
+                state,
+                "/v1/messages",
+                r#"{"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "What is 2 + 2?"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let content: Vec<serde_json::Value> = json["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| {
+                    let mut block = block.clone();
+                    block.as_object_mut().unwrap().remove("signature");
+                    block
+                })
+                .collect();
+            assert_eq!(
+                serde_json::Value::from(content),
+                expected,
+                "{model_type}: {body}"
+            );
+        }
+    }
+
     /// The streamed form is SSE with the event name on each frame, in the
     /// Anthropic order.
     #[tokio::test]

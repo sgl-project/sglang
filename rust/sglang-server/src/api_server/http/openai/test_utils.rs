@@ -69,7 +69,7 @@ pub(crate) fn core_handle() -> CoreHandle {
     )
 }
 
-pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
+pub(crate) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
@@ -228,7 +228,7 @@ pub(super) fn answering_app_state_with_item(
 }
 
 /// Answer a generation based on the request submitted to the core.
-pub(super) fn answering_app_state_with_request(
+pub(in crate::api_server::http) fn answering_app_state_with_request(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,

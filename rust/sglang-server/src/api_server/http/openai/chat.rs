@@ -203,14 +203,7 @@ async fn chat_completions(
 
     // Python's chat-layer facts for the served template, and whether the
     // reply starts in reasoning, as Python decides it from the request.
-    let chat_model = ChatModel {
-        model_type: state.server_args.model_config.model_type.clone(),
-        ..state
-            .chat_formatter
-            .as_ref()
-            .map(ChatModel::for_formatter)
-            .unwrap_or_default()
-    };
+    let chat_model = served_chat_model(state.chat_formatter.as_ref(), &state.server_args);
     let force_reasoning = chat_model.request_thinking(
         reasoning_parser.as_deref(),
         &raw,
@@ -1233,6 +1226,18 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// Python's chat-layer facts for the served template and checkpoint, shared by
+/// the chat, lowered chat and Responses paths.
+pub(crate) fn served_chat_model(
+    formatter: Option<&super::ChatFormatter>,
+    server_args: &ServerArgs,
+) -> ChatModel {
+    ChatModel {
+        model_type: server_args.model_config.model_type.clone(),
+        ..formatter.map(ChatModel::for_formatter).unwrap_or_default()
+    }
+}
+
 /// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
 /// thinking, so the generated stream has no opening marker.
 pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
@@ -1605,6 +1610,84 @@ mod tests {
                     assert_eq!(message["reasoning_content"], "Check the calculation.");
                 }
             }
+        }
+    }
+
+    /// gRPC Responses renders and submits on its own, so it must keep Gemma 4's
+    /// markers as the chat route does for its reasoning parser to split them.
+    #[tokio::test]
+    async fn gemma4_grpc_responses_keeps_reasoning_markers() {
+        use crate::api_server::responses::Responses;
+        use crate::message::config::ModelConfig;
+        use crate::message::request::RequestKind;
+        use sglang_api_types::api::v1 as api;
+
+        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
+        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
+        let tokenizer = Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        ))
+        .unwrap();
+
+        for (model_type, reasoning, answer) in [
+            ("gemma4", Some("Check the calculation."), "The answer is 4."),
+            ("llama", None, STRIPPED),
+        ] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "model".into(),
+                reasoning_parser: Some("gemma4".into()),
+                model_config: ModelConfig {
+                    model_type: Some(model_type.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let state = answering_app_state_with_request(
+                args,
+                chatml_formatter(),
+                Some(tokenizer.clone()),
+                |request| {
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation");
+                    };
+                    // Replay the same output at the decoder boundary with the submitted flag.
+                    let text = if generate.sampling_params.skip_special_tokens {
+                        STRIPPED
+                    } else {
+                        MARKED
+                    };
+                    chunk(request.rid.as_str(), text, true)
+                },
+            );
+            let adapter = Responses {
+                core: &state.core,
+                chat_formatter: state.chat_formatter.as_ref(),
+                server_args: &state.server_args,
+            };
+            let request = api::OpenAiResponsesRequest {
+                model: Some("model".into()),
+                input: Some(r#""What is 2 + 2?""#.into()),
+                ..Default::default()
+            };
+            let response = adapter.create(&request).await.unwrap();
+            let output = response["output"].as_array().unwrap();
+            let text_of = |kind: &str| {
+                output
+                    .iter()
+                    .find(|item| item["type"] == kind)
+                    .map(|item| item["content"][0]["text"].as_str().unwrap().to_owned())
+            };
+            assert_eq!(
+                text_of("reasoning").as_deref(),
+                reasoning,
+                "{model_type}: {response}"
+            );
+            assert_eq!(
+                text_of("message").as_deref(),
+                Some(answer),
+                "{model_type}: {response}"
+            );
         }
     }
 
