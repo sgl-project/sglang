@@ -371,6 +371,17 @@ For `transfer_engine`, set `MC_USE_TENT=1` on both servers and pass
 its own `--engine-info-bootstrap-port`. Seed and client must use the same model and
 TP size.
 
+With `--enable-memory-saver`:
+
+- An `nccl` client loads over R-Fork as usual. It receives each weight into a staging
+  buffer outside the memory-saver pool and copies it in, because oneCCL cannot use
+  memory saver's virtual-memory allocations directly.
+- A `transfer_engine` client logs `Fallback load_format to 'auto'` and loads its
+  weights from disk (its `/server_info` reports `load_format: auto`).
+- A seed started with `--remote-instance-weight-loader-start-seed-via-transfer-engine`
+  refuses to start, because memory saver remaps the weight memory TransferEngine
+  registers.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights
