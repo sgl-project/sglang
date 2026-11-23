@@ -80,13 +80,10 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
                     )
                     with (
                         parallel_scope(tp_group=tp, attn_tp_group=attn),
-                        # CPU projections must bypass GPU-only GEMM backends.
-                        patch(
-                            "sglang.srt.layers.quantization.unquant._use_aiter", True
-                        ),
+                        # CPU-only math/reload checks use the PyTorch GEMM path.
                         patch(
                             "sglang.srt.layers.quantization.unquant._skip_aiter_unquant",
-                            False,
+                            True,
                         ),
                         patch(
                             "sglang.srt.layers.linear.is_allocation_symmetric",
