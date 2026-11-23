@@ -1,13 +1,11 @@
 """Unlimited-OCR v2 processor with DASH image-mode semantics."""
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from typing import Any, ClassVar, Optional
 
 import torch
 
 from sglang.srt.configs.unlimited_ocr import merge_mm_processor_kwargs
-from sglang.srt.entrypoints.warmup import warmup
-from sglang.srt.entrypoints.warmups.unlimited_ocr_v2 import unlimited_ocr_v2_warmup
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.unlimited_ocr_v2 import UnlimitedOCRV2ForCausalLM
 from sglang.srt.multimodal.processors.unlimited_ocr import (
@@ -15,9 +13,6 @@ from sglang.srt.multimodal.processors.unlimited_ocr import (
     _IMAGE_MODE_PRESETS,
     UnlimitedOCRProcessor,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +117,3 @@ class UnlimitedOCRV2Processor(UnlimitedOCRProcessor):
             input_ids=input_ids.tolist(),
             im_token_id=self.mm_tokens.image_token_id,
         )
-
-
-warmup("unlimited_ocr_v2")(unlimited_ocr_v2_warmup)

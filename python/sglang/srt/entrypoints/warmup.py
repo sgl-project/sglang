@@ -7,6 +7,7 @@ import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.entrypoints.warmups.unlimited_ocr_v2 import unlimited_ocr_v2_warmup
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__file__)
 
-_warmup_registry = {}
+_warmup_registry = {"unlimited_ocr_v2": unlimited_ocr_v2_warmup}
 # Warmups that only send generate requests, which Rust-server mode runs through
 # its listener (`rust_server.warmups`); the others need the TokenizerManager.
 _rust_server_warmups = set()
