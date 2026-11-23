@@ -941,10 +941,13 @@ class Engine(EngineScoreMixin, EngineBase):
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
-                    gpu_id = (
-                        get_device().base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=get_device().base_gpu_id,
+                        gpu_id_step=get_device().gpu_id_step,
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -1932,7 +1935,8 @@ class Engine(EngineScoreMixin, EngineBase):
         result = self.loop.run_until_complete(
             self.tokenizer_manager.collective_rpc(obj)
         )
-        assert result.success, result.message
+        if not result.success:
+            raise RuntimeError(f"collective_rpc {method!r} failed: {result.message}")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
