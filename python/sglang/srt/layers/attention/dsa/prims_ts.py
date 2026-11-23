@@ -9,9 +9,13 @@ localization; only the attention kernel differs.
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+import time
+from typing import Iterable, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 # Each row count up to this gets its own kept plan, for graph shapes and eager
 # batches alike; larger batches share power-of-two capacity plans.
@@ -69,6 +73,7 @@ class PrimsTSSparseMLA:
 
     Plans compile and allocate, so they are made on eager calls; the CUDA graph
     runner's eager warmups plan every captured row count before its capture.
+    prepare() compiles every kernel those plans can need before serving.
     """
 
     def __init__(self, device: torch.device):
@@ -80,12 +85,67 @@ class PrimsTSSparseMLA:
         # packed plans' [0, rows] query offsets, keyed like _plans
         self._qo_indptr: dict[tuple[int, int, int, bool], torch.Tensor] = {}
 
-    def _wrapper(self, *, rows: int, heads: int, width: int):
-        from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
-
+    def _plan_args(self, *, rows: int, heads: int, width: int):
+        """The plan key and FlashInfer plan arguments of a ``rows``-row launch."""
         capacity = _plan_capacity(rows)
         packed = capacity is not None
         key = (capacity if packed else rows, heads, width, packed)
+        args = (self.device, 1 if packed else rows, heads)
+        kwargs = dict(
+            max_topk=width,
+            max_q_len=capacity if packed else 1,
+            packed_query=packed,
+            q_dtype=torch.float8_e4m3fn,
+            qk_rope_head_dim=64,
+            kv_cache_format="native",
+            return_lse=True,
+        )
+        return key, args, kwargs
+
+    def prepare(self, *, heads: Iterable[int], width: int) -> None:
+        """Compile every kernel a launch of these head counts and top-k ``width``
+        can plan: one plan per kernel FlashInfer compiles, at its fewest rows."""
+        try:
+            # FlashInfer 0.7.4 has no public precompile; this private helper
+            # resolves a plan without compiling or allocating. 0.7.4 plan()
+            # (mla_decode.py:2946-2978) compiles the resolved spec's kernel with
+            # fields set from the profile (family, split count, D576 reload) and
+            # the output quantization, so those key the plans too.
+            from flashinfer.attention.prims_ts.mla_decode import (
+                _resolve_sparse_mla_plan,
+            )
+        except ImportError as exc:
+            logger.warning("Prims-TS sparse MLA kernels compile on first use: %s", exc)
+            return
+        start = time.perf_counter()
+        first_rows = {}
+        for num_heads in sorted(set(heads)):
+            rows = 1
+            # FlashInfer plans fewer than 2**31 query rows x heads (int32 extents).
+            while rows * num_heads < 2**31:
+                _, args, kwargs = self._plan_args(
+                    rows=rows, heads=num_heads, width=width
+                )
+                _, profile, spec, *_, output_quant = _resolve_sparse_mla_plan(
+                    *args, **kwargs
+                )
+                first_rows.setdefault((spec, profile, output_quant), (rows, num_heads))
+                # Rows past the exact limit share one plan per power-of-two capacity.
+                rows = rows + 1 if rows < _EXACT_PLAN_MAX_ROWS else 2 * rows
+        # plan() is the public compile path; the kept plans serve these rows.
+        for rows, num_heads in first_rows.values():
+            self._wrapper(rows=rows, heads=num_heads, width=width)
+        logger.info(
+            "Prims-TS sparse MLA: made %d plans at (rows, heads) %s in %.1f s",
+            len(first_rows),
+            list(first_rows.values()),
+            time.perf_counter() - start,
+        )
+
+    def _wrapper(self, *, rows: int, heads: int, width: int):
+        from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
+
+        key, args, kwargs = self._plan_args(rows=rows, heads=heads, width=width)
         wrapper = self._plans.get(key)
         if wrapper is not None:
             return wrapper, self._qo_indptr.get(key)
@@ -95,20 +155,9 @@ class PrimsTSSparseMLA:
                 "graph capture must follow an eager run of the same shape."
             )
         wrapper = BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(
-            self.device,
-            1 if packed else rows,
-            heads,
-            max_topk=width,
-            max_q_len=capacity if packed else 1,
-            packed_query=packed,
-            q_dtype=torch.float8_e4m3fn,
-            qk_rope_head_dim=64,
-            kv_cache_format="native",
-            return_lse=True,
-        )
+        wrapper.plan(*args, **kwargs)
         self._plans[key] = wrapper
-        if packed:
+        if kwargs["packed_query"]:
             self._qo_indptr[key] = torch.zeros(2, dtype=torch.int32, device=self.device)
         return wrapper, self._qo_indptr.get(key)
 
