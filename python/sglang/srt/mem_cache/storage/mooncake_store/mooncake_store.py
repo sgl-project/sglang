@@ -723,7 +723,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            for buf in self._iter_host_pool_buffers(host_pool):
+                super().register_buffer(buf)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
