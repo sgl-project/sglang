@@ -1,5 +1,6 @@
 """DFlash tree kernels against a python best-first build and accept walk."""
 
+import sys
 import types
 
 import pytest
@@ -51,3 +52,7 @@ def test_tree(K):
         assert [x[b].tolist() for x in res] == [out, a + 1, out[a]]
         assert t.perm[b].tolist() == [b * N + j for j in w]
         assert kv[b * N : b * N + a + 1, 0].tolist() == t.perm[b, : a + 1].tolist()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
