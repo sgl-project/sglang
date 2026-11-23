@@ -10,7 +10,6 @@ from sglang.srt.models.dflash import (
     _grouped_conv,
     candidate_topk,
 )
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -432,7 +431,6 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         candidates=torch.tensor([[9, 1]]),
         next_token_logits=torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]),
         sampling_info=SimpleNamespace(is_all_greedy=False),
-        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=object(),
         prefix_lens=torch.tensor([3]),
         bs=1,

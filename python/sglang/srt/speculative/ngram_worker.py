@@ -485,8 +485,7 @@ class NGRAMWorker(BaseSpecWorker):
                 barrier=None,
             )
             accept = accept_draft_tree(
-                batch,
-                verify=verify,
+                verify,
                 verify_input=verify_input,
                 logits_output=logits_output,
                 speculative_runtime_hooks=self._speculative_runtime_hooks,
