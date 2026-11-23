@@ -88,11 +88,18 @@ class SchedulerVPPMixin:
             layout, parallel.pp_rank, self.pp_loop_size
         )
         self.vpp_batches = VPPBatchLedger(layout, parallel.pp_rank, self.pp_loop_size)
-        self.vpp_receiver = VPPActivationReceiver(
-            self.pp_group, tag=_VPP_ACTIVATION_TAG
-        )
+        reverse_group = self.pp_group.vpp_reverse_group
+        recv_group = send_group = self.pp_group
+        if layout.physical_size == 2:
+            if reverse_group is None:
+                raise RuntimeError("PP2 VPP requires a separate reverse transport")
+            if self.pp_group.is_first_rank:
+                recv_group = reverse_group
+            else:
+                send_group = reverse_group
+        self.vpp_receiver = VPPActivationReceiver(recv_group, tag=_VPP_ACTIVATION_TAG)
         self.vpp_sends = VPPSendWindow(
-            self.pp_group, self.pp_loop_size, tag=_VPP_ACTIVATION_TAG
+            send_group, self.pp_loop_size, tag=_VPP_ACTIVATION_TAG
         )
         self._vpp_next_batch_seq = 0
         self._vpp_next_slot = 0

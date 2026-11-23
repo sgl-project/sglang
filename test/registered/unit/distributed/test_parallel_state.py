@@ -37,19 +37,87 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import publish_build_topology
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+class TestVPPTransportGroups(CustomTestCase):
+    def test_only_pp2_vpp_has_independent_wraparound_transport(self):
+        """Reciprocal PP2 edges must progress independently; ordinary PP needs
+        no extra group, and PP>2 already has different peers on its two edges.
+        """
+        from sglang.srt.runtime_context import reset_context
+
+        for pp, virtual in ((2, 2), (2, 1), (3, 2)):
+            with self.subTest(pp=pp, virtual=virtual), ExitStack() as stack:
+                created = {}
+
+                def coordinator(*, group_ranks, group_name, **kwargs):
+                    group = Mock()
+                    group.world_size = len(group_ranks[0])
+                    group.rank_in_group = 0
+                    group.vpp_reverse_group = None
+                    created[group_name] = (group_ranks, group)
+                    return group
+
+                for name in (
+                    "_WORLD",
+                    "_TP",
+                    "_ATTN_CP",
+                    "_ATTN_TP",
+                    "_PP",
+                    "_SELF_PP",
+                    "_MOE_EP",
+                    "_MOE_TP",
+                    "_MOE_DP",
+                    "_SHARED_EXPERTS_TP",
+                    "_DCP",
+                ):
+                    stack.enter_context(patch.object(parallel_state, name, None))
+                stack.enter_context(
+                    patch("torch.distributed.is_initialized", return_value=True)
+                )
+                stack.enter_context(
+                    patch("torch.distributed.get_world_size", return_value=4 * pp)
+                )
+                stack.enter_context(
+                    patch.object(
+                        parallel_state,
+                        "get_world_group",
+                        return_value=Mock(local_rank=0),
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        parallel_state, "GroupCoordinator", side_effect=coordinator
+                    )
+                )
+                publish_build_topology(tp_size=4, pp_size=pp, pp_virtual_stages=virtual)
+                try:
+                    parallel_state.initialize_model_parallel(backend="nccl")
+                    pp_ranks, pp_group = created["pp"]
+                    if pp == 2 and virtual > 1:
+                        reverse_ranks, reverse_group = created["vpp_pp_reverse"]
+                        self.assertEqual(reverse_ranks, pp_ranks)
+                        self.assertIsNot(reverse_group, pp_group)
+                        self.assertIs(pp_group.vpp_reverse_group, reverse_group)
+                    else:
+                        self.assertNotIn("vpp_pp_reverse", created)
+                        self.assertIsNone(pp_group.vpp_reverse_group)
+                finally:
+                    parallel_state.destroy_model_parallel()
+                    reset_context()
 
 
 @pytest.mark.parametrize("rank", range(4))

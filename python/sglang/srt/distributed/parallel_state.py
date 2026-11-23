@@ -491,6 +491,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.vpp_reverse_group = None
         # Which FlashInfer fusion workspace this group owns, or None when the
         # group is not eligible for the allreduce-only kAllReduce path. Stamped
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
@@ -2299,6 +2300,9 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if getattr(self, "vpp_reverse_group", None) is not None:
+            self.vpp_reverse_group.destroy()
+            self.vpp_reverse_group = None
         # Must precede destroy_process_group(): FlashInfer's workspace
         # teardown collectives on the group it was built with.
         if self.pcie_ipc_comm is not None:
@@ -3160,6 +3164,22 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+    if pipeline_model_parallel_size == 2 and get_parallel().pp_virtual_stages > 1:
+        # PP2's forward and wraparound edges have the same peers. Separate NCCL
+        # communicators let each direction progress even when the other is
+        # waiting for a send that has not yet been submitted by the CPU.
+        _PP.vpp_reverse_group = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="vpp_pp_reverse",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
 
     # The one-layer draft uses a singleton PP group; every rank creates all groups
     # because new_group is collective.

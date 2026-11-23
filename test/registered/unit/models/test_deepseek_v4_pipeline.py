@@ -400,6 +400,7 @@ class TestVPPStageForward(CustomTestCase):
 
         body = module.DeepseekV4Model.__new__(module.DeepseekV4Model)
         torch.nn.Module.__init__(body)
+        body.config = SimpleNamespace(model_type="deepseek_v4")
         body.vpp_layout = layout
         body.vpp_stages = layout.stages_for_rank(rank) if layout else ()
         owned = layout.layer_ids_for_rank(rank) if layout else tuple(range(6))
@@ -489,10 +490,19 @@ class TestVPPStageForward(CustomTestCase):
                                 self.assertIsInstance(wires[j], PPProxyTensors)
                                 self.assertEqual(
                                     set(wires[j].tensors),
-                                    {"hidden_states", "hc_pre"}
+                                    {
+                                        "hidden_states",
+                                        "hc_pre",
+                                        "vpp_engram_hash_ids",
+                                    }
                                     if lagged
                                     else {"hidden_states"},
                                 )
+                                if lagged:
+                                    torch.testing.assert_close(
+                                        wires[j].tensors["vpp_engram_hash_ids"],
+                                        ids[j][:, None],
+                                    )
                                 self.assertTrue(
                                     all(
                                         isinstance(t, torch.Tensor)

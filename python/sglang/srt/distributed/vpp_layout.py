@@ -90,9 +90,7 @@ class VPPLayout:
 
     def stage(self, stage_id: int) -> VPPStage:
         if type(stage_id) is not int or not 0 <= stage_id < self.logical_size:
-            raise ValueError(
-                f"stage_id must be an integer in [0, {self.logical_size})"
-            )
+            raise ValueError(f"stage_id must be an integer in [0, {self.logical_size})")
         return self.stages[stage_id]
 
     def stages_for_rank(self, physical_rank: int) -> tuple[VPPStage, ...]:
@@ -104,9 +102,7 @@ class VPPLayout:
                 f"physical_rank must be an integer in [0, {self.physical_size})"
             )
         return tuple(
-            stage
-            for stage in self.stages
-            if stage.physical_rank == physical_rank
+            stage for stage in self.stages if stage.physical_rank == physical_rank
         )
 
     def layer_ids_for_rank(self, physical_rank: int) -> tuple[int, ...]:
