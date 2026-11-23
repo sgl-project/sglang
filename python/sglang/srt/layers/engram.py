@@ -1555,11 +1555,8 @@ class EngramEmbedding(nn.Module):
         return tensor_model_parallel_all_reduce(values)
 
     def _all_gather_lookup(self, indices: torch.Tensor) -> torch.Tensor:
-        """Lookup when every TP rank holds the same indices and owns whole hash
-        columns: each rank all-gathers its columns' rows as stored (fp8 rows, then
-        their e8m0 scales, in one payload), and every rank dequantizes all of them
-        with the kernel of the zero-fill + all-reduce lookup, so the rows are
-        bitwise the same."""
+        # Every rank all-gathers its own columns' stored fp8 rows and scales, then
+        # dequantizes all of them with the all-reduce lookup's kernel: bitwise the same.
         if indices.shape[0] == 0:
             return self.new_rows(indices)
         parallel = get_parallel()
@@ -1598,12 +1595,12 @@ class EngramEmbedding(nn.Module):
         ).flatten()
         out = self.new_rows(indices)
         engram_gather(
-            gathered.data_ptr(),
-            scales.data_ptr(),
-            ids,
-            out.view(-1, self.dim),
-            self.dim,
-            FP8_BLOCK_SIZE,
+            weight_ptr=gathered.data_ptr(),
+            scale_ptr=scales.data_ptr(),
+            ids=ids,
+            out=out.view(-1, self.dim),
+            dim=self.dim,
+            block_size=FP8_BLOCK_SIZE,
         )
         return out
 
