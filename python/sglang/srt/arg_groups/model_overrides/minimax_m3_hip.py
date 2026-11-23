@@ -159,7 +159,6 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
 def _require_attention_tp_within_kv_heads(cfg: Any, hf_config: Any) -> None:
     # on ROCm, past one KV / index head per rank the server returns NUL bytes
     kv_heads = getattr(hf_config, "text_config", hf_config).num_key_value_heads
-    # the deprecated --dp-size/--enable-dp-attention spelling is already attn_dp_size here
     attn_tp = derive_attn_tp_size(
         tp_size=cfg.tp_size,
         attn_cp_size=cfg.attn_cp_size,

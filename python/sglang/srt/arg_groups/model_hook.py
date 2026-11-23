@@ -77,7 +77,7 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
-    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950/gfx1250 + aiter)."""
     try:
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
             is_wo_a_fp8_mxscale_supported,
@@ -254,6 +254,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
+        if model_arch == "KimiK31ForConditionalGeneration" and get_platform().is_gfx95:
+            from sglang.srt.models.kimi_k3_amd import env_defaults
+
+            env_defaults.apply_kimi_k31_rocm_env_defaults()
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
@@ -281,6 +285,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
@@ -394,27 +399,30 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on the mooncake all-CP-rank KV/indexer
-            # transfer path. mori/nixl support is a temporary limitation
-            # and will be added later by the community.
+            # Layer split relies on an all-CP-rank KV/indexer transfer path:
+            # mooncake on GPU, the ascend engine (memfabric_hybrid) on NPU.
+            # mori/nixl support is a temporary limitation and will be added
+            # later by the community.
+            allowed_transfer_backend = "ascend" if get_platform().is_npu else "mooncake"
             if (
                 cfg.enable_dsa_cache_layer_split
-                and cfg.disaggregation_transfer_backend != "mooncake"
+                and cfg.disaggregation_transfer_backend != allowed_transfer_backend
             ):
                 raise ValueError(
                     "--enable-dsa-cache-layer-split currently only supports "
-                    "the mooncake transfer backend (mooncake / mooncake_tcp). "
-                    f"Got --disaggregation-transfer-backend "
+                    "the mooncake transfer backend on GPU, or ascend on NPU. Got "
+                    f"--disaggregation-transfer-backend "
                     f"{cfg.disaggregation_transfer_backend!r}. mori/nixl "
                     "support will be added later by the community."
                 )
             if cfg.enable_dsa_cache_layer_split and cfg.pp_size > 1:
-                raise ValueError(
-                    "--enable-dsa-cache-layer-split is not supported with "
-                    "pipeline parallelism (pp_size > 1) yet. It requires "
-                    "prefill context parallelism, and CP + PP has not been "
-                    "validated for this feature."
-                )
+                if not get_platform().is_npu:
+                    raise ValueError(
+                        "--enable-dsa-cache-layer-split is not supported with "
+                        "pipeline parallelism (pp_size > 1) yet. It requires "
+                        "prefill context parallelism, and CP + PP has not been "
+                        "validated for this feature."
+                    )
 
         else:
             # DeepSeek V3/R1/V3.1
@@ -791,7 +799,7 @@ def handle_model_capability_adjustments(server_args: Any):
         logger.warning(
             "HRM-Text (prefix_lm) detected: forcing --attention-backend "
             "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-            "--disable-cuda-graph for correctness of the bidirectional "
+            "--disable-decode-cuda-graph --disable-prefill-cuda-graph for correctness of the bidirectional "
             "prompt attention."
         )
 

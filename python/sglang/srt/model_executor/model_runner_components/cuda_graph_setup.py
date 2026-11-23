@@ -382,13 +382,22 @@ def recapture_elastic_cuda_graph(
     return capture
 
 
-def drop_elastic_cuda_graph_state(
+def release_decode_cuda_graph(
     *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
 ) -> None:
+    """Free a decode runner's captured graphs before it is replaced; the runner
+    and its backend reference each other, so dropping it alone leaves them to
+    the cyclic GC, which never frees them once the heap is frozen."""
     current_platform.synchronize()
     if decode_runner is not None and decode_runner is not eager_runner:
         decode_runner.backend.cleanup()
         current_platform.synchronize()
+
+
+def drop_elastic_cuda_graph_state(
+    *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
+) -> None:
+    release_decode_cuda_graph(decode_runner=decode_runner, eager_runner=eager_runner)
     set_global_graph_memory_pool(None)
     gc.collect()
     current_platform.empty_cache()
@@ -738,6 +747,12 @@ def capture_decode_graph(
     *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
 ) -> GraphCapture:
     """Capture device graphs."""
+    if get_exec().moe.enable_paged_experts and not model_runner.is_draft_worker:
+        from sglang.srt.layers.moe.paged_experts.precopy import install
+
+        # The paged executors are final (sizing ran with the memory pool): link the
+        # pre-copies before any decode capture.
+        install(model_runner.model)
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():

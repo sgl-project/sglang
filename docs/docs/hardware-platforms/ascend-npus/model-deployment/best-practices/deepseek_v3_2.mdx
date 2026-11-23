@@ -10,10 +10,7 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-V3
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
-<Warning>
-{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
-The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
-</Warning>
+The configurations on this page use the daily build image `quay.io/ascend/sglang:main-cann9.1.0-a3`.
 
 ### Low Latency
 
@@ -123,7 +120,7 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -164,7 +161,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --enable-dp-attention --dp-size 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \
@@ -320,7 +317,7 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -361,7 +358,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --enable-dp-attention --dp-size 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \
@@ -516,7 +513,7 @@ do
         --deepep-mode normal \
         --quantization modelslim \
         --disaggregation-transfer-backend ascend \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --moe-dense-tp-size 1 \
         --enable-prefill-cp \
         --cp-strategy zigzag \
@@ -557,7 +554,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp 32 \
-        --enable-dp-attention --dp-size 8 \
+        --attn-dp-size 8 \
         --ep 32 \
         --moe-dense-tp-size 1 \
         --enable-dp-lm-head \

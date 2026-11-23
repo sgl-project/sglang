@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Collection, Dict, List, Optional
 
@@ -13,7 +14,12 @@ from sglang.srt.arg_groups.arg_utils import (
     _field_to_cli_name,
     record_fields,
 )
-from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.choices import (
+    BUILT_IN_SAMPLING_BACKENDS,
+    REMOVED_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
+    removed_choice_message,
+)
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
@@ -24,7 +30,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import REMOVED_ENVS, envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
@@ -32,10 +38,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.sampling.watermarking.config import (
-    MAX_WATERMARK_CONTEXT_WINDOW,
-    parse_watermark_key,
-)
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,13 @@ def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is not None and not cfg.enable_watermark:
         raise ValueError("--watermark-config requires --enable-watermark")
+    # Checked even with watermarking off: every request resolves its watermark
+    # policy through the configured algorithm.
+    if cfg.watermark_algorithm not in WATERMARK_ALGORITHM_CHOICES:
+        raise ValueError(
+            f"unknown --watermark-algorithm {cfg.watermark_algorithm!r}; "
+            f"choose from {WATERMARK_ALGORITHM_CHOICES}"
+        )
 
     if not cfg.enable_watermark:
         return
@@ -52,34 +62,6 @@ def check_watermark_server_args(server_args: Any) -> None:
     if cfg.device != "cuda":
         raise ValueError(
             f"--enable-watermark requires --device cuda, got {cfg.device!r}"
-        )
-    if cfg.watermark_key is not None:
-        parse_watermark_key(cfg.watermark_key)
-    if cfg.watermark_key_b is not None:
-        parse_watermark_key(cfg.watermark_key_b)
-    if (
-        isinstance(cfg.watermark_context_window, bool)
-        or not isinstance(cfg.watermark_context_window, int)
-        or not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW
-    ):
-        raise ValueError("watermark context_window must be an integer from 1 to 64")
-    if cfg.watermark_key_b is not None and cfg.watermark_key is None:
-        raise ValueError("watermark key_b requires a server key")
-    if not 0 < cfg.watermark_mixing_probability < 1:
-        raise ValueError(
-            "watermark mixing_probability must be strictly between 0 and 1"
-        )
-    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
-        raise ValueError("watermark mixing_probability requires key_b")
-    if not 0 < cfg.watermark_max_probability <= 1:
-        raise ValueError(
-            "watermark max_probability must be greater than 0 and at most 1"
-        )
-    if (
-        cfg.watermark_default_enabled or cfg.watermark_enforce_all
-    ) and cfg.watermark_key is None:
-        raise ValueError(
-            "watermark default_enabled and enforce_all require a server key"
         )
     if cfg.enable_custom_logit_processor:
         raise ValueError(
@@ -107,13 +89,28 @@ def check_watermark_server_args(server_args: Any) -> None:
             "--enable-watermark is not supported with pipeline-parallel "
             "speculative decoding"
         )
-    if cfg.speculative_use_rejection_sampling:
-        raise ValueError(
-            "--enable-watermark is incompatible with "
-            "--speculative-use-rejection-sampling"
-        )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # Another algorithm's fields, set directly as server arguments; the config
+    # loader refuses them in the file.
+    allowed = ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+    others = sorted(
+        f"watermark_{name}"
+        for name in set().union(*ALGORITHM_CONFIG_FIELDS.values()) - allowed
+    )
+    fields = {field.name: field for field in record_fields(type(server_args))}
+    unread = [
+        name for name in others if getattr(cfg, name) != _field_default(fields[name])
+    ]
+    if unread:
+        raise ValueError(
+            f"server arguments {unread} are not supported with "
+            f"--watermark-algorithm {cfg.watermark_algorithm}"
+        )
+    # lazy: the algorithm's adapter imports torch and its kernels.
+    from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
+
+    check_watermark_algorithm_args(cfg)
 
 
 # Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
@@ -359,6 +356,11 @@ def check_server_args(server_args: Any):
             "replica, or unset SGLANG_RUST_SERVER."
         )
 
+    if cfg.disable_multimodal and cfg.enable_multimodal:
+        raise ValueError(
+            "--disable-multimodal cannot be combined with --enable-multimodal"
+        )
+
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 
@@ -411,6 +413,14 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    # A PP stage whose transfer poll lags releases requests later, so its gamma diverges.
+    assert not (
+        cfg.enable_uniboost_gamma_ada
+        and cfg.pp_size > 1
+        and cfg.disaggregation_mode == "prefill"
+    ), (
+        "--enable-uniboost-gamma-ada is not supported with --pp-size > 1 on a PD prefill server"
+    )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
@@ -444,6 +454,59 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
+    halving_chunks = cfg.shortest_prefill_boundary_halving_chunks
+    budget_min_ratio = cfg.shortest_prefill_budget_min_ratio
+    doubling_chunks = cfg.shortest_prefill_budget_doubling_chunks
+    # Unset values derive from halving_chunks and the chunk when the policy is built.
+    explicit_values = [
+        value
+        for value in (
+            cfg.shortest_prefill_boundary_decay_start_chunks,
+            budget_min_ratio,
+            doubling_chunks,
+        )
+        if value is not None
+    ]
+    if not all(
+        math.isfinite(value) and value >= 0
+        for value in (halving_chunks, *explicit_values)
+    ):
+        raise ValueError(
+            "--shortest-prefill-boundary-* and --shortest-prefill-budget-* values "
+            "must be finite and >= 0"
+        )
+    if explicit_values and not halving_chunks:
+        raise ValueError(
+            "--shortest-prefill-boundary-decay-start-chunks and "
+            "--shortest-prefill-budget-* require "
+            "--shortest-prefill-boundary-halving-chunks"
+        )
+    if budget_min_ratio is not None and budget_min_ratio > 1:
+        raise ValueError(
+            f"--shortest-prefill-budget-min-ratio ({budget_min_ratio}) must be at "
+            "most 1, the chunked prefill size"
+        )
+    if doubling_chunks == 0 or (doubling_chunks is not None and budget_min_ratio == 0):
+        raise ValueError(
+            "--shortest-prefill-budget-doubling-chunks must be positive, and the "
+            "budget on (--shortest-prefill-budget-min-ratio not 0)"
+        )
+    if halving_chunks:
+        if cfg.schedule_policy != "shortest-prefill-first":
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks requires "
+                "--schedule-policy shortest-prefill-first"
+            )
+        if cfg.shortest_prefill_aging_factor:
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks and "
+                "--shortest-prefill-aging-factor cannot be combined"
+            )
+        if cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "--shortest-prefill-boundary-halving-chunks is not supported with "
+                "--dllm-algorithm"
+            )
 
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -506,6 +569,7 @@ def check_server_args(server_args: Any):
         raise ValueError("Communications quantization is only supported for NPU device")
 
     validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+    validate_device_lora_backend(cfg.lora_backend, cfg.device)
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
@@ -690,6 +754,15 @@ def validate_device_sampling_backend(
     if sampling_backend == "intel_xpu" and device != "xpu":
         raise ValueError(
             f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
+
+
+def validate_device_lora_backend(lora_backend: str, device: str) -> None:
+    # The intel_xpu LoRA kernels ship only in sgl-kernel-xpu; on another device the
+    # backend import fails late, inside LoRAManager init.
+    if lora_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--lora-backend intel_xpu requires --device xpu, got --device {device}"
         )
 
 
@@ -915,14 +988,30 @@ def default_unset_prefill_decode_interval(server_args: Any):
         )
 
 
+def validate_removed_options(server_args: Any):
+    """Stop on a removed choice value or environment variable, naming what to use.
+
+    The CLI rejects a removed value while parsing; this covers the Python API.
+    """
+    cfg = resolving_view(server_args)
+    for field in REMOVED_CHOICES:
+        message = removed_choice_message(field, getattr(cfg, field))
+        if message is not None:
+            raise ValueError(f"--{field.replace('_', '-')}: {message}.")
+    for name in os.environ:
+        if name in REMOVED_ENVS:
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; "
+                f"{REMOVED_ENVS[name]}."
+            )
+        if name.startswith("SGL_") and hasattr(envs, "SGLANG_" + name[4:]):
+            raise ValueError(
+                f"Environment variable {name} was removed in SGLang 1.0; use "
+                f"SGLANG_{name[4:]}."
+            )
+
+
 def validate_sampling_mask_max_tokens(server_args: Any):
-    if envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.is_set():
-        raise ValueError(
-            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS is no longer supported. "
-            "Unset it. To enable sampling masks for disaggregated serving, set "
-            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 and use the same positive "
-            "--sampling-mask-max-tokens value on both prefill and decode servers."
-        )
     cfg = resolving_view(server_args)
     if cfg.sampling_mask_max_tokens <= 0:
         raise ValueError(

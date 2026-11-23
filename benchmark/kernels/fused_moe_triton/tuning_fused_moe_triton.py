@@ -57,8 +57,12 @@ def benchmark_config(
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    activation: str = "silu",
+    is_gated: bool = True,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
+    # w2 takes the activation output: half of w1's rows when gated, all of them otherwise
+    down_size = shard_intermediate_size // 2 if is_gated else shard_intermediate_size
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
@@ -77,7 +81,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 2,
+                down_size,
             ),
             dtype=torch.int8,
         )
@@ -98,7 +102,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 4,
+                down_size // 2,
             ),
             dtype=torch.uint8,
         )
@@ -106,9 +110,7 @@ def benchmark_config(
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
-        w2 = torch.randn(
-            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
-        )
+        w2 = torch.randn(num_experts, hidden_size, down_size, dtype=init_dtype)
     gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32)
 
     w1_scale = None
@@ -126,7 +128,7 @@ def benchmark_config(
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
         n_tiles_w2 = (hidden_size + block_n - 1) // block_n
         k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+        k_tiles_w2 = (down_size + block_k - 1) // block_k
         w1_scale = torch.randn(
             (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
         )
@@ -149,7 +151,7 @@ def benchmark_config(
             n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
             n_tiles_w2 = (hidden_size + block_n - 1) // block_n
             k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-            k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+            k_tiles_w2 = (down_size + block_k - 1) // block_k
             w1_scale = torch.rand(
                 (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
             )
@@ -180,6 +182,8 @@ def benchmark_config(
         architecture = model_config.architectures[0]
         is_dsv4 = architecture == "DeepseekV4ForCausalLM"
         moe_runner_config = MoeRunnerConfig(
+            activation=activation,
+            is_gated=is_gated,
             inplace=True,
             swiglu_limit=10.0 if is_dsv4 else None,
         )
@@ -203,35 +207,38 @@ def benchmark_config(
                 block_shape=block_shape,
             )
 
+    device_module = torch.get_device_module()
+    graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+
     # JIT compilation & warmup
     run()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
-    # Capture 10 invocations with CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    # Capture 10 invocations with a device graph
+    graph = graph_cls()
+    with device_module.graph(graph):
         for _ in range(10):
             run()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     # Warmup
     for _ in range(5):
         graph.replay()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     # Flush L2 cache with 256 MB data
-    cache_flush = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    cache_flush = torch.empty(int(256e6 // 4), dtype=torch.int, device=get_device())
     cache_flush.zero_()
 
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    start_events = [device_module.Event(enable_timing=True) for _ in range(num_iters)]
+    end_events = [device_module.Event(enable_timing=True) for _ in range(num_iters)]
 
     for i in range(num_iters):
         prepare(i)
         start_events[i].record()
         graph.replay()
         end_events[i].record()
-    torch.cuda.synchronize()
+    device_module.synchronize()
 
     latencies: List[float] = []
     for i in range(num_iters):
@@ -250,8 +257,9 @@ class BenchmarkWorker:
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. Ray isolates each worker to a single visible
         # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
-        # ROCm using the global ray gpu id here raises "invalid device ordinal".
-        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
+        # ROCm and XPU using the global ray gpu id here raises an out-of-range
+        # device ordinal.
+        self.device_id = 0 if (is_hip() or _is_xpu) else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -268,8 +276,10 @@ class BenchmarkWorker:
         use_int4_w4a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
+        activation: str = "silu",
+        is_gated: bool = True,
     ) -> Tuple[Dict[str, int], float]:
-        torch.cuda.manual_seed_all(0)
+        torch.get_device_module().manual_seed_all(0)
         dtype_str = get_config_dtype_str(
             dtype,
             use_int8_w8a16=use_int8_w8a16,
@@ -280,7 +290,7 @@ class BenchmarkWorker:
         # is the intermediate size after silu_and_mul.
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        N = shard_intermediate_size // 2
+        N = shard_intermediate_size // 2 if is_gated else shard_intermediate_size
         op_config = get_moe_configs(
             num_experts,
             N,
@@ -317,6 +327,8 @@ class BenchmarkWorker:
                 use_int4_w4a16,
                 per_channel_quant,
                 block_shape,
+                activation=activation,
+                is_gated=is_gated,
             )
         return config, kernel_time
 
@@ -335,6 +347,8 @@ class BenchmarkWorker:
         per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
+        activation: str = "silu",
+        is_gated: bool = True,
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
@@ -360,6 +374,8 @@ class BenchmarkWorker:
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
+                        activation=activation,
+                        is_gated=is_gated,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
@@ -387,6 +403,8 @@ def main(args: argparse.Namespace):
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
+    activation = model_config["activation"]
+    is_gated = model_config["is_gated"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
@@ -450,6 +468,7 @@ def main(args: argparse.Namespace):
             use_int4_w4a16,
             per_channel_quant,
             block_shape,
+            is_gated=is_gated,
         )
         print(
             f"Start tuning over {len(search_space)} configurations to create {filename}..."
@@ -473,6 +492,8 @@ def main(args: argparse.Namespace):
                     per_channel_quant,
                     block_shape,
                     search_space,
+                    activation,
+                    is_gated,
                 )
                 for batch_size in batch_sizes
             ],
@@ -503,6 +524,8 @@ def main(args: argparse.Namespace):
                     use_int4_w4a16,
                     per_channel_quant,
                     block_shape,
+                    activation,
+                    is_gated,
                 )
                 for batch_size in batch_sizes
             ],

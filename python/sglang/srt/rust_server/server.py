@@ -16,6 +16,7 @@ import json
 import logging
 import operator
 import os
+import secrets
 import signal
 import threading
 import time
@@ -309,7 +310,8 @@ class RustServer:
                 "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
                 f"model_type={scheduler.model_config.hf_config.model_type!r} "
                 f"(supported: {', '.join(supported)}; "
-                "images only). Unset SGLANG_RUST_SERVER to serve this model."
+                "images only). Pass --disable-multimodal to serve it text-only, "
+                "or unset SGLANG_RUST_SERVER."
             )
         return mm_spec
 
@@ -381,7 +383,11 @@ class RustServer:
 
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
-        """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        """Collective: every rank calls once; returns listener endpoints by DP rank.
+
+        Each listener's entry carries a ``peer_token`` its rank draws here: the
+        listener serves relayed control requests only with it, and only the
+        ranks of this launch learn it, through this gather."""
         if get_exec().moe.is_ep_joiner:
             # An elastic-EP joiner stays out: the serving ranks gathered at
             # their own startup and never enter this collective again, so a
@@ -416,6 +422,7 @@ class RustServer:
                     get_parallel().dp_rank,
                 ),
                 "endpoint": address.to_url(),
+                "peer_token": secrets.token_urlsafe(32),
             }
             if bind_host == "0.0.0.0" and address.is_ipv6:
                 config["address_error"] = (

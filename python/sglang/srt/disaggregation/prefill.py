@@ -399,11 +399,18 @@ class PrefillBootstrapQueue:
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(storage)
-        kv_args.prefill_end_layer = (
-            kv_args.prefill_start_layer + len(kv_data_ptrs)
-            if layer_shard_enabled
-            else getattr(self.token_to_kv_pool, "end_layer", None)
-        )
+        if layer_shard_enabled:
+            # NPU MLA pools report one entry per layer per buffer group
+            # (latent k/v, indexer k, fp8 index scale), so the layer span is
+            # the entry count divided by the group count, not the raw count.
+            span = getattr(self.token_to_kv_pool, "get_kv_transfer_layer_span", None)
+            kv_args.prefill_end_layer = kv_args.prefill_start_layer + (
+                span(len(kv_data_ptrs)) if span is not None else len(kv_data_ptrs)
+            )
+        else:
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool, "end_layer", None
+            )
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool
@@ -744,11 +751,68 @@ class SchedulerDisaggregationPrefillMixin:
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
 
+    def has_bootstrapped_parked_chunk(self: Scheduler) -> bool:
+        """A bootstrapped request between two chunks that got no chunk in the
+        last admission pass: its extend_end stays at prefix_len."""
+        req = self.chunked_req
+        return (
+            req is not None
+            and not req.pending_bootstrap
+            and not is_aborted(req)
+            and req.extend_end == req.prefix_len
+        )
+
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
             for req in self.waiting_queue
         )
+
+    def yield_storage_prefetch(self: Scheduler) -> None:
+        """Make room for the parked storage hit of a bootstrapped request.
+
+        A buffer-mode prefetch holds host staging and an anchor pin until its
+        request is admitted. Parked hits commit in scheduler order:
+        bootstrapped requests first, because they hold their decode
+        reservation. While the hit of one of them cannot commit, one request
+        without a reservation gives up its prefetch per call and starts the
+        lookup again."""
+        pipeline = self.tree_cache.buffer_pipeline
+        if (
+            pipeline is None
+            or not pipeline.pending_hit_allocs
+            or get_parallel().pp_size > 1
+            or get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ):
+            return
+        bootstrapped = [req for req in self.waiting_queue if not req.pending_bootstrap]
+        unreserved = [
+            *(req for req in self.waiting_queue if req.pending_bootstrap),
+            *self.disagg_prefill_bootstrap_queue.queue,
+        ]
+        # The two queues hold every live owner of a parked hit. A hit of another
+        # handle is left over from an ended attempt: it leads the line, where
+        # the next drain drops it.
+        blocked = pipeline.order_parked_hits(
+            [req.cache_request_handle for req in (*bootstrapped, *unreserved)]
+        )
+        if not any(
+            req.cache_request_handle == blocked and not is_aborted(req)
+            for req in bootstrapped
+        ):
+            return
+        # The request farthest from prefill yields first.
+        for req in reversed(unreserved):
+            if not pipeline.holds_staging(req.cache_request_handle):
+                continue
+            logger.info(
+                f"Req {req.rid} yields its L3 prefetch to a bootstrapped request"
+            )
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+            req.advance_cache_request_handle()
+            self._prefetch_kvcache(req)
+            return
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
@@ -761,6 +825,8 @@ class SchedulerDisaggregationPrefillMixin:
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
+        if self.enable_hicache_storage:
+            self.yield_storage_prefetch()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
@@ -1413,7 +1479,24 @@ class SchedulerDisaggregationPrefillMixin:
                     # Decode may have admitted different requests. Yield one
                     # slot so they can prefill, including peers still waiting
                     # for a metadata buffer in the bootstrap queue.
+                    # It also serves a refused admission pass: no second yield.
+                    self.prefill_admission_no_token = False
                     self.optimistic_release_and_requeue(req)
+                elif (
+                    poll == KVPoll.Bootstrapping
+                    and get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete"
+                    and self.prefill_admission_no_token
+                ):
+                    # Admission refused a request for lack of KV. A bootstrapped
+                    # one holds its decode reservation while parked KV keeps it
+                    # out: one parked request yields per refused pass.
+                    self.prefill_admission_no_token = False
+                    if (
+                        self.has_bootstrapped_waiting_req()
+                        or self.has_bootstrapped_parked_chunk()
+                    ):
+                        self.optimistic_release_and_requeue(req)
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
@@ -1735,11 +1818,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         sender = req.disagg_kv_sender
         # The schedule stream may wait on the in-flight forward. A sender that takes
-        # host-tensor indices waits on their copy's event itself, so the scheduler
-        # never blocks on these device reads.
-        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
-            sender.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+        # host-tensor indices waits on their copy's event itself. CP and shard
+        # filtering read the indices on the scheduler before that wait, so those
+        # paths need a completed host copy even with CP-TP group sharing.
+        host_indices = (
+            getattr(sender, "supports_host_tensor_indices", False)
+            and sender.kv_mgr.kv_shard_size <= 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
         )
 
         def page_indices_of(kv_indices: torch.Tensor):
@@ -2021,6 +2109,21 @@ class SchedulerDisaggregationPrefillMixin:
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)
+        if req.output_ids:
+            # A parked request sampled its first token. The retry samples it
+            # again, so drop what the discarded token left on the request.
+            if req.grammar is not None:
+                req.grammar.rollback(len(req.output_ids))
+                req.grammar.finished = False
+            if req.return_logprob:
+                req.logprob.output_token_logprobs_val.clear()
+                req.logprob.output_token_logprobs_idx.clear()
+                req.logprob.output_top_logprobs_val.clear()
+                req.logprob.output_top_logprobs_idx.clear()
+                req.logprob.output_token_ids_logprobs_val.clear()
+                req.logprob.output_token_ids_logprobs_idx.clear()
+            if req.return_sampling_mask:
+                req.sampling_mask_rows.take()
         req.reset_for_retract()
         req.output_ids = array("q")
         req.customized_info = None

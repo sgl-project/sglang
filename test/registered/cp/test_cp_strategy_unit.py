@@ -1094,6 +1094,25 @@ class TestCPZigzagStrategy(CustomTestCase):
         ):
             return strategy.can_apply(8, fb), strategy.can_apply(8, fb)
 
+    def test_zigzag_can_apply_with_short_requests(self):
+        cases = [
+            # A short request beside a long one keeps CP once allowed.
+            ([4096, 1], ForwardMode.EXTEND, True, True),
+            ([4096, 1], ForwardMode.EXTEND, False, False),
+            # A batch of only short requests gives some rank no row.
+            ([3, 3], ForwardMode.EXTEND, True, False),
+            # Mixed-chunk decode rows keep the per-request rule.
+            ([4096, 1], ForwardMode.MIXED, True, False),
+        ]
+        for lengths, mode, allowed, active in cases:
+            with self.subTest(lengths=lengths, mode=mode, allowed=allowed):
+                strategy = ZigzagCPStrategy(cp_size=2)
+                if allowed:
+                    strategy.allow_short_requests()
+                fb = SimpleNamespace(forward_mode=mode, extend_seq_lens_cpu=lengths)
+                with get_context().override_server_args(attention_backend="fa3"):
+                    self.assertIs(strategy.can_apply(sum(lengths), fb), active)
+
     def test_zigzag_can_apply_falls_back_on_unsupported_flashinfer(self):
         calls = []
 

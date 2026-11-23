@@ -12,7 +12,7 @@ like-for-like comparison.
 amd/GLM-5.2-MXFP4 (~190 GB) must already be in the node's HF cache: a cold
 download through hf_xet does not finish within the server start timeout.
 
-Registry: nightly-perf-8-gpu-mi35x-glm52-mxfp4-agentx suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm52-mxfp4-agentx suite
 """
 
 import unittest
@@ -23,7 +23,9 @@ from sglang.test.ci.ci_register import register_amd_ci
 # Register for AMD CI - one AgentX point: model load, then InferenceX's one-hour
 # measurement window (this row has no warmup grace).
 register_amd_ci(
-    est_time=9000, suite="nightly-perf-8-gpu-mi35x-glm52-mxfp4-agentx", nightly=True
+    est_time=9000,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm52-mxfp4-agentx",
+    nightly=True,
 )
 
 

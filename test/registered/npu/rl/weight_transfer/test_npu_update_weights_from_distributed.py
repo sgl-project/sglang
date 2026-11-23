@@ -33,8 +33,8 @@ from sglang.test.ascend.test_npu_rl_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_npu_ci(est_time=500, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=500, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=500, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=500, suite="nightly-test-2-npu-a3", nightly=True)
 
 CASE = weights.GLM52_CASE
 MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
@@ -48,7 +48,8 @@ BASE_ARGS = (
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
-    "--disable-cuda-graph",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
     "--disable-overlap-schedule",
     "--disable-radix-cache",
     "--context-length",

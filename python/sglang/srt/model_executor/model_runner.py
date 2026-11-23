@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.beam_search.trie_output_head import configure_model_trie_output_heads
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
@@ -153,6 +154,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -229,9 +231,10 @@ from sglang.srt.runtime_context import (
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
-from sglang.srt.sampling.watermarking.core import WatermarkState
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
+from sglang.srt.sampling.watermarking.interface import WatermarkEngine
+from sglang.srt.sampling.watermarking.runtime import make_watermark_engine
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
@@ -261,7 +264,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
@@ -329,7 +332,7 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
-    watermark_state: Optional[WatermarkState] = None
+    watermark: Optional[WatermarkEngine] = None
     # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
     uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None
@@ -662,24 +665,21 @@ class ModelRunner:
             device=self.device,
         )
 
-    def maybe_init_watermark_state(self):
-        features = get_exec().features
-        self.watermark_state = (
-            WatermarkState(
+    def maybe_init_watermark(self):
+        self.watermark = (
+            make_watermark_engine(
                 max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                context_window=features.watermark_context_window,
                 max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
                 vocab_size=self.model_config.vocab_size,
-                key=features.watermark_key,
-                key_b=features.watermark_key_b,
-                mixing_probability=features.watermark_mixing_probability,
-                max_probability=features.watermark_max_probability,
                 device=self.device,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
             )
-            if features.enable_watermark and not self.is_draft_worker
+            if not self.is_draft_worker
             else None
+        )
+
+    def init_sampling_pipeline(self):
+        self.sampling_pipeline = SamplingPipeline(
+            sampler=self.sampler, watermark=self.watermark
         )
 
     def init_kv_cache_configurator(
@@ -779,6 +779,12 @@ class ModelRunner:
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
+        self.beam_trie_compact_enabled = configure_model_trie_output_heads(
+            self.model,
+            self.model_config,
+            self.device,
+            lora_enabled=self.lora_manager is not None,
+        )
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
         # after every post-load change to the model, before the KV cache is sized
@@ -1070,7 +1076,8 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
-        self.maybe_init_watermark_state()
+        self.maybe_init_watermark()
+        self.init_sampling_pipeline()
 
         self.maybe_init_hisparse_coordinator()
 
@@ -1388,6 +1395,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 
@@ -1721,6 +1729,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
@@ -1921,7 +1932,7 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(
+        step_span_ctx = forward_nvtx_range(
             build_step_span_name(
                 forward_batch,
                 is_draft_worker=self.is_draft_worker,
@@ -1966,6 +1977,11 @@ class ModelRunner:
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()
+        if (
+            not self.is_draft_worker
+            and (placement := getattr(self.model, "expert_placement", None)) is not None
+        ):
+            placement.on_forward_end(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -2190,34 +2206,6 @@ class ModelRunner:
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
-    def _preprocess_logits(
-        self,
-        logits_output: LogitsProcessorOutput,
-        sampling_info: SamplingBatchInfo,
-        observer: Optional[SamplingObserver] = None,
-    ):
-        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
-        #       was executed after we processed last batch's results.
-
-        # Calculate logits bias and apply it to next_token_logits.
-        sampling_info.update_regex_vocab_mask()
-        observer_state = None
-        if observer is not None:
-            observer_state = sampling_info.apply_logits_bias_with_observer(
-                logits_output.next_token_logits,
-                observer=observer,
-            )
-        else:
-            sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
-        # Release the vocab_mask GPU tensor immediately after it has been applied
-        # to the logits. In overlap scheduling, the sampling_info (and its
-        # grammar_mask) can be kept alive by the delay_sample_func closure and
-        # batch_record_buf until the next iteration, causing a steady VRAM leak
-        # when structured output (grammar) is used.
-        sampling_info.grammar_mask = None
-        return observer_state
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -2236,75 +2224,16 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
-        observer = self.sampling_observer
-        # Preserve two-argument overrides when observation is inactive.
-        if observer is not None and observer.is_active(forward_batch.sampling_info):
-            observer_state = self._preprocess_logits(
-                logits_output,
-                forward_batch.sampling_info,
-                observer=observer,
-            )
-        else:
-            observer_state = self._preprocess_logits(
-                logits_output, forward_batch.sampling_info
-            )
-
-        watermark_state = self.watermark_state
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            logprob_logits = (
-                logits_output.next_token_logits.clone()
-                if forward_batch.return_logprob
+        next_token_ids = self.sampling_pipeline.sample(
+            logits_output,
+            forward_batch,
+            observer=self.sampling_observer,
+            graph_token_ids=(
+                self.uocr_greedy_graph.recorded_ids(logits_output, forward_batch)
+                if self.uocr_greedy_graph is not None
                 else None
-            )
-            req_pool_indices = forward_batch.req_pool_indices[
-                : logits_output.next_token_logits.shape[0]
-            ]
-            watermark_state.init_from_prompt(
-                req_pool_indices,
-                forward_batch.watermark_prompt_tail_ids,
-                forward_batch.watermark_context_hash_history,
-            )
-            watermark_state.force(
-                logits_output.next_token_logits,
-                req_pool_indices,
-                forward_batch.sampling_info,
-            )
-        else:
-            logprob_logits = None
-
-        # Sample the next tokens
-        next_token_ids = None
-        if self.uocr_greedy_graph is not None:
-            next_token_ids = self.uocr_greedy_graph.recorded_ids(
-                logits_output, forward_batch, watermark_state=watermark_state
-            )
-        if next_token_ids is None:
-            next_token_ids = self.sampler(
-                logits_output,
-                forward_batch.sampling_info,
-                forward_batch.return_logprob,
-                forward_batch.top_logprobs_nums,
-                forward_batch.token_ids_logprobs,
-                # For prefill, we only use the position of the last token.
-                (
-                    forward_batch.positions
-                    if forward_batch.forward_mode.is_decode()
-                    else forward_batch.seq_lens - 1
-                ),
-                **(
-                    {"logprob_logits": logprob_logits}
-                    if logprob_logits is not None
-                    else {}
-                ),
-            )
-        if observer_state is not None:
-            logits_output.auxiliary_device_output = observer.after_sample(
-                observer_state,
-                next_token_ids,
-            )
+            ),
+        )
         if (c := self.canary_manager) is not None:
             c.on_sampled(
                 logits_output=logits_output,
@@ -2315,14 +2244,6 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if (
-            watermark_state is not None
-            and forward_batch.sampling_info.has_watermark_candidates
-        ):
-            watermark_state.append(
-                req_pool_indices,
-                next_token_ids,
-            )
         return next_token_ids
 
     def compute_logprobs_only(
@@ -2342,19 +2263,7 @@ class ModelRunner:
             forward_batch: The forward batch that generates logits_output
         """
         logits_output.auxiliary_device_output = None
-        if not forward_batch.token_ids_logprobs:
-            return
-
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-
-        # Delegate to sampler for logprob-only computation
-        # This populates logits_output with requested token probabilities
-        self.sampler.compute_logprobs_only(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-        )
+        self.sampling_pipeline.compute_logprobs_only(logits_output, forward_batch)
 
     def check_weights(
         self,
