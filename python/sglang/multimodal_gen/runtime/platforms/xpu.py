@@ -86,9 +86,7 @@ class XpuPlatform(Platform):
         if empty_cache:
             torch.xpu.empty_cache()
 
-        used_memory = torch.xpu.memory_allocated(device_id)
-        total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory, _ = torch.xpu.mem_get_info(device_id)
 
         if distributed:
             import torch.distributed as dist

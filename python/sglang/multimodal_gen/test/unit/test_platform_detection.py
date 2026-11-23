@@ -9,10 +9,35 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.runtime import platforms
+from sglang.multimodal_gen.runtime.platforms.xpu import XpuPlatform
 
 
 class NVMLUnavailableError(Exception):
     pass
+
+
+class TestXpuMemory(unittest.TestCase):
+    def test_device_query_and_cache(self):
+        for empty_cache in (True, False):
+            with (
+                self.subTest(empty_cache=empty_cache),
+                patch.object(torch.xpu, "is_available", return_value=True),
+                patch.object(torch.xpu, "device_count", return_value=2),
+                patch.object(torch.xpu, "current_device", return_value=1),
+                patch.object(
+                    torch.xpu, "mem_get_info", return_value=(3 << 30, 16 << 30)
+                ) as mem_get_info,
+                patch.object(torch.xpu, "empty_cache") as clear_cache,
+            ):
+                self.assertEqual(
+                    XpuPlatform.get_available_gpu_memory(1, empty_cache=empty_cache),
+                    3.0,
+                )
+                mem_get_info.assert_called_once_with(1)
+                if empty_cache:
+                    clear_cache.assert_called_once_with()
+                else:
+                    clear_cache.assert_not_called()
 
 
 def _entry_point(name: str, result: str | None, dist: str | None = None):

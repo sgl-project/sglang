@@ -114,8 +114,6 @@ def _prefetch_fits_device_memory(module: nn.Module, use: ComponentUse) -> bool:
     if _module_ready_on_local_device(module, dtype=use.target_dtype):
         return True
     required_bytes = _cpu_module_nbytes(module, dtype=use.target_dtype)
-    # Not torch.xpu.mem_get_info: with torch 2.14.0+xpu it reports free memory
-    # equal to total even when memory is allocated, so a full device looks empty.
     free_bytes = int(
         current_platform.get_available_gpu_memory(
             device_id=get_local_torch_device().index or 0, empty_cache=False
