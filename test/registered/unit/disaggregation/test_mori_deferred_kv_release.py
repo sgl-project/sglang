@@ -187,7 +187,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
                 )
                 engine = MagicMock()
                 engine.wait_all.return_value = (
-                    StatusCode.IN_PROGRESS if via_drainer else StatusCode.FAILED
+                    StatusCode.IN_PROGRESS if via_drainer else StatusCode.ERR_RDMA_OP
                 )
                 manager.transport = MoriTransport(engine=engine)
                 manager._transfer_timeout_ms = 1 if via_drainer else 0
