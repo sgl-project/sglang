@@ -973,7 +973,7 @@ def postprocess_round(
             f"of {len(common_cts)} common decode steps had every rank at the "
             f"target {batch_size_per_rank} requests (need at least "
             f"{ROUND_WARMUP_STEPS + min_steady_steps}). Increase "
-            "--round-timeout / --target-steady-steps, or inspect the raw "
+            "--round-timeout / --min-steady-steps, or inspect the raw "
             "records for retraction / DP imbalance."
         )
 

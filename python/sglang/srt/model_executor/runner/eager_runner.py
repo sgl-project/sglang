@@ -57,13 +57,11 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
