@@ -226,6 +226,24 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_backup_storage_duration_metrics(self):
+        # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
+        # StorageOperation without the field (renamed or dropped) would crash
+        # the scheduler drain path instead of merely missing one sample.
+        from sglang.srt.managers.cache_controller import StorageOperation
+
+        operation = StorageOperation(host_indices=None, token_ids=[1, 2, 3])
+        self.assertIsInstance(operation.enqueue_time, float)
+        self.assertGreater(operation.enqueue_time, 0)
+
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+        collector.observe_backup_storage_duration(0.5)
+        self.assertEqual(
+            collector.backup_storage_duration_seconds.observations,
+            [(labels, 0.5)],
+        )
+
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):
@@ -281,8 +299,11 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda windows: (0, {})
+                queue=[],
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
+            max_total_num_tokens=1,
             running_batch=SimpleNamespace(reqs=[]),
             request_lists=lambda: {kind: [] for kind in ListKind},
             enable_fpm=False,
@@ -364,6 +385,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
+                num_tokens_pending_prealloc=0,
                 pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,
