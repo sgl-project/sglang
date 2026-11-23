@@ -1,3 +1,5 @@
+//! Verify that WAV input uses the shared Qwen3-ASR processor and prompt layout.
+
 #![cfg(feature = "mm")]
 
 use sglang_processor::MmProcessor;
