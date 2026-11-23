@@ -1,8 +1,10 @@
+import copy
 import logging
 import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.memory.small_copy import try_small_copy
@@ -151,6 +153,7 @@ from sglang.srt.speculative.spec_utils import (
     simulated_acc_len_generator,
 )
 from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     async_h2d,
     is_cuda,
@@ -299,6 +302,38 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _plain_greedy(si, *, has_grammar: bool) -> bool:
+    """Greedy with no sampling-time logits adjustment to apply."""
+    return si is None or (
+        si.is_all_greedy
+        and not adjusts_logits(si, has_grammar=has_grammar)
+        and si.sampling_mask_batch_indices is None
+    )
+
+
+class _DraftBlock(msgspec.Struct, frozen=True):
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    positions_2d: torch.Tensor
+    verify_out_cache_loc: torch.Tensor
+    verify_out_cache_loc_2d: torch.Tensor
+    iteration_ids: IterationIds
+    ring_block_locs: Optional[torch.Tensor]
+
+
+class _TailRows(msgspec.Struct, frozen=True):
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    req_pool_indices: torch.Tensor
+    sampling_info: None = None
+    can_run_decode_cuda_graph: bool = True
+
+
+class _TailDraftInput(msgspec.Struct, frozen=True):
+    bonus_tokens: torch.Tensor
+    nxt_kv_lens_cpu: None = None
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -2979,8 +3014,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        bind_tails=None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
+            if bind_tails:
+                bind_tails()
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2991,6 +3029,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         self._validate_phase1_sampling_support(batch)
+        self._bind = bind_tails
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -2999,6 +3038,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             # A pending aux append may own draft KV rows this forward reuses; only the
             # decode draft prep (no KV writes) runs beside it, up to the draft forward.
             self._join_aux()
+
+        if self._runs_mixed_verify(batch):
+            self._note_non_decode_step()
+            return self._forward_mixed_verify(batch, on_publish=on_publish)
+        if bind_tails:
+            bind_tails()
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._note_non_decode_step()
@@ -3177,8 +3222,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         bs = len(batch.seq_lens)
-        device = self.device
         self._info_dumper.begin_step()
+        draft = self._draft_block(batch, draft_input, bs)
+        return self._verify_block(
+            batch,
+            draft_input,
+            draft,
+            bs,
+            on_publish=on_publish,
+            grammar_barrier=grammar_barrier,
+        )
+
+    def _draft_block(self, batch, draft_input, bs: int) -> "_DraftBlock":
+        device = self.device
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3521,6 +3577,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_tokens[:, 0].copy_(block_ids[:, 0])
             draft_tokens[:, 1:].copy_(draft_next)
+        return _DraftBlock(
+            tokens=draft_tokens,
+            positions=positions,
+            positions_2d=positions_2d,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+            iteration_ids=iteration_ids,
+            ring_block_locs=ring_block_locs,
+        )
+
+    def _verify_block(
+        self,
+        batch,
+        draft_input,
+        draft: "_DraftBlock",
+        bs: int,
+        *,
+        on_publish,
+        grammar_barrier,
+    ) -> GenerationBatchResult:
+        draft_tokens, positions, positions_2d = (
+            draft.tokens,
+            draft.positions,
+            draft.positions_2d,
+        )
+        verify_out_cache_loc, verify_out_cache_loc_2d = (
+            draft.verify_out_cache_loc,
+            draft.verify_out_cache_loc_2d,
+        )
+        iteration_ids, ring_block_locs = draft.iteration_ids, draft.ring_block_locs
+        prefix_lens, block_size = batch.seq_lens, int(self.block_size)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3917,4 +4004,200 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
                 rids=[req.rid for req in batch.reqs],
             )
+        )
+
+    def _runs_mixed_verify(self, batch: ScheduleBatch) -> bool:
+        return (
+            envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+            and batch.forward_mode.is_mixed()
+            and bool(batch.decoding_reqs)
+            and _plain_greedy(batch.sampling_info, has_grammar=batch.has_grammar)
+            and not (
+                batch.has_grammar or batch.return_logprob or batch.return_hidden_states
+            )
+            and get_global_experts_capturer() is None
+            and batch.seq_lens_cpu is not None
+            and self._target_logits_processor is not None
+            and batch.hisparse_coordinator is None
+            and not (
+                self._is_domino
+                or self.lilicorr is not None
+                or self._need_mamba_verify_commit
+                # planned verify lengths, a bound runtime and the draft KV ring
+                # take the decode round only
+                or self._verify_planner is not None
+                or self._runtime is not None
+                or self.draft_kv_ring is not None
+            )
+            and not get_parallel().attn_dp_enabled
+            and get_parallel().pp_group.world_size == 1
+            # a full prefill graph replays the extend body with no eager break for the verify rows
+            and not getattr(
+                self.model_runner.prefill_cuda_graph_runner, "_is_full_backend", False
+            )
+        )
+
+    def _forward_mixed_verify(
+        self, batch: ScheduleBatch, on_publish=None
+    ) -> GenerationBatchResult:
+        """One target forward: prefill rows extend as scheduled, running rows (the tail) verify blocks."""
+        self._wait_for_fused_hicache_load(batch)
+        self.target_worker.set_hicache_consumer(batch.hicache_consumer_index)
+        block_size, device = int(self.block_size), self.device
+        n_dec = len(batch.decoding_reqs)
+        n_ext = len(batch.reqs) - n_dec
+        ext_lens = list(batch.extend_lens[:n_ext])
+        n_ext_tok = sum(ext_lens)
+        # running rows: a one-token extend of the bonus token
+        committed = batch.seq_lens[n_ext:] - 1
+        # FA3 / FA4 take host lengths only as bounds; other draft backends need them exact
+        if self._bind and getattr(
+            self.draft_model_runner.attn_backend, "fa_impl_ver", 0
+        ) not in (3, 4):
+            self._bind()
+            self._bind = None
+        # unbound host tails lag by <= 1 block: draft on this bound
+        committed_cpu = (
+            batch.seq_lens_cpu[n_ext:] - 1 + (block_size if self._bind else 0)
+        )
+        tail_input = _TailDraftInput(bonus_tokens=batch.input_ids[n_ext_tok:])
+        draft = self._draft_block(
+            _TailRows(
+                seq_lens=committed,
+                seq_lens_cpu=committed_cpu,
+                req_pool_indices=batch.req_pool_indices[n_ext:],
+            ),
+            tail_input,
+            n_dec,
+        )
+        if self._bind:
+            self._bind()
+            committed_cpu = batch.seq_lens_cpu[n_ext:] - 1
+
+        step = copy.copy(batch)
+        step.input_ids = torch.cat(
+            [
+                batch.input_ids[:n_ext_tok],
+                draft.tokens.reshape(-1).to(batch.input_ids.dtype),
+            ]
+        )
+        step.out_cache_loc = torch.cat(
+            [
+                batch.out_cache_loc[:n_ext_tok],
+                draft.verify_out_cache_loc.to(batch.out_cache_loc.dtype),
+            ]
+        )
+        step.seq_lens = torch.cat(
+            [batch.seq_lens[:n_ext], (committed + block_size).to(batch.seq_lens.dtype)]
+        )
+        step.seq_lens_cpu = torch.cat(
+            [batch.seq_lens_cpu[:n_ext], committed_cpu + block_size]
+        )
+        step.seq_lens_sum = int(step.seq_lens_cpu.sum())
+        step.extend_lens = ext_lens + [block_size] * n_dec
+        step.prefix_lens = list(batch.prefix_lens[:n_ext]) + committed_cpu.tolist()
+        step.extend_num_tokens = n_ext_tok + block_size * n_dec
+        forward_batch = ForwardBatch.init_new(
+            step,
+            self.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        forward_batch.mixed_verify_rows = n_dec
+        forward_batch.extend_logits_row_index = torch.cat(
+            [
+                torch.tensor(ext_lens, dtype=torch.int64).cumsum(0) - 1,
+                torch.arange(
+                    n_ext_tok, n_ext_tok + n_dec * block_size, dtype=torch.int64
+                ),
+            ]
+        ).to(device, non_blocking=True)
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None, forward_batch=forward_batch, is_verify=True
+        )
+        logits_output = target_out.logits_output
+        logits = logits_output.next_token_logits
+        target_lp = self._target_logits_processor
+        predict = (
+            target_lp.deferred_argmax(logits)
+            if target_lp.is_deferred_shard(logits)
+            else torch.argmax(logits, dim=-1)
+        )
+        logits_output.next_token_logits = None
+        ext_next = predict[:n_ext]
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, ext_next)
+        _, commit_lens, bonus, out_tokens, tail_seq_lens, _ = self._accept_block(
+            candidates=draft.tokens,
+            next_token_logits=None,
+            sampling_info=None,
+            draft_input=tail_input,
+            prefix_lens=committed,
+            bs=n_dec,
+            target_predict=predict[n_ext:],
+        )
+        if tail_seq_lens is None:
+            tail_seq_lens = committed + commit_lens.to(committed.dtype)
+        new_seq_lens = torch.cat(
+            [batch.seq_lens[:n_ext], tail_seq_lens.to(batch.seq_lens.dtype)]
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        hidden = logits_output.hidden_states
+        if n_ext_tok:
+            ctx_lens = async_h2d(ext_lens, dtype=torch.int32, device=device)
+            positions, _ = compute_position(
+                self.model_runner.prefill_attention_backend_str,
+                async_h2d(batch.prefix_lens[:n_ext], dtype=torch.int32, device=device),
+                ctx_lens,
+                n_ext_tok,
+            )
+            ext_swa_loc = self._draft_write_ids(
+                forward_batch.iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            )
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden[:n_ext_tok],
+                cache_loc=self._draft_write_ids(forward_batch.iteration_ids)[
+                    :n_ext_tok
+                ],
+                swa_cache_loc=(
+                    None if ext_swa_loc is None else ext_swa_loc[:n_ext_tok]
+                ),
+                positions=positions,
+                extend_lens=ctx_lens,
+            )
+        tail_loc = self._draft_write_ids(draft.iteration_ids)
+        tail_hidden = hidden[n_ext_tok : n_ext_tok + n_dec * block_size]
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=tail_hidden,
+            cache_loc=tail_loc,
+            cache_loc_2d=tail_loc.view(n_dec, block_size),
+            swa_cache_loc=self._draft_write_ids(
+                draft.iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            ),
+            positions=draft.positions,
+            commit_lens=commit_lens,
+        )
+        logits_output.hidden_states = None
+
+        tokens = torch.zeros(
+            (n_ext + n_dec, block_size), dtype=out_tokens.dtype, device=device
+        )
+        tokens[:n_ext, 0] = ext_next
+        tokens[n_ext:] = out_tokens.view(n_dec, block_size)
+        accept_lens = torch.cat(
+            [torch.ones(n_ext, dtype=commit_lens.dtype, device=device), commit_lens]
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=tokens,
+            accept_lens=accept_lens,
+            mixed_verify=True,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            next_draft_input=self._make_next_draft_input_decode(
+                bonus_tokens=torch.cat([ext_next, bonus.view(-1).to(ext_next.dtype)]),
+                new_seq_lens=new_seq_lens,
+            ),
+            speculative_num_draft_tokens=block_size,
+            new_seq_lens=new_seq_lens,
         )

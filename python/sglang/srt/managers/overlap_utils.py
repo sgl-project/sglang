@@ -312,6 +312,7 @@ class FutureMap:
     """
 
     _relay = None
+    deferred_tails = None
 
     def __init__(
         self,
@@ -673,8 +674,21 @@ class FutureMap:
                 self.new_seq_lens_cpu_pinned.copy_(
                     self.new_seq_lens_buf, non_blocking=True
                 )
+            if (
+                self.spec_algo.is_dflash()
+                and envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+            ):
+                self.deferred_tails = batch.mix_running_indices_cpu
+                return
             self.fwd_prepare_d2h_stream.synchronize()
             fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+        self.bind_tails(batch, fresh_cpu)
+
+    def bind_tails(self, batch: ScheduleBatch, fresh_cpu=None) -> None:
+        if fresh_cpu is None:
+            self.fwd_prepare_d2h_stream.synchronize()
+            fresh_cpu = self.new_seq_lens_cpu_pinned[self.deferred_tails]
+        n = len(fresh_cpu)
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu = batch.seq_lens_cpu.clone()
             seq_lens_cpu[-n:] = fresh_cpu + 1
