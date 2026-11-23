@@ -794,6 +794,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             emb,
             include_video_pos=subblock_enabled,
         )
+        if self._transformer_uses_sol_attention():
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+                minimax_h3_curve_order_target_video,
+            )
+
+            # Sol-Attn pools and routes KV blocks of consecutive rows, which
+            # need spatially compact video tokens.
+            packed = minimax_h3_curve_order_target_video(packed)
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
