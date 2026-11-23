@@ -149,7 +149,7 @@ _SUBSCHEMA_MAP_KEYS = (
     "definitions",
     "dependentSchemas",
 )
-_SUBSCHEMA_LIST_KEYS = ("anyOf", "allOf", "prefixItems")
+_SUBSCHEMA_LIST_KEYS = ("anyOf", "prefixItems")
 _SUBSCHEMA_SINGLE_KEYS = (
     "items",
     "additionalProperties",
@@ -193,11 +193,32 @@ def _is_oversized_length(value: Any, max_enforced: Optional[int]) -> bool:
     )
 
 
+def _close_like_xgrammar(schema: Dict[str, Any]) -> None:
+    """Forbid unlisted object keys and array items, as xgrammar's strict mode does."""
+    if ("properties" in schema or "patternProperties" in schema) and not (
+        "additionalProperties" in schema or "unevaluatedProperties" in schema
+    ):
+        schema["additionalProperties"] = False
+    if "prefixItems" in schema and not (
+        "items" in schema or "unevaluatedItems" in schema
+    ):
+        schema["items"] = False
+
+
 def _relax_json_schema(
-    schema: Any, *, max_enforced_string_length: Optional[int], counts: _RelaxCounts
+    schema: Any,
+    *,
+    max_enforced_string_length: Optional[int],
+    counts: _RelaxCounts,
+    close: bool = True,
 ) -> None:
     """Rewrite ``schema`` in place into a form llguidance compiles.
 
+    * Objects with listed keys and arrays with ``prefixItems`` are closed unless
+      the schema says otherwise: xgrammar compiles structural tags in strict
+      mode, while plain JSON Schema (and llguidance) leaves them open. ``allOf``
+      members and their parent stay open, since closing each member would
+      reject the keys the others add.
     * ``const``/``enum`` win over their sibling assertions, as in xgrammar;
       llguidance intersects them and reports e.g. ``{"type": "boolean",
       "enum": ["true"]}`` as unsatisfiable.
@@ -218,6 +239,7 @@ def _relax_json_schema(
                 item,
                 max_enforced_string_length=max_enforced_string_length,
                 counts=counts,
+                close=close,
             )
         return
     if not isinstance(schema, dict):
@@ -251,11 +273,20 @@ def _relax_json_schema(
         elif _is_oversized_length(schema[key], max_enforced_string_length):
             del schema[key]
             counts.oversized_lengths += 1
+    if close and "allOf" not in schema:
+        _close_like_xgrammar(schema)
     for child in _child_subschemas(schema):
         _relax_json_schema(
             child,
             max_enforced_string_length=max_enforced_string_length,
             counts=counts,
+        )
+    if "allOf" in schema:
+        _relax_json_schema(
+            schema["allOf"],
+            max_enforced_string_length=max_enforced_string_length,
+            counts=counts,
+            close=False,
         )
 
 
@@ -280,15 +311,40 @@ def _lark_string_literal(value: str) -> str:
     return '"' + "".join(out) + '"'
 
 
-# A backslash escape pair, or a bare ``/``. Matching the pair first keeps an
-# already-escaped ``\/`` (common in JSON Schema patterns) intact.
-_REGEX_ESCAPE_OR_SLASH = re.compile(r"(\\.)|/", re.DOTALL)
+# A backslash escape pair, a bracket, or a bare ``/``. Matching the pair first
+# keeps an already-escaped ``\/`` (common in JSON Schema patterns) intact.
+_REGEX_TOKEN = re.compile(r"\\.|[\[\]/]", re.DOTALL)
+
+# xgrammar reads these class escapes as ASCII, while llguidance's Lark regexes
+# are Unicode-aware (``\d`` would also match "٣"), so spell them out.
+_ASCII_CLASS_ESCAPES = {r"\d": "0-9", r"\w": "0-9A-Za-z_"}
+_NEGATED_ASCII_CLASS_ESCAPES = {r"\D": "0-9", r"\W": "0-9A-Za-z_"}
 
 
 def _lark_regex(pattern: str) -> str:
     """Render ``pattern`` as an inline ``/.../`` Lark regex."""
-    escaped = _REGEX_ESCAPE_OR_SLASH.sub(lambda m: m.group(1) or r"\/", pattern)
-    return "/" + escaped + "/"
+    pieces: List[str] = []
+    class_depth = 0
+    end = 0
+    for match in _REGEX_TOKEN.finditer(pattern):
+        pieces.append(pattern[end : match.start()])
+        end = match.end()
+        token = match.group()
+        if token == "/":
+            token = r"\/"
+        elif token in _ASCII_CLASS_ESCAPES:
+            chars = _ASCII_CLASS_ESCAPES[token]
+            token = chars if class_depth else f"[{chars}]"
+        elif token in _NEGATED_ASCII_CLASS_ESCAPES:
+            # A nested class is valid both inside and outside a class.
+            token = f"[^{_NEGATED_ASCII_CLASS_ESCAPES[token]}]"
+        elif token == "[":
+            class_depth += 1
+        elif token == "]" and class_depth:
+            class_depth -= 1
+        pieces.append(token)
+    pieces.append(pattern[end:])
+    return "/" + "".join(pieces) + "/"
 
 
 def _token_set(token_ids, *, negate: bool = False) -> str:

@@ -282,6 +282,19 @@ class TestStructuralTagToLark(CustomTestCase):
                     [("a/b", "full"), ("ab", "reject")],
                 )
 
+    def test_regex_class_escapes_are_ascii(self):
+        # xgrammar matches \d and \w against ASCII only.
+        cases = {
+            r"\d+": [("12", "full"), ("\u0663", "reject")],
+            r"[\d_]+": [("1_2", "full"), ("\u0663", "reject")],
+            r"\w+": [("a_1", "full"), ("\u00e9", "reject")],
+            r"\D": [("a", "full"), ("1", "reject"), ("\u0663", "full")],
+            r"\\d": [("\\d", "full"), ("1", "reject")],
+        }
+        for pattern, verdicts in cases.items():
+            with self.subTest(pattern=pattern):
+                self._assert_verdicts({"type": "regex", "pattern": pattern}, verdicts)
+
     def test_qwen_xml_string_values(self):
         cases = {
             # xgrammar enforces only the pattern when both are present.
@@ -323,6 +336,34 @@ class TestStructuralTagToLark(CustomTestCase):
         self._assert_verdicts(
             json_tag({"type": "boolean", "enum": ["true"]}),
             [(_value('"true"'), "full"), (_value("true"), "reject")],
+        )
+
+    def test_json_schema_closed_like_xgrammar_strict_mode(self):
+        def verdicts(schema, cases):
+            with self.subTest(schema=schema):
+                fmt = _tag({"type": "json_schema", "json_schema": schema})
+                self._assert_verdicts(fmt, [(_value(t), v) for t, v in cases])
+
+        a = {"a": {"type": "integer"}}
+        b = {"b": {"type": "integer"}}
+        both = '{"a": 1, "b": 2}'
+        verdicts(
+            {"type": "object", "properties": a},
+            [('{"a": 1}', "full"), (both, "reject")],
+        )
+        verdicts(
+            {"type": "object", "properties": a, "additionalProperties": True},
+            [(both, "full")],
+        )
+        verdicts({"type": "object"}, [(both, "full")])
+        verdicts(
+            {"type": "array", "prefixItems": [{"type": "integer"}]},
+            [("[1]", "full"), ("[1, 2]", "reject")],
+        )
+        # Closing each ``allOf`` member would reject the keys the other adds.
+        verdicts(
+            {"allOf": [{"properties": a}, {"properties": b}]},
+            [(both, "full")],
         )
 
     def test_unsupported_shapes_raise(self):
