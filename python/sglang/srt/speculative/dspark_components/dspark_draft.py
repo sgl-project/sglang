@@ -394,6 +394,7 @@ class DraftBlockProposer:
         )
         # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
         self.deferred_draft_kv = None
+        self.draft_kv_ring = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -663,6 +664,12 @@ class DraftBlockProposer:
             self.draft_model_runner.runner_ids,
             cols=slice(0, query_token_num),
         )
+        if self.draft_kv_ring is not None:
+            draft_forward_batch.out_cache_loc = self.draft_kv_ring.block_locs(
+                batch.req_pool_indices[:bs],
+                draft_positions,
+                block_size=query_token_num,
+            )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         runs_graph = graph_runner is not None and graph_runner.can_run_graph(

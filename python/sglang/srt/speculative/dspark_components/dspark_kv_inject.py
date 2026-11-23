@@ -43,6 +43,7 @@ class TargetHiddenKvInjector:
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
+        self.draft_kv_ring = None
         self.model_runner = model_runner
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
@@ -105,7 +106,15 @@ class TargetHiddenKvInjector:
             )
         # The draft KV goes to the slots the target prefill writes.
         iteration_ids = self.model_runner.runner_ids.own_plan(batch)
-        cache_loc = self.ids_for(iteration_ids)
+        if self.draft_kv_ring is not None:
+            cache_loc = self.draft_kv_ring.extend_locs(
+                req_pool_indices=batch.req_pool_indices,
+                positions=positions,
+                extend_lens=ctx_lens.to(torch.int64),
+                seq_ends=(draft_seq_lens + ctx_lens).to(torch.int64),
+            )
+        else:
+            cache_loc = self.ids_for(iteration_ids)
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):

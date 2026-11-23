@@ -17,6 +17,7 @@ from sglang.srt.speculative.dflash_draft_ring import (
     draft_kv_ring_paged_rows_per_req,
     draft_kv_ring_pool_rows,
     draft_kv_ring_rows_per_req,
+    draft_kv_ring_unsupported_reason,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -493,6 +494,51 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 rel = keys - floor
                 read = table[0, rel // page].to(torch.int64) * page + rel % page
                 self.assertTrue(torch.equal(dst_pool[read], keys))
+
+
+class TestDSparkGqaDraftKVRingRocm(unittest.TestCase):
+    def _gqa_config(self):
+        return SimpleNamespace(
+            layer_types=["sliding_attention"] * 5,
+            sliding_window=2048,
+            num_hidden_layers=5,
+            dflash_config={
+                "mask_token_id": 163839,
+                "target_layer_ids": [75, 79, 83, 87, 91],
+                "aux_hidden_stream": "prefix",
+            },
+        )
+
+    def test_rocm_gqa_dspark_ring_allowed_on_triton_and_rejected_on_pd_or_cuda(self):
+        cfg = self._gqa_config()
+        self.assertIsNone(
+            draft_kv_ring_unsupported_reason(
+                lambda: cfg,
+                draft_backend="triton",
+                dcp_size=8,
+                is_cuda=False,
+                is_dspark=True,
+            )
+        )
+        self.assertIsNotNone(
+            draft_kv_ring_unsupported_reason(
+                lambda: cfg,
+                draft_backend="triton",
+                disaggregation_mode="prefill",
+                dcp_size=8,
+                is_cuda=False,
+                is_dspark=True,
+            )
+        )
+        self.assertIsNotNone(
+            draft_kv_ring_unsupported_reason(
+                lambda: cfg,
+                draft_backend="triton",
+                dcp_size=8,
+                is_cuda=True,
+                is_dspark=True,
+            )
+        )
 
 
 if __name__ == "__main__":

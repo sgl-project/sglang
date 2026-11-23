@@ -31,7 +31,7 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     backend.draft_bf16_dot = algorithm.is_dflash_family()
     # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
     # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
-    backend.runs_decode = not algorithm.is_dflash()
+    backend.runs_decode = not algorithm.is_dflash_family()
     # The monokernel's DFLASH MLA draft verifies on its own tuning of the
     # grouped-head kernel (a sliding window, two heads a tile); nothing else does.
     if (
@@ -165,3 +165,42 @@ class MlaDcpWindowVerify:
         # The kernel's LSE is natural log and the merge of Triton partials is base 2
         # (is_mla_dcp_lse_base_on_e); -inf rows (no owned key) stay -inf.
         return out.squeeze(0).flatten(1), lse * math.log2(math.e)
+
+
+def set_gqa_draft_kv_ring(backend: TritonAttnBackend, ring) -> None:
+    """Bind a per-request KV ring for non-MLA GQA DSpark drafts on ROCm."""
+    backend.gqa_draft_kv_ring_hip = ring
+    backend.verify_reads_window_kv_only = True
+
+
+def maybe_fill_draft_ring_window_buffer(
+    backend: TritonAttnBackend,
+    *,
+    name: str,
+    req_pool_indices: torch.Tensor,
+    lens: torch.Tensor,
+    bs: int,
+    window: int,
+    graph: bool,
+):
+    """Fill a sliding-window rail from the per-request ring on non-MLA drafts, or None."""
+    ring = backend.gqa_draft_kv_ring_hip
+    if ring is None or backend.use_mla:
+        return None
+    from sglang.kernels.ops.speculative.dspark_ring_window_hip import (
+        fill_dspark_ring_window_buffer_hip,
+    )
+
+    return fill_dspark_ring_window_buffer_hip(
+        min_pos=ring.min_pos,
+        rows_per_req=ring.rows_per_req,
+        dcp_size=ring.dcp_size,
+        window_kv_indptr=backend.window_kv_indptr[name],
+        req_pool_indices=req_pool_indices,
+        seq_lens=lens,
+        bs=bs,
+        sliding_window_size=window,
+        window_kv_indices=(
+            backend.cuda_graph_window_kv_indices[name] if graph else None
+        ),
+    )

@@ -419,7 +419,14 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
+        if self.kv_injector.draft_kv_ring is not None:
+            cache_loc = self.kv_injector.draft_kv_ring.block_locs(
+                batch.req_pool_indices[:bs],
+                verify_window.positions_2d.reshape(-1),
+                block_size=self.verify_num_draft_tokens,
+            )
+        else:
+            cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -427,7 +434,11 @@ class TargetVerifyExecutor:
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
-            iteration_ids=verify_window.iteration_ids,
+            iteration_ids=(
+                None
+                if self.kv_injector.draft_kv_ring is not None
+                else verify_window.iteration_ids
+            ),
         )
 
     def _run_ragged(
