@@ -123,6 +123,10 @@ class NonCudaDecoderMixin:
         self.next_boundary = None
 
     @cached_property
+    def _mega_closed_seam(self) -> bool:
+        return mhc.can_use_mega_closed_seam(self.attn_hc)
+
+    @cached_property
     def _can_fuse_attn_mhc(self):
         return (
             get_parallel().tp_size == self.self_attn.attn_tp_size == 4
@@ -153,7 +157,10 @@ class NonCudaDecoderMixin:
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
-            state = mhc.mega_closed_seam(self.attn_hc, state, local_boundary.extend)
+            if self._mega_closed_seam:
+                state = mhc.mega_closed_seam(
+                    hc=self.attn_hc, state=state, extend=local_boundary.extend
+                )
             residual = state.residual
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)
@@ -518,6 +525,10 @@ class NonCudaDecoderMixin:
 class NonCudaDSparkMixin(NonCudaDecoderMixin):
     """Draft stage execution with plain norms and its attention call."""
 
+    @cached_property
+    def _mega_draft(self) -> bool:
+        return mhc.can_use_mega_draft(self.attn_hc, self.ffn_hc)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -577,9 +588,12 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         # no fused post across stages, so they need nothing from `bind_next` and
         # never hand anything forward.
         assert self.attn_hc is not None and self.ffn_hc is not None
-        if mhc.mega_draft_enabled(self.attn_hc, self.ffn_hc, hidden_states):
+        if self._mega_draft and hidden_states.shape[0] > 0:
             return self._forward_hc_mega(
-                positions, hidden_states, forward_batch, prev_pre
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                prev_pre=prev_pre,
             )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, hidden_states):
@@ -621,13 +635,21 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
         # Mega-mHC takes the attention seam's combine, norm and triplet in one
         # launch, and the attention post with the FFN's in another; the FFN post
         # stays plain, so the stage hands forward what the plain path does.
-        opened = mhc.mega_draft_open(self.attn_hc, hidden_states, prev_pre)
+        opened = mhc.mega_draft_open(
+            hc=self.attn_hc, residual=hidden_states, pre=prev_pre
+        )
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, opened.input.rows, forward_batch)
-        ffn = mhc.mega_draft_post(x, opened, self.ffn_hc)
-        x = self._run_ffn(ffn.input.rows, forward_batch)
+            x = self.self_attn(
+                positions=positions,
+                hidden_states=opened.input.rows,
+                forward_batch=forward_batch,
+            )
+        ffn = mhc.mega_draft_post(y=x, opened=opened, nxt=self.ffn_hc)
+        x = self._run_ffn(x=ffn.input.rows, forward_batch=forward_batch)
         ffn_pre, ffn_post, ffn_comb = ffn.stats
-        hidden_states = self.hc_post(x, ffn.residual, ffn_post, ffn_comb)
+        hidden_states = self.hc_post(
+            x=x, residual=ffn.residual, post=ffn_post, comb=ffn_comb
+        )
         return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:

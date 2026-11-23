@@ -11,6 +11,7 @@ from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models import deepseek_v4_platform_stage
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -127,7 +128,7 @@ class TestHipFlydslDispatch(unittest.TestCase):
         self.assertTrue(torch.equal(state.pre, pre))
 
 
-class TestHipClosedSeam(unittest.TestCase):
+class TestHipClosedSeam(CustomTestCase):
     def _hc(self, hidden=5120):
         norm = _Norm()
         norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
@@ -141,7 +142,7 @@ class TestHipClosedSeam(unittest.TestCase):
             norm=norm,
         )
 
-    def _run(self, state, *, hc=None, extend=True, flag=True):
+    def _run(self, state, *, extend=True):
         normalized = torch.full((2, 4), 3.0)
         post_mix = torch.full((2, 4, 1), 4.0)
         comb = torch.full((2, 4, 4), 5.0)
@@ -158,17 +159,12 @@ class TestHipClosedSeam(unittest.TestCase):
         ops.flydsl = flydsl
         aiter = types.ModuleType("aiter")
         aiter.ops = ops
-        hc = hc or self._hc()
-        with (
-            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
-            mock.patch.object(mhc, "_is_hip", True),
-            mock.patch.object(mhc, "_is_gfx95_supported", True),
-            mock.patch.dict(
-                sys.modules,
-                {"aiter": aiter, "aiter.ops": ops, "aiter.ops.flydsl": flydsl},
-            ),
+        hc = self._hc()
+        with mock.patch.dict(
+            sys.modules,
+            {"aiter": aiter, "aiter.ops": ops, "aiter.ops.flydsl": flydsl},
         ):
-            out = mhc.mega_closed_seam(hc, state, extend)
+            out = mhc.mega_closed_seam(hc=hc, state=state, extend=extend)
         return out, calls, hc, (next_pre, comb, normalized)
 
     def test_engram_seam_runs_no_post_mega(self):
@@ -211,15 +207,32 @@ class TestHipClosedSeam(unittest.TestCase):
                 {},
             ),
             "decode": (mhc.HcState(residual, pre), {"extend": False}),
-            "flag off": (mhc.HcState(residual, pre), {"flag": False}),
             "no rows": (mhc.HcState(torch.zeros(0, 4, 5120), pre), {}),
-            "norm not fusable": (mhc.HcState(residual, pre), {"hc": self._hc(4096)}),
         }
         for name, (state, kwargs) in cases.items():
             with self.subTest(name):
                 out, calls, _, _ = self._run(state, **kwargs)
                 self.assertIs(out, state)
                 self.assertEqual(calls, [])
+
+    def test_gate(self):
+        # (flag, HIP, norm hidden size, expected)
+        cases = [
+            (True, True, 5120, True),
+            (False, True, 5120, False),
+            (True, False, 5120, False),
+            (True, True, 4096, False),
+        ]
+        for flag, hip, hidden, expected in cases:
+            with (
+                self.subTest(flag=flag, hip=hip, hidden=hidden),
+                envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
+                mock.patch.object(mhc, "_is_hip", hip),
+                mock.patch.object(mhc, "_is_gfx95_supported", True),
+            ):
+                self.assertEqual(
+                    mhc.can_use_mega_closed_seam(self._hc(hidden)), expected
+                )
 
 
 class TestHipBoundaryExtend(unittest.TestCase):
@@ -246,7 +259,7 @@ class TestHipBoundaryExtend(unittest.TestCase):
             seen.append(next.extend)
             return mock.Mock()
 
-        def closed_seam(hc, state, extend):
+        def closed_seam(*, hc, state, extend):
             seen.append(extend)
             return state
 
@@ -263,6 +276,7 @@ class TestHipBoundaryExtend(unittest.TestCase):
             mock.patch.object(mhc, "use_stats_stream", return_value=False),
             mock.patch.object(mhc, "fork_stats_stream"),
             mock.patch.object(mhc, "combine"),
+            mock.patch.object(mhc, "can_use_mega_closed_seam", return_value=True),
             mock.patch.object(mhc, "mega_closed_seam", side_effect=closed_seam),
             mock.patch.object(mhc, "run_attn_post", side_effect=post),
             mock.patch.object(mhc, "run_moe_post", side_effect=post),
@@ -287,7 +301,7 @@ class TestHipBoundaryExtend(unittest.TestCase):
                         self.assertEqual(seen, [expected, expected, expected])
 
 
-class TestHipDraftMega(unittest.TestCase):
+class TestHipDraftMega(CustomTestCase):
     def _hc(self, hidden):
         norm = _Norm()
         norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
@@ -370,7 +384,9 @@ class TestHipDraftMega(unittest.TestCase):
         self.assertIs(a0[8], prev_pre)
         self.assertNotIn("sublayer_out", k0)
         self.assertIs(k0["norm_weight"], stage.attn_hc.norm.weight)
-        self.assertTrue(torch.equal(stage.self_attn.call_args.args[1], nopost[2]))
+        self.assertTrue(
+            torch.equal(stage.self_attn.call_args.kwargs["hidden_states"], nopost[2])
+        )
         # the attention post with the FFN seam: the attention's mixes, the FFN's weights
         self.assertIs(r1, residual)
         self.assertIs(a1[0], stage.ffn_hc.fn)
@@ -380,8 +396,9 @@ class TestHipDraftMega(unittest.TestCase):
         self.assertIs(k1["comb_res_mix"], nopost[1])
         self.assertIs(k1["norm_weight"], stage.ffn_hc.norm.weight)
         # the FFN reads the second launch's input; its plain post closes the stage
-        self.assertTrue(torch.equal(stage._run_ffn.call_args.args[0], post[3]))
-        x, res, post_mix, comb = stage.hc_post.call_args.args
+        self.assertTrue(torch.equal(stage._run_ffn.call_args.kwargs["x"], post[3]))
+        kw = stage.hc_post.call_args.kwargs
+        x, res, post_mix, comb = kw["x"], kw["residual"], kw["post"], kw["comb"]
         self.assertIs(x, stage._run_ffn.return_value)
         self.assertIs(res, post[0])
         self.assertTrue(torch.equal(post_mix, post[1].squeeze(-1)))
