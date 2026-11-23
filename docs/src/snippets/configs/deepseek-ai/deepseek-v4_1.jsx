@@ -86,6 +86,13 @@ if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then source /usr/local/memfa
   pythonCommand: (sel) => sel.hw === "a3" || sel.hw === "a5"
     ? "python3 -m sglang.launch_server"
     : "sglang serve",
+  pythonCommandNote: (sel) => sel.hw === "a3" || sel.hw === "a5"
+    ? {
+        text: "For Ascend NPU launch details, see",
+        label: "DeepSeek-V4.1-Flash Hardware guide →",
+        href: "/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4.1_flash",
+      }
+    : null,
   runModes: (sel) => sel.hw === "a3" || sel.hw === "a5" ? ["python"] : ["python", "docker"],
 
   github: {

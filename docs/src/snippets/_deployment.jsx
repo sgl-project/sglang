@@ -2739,6 +2739,35 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         )}
         </div>
       </div>
+      {activeRunMode === "python" && config.pythonCommandNote && (() => {
+        const note = typeof config.pythonCommandNote === "function"
+          ? config.pythonCommandNote(sel)
+          : config.pythonCommandNote;
+        return note ? (
+          <div role="note" style={{
+            padding: "6px 12px",
+            fontSize: "12px",
+            color: isDark ? "#9ca3af" : "#6b7280",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            whiteSpace: "nowrap",
+          }}>
+            <strong style={{ color: isDark ? "#e5e7eb" : "#111827" }}>
+              {note.text}
+            </strong>{" "}
+            <a href={note.href} style={{
+              color: isDark ? "#FDBA74" : "#C2410C",
+              fontWeight: 600,
+              textDecoration: "underline",
+              textUnderlineOffset: "2px",
+              textDecorationColor: "currentColor",
+            }}>
+              {note.label}
+            </a>
+          </div>
+        ) : null;
+      })()}
 
       {/* Benchmark card (only with a `benchmarks` prop + matched cell). */}
       {benchmarks && cell && renderBenchmarkCard(benchEntry)}
