@@ -27,7 +27,9 @@ Properties checked:
   victim decisions and keep identical trees;
 * pins keep a storage hit through host pressure until admit / abandon, within
   the cap; the budget re-charge releases exactly the over-charge;
-* with every switch off the stock path runs unchanged (same puts, same order).
+* with every switch off the stock path runs unchanged (same puts, same order);
+* storage attach on a DeepSeek V4 cache (LogicalHostPool KV anchor) never
+  raises: unset, the switch reads no layout; set, the tier declines.
 """
 
 import ast
@@ -42,6 +44,7 @@ import unittest
 from collections import OrderedDict, defaultdict
 from enum import Enum, IntEnum
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -1516,6 +1519,172 @@ class TestRefetchOnLoss(unittest.TestCase):
         # past the reissue cap: admitted as is
         self.assertFalse(f(sched, self._req(10_000, 0, 0, attempts=8)))
         self.assertEqual(calls, ["r"])
+
+
+# ---------------------------------------------------------------------------
+# The storage-enable point on a DeepSeek V4 HiCache cache
+# ---------------------------------------------------------------------------
+
+# environ.py (stdlib only) and the DeepSeek V4 KV anchor, as served.
+_environ = _load_file("_l3vt_environ", os.path.join(_SRT, "environ.py"))
+_LogicalHostPool = _lift(
+    os.path.join(_SRT, "mem_cache/memory_pool_host.py"),
+    ["LogicalHostPool"],
+    "_l3vt_logical_host_pool",
+    {
+        "torch": torch,
+        "threading": __import__("threading"),
+        "Optional": __import__("typing").Optional,
+        "synchronized": _lift(
+            os.path.join(_SRT, "mem_cache/pool_host/base.py"),
+            ["synchronized"],
+            "_l3vt_pool_host_base",
+            {"wraps": __import__("functools").wraps},
+        ).synchronized,
+    },
+).LogicalHostPool
+
+_URC_ATTACH_METHODS = [
+    "UnifiedRadixCache.init_l3_victim_tier",
+    "UnifiedRadixCache._l3vt_resolve",
+    "UnifiedRadixCache._l3vt_min_over_ranks",
+]
+_urc_attach = _lift(
+    os.path.join(_SRT, "mem_cache/unified_radix_cache.py"),
+    _URC_ATTACH_METHODS,
+    "_l3vt_urc_attach",
+    {
+        "torch": torch,
+        "logger": __import__("logging").getLogger("l3vt-test"),
+        "Optional": __import__("typing").Optional,
+        "envs": _environ.envs,
+        "get_disagg": lambda: SimpleNamespace(
+            disaggregation_mode="prefill", enable_pd_role_switch=False
+        ),
+        "L3VictimTierConfig": l3vt.L3VictimTierConfig,
+        "VictimTier": l3vt.VictimTier,
+        "PinLedger": l3vt.PinLedger,
+        "WaitBound": l3vt.WaitBound,
+        "PoolName": PoolName,
+        "TREE_STATE": TREE_STATE,
+    },
+)
+
+
+class AttachCache(FakeCache):
+    """FakeCache plus the served storage-enable methods."""
+
+
+for _name in _URC_ATTACH_METHODS:
+    _meth = _name.split(".", 1)[1]
+    setattr(AttachCache, _meth, getattr(_urc_attach, _meth))
+
+_MASTER = "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION"
+_SWITCH = "SGLANG_OPT_HICACHE_L3_VICTIM_TIER"
+
+
+def make_dsv4_cache():
+    """A DeepSeek V4 HiCache prefill at the storage-enable point: the KV anchor
+    is a LogicalHostPool, the tree is FULL + SWA with KV- and SWA-indexed
+    sidecars, and every other tier precondition holds (python TreeCore,
+    write_back, cache mode, a batch_set_v2 backend, one rank)."""
+    anchor = _LogicalHostPool(64 * PAGE, PAGE, layout="page_first")
+    c = AttachCache()
+    c.cache_controller = SimpleNamespace(
+        storage_backend=SimpleNamespace(batch_set_v2=lambda *a, **k: None),
+        mem_pool_host=SimpleNamespace(anchor_entry=SimpleNamespace(host_pool=anchor)),
+        page_size=PAGE,
+        prefetch_capacity_limit=0,
+    )
+    c.enable_storage = True
+    c.host_memory_mode = "cache"
+    c.linker = None
+    c.is_write_back = True
+    c._tree_core_backend = "python"
+    c.prefetch_stop_policy = "timeout"
+    c.hicache_storage_pass_prefix_keys = False
+    c.tree_components = [ComponentType.FULL, ComponentType.SWA]
+    c.slot_id = lambda family: None
+    c.sidecar_pool_specs = [
+        SidecarPoolSpec(PoolName.DEEPSEEK_V4_C4, indices_from_pool=PoolName.KV),
+        SidecarPoolSpec(PoolName.DEEPSEEK_V4_C4_STATE, indices_from_pool=PoolName.SWA),
+    ]
+    c.pp_size = 1
+    c.pp_group = None
+    c._all_reduce_attn_groups = lambda data, op: None
+    return c
+
+
+class TestL3VictimTierLogicalAnchor(unittest.TestCase):
+    """Storage attach (``init_l3_victim_tier``, at startup and at a runtime
+    attach) on a DeepSeek V4 cache with any L3 backend must not raise, with the
+    switch unset or set. Its KV anchor (LogicalHostPool) has no ``dcp_size``,
+    and the layout check read it even with the switch unset."""
+
+    def assert_off(self, c, decline):
+        cfg = c._l3vt_cfg
+        self.assertFalse(
+            cfg.victim
+            or cfg.lease_touch
+            or cfg.chain_close
+            or cfg.pin
+            or cfg.budget
+            or cfg.wait_bound
+        )
+        self.assertEqual(cfg.decline, decline)
+        self.assertIsNone(c._l3vt)
+        self.assertIsNone(c._l3pin)
+        self.assertIsNone(c._l3cc)
+        self.assertIsNone(c._l3wb)
+        self.assertFalse(c._l3vt_touch or c.l3vt_pin_active)
+
+    def test_unset_never_reads_the_layout(self):
+        """Switch unset, master on or off: attach succeeds, the tier is off with
+        no decline and no line, and the cache's layout is not read."""
+        anchor = make_dsv4_cache().cache_controller.mem_pool_host.anchor_entry
+        self.assertFalse(hasattr(anchor.host_pool, "dcp_size"))
+        for master in ("1", "0"):
+            with (
+                self.subTest(master=master),
+                mock.patch.dict(os.environ, {_MASTER: master}),
+            ):
+                os.environ.pop(_SWITCH, None)
+                self.assertEqual(
+                    _environ.envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get(),
+                    master == "1",
+                )
+                self.assertFalse(_environ.envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get())
+                c = make_dsv4_cache()
+                with self.assertNoLogs("l3vt-test", level="INFO"):
+                    c.init_l3_victim_tier()
+                self.assert_off(c, None)
+                spy = make_dsv4_cache()
+                reads = []
+                spy._l3vt_unsupported = lambda: reads.append(1)
+                spy.init_l3_victim_tier()
+                self.assertEqual(reads, [])
+                self.assert_off(spy, None)
+
+    def test_set_declines_on_the_dsv4_layout(self):
+        """Switch set: the anchor check reads the LogicalHostPool as no DCP
+        layout, and the tier declines on the FULL + SWA tree, every part off,
+        with one decline line."""
+        anchor = make_dsv4_cache().cache_controller.mem_pool_host.anchor_entry
+        self.assertFalse(hasattr(anchor.host_pool, "dcp_size"))
+        for master in ("1", "0"):
+            with (
+                self.subTest(master=master),
+                mock.patch.dict(os.environ, {_MASTER: master, _SWITCH: "1"}),
+            ):
+                self.assertTrue(_environ.envs.SGLANG_OPT_HICACHE_L3_VICTIM_TIER.get())
+                c = make_dsv4_cache()
+                with self.assertLogs("l3vt-test", level="INFO") as logs:
+                    c.init_l3_victim_tier()
+                reason = "components ['FULL', 'SWA']"
+                self.assert_off(c, reason)
+                self.assertEqual(
+                    logs.output, [f"INFO:l3vt-test:{_SWITCH} declined: {reason}"]
+                )
 
 
 if __name__ == "__main__":

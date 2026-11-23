@@ -2767,9 +2767,10 @@ class UnifiedRadixCache(BasePrefixCache):
         anchor_pool = (
             cc.mem_pool_host.anchor_entry.host_pool if cc is not None else None
         )
+        # A DeepSeek V4 anchor (LogicalHostPool) carries no DCP width.
         if anchor_pool is not None and (
             anchor_pool.shared_allocation_domain is not None
-            or anchor_pool.dcp_size != 1
+            or getattr(anchor_pool, "dcp_size", 1) != 1
         ):
             return "shared or DCP host layout"
         if not set(self.tree_components) <= {
@@ -2802,7 +2803,8 @@ class UnifiedRadixCache(BasePrefixCache):
             has_linker=self.linker is not None,
             is_write_back=bool(self.is_write_back),
             tree_core_backend=self._tree_core_backend,
-            victim_unsupported=self._l3vt_unsupported(),
+            # Off, the tier reads nothing of the cache's layout.
+            victim_unsupported=self._l3vt_unsupported() if switch_on else None,
             prefetch_stop_policy=self.prefetch_stop_policy,
             has_storage_v2=hasattr(backend, "batch_set_v2"),
             pass_prefix_keys=bool(self.hicache_storage_pass_prefix_keys),
