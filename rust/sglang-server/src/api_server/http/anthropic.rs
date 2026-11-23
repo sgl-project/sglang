@@ -204,6 +204,72 @@ mod tests {
         }
     }
 
+    /// After a `tool_result`, a Gemma 4 template can leave the thought channel
+    /// open in the prompt; the streamed thinking block must still split off.
+    #[tokio::test]
+    async fn gemma4_stream_separates_thinking_after_tool_result() {
+        use crate::api_server::http::openai::test_utils::{
+            answering_app_state_with, checkpoint_formatter,
+        };
+        use crate::message::config::{ModelConfig, ServerArgs};
+
+        let args = Arc::new(ServerArgs {
+            served_model_name: "m".into(),
+            reasoning_parser: Some("gemma4".into()),
+            model_config: ModelConfig {
+                model_type: Some("gemma4".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let formatter = checkpoint_formatter(
+            &serde_json::json!({"model_type": "gemma4"}),
+            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
+             {% else %}<|turn>model\n{% endif %}",
+        );
+        let state =
+            answering_app_state_with(args, formatter, None, "Check the result.<channel|>Done.");
+        let (status, body) = post(
+            state,
+            "/v1/messages",
+            &serde_json::json!({
+                "model": "m", "max_tokens": 8, "stream": true,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [
+                    {"role": "user", "content": "Check my booking."},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": "Confirmed."}
+                    ]},
+                ],
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deltas: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["type"] == "content_block_delta")
+            .collect();
+        let text = |kind: &str, key: &str| -> String {
+            deltas
+                .iter()
+                .filter(|event| event["delta"]["type"] == kind)
+                .filter_map(|event| event["delta"][key].as_str())
+                .collect()
+        };
+        assert_eq!(
+            text("thinking_delta", "thinking"),
+            "Check the result.",
+            "{body}"
+        );
+        assert_eq!(text("text_delta", "text"), "Done.", "{body}");
+    }
+
     /// The streamed form is SSE with the event name on each frame, in the
     /// Anthropic order.
     #[tokio::test]

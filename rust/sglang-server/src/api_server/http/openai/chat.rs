@@ -29,7 +29,7 @@ use sglang_processor::openai::ChatModel;
 use sglang_processor::{
     DeepSeekDelta, DeepSeekFinish, DeepSeekOutputOptions, DeepSeekOutputParser, DeepSeekStopMatch,
     GEMMA4_REASONING_START, ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice,
-    split_reasoning, tool_call_id, tool_call_stream,
+    is_gemma4_reasoning_parser, split_reasoning, tool_call_id, tool_call_stream,
 };
 
 use super::super::auth::DeclaredRoute;
@@ -302,11 +302,8 @@ async fn chat_completions(
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
     let prompt_stub_tokens = chat_model.unreported_prompt_tokens() as u32;
-    // Gemma 4 tool-reply templates can leave the channel open in the prompt.
-    let gemma4_reasoning_prefilled =
-        matches!(reasoning_parser.as_deref(), Some("gemma4" | "gemma-4"))
-            && rendered.continuation.is_empty()
-            && rendered.prompt.as_str().ends_with(GEMMA4_REASONING_START);
+    let gemma4_reasoning_prefilled = rendered.continuation.is_empty()
+        && prompt_opens_gemma4_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
     let reasoning_options = ReasoningOptions {
         force_reasoning: gemma4_reasoning_prefilled
             .then_some(true)
@@ -341,7 +338,7 @@ async fn chat_completions(
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             // Python's thinking mode: the grammar starts after the reasoning,
             // which the scheduler also counts.
-            require_reasoning: force_reasoning == Some(true),
+            require_reasoning: reasoning_options.force_reasoning == Some(true),
             mm: (!images.is_empty()).then(|| {
                 Box::new(MmData {
                     image_data: images.clone(),
@@ -1244,12 +1241,21 @@ pub(crate) fn served_chat_model(
 }
 
 /// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
-/// thinking, so the generated stream has no opening marker.
+/// thinking, and a Gemma 4 template can open the thought channel after a tool
+/// reply, so the generated stream has no opening marker.
 pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
-    matches!(
-        reasoning_parser,
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
-    ) && prompt.trim_end_matches('\n').ends_with("<think>")
+    prompt_opens_gemma4_reasoning(reasoning_parser, prompt)
+        || (matches!(
+            reasoning_parser,
+            Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+        ) && prompt.trim_end_matches('\n').ends_with("<think>"))
+}
+
+/// The chat route decides `<think>` from the request, as Python does, but
+/// Gemma 4's open channel only shows in the rendered prompt.
+pub(crate) fn prompt_opens_gemma4_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    reasoning_parser.is_some_and(is_gemma4_reasoning_parser)
+        && prompt.ends_with(GEMMA4_REASONING_START)
 }
 
 #[cfg(test)]
@@ -1923,11 +1929,20 @@ mod tests {
     /// The generated tokens then start with reasoning, without an opening marker.
     #[tokio::test]
     async fn gemma4_stream_separates_reasoning_after_tool_reply() {
+        use std::sync::Mutex;
+
         use super::super::test_utils::checkpoint_formatter;
+        use crate::message::config::ModelConfig;
+        use crate::message::request::RequestKind;
 
         let args = Arc::new(ServerArgs {
             served_model_name: "model".into(),
             reasoning_parser: Some("gemma4".into()),
+            tool_call_parser: Some("gemma4".into()),
+            model_config: ModelConfig {
+                model_type: Some("gemma4".into()),
+                ..Default::default()
+            },
             ..Default::default()
         });
         let formatter = checkpoint_formatter(
@@ -1935,30 +1950,86 @@ mod tests {
             "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
              {% else %}<|turn>model\n{% endif %}",
         );
-        for (thinking, generated, expected_reasoning) in [
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}},
+        }]);
+        let call = r#"[{"name": "lookup", "parameters": {}}]"#;
+        // (thinking, skip_special_tokens, tool_choice, generated, reasoning, content, tool)
+        for (thinking, skip, tool_choice, generated, reasoning, content, tool) in [
             (
                 true,
+                None,
+                None,
                 "Check the result.<channel|>Done.",
                 "Check the result.",
+                "Done.",
+                None,
             ),
-            (false, "Done.", ""),
+            (
+                true,
+                Some(false),
+                None,
+                "Check the result.<channel|>Done.",
+                "Check the result.",
+                "Done.",
+                None,
+            ),
+            (false, None, None, "Done.", "", "Done.", None),
+            (
+                true,
+                None,
+                Some("required"),
+                &*format!("Check the result.<channel|>{call}"),
+                "Check the result.",
+                "",
+                Some("lookup"),
+            ),
         ] {
-            let state = answering_app_state_with(args.clone(), formatter.clone(), None, generated);
+            let submitted = Arc::new(Mutex::new(Vec::new()));
+            let seen = submitted.clone();
+            let generated = generated.to_owned();
+            let state = answering_app_state_with_request(
+                args.clone(),
+                formatter.clone(),
+                None,
+                move |request| {
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation");
+                    };
+                    seen.lock().unwrap().push(generate.require_reasoning);
+                    // Replay the same output at the decoder boundary with the submitted flag.
+                    let text = if generate.sampling_params.skip_special_tokens {
+                        generated.replace("<channel|>", "")
+                    } else {
+                        generated.clone()
+                    };
+                    chunk(request.rid.as_str(), &text, true)
+                },
+            );
+            let mut body = serde_json::json!({
+                "model": "model", "stream": true,
+                "chat_template_kwargs": {"enable_thinking": thinking},
+                "messages": [
+                    {"role": "user", "content": "Check my booking."},
+                    {"role": "assistant", "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "Confirmed."},
+                ],
+            });
+            if let Some(skip) = skip {
+                body["skip_special_tokens"] = skip.into();
+            }
+            if let Some(tool_choice) = tool_choice {
+                body["tools"] = tools.clone();
+                body["tool_choice"] = tool_choice.into();
+            }
             let response = post_json(
                 super::routes().with_state(state),
                 "/v1/chat/completions",
-                serde_json::json!({
-                    "model": "model", "stream": true, "skip_special_tokens": false,
-                    "chat_template_kwargs": {"enable_thinking": thinking},
-                    "messages": [
-                        {"role": "user", "content": "Check my booking."},
-                        {"role": "assistant", "tool_calls": [{
-                            "id": "call_1", "type": "function",
-                            "function": {"name": "lookup", "arguments": "{}"},
-                        }]},
-                        {"role": "tool", "tool_call_id": "call_1", "content": "Confirmed."},
-                    ],
-                }),
+                body,
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -1978,8 +2049,15 @@ mod tests {
                     .filter_map(|frame| frame["choices"][0]["delta"][name].as_str())
                     .collect()
             };
-            assert_eq!(field("reasoning_content"), expected_reasoning);
-            assert_eq!(field("content"), "Done.");
+            let case = format!("thinking={thinking} skip={skip:?} tool_choice={tool_choice:?}");
+            assert_eq!(field("reasoning_content"), reasoning, "{case}");
+            assert_eq!(field("content"), content, "{case}");
+            let tool_name = deltas.iter().find_map(|frame| {
+                frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str()
+            });
+            assert_eq!(tool_name, tool, "{case}");
+            // The grammar waits for the channel to close, as Python's thinking mode.
+            assert_eq!(*submitted.lock().unwrap(), [thinking], "{case}");
         }
     }
 

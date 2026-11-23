@@ -28,7 +28,7 @@ use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
 
 /// The formatter a checkpoint with `config` and Jinja `template` selects.
-pub(super) fn checkpoint_formatter(
+pub(in crate::api_server::http) fn checkpoint_formatter(
     config: &serde_json::Value,
     template: &str,
 ) -> super::ChatFormatter {
@@ -204,7 +204,7 @@ fn answering_app_state_logged(
 }
 
 /// App state whose core intake answers every generation with one finished `text` chunk.
-pub(super) fn answering_app_state_with(
+pub(in crate::api_server::http) fn answering_app_state_with(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
