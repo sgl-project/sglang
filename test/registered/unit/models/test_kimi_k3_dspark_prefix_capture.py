@@ -48,6 +48,8 @@ class _EqualSizeGroup:
         width = -(-TOTAL // WORLD)
         if inp.shape[0] != width:
             raise RuntimeError("all-gather needs equal sizes on every rank")
+        if not torch.equal(inp, self._rank_rows(self.rank, width)):
+            raise RuntimeError("this rank sent rows other than its own shard")
         return torch.cat([self._rank_rows(r, width) for r in range(WORLD)], dim=dim)
 
 

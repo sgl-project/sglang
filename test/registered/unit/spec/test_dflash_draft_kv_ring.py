@@ -570,6 +570,7 @@ class TestSpeculatorsDSparkConfig(CustomTestCase):
         self.assertFalse(self._load(full).is_causal)
         self.assertTrue(self._load(full, full_attention_causal=True).is_causal)
         self.assertTrue(self._load(mixed, full_attention_causal=True).is_causal)
+        self.assertFalse(self._load(mixed, sliding_window_non_causal=True).is_causal)
         with self.assertRaisesRegex(ValueError, "mixes causal and non-causal"):
             self._load(mixed)
 
