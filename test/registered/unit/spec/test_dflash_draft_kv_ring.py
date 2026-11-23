@@ -532,6 +532,9 @@ class TestDSparkGqaDraftKVRingRocm(CustomTestCase):
             dict(is_cuda=False, is_hip=False),
             dict(draft_backend="fa3"),
             dict(draft_backend="flashinfer"),
+            # CUDA's MHA ring backends would admit this GQA sliding-window draft.
+            dict(is_cuda=True, is_hip=False, draft_backend="fa4", dcp_size=1),
+            dict(is_cuda=True, is_hip=False, draft_backend="trtllm_mha", dcp_size=1),
             dict(disaggregation_mode="prefill"),
         ):
             with self.subTest(**overrides):
