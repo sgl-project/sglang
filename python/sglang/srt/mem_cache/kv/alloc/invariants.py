@@ -34,3 +34,7 @@ STAGE_CAPACITY_AGREEMENT = Invariant(
 FREE_OF_BOUND_PAGE = Invariant(
     "band.free_of_bound_page", Bucket.FATAL_UNCONTAINABLE, IsTrue()
 )
+# Under logical-page KV sharding a rank binds only pages of its own class.
+SHARD_OWNED_PAGES = Invariant(
+    "chain.shard_owned_pages", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
