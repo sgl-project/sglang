@@ -65,10 +65,8 @@ def _pad_page_table_tile(
     tl.store(dst_ptr + row * dst_stride + cols, vals, mask=inside)
 
 
-# Each call brings its own row count, table widths and strides, and its row metadata
-# sits at offsets that move with the row count; specializing on those values or on
-# 16-byte alignment compiles a new variant mid-serving for every new combination, as
-# AITER notes for its own schedule kernels. BLOCK_T is the only shape key left.
+# Per-call values and row-metadata offsets change with the row count; specializing on them
+# compiles new variants while serving, so BLOCK_T is the only shape key.
 @triton.jit(
     do_not_specialize=[
         "pt_src_stride",
@@ -279,10 +277,8 @@ class PrefillScheduleBuffers:
 
     def __init__(self, rows: int, device: torch.device):
         self.fused = rows <= MAX_FUSED_ROWS
-        # Every row region and the [safe, total_splits] pair (the prep kernel writes
-        # it as one) start on a 16-byte boundary: AITER's cta_info kernel specializes
-        # on pointer alignment, so a stride of exactly rows would compile a new
-        # variant per rows % 4 while serving.
+        # Row regions and the [safe, total_splits] pair (written as one) start 16-byte
+        # aligned: AITER's cta_info kernel specializes on pointer alignment.
         stride = triton.cdiv(rows, _I32_PER_16B) * _I32_PER_16B
         if not self.fused:
             self.storage = torch.empty(2 * stride, dtype=torch.int32, device=device)
@@ -415,15 +411,12 @@ def build_prefill_schedule(
     return guarded_out, buffers
 
 
-_warm_prefill_devices: set = set()
+_warm_prefill_devices: set[torch.device] = set()
 
 
 def warm_prefill_schedule(device: torch.device) -> None:
-    """Compile every BLOCK_T variant of the fused prefill schedule (one per power of two
-    up to MAX_FUSED_ROWS) and both alignments of its local_ends once per device, so no
-    prefill call compiles one while serving; prefill calls of any row count then reuse
-    these. Skipped inside CUDA-graph capture, which must not record the warm-up
-    launches."""
+    """Compile the fused prefill schedule's BLOCK_T variants and both local_ends
+    alignments once per device; skipped during graph capture, which must not record them."""
     if device in _warm_prefill_devices or torch.cuda.is_current_stream_capturing():
         return
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -445,11 +438,11 @@ def warm_prefill_schedule(device: torch.device) -> None:
 
     rows = 16
     while rows <= MAX_FUSED_ROWS:
-        build(rows, 0)
+        build(rows=rows, ends_offset=0)
         rows *= 2
     # A request group or a row share starts at any row, and AITER's cta_info kernel
     # keys on whether local_ends is 16-byte aligned.
-    build(16, 1)
+    build(rows=16, ends_offset=1)
     _warm_prefill_devices.add(device)
 
 

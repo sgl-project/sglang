@@ -35,8 +35,6 @@ class TestPrefillScheduleCompilesBeforeServing(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4 import fp4_indexer_schedule_hip as sched
 
         kernels = (sched._prefill_schedule_prep_kernel, _prefill_cta_info_kernel)
-        if not all(hasattr(kernel, "device_caches") for kernel in kernels):
-            self.skipTest("this Triton keeps no per-device kernel cache")
 
         def variants():
             return [
