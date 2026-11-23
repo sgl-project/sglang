@@ -231,7 +231,7 @@ def _arm_tick(cache, sync_counts=False):
     live-prefetch digest check runs."""
     cache.pp_size = 1
     cache.enable_storage = True
-    cache._drain_async_work = Mock()
+    cache._bound_async_work = Mock()
     cache.flush_pending_backups = Mock()
     if sync_counts:
         cc = cache.cache_controller

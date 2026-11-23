@@ -3,13 +3,18 @@
 import dataclasses
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.runtime.entrypoints.action import api, protocol
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
@@ -266,3 +271,87 @@ def test_msgpack_roundtrip_preserves_string_keys_and_numpy_payloads():
     assert decoded["task"] == "pick"
     np.testing.assert_array_equal(decoded["array"], payload["array"])
     assert decoded["scalar"] == payload["scalar"]
+
+
+@pytest.fixture
+def action_client(monkeypatch):
+    app = FastAPI()
+    app.include_router(api.router)
+    app.state.server_args = _server_args()
+    app.state.server_args.attention_backend_config = {}
+    app.state.server_args.enable_trace = False
+
+    async def forward(req):
+        # Echo the observation as one action so the wire test checks both directions.
+        state = np.asarray(req.sampling_params.state, dtype=np.float32)
+        output = {"request_id": req.request_id, "actions": state[None, :]}
+        return SimpleNamespace(output=[output])
+
+    monkeypatch.setattr(protocol.async_scheduler_client, "forward", forward)
+    with TestClient(app) as client:
+        yield client
+
+
+def _observation(request_id, state):
+    return {
+        "request_id": request_id,
+        "input": {"task": "pick", "observation": {"state": state}},
+    }
+
+
+def _assert_binary_action(action, expected):
+    # Decode the cookbook's msgpack array layout independently of the server codec.
+    assert action[b"__ndarray__"]
+    assert action[b"shape"] == [1, len(expected)]
+    dtype = np.dtype(action[b"dtype"])
+    assert dtype == np.float32
+    np.testing.assert_array_equal(np.frombuffer(action[b"data"], dtype=dtype), expected)
+
+
+def test_action_http_client_formats(action_client):
+    endpoint = "/v1/actions/generations"
+    state = [1.25, -2.5]
+    payload = _observation("http-1", state)
+    reply = action_client.post(endpoint, json=payload)
+    assert reply.status_code == 200
+    envelope = reply.json()
+    assert (envelope["object"], envelope["id"]) == ("action.generation", "http-1")
+    assert envelope["data"][0]["action"]["values"] == [state]
+
+    payload["runtime"] = {"response_format": "raw"}
+    reply = action_client.post(
+        endpoint,
+        content=msgpack.packb(payload),
+        headers={
+            "Content-Type": "application/msgpack",
+            "Accept": "application/msgpack",
+        },
+    )
+    assert reply.status_code == 200
+    assert reply.headers["content-type"] == "application/msgpack"
+    _assert_binary_action(msgpack.unpackb(reply.content)["actions"], state)
+
+
+def test_action_realtime_client_session(action_client):
+    reply = action_client.get("/v1/actions/metadata")
+    assert reply.status_code == 200
+    metadata = reply.json()
+    assert metadata["object"] == "action.metadata"
+    with action_client.websocket_connect("/v1/actions/realtime") as ws:
+        assert msgpack.unpackb(ws.receive_bytes()) == metadata
+        for request_id, state in (("ws-1", [1.0, 2.0]), ("ws-2", [-3.0, 4.0])):
+            ws.send_bytes(msgpack.packb(_observation(request_id, state)))
+            envelope = msgpack.unpackb(ws.receive_bytes())
+            assert (envelope["object"], envelope["id"]) == (
+                "action.generation",
+                request_id,
+            )
+            _assert_binary_action(envelope["data"][0]["action"]["values"], state)
+
+
+def test_action_unsupported_output_format_is_a_client_error(action_client):
+    payload = _observation("format", [0.0])
+    payload["runtime"] = {"output_format": "csv"}
+    reply = action_client.post("/v1/actions/generations", json=payload)
+    assert reply.status_code == 400
+    assert "output_format" in reply.json()["detail"]

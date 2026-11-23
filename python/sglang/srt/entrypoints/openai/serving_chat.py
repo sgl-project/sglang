@@ -1037,6 +1037,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        top_logprobs_error = self._top_logprobs_error(
+            "top_logprobs", request.top_logprobs
+        )
+        if top_logprobs_error:
+            return top_logprobs_error
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
@@ -1047,6 +1053,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return encoding_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
+        if request.return_flat_raw_sampling_mask and not request.return_meta_info:
+            return "return_flat_raw_sampling_mask requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -1310,6 +1318,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_flat_raw_top_logprobs_b64=(
                 request.return_flat_raw_output_top_logprobs
                 and request.return_flat_raw_top_logprobs_b64
+            ),
+            return_flat_raw_sampling_mask=request.return_flat_raw_sampling_mask,
+            return_flat_raw_sampling_mask_b64=(
+                request.return_flat_raw_sampling_mask
+                and request.return_flat_raw_sampling_mask_b64
             ),
             modalities=processed_messages.modalities,
             lora_path=lora_path,

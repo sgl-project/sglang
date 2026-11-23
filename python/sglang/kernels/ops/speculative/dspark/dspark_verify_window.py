@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -23,7 +25,7 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     verify_ids: torch.Tensor
     # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
     # verify window, -1 on a padded lane.
-    window_index: torch.Tensor
+    window_index: Optional[torch.Tensor]
 
 
 class BuildRaggedVerifyWindow:
@@ -700,13 +702,17 @@ class BuildOutTokens:
                 build_out_tokens_triton as npu_build_out_tokens_triton,
             )
 
-            return npu_build_out_tokens_triton(
+            out_tokens = npu_build_out_tokens_triton(
                 draft_tokens=draft_tokens,
                 correct_len=correct_len,
                 bonus=bonus,
                 verify_num_draft_tokens=verify_num_draft_tokens,
                 gamma=gamma,
             )
+            # The native kernel still copies rejected drafts. Keep them out of
+            # downstream token gathers, matching the Torch and CUDA contract.
+            columns = torch.arange(verify_num_draft_tokens, device=out_tokens.device)
+            return out_tokens.masked_fill_(columns[None, :] > correct_len[:, None], 0)
         return build_out_tokens_triton(
             draft_tokens=draft_tokens,
             correct_len=correct_len,

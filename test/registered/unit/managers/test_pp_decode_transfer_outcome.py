@@ -20,7 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -116,7 +116,7 @@ def _transfer_queue(decode_reqs):
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
     queue.scheduler = SimpleNamespace(
-        request_retirer=MagicMock(),
+        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -125,7 +125,7 @@ def _transfer_queue(decode_reqs):
     return queue
 
 
-class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
+class _PopTransferredCase(CustomTestCase):
     def setUp(self):
         super().setUp()
         # The release collective sizes itself from the gloo group; answer as one rank.
@@ -145,6 +145,8 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+
+class TestPopTransferredFollowsConsensusOutcome(_PopTransferredCase):
     def test_consensus_failure_overrides_a_local_success(self):
         admitted = _decode_req("s", KVPoll.Success)
         failed_elsewhere = _decode_req("f", KVPoll.Success)
@@ -184,6 +186,37 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         self.assertEqual(
             queue.move_transferred(IndexedReqList(ListKind.WAITING)), [admitted.req]
         )
+
+
+class TestHostStagedLandedCount(_PopTransferredCase):
+    """Host-staged transfers whose KV landed but that the device does not admit
+    are counted for /v1/loads; the count covers only the last pass."""
+
+    def _host_queue(self, admit: bool):
+        landed = _decode_req("l", KVPoll.Success)
+        landed.host_staged = True
+        pending = _decode_req("p", KVPoll.WaitingForInput)
+        pending.host_staged = True
+        queue = _transfer_queue([landed, pending])
+        queue.enable_host_receive = True
+        prealloc = MagicMock()
+        prealloc.allocate_host_staged.return_value = admit
+        queue.scheduler.disagg_decode_prealloc_queue = prealloc
+        return queue, landed, pending
+
+    def test_landed_transfer_the_device_refuses_is_counted(self):
+        queue, landed, pending = self._host_queue(admit=False)
+        self.assertEqual(queue.move_transferred(IndexedReqList(ListKind.WAITING)), [])
+        self.assertEqual(queue.num_host_staged_landed, 1)
+        self.assertEqual(list(queue.queue.items()), [landed, pending])
+
+    def test_admitted_transfer_is_not_counted(self):
+        queue, landed, pending = self._host_queue(admit=True)
+        self.assertEqual(
+            queue.move_transferred(IndexedReqList(ListKind.WAITING)), [landed.req]
+        )
+        self.assertEqual(queue.num_host_staged_landed, 0)
+        self.assertEqual(list(queue.queue.items()), [pending])
 
 
 class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):

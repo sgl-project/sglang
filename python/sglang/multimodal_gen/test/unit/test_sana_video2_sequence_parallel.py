@@ -78,12 +78,20 @@ def test_linear_attention_ignores_padding_spanning_ranks(monkeypatch):
 
 def test_unsupported_parallel_layouts_are_rejected():
     config = SanaVideo2PipelineConfig()
-    config.validate_server_args(SimpleNamespace(ring_degree=1, sp_degree=2))
+
+    def args(ring_degree, sp_degree):
+        return SimpleNamespace(
+            ring_degree=ring_degree,
+            sp_degree=sp_degree,
+            enable_breakable_cuda_graph=False,
+        )
+
+    config.validate_server_args(args(1, 2))
     with pytest.raises(ValueError, match="ring"):
-        config.validate_server_args(SimpleNamespace(ring_degree=2, sp_degree=2))
+        config.validate_server_args(args(2, 2))
     # the softmax layers have 10 heads to spread over the ranks
     with pytest.raises(ValueError, match="10 softmax attention heads"):
-        config.validate_server_args(SimpleNamespace(ring_degree=1, sp_degree=4))
+        config.validate_server_args(args(1, 4))
 
 
 def test_extra_gpus_go_to_sequence_parallelism():

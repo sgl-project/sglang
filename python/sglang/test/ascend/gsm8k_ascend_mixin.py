@@ -24,7 +24,8 @@ class GSM8KAscendMixin(ABC):
         "0.8",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
     ]
     server_cmd = ""
     gsm8k_num_shots = 5
