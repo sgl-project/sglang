@@ -360,6 +360,46 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "int8":
+        return
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if not get_platform().is_npu:
+        raise ValueError("--kv-cache-dtype int8 requires Ascend NPU.")
+    model = model_config_of(server_args)
+    if (
+        not use_mla_backend(server_args)
+        or not is_deepseek_dsa(model.hf_config)
+        or model.kv_lora_rank != 512
+        or model.qk_rope_head_dim not in (0, 64)
+    ):
+        raise ValueError(
+            "--kv-cache-dtype int8 requires Ascend DSA with a 512-wide MLA "
+            "latent and a RoPE dimension of 0 or 64."
+        )
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-lmcache", cfg.enable_lmcache),
+            ("--enable-hisparse", cfg.enable_hisparse),
+            (
+                "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD",
+                envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get(),
+            ),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            "--kv-cache-dtype int8 requires the Ascend DSA paged KV pool "
+            f"and is incompatible with {', '.join(unsupported)}."
+        )
+
+
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
     """Check the DSA lightning-indexer INT8 cache recipe.
 

@@ -107,6 +107,8 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             (None, torch.float8_e4m3fn, 1, 132),
             # KPool's BF16 rows must be budgeted even with packed FP8 main KV.
             (None, torch.float8_e4m3fn, 4, 64),
+            (None, torch.int8, 4, 64),
+            (None, torch.int8, 1, 256),
         ]
         for indexer_dtype, kv_dtype, kpool, expected in cases:
             with self.subTest(

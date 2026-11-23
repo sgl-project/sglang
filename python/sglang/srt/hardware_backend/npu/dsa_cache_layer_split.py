@@ -139,7 +139,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     self.kr_cache_dim,
                 ),
                 dtype=(
-                    torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                    torch.bfloat16 if self.dsa_kv_cache_store_packed else self.store_dtype
                 ),
                 device=self.device,
             )
@@ -153,28 +153,29 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.index_k_scale_dtype is not None and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        dtype=self.index_k_scale_dtype,
                         device=self.device,
                     )
-                    self.indexer_hadamard_128 = create_npu_hadamard_128(
-                        self.index_head_dim, self.device
-                    )
+                    if self.dsa_kv_cache_store_fp8:
+                        self.indexer_hadamard_128 = create_npu_hadamard_128(
+                            self.index_head_dim, self.device
+                        )
             # Full-size remote scratch per buffer type, refreshed by the
             # owner-broadcast whenever a non-owned layer is read. K and V
             # live in ONE flat byte allocation (one allocation, two dtype
             # views).
             _v_dtype = (
-                torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                torch.bfloat16 if self.dsa_kv_cache_store_packed else self.store_dtype
             )
             _k_bytes = (
                 kv_pages
@@ -210,13 +211,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             if self.index_head_dim is not None:
                 self.remote_index_k_buffer = torch.empty(
                     (index_pages, self.index_page_size, 1, self.index_head_dim),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
                 if self.index_k_scale_buffer is not None:
                     self.remote_index_k_scale_buffer = torch.empty(
                         (index_pages, self.index_page_size, 1),
-                        dtype=torch.float32,
+                        dtype=self.index_k_scale_dtype,
                         device=self.device,
                     )
 
@@ -540,12 +541,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.use_combined_kv_buffer or self.use_fia_nz:
             return
         loc, _, _ = unwrap_write_loc(loc_info)
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_packed:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_quantized_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.remote_k_buffer.view(-1, 1, self.kv_cache_dim),
                 loc.view(-1, 1),
@@ -628,10 +629,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         scratch, so the follow-up get_index_k_buffer read hits
         ``remote_index_layer_id`` instead of issuing a synchronous owner
         broadcast."""
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if getattr(self, "dsa_kv_cache_store_int8", False):
+            index_k = index_k.to(self.index_k_store_dtype)
+        else:
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                index_k = index_k.view(self.store_dtype)
         torch_npu.npu_scatter_nd_update_(
             self.remote_index_k_buffer.view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
@@ -702,8 +706,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         v, indexer k, fp8 index scale), so the owned layer count is the entry
         count divided by the group count — not the raw entry count.
         """
-        groups = 1  # latent k (v stays packed into k in fp8 mode)
-        if not self.dsa_kv_cache_store_fp8:
+        groups = 1  # Latent K, with V included when the cache is packed.
+        if not self.dsa_kv_cache_store_packed:
             groups += 1  # v
         if self.index_head_dim is not None:
             groups += 1  # indexer k

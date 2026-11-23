@@ -419,8 +419,11 @@ def forward_dsa_prepare_npu(
     dynamic_scale = None
     # Resolved here so the core can read the cached plan back.
     get_dsa_token_shard_plan(forward_batch)
+    # The fused MLA prolog writes its own KV layout. Packed INT8 uses the
+    # regular per-tile KV writer after the unfused projection and RMSNorm.
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
+        and not getattr(get_token_to_kv_pool(), "dsa_kv_cache_store_int8", False)
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
     if mla_preprocess_used:
