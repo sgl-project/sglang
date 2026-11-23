@@ -255,9 +255,6 @@ class UMBPStore(HiCacheStorage):
 
     # MoRI's SPDK proxy clamps keys to kMaxKeyLen - 1 = 255 bytes.
     _SPDK_MAX_KEY_BYTES = 255
-    # Set in __init__ from the final backend. Hybrid pools check against it at
-    # registration, so it must exist even before __init__ has run.
-    _spdk_key_guard = False
 
     def __init__(
         self,
@@ -970,14 +967,14 @@ class UMBPStore(HiCacheStorage):
             cfg.ssd.ssd_backend,
         )
 
-        # Decide from the final backend (after the MLA and DP rewrites above).
-        # Anchor keys are checked once, here. Hybrid pools are checked as each
-        # one registers, because their key shape is only known then.
-        self._spdk_key_guard = bool(cfg.ssd.enabled) and cfg.ssd.ssd_backend in (
-            "spdk",
-            "spdk_proxy",
-        )
-        if self._spdk_key_guard and not self._kv_anchor_is_logical:
+        # Anchor keys are the only key shape this change lengthens. Check the
+        # final backend (after the MLA and DP rewrites above) once, here, before
+        # the KV events thread starts.
+        if (
+            cfg.ssd.enabled
+            and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
+            and not self._kv_anchor_is_logical
+        ):
             keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
             self._check_spdk_key_budget(keys, "anchor")
 
@@ -1190,20 +1187,7 @@ class UMBPStore(HiCacheStorage):
         if host_pool_name == PoolName.KV:
             return
         self.registered_pools[host_pool_name] = host_pool
-        if self._spdk_key_guard:
-            self._check_hybrid_pool_budget(host_pool_name)
         self._register_host_buffer_for_zero_copy(host_pool)
-
-    def _check_hybrid_pool_budget(self, pool_name) -> None:
-        """Hybrid suffixes come from the pool's own components, so they are only
-        known once the pool registers. Runs once per pool, not per request."""
-        keys, _ = self._get_hybrid_page_component_keys(
-            [_PAGE_HASH_PLACEHOLDER], PoolTransfer(name=pool_name)
-        )
-        if not keys:
-            # A pool with no components writes no keys, so there is nothing to size.
-            return
-        self._check_spdk_key_budget(keys, f"hybrid pool {pool_name}")
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
