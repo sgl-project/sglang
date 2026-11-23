@@ -1,4 +1,14 @@
-"""Cold-L2 latency of the DeepGEMM down-activation preparation (no GEMMs)."""
+"""Cold-L2 latency of the DeepGEMM down-activation preparation (no GEMMs).
+
+intermediate_size is the local post-SwiGLU MoE width, not model hidden_size.
+GLM-5.3-Flash has moe_intermediate_size=2048: TP1/2/4/8 give 2048/1024/512/256.
+Qwen3-235B-A22B and Qwen3-Coder-480B-A35B have MoE widths 1536 and 2560:
+https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json
+https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct/blob/main/config.json
+These are dimension-derived cases using GLM's clamped activation, not full
+execution/accuracy claims for those models. Wider synthetic cases exercise
+the other rows-per-CTA branches through the supported width limit.
+"""
 
 import torch
 
@@ -16,7 +26,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=60, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 
@@ -41,9 +51,11 @@ def fused(x, q, scale):
     return q, scale
 
 
-def measure(rows, hidden, provider):
-    x = create_random(rows, hidden * 2)
-    q = torch.empty((rows, hidden), device=x.device, dtype=torch.float8_e4m3fn)
+def measure(rows, intermediate_size, provider):
+    x = create_random(rows, intermediate_size * 2)
+    q = torch.empty(
+        (rows, intermediate_size), device=x.device, dtype=torch.float8_e4m3fn
+    )
     aligned = provider == "fused"
     scale = create_per_token_group_quant_fp8_output_scale(
         q.shape, x.device, 128, aligned, aligned, False
@@ -51,7 +63,9 @@ def measure(rows, hidden, provider):
     if aligned:
         fn, args = fused, (x, q, scale)
     else:
-        activated = torch.empty((rows, hidden), device=x.device, dtype=x.dtype)
+        activated = torch.empty(
+            (rows, intermediate_size), device=x.device, dtype=x.dtype
+        )
         fn, args = separate, (x, activated, q, scale)
     # All read and written input/output tensors rotate. At the smallest case
     # the buffers are large enough to avoid the marker's 100-rotation cap.
@@ -65,11 +79,24 @@ def measure(rows, hidden, provider):
     )
 
 
-@marker.parametrize("rows", [8192, 32768, 65536, 262144, 294912], [8192, 65536])
-@marker.parametrize("hidden", [512, 2048], [512])
+# Cover actual GLM TP widths and all three rows-per-CTA branches. Keep large
+# token counts at the original widths to bound the rotating buffer footprint.
+_SHAPES = [
+    (rows, intermediate_size)
+    for rows in (8192, 32768, 65536)
+    for intermediate_size in (256, 512, 1024, 1536, 2048, 2560, 3072, 4096, 8192)
+] + [
+    (rows, intermediate_size)
+    for rows in (262144, 294912)
+    for intermediate_size in (512, 2048)
+]
+_CI_SHAPES = [(8192, width) for width in (512, 2048, 2560, 4096, 8192)]
+
+
+@marker.parametrize("rows,intermediate_size", _SHAPES, _CI_SHAPES)
 @marker.benchmark("provider", ["separate", "fused"])
-def benchmark(rows, hidden, provider):
-    return measure(rows, hidden, provider)
+def benchmark(rows, intermediate_size, provider):
+    return measure(rows, intermediate_size, provider)
 
 
 if __name__ == "__main__":

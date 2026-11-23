@@ -51,7 +51,7 @@ def _fused(x, *, tma_aligned=True, rows_per_cta=None):
 
 
 @pytest.mark.parametrize("rows", [1, 17, 1024, 4237])
-@pytest.mark.parametrize("hidden", [256, 512, 1024, 1536, 2048, 3072, 4096, 8192])
+@pytest.mark.parametrize("hidden", [256, 512, 1024, 1536, 2048, 2560, 3072, 4096, 8192])
 @pytest.mark.parametrize("tma_aligned", [False, True])
 def test_bitwise_matches_deepgemm_reference(rows, hidden, tma_aligned):
     # FP32-only fusion changes the scale and FP8 bins near BF16 round boundaries.
@@ -66,6 +66,25 @@ def test_bitwise_matches_deepgemm_reference(rows, hidden, tma_aligned):
     if tma_aligned:
         assert actual_s.stride(0) == 1
         assert actual_s.stride(1) % 4 == 0
+
+
+@pytest.mark.parametrize("rows", [8192, 32768])
+@pytest.mark.parametrize(
+    "intermediate_size", [512, 1024, 1536, 2048, 2560, 3072, 4096, 8192]
+)
+def test_prefill_shapes_match_deepgemm_reference(rows, intermediate_size):
+    # Match the benchmark's large-row workloads, including every CTA branch.
+    # This is the local post-SwiGLU MoE width, not model hidden_size.
+    torch.manual_seed(43)
+    x = torch.randn(
+        rows, 2 * intermediate_size, device="cuda", dtype=torch.bfloat16
+    ).mul_(12)
+    expected_q, expected_s = _reference(x)
+    actual_q, actual_s = _fused(x)
+    assert torch.equal(actual_q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(actual_s, expected_s)
+    assert actual_s.stride(0) == 1
+    assert actual_s.stride(1) % 4 == 0
 
 
 @pytest.mark.parametrize("rows_per_cta", [1, 2, 4, 8])
@@ -92,9 +111,10 @@ def test_empty_input_does_not_launch_an_empty_grid():
     assert q.shape == (0, 512) and scale.shape == (0, 4)
 
 
-def test_graph_replay_uses_new_input():
+@pytest.mark.parametrize("intermediate_size", [512, 2048, 2560, 3072, 4096, 8192])
+def test_graph_replay_uses_new_input(intermediate_size):
     torch.manual_seed(8)
-    x = torch.randn(1025, 1024, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1025, 2 * intermediate_size, device="cuda", dtype=torch.bfloat16)
     _fused(x)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
