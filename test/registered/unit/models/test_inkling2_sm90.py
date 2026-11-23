@@ -19,6 +19,7 @@ hopper = pytest.mark.skipif(
 
 EXPERTS, LOCAL, TOP_K = 64, 8, 8
 EXTENT, CLIP, HEAD_DIM = 1024, 22.627416997969522, 128
+SCALE = HEAD_DIM**-0.5
 
 
 def _rel_bias_attention_ref(q, kc, vc, page_table, seqused, rel, scale, window):
@@ -81,8 +82,8 @@ def _attention_inputs(heads_q, heads_k, qlen, window, page):
     pages = [-(-n // page) for n in lens]
     order = torch.randperm(sum(pages)) + 1  # page 0 is never a sequence's
     page_table = torch.zeros(batch, max(pages) + 2, dtype=torch.int32)
-    for b, start in enumerate(torch.tensor([0] + pages).cumsum(0)[:-1].tolist()):
-        page_table[b, : pages[b]] = order[start : start + pages[b]]
+    for b, own in enumerate(order.split(pages)):
+        page_table[b, : pages[b]] = own
     page_table = page_table.cuda()
     shape = (sum(pages) + 1, page, heads_k, HEAD_DIM)
     kc = torch.full(shape, float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -108,7 +109,7 @@ def _attention_inputs(heads_q, heads_k, qlen, window, page):
 
 def _check_partials(partials, inputs, window):
     out, lse = _reduce_partials(*partials)
-    ref_out, ref_lse = _rel_bias_attention_ref(*inputs, HEAD_DIM**-0.5, window)
+    ref_out, ref_lse = _rel_bias_attention_ref(*inputs, SCALE, window)
     torch.testing.assert_close(lse, ref_lse, atol=2e-4, rtol=0)
     torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=2e-2)
 
@@ -128,12 +129,10 @@ def test_decode_partials_matches_reference(heads_q, heads_k, qlen, window, page)
     """decode_partials covers every visible key once, with the bias only below the
     extent, the causal mask inside the verify block and the window cut, and reads
     no slot past a sequence."""
-    from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
-        decode_partials,
-    )
+    from sglang.kernels.ops.attention import inkling2_decode_attention_sm90 as attn
 
     inputs = _attention_inputs(heads_q, heads_k, qlen, window, page)
-    partials = decode_partials(*inputs, HEAD_DIM**-0.5, window_size_left=window)
+    partials = attn.decode_partials(*inputs, SCALE, window_size_left=window)
     _check_partials(partials, inputs, window)
 
 
@@ -161,7 +160,7 @@ def test_interior_split_partition(
         lambda units: (interior, interior_cost, masked_cost, 2),
     )
     inputs = _attention_inputs(6, 1, 8, None, 128)
-    partials = attn.decode_partials(*inputs, HEAD_DIM**-0.5)
+    partials = attn.decode_partials(*inputs, SCALE)
     assert partials[0].shape[0] == splits
     _check_partials(partials, inputs, None)
 

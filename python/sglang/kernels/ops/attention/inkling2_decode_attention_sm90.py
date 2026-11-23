@@ -227,7 +227,8 @@ def decode_partials(
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
-    interior, interior_cost, masked_cost, num_stages = 0, 1, 1, 2 if qlen == 1 else 3
+    interior, interior_cost, masked_cost = 0, 1, 1
+    num_stages = 2 if qlen == 1 else 3
     # Tuned on blocks of up to 8 tokens x 6 heads, which pad to 64 rows;
     # at 128 rows, interior tiles add spills and ran up to 13% slower at batch 1-4.
     if qlen > 1 and window_size_left is None and qlen * group <= 64:
