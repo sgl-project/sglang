@@ -145,6 +145,10 @@ def should_force_retry(req: Req) -> bool:
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
 
 
+def _failed_transfer_trace_status(req: Req) -> Optional[int]:
+    return None if req.aborted_by_caller else HTTPStatus.INTERNAL_SERVER_ERROR
+
+
 def clamp_kv_send_end(
     req: Req,
     cache: BasePrefixCache,
@@ -576,6 +580,7 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                req.aborted_by_caller = True
                 # Only marks the abort; the exit that releases the request detaches it.
                 req.disagg_kv_sender.abort()
                 if get_parallel().pp_size > 1:
@@ -1254,7 +1259,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if sampling_mask_finish_reason is not None:
                     req.request_finish(sampling_mask_finish_reason)
                     req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": sampling_mask_finish_reason.message}
+                        abort_info={
+                            "reason": sampling_mask_finish_reason.message,
+                            "status_code": sampling_mask_finish_reason.status_code,
+                        }
                     )
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1403,6 +1411,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in self.disagg_prefill_transfer_queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
+                req.aborted_by_caller = True
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()
 
@@ -1576,7 +1585,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": _failed_transfer_trace_status(req),
+            }
+        )
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
@@ -1617,7 +1631,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": _failed_transfer_trace_status(req),
+            }
+        )
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.release_prefill_sender(req, abort_sender=False)
         self.request_retirer.release(req, checkpoint=False)
