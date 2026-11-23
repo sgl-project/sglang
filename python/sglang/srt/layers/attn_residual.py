@@ -457,10 +457,6 @@ class AttnResidual:
     One instance lives for one model forward pass.
     """
 
-    # gfx950: a read attn_residual_hip.gather_tail_read staged for the next
-    # forward() of its prefix (a StagedRead).
-    staged = None
-
     def __init__(
         self,
         hidden_states: torch.Tensor,
@@ -518,10 +514,9 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
-        if _is_gfx95 and self.staged is not None:
-            read = self.staged.take(
-                self, hidden_states, prefix_sum, score_proj, rows, write
-            )
+        # gfx950: a read attn_residual_hip.gather_tail_read staged for this prefix
+        if _is_gfx95 and (staged := getattr(self, "staged", None)) is not None:
+            read = staged.take(self, hidden_states, prefix_sum, score_proj, rows, write)
             if read is not None:
                 return read
         nvb = self.num_valid_blocks
