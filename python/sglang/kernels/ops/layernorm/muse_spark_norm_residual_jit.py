@@ -88,8 +88,13 @@ def norm_residual_launch_config(
     hidden_size: int, num_tokens: int
 ) -> tuple[int, int, bool]:
     """Return (cluster size, threads, prefetch) for the automatic shape policy."""
+    supports_clusters = current_arch().is_sm_at_least(10)
     cluster_size = _cluster_size_for_shape(hidden_size, num_tokens)
+    if not supports_clusters:
+        cluster_size = 1
     threads, prefetch = _cluster_launch_config(hidden_size, num_tokens, cluster_size)
+    if not supports_clusters and hidden_size % (1024 * _VEC) == 0:
+        threads, prefetch = 1024, True
     return cluster_size, threads, prefetch
 
 
@@ -111,12 +116,25 @@ def _cluster_launch_config(
     return num_threads, num_tokens < _SMALL_M
 
 
+def _hopper_tuned(device: torch.device) -> bool:
+    """Muse Spark Hopper launch tuning (same condition as glue.hopper_kernels_enabled);
+    SGLANG_MUSE_SPARK_HOPPER_KERNELS=0 keeps the stock configs."""
+    from sglang.srt.environ import envs
+
+    return (
+        torch.version.hip is None
+        and envs.SGLANG_MUSE_SPARK_HOPPER_KERNELS.get()
+        and torch.cuda.get_device_capability(device) == (9, 0)
+    )
+
+
 @cache_once
 def _jit_module(
     hidden_size: int,
     num_threads: int,
     prefetch_weights: bool,
     cluster_size: int,
+    vec: int = 8,
 ) -> Module:
     args = make_cpp_args(
         hidden_size,
@@ -124,6 +142,7 @@ def _jit_module(
         is_arch_support_pdl(),
         prefetch_weights,
         cluster_size,
+        vec,
     )
     return load_jit(
         "muse_spark_norm_residual",
@@ -194,6 +213,14 @@ def fused_norm_residual(
 
     assert cluster_size is not None
     num_threads, prefetch_weights = _cluster_launch_config(hidden_size, m, cluster_size)
+    hopper = _hopper_tuned(branch.device)
+    # SM90: the prefetching kernel fits one CTA per SM, past the SM count it takes two waves.
+    if (
+        prefetch_weights
+        and hopper
+        and m > torch.cuda.get_device_properties(branch.device).multi_processor_count
+    ):
+        num_threads, prefetch_weights = _launch_config(hidden_size, _SMALL_M)
     if cluster_size == 1:
         num_threads, prefetch_weights = launch_config or (
             num_threads,
@@ -204,7 +231,9 @@ def fused_norm_residual(
             raise ValueError("launch_config only applies to cluster_size=1")
         if pre_norm_bf16:
             raise ValueError("cluster kernel requires FP32 pre-norm input")
-    module = _jit_module(hidden_size, num_threads, prefetch_weights, cluster_size)
+    # SM90 single-CTA kernels: 4 elements per thread so fp32 warp accesses are whole sectors.
+    vec = 4 if cluster_size == 1 and hopper else 8
+    module = _jit_module(hidden_size, num_threads, prefetch_weights, cluster_size, vec)
     fn = getattr(
         module,
         ("run_scale" if post_norm_is_input_scale else "run_std")

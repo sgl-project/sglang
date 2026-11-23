@@ -40,7 +40,7 @@ from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
@@ -79,8 +79,29 @@ def initialize_layernorm_sp(*, model_config) -> None:
     enabled = bool(
         get_parallel().enable_layernorm_sp
         and architecture in SP_SUPPORTED_ARCHITECTURES
-    )
+    ) or _muse_spark_hopper_default(architecture)
     get_flags().sp.enabled = enabled
+
+
+def _muse_spark_hopper_default(architecture: Optional[str]) -> bool:
+    """Muse Spark on Hopper TP4/EP4 or TP8/EP8: prefill SP without --enable-layernorm-sp."""
+    if not is_muse_spark_architecture(architecture):
+        return False
+    from sglang.srt.layers.muse_spark.fused.glue import hopper_kernels_enabled
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    parallel = get_parallel()
+    graph = get_exec().graph.cuda_graph_config
+    return (
+        # a full prefill graph replays mixed batches through an extend body
+        (graph is None or graph.prefill.backend != Backend.FULL)
+        and hopper_kernels_enabled()
+        and (parallel.tp_size, parallel.moe_ep_size) in ((4, 4), (8, 8))
+        and parallel.moe_tp_size == 1
+        and parallel.attn_dp_size == 1
+        and parallel.attn_cp_size == 1
+        and parallel.pp_size == 1
+    )
 
 
 def layernorm_sp_enabled() -> bool:
@@ -363,7 +384,13 @@ def column_parallel_g_matmul(
     tile-gated all-gather; other models retain their existing implementation.
     """
     num_tokens = sp_num_tokens()
-    if sp_fused_matmul_eligible(linear):
+    if num_tokens >= getattr(
+        linear, "_sp_fused_min_tokens", 0
+    ) and sp_fused_matmul_eligible(linear):
+        if (ag := getattr(linear, "_sp_ag_matmul", None)) and (
+            out := ag(linear, input_parallel.contiguous())
+        ) is not None:
+            return out[:num_tokens]
         if is_npu():
             # CANN MC2: allgather(input shard) @ weight.t(), then narrow.
             try:
@@ -399,8 +426,15 @@ def column_parallel_g_matmul(
                 [linear.weight.t()],
                 gather_dim=0,
                 group_name=group_name,
+                return_A=False,
             )
             return mm_outputs[0][:num_tokens]
+    push = getattr(linear, "_sp_ag_push", None)
+    if (
+        push is not None
+        and (gathered := push.push_all_gather(input_parallel.contiguous())) is not None
+    ):
+        return linear.quant_method.apply(linear, gathered[:num_tokens], bias)
     gathered = sp_exit_gather(input_parallel, num_tokens=num_tokens)
     return linear.quant_method.apply(linear, gathered, bias)
 
@@ -420,7 +454,24 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     padded = ceil_align(num_tokens, tp_size)
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
-    if sp_fused_matmul_eligible(linear):
+    full_weight = getattr(linear, "_sp_full_weight", None)
+    if (
+        full_weight is not None
+        and bias is None
+        and num_tokens >= linear._sp_full_weight_min_tokens
+    ):
+        push = getattr(linear, "_sp_a2a_push", None)
+        if push is None or (full_input := push.push_all_to_all(x)) is None:
+            rows = x.shape[0] // tp_size
+            received = torch.empty_like(x)
+            get_parallel().tp_group.all_to_all_single(received.view(-1), x.view(-1))
+            full_input = (
+                received.view(tp_size, rows, -1).transpose(0, 1).reshape(rows, -1)
+            )
+        return torch.mm(full_input, full_weight.t())
+    if num_tokens >= getattr(
+        linear, "_sp_fused_min_tokens", 0
+    ) and sp_fused_matmul_eligible(linear):
         if is_npu():
             # CANN MC2: ReduceScatter(x @ weight.t()). x's padded token dim is
             # already a multiple of tp_size (required by the fused op).
@@ -463,3 +514,10 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
     get_parallel().tp_group.reduce_scatter_tensor(output, full)
     return output
+
+
+def sp_reduce_scatter(partial: torch.Tensor) -> torch.Tensor:
+    """Sum a full-sequence TP partial and keep this rank's padded token shard."""
+    if get_parallel().tp_group.world_size == 1:
+        return partial
+    return reduce_scatter_token_rows(partial)

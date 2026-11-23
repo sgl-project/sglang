@@ -28,10 +28,16 @@ from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
 )
 from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+    DG_MIN,
+    SP_MIN,
+)
+from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
     is_supported as fused_w4a16_supported,
 )
 from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+    nvfp4_w4a16_moe_sp,
     nvfp4_w4a16_moe_with_post_norm,
+    sp_dynamic_guest_ids,
 )
 from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
@@ -175,6 +181,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
             and hopper_kernels_enabled()
         )
+        self.dynamic_guest_setup = self.dynamic_guests = None
 
         # post_expert_norm is unknown until set_post_expert_norm; start with the
         # OSS default (standard, eps=1e-8) and rebuild when the real module arrives.
@@ -540,6 +547,30 @@ class MuseSpark1xFp4Experts(nn.Module):
             expert_ids_are_sorted=True,
             has_inactive_prefix_count=expert_map is None,
         ).view(num_tokens, topk, size_k), local_topk_ids
+
+    def sp_exchange_ready(self, num_tokens: int) -> bool:
+        return self._fused_w4a16_ready() and num_tokens >= SP_MIN
+
+    def forward_sp_exchange(self, topk_scores, topk_ids, buffers, rows: int) -> None:
+        dg = self.dynamic_guests if topk_ids.shape[0] >= DG_MIN else None
+        local_ids = (
+            self._expert_map[topk_ids]
+            if dg is None
+            else sp_dynamic_guest_ids(topk_ids, buffers.rank, dg.gsrc, buffers.route_ns)
+        )
+        nvfp4_w4a16_moe_sp(
+            local_ids,
+            topk_scores,
+            self.w13_weight,
+            self.w13_weight_scale_2,
+            self.w2_weight,
+            self.w2_weight_scale_2,
+            self._post_expert_norm_weight_f32,
+            shard=buffers.shard[:rows],
+            shard_ptrs=buffers.shard_ptrs,
+            recv_ptrs=buffers.recv_ptrs,
+            dg=dg,
+        )
 
     def _fused_w4a16_ready(self) -> bool:
         return (
