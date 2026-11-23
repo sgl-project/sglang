@@ -773,8 +773,7 @@ def _sharded_tokens(
 def _sharded_sampling_applies(
     *,
     verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
-    route: VerifyRoute,
+    verify: VerifyStep,
     has_local_keys: bool,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
@@ -789,10 +788,10 @@ def _sharded_sampling_applies(
         _is_cuda
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
-            batch.sampling_info,
-            adjusts_logits=route.adjusts_logits,
-            need_truncated_sampling=route.need_truncated_sampling,
-            return_logprob=batch.return_logprob,
+            verify.batch.sampling_info,
+            adjusts_logits=verify.route.adjusts_logits,
+            need_truncated_sampling=verify.route.need_truncated_sampling,
+            return_logprob=verify.batch.return_logprob,
             has_local_keys=has_local_keys,
         )
         and spec_allows_vocab_shards(get_spec())
@@ -836,8 +835,7 @@ def eagle_sample(
     vocab_shard = logits_output.next_token_logits_vocab_shard
     if vocab_shard is not None and not _sharded_sampling_applies(
         verify_input=verify_input,
-        batch=batch,
-        route=verify.route,
+        verify=verify,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
