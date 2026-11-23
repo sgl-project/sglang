@@ -1,7 +1,6 @@
 import time
 from typing import List, Optional
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import (
     AccuracyTestParams,
     AccuracyTestResult,
@@ -20,6 +19,7 @@ from sglang.test.test_utils import (
     ModelLaunchSettings,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 from sglang.test.tool_call_test_runner import (
@@ -146,17 +146,17 @@ def run_combined_tests(
         # Optionally launch one shared server for this model that all test
         # types (perf / accuracy / tool-call) reuse.
         shared_proc = None
-        if share_server and (run_perf or run_accuracy or run_tool_call):
-            print(f"\nLaunching shared server for {model.model_path} ...")
-            shared_proc = popen_launch_server(
-                model.model_path,
-                base_url,
-                other_args=model.extra_args,
-                timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                env=model.env,
-            )
-
         try:
+            if share_server and (run_perf or run_accuracy or run_tool_call):
+                print(f"\nLaunching shared server for {model.model_path} ...")
+                shared_proc = popen_launch_server(
+                    model.model_path,
+                    base_url,
+                    other_args=model.extra_args,
+                    timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    env=model.env,
+                )
+
             # Run performance test
             if run_perf:
                 perf_result: PerformanceTestResult = run_performance_test(
@@ -227,6 +227,7 @@ def run_combined_tests(
                     model=model,
                     params=tool_call_params,
                     base_url=base_url,
+                    skip_server_launch=share_server,
                 )
                 model_result["tool_call_result"] = tc_result
                 if not tc_result.passed:
@@ -237,11 +238,12 @@ def run_combined_tests(
                     print("\nWaiting 20 seconds for resource cleanup...")
                     time.sleep(20)
 
+        except Exception as exc:
+            all_passed = False
+            model_result["errors"].append(f"Model test exception: {exc}")
         finally:
             if shared_proc is not None:
-                kill_process_tree(shared_proc.pid)
-                print("\nWaiting 20 seconds for resource cleanup...")
-                time.sleep(20)
+                terminate_and_kill_process_tree(shared_proc)
 
         all_results.append(model_result)
 

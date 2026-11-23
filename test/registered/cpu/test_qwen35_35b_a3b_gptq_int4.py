@@ -2,7 +2,7 @@
 
 35B language model, TP=1 on Xeon.
 
-Registry: nightly-xeon-models suite
+Registry: nightly-test-cpu-intel suite
 """
 
 import unittest
@@ -12,12 +12,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
 # The full GSM8K evaluation exceeded the previous 90-minute file timeout.
 # With --timeout-from-est-time, this estimate gives the file a 3-hour budget.
-register_cpu_ci(est_time=7200, suite="nightly-xeon-models")
+register_cpu_ci(est_time=7200, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
@@ -25,7 +25,7 @@ BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 BASE_ARGS = CPU_BASE_ARGS
 
 
-class TestQwen35_35BXeon(unittest.TestCase):
+class TestQwen35_35BXeon(CustomTestCase):
     """Qwen/Qwen3.5-35B-A3B-GPTQ-Int4 on Xeon."""
 
     def test_qwen_35_35b_a3b_gptq_int4(self):

@@ -188,7 +188,7 @@ NIGHTLY_SUITES = {
         "nightly-test-1-gpu-musa",
     ],
     HWBackend.CPU: [
-        "nightly-xeon-models",
+        "nightly-test-cpu-intel",
     ],
     HWBackend.NPU: [
         "nightly-test-1-npu-a3",

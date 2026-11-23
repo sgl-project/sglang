@@ -124,7 +124,7 @@ jobs:
         timeout-minutes: 240
         run: |
           set -o pipefail
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+          docker exec -e SGLANG_IS_IN_CI=true -e PYTHONUNBUFFERED=1 -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
             bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite extra-test-cpu-intel,extra-tp-test-cpu-intel --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/unit-tests.log"
 
@@ -136,7 +136,7 @@ jobs:
       # Continue after test failures once container and AMX setup succeeded.
       - name: Run nightly model accuracy + perf (batch 1)
         id: model_batch_1
-        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' && (env.CONTINUE_ON_ERROR_FLAG != '' || steps.unit_tests.outcome == 'success') }}
         timeout-minutes: 300
         run: |
           set -o pipefail
@@ -145,12 +145,12 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
             -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
             ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_lo }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/model-batch-1.log"
 
       - name: Run nightly model accuracy + perf (batch 2)
         id: model_batch_2
-        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.run_container.outcome == 'success' && steps.check_amx.outcome == 'success' && (env.CONTINUE_ON_ERROR_FLAG != '' || (steps.unit_tests.outcome == 'success' && steps.model_batch_1.outcome == 'success')) }}
         timeout-minutes: 300
         run: |
           set -o pipefail
@@ -159,7 +159,7 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/$REPORT_DIR/model-summary.md" \
             -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/$REPORT_DIR/metrics.jsonl" \
             ci_sglang_${{ matrix.name }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-xeon-models --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite nightly-test-cpu-intel --auto-partition-id ${{ matrix.nightly_part_hi }} --auto-partition-size 4 --timeout-from-est-time $CONTINUE_ON_ERROR_FLAG" \
             2>&1 | tee "$REPORT_DIR/model-batch-2.log"
 
       - name: Collect evaluation reports
@@ -226,6 +226,9 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglang_${{ matrix.name }} || true
+          # Match PR Xeon cleanup: unused images and build cache only.
+          docker image prune -f --filter until=24h || true
+          docker builder prune -f --filter until=24h || true
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')

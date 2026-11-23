@@ -2,7 +2,7 @@
 
 20B language model, TP=3 on Xeon.
 
-Registry: nightly-xeon-models suite
+Registry: nightly-test-cpu-intel suite
 """
 
 import unittest
@@ -12,10 +12,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
+register_cpu_ci(est_time=3600, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "openai/gpt-oss-20b"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
@@ -23,7 +23,7 @@ BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 BASE_ARGS = CPU_BASE_ARGS
 
 
-class TestGPTOSS20BXeon(unittest.TestCase):
+class TestGPTOSS20BXeon(CustomTestCase):
     """GPT-OSS-20B on Xeon."""
 
     def test_gpt_oss_20b(self):

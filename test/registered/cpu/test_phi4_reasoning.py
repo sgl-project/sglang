@@ -3,7 +3,7 @@
 Dense 14B reasoning model with <think> chain-of-thought, TP=2 on Xeon.
 Uses deepseek-r1 reasoning parser (compatible <think>/</think> format).
 
-Registry: nightly-xeon-models suite"""
+Registry: nightly-test-cpu-intel suite"""
 
 import unittest
 
@@ -12,10 +12,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import CPU_BASE_ARGS, CPU_LAUNCH_TIMEOUT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 from sglang.test.xeon_nightly_baselines import XEON_NIGHTLY_BASELINES
 
-register_cpu_ci(est_time=3600, suite="nightly-xeon-models")
+register_cpu_ci(est_time=3600, suite="nightly-test-cpu-intel")
 
 MODEL_PATH = "microsoft/Phi-4-reasoning"
 BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
@@ -23,7 +23,7 @@ BASELINE = XEON_NIGHTLY_BASELINES[MODEL_PATH]
 BASE_ARGS = CPU_BASE_ARGS
 
 
-class TestPhi4ReasoningCPU(unittest.TestCase):
+class TestPhi4ReasoningCPU(CustomTestCase):
     """Microsoft Phi-4-reasoning on Xeon."""
 
     def test_phi4_reasoning(self):
