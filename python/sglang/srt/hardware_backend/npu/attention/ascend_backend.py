@@ -43,6 +43,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_key_lens,
     get_dsa_token_shard_plan,
 )
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import DsaTokenShardPlan
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -1511,7 +1512,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen: torch.Tensor,
         forward_batch: ForwardBatch,
         dcp_metadata: NPUDecodeContextParallelMetadata,
-        dsa_token_shard_plan,
+        dsa_token_shard_plan: Optional[DsaTokenShardPlan],
     ) -> torch.Tensor:
         """DCP extend over the context the model gathered, one contiguous run
         per request: TND keys, cumulative lengths, no block table.
