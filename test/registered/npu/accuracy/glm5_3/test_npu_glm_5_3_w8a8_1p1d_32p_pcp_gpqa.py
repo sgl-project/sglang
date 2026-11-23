@@ -10,6 +10,8 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM_5_3_W8A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ascend.test_ascend_utils import (
     append_ld_library_path,
@@ -253,7 +255,7 @@ GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
 # decode tp32/dp32/ep32, GLM-5.3-w8a8
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
+    """Serve GLM-5.3-w8a8 with PD separation, PCP and L3 Mooncake; check accuracy and hit rates"""
 
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
@@ -278,6 +280,8 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "temperature": 1.0,
         "top_p": 0.95,
     }
+    # L2 host and L3 storage traffic must both be non-zero in the hit-rate test.
+    min_hit_rate_pcts = {"host": 0, "storage": 0}
 
     @classmethod
     def setUpClass(cls):
@@ -301,6 +305,13 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             "model_path": GLM_5_3_W8A8_MODEL_PATH,
             "prefill_args": [
                 *GLM_5_3_PCP_PD_SEP_PREFILL_ARGS,
+                # Cap the device KV pool so the 32k-token GSP workload overflows
+                # L1 and exercises the L2 host tier; the 1.2x host pool (about
+                # 78k tokens) then cannot hold all three prefixes, so evictions
+                # reach the L3 store. Accuracy is unaffected: gpqa prompts are
+                # short and only the prefill-side cache is capped.
+                "--max-total-tokens",
+                65536,
                 "--hicache-storage-backend-extra-config",
                 l3_config,
             ],
@@ -325,6 +336,29 @@ class TestNPUGLM5_3_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
     def test_npu_glm_5_3_w8a8_1p1d_pcp_gpqa(self):
         """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
         self.run_accuracy()
+
+    def test_npu_glm_5_3_w8a8_1p1d_32p_pcp_l2_l3_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the host and storage hit rates"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question. Requests are shuffled and round-robin, so
+        # 32 prompts per group give several repeats of the same prefix (reuse),
+        # while the three distinct prefixes overflow the capped device pool and
+        # the host pool (eviction to L2/L3).
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":
