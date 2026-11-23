@@ -355,7 +355,7 @@ jobs:
   # The router the PD tests in nightly-test-4-npu-a3, nightly-poc-multi-node-tests
   # and the nightly-poc-multi-node-accuracy-* jobs launch.
   sgl-router-build-aarch64:
-    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,') }}
+    if: false  # TEMP(PR 52431 verification): no enabled consumer job needs the router
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
