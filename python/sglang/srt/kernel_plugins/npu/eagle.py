@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from sglang.kernels.plugin_kernels.npu.spec import (
@@ -13,6 +15,22 @@ from sglang.srt.kernel_plugins.npu.admission import all_admit, candidate_present
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.speculative.eagle_megakernel import EagleDraftRuntime
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    tokens: torch.Tensor
+    position: torch.Tensor
+    slot: int
+    generation: int
+
+
+def _current_candidate(req):
+    candidate = getattr(req, "ascend_candidate", None)
+    if candidate is not None and candidate.generation != req.retraction_count:
+        req.ascend_candidate = None
+        return None
+    return candidate
 
 
 class NpuEagleDraftRuntime(EagleDraftRuntime):
@@ -34,20 +52,27 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
             return None
         req = batch.reqs[0] if len(batch.reqs) == 1 else None
         if self.binding.mode == "fused_extend":
-            lease = getattr(req, "ascend_candidate", None)
+            lease = _current_candidate(req)
             valid = lease is None or (
-                lease[0].shape == (1, self.steps)
-                and lease[2] == req.kv.req_pool_idx
-                and torch.equal(lease[1], forward_batch.positions)
+                lease.tokens.shape == (1, self.steps)
+                and lease.slot == req.kv.req_pool_idx
+                and torch.equal(lease.position, forward_batch.positions)
             )
             if not candidate_present(lease is not None, valid):
                 return None
             req.ascend_candidate = None
             self.binding.hit("consume_fused_chain")
-            return lease[0]
+            return lease.tokens
 
         if not all_admit(
-            (not self.binding.pd_decode or getattr(req, "npu_draft_kv_ready", False))
+            (
+                not self.binding.pd_decode
+                or (
+                    req is not None
+                    and getattr(req, "npu_draft_kv_generation", None)
+                    == req.retraction_count
+                )
+            )
             and self.binding.supports_decode(
                 batch, forward_batch, self.worker.hot_token_id
             )
@@ -81,7 +106,7 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
             self.binding.supports_extend(batch, result, self.worker.hot_token_id)
             and self.extend_executor.covers("extend", batch),
             outstanding_chain=any(
-                getattr(r, "ascend_candidate", None) is not None for r in batch.reqs
+                _current_candidate(req) is not None for req in batch.reqs
             ),
         ):
             return None
@@ -95,7 +120,9 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         with forward_context(
             ForwardContext(attn_backend=backend), forward_batch=forward_batch
         ):
-            result = self.extend_executor.execute_extend(DraftExtendIO(forward_batch, select))
+            result = self.extend_executor.execute_extend(
+                DraftExtendIO(forward_batch, select)
+            )
         hidden = result.first_hidden_states
         if (
             result.token_ids.shape != (1, self.steps)
@@ -111,4 +138,6 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         next_input.dsa_topk_indices = None
         expected = forward_batch.positions.index_select(0, select.long()) + 1
         req = batch.reqs[0]
-        req.ascend_candidate = (tokens, expected, req.kv.req_pool_idx)
+        req.ascend_candidate = _Candidate(
+            tokens, expected, req.kv.req_pool_idx, req.retraction_count
+        )

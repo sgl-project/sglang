@@ -4,6 +4,7 @@
 def all_admit(local, *, outstanding_chain=False):
     import torch
     import torch.distributed as dist
+
     from sglang.srt.runtime_context import get_parallel
 
     vote = torch.tensor(
@@ -19,11 +20,14 @@ def all_admit(local, *, outstanding_chain=False):
 def candidate_present(local, valid=True):
     import torch
     import torch.distributed as dist
+
     from sglang.srt.runtime_context import get_parallel
 
     group = get_parallel().tp_group.cpu_group
     vote = torch.tensor(
-        int(local) if valid else dist.get_world_size(group) + 1, dtype=torch.int32
+        int(local) if valid else dist.get_world_size(group) + 1,
+        dtype=torch.int32,
+        device="cpu",
     )
     dist.all_reduce(vote, group=group)
     count = int(vote.item())

@@ -24,7 +24,7 @@ Enable installation with `--enable-npu-megakernel`. The target binding votes acr
 
 1. After weights, pools and attention backends are ready, `init_eagle_draft_runtime` selects the NextN strategy on the draft worker. Bootstrap and the native mode use the ordinary EAGLE implementation.
 2. After verify, `plan_fused_extend` checks model eligibility, executor coverage and outstanding ownership across TP ranks before metadata preparation or speculative writes. An admitted extend selects row `accept_lens - 1`. The host copies the borrowed tokens and selected hidden state and publishes the candidate chain on the request.
-3. At the next draft, `propose_chain` consumes that chain once, validating the request slot and position. In decode-loop mode it instead takes the independent extend seed and local write slots and calls the suffix executor once. Both paths feed the existing EAGLE verify input. Verification, target sampling, bonus and request cleanup remain SGLang operations.
+3. At the next draft, `propose_chain` consumes that chain once, validating the request generation, slot and position. Retraction invalidates both a published chain and a decode-side transfer receipt, even if the allocator reuses the same slot. In decode-loop mode the strategy takes the independent extend seed and local write slots and calls the suffix executor once. Both paths feed the existing EAGLE verify input. Verification, target sampling, bonus and request cleanup remain SGLang operations.
 4. An executor returns the complete linear candidate tensor of shape `[batch, N]`. Column zero in decode-loop mode is the seed. Failure after dispatch propagates to the worker.
 
 ## Graph runner integration

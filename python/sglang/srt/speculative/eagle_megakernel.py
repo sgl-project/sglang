@@ -43,7 +43,9 @@ class EagleDraftRuntime:
     def propose_chain(self, batch: ScheduleBatch, forward_batch: ForwardBatch):
         return None
 
-    def plan_fused_extend(self, batch: ScheduleBatch, result: Any) -> Optional[Callable]:
+    def plan_fused_extend(
+        self, batch: ScheduleBatch, result: Any
+    ) -> Optional[Callable]:
         return None
 
     def bind_draft_graphs(self, runner: Any) -> frozenset[int]:

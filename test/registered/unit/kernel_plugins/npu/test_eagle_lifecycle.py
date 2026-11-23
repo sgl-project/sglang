@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.kernel_plugins.npu import eagle
+from sglang.srt.speculative import eagle_megakernel
 from sglang.srt.speculative.eagle_megakernel import init_eagle_draft_runtime
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -32,7 +33,7 @@ class TestEagleLifecycle(unittest.TestCase):
         self.runner = Mock()
         self.runtime.bind_executors(decode=self.binding, extend=self.runner)
         self.mode = NS(is_idle=lambda: False)
-        self.req = NS(kv=NS(req_pool_idx=3))
+        self.req = NS(kv=NS(req_pool_idx=3), retraction_count=0)
         self.batch = NS(reqs=[self.req], forward_mode=self.mode)
 
         def presence(present, valid=True):
@@ -83,6 +84,40 @@ class TestEagleLifecycle(unittest.TestCase):
             self.assertIsNone(self.runtime.propose_chain(self.batch, next_forward))
         self.assertEqual(self.runner.execute_extend.call_count, 3)
 
+    def test_retraction_invalidates_chain_even_if_slot_and_position_match(self):
+        self.runner.execute_extend.return_value = NS(
+            token_ids=torch.arange(7).reshape(1, 7),
+            first_hidden_states=torch.ones(1, 4),
+        )
+        forward = NS(positions=torch.arange(8), forward_mode=self.mode)
+        next_forward = NS(positions=torch.tensor([3]), forward_mode=self.mode)
+        for first_action in ("consume", "publish"):
+            run = self.runtime.plan_fused_extend(self.batch, object())
+            run(self.batch, forward, torch.tensor([2]), NS())
+            self.req.retraction_count += 1
+            if first_action == "consume":
+                self.assertIsNone(self.runtime.propose_chain(self.batch, next_forward))
+            else:
+                self.assertIsNotNone(
+                    self.runtime.plan_fused_extend(self.batch, object())
+                )
+        self.binding.hit.assert_not_called()
+
+    def test_stock_and_nvidia_keep_their_strategy(self):
+        worker = NS(draft_runner=NS())
+        nvidia = object.__new__(eagle_megakernel.EagleMegakernel)
+        for specialized in (None, nvidia):
+            with patch.object(
+                eagle_megakernel, "init_eagle_megakernel", return_value=specialized
+            ) as resolve:
+                runtime = init_eagle_draft_runtime(draft_worker=worker)
+                resolve.assert_called_once_with(draft_worker=worker)
+            self.assertIs(
+                runtime, specialized or eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
+            )
+            self.assertIsNone(runtime.propose_chain(None, None))
+            self.assertIsNone(runtime.plan_fused_extend(None, None))
+
     def test_decline_before_execution_and_propagate_failure(self):
         self.binding.supports_extend.return_value = False
         self.assertIsNone(self.runtime.plan_fused_extend(self.batch, object()))
@@ -98,3 +133,7 @@ class TestEagleLifecycle(unittest.TestCase):
             run(self.batch, object(), object(), NS())
         self.runner.execute_extend.assert_called_once()
         self.assertFalse(hasattr(self.req, "ascend_candidate"))
+
+
+if __name__ == "__main__":
+    unittest.main()
