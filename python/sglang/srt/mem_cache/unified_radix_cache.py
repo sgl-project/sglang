@@ -4544,6 +4544,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
         return comp._mamba_host_only_checkpoint()
 
+    def _anchor_lacks_mamba_state(self, node_id: NodeId) -> bool:
+        return (
+            ComponentType.MAMBA in self.components
+            and not self.tree_core.is_root(node_id)
+            and self.tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+            is None
+        )
+
     # ---- HiCache: Scheduler Entry Points ----
 
     @rank_consensus(same_params=["params.host_hit_length"])
@@ -4552,7 +4560,8 @@ class UnifiedRadixCache(BasePrefixCache):
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
         """None means admission retries without committing a load: buffer
-        mode, or a host-only anchor whose previous load-back is still in flight."""
+        mode, a host-only anchor whose previous load-back is still in flight,
+        or a refused load-back whose device anchor has no state to extend from."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -4595,6 +4604,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id,
                 )
                 return len(new_indices), best_match_node_id
+            # A refused load-back falls back to the device anchor and extends from
+            # its device Mamba state. A non-root anchor without one (host-only
+            # checkpoints) would extend from zeros, so admission retries instead.
+            if self._anchor_lacks_mamba_state(last_best_match_device_node_id):
+                return None
 
         return 0, last_best_match_device_node_id
 

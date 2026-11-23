@@ -1222,13 +1222,10 @@ class MambaComponent(TreeComponent):
         if success or req is None:
             return
         # A refused load-back leaves req at its device anchor (req.last_node), which
-        # holds a device state unless it is the root: extend from that state.
-        anchor_state = (
-            None
-            if req.last_node is None
-            else self.tree_core.get_component_device_value(
-                req.last_node, self.component_type
-            )
+        # holds a device state unless it is the root (init_load_back retries a
+        # non-root anchor without one): extend from that state.
+        anchor_state = self.tree_core.get_component_device_value(
+            req.last_node, self.component_type
         )
         if anchor_state is not None:
             # The deferred CoW fills prepare's slot, or the one allocated at admission.

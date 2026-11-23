@@ -736,6 +736,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req = self._make_req(req_to_token_pool)
         req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         req.kv.mamba_pool_idx = None
+        req.last_node = cache.root_node_handle()
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         # Impossible quota -> load_back aborts after building the transfers.
@@ -744,6 +745,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertFalse(loaded)
         # the aborted call must return its slot and not leave req pointing at it
         self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
@@ -763,6 +765,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
         # The request already owns its slot: an aborted load-back must not free it.
         req = self._make_req(req_to_token_pool)
+        req.last_node = cache.root_node_handle()
         preexisting_slot = req.kv.mamba_pool_idx
         self.assertIsNotNone(preexisting_slot)
         mamba_avail = req_to_token_pool.mamba_allocator.available_size()
@@ -771,10 +774,84 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
         self.assertFalse(loaded)
         self.assertIs(req.kv.mamba_pool_idx, preexisting_slot)
+        # At the root the request starts from zeros in the slot it already held.
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertTrue(req.kv.mamba_needs_clear)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
         self._release_ongoing_load_back_locks(cache)
+
+    @requires_full_mamba_ps1
+    def test_load_back_abort_held_slot_copies_anchor_state(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf, anchor = chain[-1], chain[-2]
+
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        anchor_state = node_device_value(cache, anchor, ComponentType.MAMBA)
+        self.assertIsNotNone(anchor_state)
+
+        # The request keeps the slot it held and copies the anchor's state into it.
+        req = self._make_req(req_to_token_pool)
+        req.last_node = anchor
+        preexisting_slot = req.kv.mamba_pool_idx
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
+
+        self.assertFalse(loaded)
+        self.assertIs(req.kv.mamba_pool_idx, preexisting_slot)
+        self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, anchor_state))
+        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
+        self._release_ongoing_load_back_locks(cache)
+
+    @requires_full_mamba_ps1
+    def test_host_only_refusal_without_anchor_state_retries(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
+            tree_core_backend="python"
+        )
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf, anchor = chain[-1], chain[-2]
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        # Host-only checkpoints anchor on device Full pages that hold no state.
+        self._evict_device_component(cache, anchor, ComponentType.MAMBA)
+        self.assertIsNone(node_device_value(cache, anchor, ComponentType.MAMBA))
+
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+        req.last_node = anchor
+        req.mamba_host_hit_length = 1
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+        with (
+            mock.patch.object(
+                cache.components[ComponentType.MAMBA],
+                "_mamba_host_only_checkpoint",
+                return_value=True,
+            ),
+            mock.patch.object(cache.cache_controller, "load", return_value=None),
+        ):
+            loaded = cache.init_load_back(
+                InitLoadBackParams(best_match_node=leaf, host_hit_length=0, req=req)
+            )
+
+        # Nothing to extend from at the anchor: admission retries, nothing staged.
+        self.assertIsNone(loaded)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+        )
 
     @requires(
         lambda cfg: (
