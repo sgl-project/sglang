@@ -33,6 +33,7 @@ from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
     inspect_compressed_image,
     prepare_deferred_image,
 )
+from sglang.srt.multimodal.transport.feature_transport import MultimodalFeatureTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -261,6 +262,26 @@ class TestQwenVLTPPreprocess(unittest.TestCase):
         restored = msgspec.msgpack.decode(wire, type=MultimodalDataItem)
         self.assertIsInstance(restored.feature, bytes)
         self.assertEqual(restored.feature, data)
+
+    def test_cuda_ipc_only_wraps_preprocessed_tensors(self):
+        data = _encode_image(Image.new("RGB", (64, 64)), "PNG")
+        compressed = MultimodalDataItem(modality=Modality.IMAGE, feature=data)
+        pixels = torch.zeros((4, 8))
+        preprocessed = MultimodalDataItem(modality=Modality.IMAGE, feature=pixels)
+        for index, item in enumerate((compressed, preprocessed), start=1):
+            item.set_identity(bytes([index]) * 32)
+        transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
+        proxy = object()
+        with patch.object(
+            transport, "_wrap_tensor_for_cuda_ipc", return_value=proxy
+        ) as wrap:
+            transport.prepare_mm_items_for_transport([compressed, preprocessed])
+        wrap.assert_called_once()
+        self.assertIs(wrap.call_args.args[0], pixels)
+        self.assertIs(compressed.feature, data)
+        self.assertIs(preprocessed.feature, proxy)
 
     def test_vit_graph_returns_owned_embeddings_for_tp_image_groups(self):
         from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel

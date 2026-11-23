@@ -330,8 +330,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             and not get_mm().mm_enable_dp_encoder
         )
         fast_gpu_preprocessing = (
-            not self.keep_mm_features_on_device
-            and not self.disable_fast_image_processor
+            not self.disable_fast_image_processor
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
         )
@@ -347,7 +346,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         ):
             raise ValueError(
                 "Qwen-VL TP image preprocessing requires single-node pure CUDA TP, "
-                "fast GPU processing with CPU feature transport, "
+                "fast GPU processing, "
                 "and eager, breakable, or full prefill"
             )
         logger.info("Enabled Qwen-VL rank-local TP image preprocessing")

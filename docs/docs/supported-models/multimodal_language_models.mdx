@@ -418,17 +418,17 @@ Use this option when you have sufficient GPU memory and want to minimize latency
 
 ### Qwen3-VL TP Image Preprocessing
 
-For Qwen3-VL and Qwen3-VL-MoE, set `SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS=1` to distribute image resize, normalization, and patchification across TP ranks. This default-off feature requires single-node pure NVIDIA CUDA TP with `--tp-size` greater than one, the fast image processor, and `--mm-feature-transport cpu`.
+For Qwen3-VL and Qwen3-VL-MoE, set `SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS=1` to distribute image resize, normalization, and patchification across TP ranks. This default-off feature requires single-node pure NVIDIA CUDA TP with `--tp-size` greater than one and the fast image processor.
 
 ```bash
 SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS=1 \
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 sglang serve Qwen/Qwen3-VL-2B-Instruct \
-  --tp-size 4 --mm-feature-transport cpu \
+  --tp-size 4 \
   --disable-prefill-cuda-graph
 ```
 
-The tokenizer validates JPEG and PNG inputs and sends their compressed bytes as part of the request message. For each assigned image, the owning TP rank decodes JPEG with nvJPEG on its GPU where supported, or decodes PNG with PIL in the rank process. That rank runs resize, normalization, and patchification on its GPU. Ranks broadcast the packed processor outputs before executing the tensor-parallel vision encoder. Image embeddings retain the request's image order. Unsupported image formats or processor settings use the existing processing path.
+The tokenizer validates JPEG and PNG inputs and sends their compressed bytes as part of the request message. For each assigned image, the owning TP rank decodes JPEG with nvJPEG on its GPU where supported, or decodes PNG with PIL in the rank process. That rank runs resize, normalization, and patchification on its GPU. Ranks broadcast the packed processor outputs before executing the tensor-parallel vision encoder. Image embeddings retain the request's image order. Unsupported image formats or processor settings use the existing processing path and the server's configured feature transport. The default is resolved by the serving configuration. The large Hopper Qwen3-VL profile selects CUDA IPC for single-node serving when cache retention is disabled. Pass `--mm-feature-transport cuda_ipc` to select CUDA IPC explicitly for eligible fallback tensors. Deferred images use inline compressed bytes under either setting.
 
 With ViT CUDA graphs enabled, a layout is captured on its second encounter. The TP preprocessing path retains up to eight layouts with at most 8,192 patches each. Other layouts execute eagerly using the same positional interpolation. Replayed outputs receive independent storage before they are split into image embeddings.
 
