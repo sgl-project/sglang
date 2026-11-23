@@ -1700,6 +1700,9 @@ STANDALONE_FILES = {
     ],
 }
 
+# the CI planner reads the CUDA registry before platform-specific list replacements
+CUDA_STANDALONE_FILES = STANDALONE_FILES.copy()
+
 # BCG and the component reference suites previously ran in dedicated CUDA jobs.
 if not current_platform.is_cuda():
     cuda_only_files = set(
