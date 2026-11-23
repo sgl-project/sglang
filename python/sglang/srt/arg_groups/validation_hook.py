@@ -454,6 +454,23 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
+    # A negative threshold marks same-priority running requests preemptible:
+    # they preempt each other in a livelock instead of finishing, and the
+    # comparison also lets lower-priority requests preempt higher-priority
+    # ones. 0 is meaningful (only a strictly higher priority preempts).
+    if cfg.priority_scheduling_preemption_threshold < 0:
+        raise ValueError(
+            "--priority-scheduling-preemption-threshold must be non-negative, "
+            f"got {cfg.priority_scheduling_preemption_threshold}."
+        )
+    # 0 or a negative value rejects every request, and with priority
+    # scheduling the first request crashes the scheduler taking max() over
+    # an empty waiting queue. None (unset) means no limit.
+    if cfg.max_queued_requests is not None and cfg.max_queued_requests <= 0:
+        raise ValueError(
+            "--max-queued-requests must be positive when set, got "
+            f"{cfg.max_queued_requests}. Omit the flag for no limit."
+        )
     halving_chunks = cfg.shortest_prefill_boundary_halving_chunks
     budget_min_ratio = cfg.shortest_prefill_budget_min_ratio
     doubling_chunks = cfg.shortest_prefill_budget_doubling_chunks

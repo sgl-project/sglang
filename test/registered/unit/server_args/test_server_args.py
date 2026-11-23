@@ -5523,6 +5523,59 @@ class TestShortestPrefillLoadScalingArgs(CustomTestCase):
         )
 
 
+class TestPrioritySchedulingArgValidation(CustomTestCase):
+    """Startup validation of priority-scheduling arguments whose invalid
+    values previously failed late or silently: a negative preemption
+    threshold livelocks same-priority requests, and a non-positive queue
+    limit rejects every request — crashing the scheduler under priority
+    scheduling on max() over an empty waiting queue."""
+
+    def check(self, **kwargs):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            page_size=1,
+            chunked_prefill_size=4096,
+            **kwargs,
+        ).check_server_args()
+
+    def test_negative_preemption_threshold_is_rejected(self):
+        for enable in (True, False):
+            with self.subTest(enable_priority_scheduling=enable):
+                with self.assertRaisesRegex(
+                    ValueError, "priority-scheduling-preemption-threshold"
+                ):
+                    self.check(
+                        enable_priority_scheduling=enable,
+                        priority_scheduling_preemption_threshold=-1,
+                    )
+
+    def test_zero_preemption_threshold_is_accepted(self):
+        # 0 is meaningful: only a strictly higher priority preempts.
+        self.check(
+            enable_priority_scheduling=True,
+            priority_scheduling_preemption_threshold=0,
+        )
+
+    def test_non_positive_max_queued_requests_is_rejected(self):
+        for max_queued_requests in (0, -1):
+            for enable in (True, False):
+                with self.subTest(
+                    max_queued_requests=max_queued_requests,
+                    enable_priority_scheduling=enable,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "max-queued-requests"
+                    ):
+                        self.check(
+                            enable_priority_scheduling=enable,
+                            max_queued_requests=max_queued_requests,
+                        )
+
+    def test_positive_max_queued_requests_is_accepted(self):
+        self.check(enable_priority_scheduling=True, max_queued_requests=1)
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """A decode graph that can capture a collective must not run with NCCL's
     graph buffer registration: the registered graph-pool temporaries alias
