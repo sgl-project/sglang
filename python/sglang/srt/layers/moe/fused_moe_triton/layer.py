@@ -478,8 +478,6 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
-
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -542,14 +540,13 @@ class FusedMoE(torch.nn.Module):
             elif quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
-                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                gpu_method = UnquantizedFusedMoEMethod()
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels,
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
@@ -703,7 +700,6 @@ class FusedMoE(torch.nn.Module):
         self.use_flashinfer_mxfp4_moe = (
             backend is not None and backend.is_flashinfer_mxfp4()
         )
-        self.use_triton_kernels = backend is not None and backend.is_triton_kernels()
         self.use_deep_gemm = backend is not None and backend.is_deep_gemm()
         self.use_flashinfer_trtllm_moe = backend is not None and (
             backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
@@ -914,9 +910,6 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
-                    # do not transpose for bias
-                    loaded_weight = loaded_weight.transpose(-2, -1)
                 # When the buffer is padded (e.g., MXFP4 SM100 rounds
                 # intermediate up to 256), shard_size from the buffer may
                 # exceed the checkpoint's per-TP slice.  Derive the actual
@@ -1011,8 +1004,6 @@ class FusedMoE(torch.nn.Module):
                     not self.use_presharded_weights,
                 )
             elif not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
-                    loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
                 # do not cause out-of-bounds indexing into the checkpoint.
                 loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
@@ -1449,8 +1440,6 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
-            is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
 
@@ -1693,9 +1682,6 @@ class FusedMoE(torch.nn.Module):
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
-
-        if self.use_triton_kernels:
-            is_transposed = True
         shard_dim = (
             SHARD_ID_TO_SHARDED_DIM[shard_id]
             if not is_transposed

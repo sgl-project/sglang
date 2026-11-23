@@ -49,8 +49,6 @@ def _get_cuda_arch(device_index: int) -> str:
 class SparseLinearAttentionBackend(AttentionBackend):
     """Sparse Linear Attention Backend for efficient attention computation."""
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]
@@ -62,10 +60,6 @@ class SparseLinearAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SparseLinearAttentionImpl"]:
         return SparseLinearAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SparseLinearAttentionMetadata"]:
-        return SparseLinearAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SparseLinearAttentionMetadataBuilder"]:
@@ -166,12 +160,12 @@ class SparseLinearAttentionImpl(AttentionImpl, nn.Module):
         """Forward pass for sparse linear attention.
 
         Args:
-            query: query tensor of shape (B, H, L, D)
-            key: key tensor of shape (B, H, L, D)
-            value: value tensor of shape (B, H, L, D)
+            query: query tensor of shape (B, L, H, D)
+            key: key tensor of shape (B, L, H, D)
+            value: value tensor of shape (B, L, H, D)
             attn_metadata: attention metadata containing configuration
         Returns:
-            output tensor of shape (B, H, L, D)
+            output tensor of shape (B, L, H, D)
         """
         dtype = query.dtype
 
@@ -278,8 +272,6 @@ except ImportError:
 class SageSparseLinearAttentionBackend(AttentionBackend):
     """Quantized Sparse-Linear Attention backend using SageAttention kernels."""
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]
@@ -291,10 +283,6 @@ class SageSparseLinearAttentionBackend(AttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["SageSparseLinearAttentionImpl"]:
         return SageSparseLinearAttentionImpl
-
-    @staticmethod
-    def get_metadata_cls() -> type["SageSparseLinearAttentionMetadata"]:
-        return SageSparseLinearAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["SageSparseLinearAttentionMetadataBuilder"]:
