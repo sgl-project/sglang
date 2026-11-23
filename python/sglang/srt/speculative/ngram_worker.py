@@ -480,7 +480,7 @@ class NGRAMWorker(BaseSpecWorker):
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.bind_target(
+            verify.build_row_inputs(
                 logits_output,
                 tree=host_tree,
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.

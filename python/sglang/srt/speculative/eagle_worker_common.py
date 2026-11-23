@@ -872,7 +872,7 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    verify.bind_target(logits_output, tree=host_tree, barrier=grammar_barrier)
+    verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
     # SGLang's post-verify graphs when they are on, for a batch they can replay;

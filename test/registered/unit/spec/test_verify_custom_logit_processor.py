@@ -130,7 +130,7 @@ def _bound_verify(batch, layout):
         watermark=None,
         watermark_full_mask=True,
     )
-    verify.bind_target(None, tree=_host_tree(layout, 2), barrier=None)
+    verify.build_row_inputs(None, tree=_host_tree(layout, 2), barrier=None)
     return verify
 
 
