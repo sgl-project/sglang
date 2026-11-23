@@ -2337,16 +2337,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self, target_hidden: torch.Tensor, tree_perm: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """`project_target_hidden`, its rows in committed order when `tree_perm` is given."""
-        # one projection GEMM (no row split): rows do not depend on their order, so reorder the narrow output
-        late = (
-            tree_perm is not None
-            and getattr(self.draft_model, "projects_rows", False)
-            and target_hidden.shape[0] < 512
-        )
-        if tree_perm is not None and not late:
+        if tree_perm is not None:
             target_hidden = _tree_hidden(target_hidden, tree_perm)
-        ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
-        return _tree_hidden(ctx_hidden, tree_perm) if late else ctx_hidden
+        return self.draft_model.project_target_hidden(target_hidden)
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
