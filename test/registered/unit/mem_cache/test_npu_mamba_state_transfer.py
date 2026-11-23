@@ -68,6 +68,9 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
                     self.assertEqual(args["layer_id"], layer)
                     self.assertEqual(args["src_indices"].tolist(), [1])
                     self.assertEqual(args["dst_indices"].tolist(), [2])
+                    # Indices stay host-resident so the AIV backend can
+                    # validate without an NPU-to-CPU sync.
+                    self.assertEqual(args["dst_indices"].device.type, "cpu")
                     self.assertEqual(args["dst"].shape, (5, 2, 4))
                 if draft:
                     self.assertEqual(
@@ -86,9 +89,14 @@ class TestNPUMambaStateTransfer(unittest.TestCase):
                     args = call.kwargs
                     self.assertEqual(args["device_indices"].tolist(), [2])
                     self.assertEqual(args["host_indices"].tolist(), [1])
+                    # One component per layer (main plus draft layers).
                     self.assertEqual(len(args["device_states"]), 3 if draft else 1)
                     self.assertEqual(len(args["host_states"]), 3 if draft else 1)
                 if draft:
+                    self.assertEqual(
+                        op.call_args_list[0].kwargs["device_states"][0].shape,
+                        (1, 5, 2, 4),
+                    )
                     self.assertEqual(
                         op.call_args_list[0].kwargs["host_states"][2].data_ptr(),
                         pool.temporal_buffer[0, 2].data_ptr(),

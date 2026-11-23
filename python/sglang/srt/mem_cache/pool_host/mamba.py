@@ -488,16 +488,21 @@ class MambaPoolHost(HostKVCache):
                 page_size=1,
             )
         elif io_backend == "kernel_ascend":
-            src_indices = src_indices.to(
-                dtype=torch.int64, device=dst.device, non_blocking=True
-            )
-            dst_indices = dst_indices.to(dtype=torch.int64, device=dst.device)
+            # Keep the indices host-resident: the AIV backend validates them
+            # on the CPU without an NPU-to-CPU sync and uploads them with the
+            # submission. auto selects the fused AIV kernel (the host pool is
+            # DVA-registered via the npu_host_memory backend and each batch
+            # writes a destination slot at most once); aclrt remains an
+            # explicit fallback.
+            src_indices = src_indices.to(dtype=torch.int64)
+            dst_indices = dst_indices.to(dtype=torch.int64)
             transfer_kv_per_layer_direct_pf_lf(
                 src=src,
                 dst=dst,
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 layer_id=layer_id,
+                impl="auto",
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
@@ -620,19 +625,23 @@ class MambaPoolHost(HostKVCache):
             if isinstance(src_layers, torch.Tensor):
                 device_states, host_states = [src_layers], [dst]
             else:
+                # One component per layer; the AIV backend splits component
+                # lists larger than its per-submission limit across
+                # consecutive submissions.
                 device_states = [layer.unsqueeze(0) for layer in src_layers]
                 host_states = [dst.narrow(1, i, 1) for i in range(len(src_layers))]
-            src_indices = src_indices.to(
-                dtype=torch.int64, device=device_states[0].device
-            )
-            dst_indices = dst_indices.to(
-                dtype=torch.int64, device=device_states[0].device, non_blocking=True
-            )
+            # Keep the indices host-resident: the AIV backend validates them
+            # on the CPU without an NPU-to-CPU sync and uploads them with the
+            # submission. auto selects the fused AIV kernel; aclrt remains an
+            # explicit fallback.
+            src_indices = src_indices.to(dtype=torch.int64)
+            dst_indices = dst_indices.to(dtype=torch.int64)
             transfer_kv_all_layer_direct_lf_pf(
                 device_states=device_states,
                 host_states=host_states,
                 device_indices=src_indices,
                 host_indices=dst_indices,
+                impl="auto",
             )
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
