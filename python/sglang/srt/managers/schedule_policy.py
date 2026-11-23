@@ -610,10 +610,13 @@ class SchedulePolicy:
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
             # Choose the group leader by the same aged rank used for admission.
             candidates.sort(
-                key=lambda c: self._prefill_rank(
-                    r=c[0],
-                    work=self._shortest_prefill_work(c[0]),
-                    processed_tokens=processed_tokens,
+                key=lambda c: (
+                    self._prefill_rank(
+                        r=c[0],
+                        work=self._shortest_prefill_work(c[0]),
+                        processed_tokens=processed_tokens,
+                    ),
+                    c[0].time_stats.wait_queue_entry_time,
                 )
             )
         elif policy == CacheAwarePolicy.UNIBOOST:

@@ -212,6 +212,27 @@ class TestShortestPrefillFirst(CustomTestCase):
 
         self.assertEqual([req.rid for req in queue], ["old", "independent", "new"])
 
+    def test_equal_rank_prefix_leader_uses_arrival_time(self):
+        """Equal-aged leaders must use the admission arrival tie-breaker."""
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            shortest_prefill_aging_factor=0.5,
+        )
+        older = self.make_req("older", 64, arrived=1)
+        newer = self.make_req("newer", 64, arrived=2)
+        independent = _make_req("independent", "", list(range(2048, 2560)))
+        independent.full_untruncated_fill_ids = independent.origin_input_ids[:]
+        for req in (older, newer, independent):
+            req.arrival_processed_tokens = 3000
+
+        queue = policy.calc_priority([newer, older, independent], processed_tokens=3000)
+
+        self.assertEqual([req.rid for req in queue], ["older", "independent", "newer"])
+
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
         replay.output_ids.extend([0] * 64)
