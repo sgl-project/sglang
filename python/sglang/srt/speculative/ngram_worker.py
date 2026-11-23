@@ -30,7 +30,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
-    GrammarTree,
+    HostVerifyTree,
     commit_mamba_states_after_verify,
     move_accept_tokens_to_target_kvcache,
     needs_verify_tree,
@@ -467,7 +467,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            verify_tree = None
+            host_tree = None
             if self.verify_tree_host is not None:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
@@ -475,14 +475,14 @@ class NGRAMWorker(BaseSpecWorker):
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
-                verify_tree = GrammarTree.from_host(
+                host_tree = HostVerifyTree.from_host(
                     retrieve_next_token_cpu,
                     retrieve_next_sibling_cpu,
                     torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
                 )
-            verify.bind_tree(
-                verify_tree,
-                logits_output=logits_output,
+            verify.bind_target(
+                logits_output,
+                tree=host_tree,
                 # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
                 barrier=None,
             )

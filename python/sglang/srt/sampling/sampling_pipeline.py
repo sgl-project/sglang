@@ -10,7 +10,7 @@ Two entries run it:
   in one call;
 - verify: `SamplingPipeline.bind_verify` returns a `VerifyStep` before the
   target forward launches; its route picks the verify's fast paths. After the
-  launch the verify worker calls `bind_tree`, the stages (`VerifyStep.adjust`,
+  launch the verify worker calls `bind_target`, the stages (`VerifyStep.adjust`,
   inside `eagle_sample` for a tree), its accept core, and `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
@@ -55,7 +55,7 @@ if TYPE_CHECKING:
         WatermarkEngine,
     )
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
-    from sglang.srt.speculative.spec_utils import GrammarTree
+    from sglang.srt.speculative.spec_utils import HostVerifyTree
 
 
 class SamplingPipeline(msgspec.Struct, frozen=True):
@@ -319,19 +319,21 @@ class VerifyStep(msgspec.Struct):
     # (it does not support row prefixes): each commits one token.
     first_row_only_reqs: Optional[torch.Tensor] = None
 
-    def bind_tree(
+    def bind_target(
         self,
-        tree: Optional[GrammarTree],
-        *,
         logits_output: LogitsProcessorOutput,
+        *,
+        tree: Optional[HostVerifyTree],
         barrier: Optional[Callable[[], Dict[Req, List[int]]]],
     ) -> None:
-        """Build the grammar mask and the custom logit processors' row prefixes
-        over the verify tree, which the worker builds when `needs_verify_tree`.
-        Call it after the target verify launches, so the host work overlaps the
-        forward. Under overlap the previous step's result is still queued;
-        `barrier` advances the grammar FSM over its tokens and returns them per
-        request, as result processing will append them to req.output_ids."""
+        """Bind the target forward's output: build the grammar mask and the
+        custom logit processors' row prefixes over `tree`, the verify tree's
+        host copy, which the worker builds when `needs_verify_tree`. Each verify
+        worker calls it once, after the target verify launches, so the host work
+        overlaps the forward. Under overlap the previous step's result is still
+        queued; `barrier` advances the grammar FSM over its tokens and returns
+        them per request, as result processing will append them to
+        req.output_ids."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.

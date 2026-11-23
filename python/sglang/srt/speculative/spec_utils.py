@@ -880,9 +880,9 @@ def needs_verify_tree(batch: ScheduleBatch) -> bool:
     return batch.has_grammar or (info is not None and info.has_custom_logit_processor)
 
 
-class GrammarTree:
+class HostVerifyTree:
     """The verify tree on the host, for the grammar bitmask and the custom logit
-    processors' row prefixes (``VerifyStep.bind_tree``).
+    processors' row prefixes (``VerifyStep.bind_target``).
 
     ``from_device`` starts an async copy, so build it before the target verify
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
@@ -898,7 +898,7 @@ class GrammarTree:
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
-    ) -> GrammarTree:
+    ) -> HostVerifyTree:
         tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
         host = tuple(_async_d2h(t) for t in tensors)
         # Sources may be mixed -- an algorithm can synthesize part of the tree on
@@ -916,11 +916,11 @@ class GrammarTree:
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
-    ) -> GrammarTree:
+    ) -> HostVerifyTree:
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
     @classmethod
-    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> HostVerifyTree:
         """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
 
         ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
@@ -975,7 +975,7 @@ def verify_row_prefixes(
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
-    tree: GrammarTree,
+    tree: HostVerifyTree,
     sampling_info: SamplingBatchInfo,
     device,
 ) -> Optional[GrammarMask]:
