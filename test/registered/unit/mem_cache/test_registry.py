@@ -270,7 +270,9 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
         counter = MagicMock(name="layer_done_counter")
-        linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
+        linker = SimpleNamespace(
+            pools=linker_pools, layer_done_counter=counter, request_prefetch=False
+        )
         kvcache = ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value
         kvcache.start_layer = 4
         kvcache.layer_transfer_counter = None
