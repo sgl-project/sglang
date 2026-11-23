@@ -83,6 +83,9 @@ class ComposedPipelineBase(ABC):
     """
 
     is_video_pipeline: bool = False  # To be overridden by video pipelines
+    # True when no stage gates the negative cond on do_classifier_free_guidance;
+    # other pipelines reject rollout_return_neg_cond_kwargs without CFG.
+    neg_cond_without_cfg_supported: ClassVar[bool] = False
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()

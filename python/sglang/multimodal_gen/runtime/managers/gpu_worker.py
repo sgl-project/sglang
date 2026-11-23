@@ -273,6 +273,16 @@ def _skip_decode_error(
     return SKIP_DECODE_UNSUPPORTED_ERROR
 
 
+def _neg_cond_without_cfg_error(
+    pipeline: ComposedPipelineBase, batch: list[Req]
+) -> str | None:
+    if pipeline.neg_cond_without_cfg_supported or not any(
+        req.needs_neg_cond and not req.do_classifier_free_guidance for req in batch
+    ):
+        return None
+    return "rollout_return_neg_cond_kwargs needs CFG on this pipeline"
+
+
 def _releases_cache_after(output_batch: OutputBatch, req: Req) -> bool:
     """Whether the decoded tensor left ``output`` (saved to files) so the pool can shrink."""
     return (
@@ -617,11 +627,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 retrieve via take_deferred_finalize() and run off the event loop.
         """
         assert self.pipeline is not None
-        skip_decode_error = _skip_decode_error(
+        admission_error = _skip_decode_error(
             self.pipeline.stages, batch, disagg_mode=self.server_args.disagg_mode
-        )
-        if skip_decode_error is not None:
-            return OutputBatch(error=skip_decode_error)
+        ) or _neg_cond_without_cfg_error(self.pipeline, batch)
+        if admission_error is not None:
+            return OutputBatch(error=admission_error)
         # request boundary: the IPC watchdog flag is a device read, illegal
         # inside a graph capture and too costly per exchange
         IPC_A2A.check_timeout()
@@ -667,12 +677,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def execute_forward_sequentially(self, batch: list[Req]) -> Iterator[OutputBatch]:
         """Yield grouped results after each request finishes its terminal stage."""
         assert self.pipeline is not None
-        skip_decode_error = _skip_decode_error(
+        admission_error = _skip_decode_error(
             self.pipeline.stages, batch, disagg_mode=self.server_args.disagg_mode
-        )
-        if skip_decode_error is not None:
+        ) or _neg_cond_without_cfg_error(self.pipeline, batch)
+        if admission_error is not None:
             for _ in batch:
-                yield OutputBatch(error=skip_decode_error)
+                yield OutputBatch(error=admission_error)
             return
         if not any(
             req.is_warmup or req.extra.get("server_internal_prewarm") for req in batch

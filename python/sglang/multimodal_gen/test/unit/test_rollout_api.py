@@ -427,6 +427,16 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         self.assertEqual(kwargs["rollout_return_step_indices"], [1, 3])
         self.assertEqual(kwargs["rollout_stop_step_index"], 2)
 
+    def test_neg_cond_request_forwarded(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(rollout_return_neg_cond_kwargs=True)
+        )
+        self.assertTrue(kwargs["rollout_return_neg_cond_kwargs"])
+
     def test_step_index_filters_default_dropped_as_none(self):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
             _build_sampling_kwargs,
@@ -1103,6 +1113,34 @@ class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
         )
         self.assertEqual(_engine_error(SKIP_DECODE_UNSUPPORTED_ERROR).status_code, 400)
         self.assertEqual(_engine_error("forward failed").status_code, 500)
+
+    def test_neg_cond_request_without_cfg_is_rejected_unless_the_pipeline_declares_it(
+        self,
+    ):
+        """An undeclared pipeline would crash or return a negative cond its DiT never takes."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            _neg_cond_without_cfg_error,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        def request(guidance_scale):
+            sampling_params = SamplingParams(
+                prompt="x",
+                guidance_scale=guidance_scale,
+                rollout=True,
+                rollout_return_neg_cond_kwargs=True,
+            )
+            return [Req(sampling_params=sampling_params)]
+
+        undeclared = types.SimpleNamespace(neg_cond_without_cfg_supported=False)
+        declared = types.SimpleNamespace(neg_cond_without_cfg_supported=True)
+        self.assertIsNotNone(_neg_cond_without_cfg_error(undeclared, request(1.0)))
+        self.assertIsNone(_neg_cond_without_cfg_error(declared, request(1.0)))
+        # under CFG every pipeline already produces the negative cond
+        self.assertIsNone(_neg_cond_without_cfg_error(undeclared, request(4.0)))
 
     def test_rollout_requests_never_share_a_dynamic_batch(self):
         """The batched split carries no rollout trajectory, so a rollout request must get no batch signature."""

@@ -26,7 +26,7 @@ class SD3ConditioningStage(PipelineStage):
         batch.prompt_embeds, batch.pooled_embeds = self._merge(
             batch.prompt_embeds, batch.pooled_embeds
         )
-        if batch.do_classifier_free_guidance:
+        if batch.needs_neg_cond:
             batch.negative_prompt_embeds, batch.neg_pooled_embeds = self._merge(
                 batch.negative_prompt_embeds, batch.neg_pooled_embeds
             )
@@ -66,6 +66,7 @@ class StableDiffusion3Pipeline(LoRAPipeline, ComposedPipelineBase):
     """StableDiffusion3 pipeline implementation."""
 
     pipeline_name = "StableDiffusion3Pipeline"
+    neg_cond_without_cfg_supported = True
 
     _required_config_modules = [
         "text_encoder",
