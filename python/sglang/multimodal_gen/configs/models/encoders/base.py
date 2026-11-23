@@ -52,7 +52,6 @@ class TextEncoderArchConfig(EncoderArchConfig):
         default_factory=list
     )  # mapping from huggingface weight names to custom names
     tokenizer_kwargs: dict[str, Any] = field(default_factory=dict)
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
 
     def __post_init__(self) -> None:
         self.tokenizer_kwargs = {

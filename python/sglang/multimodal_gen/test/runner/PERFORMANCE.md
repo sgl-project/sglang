@@ -264,6 +264,16 @@ against 8 of 18 with the current references. Leaving out one day at a time,
 to 23% above the pool's minimum; the minimum rule leaves those runs failing
 rather than widening the pool's references to cover them.
 
+### Hunyuan3D shape denoising on `computable-e`
+
+For `hunyuan3d_shape_gen`, the fastest measured 50-step shape denoising stage
+across 84 single-H100 jobs on this pool (November 3–15, 2026) was
+[1990.09 ms](https://github.com/sgl-project/sglang/actions/runs/41990846147/job/127122908135).
+The existing 25% tolerance gives this stage a 2487.61 ms limit. The average,
+median and sampled steps also guard the denoising loop. On 31 later jobs (November 16–20),
+replaying the logged performance checks increased first-attempt passes from
+3 to 16, and jobs with a passing attempt from 19 to 31.
+
 ## Initial loading references
 
 The initial H100 loading references cover 28 cases with at least three distinct

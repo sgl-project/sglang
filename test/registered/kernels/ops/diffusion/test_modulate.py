@@ -425,7 +425,6 @@ def test_residual_gate_add_batched_rows_cuda_graph():
 
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@CUDA_NATIVE_ONLY
 def test_scaled_residual_add_is_bit_exact(dtype):
     # fp32 residual accumulator + half-precision update, as the DiT blocks
     # that keep their residual stream in fp32 emit it.

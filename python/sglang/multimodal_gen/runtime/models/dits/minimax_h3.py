@@ -60,6 +60,7 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.cache.spectrum import (
     SpectrumMixin,
     blend_h3_spectrum_prediction,
@@ -264,6 +265,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "rope_cache",
         "unique_timesteps",
         "adaln_cache_slot",
+        "adaln_timestep_bits",
         "inverse_indices",
         "update_mask",
         "update_audio_mask",
@@ -865,7 +867,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -966,7 +972,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1011,7 +1018,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -2542,6 +2550,73 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
 
+    def _adaln_memo_params(
+        self, adaln_input: torch.Tensor, timestep_bits: tuple[int, ...] | None
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Per-block AdaLN parameters memoized by the step's exact timesteps.
+
+        A block's AdaLN projection depends only on the step's unique timesteps
+        (the time embedding feeds a fixed weight), and a few-step release
+        reuses the same timestep schedule for every request. Each block's
+        projection is a weight-bandwidth-bound GEMV (2688 x 96768 BF16 =
+        520 MB read per block per step), so serving it from a small memo keyed
+        by the timesteps' bit patterns removes it after the first request with
+        the same schedule. The memo holds exactly what the same projection
+        computed for the same input, so outputs are bit-identical.
+        The memo is dropped when an AdaLN weight is rebound and whenever the
+        conditioning weights epoch advances: weight updates and LoRA merges
+        write in place, and an unmerged LoRA changes the projection without
+        touching its weight.
+        """
+        max_entries = 32
+        if (
+            timestep_bits is None
+            or self.adaln_cache is not None
+            or get_tp_world_size() > 1
+            or torch.compiler.is_compiling()
+            # CUDA only: torch.cuda's capture query is a stub on other builds
+            or adaln_input.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+            or any(block.adaln_proj is None for block in self.blocks)
+        ):
+            return None
+        weights = [block.adaln_proj.linear.weight for block in self.blocks]
+        version = (
+            conditioning_weights_epoch(),
+            # inference tensors track no version counter
+            *(
+                (w.data_ptr(), None if w.is_inference() else w._version)
+                for w in weights
+            ),
+        )
+        memo = self.__dict__.get("_adaln_memo")
+        if memo is None or memo[0] != version:
+            memo = (version, {})
+            self.__dict__["_adaln_memo"] = memo
+        entries = memo[1]
+        key = (
+            timestep_bits,
+            tuple(adaln_input.shape),
+            adaln_input.dtype,
+            adaln_input.device,
+        )
+        outputs = entries.pop(key, None)
+        if outputs is None:
+            outputs = [
+                block.adaln_proj.project_local(adaln_input) for block in self.blocks
+            ]
+            while len(entries) >= max_entries:
+                entries.pop(next(iter(entries)))
+        entries[key] = outputs
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, outputs)
+        )
+
     def _can_batch_block_adaln(self) -> bool:
         return (
             self.adaln_cache is None
@@ -3488,6 +3563,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )
+            elif (
+                memo := self._adaln_memo_params(
+                    adaln_input, kwargs.get("adaln_timestep_bits")
+                )
+            ) is not None:
+                block_adaln_params = memo
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(
                     [

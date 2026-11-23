@@ -268,15 +268,6 @@ class StorageMedium(str, enum.Enum):
     EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
 
 
-class OffloadedState(msgspec.Struct):
-    """Decode-side offload progress for one request, keyed by Req in the manager."""
-
-    # Decode-incremental length already submitted for D2H offload.
-    inc_len: int = 0
-    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
-    last_hash: Optional[str] = None
-
-
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: Optional[int]
@@ -770,6 +761,8 @@ class EventPublisherFactory:
         config_dict.pop("format")
 
         kind = config_dict.pop("publisher", "null")
+        if kind == "null":
+            return NullEventPublisher()
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:
