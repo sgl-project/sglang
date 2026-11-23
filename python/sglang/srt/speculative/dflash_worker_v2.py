@@ -527,7 +527,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
@@ -930,13 +929,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return SIMULATE_ACC_LEN > 0 or (
             self._selector_sample is None and not is_dflash_sampling_verify_available()
         )
-
-    @property
-    def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
-        return self._draft_worker
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1499,13 +1491,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
-
-    def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
 
     def _gather_req_to_token_masked(
         self,
@@ -3151,13 +3136,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # Matches the active ranks, which go eager when any DP rank is idle.
                     idle_verify_forward_batch.can_run_decode_cuda_graph = False
                     idle_can_run_cuda_graph = False
+                    idle_verify_forward_batch.mark_forward_metadata_ready()
                 # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
                 # the idle rank replays the active ranks' graph with zero real rows.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -3620,13 +3605,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
                 verify_forward_batch.can_run_decode_cuda_graph = False
 
+            if not (_is_npu or get_parallel().attn_dp_enabled):
+                verify_forward_batch.mark_forward_metadata_ready()
             target_out = self.target_worker.forward_batch_generation(
                 batch=None,
                 forward_batch=verify_forward_batch,
                 is_verify=True,
-                skip_attn_backend_init=(
-                    None if _is_npu or get_parallel().attn_dp_enabled else True
-                ),
             )
             routed_experts_output = target_out.routed_experts_output
             indexer_topk_output = target_out.indexer_topk_output
