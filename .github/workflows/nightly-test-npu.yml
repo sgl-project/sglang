@@ -366,7 +366,7 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    if: false  # TEMP(PR 52431 verification): only jobs covering changed cases run
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
