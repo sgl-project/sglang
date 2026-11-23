@@ -124,4 +124,5 @@ def handle_vpp(server_args: Any) -> None:
         "handle_vpp",
         disable_cuda_graph=True,
         disable_overlap_schedule=True,
+        enable_decoder_swa_bounded_replay=False,
     )

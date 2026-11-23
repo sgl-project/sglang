@@ -19,8 +19,12 @@ def resolve_vpp_layout(
         raise ValueError("VPP draft model loading is not supported")
     if model_config.hf_config.architectures != ["DeepseekV4ForCausalLM"]:
         raise ValueError("VPP currently supports only DeepseekV4ForCausalLM")
-    if model_config.hf_config.model_type != "deepseek_v4":
-        raise ValueError("VPP currently supports DeepSeek V4; V4.1 is not wired")
+    if model_config.hf_config.model_type not in ("deepseek_v4", "deepseek_v41"):
+        raise ValueError("VPP currently supports DeepSeek V4 and V4.1")
+    if model_config.hf_config.model_type == "deepseek_v41" and not getattr(
+        model_config, "is_lm_only", False
+    ):
+        raise ValueError("V4.1 VPP requires --language-model-only")
     if not model_config.is_generation or model_config.is_multimodal:
         raise ValueError("VPP requires a text generation model")
     return VPPLayout(

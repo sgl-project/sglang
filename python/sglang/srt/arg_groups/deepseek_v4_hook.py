@@ -387,7 +387,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
+        (
+            "pipeline parallelism",
+            cfg.pp_size > 1 and cfg.pp_virtual_stages == 1,
+        ),
     )
     for feature, enabled in unsupported:
         if enabled:

@@ -1058,7 +1058,7 @@ class TestVPPResolution(CustomTestCase):
             resolve_vpp_layout(self.model_config(num_hidden_layers=3), topology)
         with self.assertRaisesRegex(ValueError, "draft"):
             resolve_vpp_layout(self.model_config(), topology, is_draft_worker=True)
-        with self.assertRaisesRegex(ValueError, "V4.1"):
+        with self.assertRaisesRegex(ValueError, "language-model-only"):
             resolve_vpp_layout(
                 self.model_config(
                     hf_config=SimpleNamespace(
@@ -1068,6 +1068,83 @@ class TestVPPResolution(CustomTestCase):
                 ),
                 topology,
             )
+
+    def test_v41_nested_config_resolves_text_only_vpp(self):
+        from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
+        from sglang.srt.configs.vpp import resolve_vpp_layout
+
+        config = DeepseekV41Config(
+            architectures=["DeepseekV41ForCausalLM"],
+            text_config={
+                "num_hidden_layers": 40,
+                "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+                "kv_source_layer_ids": [2, 8, 14, 20],
+            },
+            vision_config={"num_hidden_layers": 32},
+        )
+        model = self.model_config(
+            hf_config=config, num_hidden_layers=40, is_lm_only=True
+        )
+        layout = resolve_vpp_layout(
+            model,
+            SimpleNamespace(
+                pp_size=2, pp_virtual_stages=2, pp_vpp_layer_partition=None
+            ),
+        )
+        self.assertEqual(config.architectures, ["DeepseekV4ForCausalLM"])
+        self.assertEqual(config.vision_n_layers, 32)
+        self.assertEqual(layout.partition, (10, 10, 10, 10))
+
+    def test_v41_full_resolution_allows_vpp_and_keeps_ordinary_pp_guard(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        config = {
+            "architectures": ["DeepseekV41ForCausalLM"],
+            "model_type": "deepseek_v41",
+            "text_config": {
+                **_MINI_CONFIG,
+                "num_hidden_layers": 40,
+                "num_key_value_heads": 1,
+                "head_dim": 512,
+                "qk_nope_head_dim": 448,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 512,
+                "kv_lora_rank": 512,
+                "q_lora_rank": 16,
+                "sliding_window": 128,
+                "index_head_dim": 128,
+                "rope_scaling": {},
+                "compress_ratios": [0, 0] + [2] * 18 + [1] * 20,
+                "kv_source_layer_ids": [2, 8, 14, 20],
+            },
+            "vision_config": {"num_hidden_layers": 32},
+        }
+        with tempfile.TemporaryDirectory(prefix="v41_vpp_resolution_") as path:
+            with open(os.path.join(path, "config.json"), "w") as handle:
+                json.dump(config, handle)
+            for role in ("null", "prefill", "decode"):
+                with self.subTest(role=role):
+                    args = ServerArgs(
+                        model_path=path,
+                        device="cuda",
+                        pp_size=2,
+                        pp_virtual_stages=2,
+                        language_model_only=True,
+                        random_seed=42,
+                        disaggregation_mode=role,
+                    )
+                    args.resolve_once()
+                    cfg = resolving_view(args)
+                    self.assertEqual(cfg.cuda_graph_config.decode.backend, "disabled")
+                    self.assertEqual(cfg.cuda_graph_config.prefill.backend, "disabled")
+                    self.assertFalse(cfg.enable_decoder_swa_bounded_replay)
+            with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+                ServerArgs(
+                    model_path=path,
+                    device="cuda",
+                    pp_size=2,
+                    language_model_only=True,
+                ).resolve_once()
 
     def test_default_pp_does_not_resolve_a_vpp_model(self):
         from sglang.srt.arg_groups.vpp_hook import handle_vpp
