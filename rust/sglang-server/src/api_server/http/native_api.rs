@@ -715,10 +715,12 @@ const SAMPLING_LOGPROBS_MODE_REMOVED: &str = "sampling_logprobs_mode was removed
 fn return_sampling_logprobs_set(flag: &serde_json::Value, batch: Option<usize>) -> bool {
     match (flag, batch) {
         (serde_json::Value::Null | serde_json::Value::Bool(false), _) => false,
-        (serde_json::Value::Array(flags), Some(n)) => flags
-            .iter()
-            .take(n)
-            .any(|flag| !matches!(flag, serde_json::Value::Null | serde_json::Value::Bool(false))),
+        (serde_json::Value::Array(flags), Some(n)) => flags.iter().take(n).any(|flag| {
+            !matches!(
+                flag,
+                serde_json::Value::Null | serde_json::Value::Bool(false)
+            )
+        }),
         (serde_json::Value::Array(flags), None) => !flags.is_empty(),
         _ => true,
     }
