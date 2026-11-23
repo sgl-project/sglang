@@ -3,11 +3,20 @@ import importlib
 import logging
 import math
 import threading
+import weakref
 from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    _SUPPORT_TENSOR_DESCRIPTOR = True
+except Exception:
+    TensorDescriptor = None
+    _SUPPORT_TENSOR_DESCRIPTOR = False
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -486,6 +495,7 @@ def mhc_pre_big_fuse_tilelang(
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
     eps_outside_sqrt: bool = False,
+    radix4_reduce: bool = False,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
@@ -512,16 +522,50 @@ def mhc_pre_big_fuse_tilelang(
         if ENABLE_PDL:
             T.pdl_sync()
 
-        for i_split in T.serial(n_splits):
-            rms[0] += gemm_out_sqrsum[i_split, i]
+        # Radix-4 reduction matches _mhc_pre_bf16x2_radix4_kernel so n_splits in
+        # {1, 4, 16, 64} evaluates the exact same floating-point tree regardless of M.
+        if radix4_reduce and n_splits == 64:
+            for g2 in T.serial(4):
+                t2 = T.alloc_var(T.float32, init=0.0)
+                for g1 in T.serial(4):
+                    t1 = T.alloc_var(T.float32, init=0.0)
+                    for g0 in T.serial(4):
+                        t1 = t1 + gemm_out_sqrsum[g2 * 16 + g1 * 4 + g0, i]
+                    t2 = t2 + t1
+                rms[0] = rms[0] + t2
+        elif radix4_reduce and n_splits == 16:
+            for g1 in T.serial(4):
+                t1 = T.alloc_var(T.float32, init=0.0)
+                for g0 in T.serial(4):
+                    t1 = t1 + gemm_out_sqrsum[g1 * 4 + g0, i]
+                rms[0] = rms[0] + t1
+        else:
+            for i_split in T.serial(n_splits):
+                rms[0] += gemm_out_sqrsum[i_split, i]
         if eps_outside_sqrt:
             rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
         else:
             rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
-            for i_split in T.serial(n_splits):
-                mixes[j] += gemm_out_mul[i_split, i, j]
+            if radix4_reduce and n_splits == 64:
+                for g2 in T.serial(4):
+                    t2 = T.alloc_var(T.float32, init=0.0)
+                    for g1 in T.serial(4):
+                        t1 = T.alloc_var(T.float32, init=0.0)
+                        for g0 in T.serial(4):
+                            t1 = t1 + gemm_out_mul[g2 * 16 + g1 * 4 + g0, i, j]
+                        t2 = t2 + t1
+                    mixes[j] = mixes[j] + t2
+            elif radix4_reduce and n_splits == 16:
+                for g1 in T.serial(4):
+                    t1 = T.alloc_var(T.float32, init=0.0)
+                    for g0 in T.serial(4):
+                        t1 = t1 + gemm_out_mul[g1 * 4 + g0, i, j]
+                    mixes[j] = mixes[j] + t1
+            else:
+                for i_split in T.serial(n_splits):
+                    mixes[j] += gemm_out_mul[i_split, i, j]
             mixes[j] *= rms[0]
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
@@ -774,6 +818,314 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     return mhc_pre_gemm_sqrsum_splitk_stage_0
 
 
+_PACKED_BF16X2_WEIGHT_CACHE: dict[int, tuple] = {}
+
+
+def _ensure_mhc_tma_allocator() -> None:
+    if not hasattr(triton, "set_allocator"):
+        return
+    try:
+        from triton.runtime._allocation import NullAllocation, _allocator
+
+        if not isinstance(_allocator.get(), NullAllocation):
+            return
+    except Exception:
+        pass
+
+    def _alloc(size: int, alignment: int, stream):
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(_alloc)
+
+
+def has_mhc_pre_packed_weight_cache(model: torch.nn.Module) -> bool:
+    """Startup-determined, rank-uniform check for models that will cache packed
+    BF16x2 mHC pre-norm weights."""
+    if not (
+        _SUPPORT_TENSOR_DESCRIPTOR
+        and _use_tilelang_mhc_pre()
+        and _use_deep_gemm_hc_prenorm()
+    ):
+        return False
+    if not current_arch().is_sm(10):
+        return False
+    for module in model.modules():
+        for attr in ("hc_attn_fn", "hc_ffn_fn", "fn_fp32"):
+            fn = getattr(module, attr, None)
+            if (
+                isinstance(fn, torch.Tensor)
+                and fn.ndim == 2
+                and fn.dtype == torch.float32
+                and fn.shape[0] <= 32
+                and fn.shape[1] % 256 == 0
+            ):
+                return True
+    return False
+
+
+def _fill_packed_bf16x2_weight(dst: torch.Tensor, fn: torch.Tensor) -> None:
+    mix = fn.shape[0]
+    src = fn.detach()
+    w_hi = src.bfloat16()
+    w_mid = (src - w_hi.float()).bfloat16()
+    dst.zero_()
+    dst[:mix].copy_(w_hi)
+    dst[32 : 32 + mix].copy_(w_mid)
+
+
+def _evict_packed_bf16x2_weight(key: int, ptr: int) -> None:
+    entry = _PACKED_BF16X2_WEIGHT_CACHE.get(key)
+    if entry is not None and entry[0] == ptr:
+        _PACKED_BF16X2_WEIGHT_CACHE.pop(key, None)
+
+
+@torch.compiler.disable
+def _get_packed_bf16x2_weight(fn: torch.Tensor, block_k: int):
+    mix, k = fn.shape
+    # Inference tensors (e.g. hc_fn * hc_norm_weight under inference_mode) do not
+    # track _version; pack freshly instead of caching.
+    if fn.is_inference():
+        with torch.no_grad():
+            w_pack = torch.empty((64, k), dtype=torch.bfloat16, device=fn.device)
+            _fill_packed_bf16x2_weight(w_pack, fn)
+        return w_pack, TensorDescriptor.from_tensor(w_pack, block_shape=[64, block_k])
+
+    key = id(fn)
+    ptr = fn.data_ptr()
+    version = fn._version
+    capturing = torch.cuda.is_current_stream_capturing()
+    entry = _PACKED_BF16X2_WEIGHT_CACHE.get(key)
+    if entry is not None:
+        c_ptr, c_ver, c_shape, c_bk, w_pack, w_desc = entry
+        if c_ptr == ptr and c_shape == (mix, k) and c_bk == block_k:
+            if c_ver == version:
+                return w_pack, w_desc
+            if not capturing:
+                with torch.inference_mode(False), torch.no_grad():
+                    _fill_packed_bf16x2_weight(w_pack, fn)
+                _PACKED_BF16X2_WEIGHT_CACHE[key] = (
+                    ptr,
+                    version,
+                    (mix, k),
+                    block_k,
+                    w_pack,
+                    w_desc,
+                )
+                return w_pack, w_desc
+
+    # Exit inference_mode before allocating so prewarm_mhc_pre (which runs under
+    # inference_mode) does not cache an inference-tensor w_pack that cannot be
+    # refreshed in-place later; no_grad avoids grad_fn pinning fn past GC.
+    with torch.inference_mode(False), torch.no_grad():
+        w_pack = torch.empty((64, k), dtype=torch.bfloat16, device=fn.device)
+        _fill_packed_bf16x2_weight(w_pack, fn)
+    w_desc = TensorDescriptor.from_tensor(w_pack, block_shape=[64, block_k])
+
+    if capturing:
+        return w_pack, w_desc
+
+    _PACKED_BF16X2_WEIGHT_CACHE[key] = (
+        ptr,
+        version,
+        (mix, k),
+        block_k,
+        w_pack,
+        w_desc,
+    )
+    weakref.finalize(fn, _evict_packed_bf16x2_weight, key, ptr)
+    return w_pack, w_desc
+
+
+@triton.jit
+def _mhc_pre_bf16x2_radix4_kernel(
+    x_desc,
+    w_desc,
+    MIX,
+    SQ,
+    M,
+    BLOCKS_PER_LEAF: tl.constexpr,
+    R4_LEVELS: tl.constexpr,
+    MIX_COLS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    m_off = pid_m * BLOCK_M
+    LEAVES_PER_SPLIT: tl.constexpr = 1 << (2 * R4_LEVELS)
+    TOTAL_BLOCKS: tl.constexpr = LEAVES_PER_SPLIT * BLOCKS_PER_LEAF
+    k_start = pid_s * (TOTAL_BLOCKS * BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, 64), tl.float32)
+    sq = tl.zeros((BLOCK_M,), tl.float32)
+
+    if R4_LEVELS >= 1:
+        g1_m = tl.zeros((BLOCK_M, 32), tl.float32)
+        g1_q = tl.zeros((BLOCK_M,), tl.float32)
+    if R4_LEVELS >= 2:
+        g2_m = tl.zeros((BLOCK_M, 32), tl.float32)
+        g2_q = tl.zeros((BLOCK_M,), tl.float32)
+    if R4_LEVELS >= 3:
+        g3_m = tl.zeros((BLOCK_M, 32), tl.float32)
+        g3_q = tl.zeros((BLOCK_M,), tl.float32)
+
+    for kb in range(TOTAL_BLOCKS):
+        k_off = k_start + kb * BLOCK_K
+        x = x_desc.load([m_off, k_off])
+        w_cat = w_desc.load([0, k_off])
+        acc = tl.dot(x, tl.trans(w_cat), acc)
+        xf = x.to(tl.float32)
+        sq += tl.sum(xf * xf, 1)
+
+        if R4_LEVELS >= 1:
+            if (kb + 1) % BLOCKS_PER_LEAF == 0:
+                a2 = tl.reshape(acc, (BLOCK_M, 2, 32))
+                hi_p, mid_p = tl.split(tl.permute(a2, (0, 2, 1)))
+                leaf_m = hi_p + mid_p
+                leaf_q = sq
+                acc = tl.zeros((BLOCK_M, 64), tl.float32)
+                sq = tl.zeros((BLOCK_M,), tl.float32)
+
+                leaf_idx = kb // BLOCKS_PER_LEAF
+                g1_m = g1_m + leaf_m
+                g1_q = g1_q + leaf_q
+                if R4_LEVELS >= 2:
+                    if (leaf_idx & 3) == 3:
+                        g2_m = g2_m + g1_m
+                        g2_q = g2_q + g1_q
+                        g1_m = tl.zeros((BLOCK_M, 32), tl.float32)
+                        g1_q = tl.zeros((BLOCK_M,), tl.float32)
+                        if R4_LEVELS >= 3:
+                            if (leaf_idx & 15) == 15:
+                                g3_m = g3_m + g2_m
+                                g3_q = g3_q + g2_q
+                                g2_m = tl.zeros((BLOCK_M, 32), tl.float32)
+                                g2_q = tl.zeros((BLOCK_M,), tl.float32)
+
+    if R4_LEVELS == 0:
+        a2 = tl.reshape(acc, (BLOCK_M, 2, 32))
+        hi_p, mid_p = tl.split(tl.permute(a2, (0, 2, 1)))
+        out_m = hi_p + mid_p
+        out_q = sq
+    elif R4_LEVELS == 1:
+        out_m, out_q = g1_m, g1_q
+    elif R4_LEVELS == 2:
+        out_m, out_q = g2_m, g2_q
+    else:
+        out_m, out_q = g3_m, g3_q
+
+    rows = m_off + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, 32)
+    sr = pid_s.to(tl.int64) * M + rows.to(tl.int64)
+    tl.store(
+        MIX + sr[:, None] * MIX_COLS + cols[None, :].to(tl.int64),
+        out_m,
+        (rows[:, None] < M) & (cols[None, :] < MIX_COLS),
+    )
+    tl.store(SQ + sr, out_q, rows < M)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def _mhc_pre_radix4_leaf_params(hc_hidden_size: int) -> Tuple[int, int]:
+    block_k = 128 if hc_hidden_size % (64 * 128) == 0 else 64
+    num_blocks = hc_hidden_size // block_k
+    for cand in (64, 16, 4, 1):
+        if num_blocks % cand == 0:
+            return block_k, cand
+    return block_k, 1
+
+
+def _mhc_pre_radix4_launch_params(
+    num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, int, int, int, int]:
+    block_k, num_leaves = _mhc_pre_radix4_leaf_params(hc_hidden_size)
+    block_m = 64 if num_tokens <= 64 else 128
+    grid_m = (max(num_tokens, 1) + block_m - 1) // block_m
+    n_sms = current_arch().num_sms
+    budget = n_sms if grid_m <= 9 else 2 * n_sms
+    target = budget // grid_m
+    n_splits = 1
+    for cand in (64, 16, 4, 1):
+        if cand <= num_leaves and cand <= target:
+            n_splits = cand
+            break
+    r4_levels = (num_leaves // n_splits).bit_length() // 2
+    return block_k, num_leaves, block_m, n_splits, r4_levels
+
+
+def _use_packed_bf16x2_arch(hc_hidden_size: int) -> bool:
+    # SM10x (Blackwell datacenter) has 228 KB SMEM; excludes SM120 (~99 KB) and non-CUDA.
+    if not (_SUPPORT_TENSOR_DESCRIPTOR and _use_deep_gemm_hc_prenorm()):
+        return False
+    return current_arch().is_sm(10) and hc_hidden_size % 256 == 0
+
+
+def _use_packed_bf16x2_mhc_pre(
+    x_flat: torch.Tensor,
+    fn_flat: torch.Tensor,
+    hc_mult3: int,
+    hc_hidden_size: int,
+) -> bool:
+    return (
+        _use_packed_bf16x2_arch(hc_hidden_size)
+        and x_flat.is_cuda
+        and x_flat.shape[0] > 0
+        and hc_mult3 <= 32
+        and x_flat.is_contiguous()
+        and fn_flat.is_contiguous()
+        and x_flat.data_ptr() % 16 == 0
+    )
+
+
+def _run_mhc_pre_bf16x2_radix4(
+    x_flat: torch.Tensor,
+    fn_flat: torch.Tensor,
+    hc_mult3: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    num_tokens, hc_hidden_size = x_flat.shape
+    block_k, num_leaves, block_m, n_splits, r4_levels = _mhc_pre_radix4_launch_params(
+        num_tokens, hc_hidden_size
+    )
+    _ensure_mhc_tma_allocator()
+    _, w_desc = _get_packed_bf16x2_weight(fn_flat, block_k)
+    x_desc = TensorDescriptor.from_tensor(x_flat, block_shape=[block_m, block_k])
+
+    gemm_out_mul = torch.empty(
+        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=x_flat.device
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=x_flat.device
+    )
+
+    num_stages = 4 if block_k == 128 else 6
+    enable_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    grid = (triton.cdiv(num_tokens, block_m), n_splits)
+    _mhc_pre_bf16x2_radix4_kernel[grid](
+        x_desc,
+        w_desc,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        num_tokens,
+        BLOCKS_PER_LEAF=(hc_hidden_size // block_k) // num_leaves,
+        R4_LEVELS=r4_levels,
+        MIX_COLS=hc_mult3,
+        BLOCK_K=block_k,
+        BLOCK_M=block_m,
+        ENABLE_PDL=enable_pdl,
+        num_warps=8,
+        num_stages=num_stages,
+        **pdl_kwargs,
+    )
+    return gemm_out_mul, gemm_out_sqrsum, n_splits
+
+
 def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
@@ -787,12 +1139,21 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
 def get_mhc_pre_token_count_representatives(
     max_num_tokens: int, hc_hidden_size: int
 ) -> Tuple[int, ...]:
-    """One representative token count per distinct mhc_pre n_splits bucket over
-    [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    """One smallest representative token count per distinct mhc_pre kernel
+    specialization over [1, max_num_tokens]."""
+    use_radix4 = _use_packed_bf16x2_arch(hc_hidden_size)
     reps = {}
     for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
         num_tokens = min(grid * 64, max_num_tokens)
-        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+        if use_radix4:
+            _, _, block_m, n_splits, _ = _mhc_pre_radix4_launch_params(
+                num_tokens, hc_hidden_size
+            )
+            reps.setdefault((block_m, n_splits), num_tokens)
+        else:
+            reps.setdefault(
+                _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size), num_tokens
+            )
     return tuple(sorted(reps.values()))
 
 
@@ -876,6 +1237,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
     eps_outside_sqrt: bool = False,
+    radix4_reduce: bool = False,
 ):
     """Fused mhc_pre big_fuse + RMSNorm of layer_input.
 
@@ -910,16 +1272,50 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         if ENABLE_PDL:
             T.pdl_sync()
 
-        for i_split in T.serial(n_splits):
-            rms[0] += gemm_out_sqrsum[i_split, i]
+        # Radix-4 reduction matches _mhc_pre_bf16x2_radix4_kernel so n_splits in
+        # {1, 4, 16, 64} evaluates the exact same floating-point tree regardless of M.
+        if radix4_reduce and n_splits == 64:
+            for g2 in T.serial(4):
+                t2 = T.alloc_var(T.float32, init=0.0)
+                for g1 in T.serial(4):
+                    t1 = T.alloc_var(T.float32, init=0.0)
+                    for g0 in T.serial(4):
+                        t1 = t1 + gemm_out_sqrsum[g2 * 16 + g1 * 4 + g0, i]
+                    t2 = t2 + t1
+                rms[0] = rms[0] + t2
+        elif radix4_reduce and n_splits == 16:
+            for g1 in T.serial(4):
+                t1 = T.alloc_var(T.float32, init=0.0)
+                for g0 in T.serial(4):
+                    t1 = t1 + gemm_out_sqrsum[g1 * 4 + g0, i]
+                rms[0] = rms[0] + t1
+        else:
+            for i_split in T.serial(n_splits):
+                rms[0] += gemm_out_sqrsum[i_split, i]
         if eps_outside_sqrt:
             rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
         else:
             rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
-            for i_split in T.serial(n_splits):
-                mixes[j] += gemm_out_mul[i_split, i, j]
+            if radix4_reduce and n_splits == 64:
+                for g2 in T.serial(4):
+                    t2 = T.alloc_var(T.float32, init=0.0)
+                    for g1 in T.serial(4):
+                        t1 = T.alloc_var(T.float32, init=0.0)
+                        for g0 in T.serial(4):
+                            t1 = t1 + gemm_out_mul[g2 * 16 + g1 * 4 + g0, i, j]
+                        t2 = t2 + t1
+                    mixes[j] = mixes[j] + t2
+            elif radix4_reduce and n_splits == 16:
+                for g1 in T.serial(4):
+                    t1 = T.alloc_var(T.float32, init=0.0)
+                    for g0 in T.serial(4):
+                        t1 = t1 + gemm_out_mul[g1 * 4 + g0, i, j]
+                    mixes[j] = mixes[j] + t1
+            else:
+                for i_split in T.serial(n_splits):
+                    mixes[j] += gemm_out_mul[i_split, i, j]
             mixes[j] *= rms[0]
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
@@ -1083,7 +1479,15 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if _use_deep_gemm_hc_prenorm():
+    x_flat_2d = residual_flat.view(num_tokens, hc_hidden_size)
+    use_radix4 = False
+    if _use_packed_bf16x2_mhc_pre(x_flat_2d, fn_flat, hc_mult3, hc_hidden_size):
+        gemm_out_mul, gemm_out_sqrsum, big_fuse_n_splits = _run_mhc_pre_bf16x2_radix4(
+            x_flat_2d, fn_flat, hc_mult3
+        )
+        gemm_last_dim = hc_mult3
+        use_radix4 = True
+    elif _use_deep_gemm_hc_prenorm():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1096,7 +1500,7 @@ def mhc_pre(
         from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
 
         tf32_hc_prenorm_gemm(
-            residual_flat.view(num_tokens, hc_hidden_size),
+            x_flat_2d,
             fn_flat,
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -1207,6 +1611,7 @@ def mhc_pre(
             hc_mult,
             gemm_last_dim,
             eps_outside_sqrt,
+            use_radix4,
         )
     else:
         mhc_pre_big_fuse_tilelang(
@@ -1228,6 +1633,7 @@ def mhc_pre(
             hc_mult,
             gemm_last_dim,
             eps_outside_sqrt,
+            use_radix4,
         )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
@@ -1603,8 +2009,8 @@ def mhc_fused_post_pre(
     This wrapper keeps the numerically sensitive ``mhc_pre_big_fuse`` stage,
     including optional RMSNorm, but removes the separate post/pre boundary.
     Small token batches use the FMA kernel above to combine ``mhc_post`` and the
-    pre-norm GEMM in one launch; larger batches keep DeepGEMM for throughput and
-    only fuse the Python/model-level scheduling boundary.
+    pre-norm GEMM in one launch; larger batches keep the tensor-core pre-norm
+    path for throughput and only fuse the Python/model-level scheduling boundary.
 
     Returns:
         residual_cur: post-mapped residual, shape (..., hc_mult, hidden_size)
@@ -1662,30 +2068,27 @@ def mhc_fused_post_pre(
     x_flat = x.view(num_tokens, hidden_size)
 
     # The scalar-FMA kernel wins only for small batches where launch
-    # overhead dominates; beyond the threshold DeepGEMM's tensor-core path wins.
+    # overhead dominates; beyond the threshold the tensor-core path wins.
     fma_token_threshold = 32
+    residual_cur = torch.empty_like(residual_flat)
+    use_radix4 = False
+
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
-    else:
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
-
-    gemm_out_mul = torch.empty(
-        n_splits,
-        num_tokens,
-        hc_mult3,
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    gemm_out_sqrsum = torch.empty(
-        n_splits,
-        num_tokens,
-        dtype=torch.float32,
-        device=residual.device,
-    )
-    residual_cur = torch.empty_like(residual_flat)
-
-    if num_tokens <= fma_token_threshold:
+        gemm_out_mul = torch.empty(
+            n_splits,
+            num_tokens,
+            hc_mult3,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits,
+            num_tokens,
+            dtype=torch.float32,
+            device=residual.device,
+        )
         # Small-batch path: one TileLang launch computes hc_post, the bf16
         # residual write, GEMM partials, and the RMS square-sum partials.
         mhc_fused_post_pre_fma_tilelang(
@@ -1704,8 +2107,8 @@ def mhc_fused_post_pre(
             split_k=n_splits,
         )
     else:
-        # Large-batch path: keep the existing high-throughput TileLang hc_post +
-        # DeepGEMM pre-norm GEMM decomposition instead of replacing tensor cores.
+        # Large-batch path: keep the TileLang hc_post + tensor-core pre-norm
+        # GEMM decomposition instead of replacing tensor cores.
         mhc_post_tilelang(
             comb_res_mix.view(num_tokens, hc_mult, hc_mult),
             residual_flat,
@@ -1716,11 +2119,31 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if _use_deep_gemm_hc_prenorm():
+        residual_cur_2d = residual_cur.view(num_tokens, hc_hidden_size)
+        if _use_packed_bf16x2_mhc_pre(residual_cur_2d, fn, hc_mult3, hc_hidden_size):
+            gemm_out_mul, gemm_out_sqrsum, n_splits = _run_mhc_pre_bf16x2_radix4(
+                residual_cur_2d, fn, hc_mult3
+            )
+            use_radix4 = True
+        elif _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
+            n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+            gemm_out_mul = torch.empty(
+                n_splits,
+                num_tokens,
+                hc_mult3,
+                dtype=torch.float32,
+                device=residual.device,
+            )
+            gemm_out_sqrsum = torch.empty(
+                n_splits,
+                num_tokens,
+                dtype=torch.float32,
+                device=residual.device,
+            )
             deep_gemm.tf32_hc_prenorm_gemm(
-                residual_cur.view(num_tokens, hc_hidden_size),
+                residual_cur_2d,
                 fn,
                 gemm_out_mul,
                 gemm_out_sqrsum,
@@ -1736,7 +2159,7 @@ def mhc_fused_post_pre(
                 num_tokens, dtype=torch.float32, device=residual.device
             )
             _mhc_pre_gemm_sqrsum_dispatch()(
-                residual_cur.view(num_tokens, hc_hidden_size),
+                residual_cur_2d,
                 fn,
                 gemm_out_mul_2d,
                 gemm_out_sqrsum_1d,
@@ -1803,6 +2226,8 @@ def mhc_fused_post_pre(
             n_splits,
             hc_mult,
             hc_mult3,
+            False,
+            use_radix4,
         )
     else:
         # Same mhc_pre finalization without the model-layer RMSNorm.
@@ -1824,6 +2249,8 @@ def mhc_fused_post_pre(
             n_splits,
             hc_mult,
             hc_mult3,
+            False,
+            use_radix4,
         )
 
     return (

@@ -62,6 +62,59 @@ class TestCompensatedMhcUpdateGuard(CustomTestCase):
             self.assertIsNone(_unsupported_derived_weight_cache_error(model))
             self.assertIsNone(_unsupported_derived_weight_cache_error())
 
+    def test_packed_bf16x2_mhc_rejects_uniformly_before_traffic(self):
+        from sglang.kernels.ops.layernorm import mhc
+
+        sm10 = SimpleNamespace(is_sm=lambda major, minor=None: major == 10)
+        sm9 = SimpleNamespace(is_sm=lambda major, minor=None: major == 9)
+        for attr, is_buffer in (
+            ("hc_attn_fn", False),
+            ("hc_ffn_fn", False),
+            ("fn_fp32", True),
+        ):
+            with self.subTest(attr=attr):
+                model = torch.nn.Module()
+                w = torch.zeros(24, 16384, dtype=torch.float32)
+                if is_buffer:
+                    model.register_buffer(attr, w)
+                else:
+                    setattr(model, attr, torch.nn.Parameter(w))
+                with (
+                    patch.object(mhc, "_SUPPORT_TENSOR_DESCRIPTOR", True),
+                    patch.object(mhc, "_use_tilelang_mhc_pre", return_value=True),
+                    patch.object(mhc, "_use_deep_gemm_hc_prenorm", return_value=True),
+                    patch.object(mhc, "current_arch", return_value=sm10),
+                    patch(
+                        "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                        return_value=False,
+                    ),
+                ):
+                    msg = _unsupported_derived_weight_cache_error(model)
+                    self.assertIsNotNone(msg)
+                    self.assertIn("SGLANG_OPT_DEEPGEMM_HC_PRENORM=0", msg)
+                for prenorm, tilelang, arch in (
+                    (False, True, sm10),
+                    (True, False, sm10),
+                    (True, True, sm9),
+                ):
+                    with (
+                        patch.object(mhc, "_SUPPORT_TENSOR_DESCRIPTOR", True),
+                        patch.object(
+                            mhc, "_use_tilelang_mhc_pre", return_value=tilelang
+                        ),
+                        patch.object(
+                            mhc, "_use_deep_gemm_hc_prenorm", return_value=prenorm
+                        ),
+                        patch.object(mhc, "current_arch", return_value=arch),
+                        patch(
+                            "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                            return_value=False,
+                        ),
+                    ):
+                        self.assertIsNone(
+                            _unsupported_derived_weight_cache_error(model)
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()
