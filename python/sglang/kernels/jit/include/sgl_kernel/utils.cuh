@@ -459,7 +459,6 @@ struct LaunchKernel {
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
 #if defined(USE_ROCM) || defined(USE_MUSA)
     (void)enabled;
-    m_config.numAttrs = 0;
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];

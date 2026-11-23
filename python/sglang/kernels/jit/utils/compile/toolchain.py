@@ -160,12 +160,14 @@ def host_compiler_path() -> str:
 
 
 @cache_once
-def gpu_arch_name() -> str:
+def gpu_arch_name(arch: CompileArch | None = None) -> str:
     """The compile target as the vendor names it.
 
     On ROCm this is ``gcnArchName`` (``gfx942:sramecc+:xnack-``) rather than the
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
+    For MUSA, an explicit ``arch`` takes precedence over ``MTGPU_TARGET``,
+    which in turn takes precedence over the device detected at runtime.
     """
     if is_hip_runtime():
         try:
@@ -177,14 +179,16 @@ def gpu_arch_name() -> str:
             )
             return "unknown"
     if is_musa_runtime():
+        if arch is not None and (arch.major, arch.minor) != (0, 0):
+            return f"mp_{arch.major}{arch.minor}{arch.suffix}"
         configured = os.environ.get("MTGPU_TARGET")
         if configured:
             return configured
-        arch = get_compile_arch()
+        arch = arch or get_compile_arch()
         if (arch.major, arch.minor) == (0, 0):
             return "unknown"
-        return f"mp_{arch.major}{arch.minor}"
-    return get_compile_arch().target_name
+        return f"mp_{arch.major}{arch.minor}{arch.suffix}"
+    return (arch or get_compile_arch()).target_name
 
 
 @cache_once
@@ -222,8 +226,10 @@ def target_flags(arch: CompileArch | None = None) -> List[str]:
                 f"{', '.join(_SAIL_GPU_ARCHS)}"
             )
         return [f"--gpu-architecture={sail_arch}"]
-    if is_hip_runtime() or is_musa_runtime():
+    if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
+    if is_musa_runtime():
+        return [f"--offload-arch={gpu_arch_name(arch)}"]
     arch = arch or get_compile_arch()
     target = f"{arch.major}{arch.minor}{arch.suffix}"
     return [f"-gencode=arch=compute_{target},code=sm_{target}"]

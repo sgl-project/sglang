@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from sglang.kernels.jit.utils import arch
-from sglang.kernels.jit.utils.compile import toolchain
+from sglang.kernels.jit.utils.compile import cache, toolchain
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -35,6 +35,12 @@ def test_musa_runtime_alias_owner_is_torchada():
     assert "__MUSACC__" in headers["utils.h"]
     assert "USE_MUSA" not in headers["tensor.h"]
     assert "USE_MUSA" not in headers["utils.h"]
+    pdl = (
+        headers["utils.cuh"]
+        .split("auto enable_pdl", 1)[1]
+        .split("auto enable_cluster", 1)[0]
+    )
+    assert "m_config.numAttrs = 0" not in pdl
     for header in ("cuda_bf16.h", "cuda_fp16.h", "cuda_fp8.h", "cuda_runtime.h"):
         assert f"#include <{header}>" in headers["utils.cuh"]
     for source in headers.values():
@@ -55,6 +61,7 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
     monkeypatch.setattr(
         toolchain, "get_compile_arch", lambda: arch.CompileArch(3, 1, "")
     )
+    monkeypatch.delenv("MTGPU_TARGET", raising=False)
     monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
     monkeypatch.setattr(
         toolchain,
@@ -78,6 +85,20 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
         "-L/opt/musa/lib",
         "-lmusart",
     ]
+
+
+def test_musa_explicit_arch_wins_over_environment_and_cache_tag(monkeypatch):
+    explicit = arch.CompileArch(4, 0, "a")
+    monkeypatch.setenv("MTGPU_TARGET", "mp_31")
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(cache, "is_musa_runtime", lambda: True)
+    monkeypatch.setattr(cache, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(cache, "is_sail_runtime", lambda: False)
+
+    assert toolchain.gpu_arch_name.__wrapped__(explicit) == "mp_40a"
+    assert toolchain.gpu_arch_name.__wrapped__() == "mp_31"
+    assert toolchain.target_flags(explicit) == ["--offload-arch=mp_40a"]
+    assert cache._target_tag.__wrapped__(explicit) == "mp_40a"
 
 
 def test_musa_checks_preserve_existing_platform_precedence(monkeypatch):
