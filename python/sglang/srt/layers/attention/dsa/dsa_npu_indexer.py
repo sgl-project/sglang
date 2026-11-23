@@ -48,7 +48,25 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
+def _quantize_npu_indexer_activation(
+    x, hadamard, dst_type, scale_type, *, kpool_query=False
+):
+    if kpool_query and scale_type == torch.float8_e8m0fnu:
+        from sgl_kernel_npu.operators.activation import dynamic_mx_quant
+
+        head_dim = x.shape[-1]
+        # One E8M0 scale per 32 channels, packed in pairs for PI.
+        scale_shape = x.shape[:-1] + (head_dim // 64, 2)
+        if x.numel() == 0:
+            return (
+                torch.empty_like(x, dtype=dst_type),
+                torch.empty(scale_shape, dtype=scale_type, device=x.device),
+            )
+        quantized, scale = dynamic_mx_quant(
+            x.reshape(-1, head_dim), dst_type=dst_type, axis=-1
+        )
+        return quantized.view(x.shape), scale.reshape(scale_shape).view(scale_type)
+
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
@@ -56,9 +74,16 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
             torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     rotated = x @ hadamard
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        rotated.reshape(-1, 128), dst_type=dst_type
-    )
+    if kpool_query and dst_type == torch.int8:
+        from sgl_kernel_npu.operators.activation import dynamic_quant
+
+        quantized, scale = dynamic_quant(rotated.reshape(-1, 128), dst_type=dst_type)
+        # PI requires positive descales, including padding rows.
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    else:
+        quantized, scale = torch_npu.npu_dynamic_quant(
+            rotated.reshape(-1, 128), dst_type=dst_type
+        )
     return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 
 

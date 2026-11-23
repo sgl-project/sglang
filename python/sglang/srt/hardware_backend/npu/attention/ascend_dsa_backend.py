@@ -343,46 +343,6 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     backend_cls = AscendDSAAttnBackend
 
 
-def _quantize_pooled_indexer_query_int8(
-    query: torch.Tensor,
-    hadamard: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric INT8 query quantization for pooled-key scoring.
-
-    Rotate queries into the same Hadamard basis as the pooled INT8 keys
-    before quantization, with one FP16 scale per query token and indexer head.
-    """
-    from sgl_kernel_npu.operators.activation import dynamic_quant
-
-    rotated = query @ hadamard
-    quantized, scale = dynamic_quant(rotated.reshape(-1, 128), dst_type=torch.int8)
-    quantized = quantized.reshape(query.shape)
-    scale = scale.reshape(query.shape[:-1])
-    # The padded all-0 rows get a scale of 0, replaced with 1
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    return quantized, scale.to(torch.float16)
-
-
-def _quantize_pooled_indexer_query_mxfp8(
-    query: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8 query quantization for pooled-key scoring (Ascend A5).
-
-    KPool stores pooled keys without Hadamard rotation, so the query keeps
-    the same basis: one E8M0 scale per 32-element block, pair-packed as
-    [D/64, 2] to match the KPool descale layout.
-    """
-    from sgl_kernel_npu.operators.activation import dynamic_mx_quant
-
-    D = query.shape[-1]
-    quantized, scale = dynamic_mx_quant(
-        query.reshape(-1, D), dst_type=torch.float8_e4m3fn, axis=-1
-    )
-    return quantized.view(query.shape), scale.reshape(
-        query.shape[:-1] + (D // 64, 2)
-    ).view(torch.float8_e8m0fnu)
-
-
 def _index_k_scale_cache(pool, layer_id: int):
     """FP32/FP16 per-row scales for FP8/INT8, raw E8M0 bytes for MXFP8."""
     if pool.dsa_kv_cache_store_fp8 or pool.indexer_kv_store_int8:
@@ -427,35 +387,33 @@ def _get_topk_npu(
     pool = get_token_to_kv_pool()
     kv = pool.layer_router.read(layer_id)
     pool, layer_id = kv.view, kv.view_layer_id
-    indexer_kwargs = dict(quant_mode=-1)  # unquant BF16
+    quant_mode = -1  # unquant BF16
     weights_dtype = torch.bfloat16
     if pool.dsa_kv_cache_store_fp8:
+        quant_mode = 0  # FP8 per-token-head quant
+    elif pool.indexer_kv_store_int8:
+        quant_mode = 2  # INT8 quant
+        weights_dtype = torch.float16
+    elif pool.indexer_kv_store_mxfp8:
+        quant_mode = 1  # MXFP8 quant
+
+    indexer_kwargs = {}
+    if quant_mode != -1:
         from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
             _quantize_npu_indexer_activation,
         )
 
+        scale_type = (
+            torch.float8_e8m0fnu if quant_mode == 1 else pool.index_k_scale_dtype
+        )
         query_safe, query_descale = _quantize_npu_indexer_activation(
-            query_safe, pool.indexer_hadamard_128, torch.float8_e4m3fn, torch.float32
+            query_safe,
+            pool.indexer_hadamard_128,
+            pool.index_k_store_dtype,
+            scale_type,
+            kpool_query=True,
         )
-        indexer_kwargs.update(
-            quant_mode=0,  # FP8 per-token-head quant
-            q_descale=query_descale,
-            k_descale=pool.get_index_k_scale_buffer(layer_id),
-        )
-    elif pool.indexer_kv_store_int8:
-        query_safe, query_descale = _quantize_pooled_indexer_query_int8(
-            query_safe, pool.indexer_hadamard_128
-        )
-        weights_dtype = torch.float16
-        indexer_kwargs.update(
-            quant_mode=2,  # INT8 quant
-            q_descale=query_descale,
-            k_descale=pool.get_index_k_scale_buffer(layer_id),
-        )
-    elif pool.indexer_kv_store_mxfp8:
-        query_safe, query_descale = _quantize_pooled_indexer_query_mxfp8(query_safe)
-        indexer_kwargs.update(
-            quant_mode=1,  # MXFP8 quant
+        indexer_kwargs = dict(
             q_descale=query_descale,
             k_descale=pool.get_index_k_scale_buffer(layer_id),
         )
@@ -472,6 +430,7 @@ def _get_topk_npu(
         topk=index_topk,
         pool_size=index_kpool,
         mask_mode=3,
+        quant_mode=quant_mode,
         return_value=False,
         **indexer_kwargs,
     )
