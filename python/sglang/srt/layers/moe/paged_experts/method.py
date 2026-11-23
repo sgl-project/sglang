@@ -208,6 +208,11 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         )
         if self.tiered and not self.loads.waiting:
             _cannot_tier("the checkpoint is not loaded as mapped safetensors files")
+        if self.tiered and get_exec().moe.paged_experts_fused_host_copy:
+            raise ValueError(
+                "--paged-experts-fused-host-copy does not support the disk tier "
+                "(--paged-experts-enable-disk)"
+            )
 
     @property
     def tiered(self) -> bool:
@@ -361,11 +366,6 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         launches need to page experts in themselves in this layer's device-planned steps."""
         from sglang.srt.layers.moe.paged_experts.runners import MARLIN, TRITON
 
-        if self.tiered:
-            raise ValueError(
-                "--paged-experts-fused-host-copy does not support the disk tier "
-                "(--paged-experts-enable-disk)"
-            )
         if self.contract not in (TRITON, MARLIN):
             raise ValueError(
                 "--paged-experts-fused-host-copy needs the triton or Marlin MoE runner"
