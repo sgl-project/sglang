@@ -1,11 +1,15 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -166,11 +170,50 @@ class TestCFGGating(unittest.TestCase):
         self.assertFalse(ctx.extra["cfg_gate_state"]["active"])
         self.assertEqual(ctx.extra["cfg_gate_state"]["gate_step"], 11)
 
-    def test_neg_cond_without_cfg_runs_one_branch(self):
-        """A rollout that only returns the negative cond must sample as without it."""
-        batch = SimpleNamespace(do_classifier_free_guidance=False)
-        policy = CFGPolicy().build(batch, {}, {"pos": 1}, {"neg": 2})
-        self.assertEqual([branch.name for branch in policy.branches], ["conditional"])
+    def test_neg_cond_without_cfg_is_built_and_runs_one_branch(self):
+        """A no-CFG rollout that asks for the negative cond gets it built, and still runs one branch."""
+        stage = DenoisingStage.__new__(DenoisingStage)
+        stage.transformer = lambda hidden_states, encoder_hidden_states: None
+        stage.transformer_2 = stage.pipeline = None
+        stage._extra_func_kwarg_names_cache = {}
+        stage.attn_backend = SimpleNamespace(get_enum=lambda: None)
+        stage.server_args = server_args = SimpleNamespace(
+            pipeline_config=PipelineConfig(should_use_guidance=False),
+            disable_autocast=True,
+        )
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="x",
+                guidance_scale=1.0,
+                rollout=True,
+                rollout_return_neg_cond_kwargs=True,
+            ),
+            scheduler=SimpleNamespace(order=1, step=lambda sample: None),
+            timesteps=torch.arange(2),
+            latents=torch.zeros(1, 4),
+            negative_prompt_embeds=[torch.ones(1, 2, 4)],
+        )
+
+        with (
+            patch.multiple(
+                denoising,
+                prepare_rollout_if_enabled=Mock(),
+                set_rollout_early_stop_if_enabled=Mock(),
+                load_transformer_if_needed=Mock(return_value=False),
+                rollout_step_kwargs=Mock(return_value={}),
+                resolve_precision=Mock(return_value=torch.float32),
+                should_apply_wan_ti2v=Mock(return_value=False),
+            ),
+            patch.object(stage, "_maybe_enable_cache_dit_and_torch_compile"),
+        ):
+            ctx = stage._prepare_denoising_loop(batch, server_args)
+
+        self.assertIs(
+            ctx.neg_cond_kwargs["encoder_hidden_states"], batch.negative_prompt_embeds
+        )
+        self.assertEqual(
+            [branch.name for branch in ctx.cfg_policy.branches], ["conditional"]
+        )
 
     def test_rejects_invalid_gate_fraction(self):
         stage = DenoisingStage.__new__(DenoisingStage)
