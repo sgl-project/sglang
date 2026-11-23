@@ -2,16 +2,25 @@
 
 PD prefill hands the decode its first token through req.output_ids, and the
 prebuilt batch still has to seed the NGRAM accept state and its relay rows;
-without them a decode-only NGRAM server fails while warming up.
+without them a decode-only NGRAM server fails while warming up. No extend runs
+on the decode, so the prebuilt requests also seed the corpus with their prompt.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+maybe_stub_sgl_kernel()
+
 from sglang.srt.disaggregation import decode_schedule_batch_mixin
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -20,13 +29,13 @@ from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     resolve_forward_inputs,
 )
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative import ngram_disaggregation
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_worker import NGRAMWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 DRAFT_TOKEN_NUM = 4
 POOL_ROWS = 8
@@ -120,6 +129,68 @@ class TestPdNgramDraftInput(CustomTestCase):
                     self.assertEqual(running.accept_lens.tolist(), [1, 0, 0])
                     self.assertEqual(running.accept_tokens.numel(), 3 * DRAFT_TOKEN_NUM)
                     self.assertEqual(running.new_seq_lens.tolist(), [20, 10, 10])
+
+
+class TestPdNgramPromptSeeding(CustomTestCase):
+    @staticmethod
+    def corpus_worker():
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 12
+        worker.draft_token_num = 4
+        worker.ngram_corpus = NgramCorpus(
+            max_trie_depth=12,
+            min_bfs_breadth=1,
+            max_bfs_breadth=1,
+            draft_token_num=4,
+            capacity=1000,
+        )
+        return worker
+
+    @staticmethod
+    def admit(spec_algorithm, draft_worker, req):
+        batch = SimpleNamespace(
+            reqs=[req], chunked_req=None, process_prebuilt=MagicMock()
+        )
+        scheduler = SimpleNamespace(
+            spec_algorithm=spec_algorithm,
+            draft_worker=draft_worker,
+            enable_overlap=False,
+            chunked_req=None,
+            future_map=None,
+            ngram_embedding_manager=MagicMock(),
+            _get_new_prebuilt_batch=lambda running_batch: batch,
+            _nonblocking_admit_in_scope=lambda batch: False,
+            _verify_kv_checksums=lambda batch: None,
+        )
+        batch.is_empty = lambda: False
+        SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(scheduler, None)
+        return batch
+
+    def test_prebuilt_prompt_reaches_the_decode_corpus(self):
+        worker = self.corpus_worker()
+        # The transferred prompt and the first token PD prefill sampled.
+        req = Req("rid", "", array("q", [1, 2, 3, 4, 5, 6]), SamplingParams())
+        req.output_ids = array("q", [7])
+
+        batch = self.admit(SpeculativeAlgorithm.NGRAM, worker, req)
+
+        batch.process_prebuilt.assert_called_once()
+        worker.ngram_corpus.synchronize()
+        draft = worker.ngram_corpus.batch_get(["probe"], [[3, 4]], [2])[0]
+        self.assertIn(5, draft)
+
+    def test_other_servers_leave_the_corpus_alone(self):
+        req = Req("rid", "", array("q", [1, 2, 3]), SamplingParams())
+        for name, spec_algorithm, draft_worker in (
+            ("eagle", SpeculativeAlgorithm.EAGLE, MagicMock()),
+            ("ngram without a draft worker", SpeculativeAlgorithm.NGRAM, None),
+        ):
+            with self.subTest(name):
+                batch = self.admit(spec_algorithm, draft_worker, req)
+
+                batch.process_prebuilt.assert_called_once()
+                if draft_worker is not None:
+                    draft_worker.insert_prompt_tails.assert_not_called()
 
 
 if __name__ == "__main__":

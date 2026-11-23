@@ -445,6 +445,33 @@ class TestDisaggregationNgram(SpecGrammarKit, PDDisaggregationServerBase):
         )
         self.assertGreater(out["meta_info"]["spec_verify_ct"], 0)
 
+    def test_decode_drafts_a_copy_of_the_prompt(self):
+        # The decode worker runs no extend, so only a prompt seeded into its corpus
+        # at admission can draft this copy; otherwise accept length stays near 1.
+        words = (
+            "amber falcon river quartz lantern meadow copper violet harbor thistle "
+            "marble orchid canyon ember glacier pepper walnut saddle compass velvet "
+            "anchor blossom cobalt dragon eclipse fountain granite hammock island "
+            "jasmine kettle lagoon mirror nectar oyster pillow quiver rocket sapphire "
+            "timber umbrella vessel willow yarrow zephyr bridge candle desert engine "
+            "forest garden hollow ivory jungle kernel ladder magnet needle office "
+            "palace quarry ribbon spindle temple unicorn valley wagon xylophone "
+            "yonder zenith apron basket castle dolphin emerald feather goblet helmet "
+            "iguana jacket kitten locket mantle napkin oracle parrot quilt rabbit"
+        )
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": f"Copy the word list exactly.\nWord list: {words}\nCopy:",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 96},
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        meta_info = response.json()["meta_info"]
+        accept_length = meta_info["completion_tokens"] / meta_info["spec_verify_ct"]
+        self.assertGreater(accept_length, 2.0, meta_info)
+
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
