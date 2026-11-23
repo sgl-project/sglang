@@ -464,12 +464,22 @@ def _hub_dit_parameter_counts(
         shards = _index_shard_names(index_path)
     except RemoteEntryNotFoundError:
         shards = [_DIT_SINGLE_FILE]
-    counts: Counter[str] = Counter()
-    for shard in shards:
-        metadata = parse_safetensors_file_metadata(
+
+    def shard_counts(shard: str) -> dict[str, int]:
+        return parse_safetensors_file_metadata(
             repo_id=repo_id, filename=f"{folder}/{shard}", revision=revision
-        )
-        counts.update(metadata.parameter_count)
+        ).parameter_count
+
+    if len(shards) == 1:
+        return Counter(shard_counts(shards[0]))
+
+    # Overlap independent Hub range requests, not the checkpoint downloads.
+    from concurrent.futures import ThreadPoolExecutor
+
+    counts: Counter[str] = Counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for per_dtype in pool.map(shard_counts, shards):
+            counts.update(per_dtype)
     return counts
 
 
