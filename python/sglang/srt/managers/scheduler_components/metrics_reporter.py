@@ -335,9 +335,9 @@ class SchedulerMetricsReporter:
         # equivalent) can reuse the same structure without resurrecting the
         # unbounded-growth bug this avoids: only append for categories
         # something actually drains.
-        self._device_timer_elapsed_by_category: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
-            lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN)
-        )
+        self._device_timer_elapsed_by_category: Dict[
+            str, Deque[Tuple[float, float]]
+        ] = defaultdict(lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN))
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -363,8 +363,13 @@ class SchedulerMetricsReporter:
                 # returns before ever draining this queue, so appending here
                 # unconditionally leaks the same way the all-categories
                 # version used to.
-                if kwargs.get("category") == "extend" and self.enable_mfu_metrics and (
-                    self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
+                if (
+                    kwargs.get("category") == "extend"
+                    and self.enable_mfu_metrics
+                    and (
+                        self.is_stats_logging_rank
+                        or self.current_scheduler_metrics_enabled
+                    )
                 ):
                     self._device_timer_elapsed_by_category["extend"].append(
                         (time.perf_counter(), kwargs["t"])
@@ -706,27 +711,30 @@ class SchedulerMetricsReporter:
         # stores weights at a narrower width than the activation dtype above, so
         # charging w_bytes at the activation width overcounts weight-read
         # bandwidth by roughly (activation_bits / weight_bits) -- e.g. ~4x for a
-        # 4-bit-weight model read as if it were bf16. Prefer the quant config's
-        # own published global_compression_ratio (compressed-tensors) when
-        # present, since it already accounts for group-size scale/zero-point
-        # overhead and any unquantized layers (e.g. lm_head) that a naive
-        # bits-only ratio would miss; fall back to a bits-per-weight ratio for
-        # GPTQ/AWQ-style flat configs that don't publish a ratio.
+        # 4-bit-weight model read as if it were bf16. Derive the ratio from the
+        # quantized weight bit-width itself (GPTQ/AWQ flat configs, or
+        # compressed-tensors' per-group `weights.num_bits`) rather than
+        # compressed-tensors' published `global_compression_ratio`: that field
+        # is a whole-model average blended across every parameter, including
+        # layers the quant config leaves unquantized (e.g. lm_head/embeddings),
+        # so it understates the savings on the matmul weights actually modeled
+        # here -- e.g. RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's
+        # real published config reports global_compression_ratio=1.24, not the
+        # 2.0x its 8-bit weights actually achieve.
         hf_quant_config = getattr(model_config, "hf_quant_config", None) or {}
-        weight_compression_ratio = hf_quant_config.get("global_compression_ratio")
-        if not weight_compression_ratio:
-            weight_bits = (
-                hf_quant_config.get("bits")
-                or hf_quant_config.get("num_bits")
-                or hf_quant_config.get("w_bit")
-            )
-            if weight_bits is None:
-                for group in (hf_quant_config.get("config_groups") or {}).values():
-                    weight_bits = (group or {}).get("weights", {}).get("num_bits")
-                    if weight_bits:
-                        break
-            if weight_bits:
-                weight_compression_ratio = (dtype_num_bytes * 8) / float(weight_bits)
+        weight_bits = (
+            hf_quant_config.get("bits")
+            or hf_quant_config.get("num_bits")
+            or hf_quant_config.get("w_bit")
+        )
+        if weight_bits is None:
+            for group in (hf_quant_config.get("config_groups") or {}).values():
+                weight_bits = (group or {}).get("weights", {}).get("num_bits")
+                if weight_bits:
+                    break
+        weight_compression_ratio = (
+            (dtype_num_bytes * 8) / float(weight_bits) if weight_bits else None
+        )
         if weight_compression_ratio and weight_compression_ratio > 1:
             w_bytes = float(dtype_num_bytes) / float(weight_compression_ratio)
 

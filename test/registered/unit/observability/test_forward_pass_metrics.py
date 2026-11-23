@@ -25,11 +25,11 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _DEVICE_TIMER_FIFO_MAX_AGE_S,
+    _DEVICE_TIMER_FIFO_MAXLEN,
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
-    _DEVICE_TIMER_FIFO_MAX_AGE_S,
-    _DEVICE_TIMER_FIFO_MAXLEN,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
@@ -2370,32 +2370,20 @@ class TestEstimatedPerfConstants(CustomTestCase):
             tp1._linear_flops_per_token, ep_only._linear_flops_per_token
         )
 
-    def test_global_compression_ratio_shrinks_weight_bytes_not_activation_bytes(self):
+    def test_quant_bits_shrinks_weight_bytes_not_activation_bytes(self):
         # Weight-only quantization (W4A16/W8A16-style) stores weights narrower
         # than the activation dtype, so weight-read bytes must shrink by the
-        # quant config's own global_compression_ratio (compressed-tensors) --
-        # but KV-cache/activation bytes, which stay at full precision for a
-        # weight-only scheme, must NOT shrink.
-        baseline = _fake_model_config(
-            hidden_size=256, num_attention_layers=2, head_dim=0
-        )
-        quantized = _fake_model_config(
-            hidden_size=256,
-            num_attention_layers=2,
-            head_dim=0,
-            hf_quant_config={"global_compression_ratio": 4.0},
-        )
-        self._init(baseline)
-        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
-        self._init(quantized)
-        self.assertAlmostEqual(
-            baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
-        )
-
-    def test_bits_fallback_used_when_no_global_compression_ratio(self):
-        # GPTQ/AWQ-style flat configs publish bits (or num_bits/w_bit) but no
-        # pre-computed ratio -- fall back to deriving it from the activation
-        # dtype width vs the published bit width.
+        # bit-width-derived ratio -- but KV-cache/activation bytes, which stay
+        # at full precision for a weight-only scheme, must NOT shrink.
+        #
+        # Deliberately not using compressed-tensors' own published
+        # global_compression_ratio here: that field is a whole-model average
+        # blended across every parameter, including layers the quant config
+        # leaves unquantized (e.g. lm_head/embeddings), so it understates the
+        # savings on the matmul weights this estimator models -- e.g.
+        # RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's real published
+        # config reports global_compression_ratio=1.24, not the 2.0x its
+        # 8-bit weights actually achieve.
         baseline = _fake_model_config(
             hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
         )
@@ -2414,10 +2402,10 @@ class TestEstimatedPerfConstants(CustomTestCase):
             baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
         )
 
-    def test_compressed_tensors_nested_config_groups_bits_fallback(self):
-        # compressed-tensors configs without a top-level global_compression_ratio
-        # (e.g. some float-quantized FP8 exports) nest bits per config group --
-        # confirmed against RedHatAI/Apertus-8B-Instruct-2509-FP8-dynamic and
+    def test_compressed_tensors_nested_config_groups_bits(self):
+        # compressed-tensors configs nest bits per config group rather than
+        # publishing a flat top-level `bits` field -- confirmed against
+        # RedHatAI/Apertus-8B-Instruct-2509-FP8-dynamic and
         # ibm-granite/granite-3.3-8b-instruct-FP8's real published configs.
         baseline = _fake_model_config(
             hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
@@ -2605,14 +2593,18 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         device-timer duration, the same way model_runner.py's
         device_timer_ctx(self.device_timer, "extend") wraps a real forward."""
         with patch.object(
-            _TimingInterval, "create", return_value=FakeInterval(milliseconds, ready=True)
+            _TimingInterval,
+            "create",
+            return_value=FakeInterval(milliseconds, ready=True),
         ):
             with device_timer_ctx(self.reporter.forward_pass_device_timer, "extend"):
                 pass
 
     def _run_decode_forward(self, milliseconds):
         with patch.object(
-            _TimingInterval, "create", return_value=FakeInterval(milliseconds, ready=True)
+            _TimingInterval,
+            "create",
+            return_value=FakeInterval(milliseconds, ready=True),
         ):
             with device_timer_ctx(self.reporter.forward_pass_device_timer, "decode"):
                 pass
@@ -2635,7 +2627,9 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         # every category here would leak the other categories' entries
         # forever since nothing consumes them.
         self._run_decode_forward(3)
-        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
 
     def test_extend_fifo_not_populated_when_rank_cannot_drain(self):
         # The TP-rank leak this regression test guards against: on a TP rank
@@ -2648,14 +2642,18 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         self.reporter.current_scheduler_metrics_enabled = False
         for _ in range(5):
             self._run_extend_forward(1)
-        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
 
     def test_extend_fifo_populated_when_stats_logging_rank(self):
         self.reporter.is_stats_logging_rank = True
         self.reporter.current_scheduler_metrics_enabled = False
         for _ in range(3):
             self._run_extend_forward(1)
-        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 3)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 3
+        )
 
     def test_extend_fifo_populated_when_metrics_enabled_for_all_schedulers(self):
         # --enable-metrics-for-all-schedulers sets current_scheduler_metrics_enabled
@@ -2665,7 +2663,9 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         self.reporter.current_scheduler_metrics_enabled = True
         for _ in range(3):
             self._run_extend_forward(1)
-        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 3)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 3
+        )
 
     def test_extend_fifo_not_populated_when_mfu_metrics_disabled(self):
         # A second, narrower trigger of the same leak class: with the device
@@ -2677,7 +2677,9 @@ class TestPrefillSolDeviceTimer(CustomTestCase):
         self.reporter.is_stats_logging_rank = True
         for _ in range(5):
             self._run_extend_forward(1)
-        self.assertEqual(len(self.reporter._device_timer_elapsed_by_category["extend"]), 0)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
 
     def test_prefill_sol_suffix_uses_device_time_not_wall_clock(self):
         # The core fix: FLOPs / this forward's own device time, not FLOPs /
