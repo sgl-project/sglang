@@ -280,15 +280,32 @@ class SchedulePolicy:
         self._touch_waiting_prefixes(policy, waiting_queue)
 
     def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
-        # Head last, so LRU evicts in reverse admission order; cache-aware policies
-        # already touch while matching, and other eviction strategies ignore recency.
+        # Cache-aware policies already touch while matching, and so does
+        # calc_priority when matching every waiting request is cheap.
         if (
             isinstance(policy, CacheAwarePolicy)
-            or not waiting_queue
+            or self.tree_cache.supports_fast_match_prefix()
+        ):
+            return
+        self._refresh_waiting_prefixes(waiting_queue)
+
+    def refresh_waiting_prefixes(self, waiting_queue: List[Req]) -> None:
+        """Keep queued requests' cached prefixes recent while admission is blocked.
+
+        calc_priority, where every policy touches or matches the queue, does not run
+        then, so requests waiting behind a full running batch would otherwise lose
+        their prefixes and mamba checkpoints to LRU eviction before admission.
+        """
+        self._refresh_waiting_prefixes(waiting_queue)
+
+    def _refresh_waiting_prefixes(self, waiting_queue: List[Req]) -> None:
+        # Head last, so LRU evicts in reverse admission order; other eviction
+        # strategies ignore recency.
+        if (
+            not waiting_queue
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
             or get_memory().radix_eviction_policy.lower() != "lru"
-            or self.tree_cache.supports_fast_match_prefix()
             or not self.tree_cache.supports_prefix_sharing()
         ):
             return

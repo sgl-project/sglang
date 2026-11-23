@@ -811,7 +811,12 @@ def _flash_attn_fwd(
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
         # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
-        q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
+        # The shared BI head-256 path needs one Q stage: two 256-column
+        # output accumulators plus score tiles exceed SM100's 512 TMEM columns.
+        single_q_stage = qk_blockscaled or (
+            is_batch_invariant() and head_dim == 256 and head_dim_v == 256
+        )
+        q_stage = 1 if single_q_stage else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -943,7 +948,12 @@ def _flash_attn_fwd(
 
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = (
-        arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+        # The dedicated kernel has neither BI masking nor seqused support.
+        # Keep packed scoring and paged decode on the shared BI implementation.
+        and not is_batch_invariant()
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 

@@ -198,7 +198,29 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
-        return MaybeTboDeepEPDispatcher(
+        from sglang.srt.true_on_policy.moe import should_use_slot_order_moe_combine
+
+        dispatcher = MaybeTboDeepEPDispatcher
+        # The stock DeepEP normal combine sums each rank's expert rows into one BF16 row first,
+        # so its grouping follows expert placement (true_on_policy.slot_order_deepep).
+        if a2a_backend.is_deepep() and should_use_slot_order_moe_combine():
+            from functools import partial
+
+            from sglang.srt.true_on_policy.fp8 import fp8_dispatch
+            from sglang.srt.true_on_policy.slot_order_deepep import (
+                build_top_slot_order_deepep_dispatcher,
+            )
+
+            dispatcher = partial(
+                build_top_slot_order_deepep_dispatcher,
+                moe_runner_config,
+                fp8_dispatch=fp8_dispatch(
+                    quantized_experts=not isinstance(
+                        quant_method, UnquantizedFusedMoEMethod
+                    )
+                ),
+            )
+        return dispatcher(
             runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,

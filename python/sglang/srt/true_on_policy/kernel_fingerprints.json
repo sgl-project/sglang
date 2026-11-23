@@ -1,0 +1,1887 @@
+{
+ "pins": {
+  "flashinfer_python": "0.7.2",
+  "sgl-deep-ep": "0.1.2.post1",
+  "sgl-deep-gemm": "0.2.3.post2",
+  "sglang-kernel": "0.4.10"
+ },
+ "symbols": {
+  "deep_ep:Buffer.dispatch": {
+   "dist": "sgl-deep-ep",
+   "hash": "48fd1326d88fa6418c1242480475720841f07fe3439a84dc7f7e9631b31cd27c",
+   "installed": "0.1.2.post1",
+   "params": [
+    "self",
+    "x",
+    "handle",
+    "num_tokens_per_rank",
+    "num_tokens_per_rdma_rank",
+    "is_token_in_rank",
+    "num_tokens_per_expert",
+    "topk_idx",
+    "topk_weights",
+    "expert_alignment",
+    "num_worst_tokens",
+    "config",
+    "previous_event",
+    "async_finish",
+    "allocate_on_comm_stream"
+   ],
+   "pin": "0.1.2.post1",
+   "status": "installed"
+  },
+  "deep_ep:Buffer.low_latency_dispatch": {
+   "dist": "sgl-deep-ep",
+   "hash": "dd7e374aa35d813cea952fc42b28cfe11b0ba204429d58cb04f4d03d0b126d24",
+   "installed": "0.1.2.post1",
+   "params": [
+    "self",
+    "x",
+    "topk_idx",
+    "num_max_dispatch_tokens_per_rank",
+    "num_experts",
+    "cumulative_local_expert_recv_stats",
+    "dispatch_wait_recv_cost_stats",
+    "x_global_scale",
+    "use_fp8",
+    "round_scale",
+    "use_ue8m0",
+    "use_nvfp4",
+    "async_finish",
+    "return_recv_hook"
+   ],
+   "pin": "0.1.2.post1",
+   "status": "installed"
+  },
+  "deep_gemm:bf16_gemm_nn": {
+   "dist": "sgl-deep-gemm",
+   "hash": "5ed53f9617728fe1f9fc56b4578996a548beef384203da86d38b921daef6b846",
+   "installed": "0.2.3.post2",
+   "params": [
+    "a",
+    "b",
+    "d",
+    "c",
+    "compiled_dims",
+    "alpha"
+   ],
+   "pin": "0.2.3.post2",
+   "status": "installed"
+  },
+  "deep_gemm:fp8_mqa_logits": {
+   "dist": "sgl-deep-gemm",
+   "hash": "90a7b6659d363821480e0389a5333a01fe543c681f5cb1fc2f2db836c5601ef7",
+   "installed": "0.2.3.post2",
+   "params": [
+    "q",
+    "kv",
+    "weights",
+    "ks",
+    "ke",
+    "clean_logits",
+    "max_seqlen_k"
+   ],
+   "pin": "0.2.3.post2",
+   "status": "installed"
+  },
+  "deep_gemm:fp8_paged_mqa_logits": {
+   "dist": "sgl-deep-gemm",
+   "hash": "2ff4d01cb131c2b43b47e53c8f55636cec847d763cb24e13919660aaf7380029",
+   "installed": "0.2.3.post2",
+   "params": [
+    "q",
+    "kv_cache",
+    "weights",
+    "context_lens",
+    "block_table",
+    "schedule_meta",
+    "max_context_len",
+    "clean_logits",
+    "indices"
+   ],
+   "pin": "0.2.3.post2",
+   "status": "installed"
+  },
+  "flashinfer:top_k": {
+   "dist": "flashinfer_python",
+   "hash": "83cbf1bf4b440c825bfe3558a66e0b6365d855cb9eb488b2069b62b294a5da5c",
+   "installed": "0.7.2",
+   "params": [
+    "input",
+    "k",
+    "sorted",
+    "deterministic",
+    "tie_break",
+    "dsa_graph_safe"
+   ],
+   "pin": "0.7.2",
+   "status": "installed"
+  },
+  "flashinfer:top_k_ragged_transform": {
+   "dist": "flashinfer_python",
+   "hash": "397159ee5b28f589cc417a792c9f84a214ef78b6094448e2b732e1778dcfd269",
+   "installed": "0.7.2",
+   "params": [
+    "input",
+    "offsets",
+    "lengths",
+    "k",
+    "deterministic",
+    "tie_break",
+    "dsa_graph_safe",
+    "row_starts"
+   ],
+   "pin": "0.7.2",
+   "status": "installed"
+  },
+  "sgl_kernel:fused_add_rmsnorm": {
+   "dist": "sglang-kernel",
+   "hash": "cda96a148ba779fd68324be7d26a072c2702063f8a670e82e7ea4be64fa922e1",
+   "installed": "0.4.10",
+   "params": [
+    "input",
+    "residual",
+    "weight",
+    "eps",
+    "enable_pdl"
+   ],
+   "pin": "0.4.10",
+   "status": "installed"
+  },
+  "sgl_kernel:gemma_fused_add_rmsnorm": {
+   "dist": "sglang-kernel",
+   "hash": "7909f4537530f12b5d476eec8d3bcf252f88c1931fa88c263932df21e5b41676",
+   "installed": "0.4.10",
+   "params": [
+    "input",
+    "residual",
+    "weight",
+    "eps",
+    "enable_pdl"
+   ],
+   "pin": "0.4.10",
+   "status": "installed"
+  },
+  "sgl_kernel:gemma_rmsnorm": {
+   "dist": "sglang-kernel",
+   "hash": "65cc2eccd8f8b019d65f7c4f2edd4a04b3f34285c8aa320bd3c75955a066db6b",
+   "installed": "0.4.10",
+   "params": [
+    "input",
+    "weight",
+    "eps",
+    "out",
+    "enable_pdl"
+   ],
+   "pin": "0.4.10",
+   "status": "installed"
+  },
+  "sgl_kernel:rmsnorm": {
+   "dist": "sglang-kernel",
+   "hash": "3ccfa2ea2eab07afebd854e9373416e8905760ab9b6823dbe26c0ad323392d61",
+   "installed": "0.4.10",
+   "params": [
+    "input",
+    "weight",
+    "eps",
+    "out",
+    "enable_pdl"
+   ],
+   "pin": "0.4.10",
+   "status": "installed"
+  },
+  "sglang.kernels.ops.activation.activation:activation_module": {
+   "hash": "904928fc919d1cbe0fc7820373d1bc6a953d9a2152d7233eac8a66c200f33b43",
+   "params": [
+    "dtype",
+    "fast_math"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.activation.activation:silu_and_mul": {
+   "hash": "9f4cc41bdbaec1ea0c621288ad76e4c5a864f32b878ff619c7b18c4aed565fd4",
+   "params": [
+    "input",
+    "out",
+    "expert_ids",
+    "expert_step",
+    "sorted_token_ids",
+    "num_tokens_post_padded",
+    "num_valid_tokens"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.activation.activation:silu_and_mul_accurate": {
+   "hash": "e6860d3a675d9a10c0c9d310d6882b6dd23576dc4c57b93ce89a290ef4d04980",
+   "params": [
+    "input",
+    "out"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.activation.activation:silu_and_mul_with_activation_rounding": {
+   "hash": "224743ac755a31f395ef13f3f57b36ce8ce56d4cdd9df0e6b6fac9cb1b4ebf29",
+   "params": [
+    "input",
+    "out",
+    "clamp_limit"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.activation.silu_and_mul_clamp:silu_and_mul_clamp": {
+   "hash": "f73677716be7c0a8f7f879323d56049ff1979e71316d21cef56c22585b4c96c9",
+   "params": [
+    "input",
+    "output",
+    "swiglu_limit"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.activation.silu_and_mul_clamp:silu_and_mul_contig_post_quant": {
+   "hash": "6825c591e7e0b7af80c69c6ca308475046f03d4c7eede7252b169c2aaa742689",
+   "params": [
+    "input",
+    "output",
+    "output_scale",
+    "quant_group_size",
+    "scale_ue8m0",
+    "transposed",
+    "swiglu_limit",
+    "swizzle"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsa.dequant_k_cache:dequantize_k_cache_paged_dsa": {
+   "hash": "d23a66dbac5bb9c3a5230a69bfa168bdf067f01131c1fe06f3455eece4ffd986",
+   "params": [
+    "quant_k_cache",
+    "page_table_1_flattened",
+    "group_size"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsa.tilelang_kernel:tilelang_fp8_paged_mqa_logits": {
+   "hash": "9627beb485677416d5074fae104a08bb4a6d4fc47f0b438d2cc205964d0e1f61",
+   "params": [
+    "q_fp8",
+    "kvcache_fp8",
+    "weight",
+    "seq_lens",
+    "page_table",
+    "deep_gemm_metadata",
+    "max_seq_len",
+    "clean_logits"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsa.tilelang_kernel:tilelang_sparse_fwd": {
+   "hash": "1765038e744eb0755fc2184ed39293c09ad09e9aa6f26f8e9d8ab66b0b45644c",
+   "params": [
+    "q",
+    "kv",
+    "indices",
+    "sm_scale",
+    "d_v"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsv4.dequant_k_cache:dequantize_k_cache_paged_dsv4": {
+   "hash": "58d494184c393dfe7cdc12eea41e94c55771123771de2d4973b532984ca1be67",
+   "params": [
+    "quant_k_cache",
+    "page_table_1_flattened",
+    "page_size",
+    "out",
+    "layout"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsv4.fp4_indexer:fp4_index_logits_paged": {
+   "hash": "35b8336018fb4ad58ac1fdc4dfa8c78dd5e8c904982cf254161bc92be89ce6c4",
+   "params": [
+    "q",
+    "weights",
+    "req",
+    "req_table",
+    "lens",
+    "table",
+    "page_size",
+    "max_len",
+    "ratio",
+    "candidate_mask"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsv4.norm_rope:fused_rope_inplace": {
+   "hash": "6586f6f152cb7de24f99f1480602833a2be9ac8ca525f30af68708d4cef7c236",
+   "params": [
+    "q",
+    "k",
+    "freqs_cis",
+    "positions",
+    "inverse"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsv4.topk:topk_transform_paged_v2": {
+   "hash": "b8e65794ec402cd326a76c0968bba55b2dd6f95ce1476bba86bae643d66e4c03",
+   "params": [
+    "scores",
+    "seq_lens",
+    "page_tables",
+    "out_page_indices",
+    "page_size",
+    "metadata",
+    "out_raw_indices"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16": {
+   "hash": "1ef70c29ed2efd2070d35555fb3115a0a84d586899393fb3f6df1869bc0683fd",
+   "params": [
+    "x",
+    "weight",
+    "freqs_cis",
+    "positions",
+    "out_mxfp8"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.chunk:chunk_gated_delta_rule": {
+   "hash": "d4d31d9344781ed4052fe081c53c095cb3d3e38fe16f59f9526dfbe9c21fb5b4",
+   "params": [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "scale",
+    "initial_state",
+    "initial_state_indices",
+    "cu_seqlens",
+    "head_first",
+    "use_qk_l2norm_in_kernel",
+    "inplace_update",
+    "fixed_output_tile",
+    "track_state",
+    "track_chunk_idx"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.chunk_fwd:chunk_gated_delta_rule_fwd_kkt_solve_kernel": {
+   "hash": "14be81b1abcd8fa7b31bacb1455ff555f3f248ec8d19e5b205bb195897826f97",
+   "params": [
+    "k",
+    "g",
+    "beta",
+    "A",
+    "cu_seqlens",
+    "chunk_indices",
+    "T",
+    "H",
+    "Hg",
+    "K",
+    "BT",
+    "BC",
+    "BK",
+    "USE_G",
+    "IS_VARLEN"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.chunk_intra:chunk_kda_fwd_intra": {
+   "hash": "f2a525464ba8bbee193eb96ddd709d45dd701794708d6c86997af4740ce0528f",
+   "params": [
+    "q",
+    "k",
+    "v",
+    "gk",
+    "beta",
+    "scale",
+    "cu_seqlens",
+    "chunk_size",
+    "chunk_indices",
+    "safe_gate",
+    "fuse_recompute",
+    "fuse_diagonal"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.chunk_intra:chunk_kda_fwd_kernel_intra_sub_chunk": {
+   "hash": "ac8e67ad52b25adbe3292b44711f4fd5d2df90c8b2cf2ef62e2b0fc87e9e8982",
+   "params": [
+    "q",
+    "k",
+    "g",
+    "beta",
+    "Aqk",
+    "Akk",
+    "scale",
+    "cu_seqlens",
+    "chunk_indices",
+    "T",
+    "H",
+    "K",
+    "BT",
+    "BC",
+    "BK",
+    "IS_VARLEN",
+    "USE_GATHER"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.fused_recurrent:fused_recurrent_gated_delta_rule_packed_decode": {
+   "hash": "97c730607b8cfb67324254d2829dc1f0a03c21889eef5cfcbbdadc1465d7752b",
+   "params": [
+    "mixed_qkv",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "scale",
+    "initial_state",
+    "out",
+    "ssm_state_indices",
+    "use_qk_l2norm_in_kernel"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.fused_recurrent:fused_recurrent_kda_packed_decode": {
+   "hash": "ed521de0a9b7cec08879f3fa2d6f41ba2a705da137a11d5f8a2aa01a46cb6a3a",
+   "params": [
+    "mixed_qkv",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "scale",
+    "initial_state",
+    "out",
+    "ssm_state_indices",
+    "use_qk_l2norm_in_kernel",
+    "lower_bound"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fla.kda:chunk_kda": {
+   "hash": "f61e31799044b94f3f48db5e0835922c5ef8ae0ddc2c9e348021400859c65c23",
+   "params": [
+    "q",
+    "k",
+    "v",
+    "g",
+    "beta",
+    "scale",
+    "initial_state",
+    "initial_state_indices",
+    "use_qk_l2norm_in_kernel",
+    "cu_seqlens",
+    "A_log",
+    "dt_bias",
+    "lower_bound",
+    "output_intermediate_states",
+    "track_state",
+    "track_chunk_idx",
+    "beta_is_raw",
+    "chunk_indices",
+    "chunk_offsets",
+    "**kwargs"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.flash_attention_v4:flash_attn_with_kvcache": {
+   "hash": "5261197953dd68c131fcb782e4c8626dd737fceabe7bb15f51d21d928fb711ce",
+   "params": [
+    "q",
+    "k_cache",
+    "v_cache",
+    "k",
+    "v",
+    "qv",
+    "rotary_cos",
+    "rotary_sin",
+    "cache_seqlens",
+    "cache_batch_idx",
+    "cache_leftpad",
+    "page_table",
+    "cu_seqlens_q",
+    "cu_seqlens_k_new",
+    "max_seqlen_q",
+    "rotary_seqlens",
+    "q_descale",
+    "k_descale",
+    "v_descale",
+    "softmax_scale",
+    "causal",
+    "window_size",
+    "attention_chunk",
+    "softcap",
+    "rotary_interleaved",
+    "scheduler_metadata",
+    "num_splits",
+    "pack_gqa",
+    "sm_margin",
+    "sinks",
+    "score_mod",
+    "aux_tensors",
+    "sfq",
+    "sfk",
+    "sfv",
+    "rel_bias",
+    "rel_bias_prep_cache",
+    "return_softmax_lse",
+    "mask_mod",
+    "out",
+    "true_on_policy",
+    "**_"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.flash_attn.cute.interface:flash_attn_combine": {
+   "hash": "32f8a845f0635370b18361bef951bc8dfca791d979db7a216dc64b285cbcddcb",
+   "params": [
+    "out_partial",
+    "lse_partial",
+    "out",
+    "out_dtype",
+    "cu_seqlens",
+    "seqused",
+    "varlen_batch_idx",
+    "return_lse"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.flash_attn.cute.interface:flash_attn_varlen_func": {
+   "hash": "5fc110002fb554936dc09b68dcf759d266cc9c4d9ca9aeadcf2a56176f75eb0f",
+   "params": [
+    "q",
+    "k",
+    "v",
+    "qv",
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "min_seqlen_k",
+    "seqused_q",
+    "seqused_k",
+    "gather_kv_indices",
+    "page_table",
+    "softmax_scale",
+    "causal",
+    "window_size",
+    "learnable_sink",
+    "softcap",
+    "num_splits",
+    "pack_gqa",
+    "deterministic",
+    "score_mod",
+    "score_mod_bwd",
+    "mask_mod",
+    "block_sparse_tensors",
+    "aux_tensors",
+    "aux_scalars",
+    "q_descale",
+    "k_descale",
+    "v_descale",
+    "rel_bias",
+    "sfq",
+    "sfk",
+    "sfv",
+    "qk_sf_vec_size",
+    "v_sf_vec_size",
+    "rel_bias_prep_cache",
+    "return_lse",
+    "out"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.flash_mla_interface:flash_mla_sparse_fwd": {
+   "hash": "456354a3f09c3a65daa88f0d5f10642e5f406d9e749bea8a3fef76b819d04771",
+   "params": [
+    "q",
+    "kv",
+    "indices",
+    "sm_scale",
+    "d_v",
+    "attn_sink",
+    "topk_length",
+    "use_legacy"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.flash_mla_interface:flash_mla_with_kvcache": {
+   "hash": "cf37676220c81173ee2b02773a152f2949e2cedabd5c9acda3968117ace8a552",
+   "params": [
+    "q",
+    "k_cache",
+    "block_table",
+    "cache_seqlens",
+    "head_dim_v",
+    "tile_scheduler_metadata",
+    "num_splits",
+    "softmax_scale",
+    "causal",
+    "descale_q",
+    "descale_k",
+    "is_fp8_kvcache",
+    "indices",
+    "attn_sink",
+    "extra_k_cache",
+    "extra_indices_in_kvcache",
+    "topk_length",
+    "extra_topk_length",
+    "kv_format",
+    "use_legacy"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate:fused_qk_gemma_rmsnorm_rope_gate": {
+   "hash": "038d1cca6b2531ce81f57e4256e18ad8309eb5f449e384e87f70717dfdf744c5",
+   "params": [
+    "q_gate",
+    "k",
+    "q_weight",
+    "k_weight",
+    "cos_sin_cache",
+    "positions",
+    "eps",
+    "num_q_heads",
+    "num_kv_heads",
+    "head_dim",
+    "rotary_dim",
+    "has_gate",
+    "mrope_axis_map"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.fused_qknorm_rope:fused_qk_norm_rope": {
+   "hash": "b972acfd533caed63eab2a5971440f28dba64962b566cf128d6c881d4528e9d9",
+   "params": [
+    "qkv",
+    "num_heads_q",
+    "num_heads_k",
+    "num_heads_v",
+    "head_dim",
+    "eps",
+    "q_weight",
+    "k_weight",
+    "base",
+    "is_neox",
+    "position_ids",
+    "factor",
+    "low",
+    "high",
+    "attention_factor",
+    "rotary_dim"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify:fused_kda_conv_gating_verify": {
+   "hash": "ca033f3bbcaf6ff81f915d12dd9080acc1ed766f1770cd8a210a375f9dd8377e",
+   "params": [
+    "mixed_qkv",
+    "conv_weight",
+    "conv_bias",
+    "conv_state",
+    "conv_state_indices",
+    "intermediate_conv_window",
+    "intermediate_state_indices",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "ssm_states",
+    "cache_indices",
+    "intermediate_states_buffer",
+    "scale",
+    "T",
+    "num_q_heads",
+    "num_v_heads",
+    "head_k_dim",
+    "head_v_dim",
+    "lower_bound",
+    "softplus_beta",
+    "softplus_threshold",
+    "use_qk_l2norm_in_kernel",
+    "num_warps",
+    "cache_ring",
+    "replayssm_rawv",
+    "replayssm_rawk",
+    "replayssm_g",
+    "replayssm_beta"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm:fused_recurrent_linear_replayssm_decode": {
+   "hash": "8ff847a3d45dcdbb1d416d69c76f9e3321718f1f4601b98463d53d5210fcab37",
+   "params": [
+    "mixed_qkv",
+    "a",
+    "b",
+    "A_log",
+    "dt_bias",
+    "scale",
+    "initial_state",
+    "d_cache",
+    "k_cache",
+    "g_cache",
+    "out",
+    "ssm_state_indices",
+    "write_pos",
+    "force_flush",
+    "use_qk_l2norm_in_kernel",
+    "is_kda",
+    "block_v",
+    "num_warps",
+    "num_stages",
+    "nk"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent:fused_sigmoid_gating_delta_rule_update": {
+   "hash": "9d250fafcae4f2c1d33b57bbda813b12eb0a241088b968f4040d7331ad26bc43",
+   "params": [
+    "A_log",
+    "a",
+    "dt_bias",
+    "softplus_beta",
+    "softplus_threshold",
+    "q",
+    "k",
+    "v",
+    "b",
+    "initial_state_source",
+    "initial_state_indices",
+    "scale",
+    "use_qk_l2norm_in_kernel",
+    "cu_seqlens",
+    "is_kda",
+    "lower_bound",
+    "disable_state_update",
+    "intermediate_states_buffer",
+    "intermediate_state_indices",
+    "cache_steps",
+    "retrieve_parent_token",
+    "cache_ring",
+    "replayssm_rawv",
+    "replayssm_rawk",
+    "replayssm_g",
+    "replayssm_beta",
+    "match_cutedsl_decode"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.rope:FusedSetKVBufferArg": {
+   "hash": "e596533bf551dbfbad38e8122be74c8e7e507336ed08626896774980f2d3b466",
+   "params": null,
+   "status": "repo"
+  },
+  "sglang.kernels.ops.attention.rope:apply_rope_with_cos_sin_cache_inplace": {
+   "hash": "9dfd5caad1e9c023b3dec7b03431bfb8d5d1d30446e9d2fb631ee940247f60e5",
+   "params": [
+    "q",
+    "k",
+    "cos_sin_cache",
+    "positions",
+    "is_neox",
+    "rope_dim",
+    "fused_args"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.elementwise.elementwise:fused_sigmoid_mul": {
+   "hash": "5a998b3aa06741f0b6225915f10810ab49fed320d7734d12ae2cfc56cd3ff6d5",
+   "params": [
+    "attn_output",
+    "gate",
+    "inplace",
+    "quant"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.elementwise.hc_combine:hc_combine": {
+   "hash": "ed2092251b151b1cd813d4309b4d41465156ac7e2c94619221007899479d005a",
+   "params": [
+    "block_output",
+    "residual",
+    "normed_residual",
+    "inject_weight",
+    "hc_count",
+    "hidden_size",
+    "out"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.elementwise.qwen4_gate:fused_qwen4_gate_reduce": {
+   "hash": "8fef6a29165e865a87483d9df47ca138d846ee49c6743910ea4b58ab9c162e13",
+   "params": [
+    "key",
+    "query",
+    "value"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.embeddings.engram_gate:fused_engram_gate": {
+   "hash": "ce8cf275c3c9ed4a23c372c47161d2b705fff72cc7403423db4d168f164709ae",
+   "params": [
+    "x",
+    "kv",
+    "q_weight",
+    "k_weight",
+    "eps",
+    "clamp_value",
+    "input_ids",
+    "image_token_id"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.embeddings.engram_hash:engram_hash_ids": {
+   "hash": "cc1bc525d8f4497b6c67aec0cb5f2ea03b5f4fe7f8013793130c21d6355277eb",
+   "params": [
+    "input_ids",
+    "positions",
+    "mode",
+    "history",
+    "token_map",
+    "multipliers",
+    "primes",
+    "offsets",
+    "pad_id",
+    "num_real",
+    "req_slots",
+    "block",
+    "row",
+    "starts",
+    "image_token_id",
+    "mm_pad_shift",
+    "block_t"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.gemm.bf16_fp32:linear_bf16_fp32": {
+   "hash": "edb5e635cdd7cd0c12f4585a332052d7171dd39a23fe37257a79f60a2ffae540",
+   "params": [
+    "x",
+    "y",
+    "hpc_kernel_min_m"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.gemm.hc_mix:fused_hc_mix": {
+   "hash": "64c381ef54a94593c935eb09e46f309f8023513d4480717468a0ffc345567e02",
+   "params": [
+    "hyper_input_normed",
+    "w_down",
+    "w_up",
+    "hc",
+    "hs"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.gemm.hc_mix_splitk:hc_mix": {
+   "hash": "520ed55302cd05da1bbeddf94786bb6f50309332fc5079d68f6db1d1b558478e",
+   "params": [
+    "hyper_input_normed",
+    "w_down",
+    "w_up_permuted_padded",
+    "hc_count",
+    "hidden_size"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16": {
+   "hash": "097bae9db22f9e2468f363e0f50494db981344730803f958c5b96d943ba2e3d8",
+   "params": [
+    "x",
+    "w",
+    "out"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.hc_combine_norm:hc_combine_norm": {
+   "hash": "16fd0d71d4bca50cbee3aa50516f325817c9a4e683f69ed8fa8361a947236cb9",
+   "params": [
+    "x",
+    "pre",
+    "weight",
+    "eps"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:hc_contract": {
+   "hash": "87ff467e930028aa5c2b3eddda1f3bab7fc1431e92c49f13c47cd12cba231011",
+   "params": [
+    "x",
+    "n"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:hc_mix_stats_sinkhorn": {
+   "hash": "f70364ed81d5a7079bf07bf127cdcb9b4440a931e241c6f7334ace882721fd96",
+   "params": [
+    "x_flat",
+    "hc_fn",
+    "hc_scale",
+    "hc_base",
+    "hc_mult",
+    "sinkhorn_iters",
+    "rms_eps",
+    "hc_eps"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:mhc_combine": {
+   "hash": "a892fc0755372c2eeb9c7e6b21d74c5ecba05ab856e4730b3d84f1fdaec6a0ad",
+   "params": [
+    "x_flat",
+    "pre",
+    "hc",
+    "out_dtype"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:mhc_fused_post_pre_fma_tilelang": {
+   "hash": "5efd8e5f79f47b6e4d0cd1edad4bc49758ac54d32f702ba670da5a9521ee168e",
+   "params": [
+    "prev_comb_mix",
+    "prev_residual",
+    "prev_post_mix",
+    "hidden_in",
+    "pre_fn",
+    "mixes_partial_out",
+    "sqrsum_partial_out",
+    "cur_residual_out",
+    "hc",
+    "hidden_size",
+    "num_mix_outputs",
+    "n_thr",
+    "tile_mix_outputs",
+    "split_k"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:mhc_pre_big_fuse_with_norm_tilelang": {
+   "hash": "65f0c848bc65b544f1ab3661365e34f5ea74b6d7440f16a25e103f39f24c221a",
+   "params": [
+    "gemm_out_mul",
+    "gemm_out_sqrsum",
+    "hc_scale",
+    "hc_base",
+    "residual",
+    "post_mix",
+    "comb_mix",
+    "layer_input",
+    "norm_weight",
+    "hidden_size",
+    "rms_eps",
+    "hc_pre_eps",
+    "hc_sinkhorn_eps",
+    "hc_post_mult_value",
+    "sinkhorn_repeat",
+    "norm_eps",
+    "n_splits",
+    "hc_mult",
+    "gemm_last_dim"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc:split_bf16_hc_weight": {
+   "hash": "83dcc6505658b66986309f14b82097182cdebd22bcddf631bdeac2cc40b8ea58",
+   "params": [
+    "weight"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc_head:fused_hc_head": {
+   "hash": "27b2cd89523f5abedf8fda1ca59fe66526f803e4ec3dd0df3174a0ba3e90d9d6",
+   "params": [
+    "x",
+    "hc_fn",
+    "hc_scale",
+    "hc_base",
+    "norm_eps",
+    "hc_eps"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc_mega:mhc_mega_boundary": {
+   "hash": "3fac84eb34385701574bc1ddb0f3145002f4559324d9cf02b6c4da155684a146",
+   "params": [
+    "x",
+    "residual",
+    "pre",
+    "post",
+    "comb",
+    "fn",
+    "scale",
+    "base",
+    "weight",
+    "rms_eps",
+    "hc_eps",
+    "norm_eps",
+    "sinkhorn_iters",
+    "y_fp8",
+    "y_gemm_sf",
+    "moe_input"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.mhc_post_split_h:mhc_post_split_h": {
+   "hash": "a436104c426f89c2a6ebb9223cb6d30237487d96ebf935232ab1a09fa77ec94f",
+   "params": [
+    "x",
+    "residual",
+    "post",
+    "comb",
+    "block_size"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.layernorm.norm:fused_inplace_qknorm": {
+   "hash": "5663b51ba1670c9de63278ac03b53cf2955e7b4df2c08dc2281400659b2f672a",
+   "params": [
+    "q",
+    "k",
+    "q_weight",
+    "k_weight",
+    "eps",
+    "head_dim"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state": {
+   "hash": "5a89dd515e9a62019244534b1a4102897e49cc3e8d718acd4f067e7914c7aa7f",
+   "params": [
+    "state",
+    "state_indices",
+    "x"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.moe.dsv4:hash_topk": {
+   "hash": "d2ed4cfb71db2fd458c6d849ecd53f146db3a2e53a55a58d40fdf68565fd1d46",
+   "params": [
+    "router_logits",
+    "input_ids",
+    "tid2eid",
+    "num_fused_shared_experts",
+    "routed_scaling_factor",
+    "scoring_func"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.moe.ep_moe_kernels:ep_gather": {
+   "hash": "4db7fd80c7f15b6dffa26cbfd404934fa8a2e1b033ea4b58fcd5ada285ad9c16",
+   "params": [
+    "input_tensor",
+    "recv_topk_ids",
+    "recv_topk_weight",
+    "input_index",
+    "output_tensor"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.moe.ep_moe_kernels:silu_and_mul_masked_fwd": {
+   "hash": "d319bb77ecaf850a6844066432ea7948f6c989a86cd15f6f63b553352d4eeeba",
+   "params": [
+    "input",
+    "output",
+    "masked_m",
+    "precise",
+    "swiglu_limit"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.moe.moe_fused_gate:moe_fused_gate": {
+   "hash": "e3691eb4c239d402579471404a18fce0b01a76c2fe6609ecb35da5ead3e52d9a",
+   "params": [
+    "scores",
+    "bias",
+    "topk",
+    "scoring_func",
+    "num_fused_shared_experts",
+    "renormalize",
+    "routed_scaling_factor",
+    "apply_routed_scaling_factor_on_output",
+    "moe_softcapping",
+    "num_expert_group",
+    "topk_group",
+    "bias_alt",
+    "input_ids",
+    "bias_alt_token_id",
+    "num_token_non_padded",
+    "renormalize_epsilon",
+    "packed_out",
+    "sqrtsoftplus_log1p"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.quantization.fp8_kernel:sglang_per_token_group_quant_fp8": {
+   "hash": "deeda1d101dee1ef36e46379c0c67062f7ff26ef586c964a3c2b1098e14ac55e",
+   "params": [
+    "x",
+    "group_size",
+    "eps",
+    "column_major_scales",
+    "scale_tma_aligned",
+    "scale_ue8m0",
+    "fuse_silu_and_mul",
+    "masked_m",
+    "output_q",
+    "output_s"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.quantization.per_token_group_quant:_jit_module": {
+   "hash": "06823ab7aa573a513347e8ab00e70f316dd668c29cdbea9443326e66a6e0a02a",
+   "params": [
+    "in_dtype",
+    "out_dtype",
+    "group_size",
+    "scale_ue8m0",
+    "row_major",
+    "aligned",
+    "fuse_silu_and_mul",
+    "masked_layout",
+    "use_pdl",
+    "sorted_layout",
+    "silu_and_mul_mode",
+    "ue8m0_fp32",
+    "clamp_swiglu",
+    "deepep_amax_floor"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.sampling.murmur_hash:murmur_hash32": {
+   "hash": "ea1737395176785030ae6b220521651ddfb1c43f4c5c357f04382e229a321e59",
+   "params": [
+    "seed",
+    "positions",
+    "col_indices"
+   ],
+   "status": "repo"
+  },
+  "sglang.kernels.ops.speculative.dspark.markov_sample:MarkovSampleStep": {
+   "hash": "1ecf01cc925bb5580993f9766b9c5788dc749b02214669543f65cf8ffffd7e1f",
+   "params": null,
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:_log_softmax_kernel": {
+   "hash": "8c60fa5562dc180465ce99d3cc4f241ab7b9ce8a5d40e7f7c80aa1c7bc64e9b9",
+   "params": [
+    "input_ptr",
+    "output_ptr",
+    "input_row_stride",
+    "output_row_stride",
+    "n_cols",
+    "BLOCK_SIZE"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:_matmul_persistent_deepgemm": {
+   "hash": "01ac96cde73ad207c02d6659e0986a990e84eac9ed7311be3b6db7464bb1f7eb",
+   "params": [
+    "a",
+    "b",
+    "out_dtype",
+    "bias"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:_matmul_persistent_top": {
+   "hash": "4db02ad38fe350c84bbbf443eea4c10e542a1eac556fd4db1bdf92e24dd814c0",
+   "params": [
+    "a",
+    "b",
+    "out_dtype",
+    "bias"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:_matmul_persistent_triton": {
+   "hash": "2a3487fa3bb1dc495c610dd4d334f46adf24256b6b5d5c9313c5381d4f44d407",
+   "params": [
+    "a",
+    "b",
+    "out_dtype",
+    "bias",
+    "config"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:matmul_persistent": {
+   "hash": "9d9d155cd801024dc80cf11f7e0708f67564214b22ba8ad5f2452b3f233d90bb",
+   "params": [
+    "a",
+    "b",
+    "bias",
+    "out_dtype"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:mean_batch_invariant": {
+   "hash": "34a12daa46380c91b02f59f2859116156010543a31a3c98df1c46cbed66b60ac",
+   "params": [
+    "input",
+    "dim",
+    "keepdim",
+    "dtype"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_invariant_ops.batch_invariant_ops:rms_norm_batch_invariant": {
+   "hash": "fa9f18f6836ecfd14f3f19e7e02801d1cbfbdcdbbc48ef16ff79d433d69fc13a",
+   "params": [
+    "input",
+    "weight",
+    "eps"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_overlap.single_batch_overlap:compute_overlap_args": {
+   "hash": "8253bb32b5350cd5c340b507149d92bd898f254070a02130f2dc8ad92c1d1ed9",
+   "params": [
+    "dispatch_output",
+    "alt_stream"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.batch_overlap.two_batch_overlap:MaybeTboDeepEPDispatcher": {
+   "hash": "44996ffcf29aa05e4e05d8b4f50777c1449e6d7f18dbeeed2179fd1b127426e0",
+   "params": [
+    "self",
+    "runner_backend",
+    "**kwargs"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.compilation.torch_compile_decoration:patch_model": {
+   "hash": "0e5fb225ed43738ef0b427f17a0eb6ae989c23246c8d1e8e5f03768ee761ac6a",
+   "params": [
+    "model",
+    "enable_compile",
+    "num_tokens",
+    "tp_group"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.activation:SiluAndMul.forward_cuda": {
+   "hash": "c7df8232d980df5dd5591a82900a84f888e6ae4a24b1c438b35763c52801f77d",
+   "params": [
+    "self",
+    "x"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.deepseek_v4_backend:DeepseekV4AttnBackend._low_ratio_compress_fused": {
+   "hash": "d0bcdb9ac1c302702e75d3755d16e8f2c226eb3fdcfb74c4c5d462706d4e1065",
+   "params": [
+    "self",
+    "layer",
+    "x",
+    "req",
+    "pos",
+    "draft_len",
+    "extend_offsets",
+    "projected"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa.dsa_indexer_kpool:IndexerKPool._forward_cuda_skip_logits": {
+   "hash": "2345e4501120442008e5cb3bf680811bfce369f020afd2b628c7b5d59c3d8e03",
+   "params": [
+    "self",
+    "x",
+    "positions",
+    "forward_batch",
+    "layer_id",
+    "act_quant",
+    "metadata",
+    "return_indices"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa.dsa_indexer_kpool:IndexerKPool._project_and_scale_head_gates": {
+   "hash": "e0597448aa71ef48cc2c31984887218214493ebc9ac3fd9851ec1127557329b9",
+   "params": [
+    "self",
+    "x"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa.dsa_topk_backend:_topk_transform_v2_paged": {
+   "hash": "58b635f7a7f6f740828d8ccc03dd9bcb09cdb04bcbd02d278351304db4b164c6",
+   "params": [
+    "logits",
+    "lengths",
+    "topk",
+    "attn_metadata"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa.kpool_fp8_index:kpool_softmax_rotate_write_cache": {
+   "hash": "c55e894465e9ddcbd6f75ff7f14f128a4cfd4313e9211992356be8a3bfe47c86",
+   "params": [
+    "pool",
+    "buf",
+    "slot_k",
+    "slot_score",
+    "ape",
+    "loc",
+    "write_mask",
+    "round_scale",
+    "return_compressed",
+    "write_cache"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa.kpool_fp8_index:topk_from_pooled_history_logits": {
+   "hash": "13d7f24671eb40df21ffaa205e8236dfafb25b238c14e1e34825b268a76e96d2",
+   "params": [
+    "logits",
+    "group_lengths",
+    "kpool",
+    "topk",
+    "page_table",
+    "topk_offsets",
+    "seq_lens",
+    "row_starts",
+    "out_rows",
+    "page_table_row_index",
+    "topk_v2_plan"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa_backend:DeepseekSparseAttnBackend._forward_flashmla_kv": {
+   "hash": "060d6cbf87cb3bb294cf1b0b121ef3a27d30d6249c5ac16f4982585821a4a81e",
+   "params": [
+    "self",
+    "q_all",
+    "kv_cache",
+    "v_head_dim",
+    "sm_scale",
+    "layer",
+    "metadata",
+    "page_table_1"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.dsa_backend:DeepseekSparseAttnBackend._forward_flashmla_sparse": {
+   "hash": "e630a6beead02a753a765f50757a8f97d78cb01fcba7b15706a2741c0956bc19",
+   "params": [
+    "self",
+    "q_all",
+    "kv_cache",
+    "v_head_dim",
+    "page_table_1",
+    "sm_scale",
+    "topk_length",
+    "attn_sink"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.linear.kernels.gdn_cutedsl:CuteDSLGDNKernel": {
+   "hash": "7e8c233203593ce2616bde30108cb65c848bbd2039cd9323a5febf62ef9264e2",
+   "params": [
+    "self"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.qsa.kernel:average_pool_qsa_keys": {
+   "hash": "dc4ad48c0ac4dfd174e448e79576c42a9661e76ade5e7737e2a9e8874706ad96",
+   "params": [
+    "key_groups"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.qsa.kernel:qsa_sparse_attention": {
+   "hash": "2abf74086e8e4b347084f87ed1d7e589918379a7fee257afdacac2cf55c0b883",
+   "params": [
+    "q",
+    "k_cache",
+    "v_cache",
+    "token_slots",
+    "softmax_scale"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.qsa.mqa:qsa_mqa_decode": {
+   "hash": "e2f84495533b277680317d1b24ad0954cd3e849941e91b736a458a37c2107338",
+   "params": [
+    "q",
+    "k_cache",
+    "page_table",
+    "context_lens",
+    "max_model_len",
+    "score_scale",
+    "min_scored_len"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.qsa.qsa_indexer:QSAIndexer._fused_compress_store": {
+   "hash": "12c851d7bf6be620913acbf46abe5b0d032321aa7fefb2d85913bfa64481f211",
+   "params": [
+    "self",
+    "pool",
+    "group_locs",
+    "write_locs",
+    "source_keys",
+    "source_rope"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.qwen_sparse_attn_backend:QwenSparseAttnBackend._forward_trtllm_sparse": {
+   "hash": "c4e9b47b3d9fce51561ee2043d1e84b5f7f82d95c07f0ac35486fef21c01f510",
+   "params": [
+    "self",
+    "q",
+    "k_buffer",
+    "v_buffer",
+    "layer",
+    "forward_batch",
+    "metadata",
+    "topk_indices",
+    "trtllm_decode",
+    "new_kv"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.attention.vision:VisionFlash4Attention": {
+   "hash": "dfcf0b1268a69bde0edd79ac07626e15c192159231361fb09481e04437132493",
+   "params": [
+    "self",
+    "**kwargs"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.conv:Conv3dLayer": {
+   "hash": "1398a7437b229517dd7a6b9118e886e9330168118066eeab177a1157538353bf",
+   "params": [
+    "self",
+    "in_channels",
+    "out_channels",
+    "kernel_size",
+    "stride",
+    "padding",
+    "dilation",
+    "groups",
+    "bias",
+    "padding_mode",
+    "disable_linear"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:gemm_nt_f8f8bf16": {
+   "hash": "16524e06179425b599b1f1b83ec23297a0d383bc79cd7ab37b655751e9d77759",
+   "params": [
+    "lhs",
+    "rhs",
+    "out",
+    "recipe"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:grouped_gemm_nt_bf16_contig": {
+   "hash": "8389f8020ac3e033f8e7d6393aabd7da176ad1c419622b764a7aab80eaea628e",
+   "params": [
+    "a",
+    "b",
+    "d",
+    "m_indices"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:grouped_gemm_nt_bf16_masked": {
+   "hash": "3b33963d6e0ab52a60df28d095a630e6fc3f2c549e7c885d1081ffc614c341f5",
+   "params": [
+    "a",
+    "b",
+    "d",
+    "masked_m",
+    "expected_m"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:grouped_gemm_nt_f8f8bf16_contig": {
+   "hash": "4a8e689ac61e8afe7b2e981750db4cac6555b812083657c944619d505022c54f",
+   "params": [
+    "lhs",
+    "rhs",
+    "out",
+    "m_indices",
+    "recipe_a",
+    "recipe_b"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:grouped_gemm_nt_f8f8bf16_masked": {
+   "hash": "8d2ce488d03ad5bf2eb86c7446a7e0cec4ac4520b405cabd31c6201ad1e1ef0f",
+   "params": [
+    "lhs",
+    "rhs",
+    "out",
+    "masked_m",
+    "expected_m",
+    "overlap_args",
+    "max_block_n",
+    "recipe_a",
+    "recipe_b"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.deep_gemm_wrapper.entrypoint:tf32_hc_prenorm_gemm": {
+   "hash": "50776f040431d1f45cc82191d1c91c97591162852acca346d52309d44b64715f",
+   "params": [
+    "x",
+    "fn",
+    "out",
+    "sqrsum",
+    "num_splits"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.dp_attention:attn_tp_reduce_scatter_tensor": {
+   "hash": "7afcd181d13359b132a55eb30f6d4a992a91346c1d8285e5b51a02f33c91c99f",
+   "params": [
+    "output",
+    "input"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.dual_gemm:DualGemm": {
+   "hash": "c834ac25115ffb488d95c79078ac5b8aa70a96379e4a79effada32e7093276d4",
+   "params": [
+    "self",
+    "gate_up_proj",
+    "down_proj",
+    "hidden_size"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.engram:engram_gate": {
+   "hash": "a3e0a1c0f350e63fd44724f653b55ecabfbf7bbd480df709fee41d67d60f7229",
+   "params": [
+    "x",
+    "kv",
+    "q_weight",
+    "k_weight",
+    "eps",
+    "clamp_value",
+    "input_ids",
+    "image_token_id"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.flashinfer_comm_fusion:flashinfer_allreduce_residual_rmsnorm": {
+   "hash": "cfc8dab44f9bcfeea6c14aaa12a545d4051f4dee83fe59d87d5cd6739b9f19a9",
+   "params": [
+    "input_tensor",
+    "residual",
+    "weight",
+    "eps",
+    "max_token_num",
+    "use_oneshot",
+    "trigger_completion_at_end",
+    "fp32_acc",
+    "use_attn_tp_group"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.layer_boundary.residual.add_norm:PlainAdd.update": {
+   "hash": "cf1961c967ec87a688d7394a4646f796f9166dbc1fa9571bf4a29e8aee1c64c6",
+   "params": [
+    "self",
+    "hidden_states",
+    "residual"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.layernorm:RMSNorm.forward_native": {
+   "hash": "a65c8f6527a6aeb909f657f8d2d18d152cb5c90dfb564cf69a9ec841b7852154",
+   "params": [
+    "self",
+    "x",
+    "residual",
+    "post_residual_addition",
+    "quant_linear"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.moe_runner.deep_gemm:DeepGemmRunnerCore._run_contiguous_gemm": {
+   "hash": "ac25209937535921bb8dc00e68bad41b29e7c43f11229514ee6c853e76fb35c4",
+   "params": [
+    "self",
+    "runner_input",
+    "quant_info",
+    "running_state"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.token_dispatcher.deepep:_DeepEPDispatcherImplNormal._combine_core": {
+   "hash": "58cdc106bf6e937f854162e9a32c4365f7e26e832d3b49d45ad7df389652a804",
+   "params": [
+    "self",
+    "x",
+    "previous_event"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.topk:TopK.forward_cuda": {
+   "hash": "f66ae6db373af13664cc0f343134a1a950b5662f3f2447b8a08060ea083e8c07",
+   "params": [
+    "self",
+    "hidden_states",
+    "router_logits",
+    "num_token_non_padded",
+    "expert_location_dispatch_info",
+    "dynamic_expert_bias",
+    "router_logits_partials"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.topk:biased_grouped_topk_gpu": {
+   "hash": "c458b58c98c25572af562f06bef1b52c42c680845957f47345b1fe14e0c1214e",
+   "params": [
+    "hidden_states",
+    "gating_output",
+    "correction_bias",
+    "topk",
+    "renormalize",
+    "num_expert_group",
+    "topk_group",
+    "num_fused_shared_experts",
+    "routed_scaling_factor",
+    "apply_routed_scaling_factor_on_output"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.topk:is_routed_scaling_factor_fused_in_topk": {
+   "hash": "9c4a035f8f599a15c8fd7fa9232ff246c409801f9368aca132068729d14b4324",
+   "params": [
+    "topk_config"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.utils:get_deepep_output_dtype": {
+   "hash": "1e1c4d7f28900576468d3f7aab97a70997106de21931689567eb231fb0e20ff7",
+   "params": [
+    "self"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.moe.utils:get_num_fused_shared_experts": {
+   "hash": "e699c79d7946eb332b286f758d38d2fae46b2e87e36d86727b91816570568458",
+   "params": [],
+   "status": "repo"
+  },
+  "sglang.srt.layers.quantization.fp8_utils:dispatch_block_fp8_mxfp8_linear": {
+   "hash": "41a280fb25a019920af6d47813f1dd4c25c64802e46e568f06ef1600395e5091",
+   "params": [
+    "backend"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.quantization.fp8_utils:dispatch_w8a8_block_fp8_linear": {
+   "hash": "a3cae867dd09db868b8d54331d7d87a8023619d71a66498cf7e2bd27b0344e1d",
+   "params": [
+    "weight_block_size",
+    "act_scale_ue8m0"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.quantization.fp8_utils:inverse_transform_scale_ue8m0": {
+   "hash": "3f43b499be6ad6859a37309c4e79a783b28feed900f9f31e5f26861ff05a7b7c",
+   "params": [
+    "sf_packed",
+    "mn"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.quantization.fp8_utils:requant_block_scale_ue8m0_for_deepgemm": {
+   "hash": "cd6dc0ddd6dff58acd54a921ed8c284db5c4d57ec8f8bc63bc8e3028953c6539",
+   "params": [
+    "weight",
+    "weight_scale",
+    "weight_block_size",
+    "use_deepgemm_runner",
+    "output_dtype",
+    "weight_shape",
+    "grouped_moe"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.quantization.unquant:UnquantizedLinearMethod.apply": {
+   "hash": "d8eb65fc719924d97495440785ab7d0053f6c2912fd2914261f4a340f30efd18",
+   "params": [
+    "self",
+    "layer",
+    "x",
+    "bias"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.rotary_embedding.mrope:MRotaryEmbedding.forward_cuda": {
+   "hash": "99a55527f5dfeb35f0210934be62b4ff39f34a8424ef7f9db15d34162926d0d3",
+   "params": [
+    "self",
+    "positions",
+    "query",
+    "key",
+    "fused_set_kv_buffer_arg"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.rotary_embedding.utils:apply_rotary_pos_emb_native_eager": {
+   "hash": "c4d1cc06e830dbcb69e989f1dff33ae29f7d7a358167b5ceb7fd56e3d58e4bd8",
+   "params": [
+    "q",
+    "k",
+    "cos",
+    "sin",
+    "unsqueeze_dim"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.sampler:Sampler._sample_from_probs": {
+   "hash": "fe1f928ded66ed9cd3976de8a87f7db5f512d694ac6e7fa0fce8e84522b7a9eb",
+   "params": [
+    "self",
+    "probs",
+    "sampling_info",
+    "positions",
+    "simple_sampling_case"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.layers.sampler:multinomial_with_seed": {
+   "hash": "0f947e55d7480b3d35effad5740c26ae1c0409aa0a62f51d3fe704abcd666260",
+   "params": [
+    "logprobs",
+    "seed",
+    "positions"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.managers.hisparse_coordinator:HiSparseCoordinator.swap_in_selected_pages": {
+   "hash": "4359623d8aecb4c90d6055e3985a9d2de42d75784c2a4d3cef1675a276c3aca2",
+   "params": [
+    "self",
+    "req_pool_indices",
+    "compressed_seq_lens",
+    "top_k_result",
+    "layer_id"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.managers.schedule_batch:ScheduleBatch.mix_with_running": {
+   "hash": "2e42444a9b783233b0cb0daa9933423bd737067cbd6df5b4078b98e9ea4729c6",
+   "params": [
+    "self",
+    "running_batch"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.mem_cache.qsa_kv_pool:resolve_qsa_indexer_dtype": {
+   "hash": "27e93fedf2c96b403c278796a91f3c8a56067e8ea9fa5fad2dafaf66f41489bb",
+   "params": [
+    "name"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.deepseek_v2:_scale_routed_and_add_shared": {
+   "hash": "f8c887e425ab4c5172453b8d4381695e4a9c8457130a7d98a8d329c51ce62567",
+   "params": [
+    "routed",
+    "shared",
+    "routed_scaling_factor",
+    "fused_in_topk"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.deepseek_v41_vit:apply_rotary": {
+   "hash": "581f2057d151c79b267551dd2d810ba27f0e310d0ad1c9cc02f76a1d42524d3a",
+   "params": [
+    "x",
+    "cos",
+    "sin"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.deepseek_v4:_flashinfer_hc_pre": {
+   "hash": "52cb1cba8c5d10f6e5f34b8462cce4e9b6903663b2aaead2cbf6728173255296",
+   "params": [
+    "x",
+    "hc_fn",
+    "hc_scale",
+    "hc_base",
+    "rms_eps",
+    "hc_eps",
+    "sinkhorn_iters"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.deepseek_v4_nextn:DeepseekV4ModelNextN.hc_head": {
+   "hash": "d2e914108ddb7667a07e8398d6d6ef8fad2fb1d76f0c07288833d8fc50047012",
+   "params": [
+    "self",
+    "x",
+    "hc_fn",
+    "hc_scale",
+    "hc_base"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.qwen2_moe:Qwen2MoeSparseMoeBlock._forward_shared_experts": {
+   "hash": "62d1ba2966c76f63c43faeff77e19b3373acc586f71c8eab82dd1c19c2e41aa8",
+   "params": [
+    "self",
+    "hidden_states",
+    "apply_gate"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.qwen3_5:Qwen3_5AttentionDecoderLayer._apply_qk_norm": {
+   "hash": "e9ab63441ab6e674b0db3349ef6f507509e2f9e161ff7ac4f70903f814fe81da",
+   "params": [
+    "self",
+    "q",
+    "k"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.qwen3_moe:Qwen3MoeSparseMoeBlock.forward_normal": {
+   "hash": "bddf1025823a9dd57704ec1c378e0949991a1a8f229a5938153a06c452416fac",
+   "params": [
+    "self",
+    "hidden_states"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.qwen3_vl:Qwen3VLMoeVisionModel.fast_pos_embed_interpolate_vectorized": {
+   "hash": "0da0fe00067c39b65d40d1e19b448bbd0b1b713ce9bbcd72b3d27b2a50adfd5f",
+   "params": [
+    "self",
+    "grid_thw"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.models.qwen3_vl:Qwen3VLMoeVisionModel.forward_with_cuda_graph": {
+   "hash": "fd8a9107a59b5c7fe85a0d25a11c649b776effaff0910ae04c3db0bb7497828d",
+   "params": [
+    "self",
+    "x",
+    "grid_thw"
+   ],
+   "status": "repo"
+  },
+  "sglang.srt.speculative.eagle_utils:_rejection_sampling_target_probs": {
+   "hash": "dbd99b036ab5a24354772eb1ca4e9e387de8bc3ebf4205b6caceb3a6c8d300d0",
+   "params": [
+    "next_token_logits",
+    "temperatures"
+   ],
+   "status": "repo"
+  }
+ }
+}

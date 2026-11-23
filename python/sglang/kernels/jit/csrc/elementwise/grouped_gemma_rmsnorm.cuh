@@ -170,6 +170,8 @@ struct GroupedGemmaRMSNormKernel {
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     const uint32_t num_blocks = num_tokens * params.num_groups;
+    // A DP-attention rank with no local rows still runs the layer; an empty grid is an invalid launch.
+    if (num_blocks == 0) return;
     LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }

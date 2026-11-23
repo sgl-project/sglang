@@ -1524,6 +1524,18 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # The program a true-on-policy (TOP) engine runs GDN layers with: "chunked" (decode follows
+    # the fixed-tile FLA chunk-64 prefill bit for bit) is the only one, and the engine sets it at
+    # launch for a GDN family. It pins that prefill's kkt kernel config when the FLA kernels are
+    # imported, so the trainer process carries it too (Miles' TOP launch sets it).
+    SGLANG_TOP_GDN_MODE = EnvStr("")
+    # Fixed key positions a TOP GDN engine splits each decode row's prefix at (true_on_policy.attention);
+    # the trainer reads the same value, so rollout and trainer must agree on it.
+    SGLANG_TOP_DECODE_KV_SPLIT = EnvInt(4096)
+    # The program a TOP engine runs KDA layers with: "chunked", set by the engine at launch for a KDA family. It pins
+    # chunk_kda to its fused intra kernel and one config per autotuned kernel when the FLA kernels are imported, so
+    # the trainer process carries it too (Miles' TOP launch sets it).
+    SGLANG_TOP_KDA_MODE = EnvStr("")
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

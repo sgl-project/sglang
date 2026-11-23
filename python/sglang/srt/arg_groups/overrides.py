@@ -1092,6 +1092,13 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 
 @register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
+    from sglang.srt.true_on_policy.contracts import (
+        get_true_on_policy_attention_overrides,
+    )
+
+    top_overrides = get_true_on_policy_attention_overrides(view)
+    if top_overrides:
+        return top_overrides
     if not view.enable_deterministic_inference:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES

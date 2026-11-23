@@ -1,33 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
 
-TrueOnPolicyContractName = Literal["qwen3_dense_true_on_policy_v1"]
-ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
-KernelContract = Literal["qwen3_dense_sglang_math"]
-LogprobContract = Literal["sglang_prefill"]
+import msgspec
+
+TrueOnPolicyContractName = Literal["true_on_policy_v1"]
 
 
-@dataclass(frozen=True)
-class TrueOnPolicyContractSchema:
-    """Declarative cross-repo identity for a true-on-policy parity contract."""
+class TrueOnPolicyContractSchema(msgspec.Struct, frozen=True, kw_only=True):
+    """Cross-repo identity of a true-on-policy program version, including its attention backend."""
 
     name: TrueOnPolicyContractName
-    model_family: ModelFamily
-    required_kernel_contracts: tuple[KernelContract, ...]
-    logprob_contract: LogprobContract
-    sglang_attention_backend: str
-    fsdp_attention_implementation: str
     disable_megatron_sequence_parallel: bool
+    attention_backend: str
 
 
-QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
-    name="qwen3_dense_true_on_policy_v1",
-    model_family="qwen3_dense",
-    required_kernel_contracts=("qwen3_dense_sglang_math",),
-    logprob_contract="sglang_prefill",
-    sglang_attention_backend="fa3",
-    fsdp_attention_implementation="flash_attention_3",
+TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
+    name="true_on_policy_v1",
     disable_megatron_sequence_parallel=True,
+    attention_backend="fa4",
 )

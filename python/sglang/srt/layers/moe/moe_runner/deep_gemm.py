@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
 )
+from sglang.srt.true_on_policy import fp8 as top_fp8
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -82,6 +83,18 @@ elif _is_musa:
     _silu_and_mul_musa = torch.nn.SwishGLU()
 else:
     _legacy_silu_and_mul = None
+
+
+def _contiguous_silu_and_mul(gateup, out):
+    """TOP decode uses the precise masked SiLU; the contiguous path must be bitwise the same."""
+    from sglang.srt.true_on_policy.moe import should_use_precise_masked_silu
+
+    # The legacy contiguous SiLU is a fast build; prefill rows must match the accurate SiLU of TOP decode.
+    if should_use_precise_masked_silu():
+        from sglang.kernels.ops.activation.activation import silu_and_mul_accurate
+
+        return silu_and_mul_accurate(gateup, out)
+    return _legacy_silu_and_mul(gateup, out)
 
 
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
@@ -374,6 +387,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             else None
         )
         with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
+            top_hidden_states = top_fp8.maybe_expert_forward(
+                runner_input,
+                quant_info,
+                weight_dtype=weight_dtype,
+                activation=self.config.activation,
+                swiglu_limit=self.swiglu_limit,
+            )
+            # The stock contiguous FP8 runner rounds the SwiGLU to BF16 before quantizing the down input;
+            # TOP's expert program quantizes the FP32 SwiGLU, as the trainer does.
+            if top_hidden_states is not None:
+                return DeepGemmRunnerOutput(hidden_states=top_hidden_states)
             if not runner_input.use_masked_gemm:
                 if weight_dtype == torch.bfloat16:
                     hidden_states = self._run_bf16_contiguous_gemm(
@@ -570,7 +594,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                         gateup_output.view(-1, N), down_input, self.swiglu_limit
                     )
                 else:
-                    _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+                    _contiguous_silu_and_mul(gateup_output.view(-1, N), down_input)
             else:
                 if self.swiglu_limit is not None:
                     gateup_output = _apply_swiglu_limit(
@@ -686,7 +710,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=gateup_output.device,
                 dtype=torch.bfloat16,
             )
-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            from sglang.srt.true_on_policy.moe import top_clamp_swiglu_input
+
+            top_clamp_swiglu_input(gateup_output, self.swiglu_limit)
+            _contiguous_silu_and_mul(gateup_output.view(-1, N), down_input)
         else:
             down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
         del gateup_output
@@ -956,7 +983,19 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         # Act
-        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        from sglang.srt.true_on_policy.moe import (
+            should_use_precise_masked_silu,
+            top_swiglu_limit,
+        )
+
+        silu_and_mul_masked_fwd(
+            gateup_output,
+            down_input,
+            masked_m,
+            # The fast exp/div can cross a BF16 rounding midpoint (should_use_precise_masked_silu).
+            precise=should_use_precise_masked_silu(),
+            swiglu_limit=top_swiglu_limit(self.swiglu_limit),
+        )
         del gateup_output
 
         # GroupGemm-1
@@ -1485,6 +1524,16 @@ def post_permute_deep_gemm_to_deepep_normal(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
     output_index = running_state["output_index"]
+
+    from sglang.srt.true_on_policy.slot_order_deepep import (
+        maybe_slot_order_combine_input,
+    )
+
+    top_input = maybe_slot_order_combine_input(
+        hidden_states, topk_ids, topk_weights, output_index
+    )
+    if top_input is not None:
+        return top_input
 
     gather_out = torch.empty(
         running_state["hidden_states_shape"],

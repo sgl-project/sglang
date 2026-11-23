@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
 from sglang.srt.server_args import compute_world_size
+from sglang.srt.true_on_policy.device import DEVICE_STATE_KEY, device_report
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ class SchedulerInternalStateController:
             self._add_step_times,
             self._add_rust_server,
             self._add_env_vars,
+            self._add_true_on_policy_device,
         ):
             contribute(state)
         # A bound signal handler is not msgpack-serializable, and no reader
@@ -140,6 +142,14 @@ class SchedulerInternalStateController:
     def _add_env_vars(self, state: Dict[str, Any]) -> None:
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():
             state["env_vars"] = exportable_env_vars()
+
+    def _add_true_on_policy_device(self, state: Dict[str, Any]) -> None:
+        # The TOP trainer refuses an engine on another GPU architecture.
+        if state.get("true_on_policy_contract") is None:
+            return
+        state[DEVICE_STATE_KEY] = device_report(
+            self.scheduler.tp_worker.model_runner.gpu_id
+        )
 
     # ------------------------------------------------------------------ update
 

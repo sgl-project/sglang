@@ -247,6 +247,19 @@ def silu_and_mul(
     )
 
 
+def silu_and_mul_accurate(
+    input: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """silu_and_mul without fast math: IEEE expf and division, bitwise the masked precise SiLU."""
+    hidden_size = input.shape[-1] // 2
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], hidden_size)
+    activation_module(input.dtype, fast_math=False).run_activation(
+        input.view(-1, hidden_size * 2), out.view(-1, hidden_size), "silu"
+    )
+    return out
+
+
 def silu_and_mul_with_activation_rounding(
     input: torch.Tensor,
     out: Optional[torch.Tensor] = None,

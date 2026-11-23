@@ -190,6 +190,8 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from sglang.srt.true_on_policy.sampling import get_true_on_policy_sampling_params
 from sglang.srt.utils import (
     add_prometheus_middleware,
     build_server_info,
@@ -750,6 +752,10 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    if resolve_true_on_policy_runtime_policy(
+        _global_state.tokenizer_manager.server_args
+    ).enabled:
+        sampling_params.update(get_true_on_policy_sampling_params())
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
@@ -2365,6 +2371,7 @@ async def _send_disaggregation_warmup_requests(
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
     timeout: int,
+    server_args: ServerArgs,
 ) -> List[int]:
     ssl_context = (
         ssl_verify
@@ -2384,6 +2391,8 @@ async def _send_disaggregation_warmup_requests(
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
         }
+        if resolve_true_on_policy_runtime_policy(server_args).enabled:
+            json_data["sampling_params"].update(get_true_on_policy_sampling_params())
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context
         ) as response:
@@ -2437,6 +2446,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # disaggregation, but its local warmup must stay on the text path.
     is_vlm = (
         bool(model_info.get("has_image_understanding", False))
+        and not resolve_true_on_policy_runtime_policy(server_args).enabled
         and not get_disagg().language_only
         and not get_disagg().language_model_only
         and not get_exec().features.enable_encoder_swa_bounded_replay
@@ -2456,6 +2466,8 @@ def _execute_server_warmup(server_args: ServerArgs):
             "max_new_tokens": max_new_tokens,
         },
     }
+    if resolve_true_on_policy_runtime_policy(server_args).enabled:
+        json_data["sampling_params"].update(get_true_on_policy_sampling_params())
     if get_serving().skip_tokenizer_init:
         json_data["input_ids"] = [
             [10, 11, 12] for _ in range(get_parallel().num_dp_ranks)
@@ -2554,6 +2566,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     headers=headers,
                     ssl_verify=ssl_verify,
                     timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                    server_args=server_args,
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]

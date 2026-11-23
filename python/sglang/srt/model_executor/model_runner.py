@@ -236,7 +236,6 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
-from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -853,13 +852,19 @@ class ModelRunner:
 
     def maybe_enable_batch_invariant_mode(self):
         if get_exec().deterministic.enable_deterministic_inference:
-            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+            from sglang.srt.batch_invariant_ops import (
+                enable_batch_invariant_mode,
+                is_batch_invariant_mode_enabled,
+            )
+            from sglang.srt.utils import init_cublas
 
+            # Library warmup is FP16 and must precede the strict BF16 GEMM override.
+            if (
+                self.device in ("cuda", "musa")
+                and not is_batch_invariant_mode_enabled()
+            ):
+                init_cublas()
             enable_batch_invariant_mode()
-        if is_tp_invariant_target():
-            from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
-
-            enable_tp_invariant_mode()
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
         # Graph recapture reaches this outside the draft PP scope, so read the

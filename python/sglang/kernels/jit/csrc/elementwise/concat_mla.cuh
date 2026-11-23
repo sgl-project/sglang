@@ -195,7 +195,7 @@ constexpr int A_LAST_DIM = 512;
 constexpr int B_LAST_DIM = 64;
 constexpr int OUT_LAST_DIM = A_LAST_DIM + B_LAST_DIM;
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kPadded = false>
 __global__ void concat_mla_absorb_q_kernel(
     const bf16_t* a,
     const bf16_t* b,
@@ -218,20 +218,70 @@ __global__ void concat_mla_absorb_q_kernel(
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / kWarpThreads;
   if (flat_warp_id >= num_items) return;
 
-  const int idx_0 = flat_warp_id / dim_1;
-  const int idx_1 = flat_warp_id % dim_1;
-  const auto out_row = out + idx_0 * out_stride_0 + idx_1 * out_stride_1;
+  if constexpr (!kPadded) {
+    const int idx_0 = flat_warp_id / dim_1;
+    const int idx_1 = flat_warp_id % dim_1;
+    const auto out_row = out + idx_0 * out_stride_0 + idx_1 * out_stride_1;
 
-  const auto b_val = warp::load_bytes<kBBytes, WARP_UNIFORM_16B>(b + idx_0 * b_stride_0 + idx_1 * b_stride_1);
-  const auto a_val = warp::load_bytes<kABytes, WARP_UNIFORM_16B>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
+    const auto b_val = warp::load_bytes<kBBytes, WARP_UNIFORM_16B>(b + idx_0 * b_stride_0 + idx_1 * b_stride_1);
+    const auto a_val = warp::load_bytes<kABytes, WARP_UNIFORM_16B>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
 
-  PDLTriggerSecondary<kUsePDL>();
+    PDLTriggerSecondary<kUsePDL>();
 
-  warp::store_bytes<kBBytes, WARP_UNIFORM_16B>(out_row + A_LAST_DIM, b_val);
-  warp::store_bytes<kABytes, WARP_UNIFORM_16B>(out_row, a_val);
+    warp::store_bytes<kBBytes, WARP_UNIFORM_16B>(out_row + A_LAST_DIM, b_val);
+    warp::store_bytes<kABytes, WARP_UNIFORM_16B>(out_row, a_val);
+  } else {
+    const int lane_id = get_lane_id();
+    const int output_heads = kPadded ? 128 : dim_1;
+    const int idx_0 = flat_warp_id / output_heads;
+    const int output_head = flat_warp_id % output_heads;
+    const int idx_1 = kPadded ? output_head / 32 * 16 + output_head % 32 : output_head;
+    const bool live = !kPadded || (output_head % 32 < 16 && idx_1 < dim_1);
+
+    if (flat_warp_id >= num_items) {
+      return;
+    }
+
+    using ABufType = int4;
+    constexpr int A_NUM_UNROLL = 2;
+    static_assert(sizeof(ABufType) * A_NUM_UNROLL == A_LAST_DIM * sizeof(a[0]) / 32);
+    ABufType a_buf[A_NUM_UNROLL] = {};
+
+    using BBufType = int;
+    constexpr int B_NUM_UNROLL = 1;
+    static_assert(sizeof(BBufType) * B_NUM_UNROLL == B_LAST_DIM * sizeof(b[0]) / 32);
+    BBufType b_buf = 0;
+
+    if (live) {
+      const BBufType* base_addr = reinterpret_cast<const BBufType*>(b + idx_0 * b_stride_0 + idx_1 * b_stride_1);
+      b_buf = *(base_addr + lane_id);
+    }
+
+#pragma unroll
+    for (int i = 0; i < A_NUM_UNROLL; ++i) {
+      if (live) {
+        const ABufType* base_addr = reinterpret_cast<const ABufType*>(a + idx_0 * a_stride_0 + idx_1 * a_stride_1);
+        a_buf[i] = *(base_addr + i * 32 + lane_id);
+      }
+    }
+
+    device::PDLTriggerSecondary<kUsePDL>();
+
+    {
+      BBufType* base_addr =
+          reinterpret_cast<BBufType*>(out + idx_0 * out_stride_0 + output_head * out_stride_1 + A_LAST_DIM);
+      *(base_addr + lane_id) = b_buf;
+    }
+
+#pragma unroll
+    for (int i = 0; i < A_NUM_UNROLL; ++i) {
+      ABufType* base_addr = reinterpret_cast<ABufType*>(out + idx_0 * out_stride_0 + output_head * out_stride_1);
+      *(base_addr + i * 32 + lane_id) = a_buf[i];
+    }
+  }
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kPadded = false>
 struct ConcatMlaAbsorbQKernel {
   static void run(tvm::ffi::TensorView a, tvm::ffi::TensorView b, tvm::ffi::TensorView out) {
     using namespace host;
@@ -297,7 +347,14 @@ struct ConcatMlaAbsorbQKernel {
         "Dimension mismatch: a.size(0) * a.size(1) must equal b.size(0) * b.size(1)");
     RuntimeCheck(N1_a.unwrap() == N1_b.unwrap(), "Dimension mismatch: a.size(1) must equal b.size(1)");
 
-    const int num_items = static_cast<int>(N0_a.unwrap() * N1_a.unwrap());
+    if constexpr (kPadded) {
+      RuntimeCheck(
+          N1_a.unwrap() > 0 && N1_a.unwrap() <= 64 && N1_a.unwrap() % 16 == 0,
+          "Padding requires complete 16-head groups");
+      RuntimeCheck(N0_out.unwrap() == N0_a.unwrap(), "Output rows mismatch");
+      RuntimeCheck(N1_out.unwrap() == 128, "Output heads mismatch");
+    }
+    const int num_items = static_cast<int>(N0_a.unwrap() * (kPadded ? 128 : N1_a.unwrap()));
     const int dim_1 = static_cast<int>(N1_a.unwrap());
 
     constexpr int num_warps_per_block = 32;
@@ -306,7 +363,7 @@ struct ConcatMlaAbsorbQKernel {
 
     LaunchKernel(grid_size, block_size, device.unwrap())
         .enable_pdl(kUsePDL)(
-            concat_mla_absorb_q_kernel<kUsePDL>,
+            concat_mla_absorb_q_kernel<kUsePDL, kPadded>,
             static_cast<const bf16_t*>(a.data_ptr()),
             static_cast<const bf16_t*>(b.data_ptr()),
             static_cast<bf16_t*>(out.data_ptr()),

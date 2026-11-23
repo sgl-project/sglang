@@ -7,8 +7,6 @@ import torch
 
 from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
 
-ROW_LINEAR_INV_BLOCK_K = 128
-
 
 def _get_global_server_args() -> Any:
     from sglang.srt.runtime_context import get_server_args
@@ -22,12 +20,6 @@ def get_rl_on_policy_target() -> Optional[str]:
 
 def is_true_on_policy_enabled() -> bool:
     return resolve_true_on_policy_runtime_policy(_get_global_server_args()).enabled
-
-
-def is_tp_invariant_target() -> bool:
-    return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
-    ).tp_invariant_row_linear
 
 
 def should_disable_reduce_scatter_for_on_policy() -> bool:
@@ -82,7 +74,6 @@ def get_on_policy_rms_norm_kwargs(
         return {}
 
     kwargs: dict[str, Any] = {
-        "cast_x_before_out_mul": True,
         "fp32_residual": fp32_residual,
     }
     if weight_dtype is not None:
@@ -90,35 +81,6 @@ def get_on_policy_rms_norm_kwargs(
     if override_orig_dtype is not None:
         kwargs["override_orig_dtype"] = override_orig_dtype
     return kwargs
-
-
-def should_use_tp_invariant_row_linear(
-    k_size: int,
-    row_linear_enable_inv: Optional[bool] = None,
-) -> bool:
-    policy_enabled = resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
-    ).tp_invariant_row_linear
-    if row_linear_enable_inv is not None:
-        policy_enabled = policy_enabled and row_linear_enable_inv
-
-    return (
-        policy_enabled
-        and k_size >= ROW_LINEAR_INV_BLOCK_K
-        and k_size % ROW_LINEAR_INV_BLOCK_K == 0
-    )
-
-
-def should_use_tp_invariant_tree_all_reduce(
-    accl_binary_tree_enabled: Optional[bool] = None,
-) -> bool:
-    policy_enabled = resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
-    ).deterministic_tree_all_reduce
-    if accl_binary_tree_enabled is not None:
-        policy_enabled = policy_enabled and not accl_binary_tree_enabled
-
-    return policy_enabled
 
 
 @contextlib.contextmanager
@@ -148,3 +110,9 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
     finally:
         if attn_backend is not None and hasattr(attn_backend, "num_splits"):
             attn_backend.num_splits = saved_num_splits
+
+
+def should_use_matched_tp1_row_linear() -> bool:
+    return resolve_true_on_policy_runtime_policy(
+        _get_global_server_args()
+    ).matched_tp1_row_linear

@@ -112,6 +112,8 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
+    "dsa",
+    "nsa",
     "fa3",
     "fa4",
     "flashinfer",

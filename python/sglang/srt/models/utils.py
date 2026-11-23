@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.true_on_policy.qk_norm import maybe_fused_qk_norm
 from sglang.srt.utils import get_current_device_stream_fast, is_cpu, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -504,6 +505,18 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    top_qk = maybe_fused_qk_norm(
+        q,
+        k,
+        q_norm,
+        k_norm,
+        head_dim=head_dim,
+        batch_size=batch_size,
+        allow_inplace=allow_inplace,
+    )
+    if top_qk is not None:
+        return top_qk
 
     if allow_inplace and can_use_fused_qk_norm_cpu(q, k, head_dim, q_eps, k_eps):
         torch.ops.sgl_kernel.fused_qk_norm_cpu(

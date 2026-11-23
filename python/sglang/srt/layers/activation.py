@@ -74,6 +74,9 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul_with_activation_rounding,
+    )
 
     # The jit act-and-mul kernel requires the per-rank hidden size to be a
     # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
@@ -129,16 +132,37 @@ logger = logging.getLogger(__name__)
 
 
 class SiluAndMul(BaseFusedOp):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, top_eager_rounding: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
-        if publish_role() is not None and is_true_on_policy_enabled():
-            self._forward_method = self.forward_native
+        if (
+            publish_role() is not None
+            and is_true_on_policy_enabled()
+            and top_eager_rounding
+        ):
+            # The fused SwiGLU keeps SiLU in FP32 before the multiply; the trainer's eager activation rounds it to BF16.
+            self._forward_method = self.forward_top
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_top(self, x: torch.Tensor) -> torch.Tensor:
+        # Preserve the eager activation cast before multiplication. The ordinary
+        # fused SwiGLU path keeps that intermediate in FP32 instead.
+        if (
+            _is_cuda
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and not x.requires_grad
+            and x.is_contiguous()
+            and x.numel() > 0
+            and x.shape[-1] % 32 == 0
+            and x.data_ptr() % 32 == 0
+        ):
+            return silu_and_mul_with_activation_rounding(x)
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2

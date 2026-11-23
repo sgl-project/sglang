@@ -500,6 +500,89 @@ def _verify_uses_greedy(
     return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
 
 
+def _verify_uses_top_race(sampling_info: SamplingBatchInfo) -> bool:
+    """Whether the non-spec sampler would draw these tokens with TOP's exponential race."""
+    from sglang.srt.runtime_context import get_exec
+    from sglang.srt.true_on_policy.config import is_true_on_policy_enabled
+
+    return (
+        is_true_on_policy_enabled()
+        and get_exec().deterministic.enable_deterministic_inference
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_min_p_sampling
+    )
+
+
+def _top_race_verify_targets(
+    *,
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Target token [bs, draft_token_num] per verify row, drawn as non-spec TOP decode draws it.
+
+    A row is keyed by (request seed, the row's input-token position), the sampler's key
+    for the same token. Accepting drafts while they equal these targets emits the non-spec
+    token stream bit for bit, whatever the drafts, the verify-window alignment, or a
+    retract re-prefill.
+    """
+    from sglang.srt.true_on_policy.exponential_race import sample_from_logprobs
+    from sglang.srt.true_on_policy.sampling import scale_logits_for_sampling
+
+    if sampling_seed is None:
+        raise ValueError(
+            "[top] spec verify needs sampling_seed for the exponential race"
+        )
+    # Clone: logprob return reads logits_output after verify.
+    scaled_logits = scale_logits_for_sampling(
+        next_token_logits.clone(),
+        torch.repeat_interleave(temperatures, draft_token_num, dim=0),
+    )
+    targets = sample_from_logprobs(
+        torch.log_softmax(scaled_logits, dim=-1),
+        torch.repeat_interleave(sampling_seed, draft_token_num, dim=0),
+        positions,
+    )
+    # The tree verify kernel reads target_predict as int64, as the greedy path's argmax.
+    return targets.view(-1, draft_token_num).to(torch.int64)
+
+
+def _top_chunked_cut_drafts(
+    candidates: torch.Tensor, positions: torch.Tensor, draft_token_num: int
+) -> torch.Tensor:
+    """Under TOP chunked GDN or KDA a verify step runs its linear-attention rows inside the root's 64-token chunk
+    only: drafts past the chunk end get no rows, so they must never be accepted. They become a token no target
+    equals."""
+    from sglang.srt.true_on_policy.gdn_chunked import CHUNK, top_gdn_chunked_active
+    from sglang.srt.true_on_policy.kda_chunked import top_kda_chunked_active
+
+    if draft_token_num <= 1 or not (
+        top_gdn_chunked_active() or top_kda_chunked_active()
+    ):
+        return candidates
+    chunk = positions.view(-1, draft_token_num) // CHUNK
+    return torch.where(chunk != chunk[:, :1], -1, candidates)
+
+
+def _rejection_sampling_target_probs(
+    next_token_logits: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    """Target probabilities for draft-dependent rejection sampling, which TOP never takes."""
+    from sglang.srt.true_on_policy.config import is_true_on_policy_enabled
+
+    if is_true_on_policy_enabled():
+        # TOP forces deterministic inference and refuses top-p/top-k/min-p per request,
+        # so its verify always draws targets with the race (_verify_uses_top_race).
+        raise NotImplementedError(
+            "[top] speculative verify under TOP draws targets with the exponential race, "
+            "not rejection sampling"
+        )
+    return sampling_softmax(next_token_logits, temperatures=temperatures)
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -628,6 +711,9 @@ def eagle_sample(
             )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    candidates = _top_chunked_cut_drafts(
+        candidates, verify_input.positions, verify_input.draft_token_num
+    )
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
@@ -673,6 +759,27 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif _verify_uses_top_race(sampling_info):
+        # Draft-dependent rejection sampling would make a token depend on its draft
+        # and its verify window, so a retracted request would not reproduce.
+        target_predict = _top_race_verify_targets(
+            next_token_logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            sampling_seed=sampling_info.sampling_seed,
+            positions=verify_input.positions,
+            draft_token_num=verify_input.draft_token_num,
+        )
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
@@ -721,8 +828,8 @@ def eagle_sample(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
+        target_probs = _rejection_sampling_target_probs(
+            next_token_logits, expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:

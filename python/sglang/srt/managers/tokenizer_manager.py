@@ -191,6 +191,8 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
 )
+from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from sglang.srt.true_on_policy.sampling import verify_true_on_policy_sampling
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
@@ -1717,6 +1719,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and resolve_true_on_policy_runtime_policy(self.server_args).enabled
+        ):
+            verify_true_on_policy_sampling(
+                sampling_params,
+                custom_logit_processor=obj.custom_logit_processor,
+                return_sampling_mask=obj.return_sampling_mask,
+            )
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

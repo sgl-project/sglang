@@ -11,10 +11,10 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
-from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
+from sglang.srt.true_on_policy import TRUE_ON_POLICY_V1
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _SERVER_ARGS_TARGET = "sglang.srt.true_on_policy.config._get_global_server_args"
 _GET_EXEC_TARGET = "sglang.srt.layers.logits_processor.get_exec"
@@ -74,9 +74,7 @@ class TestGraphLogitsBufferDtype(unittest.TestCase):
         return graph, eager
 
     def test_true_on_policy_graph_logits_match_eager_bf16(self):
-        graph, eager = self._graph_and_eager_logits(
-            contract=QWEN3_DENSE_TRUE_ON_POLICY_V1
-        )
+        graph, eager = self._graph_and_eager_logits(contract=TRUE_ON_POLICY_V1)
         self.assertEqual(graph.dtype, torch.bfloat16)
         self.assertEqual(eager.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(graph, eager))
@@ -88,8 +86,8 @@ class TestGraphLogitsBufferDtype(unittest.TestCase):
         # A logit softcap is fused with an fp32 cast, so the buffer stays fp32 under the contract.
         for contract, enable_fp32_lm_head, softcap in (
             (None, False, None),
-            (QWEN3_DENSE_TRUE_ON_POLICY_V1, True, None),
-            (QWEN3_DENSE_TRUE_ON_POLICY_V1, False, 30.0),
+            (TRUE_ON_POLICY_V1, True, None),
+            (TRUE_ON_POLICY_V1, False, 30.0),
         ):
             with self.subTest(
                 contract=contract, fp32_lm_head=enable_fp32_lm_head, softcap=softcap
@@ -134,7 +132,7 @@ class TestGraphLogitsBufferDtype(unittest.TestCase):
         with (
             patch(
                 _SERVER_ARGS_TARGET,
-                return_value=_server_args(contract=QWEN3_DENSE_TRUE_ON_POLICY_V1),
+                return_value=_server_args(contract=TRUE_ON_POLICY_V1),
             ),
             patch(_GET_EXEC_TARGET, return_value=_exec()),
             patch.object(

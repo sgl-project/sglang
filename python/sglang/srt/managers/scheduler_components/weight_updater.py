@@ -51,6 +51,8 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     LocalSerializedTensor,
 )
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.true_on_policy.fp8 import refresh_derived as top_fp8_refresh_derived
+from sglang.srt.true_on_policy.fp8 import weights_changed as top_fp8_weights_changed
 from sglang.srt.utils.weight_checker import overall_checksum
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -147,6 +149,9 @@ class SchedulerWeightUpdaterManager:
         try:
             yield
         finally:
+            # Every update_weights_from_* call writes weights inside this block.
+            top_fp8_weights_changed()
+            self._top_fp8_refresh()
             if self.metrics_collector is not None:
                 self.metrics_collector.observe_weight_load(
                     time.perf_counter() - t0, source
@@ -445,6 +450,8 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
+        # Peers wrote this session's weights (P2P/RDMA) without a load call.
+        top_fp8_weights_changed()
         if self._session.sync_base:
             run_post_load = not self._session.loaded_weights
             for _, runner in self._select_runners(self._session.selector):
@@ -458,6 +465,7 @@ class SchedulerWeightUpdaterManager:
         self._session = None
         if success and not recv_req.abort:
             self.record_weight_version_after_update(pending_version)
+        self._top_fp8_refresh()
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
 
@@ -589,6 +597,8 @@ class SchedulerWeightUpdaterManager:
 
         for tag in tags:
             self.offload_tags.remove(tag)
+        # Resumed memory holds restored or uninitialized bytes, not what derived caches saw.
+        top_fp8_weights_changed()
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
@@ -620,9 +630,17 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
 
+        self._top_fp8_refresh()
         return ResumeMemoryOccupationReqOutput()
 
+    def _top_fp8_refresh(self) -> None:
+        """TOP FP8: rewrite weight-derived buffers once the weights are resident again."""
+        if GPU_MEMORY_TYPE_WEIGHTS not in self.offload_tags:
+            top_fp8_refresh_derived()
+
     def check_weights(self, recv_req: CheckWeightsReqInput):
+        # Its actions include resetting weights in place.
+        top_fp8_weights_changed()
         try:
             role_payloads = []
             for role, runner in self._select_runners(recv_req.selector):
@@ -656,6 +674,8 @@ class SchedulerWeightUpdaterManager:
             logger.warning(f"check_weights see error: {e}")
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
+        finally:
+            self._top_fp8_refresh()
 
     def save_remote_model(self, params):
         url = params["url"]

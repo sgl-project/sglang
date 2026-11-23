@@ -64,6 +64,10 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.moe.utils import sum_post_experts_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.true_on_policy import (
+    is_true_on_policy_enabled,
+    should_disable_reduce_scatter_for_on_policy,
+)
 
 
 def tp_reduce_scatter(
@@ -147,6 +151,9 @@ def attn_tp_reduce_scatter(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     parallel = get_parallel()
+    if should_disable_reduce_scatter_for_on_policy():
+        hidden_states = attention_tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states.tensor_split(parallel.attn_tp_size)[parallel.attn_tp_rank]
     local_hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
         parallel.attn_tp_rank
     ]
@@ -375,6 +382,9 @@ def update_attn_tp_gather_output(
 ):
     """Write the output into the residual on this rank's slice, then gather it
     over attention TP (see attn_tp_gather_with)."""
+    if is_true_on_policy_enabled() and update is PLAIN_ADD:
+        # Keep both BF16 operands until fused residual RMSNorm.
+        return attn_tp_gather_input((hidden_states, residual), forward_batch)
     hidden_states = update.update(hidden_states, residual)
     return attn_tp_gather_with(hidden_states, gather), None
 

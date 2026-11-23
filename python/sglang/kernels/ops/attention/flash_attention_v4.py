@@ -219,9 +219,14 @@ def flash_attn_varlen_func(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    true_on_policy: bool = False,
     **_: object,
 ):
-    if _flash_attn_varlen_func is None:  # pragma: no cover
+    kernel = _flash_attn_varlen_func
+    if true_on_policy:
+        # TOP shares its numerical forward with the trainer.
+        from sglang.srt.true_on_policy.attention import flash_attn_varlen_func as kernel
+    if kernel is None:  # pragma: no cover
         raise ImportError(
             "FlashAttention-4 CUTE is not available. Install flash-attn-4 with "
             "its CUDA/CUTE dependencies, or run from a source tree where the "
@@ -278,8 +283,12 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
     # The kernel writes into out, except where it pads MLA heads: its output
     # then has more heads than out, and the result is a new tensor.
-    out_kwargs = {"out": out} if out is not None and mla_head_padding is None else {}
-    result = _flash_attn_varlen_func(
+    out_kwargs = (
+        {"out": out}
+        if out is not None and mla_head_padding is None and not true_on_policy
+        else {}
+    )
+    result = kernel(
         q=q,
         k=k,
         v=v,
@@ -358,6 +367,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    true_on_policy: bool = False,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -402,6 +412,7 @@ def flash_attn_with_kvcache(
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
         out=out,
+        true_on_policy=true_on_policy,
     )
 
     if return_softmax_lse:

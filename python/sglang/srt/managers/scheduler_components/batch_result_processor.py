@@ -1413,11 +1413,18 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
+                track_idx = batch.mamba_track_buffer_indices[i]
+                req.kv.mamba_last_track_idx = track_idx
                 # The slot that stops being the latest still holds its
                 # checkpoint; name it so a short key can fall back to it.
                 req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
                 req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
+                # Set from the slot this boundary wrote, not toggled: the lookahead-1
+                # flip below sees it only if this step launched before the previous
+                # result was processed, so toggles alone skip or repeat a boundary.
+                req.kv.mamba_next_track_idx = (
+                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+                )
             elif (
                 req.finished()
                 and lazy
@@ -1430,7 +1437,14 @@ class SchedulerBatchResultProcessor:
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
-        should_update = completed_mamba_boundary if lazy else known_mamba_boundary
+        if lazy:
+            should_update = completed_mamba_boundary
+        elif lookahead == 0 and known_mamba_boundary is not None:
+            # The latest launched step is the one this result completes,
+            # recorded above.
+            should_update = False
+        else:
+            should_update = known_mamba_boundary
         if should_update is None or should_update:
             self._mamba_prefix_cache_update(
                 req,
