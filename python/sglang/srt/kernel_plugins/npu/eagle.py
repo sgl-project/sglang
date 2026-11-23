@@ -17,7 +17,7 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         self.worker = worker
         self.steps = worker.speculative_num_steps
 
-    def propose_chain(self, batch, forward_batch):
+    def propose_chain(self, batch, forward_batch, shape_key=None):
         if forward_batch.forward_mode.is_idle():
             return None
         req = batch.reqs[0] if len(batch.reqs) == 1 else None
@@ -56,7 +56,9 @@ class NpuEagleDraftRuntime(EagleDraftRuntime):
         with forward_context(
             ForwardContext(attn_backend=attention), forward_batch=forward_batch
         ):
-            tokens = backend.execute_draft_graph(io)
+            tokens = backend.execute_draft_graph(io, shape_key)
+        if tokens is None:
+            return None
         if tokens.shape != (1, self.steps):
             raise RuntimeError("Invalid NextN suffix width")
         return tokens.to(dtype=seed.topk_index.dtype, copy=True)
