@@ -274,6 +274,11 @@ class UnifiedTreeCoreInterface(ABC):
         """
         return None
 
+    def full_evictable_pages_by_class(self, shard_size: int) -> Optional[list[int]]:
+        """`full_evictable_size` in pages per owner class of a KV shard group;
+        None from a core that does not track rotation bases."""
+        return None
+
     def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
         """Logical-page KV sharding: the rotation base plus the node's first
         position-page, i.e. the owner of its first page modulo the shard

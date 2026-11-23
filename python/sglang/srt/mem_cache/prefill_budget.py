@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_available_tokens,
     get_cp_sharded_padded_chunk_tokens,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.mem_cache.capacity import reclaim_for_load_back
@@ -590,6 +591,8 @@ class ChainPrefillBudget(PrefillBudget):
         # Rows the admitted requests bind, each a unit of every request sub-pool.
         self.has_request_rows = bool(allocator.request_allocators)
         self.pending_request_rows = 0
+        # Ranks the owner sub-pool is sharded over by logical page; 1 unsharded.
+        self.kv_shard_size = page_interleave_shard_size(allocator)
         # (sub-pool, retained window) per window sub-pool.
         self.windows = tuple(
             (name, tree_cache.window_retain_size(name))
@@ -798,7 +801,15 @@ class ChainPrefillBudget(PrefillBudget):
         fits = self._answers.get(key)
         if fits is None:
             fits = self.allocator.admits(
-                demand, evictable=evictable, empty_pool=empty_pool
+                demand,
+                evictable=evictable,
+                empty_pool=empty_pool,
+                # A sharded chain credits evictions per owner class.
+                owner_class_evictable=(
+                    self.tree_cache.full_evictable_pages_by_class
+                    if self.kv_shard_size > 1
+                    else None
+                ),
             )
             self._answers[key] = fits
         return fits
@@ -1126,6 +1137,9 @@ class ChainPrefillBudget(PrefillBudget):
             state_slots=state_slots,
             request_rows=request_rows,
             now=True,
+            # Sharded, the chunk's take asks for one rounding page per owner
+            # class (`KVStorage.take_extend`), not one.
+            extra_tokens=(self.kv_shard_size - 1) * self.page_size,
         )
         if self._chunk_fits(candidate, 0, **fits):
             return chunk_limit

@@ -218,7 +218,9 @@ class SchedulerInvariantChecker:
             # Conservation needs every free page, not the min-class capacity
             # floor used for admission. Sharding keeps the tree and allocator
             # page sizes equal, so cached counts must already be page-aligned.
-            full_available = allocator.aggregate_free_size()
+            # A unified chain's capacity is what it holds plus what it reports.
+            if not allocator.pools_share_memory:
+                full_available = allocator.aggregate_free_size()
             class_watermark_msg = (
                 f", class_free_pages={allocator.class_free_page_counts()}"
             )
