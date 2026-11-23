@@ -111,6 +111,10 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Mooncake NPU DCP metadata in KV buffer order. A global-slot buffer is
+    # replicated and its decode stride spans every rank's physical page.
+    dcp_page_global_slots: Optional[List[bool]] = None
+    dcp_page_layer_ids: Optional[List[int]] = None
     draft_rows_dcp_collapsed: bool = False
     draft_kv_ring_paged: bool = False
     # for system dp

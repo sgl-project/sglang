@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
+    build_page_interleaved_dcp_transfer_groups,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
@@ -202,6 +203,11 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     dst_draft_rows_dcp_collapsed: bool = False
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_dcp_page_size: int = 0
+    dst_dcp_page_global_slots: List[bool] = dataclasses.field(default_factory=list)
+    dst_dcp_page_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    # Source entry, destination entry, bytes per physical page, global slots.
+    dcp_page_transfer_entries: Optional[List[Tuple[int, int, int, bool]]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
@@ -268,7 +274,15 @@ class KVArgsRegisterInfo:
                 if len(msg) > 22 and msg[22] != b""
                 else None
             ),
-            # Note: always put the staging field at the final
+            dst_dcp_page_size=int(msg[23]) if len(msg) > 23 else 0,
+            dst_dcp_page_global_slots=[bool(slot) for slot in msg[24]]
+            if len(msg) > 24
+            else [],
+            dst_dcp_page_layer_ids=(
+                list(struct.unpack(f"{len(msg[25]) // 4}I", msg[25]))
+                if len(msg) > 25
+                else []
+            ),
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
 
@@ -1056,7 +1070,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return None
 
     def _publish_peer_registration(
-        self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
+        self,
+        mooncake_session_id: str,
+        decode_kv_args: KVArgsRegisterInfo,
+        *,
+        dcp_layout_mismatch: Optional[str] = None,
     ) -> Optional[str]:
         """Record this peer's state-layout verdict, then publish its metadata.
 
@@ -1064,9 +1082,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         previous registration's verdict still stands. Returns the rejection
         reason, if any.
         """
-        kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
-        fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
-        mismatch = kv_layout_mismatch or state_mismatch
+        mismatch = dcp_layout_mismatch
+        fully_checked = False
+        if mismatch is None:
+            kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
+            fully_checked, state_mismatch = self._validate_peer_state_layout(
+                decode_kv_args
+            )
+            mismatch = kv_layout_mismatch or state_mismatch
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
@@ -1083,6 +1106,77 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, decode_kv_args
             )
         return mismatch
+
+    def _prepare_peer_dcp_layout(self, info: KVArgsRegisterInfo) -> None:
+        info.requires_dcp_relayout = self.requires_dcp_relayout(
+            info.dst_dcp_size, info.dst_dcp_rank
+        )
+        if not info.requires_dcp_relayout:
+            return
+
+        src_global_slots = self.kv_args.dcp_page_global_slots
+        if src_global_slots is not None or info.dst_dcp_page_size:
+            if src_global_slots is None or not info.dst_dcp_page_size:
+                raise RuntimeError(
+                    "Mooncake PD DCP requires both peers to use page-interleaved KV"
+                )
+            if info.dst_dcp_page_size != self.kv_args.page_size:
+                raise RuntimeError(
+                    "Mooncake PD DCP requires matching physical page sizes"
+                )
+            if not 0 <= info.dst_dcp_rank < info.dst_dcp_size:
+                raise RuntimeError(f"Invalid Mooncake PD DCP rank {info.dst_dcp_rank}")
+
+            src_ptrs = self.kv_args.kv_data_ptrs
+            src_lens = self.kv_args.kv_item_lens
+            dst_ptrs = info.dst_kv_ptrs
+            dst_lens = info.dst_kv_item_lens
+            dst_global_slots = info.dst_dcp_page_global_slots
+            if len(src_ptrs) != len(src_lens) or len(src_ptrs) != len(src_global_slots):
+                raise RuntimeError(
+                    "Mooncake PD DCP source page metadata is inconsistent"
+                )
+            if len(dst_ptrs) != len(dst_lens) or len(dst_ptrs) != len(dst_global_slots):
+                raise RuntimeError(
+                    "Mooncake PD DCP destination page metadata is inconsistent"
+                )
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.dcp_page_layer_ids or self.kv_args.kv_layer_ids,
+                info.dst_dcp_page_layer_ids or info.dst_kv_layer_ids,
+                len(src_ptrs),
+                len(dst_ptrs),
+            )
+            entries = []
+            for src, dst in pairs:
+                page_bytes = src_lens[src]
+                uses_global_slots = src_global_slots[src]
+                if uses_global_slots != dst_global_slots[dst]:
+                    raise RuntimeError(
+                        f"Mooncake PD DCP slot layout differs at entry {src}"
+                    )
+                expected_stride = page_bytes * (
+                    info.dst_dcp_size if uses_global_slots else 1
+                )
+                if page_bytes <= 0 or dst_lens[dst] != expected_stride:
+                    raise RuntimeError(
+                        f"Mooncake PD DCP page stride differs at entry {src}: "
+                        f"expected={expected_stride}, decode={dst_lens[dst]}"
+                    )
+                entries.append((src, dst, page_bytes, uses_global_slots))
+            info.dcp_page_transfer_entries = entries
+            return
+
+        num_entries = len(self.kv_args.kv_item_lens)
+        num_draft = self.kv_args.num_draft_entries
+        dst_item_lens: List[Optional[int]] = [info.dst_kv_item_len] * (
+            num_entries - num_draft
+        ) + [None] * num_draft
+        info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+            dst_item_lens,
+            info.dst_dcp_size,
+            draft_rows_collapsed=info.dst_draft_rows_dcp_collapsed,
+        )
+        self._init_dcp_pack_buffers_once(info.dst_dcp_size, include_draft=True)
 
     def _reject_decode_without_fan_in(
         self, mooncake_session_id: str, required_dst_info_num: int
@@ -1841,6 +1935,44 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_ptrs=tuple(self.kv_args.state_data_ptrs[i][src] for src, _, _ in pairs),
             page_bytes=page_bytes.pop(),
         )
+
+    def _send_page_interleaved_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        entries: List[Tuple[int, int, int, bool]],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: Optional[int],
+    ) -> int:
+        local_groups, global_groups = build_page_interleaved_dcp_transfer_groups(
+            prefill_kv_indices,
+            dst_kv_indices,
+            page_size=self.kv_args.page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        local_units = group_units(*local_groups)
+        global_units = group_units(*global_groups)
+        src_keys = self._local_keys.kv
+        dst_keys = self._peers[mooncake_session_id].keys.kv
+        copies = [
+            Copy(
+                src=src_keys[src],
+                dst=dst_keys[dst],
+                ranges=(global_units if uses_global_slots else local_units)
+                * page_bytes,
+            )
+            for src, dst, page_bytes, uses_global_slots in entries
+        ]
+        return self._transfer_copies(mooncake_session_id, copies)
 
     def send_kvcache_dcp(
         self,
@@ -3249,9 +3381,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 )
                                 break
 
-                        target_rank_registration_info: KVArgsRegisterInfo = (
-                            self.decode_kv_args_table[req.mooncake_session_id]
-                        )
+                            target_rank_registration_info = self.decode_kv_args_table[
+                                req.mooncake_session_id
+                            ]
                         try:
                             self.validate_aux_buffers(
                                 target_rank_registration_info.dst_aux_ptrs,
@@ -3305,12 +3437,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        page_dcp_entries = (
+                            target_rank_registration_info.dcp_page_transfer_entries
+                        )
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
                         ):
                             ret = 0
+                        elif page_dcp_entries is not None:
+                            ret = self._send_page_interleaved_dcp(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                chunked_dst_kv_indice,
+                                entries=page_dcp_entries,
+                                dst_dcp_size=target_rank_registration_info.dst_dcp_size,
+                                dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
+                                src_page_offset=kv_chunk.index_slice.start or 0,
+                                decode_prefix_len=req.decode_prefix_len or 0,
+                                num_kv_tokens=kv_chunk.num_kv_tokens,
+                            )
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -3667,26 +3814,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
-                    if decode_kv_args.requires_dcp_relayout:
-                        num_entries = len(self.kv_args.kv_item_lens)
-                        num_draft = self.kv_args.num_draft_entries
-                        dst_item_lens: List[Optional[int]] = [
-                            decode_kv_args.dst_kv_item_len
-                        ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
-                            dst_item_lens,
-                            decode_kv_args.dst_dcp_size,
-                            draft_rows_collapsed=decode_kv_args.dst_draft_rows_dcp_collapsed,
-                        )
-                        self._init_dcp_pack_buffers_once(
-                            decode_kv_args.dst_dcp_size, include_draft=True
-                        )
+                    dcp_layout_mismatch = None
+                    try:
+                        self._prepare_peer_dcp_layout(decode_kv_args)
+                    except (RuntimeError, ValueError) as exc:
+                        dcp_layout_mismatch = str(exc)
                     layout_mismatch = self._publish_peer_registration(
-                        mooncake_session_id, decode_kv_args
+                        mooncake_session_id,
+                        decode_kv_args,
+                        dcp_layout_mismatch=dcp_layout_mismatch,
                     )
                     if layout_mismatch is not None:
                         logger.error(
@@ -3946,7 +4082,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
         )
 
-        return [
+        message = [
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
@@ -3981,6 +4117,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
             str(self.kv_args.num_draft_entries).encode("ascii"),
         ]
+        page_global_slots = self.kv_args.dcp_page_global_slots
+        if self.dcp_size > 1 and page_global_slots is not None:
+            page_layer_ids = (
+                self.kv_args.dcp_page_layer_ids or self.kv_args.kv_layer_ids
+            )
+            message.extend(
+                (
+                    str(self.kv_args.page_size).encode("ascii"),
+                    bytes(page_global_slots),
+                    struct.pack(f"{len(page_layer_ids)}I", *page_layer_ids),
+                )
+            )
+        return message
 
     def build_receiver_metadata_message(
         self,

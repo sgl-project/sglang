@@ -920,6 +920,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
             empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
+            mooncake_page_dcp=(
+                self.transfer_backend == TransferBackend.MOONCAKE
+                and not self.scheduler.enable_hisparse
+            ),
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
