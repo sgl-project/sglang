@@ -2384,7 +2384,6 @@ def _dp_tp_moe_skips_pad_rows() -> bool:
     parallel = get_parallel()
     return (
         _is_cuda
-        and envs.SGLANG_DP_MASK_PAD_ROWS.get()
         and parallel.attn_dp_size > 1
         and parallel.attn_tp_size == 1
         and parallel.attn_cp_size == 1
