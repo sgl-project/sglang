@@ -435,6 +435,15 @@ class GPTQAscendConfig(GPTQConfig):
 class CPUGPTQConfig(GPTQConfig):
     """CPU Config class for GPTQ on Intel CPU with AMX."""
 
+    # Older checkpoints may omit sym. Keep their legacy zero-point convention.
+    sym: Optional[bool] = None
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> CPUGPTQConfig:
+        quant_config = super().from_config(config)
+        quant_config.sym = cls.get_from_keys_or(config, ["sym"], default=None)
+        return quant_config
+
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.half, torch.bfloat16]

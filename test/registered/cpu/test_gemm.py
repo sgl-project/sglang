@@ -23,6 +23,20 @@ register_cpu_ci(est_time=9, suite="extra-test-cpu-intel")
 torch.manual_seed(1234)
 
 
+def _reference_gptq_w4a8(x, qweight, qzeros, scales, bias=None):
+    # Match the W4A8 math: row-wise A8 quantization, exact FP32 weight
+    # dequantization, FP32 accumulation/bias, then one output-dtype cast.
+    # A BF16 linear reference both skips A8 rounding and prematurely rounds
+    # the dequantized weights, which can fail even for a correct AMX result.
+    amax = x.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-7)
+    quantized_x = torch.round(x.float() * (127.0 / amax))
+    dequantized_x = quantized_x * (amax / 127.0)
+    weight = unpack_and_dequant_gptq(qweight, qzeros, scales.float())
+    return torch.nn.functional.linear(
+        dequantized_x, weight, bias=bias.float() if bias is not None else None
+    ).to(x.dtype)
+
+
 class Mod(nn.Module):
     def __init__(self, input_channel, output_channel, has_bias):
         super(Mod, self).__init__()
@@ -283,6 +297,22 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
+    def test_gptq_w4a8_reference(self):
+        # Packed codes are [11, 7, 8, ..., 8], giving signed weights
+        # [3, -1, 0, ..., 0] after legacy GPTQ zero decoding. At amax=1,
+        # activation 0.5 rounds to signed INT8 code 64, not 63.5.
+        qweight = torch.full((1, 8), -2004318085, dtype=torch.int32)  # 0x8888887B
+        qzeros = torch.full((1, 1), 0x77777777, dtype=torch.int32)
+        scales = torch.full((1, 8), 0.1, dtype=torch.bfloat16)
+        x = torch.tensor([[0.5, 1.0, 0, 0, 0, 0, 0, 0]], dtype=torch.bfloat16)
+        for bias in (None, torch.full((8,), 0.001, dtype=torch.float32)):
+            with self.subTest(bias=bias is not None):
+                expected = ((3 * 64 - 127) / 127) * scales.float()
+                if bias is not None:
+                    expected += bias
+                actual = _reference_gptq_w4a8(x, qweight, qzeros, scales, bias)
+                torch.testing.assert_close(actual, expected.to(x.dtype), rtol=0, atol=0)
+
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
     )
@@ -290,17 +320,15 @@ class TestGemm(CustomTestCase):
         torch.manual_seed(127)
         gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
         gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
-        gptq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16) // 10
+        gptq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16) / 10
+        self.assertGreater(torch.count_nonzero(gptq_scales).item(), 0)
 
-        bf16_weight = unpack_and_dequant_gptq(gptq_weight, gptq_zero, gptq_scales)
         if has_bias:
-            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
+            bias = torch.rand(N).to(torch.float)
         else:
             bias = None
-        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
-        ref_res = torch.nn.functional.linear(
-            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
-        )
+        x = torch.rand(M, K).to(torch.bfloat16)
+        ref_res = _reference_gptq_w4a8(x, gptq_weight, gptq_zero, gptq_scales, bias)
 
         packed_weight, packed_zero, packed_scales = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
