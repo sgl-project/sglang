@@ -2412,6 +2412,10 @@ class Envs:
     # Opt-in: DFlash verifies the running requests' draft blocks inside the mixed
     # extend forward (--enable-mixed-chunk) instead of a separate decode round.
     SGLANG_ENABLE_DFLASH_MIXED_VERIFY = EnvBool(False)
+    # Opt-in: DFlash draft fast path for TP > 1 (TP-split context projection,
+    # packed top-k gather, the target projecting its own context rows, startup
+    # cuBLAS shape sweep).
+    SGLANG_OPT_DFLASH_DRAFT_FAST_PATH = EnvBool(False)
 
     # Opt-in SM90 small-M BF16 GEMV (TileLang) for the unquantized linear method,
     # on the (N, K) shapes in hopper_bf16_small_m_gemv's tables.

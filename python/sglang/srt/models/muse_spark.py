@@ -1854,6 +1854,41 @@ class MuseSparkTextForCausalLM(nn.Module):
             config, logit_scale=config.output_multiplier
         )
         self.capture_aux_hidden_states = False
+        self._dflash_context_projector = None
+
+    def set_dflash_context_projector(self, projector) -> None:
+        if _hopper_kernels_enabled():
+            self._dflash_context_projector = projector
+
+    def warm_eager_gemms(self, rows: int) -> None:
+        """Run the eager GEMMs (SP o_proj, FP32 router, input-logprob lm_head) once per row count
+        up to ``rows``, largest first: a shape's first cuBLASLt use stalls the host."""
+        ms = list(self.modules())
+        fw = next(
+            (
+                m._sp_full_weight
+                for m in ms
+                if getattr(m, "_sp_full_weight", None) is not None
+            ),
+            None,
+        )
+        gw = next(
+            (
+                m._split2_hilo
+                for m in ms
+                if getattr(m, "_split2_hilo", None) is not None
+            ),
+            None,
+        )
+        h = self.lm_head.weight.new_zeros(rows, self.config.hidden_size)
+        lp_rows = envs.SGLANG_LOGPROB_CHUNK_SIZE.get()
+        for t in range(rows, 0, -1):
+            if fw is not None:
+                torch.mm(h[:t], fw.t())
+            if gw is not None:
+                torch.mm(h[:t], gw, out_dtype=torch.float32)
+            if t <= lp_rows:
+                self.logits_processor._compute_lm_head(h[:t], self.lm_head)
 
     def supports_tree_verify(self) -> bool:
         """Token-tree verify needs the fused Hopper attention (tree masks)."""
@@ -1893,6 +1928,12 @@ class MuseSparkTextForCausalLM(nn.Module):
             # duplicate the full replicated draft context with torch.cat.
             # Release the tap list before allocating the gathered output.
             aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+            projector = self._dflash_context_projector
+            lp = self.logits_processor
+            if projector is not None and (
+                lp.expected_aux_hidden_states is None or lp._aux_hidden_states_checked
+            ):
+                aux_hidden_states = projector(aux_hidden_states)
             aux_hidden_states = layernorm_sp.sp_exit_gather(
                 aux_hidden_states, num_tokens=num_tokens
             )
