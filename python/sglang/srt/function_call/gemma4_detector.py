@@ -258,19 +258,21 @@ class Gemma4Detector(BaseFormatDetector):
                 break
             normal_text.append(text[search_from:start])
             end = text.find(TOOL_CALL_END, start)
-            if end == -1:
-                break
-            inner = text[start + len(TOOL_CALL_START) : end]
+            inner = text[start + len(TOOL_CALL_START) : end if end != -1 else None]
             if inner.startswith("call:"):
                 brace = inner.find("{")
                 if brace != -1:
                     func_name = inner[5:brace]
                     args_content = inner[brace + 1 :]
                     match_idx = _find_matching_brace(args_content)
-                    args_str = (
-                        args_content[:match_idx] if match_idx != -1 else args_content
-                    )
-                    results.append((func_name, args_str))
+                    if match_idx != -1:
+                        results.append((func_name, args_content[:match_idx]))
+                    elif end != -1:
+                        results.append((func_name, args_content))
+            # An unclosed block (output cut by max_tokens) is dropped from the text
+            # unless its arguments are complete, as streaming does.
+            if end == -1:
+                break
             search_from = end + len(TOOL_CALL_END)
         return "".join(normal_text), results
 
@@ -285,7 +287,7 @@ class Gemma4Detector(BaseFormatDetector):
         try:
             normal_text, matches = self._extract_tool_calls(text)
             if not matches:
-                return StreamingParseResult(normal_text=text)
+                return StreamingParseResult(normal_text=normal_text)
 
             tool_indices = self._get_tool_indices(tools)
             for func_name, args_str in matches:

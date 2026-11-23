@@ -5952,6 +5952,26 @@ class TestGemma4Detector(CustomTestCase):
         self.assertEqual(result.calls[1].name, "get_time")
         self.assertEqual(result.normal_text, "Some text More text Done.")
 
+    def test_detect_and_parse_drops_call_cut_off_by_max_tokens(self):
+        complete = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+        cut_off = '<|tool_call>call:get_weather{location:<|"|>Par'
+        for text, expected_calls in [
+            ("Sure. " + cut_off, 0),
+            ("Sure. <|tool_call>call:get_we", 0),
+            ("Sure. " + complete + cut_off, 1),
+        ]:
+            with self.subTest(text=text):
+                result = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(result.normal_text, "Sure. ")
+                self.assertEqual(len(result.calls), expected_calls)
+
+    def test_detect_and_parse_keeps_unclosed_call_with_complete_arguments(self):
+        text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
+
     def test_parse_gemma4_args_empty(self):
         self.assertEqual(_parse_gemma4_args(""), {})
         self.assertEqual(_parse_gemma4_args("   "), {})
