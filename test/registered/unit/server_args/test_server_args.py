@@ -2932,11 +2932,11 @@ class TestHiCacheArgs(CustomTestCase):
                 ):
                     handle_hicache(args)
 
-    def test_state_free_decode_tree_rejects_hicache_and_linker(self):
+    def test_state_free_decode_tree_rejects_the_linker_only(self):
         for cache, forced, rejected in (
-            ({"enable_hierarchical_cache": True}, None, True),
             ({"enable_unified_cache_external_linker": True}, None, True),
-            ({"enable_hierarchical_cache": True}, False, False),
+            ({"enable_unified_cache_external_linker": True}, False, False),
+            ({"enable_hierarchical_cache": True}, None, False),
             ({}, None, False),
         ):
             with self.subTest(cache=cache, forced=forced):

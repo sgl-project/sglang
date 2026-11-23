@@ -1190,7 +1190,7 @@ def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
     kv_pool: Any,
-    mamba_pool: Any,
+    mamba_pool: Optional[Any],
     full_layer_mapping: dict[int, int],
     start_layer: int,
     load_cache_event,
@@ -1203,11 +1203,15 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController, HostPoolGroupConfig]:
     """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
-    then the Mamba state pool, which keeps its own host path.
+    then the Mamba state pool, which keeps its own host path. Without a
+    ``mamba_pool`` the stack holds no state.
 
     ``kv_pool`` is the hybrid pool or its full-attention KV child."""
-    mamba_info = _mamba_info(mamba_pool)
-    mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
+    if mamba_pool is not None:
+        mamba_info = _mamba_info(mamba_pool)
+        mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
+    else:
+        mamba_layer_mapping = {}
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
@@ -1220,7 +1224,9 @@ def build_hybrid_mamba_stack(
     )
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
-    if get_memory().hicache_size > 0:
+    if get_memory().hicache_size > 0 and mamba_pool is None:
+        kv_host_size = get_memory().hicache_size
+    elif get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
@@ -1234,18 +1240,20 @@ def build_hybrid_mamba_stack(
         host_size=kv_host_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
     )
-    entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
-        _mamba_entry(
-            params=params,
-            mamba_pool=mamba_pool,
-            info=mamba_info,
-            layer_mapping=mamba_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max,
-            host_size=mamba_host_size,
-            host_evict_fn=host_mamba_evict_fn,
-            device_evict_fn=device_mamba_evict_fn,
-        ),
-    ]
+    entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool)
+    if mamba_pool is not None:
+        entries.append(
+            _mamba_entry(
+                params=params,
+                mamba_pool=mamba_pool,
+                info=mamba_info,
+                layer_mapping=mamba_layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
+                host_size=mamba_host_size,
+                host_evict_fn=host_mamba_evict_fn,
+                device_evict_fn=device_mamba_evict_fn,
+            )
+        )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = _build_cache_controller(
         params=params,
@@ -2179,6 +2187,8 @@ class _DeepSeekV4Strategy(StackStrategy):
 
 
 class _MambaStrategy(StackStrategy):
+    caches_state = True
+
     def matches(self, kvcache, components):
         return kvcache.layer_router.wrapped_view() is not None and components == {
             ComponentType.FULL,
@@ -2212,7 +2222,11 @@ class _MambaStrategy(StackStrategy):
         host_pool_group, cache_controller, config = build_hybrid_mamba_stack(
             params=params,
             kv_pool=kvcache,
-            mamba_pool=params.token_to_kv_pool_allocator.state.pool,
+            mamba_pool=(
+                params.token_to_kv_pool_allocator.state.pool
+                if self.caches_state
+                else None
+            ),
             full_layer_mapping=full_layer_mapping,
             start_layer=kvcache.start_layer,
             load_cache_event=load_cache_event,
@@ -2224,20 +2238,37 @@ class _MambaStrategy(StackStrategy):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        component_host_pools = {
+            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV)
+        }
+        pool_names = [name.value.upper() for name in config.pool_names]
+        if self.caches_state:
+            component_host_pools[ComponentType.MAMBA] = host_pool_group.get_pool(
+                PoolName.MAMBA
+            )
+            pool_names.append("MAMBA")
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
-            component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
-            },
+            component_host_pools=component_host_pools,
             sidecars=[c.sidecar_spec() for c in config.sidecars],
             device_pool_names=config.pool_names,
-            loads_state_layer_wise=True,
-            pools_desc=" + ".join(
-                [name.value.upper() for name in config.pool_names] + ["MAMBA"]
-            ),
+            loads_state_layer_wise=self.caches_state,
+            pools_desc=" + ".join(pool_names),
         )
+
+
+class _StateFreeMambaStrategy(_MambaStrategy):
+    """A state-free PD decode tree: FULL KV only, since prefill sends every
+    request's recurrent state."""
+
+    caches_state = False
+    build_direct_linker_pool_group = StackStrategy.build_direct_linker_pool_group
+
+    def matches(self, kvcache, components):
+        return kvcache.layer_router.wrapped_view() is not None and components == {
+            ComponentType.FULL
+        }
 
 
 def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
@@ -2503,6 +2534,7 @@ class _KvStrategy(StackStrategy):
 _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     _MambaStrategy(),
+    _StateFreeMambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
     _MiniMaxSparseStrategy(),

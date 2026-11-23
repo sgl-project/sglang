@@ -29,13 +29,12 @@ def handle_hicache(server_args: Any):
     if (
         cfg.uses_mamba_radix_cache
         and decode_state_free_radix_of(cfg)
-        and (cfg.enable_hierarchical_cache or cfg.enable_unified_cache_external_linker)
+        and cfg.enable_unified_cache_external_linker
     ):
-        # The tree keeps FULL KV only, which no hybrid HiCache or linker stack covers.
         raise ValueError(
             "A state-free PD decode radix tree does not support "
-            "--enable-hierarchical-cache or --enable-unified-cache-external-linker; "
-            "set SGLANG_DECODE_STATE_FREE_RADIX=0 to keep Mamba state in the tree."
+            "--enable-unified-cache-external-linker; set "
+            "SGLANG_DECODE_STATE_FREE_RADIX=0 to keep Mamba state in the tree."
         )
     from sglang.srt.mem_cache.unified_cache.linker_config import (
         UnifiedCacheLinkerConfig,
