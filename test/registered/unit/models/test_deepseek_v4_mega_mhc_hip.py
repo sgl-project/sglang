@@ -293,7 +293,7 @@ class TestHipBoundaryExtend(unittest.TestCase):
                     self.assertEqual(seen, [extend, extend, extend])
 
 
-class TestHipDraftMega(unittest.TestCase):
+class TestHipDraftMega(CustomTestCase):
     def _hc(self, hidden):
         norm = _Norm()
         norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
@@ -376,7 +376,9 @@ class TestHipDraftMega(unittest.TestCase):
         self.assertIs(a0[8], prev_pre)
         self.assertNotIn("sublayer_out", k0)
         self.assertIs(k0["norm_weight"], stage.attn_hc.norm.weight)
-        self.assertTrue(torch.equal(stage.self_attn.call_args.args[1], nopost[2]))
+        self.assertTrue(
+            torch.equal(stage.self_attn.call_args.kwargs["hidden_states"], nopost[2])
+        )
         # the attention post with the FFN seam: the attention's mixes, the FFN's weights
         self.assertIs(r1, residual)
         self.assertIs(a1[0], stage.ffn_hc.fn)
@@ -386,8 +388,9 @@ class TestHipDraftMega(unittest.TestCase):
         self.assertIs(k1["comb_res_mix"], nopost[1])
         self.assertIs(k1["norm_weight"], stage.ffn_hc.norm.weight)
         # the FFN reads the second launch's input; its plain post closes the stage
-        self.assertTrue(torch.equal(stage._run_ffn.call_args.args[0], post[3]))
-        x, res, post_mix, comb = stage.hc_post.call_args.args
+        self.assertTrue(torch.equal(stage._run_ffn.call_args.kwargs["x"], post[3]))
+        kw = stage.hc_post.call_args.kwargs
+        x, res, post_mix, comb = kw["x"], kw["residual"], kw["post"], kw["comb"]
         self.assertIs(x, stage._run_ffn.return_value)
         self.assertIs(res, post[0])
         self.assertTrue(torch.equal(post_mix, post[1].squeeze(-1)))

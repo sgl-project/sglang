@@ -886,20 +886,13 @@ def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
     return opened
 
 
-def mega_draft_enabled(
-    attn: HcSubLayer, ffn: HcSubLayer, residual: torch.Tensor
-) -> bool:
+def can_use_mega_draft(attn: HcSubLayer, ffn: HcSubLayer) -> bool:
     """Whether a DSpark draft stage takes its seams through Mega-mHC
     (SGLANG_OPT_DSV41_MEGA_MHC_DRAFT, gfx950)."""
     return (
-        _is_hip
-        and envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.get()
-        and _can_use_mega_mhc(attn.cfg)
-        and residual.shape[0] > 0
-        and all(
-            make_boundary(hc.norm, accepts_mxfp8=False).norm_fusable
-            for hc in (attn, ffn)
-        )
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.get()
+        and can_use_mega_closed_seam(attn)
+        and can_use_mega_closed_seam(ffn)
     )
 
 
@@ -916,7 +909,9 @@ def mega_draft_post(y: torch.Tensor, opened: HcState, nxt: HcSubLayer) -> HcStat
     """The attention post of an opened draft seam, with the FFN's triplet, combine and
     norm, in one launch."""
     pre, post_mix, comb = opened.stats
-    return _hip_flydsl_mega_mhc(y, opened.residual, pre, post_mix, comb, nxt)
+    return _hip_flydsl_mega_mhc(
+        y=y, residual=opened.residual, pre=pre, post_mix=post_mix, comb=comb, nxt=nxt
+    )
 
 
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
