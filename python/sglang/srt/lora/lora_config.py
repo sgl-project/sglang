@@ -31,6 +31,7 @@ class LoRAConfig:
         base_vocab_size: Optional[int] = None,
     ) -> None:
         self.path = path
+        self._weights_dir: Optional[str] = None
 
         if config_dict is not None:
             self.hf_config = config_dict
@@ -53,7 +54,7 @@ class LoRAConfig:
                 token: token_id
                 for token, token_id in self.added_tokens_config.items()
                 if token_id >= base_vocab_size
-            }
+            } or None
 
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
@@ -72,25 +73,28 @@ class LoRAConfig:
             base_vocab_size=base_vocab_size,
         )
 
+    def _get_weights_dir(self) -> str:
+        if getattr(self, "_weights_dir", None) is None:
+            if not os.path.isdir(self.path):
+                self._weights_dir = snapshot_download(
+                    self.path, allow_patterns=["*.json"]
+                )
+            else:
+                self._weights_dir = self.path
+        return self._weights_dir
+
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
         else:
-            if not os.path.isdir(self.path):
-                weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-            else:
-                weights_dir = self.path
+            weights_dir = self._get_weights_dir()
             config_name = "adapter_config.json"
             with open(os.path.join(weights_dir, config_name), "r") as f:
                 return json.load(f)
 
     def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
-        # Determine the weights directory
-        if not os.path.isdir(self.path):
-            weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
-        else:
-            weights_dir = self.path
+        weights_dir = self._get_weights_dir()
 
         # Construct the path to added_tokens.json
         added_tokens_path = os.path.join(weights_dir, "added_tokens.json")
