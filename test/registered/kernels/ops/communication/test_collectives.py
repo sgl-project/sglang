@@ -335,6 +335,48 @@ def test_attention_residual_direct_all_gather():
     assert handle is not None
 
 
+@torch.inference_mode()
+def test_matmul_reduce_scatter_across_row_counts():
+    _require_sm100()
+    from sglang.kernels.ops.communication import sp_collective_gemm
+    from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+        sp_collective_gemm_workspace,
+    )
+
+    _, nccl_group = _init_world()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    if not sp_collective_gemm.supported(world_size):
+        pytest.skip(f"CUTLASS GEMM-RS does not run at TP{world_size}")
+    weight = (
+        torch.randn(
+            _HIDDEN_SIZE,
+            1536,
+            generator=torch.Generator(device="cuda").manual_seed(40),
+            device=_device(),
+        )
+        * 0.02
+    ).to(torch.bfloat16)
+    generator = torch.Generator(device="cuda").manual_seed(41 + rank)
+    for num_tokens in (4099, 1001, 4099):
+        x = torch.randn(
+            num_tokens,
+            1536,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        rows = -(-num_tokens // world_size)
+        expected = torch.zeros(world_size * rows, _HIDDEN_SIZE, device=_device())
+        expected[:num_tokens] = x.float() @ weight.float().T
+        dist.all_reduce(expected, group=nccl_group)
+        expected = expected[rank * rows : (rank + 1) * rows].to(torch.bfloat16)
+        output = sp_collective_gemm.matmul_reduce_scatter(
+            x, weight, nccl_group, workspace=sp_collective_gemm_workspace
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=3e-2)
+
+
 def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)

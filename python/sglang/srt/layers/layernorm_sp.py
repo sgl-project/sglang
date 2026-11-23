@@ -332,9 +332,10 @@ def _npu_hccl_comm_name() -> str:
 def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
-    Muse Spark selects CUTLASS; other models keep the Torch symmetric-memory
-    path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
-    depends only on static layer properties and is identical across TP ranks.
+    Layers flagged ``_sp_use_cutlass`` (Muse Spark, the Kimi-K3 o_proj) select
+    CUTLASS, and other models keep the Torch symmetric-memory path. Both require
+    an unquantized, bias-free bf16/fp16 linear. The decision depends only on static
+    layer properties and is identical across TP ranks.
     """
     if linear.bias is not None:
         return False
@@ -411,16 +412,19 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     Computes ``input_ @ weight.T`` and reduce-scatters (sum) the result across the
     TP group along dim 0, leaving this rank's ``[M_pad/tp, h]`` shard. The token
     dim is padded to a multiple of tp_size (padding rows are zeros, dropped by the
-    exit gather). Eligible Muse Spark layers use one CUTLASS GEMM with a
-    multicast reduce-scatter epilogue; other models retain their existing path.
+    exit gather). Layers flagged ``_sp_use_cutlass`` use one CUTLASS GEMM with a
+    multicast reduce-scatter epilogue, which pads every shard to whole tiles
+    itself. Other models retain their existing path.
     """
     tp_size = linear.tp_group.world_size if linear.tp_group is not None else 1
     x = input_.contiguous()
     num_tokens = x.shape[0]
     padded = ceil_align(num_tokens, tp_size)
-    if padded != num_tokens:
+    fused = sp_fused_matmul_eligible(linear)
+    cutlass = fused and not is_npu() and getattr(linear, "_sp_use_cutlass", False)
+    if padded != num_tokens and not cutlass:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
-    if sp_fused_matmul_eligible(linear):
+    if fused:
         if is_npu():
             # CANN MC2: ReduceScatter(x @ weight.t()). x's padded token dim is
             # already a multiple of tp_size (required by the fused op).

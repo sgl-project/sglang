@@ -518,6 +518,17 @@ def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
     return k3_sp_collective.reduce_scatter_res(hidden_states, residual)
 
 
+def _sp_o_proj_takes_cutlass(attn: nn.Module) -> bool:
+    """Whether the attention stops before o_proj and the CUTLASS GEMM-RS runs here."""
+    from sglang.kernels.ops.communication import sp_collective_gemm
+
+    return (
+        hasattr(attn, "forward_pre_o_proj")
+        and getattr(attn, "use_output_gate", True)
+        and sp_collective_gemm.supported(get_parallel().tp_size)
+    )
+
+
 def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
     """Under SP-MoE, write o_proj's TP-partial output into K3's persistent
     symmetric buffer whenever K3's tuned reduce-scatter for that row count
@@ -3352,6 +3363,10 @@ class KimiK3DecoderLayer(nn.Module):
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+        if layernorm_sp.layernorm_sp_enabled() and _sp_o_proj_takes_cutlass(
+            self.self_attn
+        ):
+            self.self_attn.o_proj._sp_use_cutlass = True
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -3467,6 +3482,15 @@ class KimiK3DecoderLayer(nn.Module):
         rows = k3_sp_collective.sp_all_gather(
             hidden_states, layernorm_sp.sp_num_tokens()
         )
+        o_proj = self.self_attn.o_proj
+        if getattr(o_proj, "_sp_use_cutlass", False) and (
+            layernorm_sp.sp_fused_matmul_eligible(o_proj)
+        ):
+            with get_forward().scoped(sp_active=False):
+                attn_out = self._attend(
+                    rows, positions, forward_batch, zero_allocator, pre_o_proj=True
+                )
+            return layernorm_sp.row_parallel_gbar_matmul(o_proj, attn_out, None)
         with get_forward().scoped(sp_active=False):
             partial = self._attend(rows, positions, forward_batch, zero_allocator)
         return k3_sp_collective.sp_reduce_scatter(partial)
@@ -3477,6 +3501,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        pre_o_proj: bool = False,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -3496,7 +3521,8 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
+        attn = self.self_attn.forward_pre_o_proj if pre_o_proj else self.self_attn
+        result = attn(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,

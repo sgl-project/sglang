@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     )
 
 _TILE_M = 64
+_WORLD_SIZES = (2, 4, 8)
 _TILE_N = 128
 _AG_TILES = (
     (256, 256, True, (2, 1)),
@@ -66,6 +67,22 @@ def _pad_shards(
     )
 
 
+def _tile_shards(x: torch.Tensor, world_size: int, rows: int, tile_m: int):
+    """``x`` as ``world_size`` shards of ``rows`` rows, each zero-padded to whole tiles."""
+    padded = (rows + tile_m - 1) // tile_m * tile_m
+    if x.shape[0] == world_size * padded:
+        return x
+    shards = x.new_empty((world_size, padded, x.shape[1]))
+    full, rem = divmod(x.shape[0], rows)
+    shards[:full, :rows].copy_(x[: full * rows].view(full, rows, -1))
+    shards[:full, rows:].zero_()
+    if full < world_size:
+        shards[full, :rem].copy_(x[full * rows :])
+        shards[full, rem:].zero_()
+        shards[full + 1 :].zero_()
+    return shards.view(world_size * padded, x.shape[1])
+
+
 def _unpad_shards(x: torch.Tensor, rows: int, world_size: int) -> torch.Tensor:
     return x.reshape(world_size, -1, x.shape[1])[:, :rows].reshape(
         world_size * rows, x.shape[1]
@@ -101,9 +118,14 @@ def _check_inputs(x, weight, group):
     if not current_arch().is_sm(10):
         raise ValueError("CUTLASS SP collectives require NVLink Blackwell GPUs")
     world = dist.get_world_size(group)
-    if world not in (2, 4, 8):
+    if world not in _WORLD_SIZES:
         raise ValueError("CUTLASS SP collectives require 2, 4, or 8 ranks")
     return world, dist.get_rank(group)
+
+
+def supported(world_size: int) -> bool:
+    """Whether the CUTLASS SP collectives run on this GPU at this TP size."""
+    return current_arch().is_sm(10) and world_size in _WORLD_SIZES
 
 
 def _all_gather_matmul_cublas(
@@ -272,64 +294,119 @@ def all_gather_matmul(
     return _unpad_shards(out, rows, world)
 
 
-def matmul_reduce_scatter(
-    x, weight, group, *, workspace: Callable[..., SPCollectiveGemmWorkspace]
-):
-    """reduce_scatter(x @ weight.T, SUM, dim=0), one fused GEMM-RS kernel."""
-    import cuda.bindings.driver as cuda
+def _as_mnl(x: torch.Tensor) -> torch.Tensor:
+    return x.as_strided((*x.shape, 1), (x.stride(0), 1, x.numel()))
+
+
+def _compile_rs(x, n, k, m, world, rank, sms):
     import cutlass
     import cutlass.cute as cute
+    from cutlass.cute.runtime import (
+        make_fake_compact_tensor,
+        make_fake_stream,
+        make_ptr,
+    )
 
     from sglang.kernels.ops.communication.cutlass_gemm_reduce_scatter import (
         Sm100PersistentDenseGemmReduceScatterLDMCKernel,
     )
 
+    mma_m, mma_n, use_2cta, cluster = _rs_tile(n)
+    dtype = cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
+    gemm = Sm100PersistentDenseGemmReduceScatterLDMCKernel(
+        cutlass.Float32,
+        dtype,
+        use_2cta,
+        (mma_m, mma_n),
+        cluster,
+        True,
+        rank,
+        world,
+    )
+    gemm.can_implement((m, n, k, 1), dtype, dtype, "k", "k", "n")
+    max_active_clusters = sms // (cluster[0] * cluster[1])
+
+    # Multicast views are CPU tensors, so pass their pointers.
+    @cute.jit
+    def launch(
+        a,
+        b,
+        c,
+        comm_in_multicast,
+        comm_out,
+        flags,
+        flags_multicast,
+        peer_flags,
+        stream,
+    ):
+        gemm(
+            a,
+            b,
+            c,
+            cute.make_tensor(comm_in_multicast, c.layout),
+            comm_out,
+            flags,
+            cute.make_tensor(flags_multicast, flags.layout),
+            peer_flags,
+            stream,
+            max_active_clusters,
+        )
+
+    rows, out_rows, num_flags = cute.sym_int(), cute.sym_int(), cute.sym_int()
+
+    def matrix(num_rows, num_cols):
+        return make_fake_compact_tensor(
+            dtype, (num_rows, num_cols, 1), stride_order=(1, 0, 2), assumed_align=16
+        )
+
+    def flag():
+        return make_fake_compact_tensor(cutlass.Int32, (num_flags,), assumed_align=16)
+
+    return cute.compile(
+        launch,
+        matrix(rows, k),
+        matrix(n, k),
+        matrix(rows, n),
+        make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
+        matrix(out_rows, n),
+        flag(),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16),
+        tuple(flag() for _ in range(world)),
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def matmul_reduce_scatter(
+    x, weight, group, *, workspace: Callable[..., SPCollectiveGemmWorkspace]
+):
+    """reduce_scatter(x @ weight.T, SUM, dim=0), one fused GEMM-RS kernel."""
     world, rank = _check_inputs(x, weight, group)
-    if x.shape[0] % world:
-        raise ValueError("GEMM-RS input rows must be padded to the TP world size")
-    rows = x.shape[0] // world
+    rows = (x.shape[0] + world - 1) // world
     n, k = weight.shape
     if rows == 0:
         return x.new_empty((0, n))
-    mma_m, mma_n, use_2cta, cluster = _rs_tile(n)
+    mma_m, mma_n, use_2cta, _ = _rs_tile(n)
     cta_m = mma_m // (2 if use_2cta else 1)
-    padded_input = _pad_shards(x.contiguous(), world, cta_m)
+    padded_input = _tile_shards(x.contiguous(), world, rows, cta_m)
     m = padded_input.shape[0]
     ws = workspace("rs", group, m, n, x, cta_m, (cta_m, mma_n))
     out = x.new_empty((m // world, n))
-    args = dict(
-        a=_tensor(padded_input),
-        b=_tensor(weight),
-        c=_tensor(ws.storage[:m]),
-        comm_in_multicast_tensor=_tensor(ws.multicast[:m]),
-        comm_out_unicast_tensor=_tensor(out),
-        barrier_flag_unicast=_tensor(ws.flags),
-        barrier_flag_multicast=_tensor(ws.flag_multicast),
-        barrier_flag_unicast_per_peer=tuple(_tensor(t) for t in ws.peer_flags),
-        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
-    )
     key = ("rs", x.device, x.dtype, k, n, world, rank)
     if key not in _compiled:
-        dtype = cutlass.BFloat16 if x.dtype == torch.bfloat16 else cutlass.Float16
-        gemm = Sm100PersistentDenseGemmReduceScatterLDMCKernel(
-            cutlass.Float32,
-            dtype,
-            use_2cta,
-            (mma_m, mma_n),
-            cluster,
-            True,
-            rank,
-            world,
-        )
-        gemm.can_implement((m, n, k, 1), dtype, dtype, "k", "k", "n")
-        _compiled[key] = cute.compile(
-            gemm,
-            **args,
-            max_active_clusters=ws.sms // (cluster[0] * cluster[1]),
-        )
+        _compiled[key] = _compile_rs(x, n, k, m, world, rank, ws.sms)
     # The kernel's exit-flag offsets depend on M. Even after this rank exits,
     # a peer may still be resetting its previous exit slots. A changed M can
     # reuse those slots as producer flags, so fence ALL peers before reuse.
     ws.handle.barrier(channel=0)
-    _compiled[key](**args)
+    _compiled[key](
+        _as_mnl(padded_input),
+        _as_mnl(weight),
+        _as_mnl(ws.storage[:m]),
+        ws.multicast.data_ptr(),
+        _as_mnl(out),
+        ws.flags,
+        ws.flag_multicast.data_ptr(),
+        ws.peer_flags,
+    )
     return out[:rows]
