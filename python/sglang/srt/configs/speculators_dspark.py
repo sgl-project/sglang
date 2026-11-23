@@ -24,7 +24,8 @@ _COPIED_DSPARK_KEYS = (
 def try_load_speculators_dspark_config(
     model, revision: Optional[str], **kwargs
 ) -> Optional[PretrainedConfig]:
-    """Flatten a ``speculators`` DSpark checkpoint config into ``Qwen3Config``.
+    """Flatten a ``speculators`` DSpark checkpoint config into the HF config of its
+    layer backbone (``transformer_layer_config.model_type``).
 
     Speculators checkpoints omit top-level ``model_type``, nest layer fields
     under ``transformer_layer_config``, and index ``aux_hidden_state_layer_ids``
@@ -36,8 +37,13 @@ def try_load_speculators_dspark_config(
     if config_dict.get("speculators_model_type") != "dspark":
         return None
     layer_config = config_dict.get("transformer_layer_config")
-    if not isinstance(layer_config, dict) or layer_config.get("model_type") != "qwen3":
-        return None
+    layer_model_type = (
+        layer_config.get("model_type") if isinstance(layer_config, dict) else None
+    )
+    if not isinstance(layer_model_type, str):
+        raise ValueError(
+            "speculators DSpark config needs transformer_layer_config.model_type"
+        )
 
     layer_types = set(layer_config.get("layer_types") or ())
     if layer_types == {"sliding_attention"}:
@@ -66,4 +72,4 @@ def try_load_speculators_dspark_config(
         if key in config_dict and config_dict[key] is not None:
             flat[key] = config_dict[key]
 
-    return AutoConfig.for_model("qwen3", **flat)
+    return AutoConfig.for_model(layer_model_type, **flat)

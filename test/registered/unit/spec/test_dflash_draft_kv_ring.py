@@ -540,6 +540,33 @@ class TestSpeculatorsDSparkConfig(unittest.TestCase):
         self.assertEqual(cfg.dflash_config["target_layer_ids"], [75, 79, 83, 87, 91])
         self.assertEqual(get_dflash_aux_hidden_stream(cfg), "prefix")
 
+    def _load(self, layer_config):
+        from sglang.srt.configs.speculators_dspark import (
+            try_load_speculators_dspark_config,
+        )
+
+        raw = {
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [2, 4],
+            "mask_token_id": 7,
+            "transformer_layer_config": layer_config,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            return try_load_speculators_dspark_config(tmp, revision=None)
+
+    def test_speculators_dspark_config_follows_the_layer_backbone(self):
+        """The flattened config is the backbone's HF config class, not a fixed one."""
+        cfg = self._load(
+            {"model_type": "llama", "hidden_size": 64, "num_attention_heads": 4}
+        )
+        self.assertEqual(cfg.model_type, "llama")
+        self.assertEqual(cfg.dflash_config["target_layer_ids"], [1, 3])
+
+    def test_speculators_dspark_config_without_layer_model_type_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "transformer_layer_config.model_type"):
+            self._load({"hidden_size": 64})
+
 
 if __name__ == "__main__":
     unittest.main()
