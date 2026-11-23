@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -9,8 +10,12 @@ from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_group,
     get_tp_world_size,
     model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
+    GraphCaptureContext,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
@@ -432,10 +437,13 @@ class EncoderGraphs:
     GPU work. Everything but the masked attention is captured; the attention
     runs eagerly between segments and reads each request's valid lengths, so
     prompts padded to one length (FLUX.2-klein, Z-Image) share one graph. The
-    replayed kernels are the eager ones, so the output is bit-identical. A shape
-    is captured on its second request; moved or replaced weights, and
-    /release_memory_occupation, drop every graph. A replay overwrites the previous output, so callers copy what they
-    keep (the Qwen3 text postprocessors all build new tensors).
+    replayed kernels are the eager ones, so the output is bit-identical. Under
+    tensor parallelism the all-reduces are captured too, in the encoder TP
+    group's graph_capture(); every rank sees the same requests, so the ranks
+    capture and replay together. A shape is captured on its second request;
+    moved or replaced weights, and /release_memory_occupation, drop every graph.
+    A replay overwrites the previous output, so callers copy what they keep (the
+    Qwen3 text postprocessors all build new tensors).
     """
 
     max_graphs = 8
@@ -461,7 +469,6 @@ class EncoderGraphs:
             or input_ids.shape[0] != 1
             or torch.compiler.is_compiling()
             or torch.cuda.is_current_stream_capturing()
-            or (model_parallel_is_initialized() and get_tp_world_size() > 1)
         ):
             return eager()
         tensors = [*model.parameters(), *model.buffers()]
@@ -525,9 +532,18 @@ class EncoderGraphs:
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
         graph = BreakableCUDAGraph()
+        # custom all-reduce registers the captured inputs with its peers on exit
+        tp_capture = (
+            get_tp_group().graph_capture(GraphCaptureContext(stream))
+            if model_parallel_is_initialized() and get_tp_world_size() > 1
+            else nullcontext()
+        )
         # thread_local: an async output-save thread may use CUDA during capture
-        with BreakableCUDAGraphCapture(
-            graph, pool=self.pool, stream=stream, capture_error_mode="thread_local"
+        with (
+            tp_capture,
+            BreakableCUDAGraphCapture(
+                graph, pool=self.pool, stream=stream, capture_error_mode="thread_local"
+            ),
         ):
             output = run()
         return graph, static_ids, output
